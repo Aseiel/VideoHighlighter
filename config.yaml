@@ -1,0 +1,52 @@
+# ==========================
+# 🎥 Video Highlighter Config
+# ==========================
+
+video:
+  path: "D:\\movie_highlighter\\power_rangers.mp4"       # default input video
+
+
+highlights:
+  clip_time: 10           # length of each highlight segment in seconds
+  output: "highlight.mp4" # default output filename
+  max_duration: 420       # max total highlight duration in seconds
+  exact_duration: 0     # target exact highlight duration in seconds
+  keep_temp: false        # keep temporary clips after merge
+
+# -------------------------
+# 🎯 Scoring configuration
+# -------------------------
+scoring:
+  scene_points: 0
+  motion_event_points: 0
+  motion_peak_points: 0
+  audio_peak_points: 0
+  keyword_points: 2
+  beginning_points: 0
+  ending_points: 0
+  multi_signal_boost: 1.2
+  min_signals_for_boost: 2
+  object_points: 1
+  action_points: 10
+
+# -------------------------
+# 👀 Detection configuration
+# -------------------------
+actions:
+  interesting:
+    - dancing
+    - painting
+    - running
+
+objects:
+  interesting:
+    - person
+    - car
+    - dog
+
+keywords:
+  transcript_file: "transcript.txt"
+  interesting:
+    - love
+    - fight
+    - secret

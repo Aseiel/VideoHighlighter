@@ -1,0 +1,54 @@
+📜 Changelog
+🏁 v0.09 – 19.09
+
+❌ Added cancel button in pipeline
+
+⏭️ Skip when keywords or points input is empty
+
+🖥️ v0.08 – 14.09
+
+📝 Added transcript display in GUI
+
+🗂️ Added Advanced and Transcript tabs
+
+📊 v0.07 – 13.09
+
+⏳ Progress bar in GUI
+
+⚙️ v0.06 – 12.09
+
+📝 Added config.yaml
+
+🖼️ Basic GUI
+
+🤖 v0.05 – 05.09
+
+🔧 OpenVINO support
+
+🎬 Action recognition with Intel action-recognition-0001
+
+🖼️ v0.04 – 04.09
+
+🐍 Object detection with YOLO
+
+🔄 Connected scene + motion detection in single run
+
+⚡ v0.03 – 03.09
+
+🚀 Optimized motion scene detection (2× faster)
+
+💻 Added Intel XPU support
+
+🛠️ PyTorch method for motion detection (replacing OpenCV)
+
+🏞️ v0.02 – 02.09
+
+🎬 Scene detection
+
+📈 Motion detection
+
+✨ v0.01 – 01.09
+
+📝 Automatic subtitles (SRT)
+
+🌐 Subtitles translation
