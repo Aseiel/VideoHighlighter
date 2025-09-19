@@ -21,7 +21,7 @@ Optional GUI for easy interaction.
 ## Preview
 
 ![VideoHighlighter](assets/Highlighter.png)
-![Transcript_Subtitles](assets/Transcript Subtitles.png)
+![Transcript Subtitles](assets/Transcript_Subtitles.png)
 
 
 Setup & Installation
