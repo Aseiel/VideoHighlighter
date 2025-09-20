@@ -25,22 +25,39 @@ DECODER_BIN = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-00
 SEQUENCE_LENGTH = 16
 
 def load_models(device="AUTO"):
+    """Load models with GPU optimization but no threading complexity"""
     ie = Core()
-    dev = "GPU" if "GPU" in ie.available_devices else "CPU"
-    if device != "AUTO":
-        dev = device
-    print(f"Using device: {dev}")
+    available_devices = ie.available_devices
+    print(f"Available OpenVINO devices: {available_devices}")
+    
+    # Smart device selection
+    if device == "AUTO":
+        device_priority = ["GPU.1", "GPU.0", "GPU", "CPU"]
+        selected_device = next((d for d in device_priority if d in available_devices), "CPU")
+    else:
+        selected_device = device if device in available_devices else "CPU"
+    
+    print(f"Using device: {selected_device}")
 
+    # Load models
     encoder_model = ie.read_model(model=ENCODER_XML, weights=ENCODER_BIN)
     decoder_model = ie.read_model(model=DECODER_XML, weights=DECODER_BIN)
 
-    compiled_encoder = ie.compile_model(model=encoder_model, device_name=dev)
-    compiled_decoder = ie.compile_model(model=decoder_model, device_name=dev)
+    try:
+        compiled_encoder = ie.compile_model(model=encoder_model, device_name=selected_device)
+        compiled_decoder = ie.compile_model(model=decoder_model, device_name=selected_device)
+        print(f"Models compiled successfully on {selected_device}")
+    except Exception as e:
+        print(f"Failed to compile on {selected_device}: {e}")
+        print("Falling back to CPU...")
+        compiled_encoder = ie.compile_model(model=encoder_model, device_name="CPU")
+        compiled_decoder = ie.compile_model(model=decoder_model, device_name="CPU")
 
     return compiled_encoder, compiled_encoder.input(0), compiled_encoder.output(0), \
            compiled_decoder, compiled_decoder.input(0), compiled_decoder.output(0)
 
 def preprocess_frame(frame, input_shape):
+    """Original preprocessing function - no changes"""
     N, C, H, W = input_shape
     h, w = frame.shape[:2]
 
@@ -110,7 +127,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=30, log_file="ac
             if cancel_flag and cancel_flag.is_set():
                 print("⚠️ Action detection canceled by user.")
                 break
-
+                
             ret, frame = cap.read()
             if not ret:
                 break
@@ -150,22 +167,13 @@ def run_action_detection(video_path, device="AUTO", sample_rate=30, log_file="ac
 
             # Update GUI progress
             if progress_callback is not None:
-                progress_callback(frame_id, total_frames, "Pipeline", "Running action recognition...")
+                progress_callback(frame_id, total_frames, "Action Recognition", f"Processing frame {frame_id}/{total_frames}")
 
     cap.release()
     if show_video:
         cv2.destroyAllWindows()
     print(f"All actions logged to {log_file}")
-
-    if not all_actions:
-        return []
-  
-    # Sort by confidence score (highest first) and return
-    all_actions_by_confidence = sorted(all_actions, key=lambda x: x[3], reverse=True)
-    print(f"Returning {len(all_actions_by_confidence)} actions sorted by confidence")
-    print(f"Confidence range: {all_actions_by_confidence[0][3]:.3f} to {all_actions_by_confidence[-1][3]:.3f}")
-    
-    return all_actions_by_confidence
+    return all_actions
 
 def print_top_actions(all_actions, top_n=20):
     sorted_actions = sorted(all_actions, key=lambda x: x[3], reverse=True)
