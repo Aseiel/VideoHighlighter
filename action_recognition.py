@@ -1,70 +1,78 @@
 import cv2
 import argparse
 import numpy as np
+from openvino.runtime import Core
 import csv
 import json
 from collections import Counter
 from pathlib import Path
-import time
 
-# ---------------------------
-BASE_DIR = Path(__file__).parent.resolve()
 
 # Load Kinetics-600 labels
-with open(BASE_DIR / "kinetics_600_labels.json", "r") as f:
+with open("kinetics_600_labels.json", "r") as f:
     KINETICS_600_LABELS = json.load(f)
-
-SEQUENCE_LENGTH = 16
 
 def get_action_name(action_id):
     return KINETICS_600_LABELS.get(str(action_id), f"action_{action_id}")
 
-def get_model_paths(device="GPU"):
-    """Return encoder and decoder paths depending on device."""
-    precision = "FP32" if device.upper() == "CPU" else "FP16"
-    encoder_xml = BASE_DIR / f"models/intel_action/encoder/{precision}/action-recognition-0001-encoder.xml"
-    encoder_bin = BASE_DIR / f"models/intel_action/encoder/{precision}/action-recognition-0001-encoder.bin"
-    decoder_xml = BASE_DIR / f"models/intel_action/decoder/{precision}/action-recognition-0001-decoder.xml"
-    decoder_bin = BASE_DIR / f"models/intel_action/decoder/{precision}/action-recognition-0001-decoder.bin"
-    return encoder_xml, encoder_bin, decoder_xml, decoder_bin
+# Model paths
+BASE_DIR = Path(__file__).parent.resolve()
+ENCODER_XML = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.xml"
+ENCODER_BIN = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin"
+DECODER_XML = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
+DECODER_BIN = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 
-def load_models(device="GPU"):
-    """Load encoder and decoder models with appropriate precision."""
-    try:
-        from openvino.runtime import Core
-    except ImportError:
-        raise RuntimeError("OpenVINO runtime is required for this script.")
+SEQUENCE_LENGTH = 16
 
+def load_models(device="AUTO"):
+    """Load models with GPU optimization but no threading complexity"""
     ie = Core()
     available_devices = ie.available_devices
-    selected_device = "CPU"
-    if device.upper() in available_devices:
-        selected_device = device.upper()
+    print(f"Available OpenVINO devices: {available_devices}")
+    
+    # Smart device selection
+    if device == "AUTO":
+        device_priority = ["GPU.1", "GPU.0", "GPU", "CPU"]
+        selected_device = next((d for d in device_priority if d in available_devices), "CPU")
+    else:
+        selected_device = device if device in available_devices else "CPU"
+    
     print(f"Using device: {selected_device}")
 
-    encoder_xml, encoder_bin, decoder_xml, decoder_bin = get_model_paths(selected_device)
+    # Load models
+    encoder_model = ie.read_model(model=ENCODER_XML, weights=ENCODER_BIN)
+    decoder_model = ie.read_model(model=DECODER_XML, weights=DECODER_BIN)
 
-    encoder_model = ie.read_model(model=encoder_xml, weights=encoder_bin)
-    decoder_model = ie.read_model(model=decoder_xml, weights=decoder_bin)
-
-    compiled_encoder = ie.compile_model(encoder_model, device_name=selected_device)
-    compiled_decoder = ie.compile_model(decoder_model, device_name=selected_device)
+    try:
+        compiled_encoder = ie.compile_model(model=encoder_model, device_name=selected_device)
+        compiled_decoder = ie.compile_model(model=decoder_model, device_name=selected_device)
+        print(f"Models compiled successfully on {selected_device}")
+    except Exception as e:
+        print(f"Failed to compile on {selected_device}: {e}")
+        print("Falling back to CPU...")
+        compiled_encoder = ie.compile_model(model=encoder_model, device_name="CPU")
+        compiled_decoder = ie.compile_model(model=decoder_model, device_name="CPU")
 
     return compiled_encoder, compiled_encoder.input(0), compiled_encoder.output(0), \
            compiled_decoder, compiled_decoder.input(0), compiled_decoder.output(0)
 
 def preprocess_frame(frame, input_shape):
-    """Preprocess frame to match encoder input shape (CPU/FP32 or GPU/FP16)."""
+    """Original preprocessing function - no changes"""
     N, C, H, W = input_shape
     h, w = frame.shape[:2]
+
     scale = min(W/w, H/h)
     new_w, new_h = int(w*scale), int(h*scale)
     frame_resized = cv2.resize(frame, (new_w, new_h))
-    pad_top, pad_bottom = (H - new_h) // 2, H - new_h - (H - new_h) // 2
-    pad_left, pad_right = (W - new_w) // 2, W - new_w - (W - new_w) // 2
+
+    pad_top = (H - new_h) // 2
+    pad_bottom = H - new_h - pad_top
+    pad_left = (W - new_w) // 2
+    pad_right = W - new_w - pad_left
     frame_padded = cv2.copyMakeBorder(frame_resized, pad_top, pad_bottom, pad_left, pad_right,
                                       borderType=cv2.BORDER_CONSTANT, value=[0,0,0])
-    frame_padded = frame_padded.transpose(2, 0, 1)  # HWC -> CHW
+
+    frame_padded = frame_padded.transpose(2, 0, 1)
     return np.expand_dims(frame_padded, axis=0).astype(np.float32)
 
 def detect_action_sequences(all_actions, min_duration=2.0):
@@ -87,14 +95,21 @@ def detect_action_sequences(all_actions, min_duration=2.0):
         sequences.append(current_sequence)
     return sequences
 
-def run_action_detection(video_path, device="GPU", sample_rate=30, log_file="action_log.csv", 
-                         debug=False, top_k=8, confidence_threshold=0.01, show_video=False,
-                         interesting_actions=None, progress_callback=None, cancel_flag=None):
-    """Unified GPU/CPU action detection using OpenVINO."""
-    interesting_actions_set = set([s.lower() for s in interesting_actions]) if interesting_actions else None
+def run_action_detection(video_path, device="AUTO", sample_rate=30, log_file="action_log.csv", 
+                        debug=False, top_k=8, confidence_threshold=0.01, show_video=False,
+                        interesting_actions=None, progress_callback=None, cancel_flag=None):
+    """
+    interesting_actions: list of action names to detect (optional).
+    progress_callback: function(progress, total, stage, message)
+    cancel_flag: threading.Event() or similar to cancel processing
+    Returns actions sorted by confidence (highest first)
+    """
+    if interesting_actions is not None:
+        interesting_actions_set = set([s.lower() for s in interesting_actions])
+    else:
+        interesting_actions_set = None
 
     compiled_encoder, encoder_input, encoder_output, compiled_decoder, decoder_input, decoder_output = load_models(device)
-
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -107,24 +122,18 @@ def run_action_detection(video_path, device="GPU", sample_rate=30, log_file="act
         writer.writerow(["timestamp_mmss", "frame_id", "action_id", "action_name", "score", "timestamp_seconds"])
 
         frame_id = 0
-        last_processed_time = 0
-
         while True:
+            # Check for cancellation
             if cancel_flag and cancel_flag.is_set():
                 print("⚠️ Action detection canceled by user.")
                 break
-
+                
             ret, frame = cap.read()
             if not ret:
                 break
-
             frame_id += 1
-
-            # Control processing rate
-            current_time = time.time()
-            if current_time - last_processed_time < 1.0 / sample_rate:
+            if frame_id % sample_rate != 0:
                 continue
-            last_processed_time = current_time
 
             timestamp_secs = frame_id / fps
             mins, secs = divmod(int(timestamp_secs), 60)
@@ -156,18 +165,16 @@ def run_action_detection(video_path, device="GPU", sample_rate=30, log_file="act
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
-            if progress_callback:
+            # Update GUI progress
+            if progress_callback is not None:
                 progress_callback(frame_id, total_frames, "Action Recognition", f"Processing frame {frame_id}/{total_frames}")
 
     cap.release()
     if show_video:
         cv2.destroyAllWindows()
-
     print(f"All actions logged to {log_file}")
     return all_actions
 
-# ---------------------------
-# Utilities to print results
 def print_top_actions(all_actions, top_n=20):
     sorted_actions = sorted(all_actions, key=lambda x: x[3], reverse=True)
     print(f"\nTop {min(top_n, len(sorted_actions))} actions (by confidence):")
@@ -190,11 +197,10 @@ def print_action_sequences(all_actions):
         end_mins, end_secs = divmod(int(seq['end_time']), 60)
         print(f"{i+1:2d}. {seq['action_name']} Duration: {duration:.1f}s ({start_mins:02d}:{start_secs:02d} - {end_mins:02d}:{end_secs:02d}) Max score: {seq['max_score']:.3f}")
 
-# ---------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=str, required=True)
-    parser.add_argument("--device", type=str, default="GPU")
+    parser.add_argument("--device", type=str, default="AUTO")
     parser.add_argument("--sample-rate", type=int, default=30)
     parser.add_argument("--log-file", type=str, default="action_log.csv")
     parser.add_argument("--debug", action="store_true")
