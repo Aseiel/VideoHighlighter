@@ -9,7 +9,7 @@ import warnings
 import yaml
 from tqdm import tqdm
 
-# models
+# modules
 from motion_scene_detect_optimized import detect_scenes_motion_optimized
 from action_recognition import run_action_detection, load_models
 from audio_peaks import extract_audio_peaks
@@ -675,31 +675,60 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
             if signals >= MIN_SIGNALS_FOR_BOOST:
                 print(f"  ⚡ Multi-signal boost applied (x{MULTI_SIGNAL_BOOST})")
 
-        # Select top segments (same logic as your script)
-        progress.update_progress(85, 100, "Pipeline", "Selecting highlight segments...")
-        top_indices_all = np.argsort(score)[::-1]
-        segments = []
-        used_seconds = set()
-        for sec in top_indices_all:
-            if sec in used_seconds:
-                continue
-            start = max(0, sec - CLIP_TIME // 2)
-            end = min(video_duration, start + CLIP_TIME)
-            if end - start < CLIP_TIME and end < video_duration:
-                end = min(video_duration, start + CLIP_TIME)
-            if end - start < CLIP_TIME and start > 0:
-                start = max(0, end - CLIP_TIME)
-            if any(s in used_seconds for s in range(int(start), int(end))):
-                continue
-            segments.append((start, end))
-            for s in range(int(start), int(end)):
-                used_seconds.add(s)
-            if sum(e - s for s, e in segments) >= target_duration:
-                break
-        segments.sort(key=lambda x: x[0])
+            # Module-level flag to ensure logging happens only once per video
+            if 'segments_logged' not in globals():
+                globals()['segments_logged'] = False
 
-        total_duration = sum(e - s for s, e in segments)
-        log(f"\n🎯 Final segments selected: {len(segments)}, total {total_duration:.1f}s (target {target_duration}s)")
+            # Select top segments
+            progress.update_progress(85, 100, "Pipeline", "Selecting highlight segments...")
+
+            # Only use seconds with positive score
+            positive_indices = np.where(score > 0)[0]
+            top_indices_all = positive_indices[np.argsort(score[positive_indices])[::-1]]
+
+            segments = []
+            used_seconds = set()
+
+            for sec in top_indices_all:
+                if sec in used_seconds:
+                    continue
+
+                start = max(0, sec - CLIP_TIME // 2)
+                end = min(video_duration, start + CLIP_TIME)
+
+                # Adjust start/end to ensure full CLIP_TIME
+                if end - start < CLIP_TIME and end < video_duration:
+                    end = min(video_duration, start + CLIP_TIME)
+                if end - start < CLIP_TIME and start > 0:
+                    start = max(0, end - CLIP_TIME)
+
+                # Skip if any second is already used
+                if any(s in used_seconds for s in range(int(start), int(end))):
+                    continue
+
+                segments.append((start, end))
+                for s in range(int(start), int(end)):
+                    used_seconds.add(s)
+
+                # Break based on duration mode
+                current_duration = sum(e - s for s, e in segments)
+                if duration_mode == "EXACT" and current_duration >= EXACT_DURATION:
+                    break
+                elif duration_mode == "MAX" and current_duration >= MAX_DURATION:
+                    break
+
+            # Sort segments by start time
+            segments.sort(key=lambda x: x[0])
+
+            # Compute total duration once
+            total_duration = sum(e - s for s, e in segments)
+
+            # Log final segments exactly once, even if target not reached
+            if not globals()['segments_logged']:
+                log(f"\n🎯 Final segments selected: {len(segments)}, total {total_duration:.1f}s (target {target_duration}s)")
+                globals()['segments_logged'] = True
+
+
 
         check_cancellation(cancel_flag, log, "segment selection")
 
