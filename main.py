@@ -1,19 +1,23 @@
-# main.py - Video Highlighter GUI with proper cancellation support
 import sys
 import os
 import threading
+import yaml
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QFileDialog, QLineEdit, QSpinBox, QDoubleSpinBox,
+    QPushButton, QFileDialog, QLineEdit, QSpinBox,
     QGroupBox, QTextEdit, QFormLayout, QProgressBar, QCheckBox,
     QComboBox, QTabWidget
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from pipeline import run_highlighter
 
+
+CONFIG_FILE = "config.yaml"
+
+
 class Worker(QThread):
     finished = Signal(str)
-    progress = Signal(int, int, str, str)  # current, total, task_name, details
+    progress = Signal(int, int, str, str)
     log = Signal(str)
     cancelled = Signal()
 
@@ -28,7 +32,7 @@ class Worker(QThread):
         try:
             self._is_running = True
             self.log.emit("🚀 Starting video highlighter pipeline...")
-            
+
             output = run_highlighter(
                 self.video_path,
                 gui_config=self.gui_config,
@@ -36,14 +40,14 @@ class Worker(QThread):
                 progress_fn=lambda cur, tot, task, det: self.progress.emit(cur, tot, task, det),
                 cancel_flag=self._cancel_flag
             )
-            
+
             if self._cancel_flag.is_set():
                 self.log.emit("⏹️ Pipeline was cancelled")
                 self.cancelled.emit()
                 self.finished.emit("")
             else:
                 self.finished.emit(output or "")
-                
+
         except Exception as e:
             self.log.emit(f"❌ Worker error: {e}")
             import traceback
@@ -53,19 +57,15 @@ class Worker(QThread):
             self._is_running = False
 
     def cancel(self):
-        """Request cancellation of the pipeline"""
         if self._is_running:
             self.log.emit("⏹️ Cancellation requested - stopping pipeline...")
             self._cancel_flag.set()
-            
-            # Give the thread some time to finish gracefully
-            if not self.wait(5000):  # Wait up to 5 seconds
+            if not self.wait(5000):
                 self.log.emit("⚠️ Force terminating thread...")
                 self.terminate()
                 self.wait()
-    
+
     def is_cancelled(self):
-        """Check if cancellation was requested"""
         return self._cancel_flag.is_set()
 
 
@@ -76,11 +76,13 @@ class VideoHighlighterGUI(QWidget):
         self.setGeometry(200, 200, 1000, 800)
         self.worker = None
 
+        self.config_data = self.load_config()
+
         layout = QVBoxLayout()
 
         # --- File picker ---
         file_layout = QHBoxLayout()
-        self.video_input = QLineEdit()
+        self.video_input = QLineEdit(self.config_data.get("video", {}).get("path", ""))
         browse_btn = QPushButton("Browse")
         browse_btn.clicked.connect(self.browse_file)
         file_layout.addWidget(QLabel("Input Video:"))
@@ -90,7 +92,7 @@ class VideoHighlighterGUI(QWidget):
 
         # --- Output filename ---
         out_layout = QHBoxLayout()
-        self.output_input = QLineEdit()
+        self.output_input = QLineEdit(self.config_data.get("highlights", {}).get("output", "highlight.mp4"))
         out_layout.addWidget(QLabel("Output file:"))
         out_layout.addWidget(self.output_input)
         layout.addLayout(out_layout)
@@ -116,26 +118,29 @@ class VideoHighlighterGUI(QWidget):
         scores_box = QGroupBox("Points & durations")
         scores_layout = QFormLayout()
 
-        # Scoring points
-        self.spin_scene_points = QSpinBox(); self.spin_scene_points.setRange(0,100); self.spin_scene_points.setValue(0)
-        self.spin_motion_event_points = QSpinBox(); self.spin_motion_event_points.setRange(0,100); self.spin_motion_event_points.setValue(0)
-        self.spin_motion_peak = QSpinBox(); self.spin_motion_peak.setRange(0,100); self.spin_motion_peak.setValue(3)
-        self.spin_audio_peak = QSpinBox(); self.spin_audio_peak.setRange(0,100); self.spin_audio_peak.setValue(0)
-        self.spin_keyword_points = QSpinBox(); self.spin_keyword_points.setRange(0,100); self.spin_keyword_points.setValue(2)
-        self.spin_transcript_points = QSpinBox(); self.spin_transcript_points.setRange(0,100); self.spin_transcript_points.setValue(2)
-        self.spin_object = QSpinBox(); self.spin_object.setRange(0,100); self.spin_object.setValue(1)
-        self.spin_action = QSpinBox(); self.spin_action.setRange(0,1000); self.spin_action.setValue(10)
-        self.spin_clip_time = QSpinBox(); self.spin_clip_time.setRange(1,300); self.spin_clip_time.setValue(10)
-        self.spin_max_duration = QSpinBox(); self.spin_max_duration.setRange(1,3600); self.spin_max_duration.setValue(420)
-        self.spin_exact_duration = QSpinBox(); self.spin_exact_duration.setRange(0,3600); self.spin_exact_duration.setValue(0)
+        scoring_cfg = self.config_data.get("scoring", {})
+        highlights_cfg = self.config_data.get("highlights", {})
 
-        # Add to form layout
+        # Scoring points
+        self.spin_scene_points = QSpinBox(); self.spin_scene_points.setRange(0,100); self.spin_scene_points.setValue(scoring_cfg.get("scene_points", 0))
+        self.spin_motion_event_points = QSpinBox(); self.spin_motion_event_points.setRange(0,100); self.spin_motion_event_points.setValue(scoring_cfg.get("motion_event_points", 0))
+        self.spin_motion_peak = QSpinBox(); self.spin_motion_peak.setRange(0,100); self.spin_motion_peak.setValue(scoring_cfg.get("motion_peak_points", 3))
+        self.spin_audio_peak = QSpinBox(); self.spin_audio_peak.setRange(0,100); self.spin_audio_peak.setValue(scoring_cfg.get("audio_peak_points", 0))
+        self.spin_keyword_points = QSpinBox(); self.spin_keyword_points.setRange(0,100); self.spin_keyword_points.setValue(scoring_cfg.get("keyword_points", 2))
+        self.spin_transcript_points = QSpinBox(); self.spin_transcript_points.setRange(0,100); self.spin_transcript_points.setValue(scoring_cfg.get("transcript_points", 2))
+        self.spin_object = QSpinBox(); self.spin_object.setRange(0,100); self.spin_object.setValue(scoring_cfg.get("object_points", 1))
+        self.spin_action = QSpinBox(); self.spin_action.setRange(0,1000); self.spin_action.setValue(scoring_cfg.get("action_points", 10))
+        self.spin_clip_time = QSpinBox(); self.spin_clip_time.setRange(1,300); self.spin_clip_time.setValue(highlights_cfg.get("clip_time", 10))
+        self.spin_max_duration = QSpinBox(); self.spin_max_duration.setRange(1,3600); self.spin_max_duration.setValue(highlights_cfg.get("max_duration", 420))
+        self.spin_exact_duration = QSpinBox(); self.spin_exact_duration.setRange(0,3600); self.spin_exact_duration.setValue(highlights_cfg.get("exact_duration", 0))
+
+         # Add to form layout
         scores_layout.addRow("Scene points:", self.spin_scene_points)
         scores_layout.addRow("Motion event points:", self.spin_motion_event_points)
         scores_layout.addRow("Motion peak points:", self.spin_motion_peak)
         scores_layout.addRow("Audio peak points:", self.spin_audio_peak)
-        scores_layout.addRow("Keyword points (keywords in transcript):", self.spin_keyword_points)
-        scores_layout.addRow("Transcript points (all words):", self.spin_transcript_points)
+        scores_layout.addRow("Keyword points:", self.spin_keyword_points)
+        scores_layout.addRow("Transcript points:", self.spin_transcript_points)
         scores_layout.addRow("Object points:", self.spin_object)
         scores_layout.addRow("Action points:", self.spin_action)
         scores_layout.addRow("Clip time (s):", self.spin_clip_time)
@@ -146,7 +151,7 @@ class VideoHighlighterGUI(QWidget):
 
         # Highlight object classes
         obj_layout = QHBoxLayout()
-        self.objects_input = QLineEdit()
+        self.objects_input = QLineEdit(",".join(self.config_data.get("objects", {}).get("interesting", [])))
         self.objects_input.setPlaceholderText("person,glass,wine glass,sports ball")
         obj_layout.addWidget(QLabel("Object detection:"))
         obj_layout.addWidget(self.objects_input)
@@ -154,36 +159,42 @@ class VideoHighlighterGUI(QWidget):
 
         # Action keywords
         action_kw_layout = QHBoxLayout()
-        self.actions_input = QLineEdit()
+        self.actions_input = QLineEdit(",".join(self.config_data.get("actions", {}).get("interesting", [])))
         self.actions_input.setPlaceholderText("high jump, high kick, archery")
         action_kw_layout.addWidget(QLabel("Action keywords:"))
         action_kw_layout.addWidget(self.actions_input)
         basic_layout.addLayout(action_kw_layout)
 
-        # Skip Highlights checkbox
-        self.skip_highlights_chk = QCheckBox("Skip highlights (only generate full video subtitles if enabled)")
-        self.skip_highlights_chk.setChecked(False)
+        self.skip_highlights_chk = QCheckBox("Skip highlights")
+        self.skip_highlights_chk.setChecked(highlights_cfg.get("skip_highlights", False))
         basic_layout.addWidget(self.skip_highlights_chk)
 
         basic_tab.setLayout(basic_layout)
         tabs.addTab(basic_tab, "Basic Settings")
 
         # --- Tab 2: Transcript & Subtitles ---
+        transcript_cfg = self.config_data.get("transcript", {})
+        subtitles_cfg = self.config_data.get("subtitles", {})
+
         transcript_tab = QWidget()
         transcript_layout = QVBoxLayout()
+
         transcript_group = QGroupBox("Transcript Settings")
         transcript_form = QFormLayout()
         self.transcript_checkbox = QCheckBox("Enable transcript processing")
+        self.transcript_checkbox.setChecked(transcript_cfg.get("enabled", False))
         self.transcript_checkbox.toggled.connect(self.on_transcript_toggle)
         transcript_form.addRow("Use transcript:", self.transcript_checkbox)
+        
         self.transcript_model_combo = QComboBox()
         self.transcript_model_combo.addItems(["tiny","base","small","medium","large"])
-        self.transcript_model_combo.setCurrentText("base")
-        self.transcript_model_combo.setEnabled(False)
+        self.transcript_model_combo.setCurrentText(transcript_cfg.get("model", "base"))
+        self.transcript_model_combo.setEnabled(transcript_cfg.get("enabled", False))
         transcript_form.addRow("Whisper model:", self.transcript_model_combo)
-        self.search_keywords_input = QLineEdit()
+        
+        self.search_keywords_input = QLineEdit(",".join(transcript_cfg.get("search_keywords", [])))
         self.search_keywords_input.setPlaceholderText("goal, score, win")
-        self.search_keywords_input.setEnabled(False)
+        self.search_keywords_input.setEnabled(transcript_cfg.get("enabled", False))
         transcript_form.addRow("Search keywords:", self.search_keywords_input)
         transcript_group.setLayout(transcript_form)
         transcript_layout.addWidget(transcript_group)
@@ -191,32 +202,40 @@ class VideoHighlighterGUI(QWidget):
         subtitle_group = QGroupBox("Subtitle Settings")
         subtitle_form = QFormLayout()
         self.subtitles_checkbox = QCheckBox("Generate subtitles (.srt)")
+        self.subtitles_checkbox.setChecked(subtitles_cfg.get("enabled", False))
         self.subtitles_checkbox.toggled.connect(self.on_subtitles_toggle)
+        # Disable subtitle checkbox if transcript is not enabled
+        self.subtitles_checkbox.setEnabled(transcript_cfg.get("enabled", False))
         subtitle_form.addRow("Create subtitles:", self.subtitles_checkbox)
+        
         self.source_lang_combo = QComboBox()
         self.source_lang_combo.addItems(["en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
-        self.source_lang_combo.setCurrentText("en")
-        self.source_lang_combo.setEnabled(False)
+        self.source_lang_combo.setCurrentText(subtitles_cfg.get("source_lang", "en"))
+        self.source_lang_combo.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
         subtitle_form.addRow("Source language:", self.source_lang_combo)
+        
         self.target_lang_combo = QComboBox()
         self.target_lang_combo.addItems(["en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
-        self.target_lang_combo.setCurrentText("pl")
-        self.target_lang_combo.setEnabled(False)
+        self.target_lang_combo.setCurrentText(subtitles_cfg.get("target_lang", "pl"))
+        self.target_lang_combo.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
         subtitle_form.addRow("Target language:", self.target_lang_combo)
         subtitle_group.setLayout(subtitle_form)
         transcript_layout.addWidget(subtitle_group)
+
         transcript_tab.setLayout(transcript_layout)
         tabs.addTab(transcript_tab, "Transcript & Subtitles")
 
         # --- Tab3: Advanced Tab ---
+        advanced_cfg = self.config_data.get("advanced", {})
+
         advanced_tab = QWidget()
         advanced_layout = QVBoxLayout()
         misc_box = QGroupBox("Advanced / Optional")
         misc_layout = QFormLayout()
-        self.frame_skip_spin = QSpinBox(); self.frame_skip_spin.setRange(1,30); self.frame_skip_spin.setValue(5)
-        self.obj_frame_skip_spin = QSpinBox(); self.obj_frame_skip_spin.setRange(1,60); self.obj_frame_skip_spin.setValue(10)
-        self.yolo_pt_path = QLineEdit(); self.yolo_pt_path.setPlaceholderText("Optional: path to yolo11n.pt")
-        self.openvino_model_folder = QLineEdit(); self.openvino_model_folder.setPlaceholderText("Optional: OpenVINO model folder")
+        self.frame_skip_spin = QSpinBox(); self.frame_skip_spin.setRange(1,30); self.frame_skip_spin.setValue(advanced_cfg.get("frame_skip", 5))
+        self.obj_frame_skip_spin = QSpinBox(); self.obj_frame_skip_spin.setRange(1,60); self.obj_frame_skip_spin.setValue(advanced_cfg.get("object_frame_skip", 10))
+        self.yolo_pt_path = QLineEdit(advanced_cfg.get("yolo_pt_path", ""))
+        self.openvino_model_folder = QLineEdit(advanced_cfg.get("openvino_model_folder", ""))
         misc_layout.addRow("Frame skip (motion):", self.frame_skip_spin)
         misc_layout.addRow("Frame skip (objects):", self.obj_frame_skip_spin)
         misc_layout.addRow("YOLO .pt path (optional):", self.yolo_pt_path)
@@ -228,22 +247,23 @@ class VideoHighlighterGUI(QWidget):
 
         layout.addWidget(tabs)
 
-        # --- Run / Keep temp / Cancel Controls ---
+        # --- Run / Cancel Controls ---
         ctrl_layout = QHBoxLayout()
-        self.keep_temp_chk = QPushButton("Keep temp clips: OFF")
+        self.keep_temp_chk = QPushButton("Keep temp clips: ON" if highlights_cfg.get("keep_temp", False) else "Keep temp clips: OFF")
         self.keep_temp_chk.setCheckable(True)
+        self.keep_temp_chk.setChecked(highlights_cfg.get("keep_temp", False))
         self.keep_temp_chk.clicked.connect(lambda: self.keep_temp_chk.setText(
             "Keep temp clips: ON" if self.keep_temp_chk.isChecked() else "Keep temp clips: OFF"))
-        
+
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setStyleSheet("QPushButton:enabled { background-color: #ff4444; color: white; font-weight: bold; }")
         self.cancel_btn.clicked.connect(self.cancel_pipeline)
-        
+
         self.run_btn = QPushButton("Run Highlighter")
         self.run_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
         self.run_btn.clicked.connect(self.run_pipeline)
-        
+
         ctrl_layout.addWidget(self.cancel_btn)
         ctrl_layout.addWidget(self.keep_temp_chk)
         ctrl_layout.addStretch()
@@ -258,10 +278,76 @@ class VideoHighlighterGUI(QWidget):
         layout.addWidget(self.log_output)
 
         self.setLayout(layout)
-        
-        # Timer for checking worker status (helps with responsiveness)
+
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.check_worker_status)
+
+    # --- Config persistence ---
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        return {}
+
+    def save_config(self):
+        # Helper function to get non-empty text or empty list
+        def get_text_list(input_field):
+            text = input_field.text().strip()
+            if not text:
+                return []
+            return [s.strip() for s in text.split(",") if s.strip()]
+
+        data = {
+            "video": {"path": self.video_input.text().strip()},
+            "highlights": {
+                "clip_time": int(self.spin_clip_time.value()),
+                "output": self.output_input.text().strip(),
+                "max_duration": int(self.spin_max_duration.value()),
+                "exact_duration": int(self.spin_exact_duration.value()),
+                "keep_temp": self.keep_temp_chk.isChecked(),
+                "skip_highlights": self.skip_highlights_chk.isChecked(),
+            },
+            "scoring": {
+                "scene_points": int(self.spin_scene_points.value()),
+                "motion_event_points": int(self.spin_motion_event_points.value()),
+                "motion_peak_points": int(self.spin_motion_peak.value()),
+                "audio_peak_points": int(self.spin_audio_peak.value()),
+                "keyword_points": int(self.spin_keyword_points.value()),
+                "transcript_points": int(self.spin_transcript_points.value()),
+                "object_points": int(self.spin_object.value()),
+                "action_points": int(self.spin_action.value()),
+                "multi_signal_boost": 1.2,
+                "min_signals_for_boost": 2,
+            },
+            "actions": {"interesting": get_text_list(self.actions_input)},
+            "objects": {"interesting": get_text_list(self.objects_input)},
+            "keywords": {
+                "transcript_file": "transcript.txt",
+                "interesting": get_text_list(self.search_keywords_input),
+            },
+            "transcript": {
+                "enabled": self.transcript_checkbox.isChecked(),
+                "model": self.transcript_model_combo.currentText(),
+                "search_keywords": get_text_list(self.search_keywords_input),
+            },
+            "subtitles": {
+                "enabled": self.subtitles_checkbox.isChecked(),
+                "source_lang": self.source_lang_combo.currentText(),
+                "target_lang": self.target_lang_combo.currentText(),
+            },
+            "advanced": {
+                "frame_skip": int(self.frame_skip_spin.value()),
+                "object_frame_skip": int(self.obj_frame_skip_spin.value()),
+                "yolo_pt_path": self.yolo_pt_path.text().strip(),
+                "openvino_model_folder": self.openvino_model_folder.text().strip(),
+            },
+        }
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, sort_keys=False, allow_unicode=True)
+
+    def closeEvent(self, event):
+        self.save_config()
+        event.accept()
 
     def check_worker_status(self):
         """Periodic check of worker status for UI responsiveness"""
@@ -269,13 +355,24 @@ class VideoHighlighterGUI(QWidget):
             self.status_timer.stop()
 
     def on_transcript_toggle(self, checked):
+        """Handle transcript checkbox toggle"""
         self.transcript_model_combo.setEnabled(checked)
         self.search_keywords_input.setEnabled(checked)
         self.subtitles_checkbox.setEnabled(checked)
+        
+        # If transcript is disabled, also disable subtitles
+        if not checked:
+            self.subtitles_checkbox.setChecked(False)
+            self.on_subtitles_toggle(False)
 
     def on_subtitles_toggle(self, checked):
-        self.source_lang_combo.setEnabled(checked)
-        self.target_lang_combo.setEnabled(checked)
+        """Handle subtitles checkbox toggle"""
+        # Subtitles can only be enabled if transcript is enabled
+        transcript_enabled = self.transcript_checkbox.isChecked()
+        final_state = checked and transcript_enabled
+        
+        self.source_lang_combo.setEnabled(final_state)
+        self.target_lang_combo.setEnabled(final_state)
 
     def browse_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Videos (*.mp4 *.mov *.avi *.mkv)")
@@ -324,10 +421,19 @@ class VideoHighlighterGUI(QWidget):
 
         exact_duration_val = int(self.spin_exact_duration.value())
         exact_duration = exact_duration_val if exact_duration_val > 0 else None
-        highlight_objects = [s.strip() for s in self.objects_input.text().split(",") if s.strip()] or None
-        interesting_actions = [s.strip() for s in self.actions_input.text().split(",") if s.strip()] or None
+        
+        # Helper function to get non-empty lists
+        def get_list_from_input(input_field):
+            text = input_field.text().strip()
+            if not text:
+                return None
+            items = [s.strip() for s in text.split(",") if s.strip()]
+            return items if items else None
+        
+        highlight_objects = get_list_from_input(self.objects_input)
+        interesting_actions = get_list_from_input(self.actions_input)
         use_transcript = self.transcript_checkbox.isChecked()
-        search_keywords = [kw.strip() for kw in self.search_keywords_input.text().split(",") if kw.strip()] if use_transcript else []
+        search_keywords = get_list_from_input(self.search_keywords_input) if use_transcript else []
 
         config = {
             "scene_points": int(self.spin_scene_points.value()),
