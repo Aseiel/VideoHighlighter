@@ -444,11 +444,12 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
         # --- Action recognition with grouping ---
         action_detections = []
 
-        if gui_config.get("use_actions", True):
+        interesting_actions = gui_config.get("interesting_actions", [])
+        if interesting_actions:
             try:
                 all_action_detections = run_action_detection(
                     video_path,
-                    interesting_actions=gui_config.get("interesting_actions", []),
+                    interesting_actions=interesting_actions,
                     progress_callback=progress.update_progress,
                     cancel_flag=cancel_flag
                 )
@@ -472,7 +473,8 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
                         start_time, end_time, duration, confidence, action_name = group
                         start_mins, start_secs = divmod(int(start_time), 60)
                         end_mins, end_secs = divmod(int(end_time), 60)
-                        print(f"  {i+1}. {start_mins:02d}:{start_secs:02d}-{end_mins:02d}:{end_secs:02d} ({duration:.1f}s) -> {action_name} (confidence: {confidence:.3f})")
+                        print(f"  {i+1}. {start_mins:02d}:{start_secs:02d}-{end_mins:02d}:{end_secs:02d} "
+                            f"({duration:.1f}s) -> {action_name} (confidence: {confidence:.3f})")
 
                 # 2️⃣ Select sequences to fit within max_duration
                 max_duration = gui_config.get("max_duration", 800)  # seconds
@@ -486,7 +488,8 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
                     if total_duration + duration <= max_duration:
                         selected_sequences.append(sequence)
                         total_duration += duration
-                        print(f"DEBUG: Added sequence {action_name} ({duration:.1f}s, confidence: {confidence:.3f}) - Total: {total_duration:.1f}s")
+                        print(f"DEBUG: Added sequence {action_name} "
+                            f"({duration:.1f}s, confidence: {confidence:.3f}) - Total: {total_duration:.1f}s")
                     else:
                         remaining = max_duration - total_duration
                         print(
@@ -494,7 +497,6 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
                             f"({duration:.1f}s, confidence: {confidence:.3f}) "
                             f"- Would exceed budget (remaining: {remaining:.1f}s)"
                         )
-
 
                 print(f"\nDEBUG: Selected {len(selected_sequences)} sequences totaling {total_duration:.1f}s of {max_duration}s budget")
 
@@ -516,7 +518,10 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
 
             except Exception as e:
                 log(f"⚠ Action recognition failed: {e}")
-                
+
+        else:
+            log("ℹ Skipping action recognition (no interesting actions specified)")
+                        
         # 6 Compute scores per second
         progress.update_progress(80, 100, "Pipeline", "Computing scores...")
         check_cancellation(cancel_flag, log, "score computation")
