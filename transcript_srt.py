@@ -279,7 +279,19 @@ if Translator:
 
         print(f"\n✅ Translated {len(translated_segments)} segments")
         return translated_segments
+    
+def create_srt_file(segments, output_path, source_lang="en", target_lang=None):
+    """Create SRT subtitle file from transcript segments with optional translation"""
+    if target_lang and target_lang != source_lang:
+        print(f"Translating subtitles from {source_lang} to {target_lang}...")
+        segments = translate_segments(segments, source_lang, target_lang, log_fn=print)
 
+    srt_content = create_srt_content(segments)
+
+    with open(output_path, "w", encoding="utf-8-sig") as f:
+        f.write(srt_content)
+
+    print(f"SRT file saved: {output_path}")    
 
 def create_highlight_subtitles(original_segments: List[Dict], highlight_segments: List[tuple], 
                                output_path: str, source_lang="en", target_lang=None):
