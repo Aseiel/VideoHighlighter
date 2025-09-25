@@ -3,6 +3,7 @@ import whisper
 import torch
 from tqdm import tqdm
 import re
+import subprocess
 
 def is_repetitive_hallucination(text, threshold=0.7):
     """Detect repetitive segments like 'ha ha ha'"""
@@ -36,58 +37,91 @@ def is_valid_speech(text):
         return False
     return True
 
-def get_transcript_segments(video_file, model_name="small", progress_fn=None, log_fn=print):
-    """Transcribe video with Whisper, filter hallucinations, show progress"""
+def split_audio(video_file, chunk_length=600):
+    """
+    Split audio into chunks using ffmpeg (default: 600s = 10 min).
+    Returns list of chunk file paths.
+    """
+    base, _ = os.path.splitext(video_file)
+    out_pattern = f"{base}_chunk_%03d.wav"
+
+    # Remove old chunks if they exist (safety cleanup)
+    for f in os.listdir():
+        if f.startswith(os.path.basename(base) + "_chunk_"):
+            os.remove(f)
+
+    # Use ffmpeg to split into fixed-length WAV files
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", video_file,
+        "-f", "segment", "-segment_time", str(chunk_length),
+        "-c:a", "pcm_s16le", "-ar", "16000",
+        out_pattern
+    ])
+
+    return sorted([f for f in os.listdir() if f.startswith(os.path.basename(base) + "_chunk_")])
+
+def get_transcript_segments(video_file, model_name="small", progress_fn=None, log_fn=print, chunk_length=600):
+    """
+    Transcribe video safely by splitting into chunks.
+    - Uses Whisper for transcription
+    - Filters hallucinations
+    - Preserves timestamps with offsets
+    - Shows progress via progress_fn
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log_fn(f"Using device for Whisper: {device}")
-    
-    model = whisper.load_model(model_name, device=device)
-    log_fn("Transcribing video with Whisper (this may take a while)...")
-    
-    if progress_fn:
-        progress_fn(0, 100, "Transcription", "Starting Whisper...")
-    
-    result = model.transcribe(
-        video_file,
-        language="en",
-        task="transcribe",
-        temperature=0.0,  # No randomness
-        beam_size=1,  # Greedy decoding only
-        best_of=1,  # Single attempt
-        patience=1.0,
-        condition_on_previous_text=False,  # Don't use context
-        compression_ratio_threshold=2.4,  # Detect repetition
-        logprob_threshold=-1.0,  # Filter low confidence
-        no_speech_threshold=0.6,  # Better silence detection
-        verbose=False
-    )
-    
-    segments = result.get("segments", [])
-    valid_segments = []
 
-    log_fn("Filtering transcript segments for hallucinations...")
-    if progress_fn:
-        progress_fn(70, 100, "Transcription", "Filtering segments...")
-    
-    for i, seg in enumerate(segments):
+    model = whisper.load_model(model_name, device=device)
+    log_fn("Splitting video into chunks...")
+
+    chunks = split_audio(video_file, chunk_length=chunk_length)
+    log_fn(f"Created {len(chunks)} chunks")
+
+    all_segments = []
+    for idx, chunk in enumerate(chunks):
         # Progress indicator
-        if progress_fn and i % 5 == 0:
-            progress_fn(70 + (i / len(segments)) * 25, 100, "Transcription", f"Processing {i+1}/{len(segments)}")
-        
-        text = seg["text"].strip()
-        if len(text) < 3 or not is_valid_speech(text):
-            continue
-        valid_segments.append({
-            "start": float(seg["start"]),
-            "end": float(seg["end"]),
-            "text": text
-        })
+        if progress_fn:
+            progress_fn(
+                int((idx / len(chunks)) * 60),
+                100,
+                "Transcription",
+                f"Processing chunk {idx+1}/{len(chunks)}"
+            )
+
+        log_fn(f"➡️ Transcribing chunk {idx+1}/{len(chunks)}: {chunk}")
+
+        result = model.transcribe(
+            chunk,
+            language="en",
+            task="transcribe",
+            temperature=0.0,  # No randomness
+            beam_size=1,      # Greedy decoding
+            best_of=1,        # Single attempt
+            patience=1.0,
+            condition_on_previous_text=False,
+            compression_ratio_threshold=2.4,  # Detect repetition
+            logprob_threshold=-1.0,           # Filter low confidence
+            no_speech_threshold=0.6,          # Silence detection
+            verbose=False
+        )
+
+        # Offset for proper timestamps
+        offset = idx * chunk_length
+        for seg in result.get("segments", []):
+            text = seg["text"].strip()
+            if len(text) >= 3 and is_valid_speech(text):
+                all_segments.append({
+                    "start": float(seg["start"]) + offset,
+                    "end": float(seg["end"]) + offset,
+                    "text": text
+                })
 
     if progress_fn:
         progress_fn(95, 100, "Transcription", "Complete")
-    
-    log_fn(f"Transcript ready: {len(valid_segments)} segments (filtered from {len(segments)})")
-    return valid_segments
+
+    log_fn(f"✅ Transcript ready: {len(all_segments)} segments (from {len(chunks)} chunks)")
+    return all_segments
 
 def search_transcript_for_keywords(transcript_segments, keywords, context_seconds=5):
     """Search transcript for keywords and return matching segments with context"""
