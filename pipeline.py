@@ -204,7 +204,6 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
         TRANSCRIPT_MODEL = gui_config.get("transcript_model", "base")
         SEARCH_KEYWORDS = gui_config.get("search_keywords", [])
         CREATE_SUBTITLES = gui_config.get("create_subtitles", False)
-        FULL_SUBTITLES = gui_config.get("full_subtitles", False)
         TRANSCRIPT_ONLY = gui_config.get("transcript_only", False)
         TRANSCRIPT_POINTS = int(gui_config.get("transcript_points", 0))
         SOURCE_LANG = gui_config.get("source_lang", "en")
@@ -698,9 +697,14 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
             # Select top segments
             progress.update_progress(85, 100, "Pipeline", "Selecting highlight segments...")
 
-            # Only use seconds with positive score
-            positive_indices = np.where(score > 0)[0]
-            top_indices_all = positive_indices[np.argsort(score[positive_indices])[::-1]]
+            # Only use scored seconds depending on mode
+            if duration_mode == "EXACT":
+                candidate_indices = np.arange(len(score))  # allow seconds with 0 point score 
+            else:  # "MAX"
+                candidate_indices = np.where(score > 0)[0]
+
+            # Sort by score descending
+            top_indices_all = candidate_indices[np.argsort(score[candidate_indices])[::-1]]
 
             segments = []
             used_seconds = set()
