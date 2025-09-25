@@ -37,7 +37,7 @@ class ProgressTracker:
 # Transcript modules (optional)
 try:
     from transcript import get_transcript_segments, search_transcript_for_keywords
-    from transcript_srt import create_highlight_subtitles, create_enhanced_transcript
+    from transcript_srt import create_highlight_subtitles, create_enhanced_transcript, create_srt_file
     TRANSCRIPT_AVAILABLE = True
 except ImportError:
     TRANSCRIPT_AVAILABLE = False
@@ -198,6 +198,17 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
         EXACT_DURATION = gui_config.get("exact_duration") or config.get("highlights", {}).get("exact_duration", None)
         CLIP_TIME = gui_config.get("clip_time") or config.get("highlights", {}).get("clip_time", 10)
         KEEP_TEMP = gui_config.get("keep_temp", config.get("highlights", {}).get("keep_temp", False))
+
+        # Transcript settings
+        USE_TRANSCRIPT = gui_config.get("use_transcript", False) and TRANSCRIPT_AVAILABLE
+        TRANSCRIPT_MODEL = gui_config.get("transcript_model", "base")
+        SEARCH_KEYWORDS = gui_config.get("search_keywords", [])
+        CREATE_SUBTITLES = gui_config.get("create_subtitles", False)
+        FULL_SUBTITLES = gui_config.get("full_subtitles", False)
+        TRANSCRIPT_ONLY = gui_config.get("transcript_only", False)
+        TRANSCRIPT_POINTS = int(gui_config.get("transcript_points", 0))
+        SOURCE_LANG = gui_config.get("source_lang", "en")
+        TARGET_LANG = gui_config.get("target_lang", None)
 
         target_duration = EXACT_DURATION if EXACT_DURATION else MAX_DURATION
         duration_mode = "EXACT" if EXACT_DURATION else "MAX"
@@ -780,6 +791,50 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
         except Exception as e:
             log(f"⚠️ Error during cutting/concatenation: {e}")
             raise
+
+        # Create matching subtitles for highlight video OR full video
+        if CREATE_SUBTITLES and USE_TRANSCRIPT and transcript_segments:
+            try:
+                base_name = os.path.splitext(OUTPUT_FILE)[0]
+
+                # Always create full subtitles
+                progress.update_progress(95, 100, "Pipeline", "Creating full-video subtitles...")
+                log("Creating subtitles for the full video...")
+                full_srt = f"{os.path.splitext(video_path)[0]}_{SOURCE_LANG}.srt"
+                if TARGET_LANG and TARGET_LANG != SOURCE_LANG:
+                    translated = translate_segments(transcript_segments, target_lang=TARGET_LANG)
+                    create_srt_file(translated, full_srt)
+                else:
+                    create_srt_file(transcript_segments, full_srt)
+                log(f"Full-video subtitles created: {full_srt}")
+
+                # Create highlight subtitles if we have segments
+                if segments:
+                    progress.update_progress(95, 100, "Pipeline", "Creating highlight subtitles...")
+                    log("Creating subtitles that match highlight timing...")
+                    if TARGET_LANG and TARGET_LANG != SOURCE_LANG:
+                        highlight_srt_file = f"{base_name}_{TARGET_LANG}.srt"
+                        create_highlight_subtitles(
+                            original_segments=transcript_segments,
+                            highlight_segments=segments,
+                            output_path=highlight_srt_file,
+                            source_lang=SOURCE_LANG,
+                            target_lang=TARGET_LANG
+                        )
+                    else:
+                        highlight_srt_file = f"{base_name}_{SOURCE_LANG}.srt"
+                        create_highlight_subtitles(
+                            original_segments=transcript_segments,
+                            highlight_segments=segments,
+                            output_path=highlight_srt_file,
+                            source_lang=SOURCE_LANG,
+                            target_lang=None
+                        )
+                    log(f"Highlight subtitles created: {highlight_srt_file}")
+
+            except Exception as e:
+                log(f"Error creating subtitles: {e}")
+
 
         # Final progress
         progress.update_progress(100, 100, "Pipeline", "Complete!")
