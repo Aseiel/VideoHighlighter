@@ -50,6 +50,7 @@ Download manually and place in models/intel_action/:
 Encoder:
 https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/action-recognition-0001/action-recognition-0001-encoder/FP32/
 move to VideoHighlighter/models/intel_action/encoder/FP32/
+
 Decoder:
 https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/action-recognition-0001/action-recognition-0001-decoder/FP32
 move to VideoHighlighter/models/intel_action/decoder/FP32/
