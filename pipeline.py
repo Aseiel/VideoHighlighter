@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import warnings
 import yaml
+import csv
+import cv2
 from tqdm import tqdm
 
 # modules
@@ -32,7 +34,6 @@ class ProgressTracker:
                 self.progress_fn(current, total, task_name, details)
             except:
                 pass  # Ignore callback errors
-
 
 # Transcript modules (optional)
 try:
@@ -76,60 +77,59 @@ def check_xpu_availability(log_fn=print):
         log_fn(f"❌ XPU initialization error: {e}")
         return False, "cpu"
 
-
-def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=print, progress_fn=None, frame_skip=5, cancel_flag=None):
-    """Object detection with proper progress tracking and cancellation support"""
+def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=print,
+                                 progress_fn=None, frame_skip=5, cancel_flag=None,
+                                 csv_output="object_log.csv"):
+    """Object detection with progress tracking, cancellation support, and optional CSV export in mm:ss format"""
     if model is None:
         log_fn("⚠️ No YOLO model available, skipping object detection")
         return {}
 
-    import cv2
-    
+    def seconds_to_mmss(sec):
+        minutes, seconds = divmod(int(sec), 60)
+        return f"{minutes:02d}:{seconds:02d}"
+
     cap = cv2.VideoCapture(video_path)
     fps_local = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total_frames_local = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     total_seconds = int(total_frames_local / fps_local) if fps_local else 0
-    
+
     if total_seconds <= 0:
         log_fn("⚠️ Could not determine video duration")
         cap.release()
         return {}
-    
+
     # Create progress tracker
     progress = ProgressTracker(progress_fn, log_fn)
-    
-    # Start progress
-    progress.update_progress(0, total_seconds, "Object Detection", f"Analyzing {total_seconds}s of video")
-    
+    progress.update_progress(0, total_seconds, "Object Detection",
+                             f"Analyzing {seconds_to_mmss(total_seconds)} of video")
+
     sec_objects = {}
     frame_idx = 0
     current_second = -1
     objects_found = 0
-    
+
     try:
         while True:
-            # Check for cancellation frequently
             if cancel_flag and cancel_flag.is_set():
                 log_fn("⏹️ Object detection cancelled")
                 break
-                
+
             ret, frame = cap.read()
             if not ret:
                 break
-                
+
             if frame_idx % frame_skip == 0:
-                sec = int(frame_idx / fps_local)
+                sec = int(frame_idx / fps_local)  # keep as integer for calculations
                 if sec > current_second:
-                    # Check cancellation at each second boundary
                     if cancel_flag and cancel_flag.is_set():
                         log_fn("⏹️ Object detection cancelled")
                         break
-                        
-                    # Update progress
-                    progress.update_progress(sec, total_seconds, "Object Detection", f"Found {objects_found} objects so far")
+
+                    progress.update_progress(sec, total_seconds, "Object Detection",
+                                             f"Found {objects_found} objects so far ({seconds_to_mmss(sec)})")
                     current_second = sec
-                    
-                    # Detect objects in frame
+
                     try:
                         results = model(frame, verbose=False, imgsz=640)
                         objs = []
@@ -139,32 +139,44 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
                                     cls_id = int(box.cls[0])
                                     cls_name = model.names[cls_id]
                                     conf = float(box.conf[0])
-                                    if conf > 0.5 and cls_name in highlight_objects:
+                                    if conf > 0.3 and cls_name in highlight_objects:
                                         objs.append(cls_name)
-                        
+
                         if objs:
-                            sec_objects.setdefault(sec, []).extend(objs)
+                            sec_objects.setdefault(sec, []).extend(objs)  # keep key as int
                             objects_found += len(objs)
-                            
+
                     except Exception as e:
                         log_fn(f"⚠️ Error in object detection at frame: {e}")
-                        
+
             frame_idx += 1
-            
+
     except Exception as e:
         log_fn(f"❌ Object detection error: {e}")
     finally:
         cap.release()
-        
-        # Final progress update only if not cancelled
+
         if not (cancel_flag and cancel_flag.is_set()):
-            progress.update_progress(total_seconds, total_seconds, "Object Detection", f"Complete - {objects_found} objects found")
+            progress.update_progress(total_seconds, total_seconds, "Object Detection",
+                                     f"Complete - {objects_found} objects found")
             log_fn(f"✅ Object detection complete: {objects_found} total objects detected")
-        
+
+        # Optional CSV output
+        if csv_output:
+            try:
+                with open(csv_output, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["timestamp_mmss", "timestamp_seconds", "Objects"])
+                    for sec, objs in sorted(sec_objects.items()):
+                        writer.writerow([seconds_to_mmss(sec), sec, ";".join(objs)])
+                log_fn(f"✅ CSV saved to {csv_output}")
+            except Exception as e:
+                log_fn(f"⚠️ Failed to save CSV: {e}")
+
     return sec_objects
 
 
-def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, progress_fn=None, cancel_flag=None):
+def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log_fn=print, progress_fn=None, cancel_flag=None):
     gui_config = gui_config or {}
     start_time = time.time()
     log = log_fn
@@ -229,7 +241,6 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
         log(f"🎯 YOLO device: {yolo_device}")
 
         # Get video info
-        import cv2
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -385,16 +396,16 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
             log(f"❌ Failed to load YOLO model: {e}")
             yolo_model = None
 
+        # --- Object detection ---
         # Get list of objects to highlight from GUI or config
         highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", []))
 
-        # If highlight_objects is empty or 0, skip detection
-        if not highlight_objects or highlight_objects == [0]:
+        if not highlight_objects:
             log("ℹ Skipping object detection (no objects to highlight)")
             object_detections = {}
         else:
             frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME if CLIP_TIME > 0 else 5)
-            
+
             # Run detection with cancellation support
             object_detections = detect_objects_with_progress(
                 video_path,
@@ -406,7 +417,7 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
                 cancel_flag=cancel_flag
             )
 
-        check_cancellation(cancel_flag, log, "object detection")
+        print("Detections per second:", len(object_detections))
 
         def group_consecutive_adaptive(actions, max_gap=1, jump_threshold=0.45):
             """
@@ -453,6 +464,7 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
 
         # --- Action recognition with grouping ---
         action_detections = []
+        sample_rate = gui_config.get("sample_rate", 5)
 
         interesting_actions = gui_config.get("interesting_actions", [])
         if interesting_actions:
@@ -461,7 +473,8 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
                     video_path,
                     interesting_actions=interesting_actions,
                     progress_callback=progress.update_progress,
-                    cancel_flag=cancel_flag
+                    cancel_flag=cancel_flag,
+                    sample_rate=sample_rate
                 )
 
                 check_cancellation(cancel_flag, log, "action recognition processing")
@@ -592,13 +605,43 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
         for (timestamp_secs, frame_id, action_id, sc, action_name) in action_detections:
             sec = int(timestamp_secs)
             detections_by_sec[sec].append((action_name, sc))
+
+        # Get the require_objects flag
+        actions_require_objects = gui_config.get("actions_require_objects", False)
+        OBJECT_TOLERANCE = 10
+        BASE_ACTION_POINTS = ACTION_POINTS
+
+        # action scoring (group by seconds)
+        detections_by_sec = defaultdict(list)
+        for (timestamp_secs, frame_id, action_id, sc, action_name) in action_detections:
+            sec = int(timestamp_secs)
+            detections_by_sec[sec].append((action_name, sc))
+
+        # Calculate confidence percentiles to scale relative to video
+        if detections_by_sec:
+            all_confidences = [max(conf for _, conf in actions) for actions in detections_by_sec.values()]
+            confidence_90th = np.percentile(all_confidences, 90)  # 90th percentile as "high confidence"
+            confidence_50th = np.percentile(all_confidences, 50)  # 50th percentile as "average"
+            
+            log(f"📊 Action confidence stats: 50th={confidence_50th:.2f}, 90th={confidence_90th:.2f}")
+
         for sec, actions in detections_by_sec.items():
             if sec < len(action_score):
-                action_score[sec] += ACTION_POINTS
+                if not actions_require_objects or any(abs(obj_sec - sec) <= OBJECT_TOLERANCE for obj_sec in object_detections):
+                    max_confidence = max(conf for _, conf in actions)
+                    
+                    # Scale points relative to this video's confidence distribution
+                    if max_confidence >= confidence_90th:
+                        # Top 10% confidence: bonus points
+                        action_score[sec] += ACTION_POINTS * 1.5
+                    elif max_confidence >= confidence_50th:
+                        # Above average: normal points
+                        action_score[sec] += ACTION_POINTS
+                    else:
+                        # Below average: reduced points
+                        action_score[sec] += ACTION_POINTS * 0.5
 
         log(f"✅ Object detection summary: {total_detections} detections")
-        for obj, cnt in detection_summary.items():
-            log(f"   {obj}: {cnt}")
 
         # Beginning & ending boost
         for i in range(min(int(video_duration), 60)):
@@ -666,7 +709,7 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
             print(f"  Audio: {audio_score[idx]:.1f}")
             print(f"  Keywords: {keyword_score[idx]:.1f}")
             print(f"  Objects: {object_score[idx]:.1f}")
-
+            
             # 🔍 Show which objects were detected at this second
             if idx in object_detections:
                 print(f"    Objects detected: {object_detections[idx]}")
@@ -675,9 +718,16 @@ def run_highlighter(video_path: str, gui_config: dict = None, log_fn=print, prog
             if idx in detections_by_sec:
                 detected_actions = [f"{name} ({score:.2f})" for name, score in detections_by_sec[idx]]
                 print(f"    Actions detected: {', '.join(detected_actions)}")
+                
+                actions_require_objects = gui_config.get("actions_require_objects", False)
+                if actions_require_objects:
+                    if idx in object_detections:
+                        print(f"    ✓ Action scored (objects present): +{ACTION_POINTS} points")
+                    else:
+                        print(f"    ✗ Action NOT scored (no objects detected)")
+                else:
+                    print(f"    ➕ Added {ACTION_POINTS} action points")
 
-                points_added = ACTION_POINTS * len(detections_by_sec[idx])
-                print(f"    ➕ Added {points_added} action points")
 
             signals = sum([
                 motion_event_score[idx] > 0,

@@ -165,6 +165,12 @@ class VideoHighlighterGUI(QWidget):
         action_kw_layout.addWidget(self.actions_input)
         basic_layout.addLayout(action_kw_layout)
 
+        # Conditional action scoring checkbox
+        self.actions_require_objects_chk = QCheckBox("Only score actions when objects detected")
+        self.actions_require_objects_chk.setChecked(self.config_data.get("actions", {}).get("require_objects", False))
+        self.actions_require_objects_chk.setToolTip("Actions will only add points if objects are also detected in that timeframe")
+        basic_layout.addWidget(self.actions_require_objects_chk)
+
         self.skip_highlights_chk = QCheckBox("Skip highlights")
         self.skip_highlights_chk.setChecked(highlights_cfg.get("skip_highlights", False))
         basic_layout.addWidget(self.skip_highlights_chk)
@@ -236,8 +242,12 @@ class VideoHighlighterGUI(QWidget):
         self.obj_frame_skip_spin = QSpinBox(); self.obj_frame_skip_spin.setRange(1,60); self.obj_frame_skip_spin.setValue(advanced_cfg.get("object_frame_skip", 10))
         self.yolo_pt_path = QLineEdit(advanced_cfg.get("yolo_pt_path", ""))
         self.openvino_model_folder = QLineEdit(advanced_cfg.get("openvino_model_folder", ""))
+        self.sample_rate_spin = QSpinBox()
+        self.sample_rate_spin.setRange(1,30)  # 1 = process every frame, 30 = every 30th frame
+        self.sample_rate_spin.setValue(advanced_cfg.get("action_sample_rate", 5))  # default 5
         misc_layout.addRow("Frame skip (motion):", self.frame_skip_spin)
         misc_layout.addRow("Frame skip (objects):", self.obj_frame_skip_spin)
+        misc_layout.addRow("Sample rate (actions):", self.sample_rate_spin)
         misc_layout.addRow("YOLO .pt path (optional):", self.yolo_pt_path)
         misc_layout.addRow("OpenVINO model folder (optional):", self.openvino_model_folder)
         misc_box.setLayout(misc_layout)
@@ -319,7 +329,10 @@ class VideoHighlighterGUI(QWidget):
                 "multi_signal_boost": 1.2,
                 "min_signals_for_boost": 2,
             },
-            "actions": {"interesting": get_text_list(self.actions_input)},
+            "actions": {
+                "interesting": get_text_list(self.actions_input),
+                "require_objects": self.actions_require_objects_chk.isChecked()  # NEW
+            },
             "objects": {"interesting": get_text_list(self.objects_input)},
             "keywords": {
                 "transcript_file": "transcript.txt",
@@ -455,6 +468,7 @@ class VideoHighlighterGUI(QWidget):
             "output_file": self.output_input.text().strip() or None,
             "highlight_objects": highlight_objects,
             "interesting_actions": interesting_actions,
+            "actions_require_objects": self.actions_require_objects_chk.isChecked(),
             "use_transcript": use_transcript,
             "transcript_model": self.transcript_model_combo.currentText(),
             "search_keywords": search_keywords,
@@ -466,6 +480,7 @@ class VideoHighlighterGUI(QWidget):
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_pt_path": self.yolo_pt_path.text().strip() or None,
             "openvino_model_folder": self.openvino_model_folder.text().strip() or None,
+            "sample_rate": int(self.sample_rate_spin.value()),
         }
 
         # --- Skip highlights logic ---

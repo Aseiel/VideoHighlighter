@@ -111,7 +111,7 @@ def preprocess_frame(frame, input_shape):
 # =============================
 # Run action detection
 # =============================
-def run_action_detection(video_path, device="AUTO", sample_rate=30, log_file="action_log.csv",
+def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="action_log.csv",
                          debug=False, top_k=8, confidence_threshold=0.01, show_video=False,
                          num_requests=2, interesting_actions=None,
                          progress_callback=None, cancel_flag=None):
