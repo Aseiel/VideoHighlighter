@@ -44,6 +44,10 @@ except ImportError:
     TRANSCRIPT_AVAILABLE = False
     print("⚠ Warning: Transcript modules not available. Transcript features disabled.")
 
+def seconds_to_mmss(sec):
+    """Convert seconds to mm:ss format"""
+    minutes, seconds = divmod(int(sec), 60)
+    return f"{minutes:02d}:{seconds:02d}"
 
 def check_cancellation(cancel_flag, log_fn, step_name="operation"):
     """Check if cancellation was requested and raise exception if so"""
@@ -499,29 +503,18 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                         print(f"  {i+1}. {start_mins:02d}:{start_secs:02d}-{end_mins:02d}:{end_secs:02d} "
                             f"({duration:.1f}s) -> {action_name} (confidence: {confidence:.3f})")
 
-                # 2️⃣ Select sequences to fit within max_duration
-                max_duration = gui_config.get("max_duration", 800)  # seconds
-                grouped_by_confidence = sorted(grouped_actions, key=lambda x: x[3], reverse=True)
+                # 2️⃣ Use all grouped sequences sorted by confidence
+                selected_sequences = sorted(grouped_actions, key=lambda x: x[3], reverse=True)
 
-                selected_sequences = []
+                # Log all selected sequences
                 total_duration = 0
-
-                for sequence in grouped_by_confidence:
+                for sequence in selected_sequences:
                     start_time, end_time, duration, confidence, action_name = sequence
-                    if total_duration + duration <= max_duration:
-                        selected_sequences.append(sequence)
-                        total_duration += duration
-                        print(f"DEBUG: Added sequence {action_name} "
-                            f"({duration:.1f}s, confidence: {confidence:.3f}) - Total: {total_duration:.1f}s")
-                    else:
-                        remaining = max_duration - total_duration
-                        print(
-                            f"DEBUG: Skipped sequence {action_name} "
-                            f"({duration:.1f}s, confidence: {confidence:.3f}) "
-                            f"- Would exceed budget (remaining: {remaining:.1f}s)"
-                        )
+                    total_duration += duration
+                    print(f"DEBUG: Added sequence {action_name} at {seconds_to_mmss(start_time)}-{seconds_to_mmss(end_time)} "
+                        f"({seconds_to_mmss(duration)} duration, confidence: {confidence:.3f}) - Total: {seconds_to_mmss(total_duration)})")
 
-                print(f"\nDEBUG: Selected {len(selected_sequences)} sequences totaling {total_duration:.1f}s of {max_duration}s budget")
+                print(f"\nDEBUG: Selected {len(selected_sequences)} sequences totaling {seconds_to_mmss(total_duration)}")
 
                 # 3️⃣ Convert back to individual action format for pipeline compatibility
                 action_detections = []
@@ -538,6 +531,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 # Sort chronologically for pipeline
                 action_detections = sorted(action_detections, key=lambda x: x[0])
                 log(f"✅ Action recognition: {len(action_detections)} action sequences selected (total duration: {total_duration:.1f}s)")
+
 
             except Exception as e:
                 log(f"⚠ Action recognition failed: {e}")
@@ -659,6 +653,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
         audio_set = set(int(t) for t in audio_peaks)
         keyword_set = set()
         object_set = set(object_detections.keys())
+        action_set = set(detections_by_sec.keys())
 
         for i in range(len(score)):
             signals = sum([
@@ -666,7 +661,8 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 i in motion_peaks_set,
                 i in audio_set,
                 i in keyword_set,
-                i in object_set
+                i in object_set,
+                i in action_set
             ])
             if signals >= MIN_SIGNALS_FOR_BOOST:
                 score[i] *= MULTI_SIGNAL_BOOST
@@ -702,6 +698,12 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
             minutes = idx // 60
             seconds = idx % 60
             timestamp = f"{minutes:02d}:{seconds:02d}"
+            
+            # Calculate pre-boost total
+            pre_boost_total = (scene_score[idx] + motion_event_score[idx] + 
+                            motion_peak_score[idx] + audio_score[idx] + 
+                            keyword_score[idx] + object_score[idx] + action_score[idx])
+            
             print(f"\nTime {timestamp} ({idx} sec): {score[idx]:.1f} total points")
             print(f"  Scene: {scene_score[idx]:.1f}")
             print(f"  Motion events: {motion_event_score[idx]:.1f}")
@@ -709,7 +711,9 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
             print(f"  Audio: {audio_score[idx]:.1f}")
             print(f"  Keywords: {keyword_score[idx]:.1f}")
             print(f"  Objects: {object_score[idx]:.1f}")
-            
+            print(f"  Actions: {action_score[idx]:.1f}")
+            print(f"  Subtotal (before boost): {pre_boost_total:.1f}")
+
             # 🔍 Show which objects were detected at this second
             if idx in object_detections:
                 print(f"    Objects detected: {object_detections[idx]}")
@@ -722,23 +726,50 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 actions_require_objects = gui_config.get("actions_require_objects", False)
                 if actions_require_objects:
                     if idx in object_detections:
-                        print(f"    ✓ Action scored (objects present): +{ACTION_POINTS} points")
+                        # Show actual points added (includes confidence multiplier)
+                        actual_points = action_score[idx]
+                        max_confidence = max(conf for _, conf in detections_by_sec[idx])
+                        
+                        if max_confidence >= confidence_90th:
+                            tier = "BONUS (≥90th percentile)"
+                        elif max_confidence >= confidence_50th:
+                            tier = "NORMAL (≥50th percentile)"
+                        else:
+                            tier = "REDUCED (<50th percentile)"
+                        
+                        print(f"    ✓ Action scored (objects present): +{actual_points:.1f} points [{tier}, conf={max_confidence:.2f}]")
                     else:
                         print(f"    ✗ Action NOT scored (no objects detected)")
                 else:
-                    print(f"    ➕ Added {ACTION_POINTS} action points")
-
-
+                    # Show actual points added (includes confidence multiplier)
+                    actual_points = action_score[idx]
+                    max_confidence = max(conf for _, conf in detections_by_sec[idx])
+                    
+                    if max_confidence >= confidence_90th:
+                        tier = "BONUS (≥90th percentile)"
+                    elif max_confidence >= confidence_50th:
+                        tier = "NORMAL (≥50th percentile)"
+                    else:
+                        tier = "REDUCED (<50th percentile)"
+                    
+                    print(f"    ➕ Added {actual_points:.1f} action points [{tier}, conf={max_confidence:.2f}]")
+                        
+            # Count signals
             signals = sum([
                 motion_event_score[idx] > 0,
                 motion_peak_score[idx] > 0,
                 audio_score[idx] > 0,
                 keyword_score[idx] > 0,
                 object_score[idx] > 0,
-                idx in detections_by_sec   # 👈 count action as a signal
+                idx in detections_by_sec
             ])
+            
             if signals >= MIN_SIGNALS_FOR_BOOST:
-                print(f"  ⚡ Multi-signal boost applied (x{MULTI_SIGNAL_BOOST})")
+                boost_amount = score[idx] - pre_boost_total
+                print(f"  ⚡ Multi-signal boost: {signals} signals detected")
+                print(f"     Multiplier: x{MULTI_SIGNAL_BOOST}")
+                print(f"     Boost added: +{boost_amount:.1f} points")
+                print(f"     Final score: {score[idx]:.1f}")
 
             # Module-level flag to ensure logging happens only once per video
             if 'segments_logged' not in globals():
@@ -775,6 +806,14 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 # Skip if any second is already used
                 if any(s in used_seconds for s in range(int(start), int(end))):
                     continue
+
+                # Adjust segment to not exceed target duration ---
+                current_duration = sum(e - s for s, e in segments)
+                remaining = target_duration - current_duration
+                if remaining <= 0:
+                    break
+                if end - start > remaining:
+                    end = start + remaining
 
                 segments.append((start, end))
                 for s in range(int(start), int(end)):

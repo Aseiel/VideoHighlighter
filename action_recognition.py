@@ -10,14 +10,14 @@ import argparse
 from collections import Counter
 
 # =============================
-# Load Kinetics-600 labels
+# Load Kinetics-400 labels
 # =============================
 BASE_DIR = Path(__file__).parent.resolve()
-with open(BASE_DIR / "kinetics_600_labels.json", "r") as f:
-    KINETICS_600_LABELS = json.load(f)
+with open(BASE_DIR / "kinetics_400_labels.json", "r") as f:
+    KINETICS_400_LABELS = json.load(f)
 
 def get_action_name(action_id):
-    return KINETICS_600_LABELS.get(str(action_id), f"action_{action_id}")
+    return KINETICS_400_LABELS.get(str(action_id), f"action_{action_id}")
 
 # =============================
 # Model paths
@@ -27,6 +27,13 @@ ENCODER_BIN = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-00
 DECODER_XML = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
 DECODER_BIN = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 SEQUENCE_LENGTH = 16
+
+
+def get_id_from_name(name):
+    for k, v in KINETICS_400_LABELS.items():
+        if v.lower() == name.lower():
+            return int(k)
+    raise ValueError(f"Action '{name}' not found in labels")
 
 # =============================
 # Async Inference Engine with GUI Stats
@@ -112,7 +119,7 @@ def preprocess_frame(frame, input_shape):
 # Run action detection
 # =============================
 def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="action_log.csv",
-                         debug=False, top_k=8, confidence_threshold=0.01, show_video=False,
+                         debug=False, top_k=50, confidence_threshold=0.01, show_video=False,
                          num_requests=2, interesting_actions=None,
                          progress_callback=None, cancel_flag=None):
 
@@ -172,13 +179,25 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 if len(sequence_buffer) == SEQUENCE_LENGTH:
                     sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
                     predictions = compiled_decoder([sequence_array])[decoder_output].flatten()
-                    top_indices = np.argsort(predictions)[-top_k:][::-1]
 
-                    for idx in top_indices:
-                        score = float(predictions[idx])
-                        action_name = get_action_name(idx)
-                        if score >= confidence_threshold:
-                            if interesting_actions_set is None or action_name.lower() in interesting_actions_set:
+                    if interesting_actions_set:
+                        # Check only the requested actions
+                        for action_name in interesting_actions_set:
+                            action_id = get_id_from_name(action_name)
+                            score = float(predictions[action_id])
+                            if score >= confidence_threshold:
+                                writer.writerow([timestamp_str, frame_id, action_id, action_name, score, timestamp_secs])
+                                all_actions.append((timestamp_secs, frame_id, action_id, score, action_name))
+                                detection_count += 1
+                                if debug:
+                                    print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
+                    else:
+                        # fallback: top-k as before
+                        top_indices = np.argsort(predictions)[-top_k:][::-1]
+                        for idx in top_indices:
+                            score = float(predictions[idx])
+                            action_name = get_action_name(idx)
+                            if score >= confidence_threshold:
                                 writer.writerow([timestamp_str, frame_id, idx, action_name, score, timestamp_secs])
                                 all_actions.append((timestamp_secs, frame_id, idx, score, action_name))
                                 detection_count += 1
