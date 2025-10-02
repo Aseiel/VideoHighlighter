@@ -244,7 +244,7 @@ class VideoHighlighterGUI(QWidget):
         self.openvino_model_folder = QLineEdit(advanced_cfg.get("openvino_model_folder", ""))
         self.sample_rate_spin = QSpinBox()
         self.sample_rate_spin.setRange(1,30)  # 1 = process every frame, 30 = every 30th frame
-        self.sample_rate_spin.setValue(advanced_cfg.get("action_sample_rate", 5))  # default 5
+        self.sample_rate_spin.setValue(advanced_cfg.get("sample_rate", 5))  # default 5
         misc_layout.addRow("Frame skip (motion):", self.frame_skip_spin)
         misc_layout.addRow("Frame skip (objects):", self.obj_frame_skip_spin)
         misc_layout.addRow("Sample rate (actions):", self.sample_rate_spin)
@@ -351,6 +351,7 @@ class VideoHighlighterGUI(QWidget):
             "advanced": {
                 "frame_skip": int(self.frame_skip_spin.value()),
                 "object_frame_skip": int(self.obj_frame_skip_spin.value()),
+                "sample_rate": int(self.sample_rate_spin.value()),
                 "yolo_pt_path": self.yolo_pt_path.text().strip(),
                 "openvino_model_folder": self.openvino_model_folder.text().strip(),
             },
