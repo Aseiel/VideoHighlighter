@@ -1,20 +1,11 @@
 import os
 import re
 import time
-from typing import List, Dict, Optional
-
-# Optional imports
-try:
-    import whisper
-except ImportError:
-    whisper = None
-
-try:
-    from googletrans import Translator
-except ImportError:
-    Translator = None
-
+import random
+import whisper
 import cv2
+from typing import List, Dict, Optional
+from googletrans import Translator
 
 # --------------------------
 # VIDEO & TIMESTAMP UTILITIES
@@ -138,78 +129,136 @@ def smart_merge_segments(segments: List[Dict], gap_threshold=0.5, max_merge_dura
 # --------------------------
 
 def split_long_subtitle(text: str, max_chars=80) -> List[str]:
+    """
+    Split subtitle text into balanced chunks.
+    Avoids leaving 1-word segments.
+    """
     if len(text) <= max_chars:
         return [text]
+
+    # First pass: try punctuation-based splitting
     sentences = re.split(r'([.!?]+)', text)
-    lines, current_line = [], ""
+    chunks, current = [], ""
     for i in range(0, len(sentences), 2):
-        sentence = sentences[i]
+        sentence = sentences[i].strip()
         punctuation = sentences[i + 1] if i + 1 < len(sentences) else ""
-        full_sentence = sentence + punctuation
-        if len(current_line + full_sentence) <= max_chars:
-            current_line += full_sentence
+        full_sentence = (sentence + punctuation).strip()
+        if not full_sentence:
+            continue
+        if len((current + " " + full_sentence).strip()) <= max_chars:
+            current = (current + " " + full_sentence).strip()
         else:
-            if current_line:
-                lines.append(current_line.strip())
-            current_line = full_sentence
-    if current_line:
-        lines.append(current_line.strip())
-    final_lines = []
-    for line in lines:
-        if len(line) <= max_chars:
-            final_lines.append(line)
-        else:
-            words, current = line.split(), ""
-            for word in words:
-                if len(current + " " + word) <= max_chars:
-                    current += (" " + word) if current else word
-                else:
-                    if current:
-                        final_lines.append(current)
-                    current = word
             if current:
-                final_lines.append(current)
+                chunks.append(current)
+            current = full_sentence
+    if current:
+        chunks.append(current)
+
+    # Second pass: rebalance overly long or unbalanced chunks
+    final_lines = []
+    for chunk in chunks:
+        if len(chunk) > max_chars:
+            words = chunk.split()
+            mid = len(words) // 2
+            left, right = " ".join(words[:mid]), " ".join(words[mid:])
+
+            # If badly unbalanced, fall back to greedy slicing
+            if len(right) < len(left) * 0.3 or len(left) > max_chars:
+                current, parts = "", []
+                for w in words:
+                    if len(current + " " + w) <= max_chars:
+                        current = (current + " " + w).strip()
+                    else:
+                        parts.append(current)
+                        current = w
+                if current:
+                    parts.append(current)
+                final_lines.extend(parts)
+            else:
+                final_lines.extend([left.strip(), right.strip()])
+        else:
+            final_lines.append(chunk.strip())
+
     return final_lines
 
-def create_srt_content(segments, max_chars=80, min_duration=0.8):
+def calculate_reading_time(text: str, chars_per_second=20) -> float:
+    """
+    Calculate minimum reading time based on character count.
+    Standard: 15-20 characters per second for comfortable reading.
+    """
+    char_count = len(text)
+    return char_count / chars_per_second
+
+def adjust_subtitle_duration(start: float, end: float, text: str, 
+                             min_duration=0.8, chars_per_second=20) -> tuple:
+    """
+    Adjust subtitle duration to meet reading time standards.
+    Returns (adjusted_start, adjusted_end)
+    """
+    duration = end - start
+    required_duration = max(min_duration, calculate_reading_time(text, chars_per_second))
+    
+    if duration < required_duration:
+        # Extend duration to meet reading time
+        end = start + required_duration
+    
+    return start, end
+
+def create_srt_content(segments, max_chars=80, min_duration=0.8, chars_per_second=15):
     """
     Create SRT content with precise timestamps from original segments.
     Translation text is used, but timing is preserved.
+    Each chunk gets proper duration based on reading speed.
     """
     srt_lines = []
     subtitle_number = 1
 
-    for seg in segments:
+    for idx, seg in enumerate(segments):
         text = clean_subtitle_text(seg['text'])
         if not text or len(text) < 2 or not is_valid_speech(text):
             continue
 
         start_seconds = float(seg.get('start', 0))
         end_seconds = float(seg.get('end', start_seconds + 2))
+        
+        # Check when the next segment starts to avoid overlap
+        next_segment_start = segments[idx + 1]['start'] if idx + 1 < len(segments) else None
 
-        # Ensure minimum duration
-        duration = end_seconds - start_seconds
-        if duration < min_duration:
-            end_seconds = start_seconds + min_duration
-
-        # Split long lines into chunks without changing timing
+        # Split long lines into chunks first
         chunks = split_long_subtitle(text, max_chars=max_chars)
-        if len(chunks) > 1:
-            # Split duration evenly for chunks
-            chunk_duration = (end_seconds - start_seconds) / len(chunks)
+        
+        # Calculate total required duration for all chunks
+        total_required_duration = sum(max(min_duration, len(chunk) / chars_per_second) for chunk in chunks)
+        original_duration = end_seconds - start_seconds
+        
+        # Calculate available duration (don't extend into next segment)
+        if next_segment_start is not None:
+            max_available_duration = next_segment_start - start_seconds - 0.1  # 0.1s gap
+            available_duration = max(original_duration, min(total_required_duration, max_available_duration))
         else:
-            chunk_duration = end_seconds - start_seconds
-
+            # Last segment, can extend as needed
+            available_duration = max(original_duration, total_required_duration)
+        
         current_start = start_seconds
-        for chunk in chunks:
-            current_end = current_start + chunk_duration
+        for i, chunk in enumerate(chunks):
+            # Calculate duration for this chunk based on its length
+            chunk_required_duration = max(min_duration, len(chunk) / chars_per_second)
+            
+            # Scale the chunk duration proportionally to fit within available time
+            if total_required_duration > 0:
+                chunk_duration = chunk_required_duration * (available_duration / total_required_duration)
+            else:
+                chunk_duration = min_duration
+            
+            chunk_end = current_start + chunk_duration
+            
             srt_lines.append(str(subtitle_number))
-            srt_lines.append(f"{format_timestamp_srt(current_start)} --> {format_timestamp_srt(current_end)}")
+            srt_lines.append(f"{format_timestamp_srt(current_start)} --> {format_timestamp_srt(chunk_end)}")
             srt_lines.append(chunk)
             srt_lines.append("")
 
             subtitle_number += 1
-            current_start = current_end
+            current_start = chunk_end
 
     return "\n".join(srt_lines)
 
@@ -238,48 +287,48 @@ def create_enhanced_transcript(segments: List[Dict], pause_threshold=2.0) -> str
         last_end = seg['end']
     return "".join(transcript_parts).strip()
 
-# --------------------------
-# LEGACY FUNCTIONS
-# --------------------------
+def safe_translate(translator, text, src, dest, retries=3, delay=1.0):
+    """
+    Try translating with retries and exponential backoff.
+    Falls back to original text if all retries fail.
+    """
+    for attempt in range(retries):
+        try:
+            result = translator.translate(text, src=src, dest=dest)
+            return result.text
+        except Exception as e:
+            print(f"⚠️ Translation failed (attempt {attempt+1}/{retries}): {e}")
+            if attempt < retries - 1:
+                sleep_time = delay * (2 ** attempt) + random.uniform(0, 0.5)
+                time.sleep(sleep_time)
+            else:
+                return text  # fallback
 
-translate_segments = None
-if Translator:
-    def translate_segments(segments, source_lang="en", target_lang="pl"):
-        """
-        Translate segments with per-segment logging like your manual loop.
-        """
-        if not segments:
-            print("No segments to translate")
-            return []
+def translate_segments(segments, source_lang="en", target_lang="pl"):
+    if not segments:
+        print("No segments to translate")
+        return []
 
-        if source_lang == target_lang:
-            print("No translation needed (same language)")
-            return segments
+    if source_lang == target_lang:
+        print("No translation needed (same language)")
+        return segments
 
-        translated_segments = []
-        translator = Translator()
-        print(f"⏳ Translating {len(segments)} segments from {source_lang} to {target_lang}...")
+    translator = Translator()
+    translated_segments = []
+    print(f"⏳ Translating {len(segments)} segments from {source_lang} to {target_lang}...")
 
-        for i, seg in enumerate(segments):
-            try:
-                print(f"Translating {i+1}/{len(segments)}...", end='\r')
-                translated_text = translator.translate(seg["text"], src=source_lang, dest=target_lang).text
-                translated_segments.append({
-                    'start': seg['start'],
-                    'end': seg['end'],
-                    'text': translated_text
-                })
-            except Exception as e:
-                print(f"Translation error for segment {i+1}: {e}")
-                translated_segments.append({
-                    'start': seg['start'],
-                    'end': seg['end'],
-                    'text': seg['text']
-                })
+    for i, seg in enumerate(segments):
+        translated_text = safe_translate(translator, seg["text"], src=source_lang, dest=target_lang)
+        translated_segments.append({
+            'start': seg['start'],
+            'end': seg['end'],
+            'text': translated_text
+        })
+        print(f"Translated {i+1}/{len(segments)}", end='\r')
 
-        print(f"\n✅ Translated {len(translated_segments)} segments")
-        return translated_segments
-    
+    print(f"\n✅ Translated {len(translated_segments)} segments")
+    return translated_segments
+
 def create_srt_file(segments, output_path, source_lang="en", target_lang=None):
     """Create SRT subtitle file from transcript segments with optional translation"""
     if target_lang and target_lang != source_lang:

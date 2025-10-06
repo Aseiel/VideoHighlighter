@@ -893,11 +893,12 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 # Always create full subtitles
                 progress.update_progress(95, 100, "Pipeline", "Creating full-video subtitles...")
                 log("Creating subtitles for the full video...")
-                full_srt = f"{os.path.splitext(video_path)[0]}_{SOURCE_LANG}.srt"
+                full_srt = f"{os.path.splitext(video_path)[0]}_{TARGET_LANG}.srt"
                 if TARGET_LANG and TARGET_LANG != SOURCE_LANG:
                     translated = translate_segments(transcript_segments, target_lang=TARGET_LANG)
                     create_srt_file(translated, full_srt)
                 else:
+                    full_srt = f"{os.path.splitext(video_path)[0]}_{SOURCE_LANG}.srt"
                     create_srt_file(transcript_segments, full_srt)
                 log(f"Full-video subtitles created: {full_srt}")
 
