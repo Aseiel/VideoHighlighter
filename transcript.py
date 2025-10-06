@@ -42,13 +42,19 @@ def split_audio(video_file, chunk_length=600):
     Split audio into chunks using ffmpeg (default: 600s = 10 min).
     Returns list of chunk file paths.
     """
-    base, _ = os.path.splitext(video_file)
-    out_pattern = f"{base}_chunk_%03d.wav"
+    # Get the directory where the video is located
+    video_dir = os.path.dirname(os.path.abspath(video_file))
+    base, _ = os.path.splitext(os.path.basename(video_file))
+    
+    out_pattern = os.path.join(video_dir, f"{base}_chunk_%03d.wav")
 
     # Remove old chunks if they exist (safety cleanup)
-    for f in os.listdir():
-        if f.startswith(os.path.basename(base) + "_chunk_"):
-            os.remove(f)
+    for f in os.listdir(video_dir):
+        if f.startswith(base + "_chunk_") and f.endswith(".wav"):
+            try:
+                os.remove(os.path.join(video_dir, f))
+            except OSError:
+                pass
 
     # Use ffmpeg to split into fixed-length WAV files
     subprocess.run([
@@ -57,11 +63,15 @@ def split_audio(video_file, chunk_length=600):
         "-f", "segment", "-segment_time", str(chunk_length),
         "-c:a", "pcm_s16le", "-ar", "16000",
         out_pattern
-    ])
+    ], check=True)
 
-    return sorted([f for f in os.listdir() if f.startswith(os.path.basename(base) + "_chunk_")])
+    # Return full paths to chunks in the video's directory
+    chunks = [os.path.join(video_dir, f) for f in os.listdir(video_dir) 
+              if f.startswith(base + "_chunk_") and f.endswith(".wav")]
+    
+    return sorted(chunks)
 
-def get_transcript_segments(video_file, model_name="small", progress_fn=None, log_fn=print, chunk_length=600):
+def get_transcript_segments(video_file, model_name="small", progress_fn=None, log_fn=print, chunk_length=600, cleanup=True):
     """
     Transcribe video safely by splitting into chunks.
     - Uses Whisper for transcription
@@ -119,6 +129,14 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
 
     if progress_fn:
         progress_fn(95, 100, "Transcription", "Complete")
+
+    if cleanup:
+        log_fn("🧹 Cleaning up chunk files...")
+        for f in chunks:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
     log_fn(f"✅ Transcript ready: {len(all_segments)} segments (from {len(chunks)} chunks)")
     return all_segments
