@@ -423,7 +423,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
 
         print("Detections per second:", len(object_detections))
 
-        def group_consecutive_adaptive(actions, max_gap=1, jump_threshold=0.45):
+        def group_consecutive_adaptive(actions, max_gap=1.3, jump_threshold=0.5):
             """
             Groups consecutive actions of the same type if:
             - time gap <= max_gap
@@ -434,35 +434,59 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
 
             # Sort actions chronologically first
             actions = sorted(actions, key=lambda x: x[0])
+            
+            print(f"DEBUG: Starting grouping with {len(actions)} actions")
+            print(f"DEBUG: First few actions: {actions[:5]}")
 
             groups = []
             current = [actions[0]]
 
-            for prev, curr in zip(actions, actions[1:]):
-                same_action = curr[4] == prev[4]
-                close_in_time = (curr[0] - prev[0]) <= max_gap
-                conf_stable = abs(curr[3] - prev[3]) <= jump_threshold
-
-                if same_action and close_in_time and conf_stable:
-                    current.append(curr)
+            for i in range(1, len(actions)):
+                prev = actions[i-1]
+                curr = actions[i]
+                
+                # Extract elements - handle both 4 and 5 element tuples
+                if len(prev) >= 4 and len(curr) >= 4:
+                    prev_timestamp = prev[0]
+                    curr_timestamp = curr[0]
+                    prev_action = prev[3] if len(prev) == 4 else prev[4]  # Handle both formats
+                    curr_action = curr[3] if len(curr) == 4 else curr[4]
+                    prev_conf = prev[2] if len(prev) == 4 else prev[3]
+                    curr_conf = curr[2] if len(curr) == 4 else curr[3]
+                    
+                    same_action = curr_action == prev_action
+                    time_gap = curr_timestamp - prev_timestamp
+                    close_in_time = time_gap <= max_gap
+                    conf_change = abs(curr_conf - prev_conf)
+                    conf_stable = conf_change <= jump_threshold
+                    
+                    if same_action and close_in_time and conf_stable:
+                        current.append(curr)
+                    else:
+                        groups.append(current)
+                        current = [curr]
                 else:
-                    groups.append(current)
-                    current = [curr]
+                    print(f"DEBUG: Skipping malformed action tuple: prev={prev}, curr={curr}")
 
             if current:
                 groups.append(current)
 
+            print(f"DEBUG: Formed {len(groups)} groups")
+            
             # Collapse each group
             result = []
-            for g in groups:
+            for i, g in enumerate(groups):
                 timestamps = [x[0] for x in g]
                 start = min(timestamps)
                 end = max(timestamps)
-                duration = max(0, end - start)
-                if duration == 0:
-                    duration = 1.0  # minimum 1s
-                avg_conf = sum(x[3] for x in g) / len(g)
-                result.append((start, end, duration, avg_conf, g[0][4]))
+                duration = max(0.5, end - start)  # Minimum 0.5s duration
+                avg_conf = sum(x[2] if len(x) == 4 else x[3] for x in g) / len(g)
+                action_name = g[0][3] if len(g[0]) == 4 else g[0][4]
+                
+                result.append((start, end, duration, avg_conf, action_name))
+                
+                print(f"DEBUG: Group {i+1}: {action_name} from {start:.1f}s to {end:.1f}s "
+                    f"({duration:.1f}s), avg_conf: {avg_conf:.3f}, {len(g)} detections")
 
             return result
 
@@ -486,23 +510,29 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 if all_action_detections:
                     print("DEBUG: First 10 individual actions as returned:")
                     for i, action in enumerate(all_action_detections[:10]):
-                        timestamp, frame_id, action_id, score, action_name = action
-                        print(f"  {i+1}. {timestamp:.1f}s -> {action_name} (confidence: {score:.3f})")
+                        # Handle both 4 and 5 element formats
+                        if len(action) == 4:
+                            timestamp, frame_id, score, action_name = action
+                            print(f"  {i+1}. {timestamp:.1f}s -> {action_name} (confidence: {score:.3f})")
+                        else:
+                            timestamp, frame_id, action_id, score, action_name = action
+                            print(f"  {i+1}. {timestamp:.1f}s -> {action_name} (confidence: {score:.3f})")
 
+                # Ensure consistent data format (convert to 5-element tuples)
+                normalized_detections = []
+                for detection in all_action_detections:
+                    if len(detection) == 4:
+                        # Convert (timestamp, frame_id, score, action_name) to (timestamp, frame_id, -1, score, action_name)
+                        timestamp, frame_id, score, action_name = detection
+                        normalized_detections.append((timestamp, frame_id, -1, score, action_name))
+                    else:
+                        normalized_detections.append(detection)
+                
                 # 1️⃣ Group consecutive actions chronologically
-                grouped_actions = group_consecutive_adaptive(all_action_detections, max_gap=1)
+                grouped_actions = group_consecutive_adaptive(normalized_detections, max_gap=1.3, jump_threshold=0.45)
 
-                print(f"\nDEBUG: Grouped {len(all_action_detections)} individual actions into {len(grouped_actions)} sequences")
-                if grouped_actions:
-                    print("DEBUG: Top 10 action sequences by confidence:")
-                    grouped_sorted = sorted(grouped_actions, key=lambda x: x[3], reverse=True)
-                    for i, group in enumerate(grouped_sorted[:10]):
-                        start_time, end_time, duration, confidence, action_name = group
-                        start_mins, start_secs = divmod(int(start_time), 60)
-                        end_mins, end_secs = divmod(int(end_time), 60)
-                        print(f"  {i+1}. {start_mins:02d}:{start_secs:02d}-{end_mins:02d}:{end_secs:02d} "
-                            f"({duration:.1f}s) -> {action_name} (confidence: {confidence:.3f})")
-
+                print(f"\nDEBUG: Grouped {len(normalized_detections)} individual actions into {len(grouped_actions)} sequences")
+                
                 # 2️⃣ Use all grouped sequences sorted by confidence
                 selected_sequences = sorted(grouped_actions, key=lambda x: x[3], reverse=True)
 
@@ -512,33 +542,32 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                     start_time, end_time, duration, confidence, action_name = sequence
                     total_duration += duration
                     print(f"DEBUG: Added sequence {action_name} at {seconds_to_mmss(start_time)}-{seconds_to_mmss(end_time)} "
-                        f"({seconds_to_mmss(duration)} duration, confidence: {confidence:.3f}) - Total: {seconds_to_mmss(total_duration)})")
+                        f"({duration:.1f}s duration, confidence: {confidence:.3f}) - Total: {seconds_to_mmss(total_duration)})")
 
-                print(f"\nDEBUG: Selected {len(selected_sequences)} sequences totaling {seconds_to_mmss(total_duration)}")
+                print(f"\nDEBUG: Selected {len(selected_sequences)} sequences totaling {total_duration:.1f}s")
 
                 # 3️⃣ Convert back to individual action format for pipeline compatibility
                 action_detections = []
                 for start_time, end_time, duration, confidence, action_name in selected_sequences:
                     # pick best detection in this group
                     detections_in_group = [
-                        a for a in all_action_detections
-                        if a[4] == action_name and start_time <= a[0] <= end_time
+                        a for a in normalized_detections
+                        if (a[4] if len(a) == 5 else a[3]) == action_name and start_time <= a[0] <= end_time
                     ]
                     if detections_in_group:
-                        best_detection = max(detections_in_group, key=lambda a: a[3])  # highest confidence
+                        # Use the detection with highest confidence
+                        best_detection = max(detections_in_group, key=lambda a: a[3] if len(a) == 5 else a[2])
                         action_detections.append(best_detection)
 
                 # Sort chronologically for pipeline
                 action_detections = sorted(action_detections, key=lambda x: x[0])
                 log(f"✅ Action recognition: {len(action_detections)} action sequences selected (total duration: {total_duration:.1f}s)")
 
-
             except Exception as e:
                 log(f"⚠ Action recognition failed: {e}")
-
-        else:
-            log("ℹ Skipping action recognition (no interesting actions specified)")
-                        
+                import traceback
+                log(f"Full error: {traceback.format_exc()}")
+                            
         # 6 Compute scores per second
         progress.update_progress(80, 100, "Pipeline", "Computing scores...")
         check_cancellation(cancel_flag, log, "score computation")
@@ -693,6 +722,91 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
             timestamp = f"{idx//60:02d}:{idx%60:02d}"
             print(f"{i+1}. Second {idx} ({timestamp}): {score[idx]:.1f} points")
 
+        # Module-level flag to ensure logging happens only once per video
+        if 'segments_logged' not in globals():
+            globals()['segments_logged'] = False
+
+        # Only use scored seconds depending on mode
+        if duration_mode == "EXACT":
+            candidate_indices = np.arange(len(score))  # allow seconds with 0 point score 
+        else:  # "MAX"
+            candidate_indices = np.where(score > 0)[0]
+
+        # Get scores for candidate indices
+        candidate_scores = score[candidate_indices]
+
+        # Get confidence values for tie-breaking
+        candidate_confidences = np.zeros(len(candidate_indices))
+        for idx, sec in enumerate(candidate_indices):
+            if sec in detections_by_sec:
+                candidate_confidences[idx] = max(conf for _, conf in detections_by_sec[sec])
+
+        # Sort by score descending, then by confidence descending for ties
+        sorted_indices = np.lexsort((-candidate_confidences, -candidate_scores))  # negative for descending
+        top_indices_all = candidate_indices[sorted_indices]
+
+        # DEBUG: Print top 20 actions moments being considered
+        print(f"\n=== TOP 20 ACTION MOMENTS BEING CONSIDERED ===")
+        for i, sec in enumerate(top_indices_all[:20]):
+            timestamp = f"{sec//60:02d}:{sec%60:02d}"
+            
+            # Get confidence for this second
+            confidence = 0.0
+            if sec in detections_by_sec:
+                confidence = max(conf for _, conf in detections_by_sec[sec])
+            
+            print(f"{i+1}. Second {sec} ({timestamp}): {score[sec]:.1f} points, confidence: {confidence:.3f}")
+            
+        segments = []
+        used_seconds = set()
+
+        for sec in top_indices_all:
+            if sec in used_seconds:
+                continue
+
+            start = max(0, sec - CLIP_TIME // 2)
+            end = min(video_duration, start + CLIP_TIME)
+
+            # Adjust start/end to ensure full CLIP_TIME
+            if end - start < CLIP_TIME and end < video_duration:
+                end = min(video_duration, start + CLIP_TIME)
+            if end - start < CLIP_TIME and start > 0:
+                start = max(0, end - CLIP_TIME)
+
+            # Skip if any second is already used
+            if any(s in used_seconds for s in range(int(start), int(end))):
+                continue
+
+            # Adjust segment to not exceed target duration ---
+            current_duration = sum(e - s for s, e in segments)
+            remaining = target_duration - current_duration
+            if remaining <= 0:
+                break
+            if end - start > remaining:
+                end = start + remaining
+
+            segments.append((start, end))
+            for s in range(int(start), int(end)):
+                used_seconds.add(s)
+
+            # Break based on duration mode
+            current_duration = sum(e - s for s, e in segments)
+            if duration_mode == "EXACT" and current_duration >= EXACT_DURATION:
+                break
+            elif duration_mode == "MAX" and current_duration >= MAX_DURATION:
+                break
+
+        # Sort segments by start time
+        segments.sort(key=lambda x: x[0])
+
+        # Compute total duration once
+        total_duration = sum(e - s for s, e in segments)
+
+        # Log final segments exactly once, even if target not reached
+        if not globals()['segments_logged']:
+            log(f"\n🎯 Final segments selected: {len(segments)}, total {total_duration:.1f}s (target {target_duration}s)")
+            globals()['segments_logged'] = True
+
         print(f"\n=== DETAILED DEBUG FOR TOP MOMENTS ===")
         for idx in top_indices[:10]:
             minutes = idx // 60
@@ -771,71 +885,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 print(f"     Boost added: +{boost_amount:.1f} points")
                 print(f"     Final score: {score[idx]:.1f}")
 
-            # Module-level flag to ensure logging happens only once per video
-            if 'segments_logged' not in globals():
-                globals()['segments_logged'] = False
 
-            # Select top segments
-            progress.update_progress(85, 100, "Pipeline", "Selecting highlight segments...")
-
-            # Only use scored seconds depending on mode
-            if duration_mode == "EXACT":
-                candidate_indices = np.arange(len(score))  # allow seconds with 0 point score 
-            else:  # "MAX"
-                candidate_indices = np.where(score > 0)[0]
-
-            # Sort by score descending
-            top_indices_all = candidate_indices[np.argsort(score[candidate_indices])[::-1]]
-
-            segments = []
-            used_seconds = set()
-
-            for sec in top_indices_all:
-                if sec in used_seconds:
-                    continue
-
-                start = max(0, sec - CLIP_TIME // 2)
-                end = min(video_duration, start + CLIP_TIME)
-
-                # Adjust start/end to ensure full CLIP_TIME
-                if end - start < CLIP_TIME and end < video_duration:
-                    end = min(video_duration, start + CLIP_TIME)
-                if end - start < CLIP_TIME and start > 0:
-                    start = max(0, end - CLIP_TIME)
-
-                # Skip if any second is already used
-                if any(s in used_seconds for s in range(int(start), int(end))):
-                    continue
-
-                # Adjust segment to not exceed target duration ---
-                current_duration = sum(e - s for s, e in segments)
-                remaining = target_duration - current_duration
-                if remaining <= 0:
-                    break
-                if end - start > remaining:
-                    end = start + remaining
-
-                segments.append((start, end))
-                for s in range(int(start), int(end)):
-                    used_seconds.add(s)
-
-                # Break based on duration mode
-                current_duration = sum(e - s for s, e in segments)
-                if duration_mode == "EXACT" and current_duration >= EXACT_DURATION:
-                    break
-                elif duration_mode == "MAX" and current_duration >= MAX_DURATION:
-                    break
-
-            # Sort segments by start time
-            segments.sort(key=lambda x: x[0])
-
-            # Compute total duration once
-            total_duration = sum(e - s for s, e in segments)
-
-            # Log final segments exactly once, even if target not reached
-            if not globals()['segments_logged']:
-                log(f"\n🎯 Final segments selected: {len(segments)}, total {total_duration:.1f}s (target {target_duration}s)")
-                globals()['segments_logged'] = True
 
 
 
