@@ -26,6 +26,8 @@ ENCODER_XML = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-00
 ENCODER_BIN = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin"
 DECODER_XML = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
 DECODER_BIN = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
+#DECODER_XML = BASE_DIR / "action_classifier_3d.xml"
+#DECODER_BIN = BASE_DIR / "action_classifier_3d.bin"
 SEQUENCE_LENGTH = 16
 
 
@@ -181,28 +183,29 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     predictions = compiled_decoder([sequence_array])[decoder_output].flatten()
 
                     if interesting_actions_set:
-                        # Check only the requested actions
-                        for action_name in interesting_actions_set:
-                            action_id = get_id_from_name(action_name)
-                            score = float(predictions[action_id])
-                            if score >= confidence_threshold:
-                                writer.writerow([timestamp_str, frame_id, action_id, action_name, score, timestamp_secs])
-                                all_actions.append((timestamp_secs, frame_id, action_id, score, action_name))
-                                detection_count += 1
-                                if debug:
-                                    print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
+                        # For binary classification - only check the single output
+                        score = float(predictions[0])  # Only one output value
+                        
+                        # If score > threshold, it's the positive class
+                        if score >= confidence_threshold:
+                            # Use the first interesting action name
+                            action_name = list(interesting_actions_set)[0]  
+                            action_id = 0  # or get_id_from_name(action_name) if you need specific ID
+                            
+                            writer.writerow([timestamp_str, frame_id, action_id, action_name, score, timestamp_secs])
+                            all_actions.append((timestamp_secs, frame_id, action_id, score, action_name))
+                            detection_count += 1
+                            if debug:
+                                print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
                     else:
-                        # fallback: top-k as before
-                        top_indices = np.argsort(predictions)[-top_k:][::-1]
-                        for idx in top_indices:
-                            score = float(predictions[idx])
-                            action_name = get_action_name(idx)
-                            if score >= confidence_threshold:
-                                writer.writerow([timestamp_str, frame_id, idx, action_name, score, timestamp_secs])
-                                all_actions.append((timestamp_secs, frame_id, idx, score, action_name))
-                                detection_count += 1
-                                if debug:
-                                    print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
+                        # Fallback for single class
+                        score = float(predictions[0])
+                        if score >= confidence_threshold:
+                            action_name = "detected_action"  # Use your class name
+                            writer.writerow([timestamp_str, frame_id, 0, action_name, score, timestamp_secs])
+                            all_actions.append((timestamp_secs, frame_id, 0, score, action_name))
+                            detection_count += 1
+
 
             prev_req = req
             processed_frames += 1
@@ -335,4 +338,4 @@ if __name__ == "__main__":
 
     print_top_actions(results)
     print_most_common_actions(results)
-    print_action_sequences(results)
+    print_action_sequences(results) 
