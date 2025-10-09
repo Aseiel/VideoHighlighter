@@ -423,7 +423,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
 
         print("Detections per second:", len(object_detections))
 
-        def group_consecutive_adaptive(actions, max_gap=1.3, jump_threshold=0.5):
+        def group_consecutive_adaptive(actions, max_gap=1.3, jump_threshold=0.01):
             """
             Groups consecutive actions of the same type if:
             - time gap <= max_gap
@@ -432,62 +432,56 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
             if not actions:
                 return []
 
-            # Sort actions chronologically first
-            actions = sorted(actions, key=lambda x: x[0])
+            # Ensure consistent format first
+            normalized_actions = []
+            for action in actions:
+                if len(action) == 4:
+                    timestamp, frame_id, score, action_name = action
+                    normalized_actions.append((timestamp, frame_id, -1, score, action_name))
+                else:
+                    normalized_actions.append(action)
             
-            print(f"DEBUG: Starting grouping with {len(actions)} actions")
-            print(f"DEBUG: First few actions: {actions[:5]}")
-
+            actions = sorted(normalized_actions, key=lambda x: x[0])
+            
+            # grouping logic with consistent 5-element format
             groups = []
             current = [actions[0]]
-
+            
             for i in range(1, len(actions)):
                 prev = actions[i-1]
                 curr = actions[i]
                 
-                # Extract elements - handle both 4 and 5 element tuples
-                if len(prev) >= 4 and len(curr) >= 4:
-                    prev_timestamp = prev[0]
-                    curr_timestamp = curr[0]
-                    prev_action = prev[3] if len(prev) == 4 else prev[4]  # Handle both formats
-                    curr_action = curr[3] if len(curr) == 4 else curr[4]
-                    prev_conf = prev[2] if len(prev) == 4 else prev[3]
-                    curr_conf = curr[2] if len(curr) == 4 else curr[3]
-                    
-                    same_action = curr_action == prev_action
-                    time_gap = curr_timestamp - prev_timestamp
-                    close_in_time = time_gap <= max_gap
-                    conf_change = abs(curr_conf - prev_conf)
-                    conf_stable = conf_change <= jump_threshold
-                    
-                    if same_action and close_in_time and conf_stable:
-                        current.append(curr)
-                    else:
-                        groups.append(current)
-                        current = [curr]
+                # Now all actions are 5-element: (timestamp, frame_id, action_id, score, action_name)
+                prev_timestamp, _, _, prev_score, prev_action = prev
+                curr_timestamp, _, _, curr_score, curr_action = curr
+                
+                same_action = curr_action == prev_action
+                time_gap = curr_timestamp - prev_timestamp
+                close_in_time = time_gap <= max_gap
+                conf_change = abs(curr_score - prev_score)
+                conf_stable = conf_change <= jump_threshold
+                
+                if same_action and close_in_time and conf_stable:
+                    current.append(curr)
                 else:
-                    print(f"DEBUG: Skipping malformed action tuple: prev={prev}, curr={curr}")
-
+                    groups.append(current)
+                    current = [curr]
+            
             if current:
                 groups.append(current)
-
-            print(f"DEBUG: Formed {len(groups)} groups")
             
-            # Collapse each group
+            # Collapse groups
             result = []
-            for i, g in enumerate(groups):
+            for g in groups:
                 timestamps = [x[0] for x in g]
                 start = min(timestamps)
                 end = max(timestamps)
-                duration = max(0.5, end - start)  # Minimum 0.5s duration
-                avg_conf = sum(x[2] if len(x) == 4 else x[3] for x in g) / len(g)
-                action_name = g[0][3] if len(g[0]) == 4 else g[0][4]
+                duration = max(0.5, end - start)
+                avg_conf = sum(x[3] for x in g) / len(g)  # score is at index 3
+                action_name = g[0][4]  # action_name is at index 4
                 
                 result.append((start, end, duration, avg_conf, action_name))
-                
-                print(f"DEBUG: Group {i+1}: {action_name} from {start:.1f}s to {end:.1f}s "
-                    f"({duration:.1f}s), avg_conf: {avg_conf:.3f}, {len(g)} detections")
-
+            
             return result
 
         # --- Action recognition with grouping ---
@@ -798,6 +792,105 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
 
         # Sort segments by start time
         segments.sort(key=lambda x: x[0])
+
+        print("\n🔍 FINAL HIGHLIGHT BREAKDOWN:")
+        print(f"Total segments: {len(segments)}")
+        total_final_duration = sum(e - s for s, e in segments)
+        print(f"Total highlight duration: {total_final_duration:.1f}s")
+
+        # Show the actual selected segments with BETTER confidence information
+        print(f"\nACTUAL SELECTED SEGMENTS (PEAK CONFIDENCE):")
+        for i, (seg_start, seg_end) in enumerate(segments):
+            seg_duration = seg_end - seg_start
+            
+            # Find the PEAK confidence in this segment (not average)
+            peak_confidence = 0
+            high_confidence_moments = []
+            
+            for action_seq in selected_sequences:
+                action_start, action_end, action_duration, action_conf, action_name = action_seq
+                overlap_start = max(action_start, seg_start)
+                overlap_end = min(action_end, seg_end)
+                # FIX: Use >= instead of > to include single-moment actions
+                if overlap_end >= overlap_start and action_conf > peak_confidence:
+                    peak_confidence = action_conf
+                if action_conf > 5.0:  # Track high-confidence moments
+                    high_confidence_moments.append((action_conf, f"{seconds_to_mmss(action_start)}-{seconds_to_mmss(action_end)}"))
+            
+            # Sort high-confidence moments
+            high_confidence_moments.sort(reverse=True)
+            
+            if peak_confidence > 0:
+                confidence_str = f"PEAK: {peak_confidence:.1f}"
+                if high_confidence_moments:
+                    confidence_str += f" | {len(high_confidence_moments)} high-conf moments"
+                    if len(high_confidence_moments) <= 3:  # Show top 3 if not too many
+                        for conf, range_str in high_confidence_moments[:3]:
+                            confidence_str += f" | {range_str}({conf:.1f})"
+            else:
+                confidence_str = "no high-confidence actions"
+            
+            print(f"  Segment {i+1}: {seconds_to_mmss(seg_start)}-{seconds_to_mmss(seg_end)} ({seg_duration:.1f}s) - {confidence_str}")
+
+        # Check which action sequences made it into the final highlight (SIGNIFICANTLY included)
+        action_sequences_in_highlight = []
+        for action_seq in selected_sequences:
+            action_start, action_end, action_duration, action_conf, action_name = action_seq
+            # Check if this action sequence is SIGNIFICANTLY included (not just 0s overlap)
+            for seg_start, seg_end in segments:
+                overlap_start = max(action_start, seg_start)
+                overlap_end = min(action_end, seg_end)
+                overlap_duration = overlap_end - overlap_start
+                
+                # FIX: Use >= 0 instead of > 0 to include single-moment actions
+                if overlap_duration >= 0:
+                    included_ratio = overlap_duration / action_duration
+                    action_sequences_in_highlight.append({
+                        'action_name': action_name,
+                        'original_range': f"{seconds_to_mmss(action_start)}-{seconds_to_mmss(action_end)}",
+                        'highlight_range': f"{seconds_to_mmss(overlap_start)}-{seconds_to_mmss(overlap_end)}", 
+                        'duration': overlap_duration,
+                        'confidence': action_conf,
+                        'included_ratio': included_ratio
+                    })
+                    break
+
+        print(f"\nACTION SEQUENCES INCLUDED IN HIGHLIGHT (≥1s):")
+        if action_sequences_in_highlight:
+            # Sort by confidence to see what actually made it
+            action_sequences_in_highlight.sort(key=lambda x: x['confidence'], reverse=True)
+            
+            for action in action_sequences_in_highlight:
+                ratio_percent = action['included_ratio'] * 100
+                print(f"  {action['action_name']}: {action['highlight_range']} "
+                    f"({action['duration']:.1f}s, {ratio_percent:.0f}% of original, conf: {action['confidence']:.3f})")
+        else:
+            print("  No action sequences significantly included in final highlight")
+            
+        total_action_duration = sum(a['duration'] for a in action_sequences_in_highlight)
+        print(f"Total action content in highlight: {total_action_duration:.1f}s ({total_action_duration/total_final_duration*100:.1f}% of total)")
+
+        # Also show high-confidence sequences that didn't make it
+        print(f"\nTOP 10 HIGH-CONFIDENCE ACTION SEQUENCES EXCLUDED:")
+        high_conf_excluded = []
+        for action_seq in selected_sequences:
+            action_start, action_end, action_duration, action_conf, action_name = action_seq
+            included = False
+            for seg_start, seg_end in segments:
+                overlap_start = max(action_start, seg_start)
+                overlap_end = min(action_end, seg_end)
+                # FIX: Use >= 1.0 instead of > 1.0 to be consistent
+                if overlap_end - overlap_start >= 1.0:  # At least 1s included
+                    included = True
+                    break
+            if not included and action_conf > 6.0:  # Only show high confidence excluded
+                high_conf_excluded.append((action_conf, action_name, f"{seconds_to_mmss(action_start)}-{seconds_to_mmss(action_end)}"))
+
+        # Show top 10 excluded by confidence
+        for conf, name, range_str in sorted(high_conf_excluded, reverse=True)[:10]:
+            print(f"  {name}: {range_str} (conf: {conf:.3f})")
+
+
 
         # Compute total duration once
         total_duration = sum(e - s for s, e in segments)
