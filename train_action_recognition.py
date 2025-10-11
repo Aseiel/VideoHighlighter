@@ -2,6 +2,7 @@ import os
 import glob
 import cv2
 import json
+import numpy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,7 +13,8 @@ from openvino.runtime import Core
 # =============================
 # How to
 # =============================
-# put short 5-10s videos to dataset/train/ and dataset/val/, usually You can put 100+ videos for train and 20+ for val
+# put short 5-10s videos to dataset/train/action_name and dataset/val/action_name
+# usually You should put minimum 100+ videos for train and 20+ for val
 
 
 # =============================
@@ -108,49 +110,79 @@ class IntelFeatureExtractor:
         self.ie = Core()
         self.encoder_model = self.ie.read_model(model=encoder_xml, weights=encoder_bin)
         self.encoder = self.ie.compile_model(self.encoder_model, device_name="CPU")
-        self.input_name = next(iter(self.encoder.inputs))
         
-        # Get input shape information
-        self.input_shape = self.encoder.inputs[0].shape
+        # ✅ Fix: extract proper input name and shape
+        input_tensor = self.encoder.inputs[0]
+        self.input_name = input_tensor.get_any_name()
+        self.input_shape = list(input_tensor.get_shape())
+
+        print(f"Encoder input name: {self.input_name}")
         print(f"Encoder input shape: {self.input_shape}")
 
+
     def preprocess_frame(self, frame):
-        """Preprocess frame for Intel encoder"""
-        # Convert to float32
+        """
+        frame: HxWxC, dtype=float32, 0..255
+        returns: (3, H, W) float32 aligned to model input
+        """
+        # Ensure float32 and shape HWC
         frame = frame.astype(np.float32)
-        
-        # Normalize: subtract mean and divide by std as expected by the model
-        # These values are typical for Intel models
+
+        # Normalize — model expects mean/std in pixel scale
         mean = np.array([0.485, 0.456, 0.406]) * 255.0
         std = np.array([0.229, 0.224, 0.225]) * 255.0
+        # broadcasting over H,W,C
         frame = (frame - mean) / std
-        
-        # Change from HWC to CHW format
+
+        # HWC -> CHW
         frame = frame.transpose(2, 0, 1)
-        
         return frame
 
     def extract_sequence(self, frames):
         """
-        frames: (T,H,W,C) numpy array
-        returns: (T, feature_dim) torch tensor
+        frames: np.ndarray of shape (T, H, W, C) or list of frames
+        returns: torch.Tensor of shape (T, feature_dim)
         """
         features = []
-        for frame in frames:
-            # Preprocess the frame
-            inp = self.preprocess_frame(frame)
-            # Add batch dimension
-            inp = inp[np.newaxis, ...]  # (1, 3, H, W)
-            
+        seen_shape = None
+
+        for i, frame in enumerate(frames):
+            inp = self.preprocess_frame(frame)  # (3,H,W)
+            inp = np.expand_dims(inp, axis=0).astype(np.float32)  # (1,3,H,W)
+
             # Run inference
-            out = self.encoder([inp])
-            feat = list(out.values())[0]
-            
-            # Ensure we get the right shape
-            feat = feat.squeeze()  # Remove batch dimension if present
-            features.append(torch.from_numpy(feat))
-        
+            result = self.encoder({self.input_name: inp})
+
+            # Get the output
+            out_tensor = list(result.values())[0]
+
+            # Convert to NumPy if it is a ConstOutput
+            if hasattr(out_tensor, "numpy"):
+                out_np = out_tensor.numpy()
+            else:
+                out_np = np.array(out_tensor)
+
+            out_np = np.squeeze(out_np)  # remove batch dimensions
+
+            # Flatten to 1D vector
+            if out_np.ndim == 0:
+                out_np = out_np.reshape(1)
+            elif out_np.ndim > 1:
+                out_np = out_np.ravel()
+
+            # Check consistency
+            if seen_shape is None:
+                seen_shape = out_np.shape
+                print(f"[extract_sequence] per-frame feature shape determined: {seen_shape}")
+            else:
+                if out_np.shape != seen_shape:
+                    raise RuntimeError(f"Inconsistent feature shape at frame {i}: {out_np.shape} != {seen_shape}")
+
+            features.append(torch.from_numpy(out_np.astype(np.float32)))
+
         return torch.stack(features, dim=0)  # (T, feature_dim)
+
+
 
 # =============================
 # Sequence-aware Classifier
@@ -282,63 +314,87 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
     device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    # Determine feature dimension from dummy batch
+    # Get feature_dim and sequence_length from a single dummy clip
     with torch.no_grad():
-        dummy_frames, _ = next(iter(train_loader))
-        print(f"Dummy frames shape: {dummy_frames.shape}")
-        
-        # Process first clip to get feature dimension
-        feat_seq = encoder.extract_sequence(dummy_frames[0].numpy())
-        print(f"Feature sequence shape: {feat_seq.shape}")
-        
-        feature_dim = feat_seq.shape[1]
-        sequence_length = feat_seq.shape[0]
-        print(f"Feature dimension: {feature_dim}, Sequence length: {sequence_length}")
+        dummy_frames_batch, _ = next(iter(train_loader))  # dummy_frames_batch: shape (B, T, H, W, C) as tensor or ndarray
+        print(f"Dummy frames batch shape (raw from loader): {dummy_frames_batch.shape}")
 
-    # Create model
+        # Use first clip only to determine dims
+        clip0 = dummy_frames_batch[0].numpy() if isinstance(dummy_frames_batch, torch.Tensor) else np.array(dummy_frames_batch[0])
+        feat_seq0 = encoder.extract_sequence(clip0)  # (T, feature_dim)
+        print(f"Feature sequence shape from encoder: {feat_seq0.shape}")
+
+        feature_dim = feat_seq0.shape[1]
+        sequence_length = feat_seq0.shape[0]
+        print(f"Determined feature_dim={feature_dim}, sequence_length={sequence_length}")
+
     model = SequenceActionClassifier(feature_dim, num_classes, sequence_length).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
 
     for epoch in range(CONFIG['num_epochs']):
         model.train()
-        total_loss, total_correct = 0, 0
-        batch_count = 0
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+
+        # optional: compute label histogram to check class balance
+        # (we do it per-epoch for quick sanity)
+        class_counts = {}
 
         for batch_idx, (clips, labels) in enumerate(train_loader):
+            # clips: (B, T, H, W, C) as tensor or numpy array
             batch_sequences = []
             for clip in clips:
-                # Convert to numpy for OpenVINO processing
-                clip_np = clip.numpy()
+                # clip may be torch tensor on CPU or numpy array
+                clip_np = clip.numpy() if isinstance(clip, torch.Tensor) else np.array(clip)
                 feat_seq = encoder.extract_sequence(clip_np)   # (T, feature_dim)
                 batch_sequences.append(feat_seq)
-            
-            # Stack sequences: (batch_size, sequence_length, feature_dim)
+
+            # Stack: (B, T, feature_dim)
             batch_sequences = torch.stack(batch_sequences, dim=0).to(device)
-            labels = labels.to(device)
-            
-            print(f"Batch {batch_idx}: sequences shape={batch_sequences.shape}, labels shape={labels.shape}")
+            labels = labels.to(device, dtype=torch.long)
+
+            # Debug print first batch only to avoid flooding
+            if batch_idx == 0 and epoch == 0:
+                print(f"[DEBUG] BATCH 0 shapes: batch_sequences={batch_sequences.shape}, labels={labels.shape}")
 
             optimizer.zero_grad()
-            outputs = model(batch_sequences)
+            outputs = model(batch_sequences)  # (B, num_classes)
+
+            # Basic checks
+            if outputs.ndim != 2 or outputs.shape[1] != num_classes:
+                raise RuntimeError(f"Model output shape {outputs.shape} incompatible with num_classes={num_classes}")
+
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
-            total_correct += (outputs.argmax(1) == labels).sum().item()
-            batch_count += 1
+            preds = outputs.argmax(dim=1)
+            batch_correct = (preds == labels).sum().item()
+            batch_size = labels.size(0)
+
+            total_loss += loss.item() * batch_size
+            total_correct += batch_correct
+            total_samples += batch_size
+
+            # label histogram
+            for l in labels.cpu().numpy():
+                class_counts[int(l)] = class_counts.get(int(l), 0) + 1
 
             if batch_idx % 5 == 0:
-                print(f"Epoch {epoch+1}, Batch {batch_idx}: Loss={loss.item():.4f}")
+                print(f"Epoch {epoch+1}, Batch {batch_idx}: Loss={loss.item():.4f}, BatchAcc={batch_correct/batch_size:.4f}")
 
-        if batch_count > 0:
-            acc = total_correct / len(train_loader.dataset)
-            print(f"Epoch {epoch+1}: Loss={total_loss/batch_count:.4f}, Acc={acc:.4f}")
+        # epoch metrics using actual processed samples
+        if total_samples > 0:
+            epoch_loss = total_loss / total_samples
+            epoch_acc = total_correct / total_samples
+            print(f"Epoch {epoch+1}: Loss={epoch_loss:.4f}, Acc={epoch_acc:.4f}, Samples={total_samples}")
+            print("Label distribution in epoch:", class_counts)
         else:
-            print(f"Epoch {epoch+1}: No batches processed")
+            print(f"Epoch {epoch+1}: No samples processed!")
 
-    # Wrap model with label information
+    # Wrap & save
     action_model = ActionRecognitionModel(
         model=model,
         label_to_idx=label_to_idx,
@@ -346,10 +402,7 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
         feature_dim=feature_dim,
         sequence_length=sequence_length
     )
-    
-    # Save using the new method that preserves labels
     action_model.save(CONFIG['model_save_path'])
-    
     return action_model
 
 # =============================
