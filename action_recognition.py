@@ -26,6 +26,8 @@ ENCODER_XML = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-00
 ENCODER_BIN = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin"
 DECODER_XML = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
 DECODER_BIN = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
+
+# Custom model
 # DECODER_XML = BASE_DIR / "action_classifier_3d.xml"
 # DECODER_BIN = BASE_DIR / "action_classifier_3d.bin"
 
