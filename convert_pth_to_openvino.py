@@ -8,22 +8,28 @@ from train_action_recognition import SequenceActionClassifier  # Import the new 
 def convert_current_model():
     # Your model parameters
     feature_dim = 512
-    num_classes = 1  # Adjust based on your actual classes
     sequence_length = 16
+    
+    # Load checkpoint to inspect it
+    checkpoint = torch.load("intel_finetuned_classifier_3d.pth", map_location='cpu')
+    
+    # Detect num_classes from the checkpoint
+    num_classes = checkpoint['classifier.3.weight'].shape[0]
+    print(f"Detected {num_classes} classes from checkpoint")
     
     # Load your trained 3D model
     print("Loading your trained 3D model...")
     model = SequenceActionClassifier(feature_dim, num_classes, sequence_length)
-    model.load_state_dict(torch.load("intel_finetuned_classifier_3d.pth", map_location='cpu'))
+    model.load_state_dict(checkpoint)
     model.eval()
     
     print("Model architecture:")
     print(model)
     
-    # Create dummy input with 3D shape
-    dummy_input = torch.randn(1, sequence_length, feature_dim)  # (1, 16, 512)
+    # Create dummy input with batch_size=1 to avoid LSTM warning
+    dummy_input = torch.randn(1, sequence_length, feature_dim)
     
-    # Convert to ONNX first for better compatibility
+    # Convert to ONNX
     torch.onnx.export(
         model,
         dummy_input,
@@ -31,10 +37,11 @@ def convert_current_model():
         input_names=['input'],
         output_names=['output'],
         dynamic_axes={
-            'input': {0: 'batch_size'},  # Only batch dimension is dynamic
+            'input': {0: 'batch_size'},  
             'output': {0: 'batch_size'}
         },
-        opset_version=13
+        opset_version=13,
+        verbose=False  # Reduce warnings
     )
     
     # Convert ONNX to OpenVINO
@@ -44,13 +51,14 @@ def convert_current_model():
     # Save the model
     ov.save_model(ov_model, "action_classifier_3d.xml")
     
-    # Clean up temporary file
+    # Clean up
     if os.path.exists("temp_model_3d.onnx"):
         os.remove("temp_model_3d.onnx")
     
     print("✓ Conversion successful!")
-    print(f"✓ Input shape: [batch_size, 16, 512]")
+    print(f"✓ Input shape: [batch_size, {sequence_length}, {feature_dim}]")
+    print(f"✓ Number of classes: {num_classes}")
     print(f"✓ Model saved as: action_classifier_3d.xml")
-
+    
 if __name__ == "__main__":
     convert_current_model()

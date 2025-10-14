@@ -2,6 +2,7 @@ import os
 import glob
 import cv2
 import json
+import random
 import numpy
 import numpy as np
 import torch
@@ -9,6 +10,16 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from openvino.runtime import Core
+
+# =============================
+# Set Random Seed for Reproducibility
+# =============================
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # =============================
 # How to
@@ -24,11 +35,12 @@ CONFIG = {
     "data_path": "dataset",
     "batch_size": 2,           # small batch for CPU
     "learning_rate": 1e-3,
-    "num_epochs": 5,
+    "num_epochs": 20,          # Increased from 5 to 20
     "sequence_length": 16,
     "frame_size": (224, 224),  # Intel encoder expects 224x224
     "model_save_path": "intel_finetuned_classifier_3d.pth",
-    "label_mapping_save_path": "label_mapping.json",  # NEW: Save label mapping
+    "label_mapping_save_path": "label_mapping.json",
+    "early_stopping_patience": 5,  # Early stopping
 }
 
 # =============================
@@ -220,7 +232,7 @@ class SequenceActionClassifier(nn.Module):
         return out
 
 # =============================
-# NEW: Model Manager to handle labels and model together
+# Model Manager to handle labels and model together
 # =============================
 class ActionRecognitionModel:
     def __init__(self, model, label_to_idx, idx_to_label, feature_dim, sequence_length):
@@ -308,7 +320,7 @@ class ActionRecognitionModel:
             }
 
 # =============================
-# Training loop 
+# Training loop (IMPROVED)
 # =============================
 def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_idx, idx_to_label):
     device = torch.device("cpu")
@@ -316,12 +328,11 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
 
     # Get feature_dim and sequence_length from a single dummy clip
     with torch.no_grad():
-        dummy_frames_batch, _ = next(iter(train_loader))  # dummy_frames_batch: shape (B, T, H, W, C) as tensor or ndarray
+        dummy_frames_batch, _ = next(iter(train_loader))
         print(f"Dummy frames batch shape (raw from loader): {dummy_frames_batch.shape}")
 
-        # Use first clip only to determine dims
         clip0 = dummy_frames_batch[0].numpy() if isinstance(dummy_frames_batch, torch.Tensor) else np.array(dummy_frames_batch[0])
-        feat_seq0 = encoder.extract_sequence(clip0)  # (T, feature_dim)
+        feat_seq0 = encoder.extract_sequence(clip0)
         print(f"Feature sequence shape from encoder: {feat_seq0.shape}")
 
         feature_dim = feat_seq0.shape[1]
@@ -329,40 +340,59 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
         print(f"Determined feature_dim={feature_dim}, sequence_length={sequence_length}")
 
     model = SequenceActionClassifier(feature_dim, num_classes, sequence_length).to(device)
-    criterion = nn.CrossEntropyLoss()
+    
+    # Calculate class weights to handle imbalance
+    class_counts = [0] * num_classes
+    for _, label in train_loader.dataset:
+        class_counts[label] += 1
+    
+    print(f"\n📊 Class distribution: {class_counts}")
+    
+    # Check for severely imbalanced classes
+    min_samples = min(class_counts)
+    max_samples = max(class_counts)
+    if min_samples < 5:
+        print(f"⚠️  WARNING: Some classes have very few samples (min={min_samples})!")
+        print(f"⚠️  Consider collecting more data for better results.")
+    if max_samples / (min_samples + 1e-6) > 5:
+        print(f"⚠️  WARNING: Severe class imbalance detected (ratio: {max_samples}/{min_samples})!")
+    
+    # Calculate weights (inverse frequency)
+    class_weights = torch.tensor([1.0 / (count + 1e-6) for count in class_counts], dtype=torch.float)
+    class_weights = class_weights / class_weights.sum() * num_classes
+    print(f"📊 Class weights (for balancing): {class_weights.tolist()}\n")
+    
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
 
+    # Early stopping variables
+    best_val_acc = 0
+    best_model_state = None
+    patience_counter = 0
+    
     for epoch in range(CONFIG['num_epochs']):
         model.train()
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
-
-        # optional: compute label histogram to check class balance
-        # (we do it per-epoch for quick sanity)
-        class_counts = {}
+        class_counts_epoch = {}
 
         for batch_idx, (clips, labels) in enumerate(train_loader):
-            # clips: (B, T, H, W, C) as tensor or numpy array
             batch_sequences = []
             for clip in clips:
-                # clip may be torch tensor on CPU or numpy array
                 clip_np = clip.numpy() if isinstance(clip, torch.Tensor) else np.array(clip)
-                feat_seq = encoder.extract_sequence(clip_np)   # (T, feature_dim)
+                feat_seq = encoder.extract_sequence(clip_np)
                 batch_sequences.append(feat_seq)
 
-            # Stack: (B, T, feature_dim)
             batch_sequences = torch.stack(batch_sequences, dim=0).to(device)
             labels = labels.to(device, dtype=torch.long)
 
-            # Debug print first batch only to avoid flooding
             if batch_idx == 0 and epoch == 0:
                 print(f"[DEBUG] BATCH 0 shapes: batch_sequences={batch_sequences.shape}, labels={labels.shape}")
 
             optimizer.zero_grad()
-            outputs = model(batch_sequences)  # (B, num_classes)
+            outputs = model(batch_sequences)
 
-            # Basic checks
             if outputs.ndim != 2 or outputs.shape[1] != num_classes:
                 raise RuntimeError(f"Model output shape {outputs.shape} incompatible with num_classes={num_classes}")
 
@@ -378,21 +408,51 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
             total_correct += batch_correct
             total_samples += batch_size
 
-            # label histogram
             for l in labels.cpu().numpy():
-                class_counts[int(l)] = class_counts.get(int(l), 0) + 1
+                class_counts_epoch[int(l)] = class_counts_epoch.get(int(l), 0) + 1
 
             if batch_idx % 5 == 0:
-                print(f"Epoch {epoch+1}, Batch {batch_idx}: Loss={loss.item():.4f}, BatchAcc={batch_correct/batch_size:.4f}")
+                print(f"Epoch {epoch+1}/{CONFIG['num_epochs']}, Batch {batch_idx}: Loss={loss.item():.4f}, BatchAcc={batch_correct/batch_size:.4f}")
 
-        # epoch metrics using actual processed samples
+        # Epoch metrics
         if total_samples > 0:
             epoch_loss = total_loss / total_samples
             epoch_acc = total_correct / total_samples
-            print(f"Epoch {epoch+1}: Loss={epoch_loss:.4f}, Acc={epoch_acc:.4f}, Samples={total_samples}")
-            print("Label distribution in epoch:", class_counts)
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch+1}/{CONFIG['num_epochs']} Summary:")
+            print(f"  Training Loss: {epoch_loss:.4f}")
+            print(f"  Training Acc:  {epoch_acc:.4f}")
+            print(f"  Samples:       {total_samples}")
+            print(f"  Label distribution: {class_counts_epoch}")
+            
+            # Validation
+            if len(val_loader) > 0:
+                temp_model = ActionRecognitionModel(model, label_to_idx, idx_to_label, 
+                                                   feature_dim, sequence_length)
+                val_acc = validate_classifier(encoder, temp_model, val_loader, device)
+                
+                # Early stopping check
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_model_state = model.state_dict().copy()
+                    patience_counter = 0
+                    print(f"  ✓ New best validation accuracy: {val_acc:.4f}")
+                else:
+                    patience_counter += 1
+                    print(f"  No improvement ({patience_counter}/{CONFIG['early_stopping_patience']})")
+                    
+                    if patience_counter >= CONFIG['early_stopping_patience']:
+                        print(f"\n⏹️  Early stopping triggered at epoch {epoch+1}")
+                        print(f"  Best validation accuracy: {best_val_acc:.4f}")
+                        break
+            print(f"{'='*60}\n")
         else:
             print(f"Epoch {epoch+1}: No samples processed!")
+
+    # Restore best model if we have validation data
+    if best_model_state is not None:
+        print(f"✓ Restoring best model (val_acc={best_val_acc:.4f})")
+        model.load_state_dict(best_model_state)
 
     # Wrap & save
     action_model = ActionRecognitionModel(
@@ -406,12 +466,14 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
     return action_model
 
 # =============================
-# Validation function
+# Validation function (IMPROVED)
 # =============================
 def validate_classifier(encoder, action_model, val_loader, device):
     action_model.model.eval()
     total_correct = 0
     total_samples = 0
+    class_correct = {}
+    class_total = {}
     
     with torch.no_grad():
         for clips, labels in val_loader:
@@ -425,35 +487,46 @@ def validate_classifier(encoder, action_model, val_loader, device):
             labels = labels.to(device)
             
             outputs = action_model.model(batch_sequences)
-            total_correct += (outputs.argmax(1) == labels).sum().item()
+            preds = outputs.argmax(1)
+            
+            total_correct += (preds == labels).sum().item()
             total_samples += labels.size(0)
+            
+            # Per-class accuracy
+            for label, pred in zip(labels, preds):
+                label_item = label.item()
+                class_total[label_item] = class_total.get(label_item, 0) + 1
+                if label == pred:
+                    class_correct[label_item] = class_correct.get(label_item, 0) + 1
     
     accuracy = total_correct / total_samples if total_samples > 0 else 0
-    print(f"Validation Accuracy: {accuracy:.4f}")
+    print(f"  Validation Accuracy: {accuracy:.4f} ({total_correct}/{total_samples})")
     
-    # Print class-wise accuracy
-    print("\nClass mappings:")
-    for idx, label in action_model.idx_to_label.items():
-        print(f"  {idx}: {label}")
+    # Print per-class accuracy
+    if class_total:
+        print(f"  Per-class accuracy:")
+        for idx in sorted(class_total.keys()):
+            correct = class_correct.get(idx, 0)
+            total = class_total[idx]
+            acc = correct / total if total > 0 else 0
+            label_name = action_model.idx_to_label[idx]
+            print(f"    {label_name} (class {idx}): {acc:.4f} ({correct}/{total})")
     
     return accuracy
 
 # =============================
-# NEW: Example of how to load and use the model later
+# Example of how to load and use the model later
 # =============================
 def load_and_test_model(encoder, test_video_path):
     """Example function showing how to load and use the saved model"""
     try:
-        # Load the saved model with labels
         action_model = ActionRecognitionModel.load(CONFIG['model_save_path'])
         
-        # Load and preprocess test video
-        dataset = VideoDataset("dummy")  # Create dummy dataset to use its methods
+        dataset = VideoDataset("dummy")
         frames = dataset._load_video(test_video_path)
         frames = dataset._sample_frames(frames)
         frames = np.array(frames, dtype=np.float32)
         
-        # Predict
         result = action_model.predict(encoder, frames)
         
         print(f"\nPrediction for {test_video_path}:")
@@ -470,9 +543,13 @@ def load_and_test_model(encoder, test_video_path):
         return None
 
 # =============================
-# Main (MODIFIED to use new structure)
+# Main (IMPROVED)
 # =============================
 if __name__ == "__main__":
+    # Set random seed for reproducibility
+    set_seed(42)
+    print("✓ Random seed set to 42 for reproducibility\n")
+    
     # Check if model files exist
     if not os.path.exists(ENCODER_XML) or not os.path.exists(ENCODER_BIN):
         print(f"Error: Intel model files not found at:")
@@ -488,13 +565,18 @@ if __name__ == "__main__":
         print("No training samples found! Please check your dataset structure.")
         exit(1)
         
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
-    print(f"Classes: {train_dataset.labels}")
+    print(f"\n📁 Dataset Information:")
+    print(f"  Training samples:   {len(train_dataset)}")
+    print(f"  Validation samples: {len(val_dataset)}")
+    print(f"  Classes: {train_dataset.labels}")
+    print()
     
     # Get label mappings from dataset
     label_to_idx, idx_to_label = train_dataset.get_label_mapping()
-    print(f"Label mapping: {label_to_idx}")
+    print(f"📝 Label mapping:")
+    for label, idx in sorted(label_to_idx.items(), key=lambda x: x[1]):
+        print(f"  {idx}: {label}")
+    print()
     
     train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, drop_last=True)
@@ -502,14 +584,22 @@ if __name__ == "__main__":
     encoder = IntelFeatureExtractor(ENCODER_XML, ENCODER_BIN)
     
     # Train and get the action model with label information
+    print(f"\n🚀 Starting training...\n")
     action_model = train_classifier(encoder, train_loader, val_loader, 
                                   num_classes=len(train_dataset.labels),
                                   label_to_idx=label_to_idx,
                                   idx_to_label=idx_to_label)
     
-    # Validate the model
-    device = torch.device("cpu")
-    validate_classifier(encoder, action_model, val_loader, device)
+    # Final validation
+    if len(val_loader) > 0:
+        print(f"\n📊 Final Validation:")
+        device = torch.device("cpu")
+        validate_classifier(encoder, action_model, val_loader, device)
     
-    print(f"\n✓ Training completed! Model and labels saved.")
+    print(f"\n✅ Training completed! Model and labels saved.")
+    print(f"✓ Model path: {CONFIG['model_save_path']}")
     print(f"✓ You can now load the model using: ActionRecognitionModel.load('{CONFIG['model_save_path']}')")
+    print(f"\n💡 Tips for better results:")
+    print(f"  - Ensure each class has at least 20-30 videos")
+    print(f"  - Balance your dataset (similar number of videos per class)")
+    print(f"  - Use validation data to monitor training progress")
