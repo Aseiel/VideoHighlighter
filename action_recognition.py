@@ -10,39 +10,84 @@ import argparse
 from collections import Counter
 
 # =============================
-# Load Kinetics-400 labels
+# Load labels - support both Kinetics-400 and custom models
 # =============================
 BASE_DIR = Path(__file__).parent.resolve()
-with open(BASE_DIR / "kinetics_400_labels.json", "r") as f:
-    KINETICS_400_LABELS = json.load(f)
+
+# Try to load custom model labels first, fall back to Kinetics-400
+CUSTOM_MAPPING_PATH = BASE_DIR / "intel_finetuned_classifier_3d_mapping.json"
+KINETICS_LABELS_PATH = BASE_DIR / "kinetics_400_labels.json"
+
+# Global variables for label mappings
+CUSTOM_LABELS = None
+KINETICS_400_LABELS = None
+
+def load_label_mappings():
+    global CUSTOM_LABELS, KINETICS_400_LABELS
+    
+    # Load custom model labels
+    if CUSTOM_MAPPING_PATH.exists():
+        with open(CUSTOM_MAPPING_PATH, "r") as f:
+            custom_data = json.load(f)
+            CUSTOM_LABELS = custom_data.get('idx_to_label', {})
+            # Convert string keys to integers
+            CUSTOM_LABELS = {int(k): v for k, v in CUSTOM_LABELS.items()}
+        print(f"✓ Loaded custom model labels: {len(CUSTOM_LABELS)} classes")
+        print(f"  Custom classes: {list(CUSTOM_LABELS.values())}")
+    else:
+        print("⚠️ Custom model labels not found, using Kinetics-400 only")
+        CUSTOM_LABELS = None
+    
+    # Load Kinetics-400 labels
+    if KINETICS_LABELS_PATH.exists():
+        with open(KINETICS_LABELS_PATH, "r") as f:
+            KINETICS_400_LABELS = json.load(f)
+        print(f"✓ Loaded Kinetics-400 labels: {len(KINETICS_400_LABELS)} classes")
+    else:
+        print("⚠️ Kinetics-400 labels not found")
+
+# Call this at startup
+load_label_mappings()
 
 def get_action_name(action_id):
-    return KINETICS_400_LABELS.get(str(action_id), f"action_{action_id}")
+    """Get action name - try custom labels first, then Kinetics-400"""
+    if CUSTOM_LABELS and action_id in CUSTOM_LABELS:
+        return CUSTOM_LABELS[action_id]
+    elif KINETICS_400_LABELS:
+        return KINETICS_400_LABELS.get(str(action_id), f"action_{action_id}")
+    else:
+        return f"action_{action_id}"
+
+def get_id_from_name(name):
+    """Get action ID - try custom labels first, then Kinetics-400"""
+    # Try custom labels
+    if CUSTOM_LABELS:
+        for idx, action_name in CUSTOM_LABELS.items():
+            if action_name.lower() == name.lower():
+                return idx
+    
+    # Try Kinetics-400
+    if KINETICS_400_LABELS:
+        for k, v in KINETICS_400_LABELS.items():
+            if v.lower() == name.lower():
+                return int(k)
+    
+    raise ValueError(f"Action '{name}' not found in any label set")
 
 # =============================
 # Model paths
 # =============================
 ENCODER_XML = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.xml"
 ENCODER_BIN = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin"
-DECODER_XML = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
-DECODER_BIN = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 
-# Custom model
-# DECODER_XML = BASE_DIR / "action_classifier_3d.xml"
-# DECODER_BIN = BASE_DIR / "action_classifier_3d.bin"
-
+# Custom model (2-class or small model)
+DECODER_XML = BASE_DIR / "action_classifier_3d.xml"
+DECODER_BIN = BASE_DIR / "action_classifier_3d.bin"
 
 SEQUENCE_LENGTH = 16
 
-
-def get_id_from_name(name):
-    for k, v in KINETICS_400_LABELS.items():
-        if v.lower() == name.lower():
-            return int(k)
-    raise ValueError(f"Action '{name}' not found in labels")
-
 # =============================
-# Async Inference Engine with GUI Stats
+# Async Inference Engine
 # =============================
 class AsyncBatchedInferenceEngine:
     def __init__(self, compiled_model, input_layer, output_layer, num_requests=2):
@@ -91,8 +136,19 @@ def load_models(device="AUTO"):
 
     print(f"Using device: {selected_device}")
 
+    # Check if custom model exists, otherwise use default
+    if DECODER_XML.exists() and DECODER_BIN.exists():
+        print("✓ Using custom fine-tuned model")
+        decoder_model_path = DECODER_XML
+        decoder_weights_path = DECODER_BIN
+    else:
+        print("⚠️ Custom model not found, using default Kinetics-400 model")
+        # You might want to set default Kinetics-400 decoder paths here
+        decoder_model_path = DECODER_XML  # This will fail if files don't exist
+        decoder_weights_path = DECODER_BIN
+
     encoder_model = ie.read_model(model=ENCODER_XML, weights=ENCODER_BIN)
-    decoder_model = ie.read_model(model=DECODER_XML, weights=DECODER_BIN)
+    decoder_model = ie.read_model(model=decoder_model_path, weights=decoder_weights_path)
 
     compiled_encoder = ie.compile_model(model=encoder_model, device_name=selected_device)
     compiled_decoder = ie.compile_model(model=decoder_model, device_name=selected_device)
@@ -131,8 +187,10 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     if interesting_actions is not None:
         interesting_actions_set = set([s.lower() for s in interesting_actions])
+        print(f"🔍 Monitoring for actions: {interesting_actions_set}")
     else:
         interesting_actions_set = None
+        print("🔍 Monitoring all actions")
 
     compiled_encoder, encoder_input, encoder_output, compiled_decoder, decoder_input, decoder_output, actual_device = load_models(device)
     encoder_engine = AsyncBatchedInferenceEngine(compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
@@ -185,61 +243,50 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 if len(sequence_buffer) == SEQUENCE_LENGTH:
                     sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
                     predictions = compiled_decoder([sequence_array])[decoder_output].flatten()
+                    num_classes = len(predictions)
 
+                    # ====================================
+                    # Unified handling for any output size
+                    # ====================================
                     if interesting_actions_set:
-                        # Check if this is binary classification (single output)
-                        if len(predictions) == 1:
-                            # Binary classification - single output value
-                            score = float(predictions[0])
-                            
-                            if score >= confidence_threshold:
-                                # Use the first (and likely only) interesting action name
-                                action_name = list(interesting_actions_set)[0]
+                        # Check if we're using custom model or Kinetics-400
+                        is_custom_model = CUSTOM_LABELS is not None
+                        
+                        if debug:
+                            print(f"Model type: {'Custom' if is_custom_model else 'Kinetics-400'}, Classes: {num_classes}")
+                        
+                        for action_name in interesting_actions_set:
+                            try:
                                 action_id = get_id_from_name(action_name)
                                 
-                                writer.writerow([timestamp_str, frame_id, action_id, action_name, score, timestamp_secs])
-                                all_actions.append((timestamp_secs, frame_id, action_id, score, action_name))
-                                detection_count += 1
-                                if debug:
-                                    print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
-                        else:
-                            # Multi-class classification - check only requested actions
-                            for action_name in interesting_actions_set:
-                                action_id = get_id_from_name(action_name)
-                                score = float(predictions[action_id])
-                                
-                                if score >= confidence_threshold:
-                                    writer.writerow([timestamp_str, frame_id, action_id, action_name, score, timestamp_secs])
-                                    all_actions.append((timestamp_secs, frame_id, action_id, score, action_name))
-                                    detection_count += 1
+                                # Safety check: make sure action_id is within model output range
+                                if action_id < num_classes:
+                                    score = float(predictions[action_id])
+                                    if score >= confidence_threshold:
+                                        writer.writerow([timestamp_str, frame_id, action_id, action_name, score, timestamp_secs])
+                                        all_actions.append((timestamp_secs, frame_id, action_id, score, action_name))
+                                        detection_count += 1
+                                        if debug:
+                                            print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
+                                else:
                                     if debug:
-                                        print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
+                                        print(f"⚠️ Action '{action_name}' ID {action_id} out of range (max: {num_classes-1})")
+                                        
+                            except ValueError as e:
+                                if debug:
+                                    print(f"⚠️ {e}")
                     else:
-                        # No interesting actions specified - use fallback behavior
-                        if len(predictions) == 1:
-                            # Binary classification fallback
-                            score = float(predictions[0])
+                        # --- Fallback: log all detected classes above threshold ---
+                        top_indices = np.argsort(predictions)[-top_k:][::-1]
+                        for idx in top_indices:
+                            score = float(predictions[idx])
                             if score >= confidence_threshold:
-                                action_name = "detected_action"  # Default name for binary case
-                                writer.writerow([timestamp_str, frame_id, 0, action_name, score, timestamp_secs])
-                                all_actions.append((timestamp_secs, frame_id, 0, score, action_name))
+                                action_name = get_action_name(idx)
+                                writer.writerow([timestamp_str, frame_id, idx, action_name, score, timestamp_secs])
+                                all_actions.append((timestamp_secs, frame_id, idx, score, action_name))
                                 detection_count += 1
                                 if debug:
                                     print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
-                        else:
-                            # Multi-class fallback - use top-k
-                            top_indices = np.argsort(predictions)[-top_k:][::-1]
-                            for idx in top_indices:
-                                score = float(predictions[idx])
-                                action_name = get_action_name(idx)
-                                
-                                if score >= confidence_threshold:
-                                    writer.writerow([timestamp_str, frame_id, idx, action_name, score, timestamp_secs])
-                                    all_actions.append((timestamp_secs, frame_id, idx, score, action_name))
-                                    detection_count += 1
-                                    if debug:
-                                        print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
-
 
             prev_req = req
             processed_frames += 1
@@ -269,17 +316,15 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
                 predictions = compiled_decoder([sequence_array])[decoder_output].flatten()
                 top_indices = np.argsort(predictions)[-top_k:][::-1]
-
                 for idx in top_indices:
                     score = float(predictions[idx])
                     action_name = get_action_name(idx)
                     if score >= confidence_threshold:
-                        if interesting_actions_set is None or action_name.lower() in interesting_actions_set:
-                            writer.writerow([timestamp_str, frame_id, idx, action_name, score, timestamp_secs])
-                            all_actions.append((timestamp_secs, frame_id, idx, score, action_name))
-                            detection_count += 1
-                            if debug:
-                                print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
+                        writer.writerow([timestamp_str, frame_id, idx, action_name, score, timestamp_secs])
+                        all_actions.append((timestamp_secs, frame_id, idx, score, action_name))
+                        detection_count += 1
+                        if debug:
+                            print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
 
     cap.release()
 
@@ -295,7 +340,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     return all_actions
 
 # =============================
-# Debug / Analysis Functions
+# Debug / Analysis
 # =============================
 def print_top_actions(all_actions, top_n=20):
     sorted_actions = sorted(all_actions, key=lambda x: x[3], reverse=True)
@@ -357,7 +402,14 @@ if __name__ == "__main__":
     parser.add_argument("--show-video", action="store_true")
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--confidence", type=float, default=0.01)
+    parser.add_argument("--actions", type=str, nargs="+", help="Specific actions to monitor")
     args = parser.parse_args()
+
+    # Print model info
+    if CUSTOM_LABELS:
+        print(f"🎯 Using custom model with {len(CUSTOM_LABELS)} classes: {list(CUSTOM_LABELS.values())}")
+    else:
+        print("🎯 Using Kinetics-400 model with 400 classes")
 
     results = run_action_detection(
         video_path=args.input,
@@ -367,7 +419,8 @@ if __name__ == "__main__":
         debug=args.debug,
         top_k=args.top_k,
         confidence_threshold=args.confidence,
-        show_video=args.show_video
+        show_video=args.show_video,
+        interesting_actions=args.actions
     )
 
     print_top_actions(results)
