@@ -18,8 +18,10 @@ def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 # =============================
 # How to
@@ -41,6 +43,8 @@ CONFIG = {
     "model_save_path": "intel_finetuned_classifier_3d.pth",
     "label_mapping_save_path": "label_mapping.json",
     "early_stopping_patience": 5,  # Early stopping
+    "min_train_per_action": 5,     # Minimum videos per action in training
+    "min_val_per_action": 0,       # Minimum videos per action in validation
 }
 
 # =============================
@@ -113,6 +117,58 @@ class VideoDataset(Dataset):
     def get_label_mapping(self):
         """Return label to index and index to label mappings"""
         return self.label_to_idx, self.idx_to_label
+
+# =============================
+# Dataset validation function
+# =============================
+def validate_dataset_size(train_dataset, val_dataset):
+    """Check if dataset has minimum required videos per action"""
+    min_train = CONFIG['min_train_per_action']
+    min_val = CONFIG['min_val_per_action']
+    
+    print(f"\n📊 Validating dataset size...")
+    print(f"  Minimum training videos per action: {min_train}")
+    print(f"  Minimum validation videos per action: {min_val}")
+    
+    # Count videos per action in training set
+    train_counts = {}
+    for _, label in train_dataset.samples:
+        action = train_dataset.idx_to_label[label]
+        train_counts[action] = train_counts.get(action, 0) + 1
+    
+    # Count videos per action in validation set
+    val_counts = {}
+    for _, label in val_dataset.samples:
+        action = val_dataset.idx_to_label[label]
+        val_counts[action] = val_counts.get(action, 0) + 1
+    
+    # Check thresholds and filter valid actions
+    valid_actions = []
+    for action in train_dataset.labels:
+        train_count = train_counts.get(action, 0)
+        val_count = val_counts.get(action, 0)  # Use get() to avoid KeyError
+        
+        if train_count >= min_train and val_count >= min_val:
+            print(f"  ✅ Action '{action}': {train_count} train, {val_count} val")
+            valid_actions.append(action)
+        else:
+            if train_count < min_train:
+                print(f"  ⚠️  Action '{action}': {train_count} train videos (need {min_train}) - SKIPPED")
+            if val_count < min_val:
+                print(f"  ⚠️  Action '{action}': {val_count} val videos (need {min_val}) - SKIPPED")
+    
+    if len(valid_actions) == 0:
+        print("\n❌ No actions meet minimum requirements. Please collect more videos.")
+        return False, []
+    
+    print(f"\n✅ Dataset validation passed! Training with {len(valid_actions)} actions:")
+    for action in valid_actions:
+        # Use get() to safely access counts
+        train_count = train_counts.get(action, 0)
+        val_count = val_counts.get(action, 0)  # This will now work even if action is missing from val_counts
+        print(f"   - {action}: {train_count} train, {val_count} val")
+    
+    return True, valid_actions
 
 # =============================
 # Intel Feature Extractor
@@ -372,6 +428,9 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
     
     for epoch in range(CONFIG['num_epochs']):
         model.train()
+        for m in model.modules():
+            if isinstance(m, nn.Dropout):
+                m.p = 0.0
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
@@ -571,15 +630,56 @@ if __name__ == "__main__":
     print(f"  Classes: {train_dataset.labels}")
     print()
     
+    # Validate dataset size and filter actions
+    is_valid, valid_actions = validate_dataset_size(train_dataset, val_dataset)
+    if not is_valid:
+        print("\n❌ Training aborted due to insufficient data.")
+        exit(1)
+    
+    # Filter datasets to only include valid actions
+    if len(valid_actions) < len(train_dataset.labels):
+        print(f"\n🔄 Filtering datasets to include only valid actions...")
+        
+        # Create old to new index mapping
+        old_to_new_idx = {train_dataset.label_to_idx[action]: new_idx for new_idx, action in enumerate(valid_actions)}
+        
+        # Filter training samples
+        train_dataset.samples = [
+            (path, old_to_new_idx[label]) 
+            for path, label in train_dataset.samples 
+            if label in old_to_new_idx
+        ]
+        
+        # Filter validation samples
+        val_dataset.samples = [
+            (path, old_to_new_idx[label]) 
+            for path, label in val_dataset.samples 
+            if label in old_to_new_idx
+        ]
+        
+        # Update label mappings
+        train_dataset.labels = valid_actions
+        train_dataset.label_to_idx = {label: idx for idx, label in enumerate(valid_actions)}
+        train_dataset.idx_to_label = {idx: label for label, idx in train_dataset.label_to_idx.items()}
+        
+        val_dataset.labels = valid_actions
+        val_dataset.label_to_idx = train_dataset.label_to_idx
+        val_dataset.idx_to_label = train_dataset.idx_to_label
+        
+        print(f"✅ Filtered dataset:")
+        print(f"  Training samples: {len(train_dataset.samples)}")
+        print(f"  Validation samples: {len(val_dataset.samples)}")
+        print(f"  Final classes: {valid_actions}")
+    
     # Get label mappings from dataset
     label_to_idx, idx_to_label = train_dataset.get_label_mapping()
-    print(f"📝 Label mapping:")
+    print(f"\n📝 Final label mapping:")
     for label, idx in sorted(label_to_idx.items(), key=lambda x: x[1]):
         print(f"  {idx}: {label}")
     print()
     
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, drop_last=True)
+    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
 
     encoder = IntelFeatureExtractor(ENCODER_XML, ENCODER_BIN)
     

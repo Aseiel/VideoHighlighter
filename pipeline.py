@@ -423,7 +423,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
 
         print("Detections per second:", len(object_detections))
 
-        def group_consecutive_adaptive(actions, max_gap=1.3, jump_threshold=0.01):
+        def group_consecutive_adaptive(actions, max_gap=1.3, jump_threshold=0.0001):
             """
             Groups consecutive actions of the same type if:
             - time gap <= max_gap
@@ -523,7 +523,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                         normalized_detections.append(detection)
                 
                 # 1️⃣ Group consecutive actions chronologically
-                grouped_actions = group_consecutive_adaptive(normalized_detections, max_gap=1.3, jump_threshold=0.45)
+                grouped_actions = group_consecutive_adaptive(normalized_detections, max_gap=1.3, jump_threshold=0.01)
 
                 print(f"\nDEBUG: Grouped {len(normalized_detections)} individual actions into {len(grouped_actions)} sequences")
                 
@@ -988,6 +988,8 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
         progress.update_progress(90, 100, "Pipeline", "Creating highlight video...")
         log("🔹 Step 7: Cutting video segments...")
         try:
+            base_name = os.path.splitext(OUTPUT_FILE)[0]
+
             if len(segments) == 0:
                 log("⚠️ No segments selected — nothing to cut.")
             elif len(segments) == 1:
@@ -997,7 +999,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 temp_clips = []
                 for i, (s, e) in enumerate(segments):
                     check_cancellation(cancel_flag, log, f"video cutting clip {i+1}")
-                    temp_name = f"temp_clip_{i}.mp4"
+                    temp_name = f"{base_name}_temp_clip_{i}.mp4"
                     cut_video(video_path, s, e, temp_name)
                     temp_clips.append(temp_name)
                     # Update progress for each clip
