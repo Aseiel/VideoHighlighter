@@ -10,6 +10,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from openvino.runtime import Core
+from tqdm import tqdm
+
+# =============================
+# How to
+# =============================
+# Put short 5-10s videos to dataset/train/{action_name} and dataset/val/{action_name}
+# Usually You should put minimum 100+ videos for train and 20+ for val
 
 # =============================
 # Set Random Seed for Reproducibility
@@ -22,29 +29,27 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
-# =============================
-# How to
-# =============================
-# put short 5-10s videos to dataset/train/action_name and dataset/val/action_name
-# usually You should put minimum 100+ videos for train and 20+ for val
-
-
 # =============================
 # Configuration
 # =============================
 CONFIG = {
     "data_path": "dataset",
-    "batch_size": 2,           # small batch for CPU
-    "learning_rate": 1e-3,
-    "num_epochs": 20,          # Increased from 5 to 20
+    "batch_size": 2,
+    "learning_rate": 1e-4,
+    "num_epochs": 25,
     "sequence_length": 16,
-    "frame_size": (224, 224),  # Intel encoder expects 224x224
+    "frame_size": (256, 256),
+    "crop_size": (224, 224),
+    "fps_target": 30,
+    "center_jitter": 0.1,
+    "target_fps": 15,
+    "clip_stride": 8,
     "model_save_path": "intel_finetuned_classifier_3d.pth",
     "label_mapping_save_path": "label_mapping.json",
-    "early_stopping_patience": 5,  # Early stopping
-    "min_train_per_action": 5,     # Minimum videos per action in training
-    "min_val_per_action": 0,       # Minimum videos per action in validation
+    "early_stopping_patience": 5,
+    "min_train_per_action": 5,
+    "min_val_per_action": 0,
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
 
 # =============================
@@ -53,70 +58,167 @@ CONFIG = {
 BASE_DIR = os.getcwd()
 ENCODER_XML = os.path.join(BASE_DIR, "models/intel_action/encoder/FP32/action-recognition-0001-encoder.xml")
 ENCODER_BIN = os.path.join(BASE_DIR, "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin")
-SEQUENCE_LENGTH = CONFIG['sequence_length']
 
 # =============================
-# Dataset 
+# VIDEO PREPROCESSING HELPERS
+# =============================
+def center_crop(frame, crop_size=(224, 224), jitter=0.1):
+    """Crop around center with slight random jitter."""
+    h, w, _ = frame.shape
+    ch, cw = crop_size
+    jh = int(jitter * (h - ch))
+    jw = int(jitter * (w - cw))
+    y = max(0, h // 2 - ch // 2 + random.randint(-jh, jh))
+    x = max(0, w // 2 - cw // 2 + random.randint(-jw, jw))
+    return frame[y:y+ch, x:x+cw]
+
+def load_video_normalized(path, is_training=True):
+    """Load video, normalize FPS, resize, and crop center with jitter."""
+    cap = cv2.VideoCapture(path)
+    orig_fps = cap.get(cv2.CAP_PROP_FPS) or CONFIG["fps_target"]
+    frame_skip = max(1, int(round(orig_fps / CONFIG["fps_target"])))
+
+    frames = []
+    idx = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if idx % frame_skip == 0:
+            frame = cv2.resize(frame, CONFIG["frame_size"])
+            if is_training:
+                frame = center_crop(frame, CONFIG["crop_size"], CONFIG["center_jitter"])
+            else:
+                # Center crop without jitter for validation
+                h, w, _ = frame.shape
+                ch, cw = CONFIG["crop_size"]
+                y = max(0, h // 2 - ch // 2)
+                x = max(0, w // 2 - cw // 2)
+                frame = frame[y:y+ch, x:x+cw]
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = frame.astype(np.float32) / 255.0
+            frames.append(frame)
+        idx += 1
+
+    cap.release()
+    return np.array(frames)
+
+# =============================
+# VideoDataset
 # =============================
 class VideoDataset(Dataset):
-    def __init__(self, root, sequence_length=16):
-        self.samples = []
+    def __init__(self, root, sequence_length=16, target_fps=15, stride=8, is_training=True):
+        self.video_samples = []  # list of (video_path, label)
         self.sequence_length = sequence_length
+        self.target_fps = target_fps
+        self.stride = stride
+        self.is_training = is_training
+
         if not os.path.exists(root):
             print(f"Warning: Dataset path {root} does not exist")
             self.labels = []
             self.label_to_idx = {}
+            self.idx_to_label = {}
+            self.samples = []  # legacy support
             return
-            
-        self.labels = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
-        self.label_to_idx = {label: idx for idx, label in enumerate(self.labels)}
-        self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
 
+        # First pass: collect all class folders
+        class_folders = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+        
+        # Create label mapping from folder names
+        self.label_to_idx = {label: idx for idx, label in enumerate(class_folders)}
+        self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
+        self.labels = class_folders
+        
+        print(f"📊 Detected {len(self.labels)} action classes:")
+        for label, idx in self.label_to_idx.items():
+            print(f"  {idx}: {label}")
+
+        # Second pass: collect videos with correct labels
+        video_count = 0
         for label in self.labels:
             label_path = os.path.join(root, label)
             video_files = glob.glob(os.path.join(label_path, "*.mp4")) + \
                           glob.glob(os.path.join(label_path, "*.avi")) + \
                           glob.glob(os.path.join(label_path, "*.mov"))
             for video_path in video_files:
-                self.samples.append((video_path, self.label_to_idx[label]))
-        
-        print(f"Found {len(self.samples)} samples in {root}")
+                self.video_samples.append((video_path, self.label_to_idx[label]))
+                video_count += 1
+
+        print(f"✅ Found {video_count} videos in {root} across {len(self.labels)} actions")
+        print(f"✅ Label index range: 0 to {len(self.labels) - 1}")
+
+        # ✅ Legacy support for old code
+        self.samples = self.video_samples
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.video_samples)
 
     def __getitem__(self, idx):
-        video_path, label = self.samples[idx]
-        frames = self._load_video(video_path)
-        frames = self._sample_frames(frames)
-        frames = np.array(frames, dtype=np.float32)
-        return frames, label
-
-    def _load_video(self, path):
-        cap = cv2.VideoCapture(path)
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.resize(frame, CONFIG['frame_size'])
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame)
-        cap.release()
-        return frames
-
-    def _sample_frames(self, frames):
-        total = len(frames)
-        if total >= self.sequence_length:
-            indices = np.linspace(0, total-1, self.sequence_length, dtype=int)
-            return [frames[i] for i in indices]
+        video_path, label = self.video_samples[idx]
+        
+        # Load video with our improved preprocessing
+        frames = load_video_normalized(video_path, self.is_training)
+        
+        # Generate multiple clips from the video
+        clips = self._generate_clips(frames)
+        
+        if self.is_training:
+            # During training: randomly select one clip for data augmentation
+            selected_clip = random.choice(clips) if clips else None
         else:
-            last = frames[-1]
-            return frames + [last] * (self.sequence_length - total)
+            # During validation: use the center clip for consistency
+            selected_clip = clips[len(clips) // 2] if len(clips) > 0 else clips[0] if clips else None
+        
+        if selected_clip is None:
+            # Create a dummy clip if no clips were generated
+            selected_clip = np.zeros((self.sequence_length, CONFIG["crop_size"][0], CONFIG["crop_size"][1], 3), dtype=np.float32)
+        
+        # Convert to tensor format
+        selected_clip = np.transpose(selected_clip, (0, 3, 1, 2))  # TCHW format
+        return torch.tensor(selected_clip, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
+
+    def _generate_clips(self, frames):
+        """Split frames into overlapping clips of sequence_length"""
+        clips = []
+        total_frames = len(frames)
+        
+        if total_frames < self.sequence_length:
+            # If video is too short, pad with last frame
+            padded_frames = np.zeros((self.sequence_length, *frames.shape[1:]), dtype=frames.dtype)
+            padded_frames[:total_frames] = frames
+            padded_frames[total_frames:] = frames[-1]
+            clips.append(padded_frames)
+        else:
+            # Generate overlapping clips
+            for start_idx in range(0, total_frames - self.sequence_length + 1, self.stride):
+                end_idx = start_idx + self.sequence_length
+                clip = frames[start_idx:end_idx]
+                clips.append(clip)
+            
+            # Ensure we include the last frames
+            if (total_frames - self.sequence_length) % self.stride != 0:
+                last_clip = frames[-self.sequence_length:]
+                clips.append(last_clip)
+        
+        return clips
 
     def get_label_mapping(self):
-        """Return label to index and index to label mappings"""
         return self.label_to_idx, self.idx_to_label
+
+    def analyze_class_distribution(self):
+        """Analyze the distribution of videos per class"""
+        print(f"\n📊 Class Distribution Analysis:")
+        class_counts = {label: 0 for label in self.labels}
+        
+        for _, label in self.video_samples:
+            class_name = self.idx_to_label[label]
+            class_counts[class_name] += 1
+        
+        for class_name, count in sorted(class_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {class_name}: {count} videos")
+        
+        return class_counts
 
 # =============================
 # Dataset validation function
@@ -130,23 +232,14 @@ def validate_dataset_size(train_dataset, val_dataset):
     print(f"  Minimum training videos per action: {min_train}")
     print(f"  Minimum validation videos per action: {min_val}")
     
-    # Count videos per action in training set
-    train_counts = {}
-    for _, label in train_dataset.samples:
-        action = train_dataset.idx_to_label[label]
-        train_counts[action] = train_counts.get(action, 0) + 1
+    # Analyze class distributions
+    train_counts = train_dataset.analyze_class_distribution()
+    val_counts = val_dataset.analyze_class_distribution()
     
-    # Count videos per action in validation set
-    val_counts = {}
-    for _, label in val_dataset.samples:
-        action = val_dataset.idx_to_label[label]
-        val_counts[action] = val_counts.get(action, 0) + 1
-    
-    # Check thresholds and filter valid actions
     valid_actions = []
     for action in train_dataset.labels:
         train_count = train_counts.get(action, 0)
-        val_count = val_counts.get(action, 0)  # Use get() to avoid KeyError
+        val_count = val_counts.get(action, 0)
         
         if train_count >= min_train and val_count >= min_val:
             print(f"  ✅ Action '{action}': {train_count} train, {val_count} val")
@@ -163,9 +256,8 @@ def validate_dataset_size(train_dataset, val_dataset):
     
     print(f"\n✅ Dataset validation passed! Training with {len(valid_actions)} actions:")
     for action in valid_actions:
-        # Use get() to safely access counts
         train_count = train_counts.get(action, 0)
-        val_count = val_counts.get(action, 0)  # This will now work even if action is missing from val_counts
+        val_count = val_counts.get(action, 0)
         print(f"   - {action}: {train_count} train, {val_count} val")
     
     return True, valid_actions
@@ -179,7 +271,6 @@ class IntelFeatureExtractor:
         self.encoder_model = self.ie.read_model(model=encoder_xml, weights=encoder_bin)
         self.encoder = self.ie.compile_model(self.encoder_model, device_name="CPU")
         
-        # ✅ Fix: extract proper input name and shape
         input_tensor = self.encoder.inputs[0]
         self.input_name = input_tensor.get_any_name()
         self.input_shape = list(input_tensor.get_shape())
@@ -187,108 +278,69 @@ class IntelFeatureExtractor:
         print(f"Encoder input name: {self.input_name}")
         print(f"Encoder input shape: {self.input_shape}")
 
+    def encode(self, frames_batch):
+        """frames_batch: [B, T, C, H, W] float32 tensor in range 0-1"""
+        B, T, C, H, W = frames_batch.shape
+        feats = []
+        
+        # Process each batch item and time step separately
+        for batch_idx in range(B):
+            batch_feats = []
+            for time_idx in range(T):
+                # Get single frame: [C, H, W]
+                frame = frames_batch[batch_idx, time_idx].numpy()  # [C, H, W]
+                
+                # Add batch dimension: [1, C, H, W]
+                frame_batch = np.expand_dims(frame, axis=0)
+                
+                # Preprocess for Intel model
+                frame_batch = self._preprocess_batch(frame_batch)
+                
+                # Run inference - model expects [1, 3, 224, 224]
+                out = self.encoder([frame_batch])
+                feat = out[self.encoder.output(0)]
+                
+                # Flatten the feature if it's not 1D
+                if feat.ndim > 1:
+                    feat = feat.reshape(feat.shape[0], -1)  # [1, feature_dim]
+                batch_feats.append(feat)
+            
+            # Stack time steps for this batch item: [T, feature_dim]
+            batch_feats = np.concatenate(batch_feats, axis=0)  # [T, feature_dim]
+            feats.append(batch_feats)
+        
+        # Stack batch items: [B, T, feature_dim]
+        feats = np.stack(feats, axis=0)
+        return torch.tensor(feats, dtype=torch.float32)
 
-    def preprocess_frame(self, frame):
-        """
-        frame: HxWxC, dtype=float32, 0..255
-        returns: (3, H, W) float32 aligned to model input
-        """
-        # Ensure float32 and shape HWC
-        frame = frame.astype(np.float32)
-
-        # Normalize — model expects mean/std in pixel scale
-        mean = np.array([0.485, 0.456, 0.406]) * 255.0
-        std = np.array([0.229, 0.224, 0.225]) * 255.0
-        # broadcasting over H,W,C
-        frame = (frame - mean) / std
-
-        # HWC -> CHW
-        frame = frame.transpose(2, 0, 1)
-        return frame
-
-    def extract_sequence(self, frames):
-        """
-        frames: np.ndarray of shape (T, H, W, C) or list of frames
-        returns: torch.Tensor of shape (T, feature_dim)
-        """
-        features = []
-        seen_shape = None
-
-        for i, frame in enumerate(frames):
-            inp = self.preprocess_frame(frame)  # (3,H,W)
-            inp = np.expand_dims(inp, axis=0).astype(np.float32)  # (1,3,H,W)
-
-            # Run inference
-            result = self.encoder({self.input_name: inp})
-
-            # Get the output
-            out_tensor = list(result.values())[0]
-
-            # Convert to NumPy if it is a ConstOutput
-            if hasattr(out_tensor, "numpy"):
-                out_np = out_tensor.numpy()
-            else:
-                out_np = np.array(out_tensor)
-
-            out_np = np.squeeze(out_np)  # remove batch dimensions
-
-            # Flatten to 1D vector
-            if out_np.ndim == 0:
-                out_np = out_np.reshape(1)
-            elif out_np.ndim > 1:
-                out_np = out_np.ravel()
-
-            # Check consistency
-            if seen_shape is None:
-                seen_shape = out_np.shape
-                print(f"[extract_sequence] per-frame feature shape determined: {seen_shape}")
-            else:
-                if out_np.shape != seen_shape:
-                    raise RuntimeError(f"Inconsistent feature shape at frame {i}: {out_np.shape} != {seen_shape}")
-
-            features.append(torch.from_numpy(out_np.astype(np.float32)))
-
-        return torch.stack(features, dim=0)  # (T, feature_dim)
-
-
+    def _preprocess_batch(self, batch_frames):
+        """Preprocess batch of frames for Intel model"""
+        # batch_frames: [1, C, H, W] in range 0-1
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+        
+        # Denormalize from [0,1] to [0,255] then apply model normalization
+        batch_frames = batch_frames * 255.0
+        batch_frames = (batch_frames / 255.0 - mean) / std
+        return batch_frames.astype(np.float32)
 
 # =============================
-# Sequence-aware Classifier
+# SIMPLIFIED LSTM MODEL
 # =============================
-class SequenceActionClassifier(nn.Module):
-    def __init__(self, feature_dim, num_classes, sequence_length=16):
+class EncoderLSTM(nn.Module):
+    def __init__(self, feature_dim=1024, hidden_dim=512, num_classes=2):
         super().__init__()
-        self.sequence_length = sequence_length
-        self.feature_dim = feature_dim
-        
-        # Use LSTM to capture temporal patterns
-        self.lstm = nn.LSTM(
-            input_size=feature_dim,
-            hidden_size=256,
-            num_layers=1,
-            batch_first=True,
-            bidirectional=False
-        )
-        
-        self.classifier = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
-        )
+        self.lstm = nn.LSTM(feature_dim, hidden_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x):
-        # x shape: (batch_size, sequence_length, feature_dim)
-        
-        # LSTM processing
-        lstm_out, (hidden, _) = self.lstm(x)
-        
-        # Use the last hidden state for classification
-        out = self.classifier(hidden[-1])
-        return out
+        # x should be [batch_size, sequence_length, feature_dim]
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]  # take last frame output
+        return self.fc(out)
 
 # =============================
-# Model Manager to handle labels and model together
+# Model Manager
 # =============================
 class ActionRecognitionModel:
     def __init__(self, model, label_to_idx, idx_to_label, feature_dim, sequence_length):
@@ -298,13 +350,14 @@ class ActionRecognitionModel:
         self.feature_dim = feature_dim
         self.sequence_length = sequence_length
         self.num_classes = len(label_to_idx)
+        
+        print(f"✅ Model initialized with {self.num_classes} classes")
+        print(f"✅ Label range: 0 to {self.num_classes - 1}")
     
     def save(self, path):
         """Save both model and label mapping"""
-        # Save model state
         torch.save(self.model.state_dict(), path)
         
-        # Save label mapping as JSON
         mapping_path = path.replace('.pth', '_mapping.json')
         mapping_data = {
             'label_to_idx': self.label_to_idx,
@@ -318,6 +371,7 @@ class ActionRecognitionModel:
         
         print(f"✓ Model saved to {path}")
         print(f"✓ Label mapping saved to {mapping_path}")
+        print(f"✓ Classes: {list(self.label_to_idx.keys())}")
     
     @classmethod
     def load(cls, model_path, device='cpu'):
@@ -327,80 +381,47 @@ class ActionRecognitionModel:
         if not os.path.exists(mapping_path):
             raise FileNotFoundError(f"Label mapping file not found: {mapping_path}")
         
-        # Load label mapping
         with open(mapping_path, 'r') as f:
             mapping_data = json.load(f)
         
-        # Recreate model architecture
-        model = SequenceActionClassifier(
+        model = EncoderLSTM(
             feature_dim=mapping_data['feature_dim'],
-            num_classes=mapping_data['num_classes'],
-            sequence_length=mapping_data['sequence_length']
+            hidden_dim=512,
+            num_classes=mapping_data['num_classes']
         )
         
-        # Load model weights
         model.load_state_dict(torch.load(model_path, map_location=device))
         model.to(device)
         model.eval()
         
-        # Convert string keys back to integers for idx_to_label
         idx_to_label = {int(k): v for k, v in mapping_data['idx_to_label'].items()}
+        
+        print(f"✅ Model loaded with {mapping_data['num_classes']} classes")
+        print(f"✅ Classes: {list(mapping_data['label_to_idx'].keys())}")
         
         return cls(model, mapping_data['label_to_idx'], idx_to_label, 
                   mapping_data['feature_dim'], mapping_data['sequence_length'])
-    
-    def predict(self, encoder, frames_sequence):
-        """Predict action for a sequence of frames"""
-        self.model.eval()
-        with torch.no_grad():
-            # Extract features
-            features = encoder.extract_sequence(frames_sequence)  # (T, feature_dim)
-            features = features.unsqueeze(0)  # Add batch dimension: (1, T, feature_dim)
-            
-            # Predict
-            outputs = self.model(features)
-            probabilities = torch.softmax(outputs, dim=1)
-            predicted_idx = outputs.argmax(1).item()
-            confidence = probabilities[0][predicted_idx].item()
-            
-            predicted_label = self.idx_to_label[predicted_idx]
-            
-            return {
-                'action': predicted_label,
-                'action_id': predicted_idx,
-                'confidence': confidence,
-                'probabilities': {
-                    self.idx_to_label[i]: prob.item() 
-                    for i, prob in enumerate(probabilities[0])
-                }
-            }
 
 # =============================
-# Training loop (IMPROVED)
+# TRAINING FUNCTION
 # =============================
 def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_idx, idx_to_label):
-    device = torch.device("cpu")
+    device = torch.device(CONFIG["device"])
     print(f"Using device: {device}")
 
-    # Get feature_dim and sequence_length from a single dummy clip
+    # Determine feature dimension by processing a single sample
     with torch.no_grad():
-        dummy_frames_batch, _ = next(iter(train_loader))
-        print(f"Dummy frames batch shape (raw from loader): {dummy_frames_batch.shape}")
+        sample_frames, sample_labels = next(iter(train_loader))
+        single_frames = sample_frames[0:1]  # Take first sample only [1, T, C, H, W]
+        dummy_feats = encoder.encode(single_frames.cpu())
+        feature_dim = dummy_feats.shape[-1]
+        print(f"Determined feature_dim: {feature_dim}")
 
-        clip0 = dummy_frames_batch[0].numpy() if isinstance(dummy_frames_batch, torch.Tensor) else np.array(dummy_frames_batch[0])
-        feat_seq0 = encoder.extract_sequence(clip0)
-        print(f"Feature sequence shape from encoder: {feat_seq0.shape}")
-
-        feature_dim = feat_seq0.shape[1]
-        sequence_length = feat_seq0.shape[0]
-        print(f"Determined feature_dim={feature_dim}, sequence_length={sequence_length}")
-
-    model = SequenceActionClassifier(feature_dim, num_classes, sequence_length).to(device)
-    
-    # Calculate class weights to handle imbalance
+    # Calculate class weights for imbalanced datasets
     class_counts = [0] * num_classes
-    for _, label in train_loader.dataset:
-        class_counts[label] += 1
+    for _, label in train_loader.dataset.samples:
+        if label < num_classes:  # Only count valid labels
+            class_counts[label] += 1
     
     print(f"\n📊 Class distribution: {class_counts}")
     
@@ -414,83 +435,75 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
         print(f"⚠️  WARNING: Severe class imbalance detected (ratio: {max_samples}/{min_samples})!")
     
     # Calculate weights (inverse frequency)
-    class_weights = torch.tensor([1.0 / (count + 1e-6) for count in class_counts], dtype=torch.float)
-    class_weights = class_weights / class_weights.sum() * num_classes
-    print(f"📊 Class weights (for balancing): {class_weights.tolist()}\n")
-    
-    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
+    class_counts = np.array(class_counts, dtype=np.float32)
+    class_weights = 1.0 / (class_counts + 1e-6)
+    class_weights = class_weights / class_weights.max()  # normalize scale only
 
-    # Early stopping variables
+    print(f"📊 Class weights (for balancing): {[f'{w:.4f}' for w in class_weights.tolist()]}\n")
+
+    model = EncoderLSTM(
+        feature_dim=feature_dim,
+        hidden_dim=512,
+        num_classes=num_classes
+    ).to(device)
+    
+    # Use weighted loss for imbalanced classes
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float, device=device))
+    optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
+
     best_val_acc = 0
     best_model_state = None
     patience_counter = 0
     
     for epoch in range(CONFIG['num_epochs']):
         model.train()
-        for m in model.modules():
-            if isinstance(m, nn.Dropout):
-                m.p = 0.0
-        total_loss = 0.0
+        running_loss = 0.0
         total_correct = 0
         total_samples = 0
-        class_counts_epoch = {}
-
-        for batch_idx, (clips, labels) in enumerate(train_loader):
-            batch_sequences = []
-            for clip in clips:
-                clip_np = clip.numpy() if isinstance(clip, torch.Tensor) else np.array(clip)
-                feat_seq = encoder.extract_sequence(clip_np)
-                batch_sequences.append(feat_seq)
-
-            batch_sequences = torch.stack(batch_sequences, dim=0).to(device)
-            labels = labels.to(device, dtype=torch.long)
-
-            if batch_idx == 0 and epoch == 0:
-                print(f"[DEBUG] BATCH 0 shapes: batch_sequences={batch_sequences.shape}, labels={labels.shape}")
-
-            optimizer.zero_grad()
-            outputs = model(batch_sequences)
-
-            if outputs.ndim != 2 or outputs.shape[1] != num_classes:
-                raise RuntimeError(f"Model output shape {outputs.shape} incompatible with num_classes={num_classes}")
-
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CONFIG['num_epochs']}")
+        
+        for frames, labels in pbar:
+            frames, labels = frames.to(device), labels.to(device)
+            
+            # Extract features using batch method
+            with torch.no_grad():
+                feats = encoder.encode(frames.cpu())
+            
+            # Ensure features are on the right device
+            feats = feats.to(device)
+            
+            # Forward pass
+            outputs = model(feats)
             loss = criterion(outputs, labels)
+
+            # Backward pass
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            preds = outputs.argmax(dim=1)
-            batch_correct = (preds == labels).sum().item()
-            batch_size = labels.size(0)
-
-            total_loss += loss.item() * batch_size
-            total_correct += batch_correct
-            total_samples += batch_size
-
-            for l in labels.cpu().numpy():
-                class_counts_epoch[int(l)] = class_counts_epoch.get(int(l), 0) + 1
-
-            if batch_idx % 5 == 0:
-                print(f"Epoch {epoch+1}/{CONFIG['num_epochs']}, Batch {batch_idx}: Loss={loss.item():.4f}, BatchAcc={batch_correct/batch_size:.4f}")
-
-        # Epoch metrics
-        if total_samples > 0:
-            epoch_loss = total_loss / total_samples
-            epoch_acc = total_correct / total_samples
-            print(f"\n{'='*60}")
-            print(f"Epoch {epoch+1}/{CONFIG['num_epochs']} Summary:")
-            print(f"  Training Loss: {epoch_loss:.4f}")
-            print(f"  Training Acc:  {epoch_acc:.4f}")
-            print(f"  Samples:       {total_samples}")
-            print(f"  Label distribution: {class_counts_epoch}")
+            # Calculate accuracy
+            preds = outputs.argmax(1)
+            correct = (preds == labels).sum().item()
+            total_correct += correct
+            total_samples += labels.size(0)
             
+            running_loss += loss.item() * frames.size(0)
+            pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{correct/labels.size(0):.4f}'
+            })
+
+        # Epoch statistics
+        if total_samples > 0:
+            avg_loss = running_loss / total_samples
+            epoch_acc = total_correct / total_samples
+            print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Acc: {epoch_acc:.4f}")
+
             # Validation
             if len(val_loader) > 0:
-                temp_model = ActionRecognitionModel(model, label_to_idx, idx_to_label, 
-                                                   feature_dim, sequence_length)
-                val_acc = validate_classifier(encoder, temp_model, val_loader, device)
+                val_acc = validate_classifier(encoder, model, val_loader, device, idx_to_label)
                 
-                # Early stopping check
                 if val_acc > best_val_acc:
                     best_val_acc = val_acc
                     best_model_state = model.state_dict().copy()
@@ -504,14 +517,13 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
                         print(f"\n⏹️  Early stopping triggered at epoch {epoch+1}")
                         print(f"  Best validation accuracy: {best_val_acc:.4f}")
                         break
-            print(f"{'='*60}\n")
-        else:
-            print(f"Epoch {epoch+1}: No samples processed!")
 
-    # Restore best model if we have validation data
+    # Restore best model
     if best_model_state is not None:
         print(f"✓ Restoring best model (val_acc={best_val_acc:.4f})")
         model.load_state_dict(best_model_state)
+
+    model.eval()
 
     # Wrap & save
     action_model = ActionRecognitionModel(
@@ -519,33 +531,33 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
         label_to_idx=label_to_idx,
         idx_to_label=idx_to_label,
         feature_dim=feature_dim,
-        sequence_length=sequence_length
+        sequence_length=CONFIG['sequence_length']
     )
     action_model.save(CONFIG['model_save_path'])
     return action_model
 
 # =============================
-# Validation function (IMPROVED)
+# VALIDATION FUNCTION
 # =============================
-def validate_classifier(encoder, action_model, val_loader, device):
-    action_model.model.eval()
+def validate_classifier(encoder, model, val_loader, device, idx_to_label):
+    """Simplified validation function"""
+    model.eval()
+    torch.set_grad_enabled(False)
+    
     total_correct = 0
     total_samples = 0
     class_correct = {}
     class_total = {}
     
     with torch.no_grad():
-        for clips, labels in val_loader:
-            batch_sequences = []
-            for clip in clips:
-                clip_np = clip.numpy()
-                feat_seq = encoder.extract_sequence(clip_np)
-                batch_sequences.append(feat_seq)
+        for frames, labels in val_loader:
+            frames, labels = frames.to(device), labels.to(device)
             
-            batch_sequences = torch.stack(batch_sequences, dim=0).to(device)
-            labels = labels.to(device)
+            # Extract features
+            feats = encoder.encode(frames.cpu())
             
-            outputs = action_model.model(batch_sequences)
+            # Predict
+            outputs = model(feats.to(device))
             preds = outputs.argmax(1)
             
             total_correct += (preds == labels).sum().item()
@@ -568,138 +580,67 @@ def validate_classifier(encoder, action_model, val_loader, device):
             correct = class_correct.get(idx, 0)
             total = class_total[idx]
             acc = correct / total if total > 0 else 0
-            label_name = action_model.idx_to_label[idx]
+            label_name = idx_to_label[idx]
             print(f"    {label_name} (class {idx}): {acc:.4f} ({correct}/{total})")
     
+    torch.set_grad_enabled(True)
     return accuracy
 
 # =============================
-# Example of how to load and use the model later
-# =============================
-def load_and_test_model(encoder, test_video_path):
-    """Example function showing how to load and use the saved model"""
-    try:
-        action_model = ActionRecognitionModel.load(CONFIG['model_save_path'])
-        
-        dataset = VideoDataset("dummy")
-        frames = dataset._load_video(test_video_path)
-        frames = dataset._sample_frames(frames)
-        frames = np.array(frames, dtype=np.float32)
-        
-        result = action_model.predict(encoder, frames)
-        
-        print(f"\nPrediction for {test_video_path}:")
-        print(f"Action: {result['action']} (ID: {result['action_id']})")
-        print(f"Confidence: {result['confidence']:.4f}")
-        print("All probabilities:")
-        for action, prob in result['probabilities'].items():
-            print(f"  {action}: {prob:.4f}")
-            
-        return result
-        
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return None
-
-# =============================
-# Main (IMPROVED)
+# Main with AUTO CLASS DETECTION
 # =============================
 if __name__ == "__main__":
-    # Set random seed for reproducibility
     set_seed(42)
     print("✓ Random seed set to 42 for reproducibility\n")
     
-    # Check if model files exist
     if not os.path.exists(ENCODER_XML) or not os.path.exists(ENCODER_BIN):
         print(f"Error: Intel model files not found at:")
         print(f"  XML: {ENCODER_XML}")
         print(f"  BIN: {ENCODER_BIN}")
-        print("Please download the model using the OpenVINO Model Downloader")
         exit(1)
 
-    train_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "train"))
-    val_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "val"))
+    # Initialize datasets - they will auto-detect the correct number of classes
+    train_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "train"), is_training=True)
+    val_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "val"), is_training=False)
     
-    if len(train_dataset) == 0:
+    if len(train_dataset.samples) == 0:
         print("No training samples found! Please check your dataset structure.")
         exit(1)
         
     print(f"\n📁 Dataset Information:")
     print(f"  Training samples:   {len(train_dataset)}")
     print(f"  Validation samples: {len(val_dataset)}")
-    print(f"  Classes: {train_dataset.labels}")
+    print(f"  Total classes detected: {len(train_dataset.labels)}")
     print()
     
-    # Validate dataset size and filter actions
     is_valid, valid_actions = validate_dataset_size(train_dataset, val_dataset)
     if not is_valid:
         print("\n❌ Training aborted due to insufficient data.")
         exit(1)
     
-    # Filter datasets to only include valid actions
-    if len(valid_actions) < len(train_dataset.labels):
-        print(f"\n🔄 Filtering datasets to include only valid actions...")
-        
-        # Create old to new index mapping
-        old_to_new_idx = {train_dataset.label_to_idx[action]: new_idx for new_idx, action in enumerate(valid_actions)}
-        
-        # Filter training samples
-        train_dataset.samples = [
-            (path, old_to_new_idx[label]) 
-            for path, label in train_dataset.samples 
-            if label in old_to_new_idx
-        ]
-        
-        # Filter validation samples
-        val_dataset.samples = [
-            (path, old_to_new_idx[label]) 
-            for path, label in val_dataset.samples 
-            if label in old_to_new_idx
-        ]
-        
-        # Update label mappings
-        train_dataset.labels = valid_actions
-        train_dataset.label_to_idx = {label: idx for idx, label in enumerate(valid_actions)}
-        train_dataset.idx_to_label = {idx: label for label, idx in train_dataset.label_to_idx.items()}
-        
-        val_dataset.labels = valid_actions
-        val_dataset.label_to_idx = train_dataset.label_to_idx
-        val_dataset.idx_to_label = train_dataset.idx_to_label
-        
-        print(f"✅ Filtered dataset:")
-        print(f"  Training samples: {len(train_dataset.samples)}")
-        print(f"  Validation samples: {len(val_dataset.samples)}")
-        print(f"  Final classes: {valid_actions}")
-    
-    # Get label mappings from dataset
+    # Use ALL detected classes (no filtering needed since we auto-detect correctly)
     label_to_idx, idx_to_label = train_dataset.get_label_mapping()
-    print(f"\n📝 Final label mapping:")
-    for label, idx in sorted(label_to_idx.items(), key=lambda x: x[1]):
-        print(f"  {idx}: {label}")
-    print()
+    
+    print(f"\n🎯 Final training configuration:")
+    print(f"  Number of classes: {len(train_dataset.labels)}")
+    print(f"  Training samples: {len(train_dataset.samples)}")
+    print(f"  Validation samples: {len(val_dataset.samples)}")
     
     train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
 
     encoder = IntelFeatureExtractor(ENCODER_XML, ENCODER_BIN)
     
-    # Train and get the action model with label information
     print(f"\n🚀 Starting training...\n")
     action_model = train_classifier(encoder, train_loader, val_loader, 
                                   num_classes=len(train_dataset.labels),
                                   label_to_idx=label_to_idx,
                                   idx_to_label=idx_to_label)
     
-    # Final validation
     if len(val_loader) > 0:
         print(f"\n📊 Final Validation:")
-        device = torch.device("cpu")
-        validate_classifier(encoder, action_model, val_loader, device)
+        device = torch.device(CONFIG["device"])
+        validate_classifier(encoder, action_model.model, val_loader, device, idx_to_label)
     
     print(f"\n✅ Training completed! Model and labels saved.")
     print(f"✓ Model path: {CONFIG['model_save_path']}")
-    print(f"✓ You can now load the model using: ActionRecognitionModel.load('{CONFIG['model_save_path']}')")
-    print(f"\n💡 Tips for better results:")
-    print(f"  - Ensure each class has at least 20-30 videos")
-    print(f"  - Balance your dataset (similar number of videos per class)")
-    print(f"  - Use validation data to monitor training progress")

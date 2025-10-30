@@ -433,6 +433,51 @@ class VideoHighlighterGUI(QWidget):
             self.append_log("⚠️ Pipeline already running!")
             return
 
+        # --- NEW: Validate scoring points ---
+        scene_points = int(self.spin_scene_points.value())
+        motion_event_points = int(self.spin_motion_event_points.value())
+        motion_peak_points = int(self.spin_motion_peak.value())
+        audio_peak_points = int(self.spin_audio_peak.value())
+        
+        # Object points only count if objects are configured
+        highlight_objects = [s.strip() for s in self.objects_input.text().split(",") if s.strip()]
+        object_points = int(self.spin_object.value()) if highlight_objects else 0
+        
+        # Action points only count if actions are configured
+        interesting_actions = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
+        action_points = int(self.spin_action.value()) if interesting_actions else 0
+        
+        # Transcript and keyword points only count if transcript is enabled
+        use_transcript = self.transcript_checkbox.isChecked()
+        keyword_points = int(self.spin_keyword_points.value()) if use_transcript else 0
+        transcript_points = int(self.spin_transcript_points.value()) if use_transcript else 0
+        
+        beginning_points = 0  # Not configurable in GUI
+        ending_points = 0     # Not configurable in GUI
+        
+        total_points = (scene_points + motion_event_points + motion_peak_points + 
+                       audio_peak_points + keyword_points + transcript_points + 
+                       beginning_points + ending_points + object_points + action_points)
+        
+        if total_points == 0:
+            self.append_log("❌ ERROR: All scoring points are set to 0!")
+            self.append_log("")
+            self.append_log("Please configure at least one scoring point:")
+            self.append_log("  • Scene points")
+            self.append_log("  • Motion event points")
+            self.append_log("  • Motion peak points")
+            self.append_log("  • Audio peak points")
+            self.append_log("  • Object points")
+            self.append_log("  • Action points")
+            if use_transcript:
+                self.append_log("  • Keyword points (transcript enabled)")
+                self.append_log("  • Transcript points (transcript enabled)")
+            else:
+                self.append_log("")
+                self.append_log("Note: Transcript is disabled - keyword and transcript")
+                self.append_log("points are not counted. Enable transcript to use them.")
+            return
+
         exact_duration_val = int(self.spin_exact_duration.value())
         exact_duration = exact_duration_val if exact_duration_val > 0 else None
         
