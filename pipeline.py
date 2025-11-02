@@ -83,8 +83,39 @@ def check_xpu_availability(log_fn=print):
 
 def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=print,
                                  progress_fn=None, frame_skip=5, cancel_flag=None,
-                                 csv_output="object_log.csv"):
+                                 csv_output="object_log.csv", draw_boxes=False,
+                                 annotated_output=None):
     """Object detection with progress tracking, cancellation support, and optional CSV export in mm:ss format"""
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        log_fn(f"❌ Failed to open video: {video_path}")
+        return {}  # or raise an exception
+    
+    # Get fps for video writer
+    fps_local = cap.get(cv2.CAP_PROP_FPS)
+
+    # Setup video writer if drawing boxes
+    video_writer = None
+    if draw_boxes and annotated_output:
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(annotated_output, fourcc, fps_local, (frame_width, frame_height))
+        log_fn(f"🎨 Creating object detection annotated video: {annotated_output}")
+
+    # Bounding box visualization settings
+    BBOX_COLORS = {
+        'person': (0, 255, 0),
+        'car': (255, 0, 0),
+        'dog': (0, 165, 255),
+        'cat': (147, 20, 255),
+        'default': (0, 255, 255)
+    }
+    BBOX_THICKNESS = 2
+    FONT_SCALE = 0.6
+    FONT_THICKNESS = 2
+
     if model is None:
         log_fn("⚠️ No YOLO model available, skipping object detection")
         return {}
@@ -137,6 +168,8 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
                     try:
                         results = model(frame, verbose=False, imgsz=640)
                         objs = []
+                        annotated_frame = frame.copy() if draw_boxes else None
+                        
                         for result in results:
                             if result.boxes is not None:
                                 for box in result.boxes:
@@ -145,10 +178,57 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
                                     conf = float(box.conf[0])
                                     if conf > 0.3 and cls_name in highlight_objects:
                                         objs.append(cls_name)
+                                        
+                                        # Draw bounding box if enabled
+                                        if draw_boxes and annotated_frame is not None:
+                                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                                            color = BBOX_COLORS.get(cls_name, BBOX_COLORS['default'])
+                                            
+                                            # Draw rectangle
+                                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, BBOX_THICKNESS)
+                                            
+                                            # Prepare label
+                                            label = f"{cls_name} {conf:.2f}"
+                                            (text_width, text_height), baseline = cv2.getTextSize(
+                                                label, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, FONT_THICKNESS
+                                            )
+                                            
+                                            # Draw background for text
+                                            cv2.rectangle(
+                                                annotated_frame,
+                                                (x1, y1 - text_height - baseline - 5),
+                                                (x1 + text_width, y1),
+                                                color,
+                                                -1
+                                            )
+                                            
+                                            # Draw text
+                                            cv2.putText(
+                                                annotated_frame,
+                                                label,
+                                                (x1, y1 - baseline - 2),
+                                                cv2.FONT_HERSHEY_SIMPLEX,
+                                                FONT_SCALE,
+                                                (255, 255, 255),
+                                                FONT_THICKNESS
+                                            )
+
+                        if objs:
+                            sec_objects.setdefault(sec, []).extend(objs)
+                            objects_found += len(objs)
+                        
+                        # Write annotated frame if enabled
+                        if video_writer and draw_boxes and annotated_frame is not None:
+                            video_writer.write(annotated_frame)
 
                         if objs:
                             sec_objects.setdefault(sec, []).extend(objs)  # keep key as int
                             objects_found += len(objs)
+
+                        else:
+                        # For frames we skip detection, still write original frame if creating annotated video
+                            if video_writer and draw_boxes:
+                                video_writer.write(frame)
 
                     except Exception as e:
                         log_fn(f"⚠️ Error in object detection at frame: {e}")
@@ -159,6 +239,11 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
         log_fn(f"❌ Object detection error: {e}")
     finally:
         cap.release()
+        if video_writer:  # NEW
+            video_writer.release()  # NEW
+            if draw_boxes:  # NEW
+                log_fn(f"✅ Object detection annotated video saved: {annotated_output}")  # NEW
+
 
         if not (cancel_flag and cancel_flag.is_set()):
             progress.update_progress(total_seconds, total_seconds, "Object Detection",
@@ -180,9 +265,91 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
     return sec_objects
 
 
-def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log_fn=print, progress_fn=None, cancel_flag=None):
+def run_highlighter(video_path, sample_rate=5, gui_config: dict = None, 
+                    log_fn=print, progress_fn=None, cancel_flag=None):
+    """
+    Process single video or multiple videos for highlight generation.
+    
+    Args:
+        video_path: str for single video OR list of str for multiple videos
+        sample_rate: Frame sampling rate
+        gui_config: Configuration dictionary
+        log_fn: Logging function
+        progress_fn: Progress callback function
+        cancel_flag: Threading event for cancellation
+    
+    Returns:
+        str (single output path) or list of tuples [(input_path, output_path), ...]
+    """
+    
+    # ========== MULTI-FILE BATCH PROCESSING ==========
+    if isinstance(video_path, (list, tuple)):
+        results = []
+        total_videos = len(video_path)
+        progress = ProgressTracker(progress_fn, log_fn)
+        
+        for idx, single_video_path in enumerate(video_path, 1):
+            log_fn(f"\n{'='*60}")
+            log_fn(f"📹 Processing video {idx}/{total_videos}: {os.path.basename(single_video_path)}")
+            log_fn(f"{'='*60}\n")
+            
+            # Check cancellation
+            if cancel_flag and cancel_flag.is_set():
+                log_fn("⏹️ Batch processing cancelled")
+                break
+            
+            # Update batch progress
+            batch_progress = int((idx - 1) / total_videos * 100)
+            progress.update_progress(batch_progress, 100, "Batch Processing", 
+                                   f"Video {idx}/{total_videos}")
+            
+            # Auto-generate output filename
+            video_gui_config = gui_config.copy() if gui_config else {}
+            if "output_file" not in video_gui_config or video_gui_config["output_file"] == "highlight.mp4":
+                base_name = os.path.splitext(single_video_path)[0]
+                video_gui_config["output_file"] = f"{base_name}_highlight.mp4"
+            else:
+                base_name = os.path.splitext(video_gui_config["output_file"])[0]
+                ext = os.path.splitext(video_gui_config["output_file"])[1]
+                video_gui_config["output_file"] = f"{base_name}_{idx}{ext}"
+            
+            # Recursive call for single video
+            try:
+                result = run_highlighter(
+                    video_path=single_video_path,
+                    sample_rate=sample_rate,
+                    gui_config=video_gui_config,
+                    log_fn=log_fn,
+                    progress_fn=progress_fn,
+                    cancel_flag=cancel_flag
+                )
+                results.append((single_video_path, result))
+                
+                if result:
+                    log_fn(f"✅ Completed {idx}/{total_videos}: {os.path.basename(result)}")
+                else:
+                    log_fn(f"⚠️ Failed {idx}/{total_videos}: {os.path.basename(single_video_path)}")
+            except Exception as e:
+                log_fn(f"❌ Error processing {single_video_path}: {e}")
+                results.append((single_video_path, None))
+        
+        # Summary
+        log_fn(f"\n{'='*60}")
+        log_fn(f"📊 BATCH PROCESSING SUMMARY")
+        log_fn(f"{'='*60}")
+        successful = sum(1 for _, r in results if r is not None)
+        log_fn(f"Total: {total_videos} | ✅ Success: {successful} | ❌ Failed: {total_videos - successful}")
+        
+        for input_path, output_path in results:
+            status = "✅" if output_path else "❌"
+            log_fn(f"  {status} {os.path.basename(input_path)}")
+        
+        progress.update_progress(100, 100, "Batch Processing", 
+                               f"Complete: {successful}/{total_videos}")
+        return results
+    
+    # ========== SINGLE FILE PROCESSING ==========
     gui_config = gui_config or {}
-    start_time = time.time()
     log = log_fn
     
     # Create progress tracker
@@ -207,6 +374,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
 
         # Check cancellation after config load
         check_cancellation(cancel_flag, log, "initialization")
+
 
         # Merge CLI/gui-style values with defaults
         OUTPUT_FILE = gui_config.get("output_file") or config.get("video", {}).get("output", "highlight.mp4")
@@ -293,6 +461,8 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
+        start_time = time.time()
+
         # --- 1+2 Detect scenes + motion + peaks with live progress ---
         progress.update_progress(10, 100, "Pipeline", "Detecting motion and scenes...")
 
@@ -365,6 +535,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
         progress.update_progress(40, 100, "Pipeline", "Setting up object detection...")
         check_cancellation(cancel_flag, log, "object detection setup")
         
+        # Get list of objects to highlight from GUI or config
         highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", []))
         openvino_model_folder = gui_config.get("openvino_model_folder", "yolo11n_openvino_model/")
 
@@ -401,7 +572,6 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
             yolo_model = None
 
         # --- Object detection ---
-        # Get list of objects to highlight from GUI or config
         highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", []))
 
         if not highlight_objects:
@@ -409,8 +579,17 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
             object_detections = {}
         else:
             frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME if CLIP_TIME > 0 else 5)
+            
+            # Get bounding box settings
+            draw_object_boxes = gui_config.get("draw_object_boxes", False)
+            object_annotated_path = None
+            if draw_object_boxes:
+                video_basename = os.path.splitext(os.path.basename(video_path))[0]
+                temp_folder = os.path.dirname(video_path) or "."
+                object_annotated_path = os.path.join(temp_folder, f"{video_basename}_objects_annotated.mp4")
+                log(f"🎨 Object bounding boxes enabled, output: {object_annotated_path}")
 
-            # Run detection with cancellation support
+            # Run detection with cancellation support and bounding boxes
             object_detections = detect_objects_with_progress(
                 video_path,
                 yolo_model,
@@ -418,8 +597,11 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 log_fn=log_fn,
                 progress_fn=progress_fn,
                 frame_skip=frame_skip_for_obj,
-                cancel_flag=cancel_flag
+                cancel_flag=cancel_flag,
+                draw_boxes=draw_object_boxes,  # NEW
+                annotated_output=object_annotated_path  # NEW
             )
+
 
         print("Detections per second:", len(object_detections))
 
@@ -484,6 +666,9 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
             
             return result
 
+        selected_sequences = []
+
+
         # --- Action recognition with grouping ---
         action_detections = []
         sample_rate = gui_config.get("sample_rate", 5)
@@ -491,13 +676,25 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
         interesting_actions = gui_config.get("interesting_actions", [])
         if interesting_actions:
             try:
+                # NEW: Get action label settings
+                draw_action_labels = gui_config.get("draw_action_labels", False)
+                action_annotated_path = None
+                if draw_action_labels:
+                    video_basename = os.path.splitext(os.path.basename(video_path))[0]
+                    temp_folder = os.path.dirname(video_path) or "."
+                    action_annotated_path = os.path.join(temp_folder, f"{video_basename}_actions_annotated.mp4")
+                    log(f"🎨 Action labels enabled, output: {action_annotated_path}")
+                
                 all_action_detections = run_action_detection(
                     video_path,
                     interesting_actions=interesting_actions,
                     progress_callback=progress.update_progress,
                     cancel_flag=cancel_flag,
-                    sample_rate=sample_rate
+                    sample_rate=sample_rate,
+                    draw_labels=draw_action_labels,  # NEW
+                    annotated_output=action_annotated_path  # NEW
                 )
+
 
                 check_cancellation(cancel_flag, log, "action recognition processing")
 
@@ -868,7 +1065,11 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
             print("  No action sequences significantly included in final highlight")
             
         total_action_duration = sum(a['duration'] for a in action_sequences_in_highlight)
-        print(f"Total action content in highlight: {total_action_duration:.1f}s ({total_action_duration/total_final_duration*100:.1f}% of total)")
+        if total_final_duration > 0:
+            action_percentage = (total_action_duration / total_final_duration) * 100
+            print(f"Total action content in highlight: {total_action_duration:.1f}s ({action_percentage:.1f}% of total)")
+        else:
+            print(f"Total action content in highlight: {total_action_duration:.1f}s (no highlight segments)")
 
         # Also show high-confidence sequences that didn't make it
         print(f"\nTOP 10 HIGH-CONFIDENCE ACTION SEQUENCES EXCLUDED:")
@@ -988,8 +1189,6 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
         progress.update_progress(90, 100, "Pipeline", "Creating highlight video...")
         log("🔹 Step 7: Cutting video segments...")
         try:
-            base_name = os.path.splitext(OUTPUT_FILE)[0]
-
             if len(segments) == 0:
                 log("⚠️ No segments selected — nothing to cut.")
             elif len(segments) == 1:
@@ -997,9 +1196,14 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 cut_video(video_path, segments[0][0], segments[0][1], OUTPUT_FILE)
             else:
                 temp_clips = []
+                # Get the directory of the output file to save temp clips in the same location
+                output_dir = os.path.dirname(OUTPUT_FILE)
+                video_base_name = os.path.splitext(os.path.basename(video_path))[0]
+                
                 for i, (s, e) in enumerate(segments):
                     check_cancellation(cancel_flag, log, f"video cutting clip {i+1}")
-                    temp_name = f"{base_name}_temp_clip_{i}.mp4"
+                    # Include the directory path for temp files
+                    temp_name = os.path.join(output_dir, f"{video_base_name}_temp_clip_{i}.mp4")
                     cut_video(video_path, s, e, temp_name)
                     temp_clips.append(temp_name)
                     # Update progress for each clip
@@ -1007,7 +1211,7 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
                 
                 check_cancellation(cancel_flag, log, "video concatenation")
                 
-                concat_file = "concat_list.txt"
+                concat_file = os.path.join(output_dir, "concat_list.txt")
                 with open(concat_file, "w") as f:
                     for t in temp_clips:
                         f.write(f"file '{t}'\n")
@@ -1029,6 +1233,8 @@ def run_highlighter(video_path: str, sample_rate=5, gui_config: dict = None, log
         except Exception as e:
             log(f"⚠️ Error during cutting/concatenation: {e}")
             raise
+
+
 
         # Create matching subtitles for highlight video OR full video
         if CREATE_SUBTITLES and USE_TRANSCRIPT and transcript_segments:

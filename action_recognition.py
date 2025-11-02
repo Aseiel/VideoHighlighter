@@ -7,7 +7,7 @@ import json
 import threading
 import time
 import argparse
-from collections import Counter
+from collections import Counter, deque
 
 # =============================
 # Load labels - support both Kinetics-400 and custom models
@@ -33,7 +33,6 @@ def load_label_mappings():
             # Convert string keys to integers
             CUSTOM_LABELS = {int(k): v for k, v in CUSTOM_LABELS.items()}
         print(f"✓ Loaded custom model labels: {len(CUSTOM_LABELS)} classes")
-        print(f"  Custom classes: {list(CUSTOM_LABELS.values())}")
     else:
         CUSTOM_LABELS = None
     
@@ -64,7 +63,7 @@ def get_id_from_name(name):
         for idx, action_name in CUSTOM_LABELS.items():
             if action_name.lower() == name.lower():
                 return idx
-    
+            
     # Try Kinetics-400
     if KINETICS_400_LABELS:
         for k, v in KINETICS_400_LABELS.items():
@@ -80,6 +79,15 @@ ENCODER_XML = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-00
 ENCODER_BIN = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin"
 SEQUENCE_LENGTH = 16
 
+# =============================
+# Visualization settings
+# =============================
+ACTION_LABEL_BG_COLOR = (0, 0, 0)  # Black background
+ACTION_LABEL_TEXT_COLOR = (0, 255, 255)  # Cyan text
+ACTION_LABEL_HIGH_CONF_COLOR = (0, 255, 0)  # Green for high confidence
+ACTION_FONT_SCALE = 0.8
+ACTION_FONT_THICKNESS = 2
+ACTION_LABEL_ALPHA = 0.7  # Semi-transparent background
 
 # =============================
 # Async Inference Engine with GUI Stats
@@ -131,9 +139,7 @@ def load_models(device="AUTO"):
 
     print(f"Using device: {selected_device}")
 
-    # =============================
-    # Encoder (always required)
-    # =============================
+    # Encoder (always required) 
     if not ENCODER_XML.exists() or not ENCODER_BIN.exists():
         raise FileNotFoundError(f"❌ Encoder model not found at {ENCODER_XML}")
     print("✓ Encoder model found")
@@ -141,9 +147,7 @@ def load_models(device="AUTO"):
     encoder_model = ie.read_model(model=ENCODER_XML, weights=ENCODER_BIN)
     compiled_encoder = ie.compile_model(model=encoder_model, device_name=selected_device)
 
-    # =============================
-    # Decoder (custom or fallback)
-    # =============================
+    # Decoder
     custom_decoder_xml = BASE_DIR / "action_classifier_3d.xml"
     custom_decoder_bin = BASE_DIR / "action_classifier_3d.bin"
 
@@ -157,10 +161,7 @@ def load_models(device="AUTO"):
         decoder_weights_path = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 
         if not decoder_model_path.exists() or not decoder_weights_path.exists():
-            raise FileNotFoundError(
-                f"❌ Neither custom nor Intel default decoder found!\n"
-                f"Expected at: {decoder_model_path}"
-            )
+            raise FileNotFoundError(f"❌ Neither custom nor Intel default decoder found!")
 
     decoder_model = ie.read_model(model=decoder_model_path, weights=decoder_weights_path)
     compiled_decoder = ie.compile_model(model=decoder_model, device_name=selected_device)
@@ -192,13 +193,114 @@ def preprocess_frame(frame, input_shape):
     return np.expand_dims(frame_padded, axis=0).astype(np.float32)
 
 # =============================
+# Draw action labels on frame
+# =============================
+def draw_action_labels(frame, detected_actions, max_labels=3):
+    """
+    Draw detected action labels on frame
+    
+    Args:
+        frame: Input frame
+        detected_actions: List of (action_name, score) tuples, sorted by score
+        max_labels: Maximum number of labels to display
+    
+    Returns:
+        Annotated frame
+    """
+    if not detected_actions:
+        return frame
+    
+    annotated = frame.copy()
+    h, w = frame.shape[:2]
+    
+    # Limit to top actions
+    top_actions = detected_actions[:max_labels]
+    
+    # Calculate panel size
+    panel_height = 30 + (len(top_actions) * 35)
+    panel_width = 400
+    panel_x = w - panel_width - 10
+    panel_y = 10
+    
+    # Create semi-transparent overlay
+    overlay = annotated.copy()
+    cv2.rectangle(overlay, 
+                  (panel_x, panel_y), 
+                  (panel_x + panel_width, panel_y + panel_height),
+                  ACTION_LABEL_BG_COLOR, 
+                  -1)
+    
+    # Blend overlay with original
+    cv2.addWeighted(overlay, ACTION_LABEL_ALPHA, annotated, 1 - ACTION_LABEL_ALPHA, 0, annotated)
+    
+    # Draw border
+    cv2.rectangle(annotated,
+                  (panel_x, panel_y),
+                  (panel_x + panel_width, panel_y + panel_height),
+                  ACTION_LABEL_TEXT_COLOR,
+                  2)
+    
+    # Draw title
+    cv2.putText(annotated, "DETECTED ACTIONS", 
+                (panel_x + 10, panel_y + 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                0.6, 
+                ACTION_LABEL_TEXT_COLOR, 
+                2)
+    
+    # Draw each action
+    y_offset = panel_y + 50
+    for i, (action_name, score) in enumerate(top_actions):
+        # Choose color based on confidence
+        text_color = ACTION_LABEL_HIGH_CONF_COLOR if score > 0.5 else ACTION_LABEL_TEXT_COLOR
+        
+        # Format action text
+        action_text = f"{i+1}. {action_name}"
+        score_text = f"{score:.2%}"
+        
+        # Draw action name
+        cv2.putText(annotated, action_text,
+                    (panel_x + 10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    text_color,
+                    1)
+        
+        # Draw score
+        cv2.putText(annotated, score_text,
+                    (panel_x + panel_width - 70, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    text_color,
+                    1)
+        
+        # Draw confidence bar
+        bar_width = int((panel_width - 30) * score)
+        cv2.rectangle(annotated,
+                      (panel_x + 10, y_offset + 5),
+                      (panel_x + 10 + bar_width, y_offset + 10),
+                      text_color,
+                      -1)
+        
+        y_offset += 35
+    
+    return annotated
+
+# =============================
 # Run action detection
 # =============================
 def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="action_log.csv",
                          debug=False, top_k=50, confidence_threshold=0.01, show_video=False,
                          num_requests=2, interesting_actions=None,
-                         progress_callback=None, cancel_flag=None):
-
+                         progress_callback=None, cancel_flag=None,
+                         draw_labels=False, annotated_output=None):
+    """
+    Run action recognition on video
+    
+    Args:
+        draw_labels: If True, draw action labels on frames
+        annotated_output: Path for annotated video output
+    """
     if interesting_actions is not None:
         interesting_actions_set = set([s.lower() for s in interesting_actions])
     else:
@@ -211,6 +313,15 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     expected_processed_frames = total_frames // sample_rate
+    
+    # Setup video writer for annotated output
+    video_writer = None
+    if draw_labels and annotated_output:
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(annotated_output, fourcc, fps, (frame_width, frame_height))
+        print(f"🎨 Creating annotated video: {annotated_output}")
 
     sequence_buffer = []
     all_actions = []
@@ -218,6 +329,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     frame_id = 0
     processed_frames = 0
     detection_count = 0
+    
+    # For visualization: keep track of recent detections
+    recent_detections = deque(maxlen=SEQUENCE_LENGTH)
 
     start_time = time.time()
     last_gui_update = start_time
@@ -234,8 +348,19 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
             ret, frame = cap.read()
             if not ret:
                 break
+            
+            original_frame = frame.copy() if draw_labels else None
             frame_id += 1
+            
             if frame_id % sample_rate != 0:
+                # Still write frame to annotated video if enabled
+                if video_writer and draw_labels and original_frame is not None:
+                    # Draw last known detections
+                    if recent_detections:
+                        annotated = draw_action_labels(original_frame, list(recent_detections))
+                        video_writer.write(annotated)
+                    else:
+                        video_writer.write(original_frame)
                 continue
 
             timestamp_secs = frame_id / fps
@@ -255,6 +380,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 if len(sequence_buffer) == SEQUENCE_LENGTH:
                     sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
                     predictions = compiled_decoder([sequence_array])[decoder_output].flatten()
+                    
+                    # Clear recent detections for this frame
+                    frame_detections = []
 
                     if interesting_actions_set:
                         # Check only the requested actions
@@ -264,11 +392,12 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             if score >= confidence_threshold:
                                 writer.writerow([timestamp_str, frame_id, action_id, action_name, score, timestamp_secs])
                                 all_actions.append((timestamp_secs, frame_id, action_id, score, action_name))
+                                frame_detections.append((action_name, score))
                                 detection_count += 1
                                 if debug:
                                     print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
                     else:
-                        # fallback: top-k as before
+                        # fallback to top-k
                         top_indices = np.argsort(predictions)[-top_k:][::-1]
                         for idx in top_indices:
                             score = float(predictions[idx])
@@ -276,9 +405,24 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             if score >= confidence_threshold:
                                 writer.writerow([timestamp_str, frame_id, idx, action_name, score, timestamp_secs])
                                 all_actions.append((timestamp_secs, frame_id, idx, score, action_name))
+                                frame_detections.append((action_name, score))
                                 detection_count += 1
                                 if debug:
                                     print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
+                    
+                    # Update recent detections (sorted by score)
+                    if frame_detections:
+                        frame_detections.sort(key=lambda x: x[1], reverse=True)
+                        recent_detections.clear()
+                        recent_detections.extend(frame_detections[:3])  # Keep top 3
+
+            # Draw labels and write annotated frame
+            if video_writer and draw_labels and original_frame is not None:
+                if recent_detections:
+                    annotated = draw_action_labels(original_frame, list(recent_detections))
+                    video_writer.write(annotated)
+                else:
+                    video_writer.write(original_frame)
 
             prev_req = req
             processed_frames += 1
@@ -296,7 +440,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 progress_callback(processed_frames, expected_processed_frames, "Enhanced Action Recognition", progress_msg)
                 last_gui_update = current_time
 
-        # --- Flush last frame ---
+        # Flush last frame
         if prev_req is not None:
             features = encoder_engine.wait_and_get(prev_req)[0]
             features = np.reshape(features, (-1,))
@@ -321,6 +465,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                 print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
 
     cap.release()
+    if video_writer:
+        video_writer.release()
+        print(f"✅ Annotated video saved: {annotated_output}")
 
     if progress_callback:
         total_time = time.time() - start_time
@@ -396,6 +543,8 @@ if __name__ == "__main__":
     parser.add_argument("--show-video", action="store_true")
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--confidence", type=float, default=0.01)
+    parser.add_argument("--draw-labels", action="store_true", help="Draw action labels on frames")
+    parser.add_argument("--annotated-output", type=str, help="Output path for annotated video")
     args = parser.parse_args()
 
     results = run_action_detection(
@@ -406,9 +555,12 @@ if __name__ == "__main__":
         debug=args.debug,
         top_k=args.top_k,
         confidence_threshold=args.confidence,
-        show_video=args.show_video
+        show_video=args.show_video,
+        draw_labels=args.draw_labels,
+        annotated_output=args.annotated_output
     )
-
+    
     print_top_actions(results)
     print_most_common_actions(results)
     print_action_sequences(results)
+    print(f"\n✅ Processing complete. Found {len(results)} action detections.")
