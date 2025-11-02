@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QLineEdit, QSpinBox,
     QGroupBox, QTextEdit, QFormLayout, QProgressBar, QCheckBox,
-    QComboBox, QTabWidget
+    QComboBox, QTabWidget, QListWidget
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from pipeline import run_highlighter
@@ -16,7 +16,7 @@ CONFIG_FILE = "config.yaml"
 
 
 class Worker(QThread):
-    finished = Signal(str)
+    finished = Signal(object)
     progress = Signal(int, int, str, str)
     log = Signal(str)
     cancelled = Signal()
@@ -31,7 +31,12 @@ class Worker(QThread):
     def run(self):
         try:
             self._is_running = True
-            self.log.emit("🚀 Starting video highlighter pipeline...")
+            # Check if single or multiple files
+            if isinstance(self.video_path, list):
+                self.log.emit(f"🚀 Starting batch processing of {len(self.video_path)} videos...")
+            else:
+                self.log.emit("🚀 Starting video highlighter pipeline...")
+
 
             output = run_highlighter(
                 self.video_path,
@@ -81,20 +86,48 @@ class VideoHighlighterGUI(QWidget):
         layout = QVBoxLayout()
 
         # --- File picker ---
-        file_layout = QHBoxLayout()
-        self.video_input = QLineEdit(self.config_data.get("video", {}).get("path", ""))
-        browse_btn = QPushButton("Browse")
-        browse_btn.clicked.connect(self.browse_file)
-        file_layout.addWidget(QLabel("Input Video:"))
-        file_layout.addWidget(self.video_input)
-        file_layout.addWidget(browse_btn)
-        layout.addLayout(file_layout)
+        file_group = QGroupBox("Input Videos")
+        file_layout = QVBoxLayout()
+
+        # Buttons row
+        btn_layout = QHBoxLayout()
+        self.browse_btn = QPushButton("Add Videos")
+        self.browse_btn.clicked.connect(self.browse_files)
+        self.remove_btn = QPushButton("Remove Selected")
+        self.remove_btn.clicked.connect(self.remove_selected_file)
+        self.clear_btn = QPushButton("Clear All")
+        self.clear_btn.clicked.connect(self.clear_files)
+        
+        btn_layout.addWidget(self.browse_btn)
+        btn_layout.addWidget(self.remove_btn)
+        btn_layout.addWidget(self.clear_btn)
+        btn_layout.addStretch()  # Push buttons to the left
+
+        file_layout.addLayout(btn_layout)
+
+        # File list
+        self.file_list = QListWidget()
+        self.file_list.setMaximumHeight(120)
+        file_layout.addWidget(self.file_list)
+
+        # Load saved paths if any
+        saved_paths = self.config_data.get("video", {}).get("paths", [])
+        if saved_paths:
+            for path in saved_paths:
+                if os.path.exists(path):
+                    self.file_list.addItem(path)
+        
+        file_group.setLayout(file_layout)
+        layout.addWidget(file_group)
 
         # --- Output filename ---
         out_layout = QHBoxLayout()
         self.output_input = QLineEdit(self.config_data.get("highlights", {}).get("output", "highlight.mp4"))
-        out_layout.addWidget(QLabel("Output file:"))
+        out_layout.addWidget(QLabel("Output base name:"))
         out_layout.addWidget(self.output_input)
+        info_label = QLabel("ℹ️ For multiple files, '_highlight' will be appended to each filename")
+        info_label.setStyleSheet("color: #666; font-size: 9pt;")
+        out_layout.addWidget(info_label)
         layout.addLayout(out_layout)
 
         # --- Progress Section ---
@@ -139,8 +172,8 @@ class VideoHighlighterGUI(QWidget):
         scores_layout.addRow("Motion event points:", self.spin_motion_event_points)
         scores_layout.addRow("Motion peak points:", self.spin_motion_peak)
         scores_layout.addRow("Audio peak points:", self.spin_audio_peak)
-        scores_layout.addRow("Keyword points:", self.spin_keyword_points)
-        scores_layout.addRow("Transcript points:", self.spin_transcript_points)
+        scores_layout.addRow("Keyword points (keywords in transcript):", self.spin_keyword_points)
+        scores_layout.addRow("Transcript points (all words):", self.spin_transcript_points)
         scores_layout.addRow("Object points:", self.spin_object)
         scores_layout.addRow("Action points:", self.spin_action)
         scores_layout.addRow("Clip time (s):", self.spin_clip_time)
@@ -233,6 +266,7 @@ class VideoHighlighterGUI(QWidget):
 
         # --- Tab3: Advanced Tab ---
         advanced_cfg = self.config_data.get("advanced", {})
+        visualization_cfg = self.config_data.get("visualization", {})
 
         advanced_tab = QWidget()
         advanced_layout = QVBoxLayout()
@@ -252,6 +286,28 @@ class VideoHighlighterGUI(QWidget):
         misc_layout.addRow("OpenVINO model folder (optional):", self.openvino_model_folder)
         misc_box.setLayout(misc_layout)
         advanced_layout.addWidget(misc_box)
+        
+        # --- Bounding Box Visualization Options ---
+        bbox_box = QGroupBox("Bounding Box Visualization")
+        bbox_layout = QVBoxLayout()
+        
+        info_label = QLabel("ℹ️ Enable bounding boxes, creates new file with extension _annotated.mp4 for debugging")
+        info_label.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
+        bbox_layout.addWidget(info_label)
+        
+        self.bbox_objects_chk = QCheckBox("Draw bounding boxes for object detection")
+        self.bbox_objects_chk.setChecked(visualization_cfg.get("draw_object_boxes", False))
+        self.bbox_objects_chk.setToolTip("Visualize detected objects with labeled bounding boxes")
+        bbox_layout.addWidget(self.bbox_objects_chk)
+        
+        self.bbox_actions_chk = QCheckBox("Draw labels for action recognition")
+        self.bbox_actions_chk.setChecked(visualization_cfg.get("draw_action_labels", False))
+        self.bbox_actions_chk.setToolTip("Display detected action names on frames")
+        bbox_layout.addWidget(self.bbox_actions_chk)
+        
+        bbox_box.setLayout(bbox_layout)
+        advanced_layout.addWidget(bbox_box)
+        
         advanced_tab.setLayout(advanced_layout)
         tabs.addTab(advanced_tab, "Advanced")
 
@@ -292,6 +348,39 @@ class VideoHighlighterGUI(QWidget):
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.check_worker_status)
 
+    # --- Multi-file support methods ---
+    def browse_files(self):
+        """Add one or more video files"""
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Video(s)", "", "Videos (*.mp4 *.mov *.avi *.mkv)"
+        )
+        existing = self.get_file_list()
+        for path in file_paths:
+            if path not in existing:
+                self.file_list.addItem(path)
+        
+        # Auto-set output filename based on first video if output is empty or default
+        if file_paths and (not self.output_input.text().strip() or 
+                        self.output_input.text().strip() == "highlight.mp4"):
+            first_video = file_paths[0]
+            base_name = os.path.splitext(os.path.basename(first_video))[0]
+            self.output_input.setText(f"{base_name}_highlight.mp4")
+
+    def remove_selected_file(self):
+        """Remove selected file from the list"""
+        current_row = self.file_list.currentRow()
+        if current_row >= 0:
+            self.file_list.takeItem(current_row)
+
+    def clear_files(self):
+        """Clear all files from the list"""
+        self.file_list.clear()
+
+    def get_file_list(self):
+        """Get list of all files in the list widget"""
+        return [self.file_list.item(i).text() for i in range(self.file_list.count())]
+
+
     # --- Config persistence ---
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -308,7 +397,7 @@ class VideoHighlighterGUI(QWidget):
             return [s.strip() for s in text.split(",") if s.strip()]
 
         data = {
-            "video": {"path": self.video_input.text().strip()},
+            "video": {"paths": self.get_file_list()},
             "highlights": {
                 "clip_time": int(self.spin_clip_time.value()),
                 "output": self.output_input.text().strip(),
@@ -331,7 +420,7 @@ class VideoHighlighterGUI(QWidget):
             },
             "actions": {
                 "interesting": get_text_list(self.actions_input),
-                "require_objects": self.actions_require_objects_chk.isChecked()  # NEW
+                "require_objects": self.actions_require_objects_chk.isChecked()
             },
             "objects": {"interesting": get_text_list(self.objects_input)},
             "keywords": {
@@ -354,6 +443,10 @@ class VideoHighlighterGUI(QWidget):
                 "sample_rate": int(self.sample_rate_spin.value()),
                 "yolo_pt_path": self.yolo_pt_path.text().strip(),
                 "openvino_model_folder": self.openvino_model_folder.text().strip(),
+            },
+            "visualization": {
+                "draw_object_boxes": self.bbox_objects_chk.isChecked(),
+                "draw_action_labels": self.bbox_actions_chk.isChecked(),
             },
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -388,13 +481,6 @@ class VideoHighlighterGUI(QWidget):
         self.source_lang_combo.setEnabled(final_state)
         self.target_lang_combo.setEnabled(final_state)
 
-    def browse_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Videos (*.mp4 *.mov *.avi *.mkv)")
-        if file_path:
-            self.video_input.setText(file_path)
-            base, ext = os.path.splitext(file_path)
-            self.output_input.setText(base + "_highlight" + (ext or ".mp4"))
-
     def append_log(self, text):
         """Append text to log and auto-scroll"""
         self.log_output.append(text)
@@ -418,22 +504,26 @@ class VideoHighlighterGUI(QWidget):
         QApplication.processEvents()
 
     def run_pipeline(self):
-        """Start the pipeline processing"""
-        video = self.video_input.text().strip()
-        if not video:
-            self.append_log("⚠️ No video selected!")
+        """Start the pipeline processing (UPDATED for multi-file)"""
+        video_paths = self.get_file_list()
+        
+        if not video_paths:
+            self.append_log("⚠️ No videos selected!")
             return
 
-        if not os.path.exists(video):
-            self.append_log(f"⚠️ Video file not found: {video}")
+        # Check if all files exist
+        missing_files = [p for p in video_paths if not os.path.exists(p)]
+        if missing_files:
+            self.append_log(f"⚠️ Video file(s) not found:")
+            for f in missing_files:
+                self.append_log(f"  - {f}")
             return
 
-        # Stop any existing worker
         if self.worker and self.worker.isRunning():
             self.append_log("⚠️ Pipeline already running!")
             return
-
-        # --- NEW: Validate scoring points ---
+        
+        # --- Validate scoring points ---
         scene_points = int(self.spin_scene_points.value())
         motion_event_points = int(self.spin_motion_event_points.value())
         motion_peak_points = int(self.spin_motion_peak.value())
@@ -481,6 +571,24 @@ class VideoHighlighterGUI(QWidget):
         exact_duration_val = int(self.spin_exact_duration.value())
         exact_duration = exact_duration_val if exact_duration_val > 0 else None
         
+        # Get output base name from input
+        output_base = self.output_input.text().strip() or "highlight.mp4"
+        
+        # If multiple files, we'll handle output paths per file in the pipeline
+        # For single file, use the source video's directory
+        if len(video_paths) == 1:
+            # Single file - use the same directory as source video
+            source_dir = os.path.dirname(video_paths[0])
+            output_file = os.path.join(source_dir, output_base)
+        else:
+            # Multiple files - the pipeline will handle appending '_highlight' to each
+            # But we still want to use the output_base as a template
+            output_file = output_base
+
+        exact_duration_val = int(self.spin_exact_duration.value())
+        exact_duration = exact_duration_val if exact_duration_val > 0 else None
+
+
         # Helper function to get non-empty lists
         def get_list_from_input(input_field):
             text = input_field.text().strip()
@@ -511,7 +619,7 @@ class VideoHighlighterGUI(QWidget):
             "multi_signal_boost": 1.2,
             "min_signals_for_boost": 2,
             "keep_temp": self.keep_temp_chk.isChecked(),
-            "output_file": self.output_input.text().strip() or None,
+            "output_file": output_file,
             "highlight_objects": highlight_objects,
             "interesting_actions": interesting_actions,
             "actions_require_objects": self.actions_require_objects_chk.isChecked(),
@@ -527,6 +635,8 @@ class VideoHighlighterGUI(QWidget):
             "yolo_pt_path": self.yolo_pt_path.text().strip() or None,
             "openvino_model_folder": self.openvino_model_folder.text().strip() or None,
             "sample_rate": int(self.sample_rate_spin.value()),
+            "draw_object_boxes": self.bbox_objects_chk.isChecked(),
+            "draw_action_labels": self.bbox_actions_chk.isChecked(),
         }
 
         # --- Skip highlights logic ---
@@ -548,8 +658,10 @@ class VideoHighlighterGUI(QWidget):
         # Clear previous logs
         self.log_output.clear()
         self.append_log("=== Starting Video Highlighter Pipeline ===")
-        self.append_log(f"📁 Input: {video}")
+        self.append_log(f"📁 Input: {video_paths}")
         self.append_log(f"📁 Output: {config.get('output_file', 'highlight.mp4')}")
+        if config.get('draw_object_boxes') or config.get('draw_action_labels'):
+            self.append_log("🎨 Bounding box visualization enabled for temp files")
         self.append_log("")
 
         # UI state changes
@@ -560,11 +672,14 @@ class VideoHighlighterGUI(QWidget):
         self.cancel_btn.setEnabled(True)
         
         # Disable form inputs during processing
-        self.video_input.setEnabled(False)
+        self.file_list.setEnabled(False)
         self.output_input.setEnabled(False)
+        self.browse_btn.setEnabled(False)
+        self.remove_btn.setEnabled(False)
+        self.clear_btn.setEnabled(False)
 
         # Create and start worker
-        self.worker = Worker(video, config)
+        self.worker = Worker(video_paths, config)
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.pipeline_done)
@@ -603,17 +718,45 @@ class VideoHighlighterGUI(QWidget):
         
         if output_file and not self.worker.is_cancelled():
             self.append_log(f"\n✅ === PIPELINE COMPLETED SUCCESSFULLY ===")
-            self.append_log(f"🎬 Output saved to: {output_file}")
             
-            # Check for additional files
-            base_name = os.path.splitext(output_file)[0]
-            srt_file = f"{base_name}_{self.target_lang_combo.currentText()}.srt"
-            transcript_file = f"{base_name}_transcript.txt"
-            
-            if os.path.exists(srt_file): 
-                self.append_log(f"📝 Subtitle file: {srt_file}")
-            if os.path.exists(transcript_file): 
-                self.append_log(f"📄 Transcript file: {transcript_file}")
+            # Handle both single file (string) and multiple files (list of tuples)
+            if isinstance(output_file, list):
+                self.append_log(f"🎬 Processed {len(output_file)} videos:")
+                for item in output_file:
+                    # Handle tuple format: (input_path, output_path)
+                    if isinstance(item, tuple):
+                        input_path, result_path = item
+                        file = result_path
+                    else:
+                        file = item
+                    
+                    if file:
+                        self.append_log(f"   • {file}")
+                        
+                        # Check for additional files for each video
+                        base_name = os.path.splitext(file)[0]
+                        srt_file = f"{base_name}_{self.target_lang_combo.currentText()}.srt"
+                        transcript_file = f"{base_name}_transcript.txt"
+                        
+                        if os.path.exists(srt_file): 
+                            self.append_log(f"     📝 Subtitle: {srt_file}")
+                        if os.path.exists(transcript_file): 
+                            self.append_log(f"     📄 Transcript: {transcript_file}")
+                    else:
+                        self.append_log(f"   ❌ Failed to process")
+            else:
+                # Single file
+                self.append_log(f"🎬 Output saved to: {output_file}")
+                
+                # Check for additional files
+                base_name = os.path.splitext(output_file)[0]
+                srt_file = f"{base_name}_{self.target_lang_combo.currentText()}.srt"
+                transcript_file = f"{base_name}_transcript.txt"
+                
+                if os.path.exists(srt_file): 
+                    self.append_log(f"📝 Subtitle file: {srt_file}")
+                if os.path.exists(transcript_file): 
+                    self.append_log(f"📄 Transcript file: {transcript_file}")
                 
             self.task_label.setText("✅ Complete!")
             self.task_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
@@ -642,9 +785,14 @@ class VideoHighlighterGUI(QWidget):
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setText("Cancel")
-        self.video_input.setEnabled(True)
+
+        # Re-enable file inputs
+        self.file_list.setEnabled(True)
+        self.browse_btn.setEnabled(True)
+        self.remove_btn.setEnabled(True)
+        self.clear_btn.setEnabled(True)
         self.output_input.setEnabled(True)
-        
+
         # Reset task label style
         QTimer.singleShot(5000, lambda: self.task_label.setStyleSheet("color: #666; font-weight: bold;"))
         
