@@ -598,14 +598,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 progress_fn=progress_fn,
                 frame_skip=frame_skip_for_obj,
                 cancel_flag=cancel_flag,
-                draw_boxes=draw_object_boxes,  # NEW
-                annotated_output=object_annotated_path  # NEW
+                draw_boxes=draw_object_boxes,
+                annotated_output=object_annotated_path
             )
 
 
         print("Detections per second:", len(object_detections))
 
-        def group_consecutive_adaptive(actions, max_gap=1.3, jump_threshold=0.0001):
+        def group_consecutive_adaptive(actions, max_gap=1.3, jump_threshold=0.01):
             """
             Groups consecutive actions of the same type if:
             - time gap <= max_gap
@@ -720,18 +720,29 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         normalized_detections.append(detection)
                 
                 # 1️⃣ Group consecutive actions chronologically
-                grouped_actions = group_consecutive_adaptive(normalized_detections, max_gap=1.3, jump_threshold=0.01)
+                grouped_actions = group_consecutive_adaptive(all_action_detections, max_gap=1)
 
-                print(f"\nDEBUG: Grouped {len(normalized_detections)} individual actions into {len(grouped_actions)} sequences")
-                
-                # 2️⃣ Use all grouped sequences sorted by confidence
-                selected_sequences = sorted(grouped_actions, key=lambda x: x[3], reverse=True)
+                print(f"\nDEBUG: Grouped {len(all_action_detections)} individual actions into {len(grouped_actions)} sequences")
 
-                # Log all selected sequences
+                # 2️⃣ Sort by confidence (best first) and cap total duration
+                # Cap at 2-3x your target to give scoring system good options without hanging
+                MAX_ACTION_DURATION = target_duration * 3  # 3x target = plenty of options
+                selected_sequences = []
                 total_duration = 0
-                for sequence in selected_sequences:
+
+                sorted_sequences = sorted(grouped_actions, key=lambda x: x[3], reverse=True)
+
+                for sequence in sorted_sequences:
                     start_time, end_time, duration, confidence, action_name = sequence
+                    
+                    # Stop when we hit duration cap
+                    if total_duration >= MAX_ACTION_DURATION:
+                        break
+                    
+                    selected_sequences.append(sequence)
                     total_duration += duration
+                    
+                    # Log ALL sequences
                     print(f"DEBUG: Added sequence {action_name} at {seconds_to_mmss(start_time)}-{seconds_to_mmss(end_time)} "
                         f"({duration:.1f}s duration, confidence: {confidence:.3f}) - Total: {seconds_to_mmss(total_duration)})")
 
@@ -742,12 +753,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 for start_time, end_time, duration, confidence, action_name in selected_sequences:
                     # pick best detection in this group
                     detections_in_group = [
-                        a for a in normalized_detections
-                        if (a[4] if len(a) == 5 else a[3]) == action_name and start_time <= a[0] <= end_time
+                        a for a in all_action_detections
+                        if a[4] == action_name and start_time <= a[0] <= end_time
                     ]
                     if detections_in_group:
-                        # Use the detection with highest confidence
-                        best_detection = max(detections_in_group, key=lambda a: a[3] if len(a) == 5 else a[2])
+                        best_detection = max(detections_in_group, key=lambda a: a[3])  # highest confidence
                         action_detections.append(best_detection)
 
                 # Sort chronologically for pipeline
