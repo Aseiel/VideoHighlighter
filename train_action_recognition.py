@@ -3,115 +3,316 @@ import glob
 import cv2
 import json
 import random
-import numpy
 import numpy as np
+from ultralytics import YOLO
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from openvino.runtime import Core
 from tqdm import tqdm
+from collections import deque
 
 # =============================
 # How to
-# =============================
 # Put short 5-10s videos to dataset/train/{action_name} and dataset/val/{action_name}
 # Usually You should put minimum 100+ videos for train and 20+ for val
+# =============================
 
 # =============================
-# Set Random Seed for Reproducibility
+# Smoothed ROI Detection
+# =============================
+class SmoothedROIDetector:
+    """Temporal smoothing for ROI detection to reduce jitter"""
+    def __init__(self, window_size=5, alpha=0.3):
+        self.window_size = window_size
+        self.alpha = alpha
+        self.roi_history = deque(maxlen=window_size)
+        self.smoothed_roi = None
+        
+    def update(self, current_roi):
+        if current_roi is None:
+            if self.smoothed_roi is not None:
+                return tuple(self.smoothed_roi.astype(int))
+            return None
+        
+        self.roi_history.append(current_roi)
+        
+        if len(self.roi_history) == 0:
+            return None
+            
+        if self.smoothed_roi is None:
+            self.smoothed_roi = np.array(current_roi, dtype=np.float32)
+        else:
+            current = np.array(current_roi, dtype=np.float32)
+            self.smoothed_roi = self.alpha * current + (1 - self.alpha) * self.smoothed_roi
+        
+        return tuple(self.smoothed_roi.astype(int))
+    
+    def reset(self):
+        self.roi_history.clear()
+        self.smoothed_roi = None
+
+# =============================
+# Person Detection with Tracking
+# =============================
+yolo_people = YOLO("yolo11n.pt")
+
+class PersonTracker:
+    """Simple IoU-based person tracker to maintain consistent IDs"""
+    def __init__(self, iou_threshold=0.3, max_lost_frames=10):
+        self.tracks = {}
+        self.next_id = 0
+        self.iou_threshold = iou_threshold
+        self.max_lost_frames = max_lost_frames
+    
+    def _compute_iou(self, box1, box2):
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i < x1_i or y2_i < y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def update(self, detected_boxes):
+        if len(detected_boxes) == 0:
+            for track_id in list(self.tracks.keys()):
+                self.tracks[track_id]['lost_frames'] += 1
+                if self.tracks[track_id]['lost_frames'] > self.max_lost_frames:
+                    del self.tracks[track_id]
+            return []
+        
+        matched_tracks = set()
+        matched_detections = set()
+        
+        for det_idx, det_box in enumerate(detected_boxes):
+            best_iou = 0
+            best_track_id = None
+            
+            for track_id, track_data in self.tracks.items():
+                if track_id in matched_tracks:
+                    continue
+                
+                iou = self._compute_iou(det_box, track_data['box'])
+                if iou > best_iou and iou > self.iou_threshold:
+                    best_iou = iou
+                    best_track_id = track_id
+            
+            if best_track_id is not None:
+                self.tracks[best_track_id]['box'] = det_box
+                self.tracks[best_track_id]['lost_frames'] = 0
+                matched_tracks.add(best_track_id)
+                matched_detections.add(det_idx)
+            else:
+                new_track_id = self.next_id
+                self.next_id += 1
+                self.tracks[new_track_id] = {'box': det_box, 'lost_frames': 0}
+                matched_detections.add(det_idx)
+        
+        for track_id in list(self.tracks.keys()):
+            if track_id not in matched_tracks:
+                self.tracks[track_id]['lost_frames'] += 1
+                if self.tracks[track_id]['lost_frames'] > self.max_lost_frames:
+                    del self.tracks[track_id]
+        
+        sorted_tracks = sorted(self.tracks.items(), key=lambda x: x[0])
+        top_tracks = sorted_tracks[:2]
+        
+        return [(track_id, data['box']) for track_id, data in top_tracks]
+    
+    def reset(self):
+        self.tracks = {}
+        self.next_id = 0
+
+def detect_top2_people(frame, detector, tracker=None):
+    result = detector.predict(frame, conf=0.40, classes=[0], verbose=False)
+    boxes = []
+
+    for r in result:
+        for b in r.boxes:
+            x1, y1, x2, y2 = map(int, b.xyxy[0])
+            score = float(b.conf)
+            boxes.append((score, (x1, y1, x2, y2)))
+
+    boxes = sorted(boxes, key=lambda x: x[0], reverse=True)
+    detected_boxes = [b for _, b in boxes]
+    
+    if tracker is None:
+        return detected_boxes[:2]
+    else:
+        tracked = tracker.update(detected_boxes)
+        return tracked
+
+def merge_boxes(boxes):
+    if len(boxes) == 0:
+        return None
+    if len(boxes) == 1:
+        return boxes[0]
+
+    (x1a, y1a, x2a, y2a) = boxes[0]
+    (x1b, y1b, x2b, y2b) = boxes[1]
+    return (min(x1a, x1b), min(y1a, y1b), max(x2a, x2b), max(y2a, y2b))
+
+def crop_roi(frame, roi, output_size):
+    if roi is None:
+        h, w, _ = frame.shape
+        th, tw = output_size
+        y = max(0, h // 2 - th // 2)
+        x = max(0, w // 2 - tw // 2)
+        crop = frame[y:y+th, x:x+tw]
+        return cv2.resize(crop, output_size)
+
+    x1, y1, x2, y2 = roi
+    h, w, _ = frame.shape
+    x1 = max(0, min(x1, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    x2 = max(0, min(x2, w - 1))
+    y2 = max(0, min(y2, h - 1))
+
+    # Avoid empty crop
+    if x2 <= x1 or y2 <= y1:
+        h, w, _ = frame.shape
+        th, tw = output_size
+        y = max(0, h // 2 - th // 2)
+        x = max(0, w // 2 - tw // 2)
+        crop = frame[y:y+th, x:x+tw]
+        return cv2.resize(crop, output_size)
+
+    crop = frame[y1:y2, x1:x2]
+    return cv2.resize(crop, output_size)
+
+# =============================
+# Configuration (merged)
 # =============================
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-# =============================
-# Configuration
-# =============================
 CONFIG = {
     "data_path": "dataset",
     "batch_size": 2,
-    "learning_rate": 1e-4,
-    "num_epochs": 25,
+    # Two-phase training: base and finetune settings
+    "base_epochs": 25,                  # initial training epochs
+    "base_learning_rate": 1e-4,         # initial LR
+    "finetune_learning_rate": 1e-5,     # LR when resuming (10x smaller)
+    "max_finetune_epochs": 15,          # safety ceiling for fine-tuning additional epochs
+    "early_stopping_patience": 5,       # patience for early stopping
+    "min_delta": 0.001,                 # minimal improvement in val loss to reset patience
+
+    # Class balancing
+    "use_class_weights": True,          # Enable class weighting for imbalanced datasets
+
+    # previously used keys kept for compatibility
     "sequence_length": 16,
-    "frame_size": (256, 256),
     "crop_size": (224, 224),
-    "fps_target": 30,
-    "center_jitter": 0.1,
-    "target_fps": 15,
-    "clip_stride": 8,
     "model_save_path": "intel_finetuned_classifier_3d.pth",
-    "label_mapping_save_path": "label_mapping.json",
-    "early_stopping_patience": 5,
+    "checkpoint_path": r"D:\movie_highlighter\checkpoints\checkpoint_latest.pth",  # for resume
+    "save_checkpoint_every": 5,  # Save checkpoint every N epochs
+    "checkpoint_dir": "checkpoints",  # Directory for checkpoint saves
     "min_train_per_action": 5,
     "min_val_per_action": 0,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "mean": [0.485, 0.456, 0.406],
+    "std": [0.229, 0.224, 0.225],
+    "create_visualizations": False,  # Set to True to create sample videos
+    "num_visualization_samples": 2,
+    "visualization_sample_rate": 5,
+    "use_roi_smoothing": True,
 }
 
-# =============================
-# Intel OpenVINO model paths
-# =============================
 BASE_DIR = os.getcwd()
 ENCODER_XML = os.path.join(BASE_DIR, "models/intel_action/encoder/FP32/action-recognition-0001-encoder.xml")
 ENCODER_BIN = os.path.join(BASE_DIR, "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin")
 
 # =============================
-# VIDEO PREPROCESSING HELPERS
+# Video Loading
 # =============================
-def center_crop(frame, crop_size=(224, 224), jitter=0.1):
-    """Crop around center with slight random jitter."""
-    h, w, _ = frame.shape
-    ch, cw = crop_size
-    jh = int(jitter * (h - ch))
-    jw = int(jitter * (w - cw))
-    y = max(0, h // 2 - ch // 2 + random.randint(-jh, jh))
-    x = max(0, w // 2 - cw // 2 + random.randint(-jw, jw))
-    return frame[y:y+ch, x:x+cw]
-
 def load_video_normalized(path, is_training=True):
-    """Load video, normalize FPS, resize, and crop center with jitter."""
     cap = cv2.VideoCapture(path)
-    orig_fps = cap.get(cv2.CAP_PROP_FPS) or CONFIG["fps_target"]
-    frame_skip = max(1, int(round(orig_fps / CONFIG["fps_target"])))
+    if not cap.isOpened():
+        return []
 
-    frames = []
-    idx = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if idx % frame_skip == 0:
-            frame = cv2.resize(frame, CONFIG["frame_size"])
-            if is_training:
-                frame = center_crop(frame, CONFIG["crop_size"], CONFIG["center_jitter"])
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        return []
+
+    indices = np.linspace(0, total_frames - 1, CONFIG["sequence_length"]).astype(int)
+    
+    output_frames = []
+    crop_size = CONFIG["crop_size"]
+    
+    roi_smoother = SmoothedROIDetector(window_size=5, alpha=0.3) if CONFIG["use_roi_smoothing"] else None
+    person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=5) if CONFIG["use_roi_smoothing"] else None
+
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        success, frame = cap.read()
+        if not success:
+            continue
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        if person_tracker:
+            tracked = detect_top2_people(frame, yolo_people, person_tracker)
+            # tracked returns [(id, box), ...] when using tracker
+            if tracked and isinstance(tracked[0], tuple) and len(tracked[0]) == 2 and isinstance(tracked[0][1], tuple):
+                people = [box for _, box in tracked]
             else:
-                # Center crop without jitter for validation
-                h, w, _ = frame.shape
-                ch, cw = CONFIG["crop_size"]
-                y = max(0, h // 2 - ch // 2)
-                x = max(0, w // 2 - cw // 2)
-                frame = frame[y:y+ch, x:x+cw]
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = frame.astype(np.float32) / 255.0
-            frames.append(frame)
-        idx += 1
+                people = tracked
+        else:
+            people = detect_top2_people(frame, yolo_people)
+        
+        merged_roi = merge_boxes(people)
+        
+        if roi_smoother:
+            roi = roi_smoother.update(merged_roi)
+        else:
+            roi = merged_roi
+        
+        frame = crop_roi(frame, roi, crop_size)
+        frame = frame.astype(np.float32) / 255.0
+        mean = np.array(CONFIG["mean"], dtype=np.float32)
+        std = np.array(CONFIG["std"], dtype=np.float32)
+        frame = (frame - mean) / std
+        
+        output_frames.append(frame)
 
     cap.release()
-    return np.array(frames)
+    
+    if len(output_frames) == 0:
+        return []
+    
+    # If fewer than sequence_length frames were read, pad by repeating last frame
+    if len(output_frames) < CONFIG["sequence_length"]:
+        last = output_frames[-1]
+        while len(output_frames) < CONFIG["sequence_length"]:
+            output_frames.append(last.copy())
+
+    return np.stack(output_frames, axis=0)
 
 # =============================
-# VideoDataset
+# Dataset
 # =============================
 class VideoDataset(Dataset):
-    def __init__(self, root, sequence_length=16, target_fps=15, stride=8, is_training=True):
-        self.video_samples = []  # list of (video_path, label)
+    def __init__(self, root, sequence_length=16, is_training=True):
+        self.video_samples = []
         self.sequence_length = sequence_length
-        self.target_fps = target_fps
-        self.stride = stride
         self.is_training = is_training
 
         if not os.path.exists(root):
@@ -119,13 +320,10 @@ class VideoDataset(Dataset):
             self.labels = []
             self.label_to_idx = {}
             self.idx_to_label = {}
-            self.samples = []  # legacy support
+            self.samples = []
             return
 
-        # First pass: collect all class folders
         class_folders = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
-        
-        # Create label mapping from folder names
         self.label_to_idx = {label: idx for idx, label in enumerate(class_folders)}
         self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
         self.labels = class_folders
@@ -134,7 +332,6 @@ class VideoDataset(Dataset):
         for label, idx in self.label_to_idx.items():
             print(f"  {idx}: {label}")
 
-        # Second pass: collect videos with correct labels
         video_count = 0
         for label in self.labels:
             label_path = os.path.join(root, label)
@@ -145,10 +342,7 @@ class VideoDataset(Dataset):
                 self.video_samples.append((video_path, self.label_to_idx[label]))
                 video_count += 1
 
-        print(f"✅ Found {video_count} videos in {root} across {len(self.labels)} actions")
-        print(f"✅ Label index range: 0 to {len(self.labels) - 1}")
-
-        # ✅ Legacy support for old code
+        print(f"✅ Found {video_count} videos")
         self.samples = self.video_samples
 
     def __len__(self):
@@ -156,111 +350,69 @@ class VideoDataset(Dataset):
 
     def __getitem__(self, idx):
         video_path, label = self.video_samples[idx]
-        
-        # Load video with our improved preprocessing
         frames = load_video_normalized(video_path, self.is_training)
         
-        # Generate multiple clips from the video
-        clips = self._generate_clips(frames)
+        if len(frames) == 0:
+            frames = np.zeros((self.sequence_length, CONFIG["crop_size"][0], CONFIG["crop_size"][1], 3), dtype=np.float32)
         
-        if self.is_training:
-            # During training: randomly select one clip for data augmentation
-            selected_clip = random.choice(clips) if clips else None
-        else:
-            # During validation: use the center clip for consistency
-            selected_clip = clips[len(clips) // 2] if len(clips) > 0 else clips[0] if clips else None
-        
-        if selected_clip is None:
-            # Create a dummy clip if no clips were generated
-            selected_clip = np.zeros((self.sequence_length, CONFIG["crop_size"][0], CONFIG["crop_size"][1], 3), dtype=np.float32)
-        
-        # Convert to tensor format
-        selected_clip = np.transpose(selected_clip, (0, 3, 1, 2))  # TCHW format
-        return torch.tensor(selected_clip, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
-
-    def _generate_clips(self, frames):
-        """Split frames into overlapping clips of sequence_length"""
-        clips = []
-        total_frames = len(frames)
-        
-        if total_frames < self.sequence_length:
-            # If video is too short, pad with last frame
-            padded_frames = np.zeros((self.sequence_length, *frames.shape[1:]), dtype=frames.dtype)
-            padded_frames[:total_frames] = frames
-            padded_frames[total_frames:] = frames[-1]
-            clips.append(padded_frames)
-        else:
-            # Generate overlapping clips
-            for start_idx in range(0, total_frames - self.sequence_length + 1, self.stride):
-                end_idx = start_idx + self.sequence_length
-                clip = frames[start_idx:end_idx]
-                clips.append(clip)
-            
-            # Ensure we include the last frames
-            if (total_frames - self.sequence_length) % self.stride != 0:
-                last_clip = frames[-self.sequence_length:]
-                clips.append(last_clip)
-        
-        return clips
+        frames = np.transpose(frames, (0, 3, 1, 2))
+        return torch.tensor(frames, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
 
     def get_label_mapping(self):
         return self.label_to_idx, self.idx_to_label
 
-    def analyze_class_distribution(self):
-        """Analyze the distribution of videos per class"""
-        print(f"\n📊 Class Distribution Analysis:")
-        class_counts = {label: 0 for label in self.labels}
-        
-        for _, label in self.video_samples:
-            class_name = self.idx_to_label[label]
-            class_counts[class_name] += 1
-        
-        for class_name, count in sorted(class_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"  {class_name}: {count} videos")
-        
-        return class_counts
+# =============================
+# Class Weight Computation
+# =============================
+def compute_class_weights(train_dataset):
+    """Compute inverse frequency weights for balanced training"""
+    label_counts = {}
+    for _, label in train_dataset.video_samples:
+        label_counts[label] = label_counts.get(label, 0) + 1
+    
+    total_samples = len(train_dataset)
+    num_classes = len(label_counts)
+    
+    # Inverse frequency weighting
+    weights = []
+    for class_idx in range(num_classes):
+        count = label_counts.get(class_idx, 1)
+        weight = total_samples / (num_classes * count)
+        weights.append(weight)
+    
+    print(f"\n⚖️  Class weights computed:")
+    for idx, weight in enumerate(weights):
+        class_name = train_dataset.idx_to_label[idx]
+        count = label_counts.get(idx, 0)
+        print(f"   {class_name}: {count} samples, weight: {weight:.4f}")
+    
+    return torch.FloatTensor(weights)
 
-# =============================
-# Dataset validation function
-# =============================
-def validate_dataset_size(train_dataset, val_dataset):
-    """Check if dataset has minimum required videos per action"""
-    min_train = CONFIG['min_train_per_action']
-    min_val = CONFIG['min_val_per_action']
+def print_class_distribution(dataset, dataset_name="Dataset"):
+    """Print class distribution statistics"""
+    label_counts = {}
+    for _, label in dataset.video_samples:
+        label_counts[label] = label_counts.get(label, 0) + 1
     
-    print(f"\n📊 Validating dataset size...")
-    print(f"  Minimum training videos per action: {min_train}")
-    print(f"  Minimum validation videos per action: {min_val}")
+    print(f"\n📊 {dataset_name} class distribution:")
+    total = sum(label_counts.values())
+    for label_idx in sorted(label_counts.keys()):
+        count = label_counts[label_idx]
+        percentage = (count / total) * 100
+        class_name = dataset.idx_to_label[label_idx]
+        print(f"   {class_name}: {count} videos ({percentage:.1f}%)")
     
-    # Analyze class distributions
-    train_counts = train_dataset.analyze_class_distribution()
-    val_counts = val_dataset.analyze_class_distribution()
-    
-    valid_actions = []
-    for action in train_dataset.labels:
-        train_count = train_counts.get(action, 0)
-        val_count = val_counts.get(action, 0)
-        
-        if train_count >= min_train and val_count >= min_val:
-            print(f"  ✅ Action '{action}': {train_count} train, {val_count} val")
-            valid_actions.append(action)
+    # Check for imbalance
+    counts = list(label_counts.values())
+    if len(counts) > 1:
+        max_count = max(counts)
+        min_count = min(counts)
+        imbalance_ratio = max_count / min_count
+        if imbalance_ratio > 2.0:
+            print(f"   ⚠️  Class imbalance detected! Ratio: {imbalance_ratio:.2f}x")
+            print(f"   💡 Class weighting is ENABLED to handle this")
         else:
-            if train_count < min_train:
-                print(f"  ⚠️  Action '{action}': {train_count} train videos (need {min_train}) - SKIPPED")
-            if val_count < min_val:
-                print(f"  ⚠️  Action '{action}': {val_count} val videos (need {min_val}) - SKIPPED")
-    
-    if len(valid_actions) == 0:
-        print("\n❌ No actions meet minimum requirements. Please collect more videos.")
-        return False, []
-    
-    print(f"\n✅ Dataset validation passed! Training with {len(valid_actions)} actions:")
-    for action in valid_actions:
-        train_count = train_counts.get(action, 0)
-        val_count = val_counts.get(action, 0)
-        print(f"   - {action}: {train_count} train, {val_count} val")
-    
-    return True, valid_actions
+            print(f"   ✅ Classes are relatively balanced (ratio: {imbalance_ratio:.2f}x)")
 
 # =============================
 # Intel Feature Extractor
@@ -274,58 +426,57 @@ class IntelFeatureExtractor:
         input_tensor = self.encoder.inputs[0]
         self.input_name = input_tensor.get_any_name()
         self.input_shape = list(input_tensor.get_shape())
-
-        print(f"Encoder input name: {self.input_name}")
-        print(f"Encoder input shape: {self.input_shape}")
+        print(f"Encoder input: {self.input_name}, shape: {self.input_shape}")
 
     def encode(self, frames_batch):
-        """frames_batch: [B, T, C, H, W] float32 tensor in range 0-1"""
+        """
+        frames_batch: torch tensor or numpy array of shape (B, T, C, H, W)
+        Returns: torch.FloatTensor of encoded features shape (B, T * feat_dim_per_frame) or (B, T, feat_dim)
+        """
+        if isinstance(frames_batch, torch.Tensor):
+            frames_batch = frames_batch.cpu().numpy()
+
         B, T, C, H, W = frames_batch.shape
         feats = []
         
-        # Process each batch item and time step separately
         for batch_idx in range(B):
             batch_feats = []
             for time_idx in range(T):
-                # Get single frame: [C, H, W]
-                frame = frames_batch[batch_idx, time_idx].numpy()  # [C, H, W]
-                
-                # Add batch dimension: [1, C, H, W]
-                frame_batch = np.expand_dims(frame, axis=0)
-                
-                # Preprocess for Intel model
-                frame_batch = self._preprocess_batch(frame_batch)
-                
-                # Run inference - model expects [1, 3, 224, 224]
+                frame = frames_batch[batch_idx, time_idx]
+                # frame shape (C,H,W) with channels normalized already
+                frame_batch = np.expand_dims(frame, axis=0)  # (1, C, H, W)
+                frame_batch = self._preprocess_batch(frame_batch)  # preprocess to expected input
+                # OpenVINO compiled model inference expects a dict or sequence; older API accepted list
                 out = self.encoder([frame_batch])
-                feat = out[self.encoder.output(0)]
+                # out is a dictionary-like mapping; fetch first output
+                # Safely get output tensor
+                try:
+                    output_node = self.encoder.output(0)
+                    feat = out[output_node]
+                except Exception:
+                    # fallback: take first value
+                    feat = list(out.values())[0]
                 
-                # Flatten the feature if it's not 1D
                 if feat.ndim > 1:
-                    feat = feat.reshape(feat.shape[0], -1)  # [1, feature_dim]
+                    feat = feat.reshape(feat.shape[0], -1)  # (1, feat_dim)
                 batch_feats.append(feat)
             
-            # Stack time steps for this batch item: [T, feature_dim]
-            batch_feats = np.concatenate(batch_feats, axis=0)  # [T, feature_dim]
+            batch_feats = np.concatenate(batch_feats, axis=0)  # (T, feat_dim)
             feats.append(batch_feats)
         
-        # Stack batch items: [B, T, feature_dim]
-        feats = np.stack(feats, axis=0)
+        feats = np.stack(feats, axis=0)  # (B, T, feat_dim)
+        # Convert to torch tensor
         return torch.tensor(feats, dtype=torch.float32)
 
     def _preprocess_batch(self, batch_frames):
-        """Preprocess batch of frames for Intel model"""
-        # batch_frames: [1, C, H, W] in range 0-1
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
-        
-        # Denormalize from [0,1] to [0,255] then apply model normalization
         batch_frames = batch_frames * 255.0
         batch_frames = (batch_frames / 255.0 - mean) / std
         return batch_frames.astype(np.float32)
 
 # =============================
-# SIMPLIFIED LSTM MODEL
+# Model
 # =============================
 class EncoderLSTM(nn.Module):
     def __init__(self, feature_dim=1024, hidden_dim=512, num_classes=2):
@@ -334,313 +485,323 @@ class EncoderLSTM(nn.Module):
         self.fc = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x):
-        # x should be [batch_size, sequence_length, feature_dim]
         out, _ = self.lstm(x)
-        out = out[:, -1, :]  # take last frame output
+        out = out[:, -1, :]
         return self.fc(out)
 
 # =============================
-# Model Manager
+# Checkpoint Management
 # =============================
-class ActionRecognitionModel:
-    def __init__(self, model, label_to_idx, idx_to_label, feature_dim, sequence_length):
-        self.model = model
-        self.label_to_idx = label_to_idx
-        self.idx_to_label = idx_to_label
-        self.feature_dim = feature_dim
-        self.sequence_length = sequence_length
-        self.num_classes = len(label_to_idx)
-        
-        print(f"✅ Model initialized with {self.num_classes} classes")
-        print(f"✅ Label range: 0 to {self.num_classes - 1}")
+def save_checkpoint(model, optimizer, epoch, best_val_acc, label_to_idx, idx_to_label, 
+                   feature_dim, checkpoint_path, best_val_loss=None):
+    """Save training checkpoint"""
+    os.makedirs(os.path.dirname(checkpoint_path) if os.path.dirname(checkpoint_path) else '.', exist_ok=True)
     
-    def save(self, path):
-        """Save both model and label mapping"""
-        torch.save(self.model.state_dict(), path)
-        
-        mapping_path = path.replace('.pth', '_mapping.json')
-        mapping_data = {
-            'label_to_idx': self.label_to_idx,
-            'idx_to_label': self.idx_to_label,
-            'feature_dim': self.feature_dim,
-            'sequence_length': self.sequence_length,
-            'num_classes': self.num_classes
-        }
-        with open(mapping_path, 'w') as f:
-            json.dump(mapping_data, f, indent=2)
-        
-        print(f"✓ Model saved to {path}")
-        print(f"✓ Label mapping saved to {mapping_path}")
-        print(f"✓ Classes: {list(self.label_to_idx.keys())}")
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
+        'best_val_acc': best_val_acc,
+        'best_val_loss': best_val_loss if best_val_loss is not None else float('inf'),
+        'label_to_idx': label_to_idx,
+        'idx_to_label': idx_to_label,
+        'feature_dim': feature_dim,
+        'sequence_length': CONFIG['sequence_length'],
+        'num_classes': len(label_to_idx),
+        'config': CONFIG.copy()
+    }
     
-    @classmethod
-    def load(cls, model_path, device='cpu'):
-        """Load both model and label mapping"""
-        mapping_path = model_path.replace('.pth', '_mapping.json')
-        
-        if not os.path.exists(mapping_path):
-            raise FileNotFoundError(f"Label mapping file not found: {mapping_path}")
-        
-        with open(mapping_path, 'r') as f:
-            mapping_data = json.load(f)
-        
-        model = EncoderLSTM(
-            feature_dim=mapping_data['feature_dim'],
-            hidden_dim=512,
-            num_classes=mapping_data['num_classes']
-        )
-        
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.to(device)
-        model.eval()
-        
-        idx_to_label = {int(k): v for k, v in mapping_data['idx_to_label'].items()}
-        
-        print(f"✅ Model loaded with {mapping_data['num_classes']} classes")
-        print(f"✅ Classes: {list(mapping_data['label_to_idx'].keys())}")
-        
-        return cls(model, mapping_data['label_to_idx'], idx_to_label, 
-                  mapping_data['feature_dim'], mapping_data['sequence_length'])
+    torch.save(checkpoint, checkpoint_path)
+    print(f"💾 Checkpoint saved: {checkpoint_path} (epoch {epoch+1})")
+
+def load_checkpoint(checkpoint_path, model, optimizer=None):
+    """Load training checkpoint"""
+    if not os.path.exists(checkpoint_path):
+        print(f"❌ Checkpoint not found: {checkpoint_path}")
+        return None
+    
+    print(f"📂 Loading checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=CONFIG['device'])
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    if optimizer is not None and checkpoint.get('optimizer_state_dict') is not None:
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except Exception as e:
+            print(f"⚠️  Could not load optimizer state: {e}")
+    
+    print(f"✅ Checkpoint loaded successfully!")
+    print(f"   Resuming from epoch {checkpoint['epoch'] + 1}")
+    print(f"   Best validation accuracy: {checkpoint.get('best_val_acc', 0):.4f}")
+    
+    return checkpoint
 
 # =============================
-# TRAINING FUNCTION
+# Training & Validation
 # =============================
-def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_idx, idx_to_label):
-    device = torch.device(CONFIG["device"])
-    print(f"Using device: {device}")
-
-    # Determine feature dimension by processing a single sample
-    with torch.no_grad():
-        sample_frames, sample_labels = next(iter(train_loader))
-        single_frames = sample_frames[0:1]  # Take first sample only [1, T, C, H, W]
-        dummy_feats = encoder.encode(single_frames.cpu())
-        feature_dim = dummy_feats.shape[-1]
-        print(f"Determined feature_dim: {feature_dim}")
-
-    # Calculate class weights for imbalanced datasets
-    class_counts = [0] * num_classes
-    for _, label in train_loader.dataset.samples:
-        if label < num_classes:  # Only count valid labels
-            class_counts[label] += 1
-    
-    print(f"\n📊 Class distribution: {class_counts}")
-    
-    # Check for severely imbalanced classes
-    min_samples = min(class_counts)
-    max_samples = max(class_counts)
-    if min_samples < 5:
-        print(f"⚠️  WARNING: Some classes have very few samples (min={min_samples})!")
-        print(f"⚠️  Consider collecting more data for better results.")
-    if max_samples / (min_samples + 1e-6) > 5:
-        print(f"⚠️  WARNING: Severe class imbalance detected (ratio: {max_samples}/{min_samples})!")
-    
-    # Calculate weights (inverse frequency)
-    class_counts = np.array(class_counts, dtype=np.float32)
-    class_weights = 1.0 / (class_counts + 1e-6)
-    class_weights = class_weights / class_weights.max()  # normalize scale only
-
-    print(f"📊 Class weights (for balancing): {[f'{w:.4f}' for w in class_weights.tolist()]}\n")
-
-    model = EncoderLSTM(
-        feature_dim=feature_dim,
-        hidden_dim=512,
-        num_classes=num_classes
-    ).to(device)
-    
-    # Use weighted loss for imbalanced classes
-    criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float, device=device))
-    optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
-
-    best_val_acc = 0
-    best_model_state = None
-    patience_counter = 0
-    
-    for epoch in range(CONFIG['num_epochs']):
-        model.train()
-        running_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CONFIG['num_epochs']}")
-        
-        for frames, labels in pbar:
-            frames, labels = frames.to(device), labels.to(device)
-            
-            # Extract features using batch method
-            with torch.no_grad():
-                feats = encoder.encode(frames.cpu())
-            
-            # Ensure features are on the right device
-            feats = feats.to(device)
-            
-            # Forward pass
-            outputs = model(feats)
-            loss = criterion(outputs, labels)
-
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            # Calculate accuracy
-            preds = outputs.argmax(1)
-            correct = (preds == labels).sum().item()
-            total_correct += correct
-            total_samples += labels.size(0)
-            
-            running_loss += loss.item() * frames.size(0)
-            pbar.set_postfix({
-                'Loss': f'{loss.item():.4f}',
-                'Acc': f'{correct/labels.size(0):.4f}'
-            })
-
-        # Epoch statistics
-        if total_samples > 0:
-            avg_loss = running_loss / total_samples
-            epoch_acc = total_correct / total_samples
-            print(f"Epoch {epoch+1} - Loss: {avg_loss:.4f}, Acc: {epoch_acc:.4f}")
-
-            # Validation
-            if len(val_loader) > 0:
-                val_acc = validate_classifier(encoder, model, val_loader, device, idx_to_label)
-                
-                if val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    best_model_state = model.state_dict().copy()
-                    patience_counter = 0
-                    print(f"  ✓ New best validation accuracy: {val_acc:.4f}")
-                else:
-                    patience_counter += 1
-                    print(f"  No improvement ({patience_counter}/{CONFIG['early_stopping_patience']})")
-                    
-                    if patience_counter >= CONFIG['early_stopping_patience']:
-                        print(f"\n⏹️  Early stopping triggered at epoch {epoch+1}")
-                        print(f"  Best validation accuracy: {best_val_acc:.4f}")
-                        break
-
-    # Restore best model
-    if best_model_state is not None:
-        print(f"✓ Restoring best model (val_acc={best_val_acc:.4f})")
-        model.load_state_dict(best_model_state)
-
+def validate_classifier(encoder, model, val_loader, device, criterion):
+    """Validate model on validation set and return loss, accuracy, and per-class accuracy"""
     model.eval()
-
-    # Wrap & save
-    action_model = ActionRecognitionModel(
-        model=model,
-        label_to_idx=label_to_idx,
-        idx_to_label=idx_to_label,
-        feature_dim=feature_dim,
-        sequence_length=CONFIG['sequence_length']
-    )
-    action_model.save(CONFIG['model_save_path'])
-    return action_model
-
-# =============================
-# VALIDATION FUNCTION
-# =============================
-def validate_classifier(encoder, model, val_loader, device, idx_to_label):
-    """Simplified validation function"""
-    model.eval()
-    torch.set_grad_enabled(False)
-    
     total_correct = 0
     total_samples = 0
+    running_loss = 0.0
+    
+    # For per-class accuracy
     class_correct = {}
     class_total = {}
     
     with torch.no_grad():
         for frames, labels in val_loader:
             frames, labels = frames.to(device), labels.to(device)
-            
-            # Extract features
-            feats = encoder.encode(frames.cpu())
-            
-            # Predict
-            outputs = model(feats.to(device))
+            feats = encoder.encode(frames.cpu()).to(device)
+            outputs = model(feats)
+            loss = criterion(outputs, labels)
             preds = outputs.argmax(1)
             
             total_correct += (preds == labels).sum().item()
             total_samples += labels.size(0)
+            running_loss += loss.item() * labels.size(0)
             
-            # Per-class accuracy
-            for label, pred in zip(labels, preds):
-                label_item = label.item()
-                class_total[label_item] = class_total.get(label_item, 0) + 1
+            # Per-class tracking
+            for label, pred in zip(labels.cpu().numpy(), preds.cpu().numpy()):
+                if label not in class_total:
+                    class_total[label] = 0
+                    class_correct[label] = 0
+                class_total[label] += 1
                 if label == pred:
-                    class_correct[label_item] = class_correct.get(label_item, 0) + 1
+                    class_correct[label] += 1
     
     accuracy = total_correct / total_samples if total_samples > 0 else 0
-    print(f"  Validation Accuracy: {accuracy:.4f} ({total_correct}/{total_samples})")
+    avg_loss = running_loss / total_samples if total_samples > 0 else float('inf')
     
-    # Print per-class accuracy
-    if class_total:
-        print(f"  Per-class accuracy:")
-        for idx in sorted(class_total.keys()):
-            correct = class_correct.get(idx, 0)
-            total = class_total[idx]
-            acc = correct / total if total > 0 else 0
-            label_name = idx_to_label[idx]
-            print(f"    {label_name} (class {idx}): {acc:.4f} ({correct}/{total})")
+    # Compute per-class accuracy
+    per_class_acc = {}
+    for label in class_total:
+        per_class_acc[label] = class_correct[label] / class_total[label] if class_total[label] > 0 else 0
     
-    torch.set_grad_enabled(True)
-    return accuracy
+    return avg_loss, accuracy, per_class_acc
+
+def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_idx, idx_to_label):
+    device = torch.device(CONFIG["device"])
+    
+    # Determine feature dimension using a sample
+    with torch.no_grad():
+        sample_frames, _ = next(iter(train_loader))
+        dummy_feats = encoder.encode(sample_frames[0:1].cpu())
+        feature_dim = dummy_feats.shape[-1]
+    
+    print(f"Feature dimension: {feature_dim}")
+    
+    # Initialize model
+    model = EncoderLSTM(feature_dim=feature_dim, hidden_dim=512, num_classes=num_classes).to(device)
+    
+    # Compute class weights if enabled
+    if CONFIG.get('use_class_weights', True):
+        class_weights = compute_class_weights(train_loader.dataset).to(device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+    else:
+        criterion = nn.CrossEntropyLoss()
+        print("\n⚠️  Training without class weights")
+    
+    # Decide if resuming
+    is_resuming = CONFIG.get('checkpoint_path') and os.path.exists(CONFIG['checkpoint_path'])
+    
+    # Choose LR and max epochs based on resume status
+    if is_resuming:
+        lr = CONFIG['finetune_learning_rate']
+        print(f"🔄 Resume detected: using finetune LR {lr}")
+    else:
+        lr = CONFIG['base_learning_rate']
+        print(f"🆕 Training from scratch: using base LR {lr}")
+    
+    # Create optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # Try to load checkpoint if resuming
+    start_epoch = 0
+    best_val_acc = 0.0
+    best_val_loss = float('inf')
+    best_model_state = None
+    checkpoint = None
+
+    if is_resuming:
+        checkpoint = load_checkpoint(CONFIG['checkpoint_path'], model, optimizer)
+        if checkpoint:
+            start_epoch = checkpoint.get('epoch', 0) + 1
+            best_val_acc = checkpoint.get('best_val_acc', 0.0)
+            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        else:
+            print("⚠️  Failed to load checkpoint — starting from scratch with finetune LR.")
+    
+    # Determine max_epochs
+    if is_resuming:
+        # When resuming: run at most start_epoch + max_finetune_epochs (so we run additional fine-tune epochs)
+        max_epochs = start_epoch + CONFIG.get('max_finetune_epochs', 15)
+        print(f"   Fine-tuning mode: starting at epoch {start_epoch}, will run up to epoch {max_epochs}")
+    else:
+        max_epochs = CONFIG.get('base_epochs', 25)
+        print(f"   Fresh training mode: will run up to epoch {max_epochs}")
+    
+    patience_counter = 0
+
+    # Training loop
+    for epoch in range(start_epoch, max_epochs):
+        model.train()
+        running_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
+        for frames, labels in pbar:
+            frames, labels = frames.to(device), labels.to(device)
+            
+            # Encode features (encoder works on numpy/CPU so send frames.cpu())
+            with torch.no_grad():
+                feats = encoder.encode(frames.cpu())
+            feats = feats.to(device)
+            
+            outputs = model(feats)
+            loss = criterion(outputs, labels)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            preds = outputs.argmax(1)
+            total_correct += (preds == labels).sum().item()
+            total_samples += labels.size(0)
+            running_loss += loss.item() * frames.size(0)
+            
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'acc': f'{total_correct/total_samples:.4f}'
+            })
+        
+        train_loss = running_loss / total_samples if total_samples > 0 else float('inf')
+        train_acc = total_correct / total_samples if total_samples > 0 else 0.0
+
+        print(f"\n📊 Epoch {epoch+1}/{max_epochs}")
+        print(f"   Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+
+        # Validation step
+        val_loss = float('inf')
+        val_acc = 0.0
+        per_class_acc = {}
+        if len(val_loader) > 0:
+            val_loss, val_acc, per_class_acc = validate_classifier(encoder, model, val_loader, device, criterion)
+            print(f"   Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+            
+            # Print per-class validation accuracy
+            if per_class_acc:
+                print(f"   Per-class validation accuracy:")
+                for label_idx in sorted(per_class_acc.keys()):
+                    class_name = idx_to_label[label_idx]
+                    acc = per_class_acc[label_idx]
+                    print(f"     {class_name}: {acc:.4f}")
+
+        # Early stopping logic (based on validation loss)
+        improved = val_loss < (best_val_loss - CONFIG.get('min_delta', 0.0))
+        if improved:
+            best_val_loss = val_loss
+            best_val_acc = val_acc
+            best_model_state = model.state_dict().copy()
+            patience_counter = 0
+            print("   ⭐ Validation loss improved — saving best model state and resetting patience.")
+        else:
+            patience_counter += 1
+            print(f"   No improvement in validation loss ({patience_counter}/{CONFIG['early_stopping_patience']})")
+            if patience_counter >= CONFIG['early_stopping_patience']:
+                print("\n🛑 Early stopping triggered — stopping training.")
+                break
+
+        # Periodic checkpoint save
+        if CONFIG.get('save_checkpoint_every') and (epoch + 1) % CONFIG['save_checkpoint_every'] == 0:
+            checkpoint_name = f"checkpoint_epoch_{epoch+1}.pth"
+            checkpoint_path = os.path.join(CONFIG.get('checkpoint_dir', '.'), checkpoint_name)
+            save_checkpoint(model, optimizer, epoch, best_val_acc, 
+                          label_to_idx, idx_to_label, feature_dim, checkpoint_path, best_val_loss)
+
+        # Save latest checkpoint
+        if CONFIG.get('checkpoint_dir'):
+            latest_checkpoint = os.path.join(CONFIG['checkpoint_dir'], 'checkpoint_latest.pth')
+            save_checkpoint(model, optimizer, epoch, best_val_acc, 
+                          label_to_idx, idx_to_label, feature_dim, latest_checkpoint, best_val_loss)
+    
+    # Load best model if available
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+        print(f"\n✅ Loaded best model (val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.4f})")
+
+    # Save final model and mapping
+    torch.save(model.state_dict(), CONFIG['model_save_path'])
+    mapping_path = CONFIG['model_save_path'].replace('.pth', '_mapping.json')
+    mapping_data = {
+        'label_to_idx': label_to_idx,
+        'idx_to_label': idx_to_label,
+        'feature_dim': feature_dim,
+        'sequence_length': CONFIG['sequence_length'],
+        'num_classes': num_classes
+    }
+    with open(mapping_path, 'w') as f:
+        json.dump(mapping_data, f, indent=2)
+    
+    return model
 
 # =============================
-# Main with AUTO CLASS DETECTION
+# Main
 # =============================
 if __name__ == "__main__":
     set_seed(42)
-    print("✓ Random seed set to 42 for reproducibility\n")
     
-    if not os.path.exists(ENCODER_XML) or not os.path.exists(ENCODER_BIN):
-        print(f"Error: Intel model files not found at:")
-        print(f"  XML: {ENCODER_XML}")
-        print(f"  BIN: {ENCODER_BIN}")
-        exit(1)
-
-    # Initialize datasets - they will auto-detect the correct number of classes
+    print("=" * 60)
+    print("🎯 ACTION RECOGNITION TRAINING (WITH CLASS BALANCING)")
+    print("=" * 60)
+    
+    # Display training mode intention
+    if CONFIG.get('checkpoint_path'):
+        print(f"\n📂 Config checkpoint path: {CONFIG['checkpoint_path']}")
+    print(f"   Device: {CONFIG['device']}")
+    print(f"   Batch size: {CONFIG['batch_size']}")
+    print(f"   Class weighting: {'ENABLED' if CONFIG.get('use_class_weights') else 'DISABLED'}")
+    print(f"   Early stopping patience: {CONFIG['early_stopping_patience']} epochs")
+    print("=" * 60)
+    
+    # Load datasets
+    print("\n📁 Loading datasets...")
     train_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "train"), is_training=True)
     val_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "val"), is_training=False)
     
-    if len(train_dataset.samples) == 0:
-        print("No training samples found! Please check your dataset structure.")
-        exit(1)
-        
-    print(f"\n📁 Dataset Information:")
-    print(f"  Training samples:   {len(train_dataset)}")
-    print(f"  Validation samples: {len(val_dataset)}")
-    print(f"  Total classes detected: {len(train_dataset.labels)}")
-    print()
+    print(f"\n📊 Dataset statistics:")
+    print(f"   Training samples: {len(train_dataset)}")
+    print(f"   Validation samples: {len(val_dataset)}")
+    print(f"   Number of classes: {len(train_dataset.labels)}")
     
-    is_valid, valid_actions = validate_dataset_size(train_dataset, val_dataset)
-    if not is_valid:
-        print("\n❌ Training aborted due to insufficient data.")
-        exit(1)
+    # Print class distribution
+    print_class_distribution(train_dataset, "Training set")
+    if len(val_dataset) > 0:
+        print_class_distribution(val_dataset, "Validation set")
     
-    # Use ALL detected classes (no filtering needed since we auto-detect correctly)
-    label_to_idx, idx_to_label = train_dataset.get_label_mapping()
-    
-    print(f"\n🎯 Final training configuration:")
-    print(f"  Number of classes: {len(train_dataset.labels)}")
-    print(f"  Training samples: {len(train_dataset.samples)}")
-    print(f"  Validation samples: {len(val_dataset.samples)}")
-    
+    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
-
+    
+    # Initialize encoder
+    print(f"\n🔧 Initializing Intel encoder...")
     encoder = IntelFeatureExtractor(ENCODER_XML, ENCODER_BIN)
     
-    print(f"\n🚀 Starting training...\n")
-    action_model = train_classifier(encoder, train_loader, val_loader, 
-                                  num_classes=len(train_dataset.labels),
-                                  label_to_idx=label_to_idx,
-                                  idx_to_label=idx_to_label)
+    # Get label mappings
+    label_to_idx, idx_to_label = train_dataset.get_label_mapping()
     
-    if len(val_loader) > 0:
-        print(f"\n📊 Final Validation:")
-        device = torch.device(CONFIG["device"])
-        validate_classifier(encoder, action_model.model, val_loader, device, idx_to_label)
+    # Train model
+    print(f"\n🚀 Starting training...")
+    model = train_classifier(encoder, train_loader, val_loader, 
+                            len(train_dataset.labels), label_to_idx, idx_to_label)
     
-    print(f"\n✅ Training completed! Model and labels saved.")
-    print(f"✓ Model path: {CONFIG['model_save_path']}")
+    if model:
+        print(f"\n✅ Training complete!")
+        print(f"   Final model saved to: {CONFIG['model_save_path']}")
+    else:
+        print(f"\n❌ Training failed!")
+    
+    print("=" * 60)

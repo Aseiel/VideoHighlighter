@@ -289,6 +289,11 @@ def draw_action_labels(frame, detected_actions, max_labels=3):
 # =============================
 # Run action detection
 # =============================
+def softmax(x):
+    e = np.exp(x - np.max(x))
+    return e / np.sum(e)
+
+
 def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="action_log.csv",
                          debug=False, top_k=50, confidence_threshold=0.01, show_video=False,
                          num_requests=2, interesting_actions=None,
@@ -380,6 +385,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 if len(sequence_buffer) == SEQUENCE_LENGTH:
                     sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
                     predictions = compiled_decoder([sequence_array])[decoder_output].flatten()
+                    probabilities = softmax(predictions)
                     
                     # Clear recent detections for this frame
                     frame_detections = []
@@ -388,7 +394,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                         # Check only the requested actions
                         for action_name in interesting_actions_set:
                             action_id = get_id_from_name(action_name)
-                            score = float(predictions[action_id])
+                            score = float(probabilities[action_id])
                             if score >= confidence_threshold:
                                 writer.writerow([timestamp_str, frame_id, action_id, action_name, score, timestamp_secs])
                                 all_actions.append((timestamp_secs, frame_id, action_id, score, action_name))
@@ -398,9 +404,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                     print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
                     else:
                         # fallback to top-k
-                        top_indices = np.argsort(predictions)[-top_k:][::-1]
+                        top_indices = np.argsort(probabilities)[-top_k:][::-1]
                         for idx in top_indices:
-                            score = float(predictions[idx])
+                            score = float(probabilities[idx])
                             action_name = get_action_name(idx)
                             if score >= confidence_threshold:
                                 writer.writerow([timestamp_str, frame_id, idx, action_name, score, timestamp_secs])
@@ -450,11 +456,18 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
             if len(sequence_buffer) == SEQUENCE_LENGTH:
                 sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
-                predictions = compiled_decoder([sequence_array])[decoder_output].flatten()
-                top_indices = np.argsort(predictions)[-top_k:][::-1]
+
+                # Decode logits
+                logits = compiled_decoder([sequence_array])[decoder_output].flatten()
+
+                # ✅ Convert logits → probabilities
+                probabilities = softmax(logits)
+
+                # ✅ Use probabilities for ranking
+                top_indices = np.argsort(probabilities)[-top_k:][::-1]
 
                 for idx in top_indices:
-                    score = float(predictions[idx])
+                    score = float(probabilities[idx])
                     action_name = get_action_name(idx)
                     if score >= confidence_threshold:
                         if interesting_actions_set is None or action_name.lower() in interesting_actions_set:
@@ -463,6 +476,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             detection_count += 1
                             if debug:
                                 print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
+
 
     cap.release()
     if video_writer:
