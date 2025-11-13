@@ -719,34 +719,54 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     else:
                         normalized_detections.append(detection)
                 
-                # 1️⃣ Group consecutive actions chronologically
-                grouped_actions = group_consecutive_adaptive(all_action_detections, max_gap=1)
+                # 1️⃣ Group consecutive actions chronologically - BUT GROUP EACH ACTION TYPE SEPARATELY
+                sequences_by_action = defaultdict(list)
 
-                print(f"\nDEBUG: Grouped {len(all_action_detections)} individual actions into {len(grouped_actions)} sequences")
+                # First, separate actions by type
+                for action in all_action_detections:
+                    if len(action) == 4:
+                        timestamp, frame_id, score, action_name = action
+                        sequences_by_action[action_name].append((timestamp, frame_id, -1, score, action_name))
+                    else:
+                        timestamp, frame_id, action_id, score, action_name = action
+                        sequences_by_action[action_name].append(action)
 
-                # 2️⃣ Sort by confidence (best first) and cap total duration
-                # Cap at 2-3x your target to give scoring system good options without hanging
-                MAX_ACTION_DURATION = target_duration * 3  # 3x target = plenty of options
+                # Now group each action type independently
+                grouped_by_action = {}
+                for action_name, action_list in sequences_by_action.items():
+                    grouped_by_action[action_name] = group_consecutive_adaptive(action_list, max_gap=1.3, jump_threshold=0.01)
+                    print(f"DEBUG: {action_name}: {len(action_list)} detections → {len(grouped_by_action[action_name])} sequences")
+
+                # 2️⃣ Select best sequences FROM EACH action with per-action quota
+                MAX_ACTION_DURATION = target_duration * 3
                 selected_sequences = []
-                total_duration = 0
 
-                sorted_sequences = sorted(grouped_actions, key=lambda x: x[3], reverse=True)
+                # Calculate quota per action (distribute duration fairly)
+                num_actions = len(grouped_by_action)
+                quota_per_action = MAX_ACTION_DURATION / num_actions if num_actions > 0 else 0
 
-                for sequence in sorted_sequences:
-                    start_time, end_time, duration, confidence, action_name = sequence
-                    
-                    # Stop when we hit duration cap
-                    if total_duration >= MAX_ACTION_DURATION:
-                        break
-                    
-                    selected_sequences.append(sequence)
-                    total_duration += duration
-                    
-                    # Log ALL sequences
-                    print(f"DEBUG: Added sequence {action_name} at {seconds_to_mmss(start_time)}-{seconds_to_mmss(end_time)} "
-                        f"({duration:.1f}s duration, confidence: {confidence:.3f}) - Total: {seconds_to_mmss(total_duration)})")
+                print(f"DEBUG: Allocating {quota_per_action:.1f}s per action type ({num_actions} types)")
 
-                print(f"\nDEBUG: Selected {len(selected_sequences)} sequences totaling {total_duration:.1f}s")
+                # Select best sequences from EACH action independently
+                for action_name, action_sequences in grouped_by_action.items():  # ← Use grouped_by_action directly!
+                    # Sort this action's sequences by confidence
+                    sorted_action_seqs = sorted(action_sequences, key=lambda x: x[3], reverse=True)
+                    
+                    action_duration = 0
+                    for sequence in sorted_action_seqs:
+                        start_time, end_time, duration, confidence, action_name = sequence
+                        
+                        # Stop when this action hits its quota
+                        if action_duration >= quota_per_action:
+                            break
+                        
+                        selected_sequences.append(sequence)
+                        action_duration += duration
+                        
+                        print(f"DEBUG: Selected {action_name} at {seconds_to_mmss(start_time)}-{seconds_to_mmss(end_time)} "
+                            f"({duration:.1f}s, conf: {confidence:.3f}) - Action total: {action_duration:.1f}s/{quota_per_action:.1f}s")
+
+                print(f"\nDEBUG: Selected {len(selected_sequences)} sequences from {num_actions} action types")
 
                 # 3️⃣ Convert back to individual action format for pipeline compatibility
                 action_detections = []
@@ -835,35 +855,47 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         OBJECT_TOLERANCE = 10
         BASE_ACTION_POINTS = ACTION_POINTS
 
-        # action scoring (group by seconds)
-        detections_by_sec = defaultdict(list)
-        for (timestamp_secs, frame_id, action_id, sc, action_name) in action_detections:
-            sec = int(timestamp_secs)
-            detections_by_sec[sec].append((action_name, sc))
+        # Calculate confidence percentiles PER ACTION TYPE
+        action_type_confidences = defaultdict(list)
+        for sec, actions in detections_by_sec.items():
+            for action_name, confidence in actions:
+                action_type_confidences[action_name].append(confidence)
 
-        # Calculate confidence percentiles to scale relative to video
-        if detections_by_sec:
-            all_confidences = [max(conf for _, conf in actions) for actions in detections_by_sec.values()]
-            confidence_90th = np.percentile(all_confidences, 90)  # 90th percentile as "high confidence"
-            confidence_50th = np.percentile(all_confidences, 50)  # 50th percentile as "average"
-            
-            log(f"📊 Action confidence stats: 50th={confidence_50th:.2f}, 90th={confidence_90th:.2f}")
+        # Calculate percentiles for each action type
+        action_type_percentiles = {}
+        for action_name, confidences in action_type_confidences.items():
+            if len(confidences) > 0:
+                action_type_percentiles[action_name] = {
+                    '50th': np.percentile(confidences, 50),
+                    '90th': np.percentile(confidences, 90)
+                }
+                log(f"📊 {action_name} confidence stats: 50th={action_type_percentiles[action_name]['50th']:.2f}, 90th={action_type_percentiles[action_name]['90th']:.2f}")
 
+        # Now score each second with action-type-specific percentiles
         for sec, actions in detections_by_sec.items():
             if sec < len(action_score):
                 if not actions_require_objects or any(abs(obj_sec - sec) <= OBJECT_TOLERANCE for obj_sec in object_detections):
-                    max_confidence = max(conf for _, conf in actions)
+                    # Find the HIGHEST confidence action in this second
+                    max_confidence = 0
+                    best_action_name = None
                     
-                    # Scale points relative to this video's confidence distribution
-                    if max_confidence >= confidence_90th:
-                        # Top 10% confidence: bonus points
-                        action_score[sec] += ACTION_POINTS * 1.5
-                    elif max_confidence >= confidence_50th:
-                        # Above average: normal points
-                        action_score[sec] += ACTION_POINTS
-                    else:
-                        # Below average: reduced points
-                        action_score[sec] += ACTION_POINTS * 0.5
+                    for action_name, confidence in actions:
+                        if confidence > max_confidence:
+                            max_confidence = confidence
+                            best_action_name = action_name
+                    
+                    # Score ONLY ONCE per second using the best action
+                    if best_action_name and max_confidence > 0:
+                        percentiles = action_type_percentiles.get(best_action_name, {})
+                        confidence_90th = percentiles.get('90th', 0)
+                        confidence_50th = percentiles.get('50th', 0)
+                        
+                        if max_confidence >= confidence_90th:
+                            action_score[sec] += ACTION_POINTS * 1.5
+                        elif max_confidence >= confidence_50th:
+                            action_score[sec] += ACTION_POINTS
+                        else:
+                            action_score[sec] += ACTION_POINTS * 0.5
 
         log(f"✅ Object detection summary: {total_detections} detections")
 

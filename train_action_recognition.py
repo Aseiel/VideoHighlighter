@@ -14,7 +14,7 @@ from tqdm import tqdm
 from collections import deque
 
 # =============================
-# How to
+# How to Use
 # Put short 5-10s videos to dataset/train/{action_name} and dataset/val/{action_name}
 # Usually You should put minimum 100+ videos for train and 20+ for val
 # =============================
@@ -52,6 +52,124 @@ class SmoothedROIDetector:
     def reset(self):
         self.roi_history.clear()
         self.smoothed_roi = None
+
+# =============================
+# Pose Estimation for Spatial Guidance
+# =============================
+class PoseExtractor:
+    """Extract YOLOv11 pose keypoints to guide spatial cropping"""
+    def __init__(self, model_name="yolo11n-pose.pt", conf_threshold=0.3):
+        """
+        Initialize pose extractor for spatial guidance
+        Args:
+            model_name: YOLOv11 pose model (n/s/m/l/x variants)
+            conf_threshold: Confidence threshold for pose detection
+        """
+        print(f"🦴 Loading pose estimation model: {model_name}")
+        self.model = YOLO(model_name)
+        self.conf_threshold = conf_threshold
+        # COCO format: 17 keypoints
+        self.num_keypoints = 17
+        self.keypoint_names = [
+            'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+            'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+            'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+            'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
+        ]
+        
+    def get_action_region_from_poses(self, frame, person_boxes):
+        """
+        Use pose keypoints to identify WHERE the action is happening
+        Focuses on torso/hip/pelvis region for intimate actions
+        
+        Args:
+            frame: RGB frame (H, W, 3)
+            person_boxes: List of (x1, y1, x2, y2) person bounding boxes
+            
+        Returns:
+            action_roi: (x1, y1, x2, y2) focused on action region
+        """
+        h, w = frame.shape[:2]
+        
+        # Run pose detection on full frame
+        results = self.model.predict(frame, conf=self.conf_threshold, verbose=False)
+        
+        if len(results) == 0 or results[0].keypoints is None:
+            # Fallback: use merged person boxes
+            return self._merge_boxes(person_boxes)
+        
+        all_keypoints = results[0].keypoints.data.cpu().numpy()
+        
+        if len(all_keypoints) == 0:
+            return self._merge_boxes(person_boxes)
+        
+        # Define "action region" keypoints (focus on torso/hips/pelvis)
+        # COCO format indices:
+        # 5: left_shoulder, 6: right_shoulder
+        # 11: left_hip, 12: right_hip
+        # 13: left_knee, 14: right_knee
+        action_keypoint_indices = [5, 6, 11, 12, 13, 14]
+        
+        action_points = []
+        
+        # Collect all relevant keypoints from all detected people
+        for kpts in all_keypoints:
+            for idx in action_keypoint_indices:
+                if kpts[idx, 2] > 0.3:  # confidence > 0.3
+                    action_points.append(kpts[idx, :2])
+        
+        if len(action_points) == 0:
+            return self._merge_boxes(person_boxes)
+        
+        action_points = np.array(action_points)
+        
+        # Find bounding box around action points
+        x_min = np.min(action_points[:, 0])
+        y_min = np.min(action_points[:, 1])
+        x_max = np.max(action_points[:, 0])
+        y_max = np.max(action_points[:, 1])
+        
+        # Add padding (30% extra on each side to capture context)
+        width = x_max - x_min
+        height = y_max - y_min
+        padding_x = width * 0.3
+        padding_y = height * 0.3
+        
+        x1 = max(0, int(x_min - padding_x))
+        y1 = max(0, int(y_min - padding_y))
+        x2 = min(w, int(x_max + padding_x))
+        y2 = min(h, int(y_max + padding_y))
+        
+        return (x1, y1, x2, y2)
+    
+    def _merge_boxes(self, boxes):
+        """Merge multiple bounding boxes into one"""
+        if len(boxes) == 0:
+            return None
+        if len(boxes) == 1:
+            return boxes[0]
+        
+        x1_min = min(b[0] for b in boxes)
+        y1_min = min(b[1] for b in boxes)
+        x2_max = max(b[2] for b in boxes)
+        y2_max = max(b[3] for b in boxes)
+        
+        return (x1_min, y1_min, x2_max, y2_max)
+    
+    def get_all_keypoints_for_visualization(self, frame):
+        """
+        Get all detected keypoints for visualization purposes
+        
+        Returns:
+            List of keypoint arrays (each is 17x3: x, y, conf)
+        """
+        results = self.model.predict(frame, conf=self.conf_threshold, verbose=False)
+        
+        if len(results) == 0 or results[0].keypoints is None:
+            return []
+        
+        all_keypoints = results[0].keypoints.data.cpu().numpy()
+        return [kpts for kpts in all_keypoints if np.sum(kpts[:, 2] > 0.3) >= 5]
 
 # =============================
 # Person Detection with Tracking
@@ -127,15 +245,15 @@ class PersonTracker:
                     del self.tracks[track_id]
         
         sorted_tracks = sorted(self.tracks.items(), key=lambda x: x[0])
-        top_tracks = sorted_tracks[:2]
         
-        return [(track_id, data['box']) for track_id, data in top_tracks]
+        return [(track_id, data['box']) for track_id, data in sorted_tracks]
     
     def reset(self):
         self.tracks = {}
         self.next_id = 0
 
-def detect_top2_people(frame, detector, tracker=None):
+def detect_all_people(frame, detector, tracker=None):
+    """Detect all persons with optional tracking"""
     result = detector.predict(frame, conf=0.40, classes=[0], verbose=False)
     boxes = []
 
@@ -149,7 +267,7 @@ def detect_top2_people(frame, detector, tracker=None):
     detected_boxes = [b for _, b in boxes]
     
     if tracker is None:
-        return detected_boxes[:2]
+        return detected_boxes
     else:
         tracked = tracker.update(detected_boxes)
         return tracked
@@ -160,11 +278,15 @@ def merge_boxes(boxes):
     if len(boxes) == 1:
         return boxes[0]
 
-    (x1a, y1a, x2a, y2a) = boxes[0]
-    (x1b, y1b, x2b, y2b) = boxes[1]
-    return (min(x1a, x1b), min(y1a, y1b), max(x2a, x2b), max(y2a, y2b))
+    x1_min = min(b[0] for b in boxes)
+    y1_min = min(b[1] for b in boxes)
+    x2_max = max(b[2] for b in boxes)
+    y2_max = max(b[3] for b in boxes)
+    
+    return (x1_min, y1_min, x2_max, y2_max)
 
 def crop_roi(frame, roi, output_size):
+    """Crop frame to ROI at high resolution, then resize to output_size"""
     if roi is None:
         h, w, _ = frame.shape
         th, tw = output_size
@@ -180,7 +302,6 @@ def crop_roi(frame, roi, output_size):
     x2 = max(0, min(x2, w - 1))
     y2 = max(0, min(y2, h - 1))
 
-    # Avoid empty crop
     if x2 <= x1 or y2 <= y1:
         h, w, _ = frame.shape
         th, tw = output_size
@@ -193,7 +314,290 @@ def crop_roi(frame, roi, output_size):
     return cv2.resize(crop, output_size)
 
 # =============================
-# Configuration (merged)
+# Improved Frame Sampling for Static Actions
+# =============================
+def improved_frame_sampling(video_path, sequence_length=16, sampling_strategy="temporal_stride"):
+    """
+    Multiple sampling strategies for better temporal understanding
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    # Choose sampling strategy based on video characteristics
+    if sampling_strategy == "temporal_stride":
+        # For static actions: sample every 4-6 frames to see subtle changes
+        stride = max(4, total_frames // (sequence_length * 2))
+        indices = np.linspace(0, total_frames - 1, sequence_length * stride)[::stride][:sequence_length]
+        indices = indices.astype(int)
+        
+    elif sampling_strategy == "three_segment":
+        # Divide video into beginning, middle, end - good for action progression
+        segment_frames = sequence_length // 3
+        remaining = sequence_length % 3
+        
+        # Beginning segment
+        start_indices = np.linspace(0, total_frames // 3, segment_frames + remaining).astype(int)
+        # Middle segment  
+        mid_indices = np.linspace(total_frames // 3, 2 * total_frames // 3, segment_frames).astype(int)
+        # End segment
+        end_indices = np.linspace(2 * total_frames // 3, total_frames - 1, segment_frames).astype(int)
+        
+        indices = np.concatenate([start_indices, mid_indices, end_indices])
+        
+    elif sampling_strategy == "adaptive_motion":
+        # Sample more frames during high-motion periods
+        indices = adaptive_motion_sampling(cap, total_frames, sequence_length)
+    
+    else:  # uniform
+        indices = np.linspace(0, total_frames - 1, sequence_length).astype(int)
+    
+    cap.release()
+    return indices
+
+def adaptive_motion_sampling(cap, total_frames, sequence_length):
+    """Sample more frames during periods of high motion"""
+    # Read sample frames to detect motion
+    sample_interval = max(1, total_frames // 50)
+    frame_diff = []
+    prev_frame = None
+    
+    for i in range(0, total_frames, sample_interval):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+            
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if prev_frame is not None:
+            diff = cv2.absdiff(prev_frame, gray)
+            frame_diff.append((i, diff.mean()))
+        prev_frame = gray
+    
+    if not frame_diff:
+        return np.linspace(0, total_frames - 1, sequence_length).astype(int)
+    
+    # Find high-motion regions
+    frame_diff = np.array(frame_diff)
+    motion_threshold = np.percentile(frame_diff[:, 1], 70)
+    high_motion_frames = frame_diff[frame_diff[:, 1] > motion_threshold, 0]
+    
+    # Sample strategically: more frames in high-motion regions
+    if len(high_motion_frames) > sequence_length // 2:
+        # If lots of motion, sample evenly from high-motion frames
+        high_motion_samples = np.random.choice(
+            high_motion_frames, 
+            size=min(sequence_length // 2, len(high_motion_frames)), 
+            replace=False
+        )
+        remaining_samples = sequence_length - len(high_motion_samples)
+        other_samples = np.linspace(0, total_frames - 1, remaining_samples * 2)[::2].astype(int)
+        indices = np.concatenate([high_motion_samples, other_samples])
+    else:
+        # Default to temporal stride
+        stride = max(4, total_frames // (sequence_length * 2))
+        indices = np.linspace(0, total_frames - 1, sequence_length * stride)[::stride][:sequence_length].astype(int)
+    
+    return np.sort(indices)
+
+# =============================
+# Video Sample Visualization
+# =============================
+def visualize_training_sample(video_path, label, pose_extractor, output_path="training_sample.mp4", 
+                              sample_rate=5):
+    """Creates a video sample visualization with bounding boxes, pose keypoints, and action ROI"""
+    print(f"\n🎬 Creating training sample visualization for: {video_path}")
+    print(f"   Action label: {label}")
+    print(f"   Detection sample rate: every {sample_rate} frame(s)")
+    
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"❌ Could not open video: {video_path}")
+        return False
+    
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    if fps == 0:
+        fps = 30
+    
+    print(f"   Video properties: {width}x{height}, {fps} FPS, {total_frames} frames")
+    
+    # Try codecs
+    codecs = [('mp4v', '.mp4'), ('avc1', '.mp4'), ('XVID', '.avi'), ('MJPG', '.avi')]
+    video_writer = None
+    
+    for codec, ext in codecs:
+        try:
+            output_path_with_ext = output_path.replace('.mp4', ext).replace('.avi', ext)
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            video_writer = cv2.VideoWriter(output_path_with_ext, fourcc, fps, (width, height + 60))
+            if video_writer.isOpened():
+                output_path = output_path_with_ext
+                print(f"   Using codec: {codec}")
+                break
+            else:
+                video_writer = None
+        except:
+            continue
+    
+    if video_writer is None:
+        print("❌ Could not initialize video writer")
+        cap.release()
+        return False
+    
+    frame_count = 0
+    successful_frames = 0
+    pbar = tqdm(total=total_frames, desc="Creating visualization")
+    
+    person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=10)
+    roi_smoother = SmoothedROIDetector(window_size=5, alpha=0.3)
+    
+    track_colors = {}
+    color_palette = [(0, 255, 0), (255, 0, 255), (255, 255, 0), (0, 255, 255), 
+                     (255, 128, 0), (128, 255, 0), (0, 128, 255), (255, 0, 128)]
+    
+    last_tracked_people = []
+    last_action_roi = None
+    last_poses = []
+    
+    # Pose visualization connections
+    pose_connections = [
+        (0, 1), (0, 2), (1, 3), (2, 4),  # Face
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # Arms
+        (5, 11), (6, 12), (11, 12),  # Torso
+        (11, 13), (13, 15), (12, 14), (14, 16)  # Legs
+    ]
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        try:
+            display_frame = frame.copy()
+            
+            if frame_count % sample_rate == 0:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Detect and track people
+                last_tracked_people = detect_all_people(frame_rgb, yolo_people, person_tracker)
+                
+                # Extract boxes
+                if last_tracked_people and isinstance(last_tracked_people[0], tuple):
+                    boxes_only = [box for _, box in last_tracked_people]
+                else:
+                    boxes_only = last_tracked_people
+                
+                # Get ACTION-FOCUSED ROI using pose
+                if pose_extractor is not None and len(boxes_only) > 0:
+                    action_roi = pose_extractor.get_action_region_from_poses(frame_rgb, boxes_only)
+                else:
+                    action_roi = merge_boxes(boxes_only)
+                
+                # Smooth the action ROI
+                last_action_roi = roi_smoother.update(action_roi)
+                
+                # Get keypoints for visualization
+                if pose_extractor is not None:
+                    last_poses = pose_extractor.get_all_keypoints_for_visualization(frame_rgb)
+            
+            # Draw tracked person boxes (GREEN)
+            for i, item in enumerate(last_tracked_people):
+                if isinstance(item, tuple):
+                    track_id, (x1, y1, x2, y2) = item
+                    if track_id not in track_colors:
+                        track_colors[track_id] = color_palette[len(track_colors) % len(color_palette)]
+                    color = track_colors[track_id]
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(display_frame, f"Person {track_id}", (x1, max(20, y1-10)), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                else:
+                    x1, y1, x2, y2 = item
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            # Draw ACTION ROI (BLUE - thicker)
+            if last_action_roi:
+                x1, y1, x2, y2 = last_action_roi
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 0, 0), 4)
+                cv2.putText(display_frame, "ACTION CROP", (x1, max(45, y1-40)), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 3)
+            
+            # Draw pose keypoints and skeleton
+            for pose_kpts in last_poses:
+                # Draw skeleton connections (CYAN)
+                for conn in pose_connections:
+                    pt1_idx, pt2_idx = conn
+                    if pose_kpts[pt1_idx, 2] > 0.3 and pose_kpts[pt2_idx, 2] > 0.3:
+                        pt1 = (int(pose_kpts[pt1_idx, 0]), int(pose_kpts[pt1_idx, 1]))
+                        pt2 = (int(pose_kpts[pt2_idx, 0]), int(pose_kpts[pt2_idx, 1]))
+                        cv2.line(display_frame, pt1, pt2, (0, 255, 255), 2)
+                
+                # Draw keypoints (RED)
+                for kpt in pose_kpts:
+                    if kpt[2] > 0.3:
+                        cv2.circle(display_frame, (int(kpt[0]), int(kpt[1])), 4, (0, 0, 255), -1)
+            
+            # Create label area
+            label_area = np.zeros((60, width, 3), dtype=np.uint8)
+            cv2.putText(label_area, f"ACTION: {label}", (20, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+            cv2.putText(label_area, f"Frame: {frame_count}/{total_frames}", (width-250, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            num_people = len(last_tracked_people)
+            cv2.putText(label_area, f"People: {num_people} | Poses: {len(last_poses)}", (width-550, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            
+            combined_frame = np.vstack([label_area, display_frame])
+            video_writer.write(combined_frame)
+            successful_frames += 1
+            
+        except Exception as e:
+            print(f"⚠️  Error processing frame {frame_count}: {e}")
+        
+        frame_count += 1
+        pbar.update(1)
+    
+    cap.release()
+    video_writer.release()
+    pbar.close()
+    
+    success_rate = (successful_frames / frame_count) * 100 if frame_count > 0 else 0
+    print(f"✅ Visualization: {successful_frames}/{frame_count} frames ({success_rate:.1f}%)")
+    print(f"✅ Output: {output_path}")
+    
+    return successful_frames > 0
+
+def create_sample_visualizations(dataset, pose_extractor, num_samples=2):
+    """Create visualizations for random samples"""
+    print(f"\n📹 Creating {num_samples} sample visualizations...")
+    
+    if len(dataset.samples) == 0:
+        print("❌ No samples found")
+        return
+    
+    selected_indices = random.sample(range(len(dataset.samples)), min(num_samples, len(dataset.samples)))
+    
+    for i, idx in enumerate(selected_indices):
+        video_path, label_idx = dataset.samples[idx]
+        label_name = dataset.idx_to_label[label_idx]
+        output_filename = f"sample_{i+1}_{label_name.replace(' ', '_')}.mp4"
+        visualize_training_sample(
+            video_path, 
+            label_name,
+            pose_extractor,
+            output_filename,
+            sample_rate=CONFIG.get('visualization_sample_rate', 5)
+        )
+
+# =============================
+# Configuration
 # =============================
 def set_seed(seed=42):
     random.seed(seed)
@@ -207,33 +611,38 @@ def set_seed(seed=42):
 CONFIG = {
     "data_path": "dataset",
     "batch_size": 2,
-    # Two-phase training: base and finetune settings
-    "base_epochs": 25,                  # initial training epochs
-    "base_learning_rate": 1e-4,         # initial LR
-    "finetune_learning_rate": 1e-5,     # LR when resuming (10x smaller)
-    "max_finetune_epochs": 15,          # safety ceiling for fine-tuning additional epochs
-    "early_stopping_patience": 5,       # patience for early stopping
-    "min_delta": 0.001,                 # minimal improvement in val loss to reset patience
-
-    # Class balancing
-    "use_class_weights": True,          # Enable class weighting for imbalanced datasets
-
-    # previously used keys kept for compatibility
+    "base_epochs": 25,
+    "base_learning_rate": 1e-4,
+    "finetune_learning_rate": 1e-5,
+    "max_finetune_epochs": 15,
+    "early_stopping_patience": 5,
+    "min_delta": 0.001,
+    "use_class_weights": True,
+    "augmentation_prob": 0.3,  # 30% chance of augmentation per frame
     "sequence_length": 16,
-    "crop_size": (224, 224),
+    "crop_size": (224, 224),  # Intel encoder requires 224x224
     "model_save_path": "intel_finetuned_classifier_3d.pth",
-    "checkpoint_path": r"D:\movie_highlighter\checkpoints\checkpoint_latest.pth",  # for resume
-    "save_checkpoint_every": 5,  # Save checkpoint every N epochs
-    "checkpoint_dir": "checkpoints",  # Directory for checkpoint saves
+    "checkpoint_path": r"D:\movie_highlighter\checkpoints\checkpoint_latest.pth",
+    "save_checkpoint_every": 5,
+    "checkpoint_dir": "checkpoints",
     "min_train_per_action": 5,
     "min_val_per_action": 0,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "mean": [0.485, 0.456, 0.406],
     "std": [0.229, 0.224, 0.225],
-    "create_visualizations": False,  # Set to True to create sample videos
+    "create_visualizations": True,
     "num_visualization_samples": 2,
     "visualization_sample_rate": 5,
     "use_roi_smoothing": True,
+    # Pose-guided cropping (NOT feature extraction)
+    "use_pose_guided_crop": True,
+    "pose_model": "yolo11n-pose.pt",
+    "pose_conf_threshold": 0.3,
+    # Improved frame sampling for static actions
+    "sampling_strategy": "temporal_stride",  # "temporal_stride", "three_segment", "adaptive_motion"
+    "default_stride": 4,  # For temporal_stride: sample every 4-6 frames
+    "min_stride": 3,
+    "max_stride": 8,
 }
 
 BASE_DIR = os.getcwd()
@@ -241,9 +650,10 @@ ENCODER_XML = os.path.join(BASE_DIR, "models/intel_action/encoder/FP32/action-re
 ENCODER_BIN = os.path.join(BASE_DIR, "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin")
 
 # =============================
-# Video Loading
+# Video Loading with Improved Frame Sampling
 # =============================
-def load_video_normalized(path, is_training=True):
+def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=False):
+    """Load video with improved frame sampling for static actions"""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         return []
@@ -252,7 +662,31 @@ def load_video_normalized(path, is_training=True):
     if total_frames <= 0:
         return []
 
-    indices = np.linspace(0, total_frames - 1, CONFIG["sequence_length"]).astype(int)
+    # Use improved sampling strategy
+    sampling_strategy = CONFIG.get("sampling_strategy", "temporal_stride")
+    
+    if sampling_strategy == "temporal_stride":
+        stride = CONFIG.get("default_stride", 4)
+        # Adjust stride based on video length
+        stride = max(CONFIG.get("min_stride", 3), 
+                    min(CONFIG.get("max_stride", 8), 
+                        total_frames // (CONFIG["sequence_length"] * 2)))
+        
+        indices = np.linspace(0, total_frames - 1, CONFIG["sequence_length"] * stride)
+        indices = indices[::stride][:CONFIG["sequence_length"]].astype(int)
+        
+    elif sampling_strategy == "three_segment":
+        indices = improved_frame_sampling(path, CONFIG["sequence_length"], "three_segment")
+        
+    elif sampling_strategy == "adaptive_motion":
+        indices = improved_frame_sampling(path, CONFIG["sequence_length"], "adaptive_motion")
+        
+    else:  # uniform (fallback)
+        indices = np.linspace(0, total_frames - 1, CONFIG["sequence_length"]).astype(int)
+    
+    # Only print sampling info occasionally during training for debugging
+    if verbose and random.random() < 0.01:  # Only print 1% of the time
+        print(f"   Sampling: {len(indices)} frames with strategy '{sampling_strategy}' (stride: {stride if sampling_strategy == 'temporal_stride' else 'N/A'})")
     
     output_frames = []
     crop_size = CONFIG["crop_size"]
@@ -268,24 +702,47 @@ def load_video_normalized(path, is_training=True):
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
+        # Detect and track people
         if person_tracker:
-            tracked = detect_top2_people(frame, yolo_people, person_tracker)
-            # tracked returns [(id, box), ...] when using tracker
-            if tracked and isinstance(tracked[0], tuple) and len(tracked[0]) == 2 and isinstance(tracked[0][1], tuple):
+            tracked = detect_all_people(frame, yolo_people, person_tracker)
+            if tracked and isinstance(tracked[0], tuple):
                 people = [box for _, box in tracked]
             else:
                 people = tracked
         else:
-            people = detect_top2_people(frame, yolo_people)
+            people = detect_all_people(frame, yolo_people)
         
-        merged_roi = merge_boxes(people)
-        
-        if roi_smoother:
-            roi = roi_smoother.update(merged_roi)
+        # Get ACTION-FOCUSED ROI using pose guidance
+        if pose_extractor is not None and len(people) > 0:
+            roi = pose_extractor.get_action_region_from_poses(frame, people)
         else:
-            roi = merged_roi
+            # Fallback: merge all person boxes
+            roi = merge_boxes(people)
         
+        # Smooth the ROI
+        if roi_smoother:
+            roi = roi_smoother.update(roi)
+        
+        # Crop at HIGH resolution, then resize to 224x224
+        # This preserves more detail than cropping directly at 224x224
         frame = crop_roi(frame, roi, crop_size)
+        
+        # Data augmentation for training only
+        if is_training and random.random() < CONFIG.get('augmentation_prob', 0.3):
+            # Random brightness adjustment (helps with lighting variations)
+            brightness_factor = random.uniform(0.8, 1.2)
+            frame = np.clip(frame * brightness_factor, 0, 255).astype(np.uint8)
+            
+            # Random contrast adjustment (helps model focus on color/texture changes)
+            contrast_factor = random.uniform(0.8, 1.2)
+            mean = frame.mean(axis=(0, 1), keepdims=True)
+            frame = np.clip((frame - mean) * contrast_factor + mean, 0, 255).astype(np.uint8)
+            
+            # Random horizontal flip (50% chance)
+            if random.random() < 0.5:
+                frame = np.fliplr(frame)
+        
+        # Normalize
         frame = frame.astype(np.float32) / 255.0
         mean = np.array(CONFIG["mean"], dtype=np.float32)
         std = np.array(CONFIG["std"], dtype=np.float32)
@@ -298,21 +755,21 @@ def load_video_normalized(path, is_training=True):
     if len(output_frames) == 0:
         return []
     
-    # If fewer than sequence_length frames were read, pad by repeating last frame
+    # Pad if fewer frames than sequence_length
     if len(output_frames) < CONFIG["sequence_length"]:
         last = output_frames[-1]
         while len(output_frames) < CONFIG["sequence_length"]:
             output_frames.append(last.copy())
 
     return np.stack(output_frames, axis=0)
-
 # =============================
 # Dataset
 # =============================
 class VideoDataset(Dataset):
-    def __init__(self, root, sequence_length=16, is_training=True):
+    def __init__(self, root, sequence_length=16, pose_extractor=None, is_training=True):
         self.video_samples = []
         self.sequence_length = sequence_length
+        self.pose_extractor = pose_extractor
         self.is_training = is_training
 
         if not os.path.exists(root):
@@ -350,7 +807,14 @@ class VideoDataset(Dataset):
 
     def __getitem__(self, idx):
         video_path, label = self.video_samples[idx]
-        frames = load_video_normalized(video_path, self.is_training)
+        
+        # Pass pose_extractor for guided cropping (not feature extraction)
+        frames = load_video_normalized(
+            video_path, 
+            pose_extractor=self.pose_extractor if CONFIG.get('use_pose_guided_crop') else None,
+            is_training=self.is_training,
+            verbose=False  # Disable verbose output during training
+        )
         
         if len(frames) == 0:
             frames = np.zeros((self.sequence_length, CONFIG["crop_size"][0], CONFIG["crop_size"][1], 3), dtype=np.float32)
@@ -373,14 +837,13 @@ def compute_class_weights(train_dataset):
     total_samples = len(train_dataset)
     num_classes = len(label_counts)
     
-    # Inverse frequency weighting
     weights = []
     for class_idx in range(num_classes):
         count = label_counts.get(class_idx, 1)
         weight = total_samples / (num_classes * count)
         weights.append(weight)
     
-    print(f"\n⚖️  Class weights computed:")
+    print(f"\n⚖️  Class weights computed (inverse frequency):")
     for idx, weight in enumerate(weights):
         class_name = train_dataset.idx_to_label[idx]
         count = label_counts.get(idx, 0)
@@ -402,7 +865,6 @@ def print_class_distribution(dataset, dataset_name="Dataset"):
         class_name = dataset.idx_to_label[label_idx]
         print(f"   {class_name}: {count} videos ({percentage:.1f}%)")
     
-    # Check for imbalance
     counts = list(label_counts.values())
     if len(counts) > 1:
         max_count = max(counts)
@@ -431,7 +893,7 @@ class IntelFeatureExtractor:
     def encode(self, frames_batch):
         """
         frames_batch: torch tensor or numpy array of shape (B, T, C, H, W)
-        Returns: torch.FloatTensor of encoded features shape (B, T * feat_dim_per_frame) or (B, T, feat_dim)
+        Returns: torch.FloatTensor of encoded features shape (B, T, feat_dim)
         """
         if isinstance(frames_batch, torch.Tensor):
             frames_batch = frames_batch.cpu().numpy()
@@ -443,29 +905,25 @@ class IntelFeatureExtractor:
             batch_feats = []
             for time_idx in range(T):
                 frame = frames_batch[batch_idx, time_idx]
-                # frame shape (C,H,W) with channels normalized already
-                frame_batch = np.expand_dims(frame, axis=0)  # (1, C, H, W)
-                frame_batch = self._preprocess_batch(frame_batch)  # preprocess to expected input
-                # OpenVINO compiled model inference expects a dict or sequence; older API accepted list
+                frame_batch = np.expand_dims(frame, axis=0)
+                frame_batch = self._preprocess_batch(frame_batch)
+                
                 out = self.encoder([frame_batch])
-                # out is a dictionary-like mapping; fetch first output
-                # Safely get output tensor
+                
                 try:
                     output_node = self.encoder.output(0)
                     feat = out[output_node]
                 except Exception:
-                    # fallback: take first value
                     feat = list(out.values())[0]
                 
                 if feat.ndim > 1:
-                    feat = feat.reshape(feat.shape[0], -1)  # (1, feat_dim)
+                    feat = feat.reshape(feat.shape[0], -1)
                 batch_feats.append(feat)
             
-            batch_feats = np.concatenate(batch_feats, axis=0)  # (T, feat_dim)
+            batch_feats = np.concatenate(batch_feats, axis=0)
             feats.append(batch_feats)
         
-        feats = np.stack(feats, axis=0)  # (B, T, feat_dim)
-        # Convert to torch tensor
+        feats = np.stack(feats, axis=0)
         return torch.tensor(feats, dtype=torch.float32)
 
     def _preprocess_batch(self, batch_frames):
@@ -479,15 +937,20 @@ class IntelFeatureExtractor:
 # Model
 # =============================
 class EncoderLSTM(nn.Module):
-    def __init__(self, feature_dim=1024, hidden_dim=512, num_classes=2):
+    def __init__(self, feature_dim=1024, hidden_dim=512, num_classes=2, bidirectional=True):
         super().__init__()
-        self.lstm = nn.LSTM(feature_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, num_classes)
+        self.bidirectional = bidirectional
+        self.lstm = nn.LSTM(feature_dim, hidden_dim, batch_first=True, bidirectional=bidirectional)
+        
+        # Adjust output dimension based on bidirectional
+        lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
+        self.fc = nn.Linear(lstm_output_dim, num_classes)
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        out = out[:, -1, :]
+        out = out[:, -1, :]  # Take the last time step
         return self.fc(out)
+
 
 # =============================
 # Checkpoint Management
@@ -541,13 +1004,12 @@ def load_checkpoint(checkpoint_path, model, optimizer=None):
 # Training & Validation
 # =============================
 def validate_classifier(encoder, model, val_loader, device, criterion):
-    """Validate model on validation set and return loss, accuracy, and per-class accuracy"""
+    """Validate model on validation set"""
     model.eval()
     total_correct = 0
     total_samples = 0
     running_loss = 0.0
     
-    # For per-class accuracy
     class_correct = {}
     class_total = {}
     
@@ -563,7 +1025,6 @@ def validate_classifier(encoder, model, val_loader, device, criterion):
             total_samples += labels.size(0)
             running_loss += loss.item() * labels.size(0)
             
-            # Per-class tracking
             for label, pred in zip(labels.cpu().numpy(), preds.cpu().numpy()):
                 if label not in class_total:
                     class_total[label] = 0
@@ -575,7 +1036,6 @@ def validate_classifier(encoder, model, val_loader, device, criterion):
     accuracy = total_correct / total_samples if total_samples > 0 else 0
     avg_loss = running_loss / total_samples if total_samples > 0 else float('inf')
     
-    # Compute per-class accuracy
     per_class_acc = {}
     for label in class_total:
         per_class_acc[label] = class_correct[label] / class_total[label] if class_total[label] > 0 else 0
@@ -585,7 +1045,6 @@ def validate_classifier(encoder, model, val_loader, device, criterion):
 def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_idx, idx_to_label):
     device = torch.device(CONFIG["device"])
     
-    # Determine feature dimension using a sample
     with torch.no_grad():
         sample_frames, _ = next(iter(train_loader))
         dummy_feats = encoder.encode(sample_frames[0:1].cpu())
@@ -593,10 +1052,8 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
     
     print(f"Feature dimension: {feature_dim}")
     
-    # Initialize model
-    model = EncoderLSTM(feature_dim=feature_dim, hidden_dim=512, num_classes=num_classes).to(device)
+    model = EncoderLSTM(feature_dim=feature_dim, hidden_dim=512, num_classes=num_classes, bidirectional=True).to(device)
     
-    # Compute class weights if enabled
     if CONFIG.get('use_class_weights', True):
         class_weights = compute_class_weights(train_loader.dataset).to(device)
         criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -604,10 +1061,8 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
         criterion = nn.CrossEntropyLoss()
         print("\n⚠️  Training without class weights")
     
-    # Decide if resuming
     is_resuming = CONFIG.get('checkpoint_path') and os.path.exists(CONFIG['checkpoint_path'])
     
-    # Choose LR and max epochs based on resume status
     if is_resuming:
         lr = CONFIG['finetune_learning_rate']
         print(f"🔄 Resume detected: using finetune LR {lr}")
@@ -615,10 +1070,8 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
         lr = CONFIG['base_learning_rate']
         print(f"🆕 Training from scratch: using base LR {lr}")
     
-    # Create optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    # Try to load checkpoint if resuming
     start_epoch = 0
     best_val_acc = 0.0
     best_val_loss = float('inf')
@@ -634,9 +1087,7 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
         else:
             print("⚠️  Failed to load checkpoint — starting from scratch with finetune LR.")
     
-    # Determine max_epochs
     if is_resuming:
-        # When resuming: run at most start_epoch + max_finetune_epochs (so we run additional fine-tune epochs)
         max_epochs = start_epoch + CONFIG.get('max_finetune_epochs', 15)
         print(f"   Fine-tuning mode: starting at epoch {start_epoch}, will run up to epoch {max_epochs}")
     else:
@@ -645,7 +1096,6 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
     
     patience_counter = 0
 
-    # Training loop
     for epoch in range(start_epoch, max_epochs):
         model.train()
         running_loss = 0.0
@@ -656,7 +1106,6 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
         for frames, labels in pbar:
             frames, labels = frames.to(device), labels.to(device)
             
-            # Encode features (encoder works on numpy/CPU so send frames.cpu())
             with torch.no_grad():
                 feats = encoder.encode(frames.cpu())
             feats = feats.to(device)
@@ -681,26 +1130,24 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
         train_loss = running_loss / total_samples if total_samples > 0 else float('inf')
         train_acc = total_correct / total_samples if total_samples > 0 else 0.0
 
-        print(f"\n📊 Epoch {epoch+1}/{max_epochs}")
-        print(f"   Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
+        print(f"\nEpoch {epoch+1}/{max_epochs}")
+        print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
 
-        # Validation step
         val_loss = float('inf')
         val_acc = 0.0
         per_class_acc = {}
         if len(val_loader) > 0:
             val_loss, val_acc, per_class_acc = validate_classifier(encoder, model, val_loader, device, criterion)
-            print(f"   Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+            print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
             
-            # Print per-class validation accuracy
-            if per_class_acc:
-                print(f"   Per-class validation accuracy:")
+            # Only print per-class accuracy every 5 epochs to reduce clutter
+            if per_class_acc and (epoch + 1) % 5 == 0:
+                print(f"  Per-class accuracy:")
                 for label_idx in sorted(per_class_acc.keys()):
                     class_name = idx_to_label[label_idx]
                     acc = per_class_acc[label_idx]
-                    print(f"     {class_name}: {acc:.4f}")
+                    print(f"    {class_name}: {acc:.4f}")
 
-        # Early stopping logic (based on validation loss)
         improved = val_loss < (best_val_loss - CONFIG.get('min_delta', 0.0))
         if improved:
             best_val_loss = val_loss
@@ -715,25 +1162,21 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
                 print("\n🛑 Early stopping triggered — stopping training.")
                 break
 
-        # Periodic checkpoint save
         if CONFIG.get('save_checkpoint_every') and (epoch + 1) % CONFIG['save_checkpoint_every'] == 0:
             checkpoint_name = f"checkpoint_epoch_{epoch+1}.pth"
             checkpoint_path = os.path.join(CONFIG.get('checkpoint_dir', '.'), checkpoint_name)
             save_checkpoint(model, optimizer, epoch, best_val_acc, 
                           label_to_idx, idx_to_label, feature_dim, checkpoint_path, best_val_loss)
 
-        # Save latest checkpoint
         if CONFIG.get('checkpoint_dir'):
             latest_checkpoint = os.path.join(CONFIG['checkpoint_dir'], 'checkpoint_latest.pth')
             save_checkpoint(model, optimizer, epoch, best_val_acc, 
                           label_to_idx, idx_to_label, feature_dim, latest_checkpoint, best_val_loss)
     
-    # Load best model if available
     if best_model_state:
         model.load_state_dict(best_model_state)
         print(f"\n✅ Loaded best model (val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.4f})")
 
-    # Save final model and mapping
     torch.save(model.state_dict(), CONFIG['model_save_path'])
     mapping_path = CONFIG['model_save_path'].replace('.pth', '_mapping.json')
     mapping_data = {
@@ -755,32 +1198,61 @@ if __name__ == "__main__":
     set_seed(42)
     
     print("=" * 60)
-    print("🎯 ACTION RECOGNITION TRAINING (WITH CLASS BALANCING)")
+    print("🎯 ACTION RECOGNITION TRAINING (IMPROVED FRAME SAMPLING)")
     print("=" * 60)
     
-    # Display training mode intention
     if CONFIG.get('checkpoint_path'):
         print(f"\n📂 Config checkpoint path: {CONFIG['checkpoint_path']}")
     print(f"   Device: {CONFIG['device']}")
     print(f"   Batch size: {CONFIG['batch_size']}")
+    print(f"   Pose-guided cropping: {'ENABLED' if CONFIG.get('use_pose_guided_crop') else 'DISABLED'}")
     print(f"   Class weighting: {'ENABLED' if CONFIG.get('use_class_weights') else 'DISABLED'}")
     print(f"   Early stopping patience: {CONFIG['early_stopping_patience']} epochs")
+    print(f"   Frame sampling strategy: {CONFIG.get('sampling_strategy', 'temporal_stride')}")
+    print(f"   Default stride: {CONFIG.get('default_stride', 4)} frames")
     print("=" * 60)
+    
+    # Initialize pose extractor for CROPPING (not feature extraction)
+    pose_extractor = None
+    if CONFIG.get('use_pose_guided_crop', False):
+        print("\n🦴 Initializing pose-guided cropping...")
+        pose_extractor = PoseExtractor(
+            model_name=CONFIG.get('pose_model', 'yolo11n-pose.pt'),
+            conf_threshold=CONFIG.get('pose_conf_threshold', 0.3)
+        )
+        print("   ✅ Pose will guide ACTION REGION detection for better cropping")
+    else:
+        print("\n⚠️  Pose-guided cropping DISABLED - using full person boxes")
     
     # Load datasets
     print("\n📁 Loading datasets...")
-    train_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "train"), is_training=True)
-    val_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "val"), is_training=False)
+    train_dataset = VideoDataset(
+        os.path.join(CONFIG['data_path'], "train"),
+        pose_extractor=pose_extractor,
+        is_training=True
+    )
+    val_dataset = VideoDataset(
+        os.path.join(CONFIG['data_path'], "val"),
+        pose_extractor=pose_extractor,
+        is_training=False
+    )
     
     print(f"\n📊 Dataset statistics:")
     print(f"   Training samples: {len(train_dataset)}")
     print(f"   Validation samples: {len(val_dataset)}")
     print(f"   Number of classes: {len(train_dataset.labels)}")
     
-    # Print class distribution
     print_class_distribution(train_dataset, "Training set")
     if len(val_dataset) > 0:
         print_class_distribution(val_dataset, "Validation set")
+    
+    # Create sample visualizations BEFORE training
+    if CONFIG.get('create_visualizations', False) and pose_extractor is not None:
+        create_sample_visualizations(
+            train_dataset, 
+            pose_extractor,
+            num_samples=CONFIG.get('num_visualization_samples', 2)
+        )
     
     # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=0)
