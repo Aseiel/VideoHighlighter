@@ -686,13 +686,16 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"🎨 Action labels enabled, output: {action_annotated_path}")
                 
                 all_action_detections = run_action_detection(
-                    video_path,
+                    video_path=video_path,
+                    sample_rate=sample_rate,
+                    debug=False,
                     interesting_actions=interesting_actions,
                     progress_callback=progress.update_progress,
                     cancel_flag=cancel_flag,
-                    sample_rate=sample_rate,
-                    draw_labels=draw_action_labels,  # NEW
-                    annotated_output=action_annotated_path  # NEW
+                    draw_bboxes=True,
+                    annotated_output=action_annotated_path,
+                    use_person_detection=True,
+                    max_people=2
                 )
 
 
@@ -779,6 +782,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     if detections_in_group:
                         best_detection = max(detections_in_group, key=lambda a: a[3])  # highest confidence
                         action_detections.append(best_detection)
+
+                # Calculate total duration from selected sequences
+                total_duration = sum(duration for _, _, duration, _, _ in selected_sequences)
 
                 # Sort chronologically for pipeline
                 action_detections = sorted(action_detections, key=lambda x: x[0])
