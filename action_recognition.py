@@ -8,6 +8,7 @@ import threading
 import time
 import argparse
 from collections import Counter, deque
+from ultralytics import YOLO
 
 # =============================
 # Load labels - support both Kinetics-400 and custom models
@@ -36,7 +37,6 @@ def load_label_mappings():
     else:
         CUSTOM_LABELS = None
     
-    # Load Kinetics-400 labels
     if KINETICS_LABELS_PATH.exists():
         with open(KINETICS_LABELS_PATH, "r") as f:
             KINETICS_400_LABELS = json.load(f)
@@ -63,7 +63,7 @@ def get_id_from_name(name):
         for idx, action_name in CUSTOM_LABELS.items():
             if action_name.lower() == name.lower():
                 return idx
-            
+
     # Try Kinetics-400
     if KINETICS_400_LABELS:
         for k, v in KINETICS_400_LABELS.items():
@@ -73,6 +73,194 @@ def get_id_from_name(name):
     raise ValueError(f"Action '{name}' not found in any label set")
 
 # =============================
+# Person Detection & Tracking
+# =============================
+class PersonTracker:
+    """Simple IoU-based person tracker"""
+    def __init__(self, iou_threshold=0.3, max_lost_frames=10):
+        self.tracks = {}
+        self.next_id = 0
+        self.iou_threshold = iou_threshold
+        self.max_lost_frames = max_lost_frames
+    
+    def _compute_iou(self, box1, box2):
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i < x1_i or y2_i < y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def update(self, detected_boxes):
+        if len(detected_boxes) == 0:
+            for track_id in list(self.tracks.keys()):
+                self.tracks[track_id]['lost_frames'] += 1
+                if self.tracks[track_id]['lost_frames'] > self.max_lost_frames:
+                    del self.tracks[track_id]
+            return []
+        
+        matched_tracks = set()
+        matched_detections = set()
+        
+        for det_idx, det_box in enumerate(detected_boxes):
+            best_iou = 0
+            best_track_id = None
+            
+            for track_id, track_data in self.tracks.items():
+                if track_id in matched_tracks:
+                    continue
+                
+                iou = self._compute_iou(det_box, track_data['box'])
+                if iou > best_iou and iou > self.iou_threshold:
+                    best_iou = iou
+                    best_track_id = track_id
+            
+            if best_track_id is not None:
+                self.tracks[best_track_id]['box'] = det_box
+                self.tracks[best_track_id]['lost_frames'] = 0
+                matched_tracks.add(best_track_id)
+                matched_detections.add(det_idx)
+            else:
+                new_track_id = self.next_id
+                self.next_id += 1
+                self.tracks[new_track_id] = {'box': det_box, 'lost_frames': 0}
+                matched_detections.add(det_idx)
+        
+        for track_id in list(self.tracks.keys()):
+            if track_id not in matched_tracks:
+                self.tracks[track_id]['lost_frames'] += 1
+                if self.tracks[track_id]['lost_frames'] > self.max_lost_frames:
+                    del self.tracks[track_id]
+        
+        sorted_tracks = sorted(self.tracks.items(), key=lambda x: x[0])
+        
+        return [(track_id, data['box']) for track_id, data in sorted_tracks]
+    
+    def reset(self):
+        self.tracks = {}
+        self.next_id = 0
+
+class SmartActionDetector:
+    """Detects people most likely performing actions"""
+    def __init__(self, sticky_frames=15):
+        self.prev_frame_data = None
+        self.frame_count = 0
+        self.selection_history = deque(maxlen=sticky_frames)
+        
+    def detect(self, frame, detector, max_people=2):
+        h, w = frame.shape[:2]
+        center_x, center_y = w / 2, h / 2
+        
+        result = detector.predict(frame, conf=0.40, classes=[0], verbose=False)
+        current_detections = []
+        
+        for r in result:
+            for b in r.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                conf = float(b.conf)
+                
+                box_center_x = (x1 + x2) / 2
+                box_center_y = (y1 + y2) / 2
+                area = (x2 - x1) * (y2 - y1)
+                
+                dist = np.sqrt((box_center_x - center_x)**2 + (box_center_y - center_y)**2)
+                max_dist = np.sqrt(center_x**2 + center_y**2)
+                center_score = 1 - (dist / max_dist)
+                
+                frame_area = h * w
+                size_score = min(area / (frame_area * 0.3), 1.0)
+                
+                motion_score = 0
+                if self.prev_frame_data and self.frame_count > 0:
+                    for prev_box in self.prev_frame_data:
+                        iou = self._iou((x1, y1, x2, y2), prev_box['box'])
+                        if iou > 0.3:
+                            prev_cx, prev_cy = prev_box['center']
+                            position_change = np.sqrt((box_center_x - prev_cx)**2 + 
+                                                     (box_center_y - prev_cy)**2)
+                            motion_score = min(position_change / 50.0, 1.0)
+                            break
+                
+                temporal_score = 0
+                if len(self.selection_history) > 0:
+                    for prev_selection in self.selection_history:
+                        for prev_box in prev_selection:
+                            if self._iou((x1, y1, x2, y2), prev_box) > 0.5:
+                                temporal_score = 1.0
+                                break
+                        if temporal_score > 0:
+                            break
+                
+                current_detections.append({
+                    'box': (x1, y1, x2, y2),
+                    'center': (box_center_x, box_center_y),
+                    'area': area,
+                    'conf': conf,
+                    'motion': motion_score,
+                    'center_prox': center_score,
+                    'size': size_score,
+                    'temporal': temporal_score
+                })
+        
+        for det in current_detections:
+            action_score = (
+                det['conf'] * 0.2 +
+                det['center_prox'] * 0.2 +
+                det['size'] * 0.2 +
+                det['motion'] * 0.2 +
+                det['temporal'] * 0.2
+            )
+            det['score'] = action_score
+        
+        self.prev_frame_data = current_detections
+        self.frame_count += 1
+        
+        sorted_detections = sorted(current_detections, 
+                                  key=lambda x: x['score'], 
+                                  reverse=True)
+        
+        selected_boxes = [d['box'] for d in sorted_detections[:max_people]]
+        self.selection_history.append(selected_boxes)
+        return selected_boxes
+    
+    def _iou(self, box1, box2):
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        if x2_i < x1_i or y2_i < y1_i:
+            return 0.0
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        return intersection / union if union > 0 else 0.0
+
+def merge_boxes(boxes):
+    if len(boxes) == 0:
+        return None
+    if len(boxes) == 1:
+        return boxes[0]
+    x1_min = min(b[0] for b in boxes)
+    y1_min = min(b[1] for b in boxes)
+    x2_max = max(b[2] for b in boxes)
+    y2_max = max(b[3] for b in boxes)
+    return (x1_min, y1_min, x2_max, y2_max)
+
+# =============================
 # Model paths
 # =============================
 ENCODER_XML = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.xml"
@@ -80,17 +268,7 @@ ENCODER_BIN = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-00
 SEQUENCE_LENGTH = 16
 
 # =============================
-# Visualization settings
-# =============================
-ACTION_LABEL_BG_COLOR = (0, 0, 0)  # Black background
-ACTION_LABEL_TEXT_COLOR = (0, 255, 255)  # Cyan text
-ACTION_LABEL_HIGH_CONF_COLOR = (0, 255, 0)  # Green for high confidence
-ACTION_FONT_SCALE = 0.8
-ACTION_FONT_THICKNESS = 2
-ACTION_LABEL_ALPHA = 0.7  # Semi-transparent background
-
-# =============================
-# Async Inference Engine with GUI Stats
+# Async Inference Engine
 # =============================
 class AsyncBatchedInferenceEngine:
     def __init__(self, compiled_model, input_layer, output_layer, num_requests=2):
@@ -139,7 +317,6 @@ def load_models(device="AUTO"):
 
     print(f"Using device: {selected_device}")
 
-    # Encoder (always required) 
     if not ENCODER_XML.exists() or not ENCODER_BIN.exists():
         raise FileNotFoundError(f"❌ Encoder model not found at {ENCODER_XML}")
     print("✓ Encoder model found")
@@ -147,7 +324,6 @@ def load_models(device="AUTO"):
     encoder_model = ie.read_model(model=ENCODER_XML, weights=ENCODER_BIN)
     compiled_encoder = ie.compile_model(model=encoder_model, device_name=selected_device)
 
-    # Decoder
     custom_decoder_xml = BASE_DIR / "action_classifier_3d.xml"
     custom_decoder_bin = BASE_DIR / "action_classifier_3d.bin"
 
@@ -175,9 +351,14 @@ def load_models(device="AUTO"):
     )
 
 # =============================
-# Preprocess frame
+# Preprocess frame with ROI support
 # =============================
-def preprocess_frame(frame, input_shape):
+def preprocess_frame(frame, input_shape, roi=None):
+    """Preprocess frame, optionally cropping to ROI first"""
+    if roi is not None:
+        x1, y1, x2, y2 = roi
+        frame = frame[y1:y2, x1:x2]
+    
     N, C, H, W = input_shape
     h, w = frame.shape[:2]
     scale = min(W / w, H / h)
@@ -193,27 +374,81 @@ def preprocess_frame(frame, input_shape):
     return np.expand_dims(frame_padded, axis=0).astype(np.float32)
 
 # =============================
-# Draw action labels on frame
+# Draw visualization with bounding boxes
 # =============================
-def draw_action_labels(frame, detected_actions, max_labels=3):
+def draw_detections_with_actions(frame, tracked_people, action_roi, detected_actions, focus_region="full_body"):
     """
-    Draw detected action labels on frame
+    Draw bounding boxes for tracked people and action ROI with detected actions
     
     Args:
         frame: Input frame
-        detected_actions: List of (action_name, score) tuples, sorted by score
-        max_labels: Maximum number of labels to display
-    
-    Returns:
-        Annotated frame
+        tracked_people: List of (track_id, bbox) tuples
+        action_roi: Action region of interest bbox
+        detected_actions: List of (action_name, score) tuples
+        focus_region: Focus region type (upper_body, lower_body, full_body)
     """
-    if not detected_actions:
-        return frame
-    
     annotated = frame.copy()
     h, w = frame.shape[:2]
     
-    # Limit to top actions
+    # Color palette for person boxes
+    color_palette = [(0, 255, 0), (255, 0, 255), (255, 255, 0), (0, 255, 255)]
+    
+    # Draw tracked person boxes
+    for i, item in enumerate(tracked_people):
+        if isinstance(item, tuple):
+            track_id, (x1, y1, x2, y2) = item
+            color = color_palette[track_id % len(color_palette)]
+        else:
+            x1, y1, x2, y2 = item
+            color = (0, 255, 0)
+            track_id = i
+        
+        # Draw person box
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        
+        # Draw person label
+        label = f"Person {track_id}"
+        (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(annotated, (x1, y1 - label_h - 5), (x1 + label_w, y1), color, -1)
+        cv2.putText(annotated, label, (x1, y1 - 5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    
+    # Draw action ROI with focus region color coding
+    if action_roi:
+        x1, y1, x2, y2 = action_roi
+        
+        if focus_region == 'upper_body':
+            roi_color = (0, 255, 255)  # Yellow
+            region_text = "UPPER BODY"
+        elif focus_region == 'lower_body':
+            roi_color = (0, 255, 0)    # Green
+            region_text = "LOWER BODY"
+        else:
+            roi_color = (255, 0, 0)    # Blue
+            region_text = "FULL BODY"
+        
+        # Draw thick action ROI box
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), roi_color, 3)
+        
+        # Draw focus region label
+        label = f"ACTION: {region_text}"
+        (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(annotated, (x1, y2 + 5), (x1 + label_w + 10, y2 + label_h + 15), roi_color, -1)
+        cv2.putText(annotated, label, (x1 + 5, y2 + label_h + 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    
+    # Draw action labels panel
+    if detected_actions:
+        draw_action_panel(annotated, detected_actions, max_labels=3)
+    
+    return annotated
+
+def draw_action_panel(frame, detected_actions, max_labels=3):
+    """Draw action detection panel on frame"""
+    if not detected_actions:
+        return
+    
+    h, w = frame.shape[:2]
     top_actions = detected_actions[:max_labels]
     
     # Calculate panel size
@@ -223,88 +458,83 @@ def draw_action_labels(frame, detected_actions, max_labels=3):
     panel_y = 10
     
     # Create semi-transparent overlay
-    overlay = annotated.copy()
+    overlay = frame.copy()
     cv2.rectangle(overlay, 
                   (panel_x, panel_y), 
                   (panel_x + panel_width, panel_y + panel_height),
-                  ACTION_LABEL_BG_COLOR, 
+                  (0, 0, 0), 
                   -1)
-    
-    # Blend overlay with original
-    cv2.addWeighted(overlay, ACTION_LABEL_ALPHA, annotated, 1 - ACTION_LABEL_ALPHA, 0, annotated)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     
     # Draw border
-    cv2.rectangle(annotated,
+    cv2.rectangle(frame,
                   (panel_x, panel_y),
                   (panel_x + panel_width, panel_y + panel_height),
-                  ACTION_LABEL_TEXT_COLOR,
+                  (0, 255, 255),
                   2)
     
     # Draw title
-    cv2.putText(annotated, "DETECTED ACTIONS", 
+    cv2.putText(frame, "DETECTED ACTIONS", 
                 (panel_x + 10, panel_y + 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 
                 0.6, 
-                ACTION_LABEL_TEXT_COLOR, 
+                (0, 255, 255), 
                 2)
     
-    # Draw each action
+     # Draw each action
     y_offset = panel_y + 50
     for i, (action_name, score) in enumerate(top_actions):
         # Choose color based on confidence
-        text_color = ACTION_LABEL_HIGH_CONF_COLOR if score > 0.5 else ACTION_LABEL_TEXT_COLOR
+        text_color = (0, 255, 0) if score > 0.5 else (0, 255, 255)
         
-        # Format action text
         action_text = f"{i+1}. {action_name}"
         score_text = f"{score:.2%}"
         
         # Draw action name
-        cv2.putText(annotated, action_text,
+        cv2.putText(frame, action_text,
                     (panel_x + 10, y_offset),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     text_color,
                     1)
         
-        # Draw score
-        cv2.putText(annotated, score_text,
+        # Draw confidence bar
+        cv2.putText(frame, score_text,
                     (panel_x + panel_width - 70, y_offset),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     text_color,
                     1)
         
-        # Draw confidence bar
         bar_width = int((panel_width - 30) * score)
-        cv2.rectangle(annotated,
+        cv2.rectangle(frame,
                       (panel_x + 10, y_offset + 5),
                       (panel_x + 10 + bar_width, y_offset + 10),
                       text_color,
                       -1)
         
         y_offset += 35
-    
-    return annotated
 
 # =============================
-# Run action detection
+# Run action detection with bounding boxes
 # =============================
 def softmax(x):
     e = np.exp(x - np.max(x))
     return e / np.sum(e)
 
-
 def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="action_log.csv",
                          debug=False, top_k=50, confidence_threshold=0.01, show_video=False,
                          num_requests=2, interesting_actions=None,
                          progress_callback=None, cancel_flag=None,
-                         draw_labels=False, annotated_output=None):
+                         draw_bboxes=True, annotated_output=None,
+                         use_person_detection=True, max_people=2):
     """
-    Run action recognition on video
+    Run action recognition with bounding box visualization
     
     Args:
-        draw_labels: If True, draw action labels on frames
-        annotated_output: Path for annotated video output
+        draw_bboxes: If True, draw bounding boxes and action labels
+        use_person_detection: If True, detect and track people
+        max_people: Maximum number of people to track
     """
     if interesting_actions is not None:
         interesting_actions_set = set([s.lower() for s in interesting_actions])
@@ -314,14 +544,24 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     compiled_encoder, encoder_input, encoder_output, compiled_decoder, decoder_input, decoder_output, actual_device = load_models(device)
     encoder_engine = AsyncBatchedInferenceEngine(compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
 
+    # Initialize person detection if enabled
+    yolo_people = None
+    person_tracker = None
+    action_detector = None
+    
+    if use_person_detection:
+        print("🔍 Initializing person detection...")
+        yolo_people = YOLO("yolo11n.pt")
+        person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=10)
+        action_detector = SmartActionDetector(sticky_frames=15)
+
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     expected_processed_frames = total_frames // sample_rate
     
-    # Setup video writer for annotated output
     video_writer = None
-    if draw_labels and annotated_output:
+    if draw_bboxes and annotated_output:
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -335,8 +575,10 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     processed_frames = 0
     detection_count = 0
     
-    # For visualization: keep track of recent detections
     recent_detections = deque(maxlen=SEQUENCE_LENGTH)
+    current_tracked_people = []
+    current_action_roi = None
+    current_focus_region = "full_body"
 
     start_time = time.time()
     last_gui_update = start_time
@@ -354,25 +596,44 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
             if not ret:
                 break
             
-            original_frame = frame.copy() if draw_labels else None
+            original_frame = frame.copy()
             frame_id += 1
             
+            # Process person detection on every frame for smooth visualization
+            if use_person_detection and yolo_people and frame_id % sample_rate == 0:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Detect action people
+                action_boxes = action_detector.detect(frame_rgb, yolo_people, max_people=max_people)
+                
+                # Track people
+                tracked = person_tracker.update(action_boxes)
+                current_tracked_people = tracked
+                
+                # Compute action ROI
+                current_action_roi = merge_boxes(action_boxes) if action_boxes else None
+            
+            # Write annotated frame
+            if video_writer and draw_bboxes:
+                annotated = draw_detections_with_actions(
+                    original_frame, 
+                    current_tracked_people,
+                    current_action_roi,
+                    list(recent_detections),
+                    current_focus_region
+                )
+                video_writer.write(annotated)
+            
             if frame_id % sample_rate != 0:
-                # Still write frame to annotated video if enabled
-                if video_writer and draw_labels and original_frame is not None:
-                    # Draw last known detections
-                    if recent_detections:
-                        annotated = draw_action_labels(original_frame, list(recent_detections))
-                        video_writer.write(annotated)
-                    else:
-                        video_writer.write(original_frame)
                 continue
 
             timestamp_secs = frame_id / fps
             mins, secs = divmod(int(timestamp_secs), 60)
             timestamp_str = f"{mins:02d}:{secs:02d}"
 
-            processed_frame = preprocess_frame(frame, encoder_input.shape)
+            # Preprocess with ROI if available
+            processed_frame = preprocess_frame(frame, encoder_input.shape, 
+                                             roi=current_action_roi if use_person_detection else None)
             req = encoder_engine.infer_async(processed_frame)
 
             if prev_req is not None:
@@ -420,15 +681,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     if frame_detections:
                         frame_detections.sort(key=lambda x: x[1], reverse=True)
                         recent_detections.clear()
-                        recent_detections.extend(frame_detections[:3])  # Keep top 3
-
-            # Draw labels and write annotated frame
-            if video_writer and draw_labels and original_frame is not None:
-                if recent_detections:
-                    annotated = draw_action_labels(original_frame, list(recent_detections))
-                    video_writer.write(annotated)
-                else:
-                    video_writer.write(original_frame)
+                        recent_detections.extend(frame_detections[:3])
 
             prev_req = req
             processed_frames += 1
@@ -443,7 +696,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                 f"Processing: {processing_fps:.1f} FPS | "
                                 f"Inference: {engine_stats['inference_fps']:.1f} FPS | "
                                 f"Device: {actual_device}")
-                progress_callback(processed_frames, expected_processed_frames, "Enhanced Action Recognition", progress_msg)
+                progress_callback(processed_frames, expected_processed_frames, "Action Recognition", progress_msg)
                 last_gui_update = current_time
 
         # Flush last frame
@@ -456,14 +709,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
             if len(sequence_buffer) == SEQUENCE_LENGTH:
                 sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
-
-                # Decode logits
                 logits = compiled_decoder([sequence_array])[decoder_output].flatten()
-
-                # ✅ Convert logits → probabilities
                 probabilities = softmax(logits)
-
-                # ✅ Use probabilities for ranking
                 top_indices = np.argsort(probabilities)[-top_k:][::-1]
 
                 for idx in top_indices:
@@ -476,7 +723,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             detection_count += 1
                             if debug:
                                 print(f"{timestamp_str} -> {action_name} (score:{score:.3f})")
-
 
     cap.release()
     if video_writer:
@@ -548,18 +794,32 @@ def print_action_sequences(all_actions):
 # CLI
 # =============================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=str, required=True)
-    parser.add_argument("--device", type=str, default="AUTO")
-    parser.add_argument("--sample-rate", type=int, default=30)
-    parser.add_argument("--log-file", type=str, default="action_log.csv")
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--show-video", action="store_true")
-    parser.add_argument("--top-k", type=int, default=10)
-    parser.add_argument("--confidence", type=float, default=0.01)
-    parser.add_argument("--draw-labels", action="store_true", help="Draw action labels on frames")
+    parser = argparse.ArgumentParser(description="Action Recognition with Bounding Boxes")
+    parser.add_argument("--input", type=str, required=True, help="Input video path")
+    parser.add_argument("--device", type=str, default="AUTO", help="Device (AUTO, CPU, GPU)")
+    parser.add_argument("--sample-rate", type=int, default=30, help="Frame sampling rate")
+    parser.add_argument("--log-file", type=str, default="action_log.csv", help="CSV log output")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("--show-video", action="store_true", help="Show video preview")
+    parser.add_argument("--top-k", type=int, default=10, help="Top K actions to consider")
+    parser.add_argument("--confidence", type=float, default=0.01, help="Confidence threshold")
+    parser.add_argument("--draw-bboxes", action="store_true", help="Draw bounding boxes on frames")
     parser.add_argument("--annotated-output", type=str, help="Output path for annotated video")
+    parser.add_argument("--use-person-detection", action="store_true", help="Enable person detection")
+    parser.add_argument("--max-people", type=int, default=2, help="Maximum number of people to track")
+    parser.add_argument("--interesting-actions", type=str, nargs="+", help="Specific actions to detect")
     args = parser.parse_args()
+
+    print("=" * 60)
+    print("🎯 ACTION RECOGNITION WITH BOUNDING BOXES")
+    print("=" * 60)
+    print(f"Input: {args.input}")
+    print(f"Device: {args.device}")
+    print(f"Person detection: {'ENABLED' if args.use_person_detection else 'DISABLED'}")
+    print(f"Bounding boxes: {'ENABLED' if args.draw_bboxes else 'DISABLED'}")
+    if args.annotated_output:
+        print(f"Annotated output: {args.annotated_output}")
+    print("=" * 60)
 
     results = run_action_detection(
         video_path=args.input,
@@ -570,8 +830,11 @@ if __name__ == "__main__":
         top_k=args.top_k,
         confidence_threshold=args.confidence,
         show_video=args.show_video,
-        draw_labels=args.draw_labels,
-        annotated_output=args.annotated_output
+        draw_bboxes=args.draw_bboxes,
+        annotated_output=args.annotated_output,
+        use_person_detection=args.use_person_detection,
+        max_people=args.max_people,
+        interesting_actions=args.interesting_actions
     )
     
     print_top_actions(results)

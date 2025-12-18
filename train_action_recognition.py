@@ -14,136 +14,422 @@ from tqdm import tqdm
 from collections import deque
 
 # =============================
-# How to Use
-# Put short 5-10s videos to dataset/train/{action_name} and dataset/val/{action_name}
-# Usually You should put minimum 100+ videos for train and 20+ for val
+# Adaptive Action Region Detection
 # =============================
-
-# =============================
-# Smoothed ROI Detection
-# =============================
-class SmoothedROIDetector:
-    """Temporal smoothing for ROI detection to reduce jitter"""
-    def __init__(self, window_size=5, alpha=0.3):
-        self.window_size = window_size
-        self.alpha = alpha
-        self.roi_history = deque(maxlen=window_size)
-        self.smoothed_roi = None
-        
-    def update(self, current_roi):
-        if current_roi is None:
-            if self.smoothed_roi is not None:
-                return tuple(self.smoothed_roi.astype(int))
-            return None
-        
-        self.roi_history.append(current_roi)
-        
-        if len(self.roi_history) == 0:
-            return None
-            
-        if self.smoothed_roi is None:
-            self.smoothed_roi = np.array(current_roi, dtype=np.float32)
-        else:
-            current = np.array(current_roi, dtype=np.float32)
-            self.smoothed_roi = self.alpha * current + (1 - self.alpha) * self.smoothed_roi
-        
-        return tuple(self.smoothed_roi.astype(int))
+class AdaptiveActionDetector:
+    """Detects WHERE the action is happening based on motion and interaction patterns"""
     
-    def reset(self):
-        self.roi_history.clear()
-        self.smoothed_roi = None
+    def __init__(self, motion_threshold=5.0, debug=False):
+        self.motion_threshold = motion_threshold
+        self.prev_poses = None
+        self.debug = debug
 
-# =============================
-# Pose Estimation for Spatial Guidance
-# =============================
-class PoseExtractor:
-    """Extract YOLOv11 pose keypoints to guide spatial cropping"""
-    def __init__(self, model_name="yolo11n-pose.pt", conf_threshold=0.3):
-        """
-        Initialize pose extractor for spatial guidance
-        Args:
-            model_name: YOLOv11 pose model (n/s/m/l/x variants)
-            conf_threshold: Confidence threshold for pose detection
-        """
-        print(f"🦴 Loading pose estimation model: {model_name}")
-        self.model = YOLO(model_name)
-        self.conf_threshold = conf_threshold
-        # COCO format: 17 keypoints
-        self.num_keypoints = 17
-        self.keypoint_names = [
-            'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
-            'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
-            'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
-            'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
-        ]
+    
+    def _check_body_visibility(self, poses):
+        """Check which body parts are visible in the poses"""
+        visibility = {
+            'has_upper': False,
+            'has_lower': False,
+            'has_hips': False,
+            'has_feet': False,
+            'has_hands': False
+        }
         
-    def get_action_region_from_poses(self, frame, person_boxes):
-        """
-        Use pose keypoints to identify WHERE the action is happening
-        Focuses on torso/hip/pelvis region for intimate actions
-        
-        Args:
-            frame: RGB frame (H, W, 3)
-            person_boxes: List of (x1, y1, x2, y2) person bounding boxes
+        for pose in poses:
+            # Hips: keypoints 11, 12
+            if pose[11, 2] > 0.15 or pose[12, 2] > 0.15:
+                visibility['has_hips'] = True
+                visibility['has_lower'] = True
             
-        Returns:
-            action_roi: (x1, y1, x2, y2) focused on action region
-        """
+            # Feet: keypoints 15, 16
+            if pose[15, 2] > 0.15 or pose[16, 2] > 0.15:
+                visibility['has_feet'] = True
+                visibility['has_lower'] = True
+            
+            # Knees: 13, 14 also count as lower body
+            if pose[13, 2] > 0.15 or pose[14, 2] > 0.15:
+                visibility['has_lower'] = True
+            
+            # Shoulders: 5, 6
+            if pose[5, 2] > 0.15 or pose[6, 2] > 0.15:
+                visibility['has_upper'] = True
+            
+            # Hands: 9, 10
+            if pose[9, 2] > 0.15 or pose[10, 2] > 0.15:
+                visibility['has_hands'] = True
+                visibility['has_upper'] = True
+        
+        return visibility
+    
+    def detect_action_region(self, frame, person_boxes, pose_extractor, max_poses=2):
+        """Smart detection of WHERE action is happening"""
         h, w = frame.shape[:2]
         
-        # Run pose detection on full frame
-        results = self.model.predict(frame, conf=self.conf_threshold, verbose=False)
+        current_poses = self._get_matched_poses(frame, person_boxes, pose_extractor, max_poses)
+        
+        if len(current_poses) == 0:
+            if self.debug:
+                print("   ⚠️  No poses detected -> defaulting to LOWER BODY (hip-based)")
+            # When no poses detected, assume lower body action
+            return self._merge_boxes(person_boxes), 'lower_body'
+        
+        # Check what body parts are visible
+        body_part_visibility = self._check_body_visibility(current_poses)
+        motion_regions = self._analyze_motion_regions(current_poses)
+        focus_region = self._determine_focus_region(current_poses, motion_regions, person_boxes, body_part_visibility)
+        final_roi = self._adaptive_crop(focus_region, current_poses, w, h)
+        
+        return final_roi, focus_region
+    
+    def _get_matched_poses(self, frame, person_boxes, pose_extractor, max_poses):
+        """Get poses only for the detected action people - WITH LOWER THRESHOLDS"""
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose_extractor.model.predict(frame_rgb, conf=0.15, verbose=False)  # Lower confidence!
         
         if len(results) == 0 or results[0].keypoints is None:
-            # Fallback: use merged person boxes
-            return self._merge_boxes(person_boxes)
+            return []
         
         all_keypoints = results[0].keypoints.data.cpu().numpy()
+        matched_poses = []
         
-        if len(all_keypoints) == 0:
-            return self._merge_boxes(person_boxes)
+        for action_box in person_boxes[:max_poses]:
+            ax1, ay1, ax2, ay2 = action_box
+            
+            best_match_idx = None
+            best_match_score = 0
+            
+            for idx, kpts in enumerate(all_keypoints):
+                # Accept poses with even just 2 visible keypoints (very permissive!)
+                if np.sum(kpts[:, 2] > 0.15) >= 2:  # Lower from 4 keypoints and 0.2 confidence
+                    visible_kpts = kpts[kpts[:, 2] > 0.15]
+                    pose_center = visible_kpts[:, :2].mean(axis=0)
+                    
+                    if ax1 <= pose_center[0] <= ax2 and ay1 <= pose_center[1] <= ay2:
+                        score = len(visible_kpts)
+                        if score > best_match_score:
+                            best_match_score = score
+                            best_match_idx = idx
+            
+            if best_match_idx is not None:
+                matched_poses.append(all_keypoints[best_match_idx])
+                if len(matched_poses) >= max_poses:
+                    break
         
-        # Define "action region" keypoints (focus on torso/hips/pelvis)
-        # COCO format indices:
-        # 5: left_shoulder, 6: right_shoulder
-        # 11: left_hip, 12: right_hip
-        # 13: left_knee, 14: right_knee
-        action_keypoint_indices = [5, 6, 11, 12, 13, 14]
+        return matched_poses
+    
+    def _analyze_motion_regions(self, current_poses):
+        """Analyze motion with BETTER lower body sensitivity"""
+        motion_regions = {
+            'head': 0, 'upper_body': 0, 'lower_body': 0, 'hands': 0, 'feet': 0
+        }
         
-        action_points = []
+        # FIRST FRAME: No motion history yet
+        if self.prev_poses is None or len(self.prev_poses) != len(current_poses):
+            self.prev_poses = current_poses
+            # For first frame, estimate likely action region based on pose structure
+            if len(current_poses) > 0:
+                body_visibility = self._check_body_visibility(current_poses)
+                
+                # Check body part positions to guess action type
+                for pose in current_poses:
+                    # If lower body keypoints are visible, give initial boost
+                    lower_visible = sum(1 for idx in [11, 12, 13, 14, 15, 16] if pose[idx, 2] > 0.15)
+                    upper_visible = sum(1 for idx in [5, 6, 7, 8, 9, 10] if pose[idx, 2] > 0.15)
+                    
+                    # Initial bias based on visibility
+                    if lower_visible >= upper_visible:
+                        motion_regions['lower_body'] += 2.0
+                        motion_regions['feet'] += 1.5
+                        if self.debug:
+                            print("   🎬 FIRST FRAME: Lower body visible, mild LOWER BODY bias")
+                    elif body_visibility.get('has_hips', False):
+                        motion_regions['lower_body'] += 1.5
+                        if self.debug:
+                            print("   🎬 FIRST FRAME: Hips visible, mild LOWER BODY bias")
+                    else:
+                        motion_regions['upper_body'] += 2.0
+                        if self.debug:
+                            print("   🎬 FIRST FRAME: Upper body dominant")
+
+            return motion_regions
         
-        # Collect all relevant keypoints from all detected people
-        for kpts in all_keypoints:
-            for idx in action_keypoint_indices:
-                if kpts[idx, 2] > 0.3:  # confidence > 0.3
-                    action_points.append(kpts[idx, :2])
+        region_mapping = {
+            'head': [0, 1, 2, 3, 4],
+            'upper_body': [5, 6, 7, 8, 9, 10],
+            'lower_body': [11, 12, 13, 14, 15, 16],
+            'hands': [9, 10],
+            'feet': [15, 16]
+        }
         
-        if len(action_points) == 0:
-            return self._merge_boxes(person_boxes)
+        total_motion = 0
+        motion_count = 0
         
-        action_points = np.array(action_points)
+        for prev_pose, curr_pose in zip(self.prev_poses, current_poses):
+            for region_name, indices in region_mapping.items():
+                region_motion = 0
+                valid_points = 0
+                
+                for idx in indices:
+                    if (idx < len(prev_pose) and idx < len(curr_pose) and 
+                        prev_pose[idx, 2] > 0.15 and curr_pose[idx, 2] > 0.15):  # Lower confidence needed
+                        
+                        motion = np.sqrt(
+                            (curr_pose[idx, 0] - prev_pose[idx, 0])**2 +
+                            (curr_pose[idx, 1] - prev_pose[idx, 1])**2
+                        )
+                        
+                        # BOOST lower body motion more aggressively
+                        if region_name in ['lower_body', 'feet']:
+                            motion = motion * 1.3
+                        else:
+                            motion = motion * 1.0
+                        
+                        region_motion += motion
+                        valid_points += 1
+                        total_motion += motion
+                        motion_count += 1
+                
+                if valid_points > 0:
+                    motion_regions[region_name] += region_motion / valid_points
         
-        # Find bounding box around action points
-        x_min = np.min(action_points[:, 0])
-        y_min = np.min(action_points[:, 1])
-        x_max = np.max(action_points[:, 0])
-        y_max = np.max(action_points[:, 1])
+        self.prev_poses = current_poses
+        return motion_regions
+    
+    def _determine_focus_region(self, poses, motion_regions, person_boxes, body_visibility):
+        """Determine which body region to focus on - WITH FULL BODY DETECTION"""
+        if len(poses) == 0:
+            return 'lower_body'  # Default to lower body when no poses
         
-        # Add padding (30% extra on each side to capture context)
-        width = x_max - x_min
-        height = y_max - y_min
-        padding_x = width * 0.3
-        padding_y = height * 0.3
+        # Get motion values
+        hands_motion = motion_regions.get('hands', 0)
+        feet_motion = motion_regions.get('feet', 0) 
+        head_motion = motion_regions.get('head', 0)
+        upper_body_motion = motion_regions.get('upper_body', 0)
+        lower_body_motion = motion_regions.get('lower_body', 0)
+        
+        # Check if this is likely first frame analysis (motion from visibility bias)
+        total_motion = sum(motion_regions.values())
+        is_first_frame_bias = (total_motion > 0 and 
+                            all(v < 1.0 or v > 2.0 for v in motion_regions.values() if v > 0))
+        
+        if is_first_frame_bias:
+            if self.debug:
+                print("   🎬 FIRST FRAME DECISION based on visibility")
+            # First frame: decide purely on visibility
+            if lower_body_motion > upper_body_motion:
+                if self.debug:
+                    print("   🦵 First frame: Lower body visibility bias -> LOWER BODY")
+                return 'lower_body'
+            elif body_visibility.get('has_hips', False):
+                if self.debug:
+                    print("   🦴 First frame: Hips visible -> LOWER BODY")
+            elif body_visibility.get('has_feet', False):
+                if self.debug:
+                    print("   🦶 First frame: Feet visible -> LOWER BODY")
+                return 'lower_body'
+        
+        # NO MOTION DETECTED
+        if not motion_regions or all(value == 0 for value in motion_regions.values()):
+            # If no motion but we can see body parts, decide based on visibility
+            if body_visibility['has_hips'] or body_visibility['has_feet']:
+                if self.debug:
+                    print("   🦴 Hips/feet visible, no motion -> LOWER BODY default")
+                return 'lower_body'
+            elif body_visibility['has_upper']:
+                if self.debug:
+                    print("   🦴 Upper body visible, no motion -> UPPER BODY default")
+                return 'upper_body'
+            return 'full_body'
+        
+        # MUCH MORE SENSITIVE thresholds for lower body
+        base_threshold = self.motion_threshold * 0.3
+        
+        # Debug output
+        if self.debug:
+            debug_info = {k: f"{v:.2f}" for k, v in motion_regions.items()}
+            visibility_info = ', '.join([k.replace('has_', '') for k, v in body_visibility.items() if v])
+            print(f"   Motion: {debug_info}, Visible: {visibility_info}, Threshold: {base_threshold:.2f}")
+        
+        # ============================================
+        # FULL BODY DETECTION
+        # ============================================
+        # Calculate total motion for upper and lower body
+        total_upper = upper_body_motion + hands_motion + head_motion
+        total_lower = lower_body_motion + feet_motion
+        
+        # Check if BOTH regions have significant motion
+        upper_active = total_upper > base_threshold * 0.7
+        lower_active = total_lower > base_threshold * 0.6
+        
+        if upper_active and lower_active:
+            # Both regions are moving - check if motion is balanced
+            motion_ratio = min(total_upper, total_lower) / max(total_upper, total_lower)
+            
+            # If motion is relatively balanced (within 2x), it's a full body action
+            if motion_ratio > 0.5:
+                if self.debug:
+                    print(f"   🧍 FULL BODY detected - balanced motion (upper={total_upper:.2f}, lower={total_lower:.2f}, ratio={motion_ratio:.2f})")
+                return 'full_body'
+            elif total_upper > total_lower * 1.3:
+                if self.debug:
+                    print(f"   💪 Both moving but UPPER dominant (upper={total_upper:.2f}, lower={total_lower:.2f})")
+                return 'upper_body'
+            elif total_lower > total_upper * 1.3:
+                if self.debug:
+                    print(f"   🦵 Both moving but LOWER dominant (upper={total_upper:.2f}, lower={total_lower:.2f})")
+                return 'lower_body'
+            else:
+                if self.debug:
+                    print(f"   🧍 FULL BODY detected - both regions active (upper={total_upper:.2f}, lower={total_lower:.2f})")
+                return 'full_body'
+        
+        # Check visibility for full body actions
+        has_full_body_visible = (body_visibility.get('has_upper', False) and 
+                                (body_visibility.get('has_hips', False) or body_visibility.get('has_lower', False)))
+        
+        if has_full_body_visible and total_motion > base_threshold:
+            # If we can see both upper and lower body, and there's general motion
+            if total_upper > 0 and total_lower > 0:
+                print(f"   🧍 FULL BODY detected - visibility + distributed motion")
+                return 'full_body'
+        
+        # ============================================
+        # EXISTING PRIORITY ORDER
+        # ============================================
+        # SPECIAL CASE: If hips are visible but upper body isn't, favor lower body
+        if body_visibility['has_hips'] and not body_visibility['has_upper']:
+            if self.debug:
+                print("   🦴 Hips visible, no upper body -> LOWER BODY bias")
+            if lower_body_motion > 0 or feet_motion > 0:
+                if self.debug:
+                    print("   🦵 ANY lower motion with hip visibility -> LOWER BODY")
+                return 'lower_body'
+        
+        # EVEN MORE AGGRESSIVE: If lower body visible at all, lower the threshold further
+        if body_visibility.get('has_hips', False) or body_visibility.get('has_feet', False):
+            lower_body_threshold = base_threshold * 0.6
+            if self.debug:
+                print(f"   🦴 Lower body parts visible, using moderate threshold: {lower_body_threshold:.2f}")
+            
+            if lower_body_motion > lower_body_threshold or feet_motion > lower_body_threshold * 0.7:
+                if self.debug:
+                    print("   🦵 LOWER BODY detected with hip/feet visibility")
+                return 'lower_body'
+
+        # PRIORITY ORDER with LOWER thresholds for lower body
+        # 1. Hands (clear hand actions)
+        if hands_motion > base_threshold * 1.5:
+            if self.debug:
+                print("   👐 Hand motion detected -> UPPER BODY")
+            return 'upper_body'
+        
+        # 2. Feet (explicit foot motion)
+        if feet_motion > base_threshold * 0.6:
+            if self.debug:
+                print("   🦶 Foot motion detected -> LOWER BODY")
+            return 'lower_body'
+        
+        # 3. Lower body region (leg movement)
+        if lower_body_motion > base_threshold * 0.6:
+            if self.debug:
+                print("   🦵 Lower body motion detected -> LOWER BODY")
+            return 'lower_body'
+        
+        # 4. Head motion
+        if head_motion > base_threshold * 1.0:
+            if self.debug:
+                print("   👤 Head motion detected -> UPPER BODY")
+            return 'upper_body'
+        
+        # 5. Upper body (torso, arms)
+        if upper_body_motion > base_threshold * 0.7:
+            if self.debug:
+                print("   💪 Upper body motion detected -> UPPER BODY")
+            return 'upper_body'
+        
+        # 6. ANY lower body hint + hip visibility
+        if (lower_body_motion > 0 or feet_motion > 0) and body_visibility['has_hips']:
+            if self.debug:
+                print(f"   🦴 Lower motion with visible hips -> LOWER BODY")
+            return 'lower_body'
+        
+        # 7. ANY lower body motion (even tiny)
+        if lower_body_motion > 0 or feet_motion > 0:
+            total_lower = lower_body_motion + feet_motion
+            total_upper = upper_body_motion + hands_motion + head_motion
+            
+            if total_lower > 0 and total_lower >= total_upper * 0.3:
+                if self.debug:
+                    print(f"   🦵 Subtle lower motion (lower={total_lower:.2f}, upper={total_upper:.2f}) -> LOWER BODY")
+                return 'lower_body'
+        
+        # 8. Final fallback based on visibility
+        if body_visibility['has_hips'] or body_visibility['has_feet']:
+            if self.debug:
+                print("   🦴 Defaulting to LOWER BODY (hips/feet visible)")
+            return 'lower_body'
+        
+        if self.debug:
+            print("   🔄 No clear focus -> FULL BODY")
+        return 'full_body'
+    
+    def _adaptive_crop(self, focus_region, poses, frame_width, frame_height):
+        """Apply different cropping strategies based on focus region"""
+        all_points = []
+        
+        for pose in poses:
+            if focus_region == 'upper_body':
+                indices = list(range(0, 11))
+            elif focus_region == 'lower_body':
+                indices = list(range(11, 17))
+            else:
+                indices = list(range(0, 17))
+            
+            for idx in indices:
+                if pose[idx, 2] > 0.2:
+                    all_points.append(pose[idx, :2])
+        
+        if len(all_points) == 0:
+            return None
+        
+        all_points = np.array(all_points)
+        x_min, y_min = np.min(all_points, axis=0)
+        x_max, y_max = np.max(all_points, axis=0)
+        
+        if focus_region == 'upper_body':
+            padding_x = (x_max - x_min) * 0.4
+            padding_y_top = (y_max - y_min) * 0.6
+            padding_y_bottom = (y_max - y_min) * 0.3
+        elif focus_region == 'lower_body':
+            padding_x = (x_max - x_min) * 0.4
+            padding_y_top = (y_max - y_min) * 0.3
+            padding_y_bottom = (y_max - y_min) * 0.6
+        else:
+            padding_x = (x_max - x_min) * 0.3
+            padding_y_top = (y_max - y_min) * 0.4
+            padding_y_bottom = (y_max - y_min) * 0.4
         
         x1 = max(0, int(x_min - padding_x))
-        y1 = max(0, int(y_min - padding_y))
-        x2 = min(w, int(x_max + padding_x))
-        y2 = min(h, int(y_max + padding_y))
+        y1 = max(0, int(y_min - padding_y_top))
+        x2 = min(frame_width, int(x_max + padding_x))
+        y2 = min(frame_height, int(y_max + padding_y_bottom))
+        
+        min_width = frame_width * 0.3
+        min_height = frame_height * 0.4
+        
+        if (x2 - x1) < min_width:
+            center_x = (x1 + x2) // 2
+            x1 = max(0, int(center_x - min_width // 2))
+            x2 = min(frame_width, int(center_x + min_width // 2))
+        
+        if (y2 - y1) < min_height:
+            center_y = (y1 + y2) // 2
+            y1 = max(0, int(center_y - min_height // 2))
+            y2 = min(frame_height, int(center_y + min_height // 2))
         
         return (x1, y1, x2, y2)
     
     def _merge_boxes(self, boxes):
-        """Merge multiple bounding boxes into one"""
         if len(boxes) == 0:
             return None
         if len(boxes) == 1:
@@ -156,13 +442,612 @@ class PoseExtractor:
         
         return (x1_min, y1_min, x2_max, y2_max)
     
-    def get_all_keypoints_for_visualization(self, frame):
-        """
-        Get all detected keypoints for visualization purposes
+    def debug_motion_analysis(self, frame, person_boxes, pose_extractor):
+        """Debug method - only called when debug_motion_analysis is enabled"""
+        if not self.debug:
+            return
+            
+        current_poses = self._get_matched_poses(frame, person_boxes, pose_extractor, 2)
         
-        Returns:
-            List of keypoint arrays (each is 17x3: x, y, conf)
+        if len(current_poses) == 0:
+            print("   ❌ No poses detected -> Will default to LOWER BODY")
+            return
+        
+        body_visibility = self._check_body_visibility(current_poses)
+        motion_regions = self._analyze_motion_regions(current_poses)
+        focus_region = self._determine_focus_region(current_poses, motion_regions, person_boxes, body_visibility)
+        
+        print(f"   🔍 DEBUG: {len(current_poses)} poses, Focus: {focus_region}")
+        print(f"   📊 Motion: {motion_regions}")
+        
+        upper_body_kpts = 0
+        lower_body_kpts = 0
+        hip_kpts = 0
+        for pose in current_poses:
+            for idx in [5, 6, 7, 8, 9, 10]:
+                if pose[idx, 2] > 0.15:
+                    upper_body_kpts += 1
+            for idx in [11, 12, 13, 14, 15, 16]:
+                if pose[idx, 2] > 0.15:
+                    lower_body_kpts += 1
+            for idx in [11, 12]:
+                if pose[idx, 2] > 0.15:
+                    hip_kpts += 1
+        
+        print(f"   👤 Keypoints: upper={upper_body_kpts}, lower={lower_body_kpts}, hips={hip_kpts}")
+        print(f"   🦴 Visibility: {body_visibility}")
+
+
+
+    def reset(self):
+        """Reset motion history"""
+        self.prev_poses = None
+
+# =============================
+# Smart Action-Based Person Detection
+# =============================
+class SmartActionDetector:
+    """Detects people most likely performing the action using interaction + relative motion patterns"""
+    def __init__(self, sticky_frames=15, sticky_weight=0.5, debug=False):
+        self.prev_frame_data = None
+        self.frame_count = 0
+        self.selected_people = []  # People selected in recent frames
+        self.selection_history = deque(maxlen=sticky_frames)  # Track selections
+        self.sticky_weight = sticky_weight  # Weight for previous selections
+        self.locked_pair = None  # Lock onto a specific pair once detected
+        self.lock_strength = 0  # How strongly we're locked onto current pair
+        self.locked_track_ids = set()  # Track IDs of locked people (for tracking mode)
+        self.debug = debug
+        
+    def detect(self, frame, detector, max_people=2, allow_dynamic_group=True):
         """
+        Detect people most likely to be performing actions based on INTERACTION + RELATIVE MOTION
+        """
+        h, w = frame.shape[:2]
+        center_x, center_y = w / 2, h / 2
+        
+        result = detector.predict(frame, conf=0.40, classes=[0], verbose=False)
+        current_detections = []
+        
+        for r in result:
+            for b in r.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                conf = float(b.conf)
+                
+                box_center_x = (x1 + x2) / 2
+                box_center_y = (y1 + y2) / 2
+                area = (x2 - x1) * (y2 - y1)
+                
+                # Score 1: Center proximity (0-1, higher = closer to center)
+                dist = np.sqrt((box_center_x - center_x)**2 + (box_center_y - center_y)**2)
+                max_dist = np.sqrt(center_x**2 + center_y**2)
+                center_score = 1 - (dist / max_dist)
+                
+                # Score 2: Size relevance (larger boxes are often more important)
+                frame_area = h * w
+                size_score = min(area / (frame_area * 0.3), 1.0)
+                
+                # Score 3: Motion with direction tracking
+                motion_score = 0
+                motion_vector = (0, 0)  # Track motion direction
+                if self.prev_frame_data and self.frame_count > 0:
+                    best_match_motion = 0
+                    best_motion_vector = (0, 0)
+                    for prev_box in self.prev_frame_data:
+                        iou = self._iou((x1, y1, x2, y2), prev_box['box'])
+                        if iou > 0.3:
+                            prev_cx, prev_cy = prev_box['center']
+                            position_change = np.sqrt((box_center_x - prev_cx)**2 + 
+                                                     (box_center_y - prev_cy)**2)
+                            
+                            prev_area = prev_box['area']
+                            size_change = abs(area - prev_area) / max(prev_area, 1)
+                            
+                            motion = position_change / 50.0 + size_change * 2.0
+                            if motion > best_match_motion:
+                                best_match_motion = motion
+                                best_motion_vector = (box_center_x - prev_cx, box_center_y - prev_cy)
+                    
+                    motion_score = min(best_match_motion, 1.0)
+                    motion_vector = best_motion_vector
+                
+                # Score 4: Temporal consistency (was this person selected before?)
+                temporal_score = 0
+                if len(self.selection_history) > 0:
+                    for prev_selection in self.selection_history:
+                        for prev_box in prev_selection:
+                            if self._iou((x1, y1, x2, y2), prev_box) > 0.5:
+                                temporal_score = 1.0
+                                break
+                        if temporal_score > 0:
+                            break
+                
+                current_detections.append({
+                    'box': (x1, y1, x2, y2),
+                    'center': (box_center_x, box_center_y),
+                    'area': area,
+                    'conf': conf,
+                    'motion': motion_score,
+                    'motion_vector': motion_vector,
+                    'center_prox': center_score,
+                    'size': size_score,
+                    'temporal': temporal_score
+                })
+        
+        # Calculate interaction scores with RELATIVE MOTION COHERENCE
+        for i, det in enumerate(current_detections):
+            interaction_score = 0
+            max_pair_motion_coherence = 0
+            
+            for j, other_det in enumerate(current_detections):
+                if i == j:
+                    continue
+                
+                # Spatial proximity
+                dx = det['center'][0] - other_det['center'][0]
+                dy = det['center'][1] - other_det['center'][1]
+                distance = np.sqrt(dx**2 + dy**2)
+                
+                frame_diag = np.sqrt(w**2 + h**2)
+                norm_distance = distance / frame_diag
+                
+                proximity_score = max(0, 1 - norm_distance * 3)
+                
+                # Overlap
+                iou = self._iou(det['box'], other_det['box'])
+                overlap_score = iou * 2.0
+                
+                # RELATIVE MOTION COHERENCE
+                motion_coherence = 0
+                if self.prev_frame_data and len(det['motion_vector']) == 2 and len(other_det['motion_vector']) == 2:
+                    my_motion_mag = np.sqrt(det['motion_vector'][0]**2 + det['motion_vector'][1]**2)
+                    other_motion_mag = np.sqrt(other_det['motion_vector'][0]**2 + other_det['motion_vector'][1]**2)
+                    
+                    # Case 1: One person moving, other static OR both have some motion
+                    motion_diff = abs(my_motion_mag - other_motion_mag)
+                    if motion_diff > 5:
+                        static_moving_bonus = min(motion_diff / 40.0, 1.0)
+                        
+                        if norm_distance < 0.35:
+                            motion_coherence = static_moving_bonus * 1.8
+                    
+                    # Case 2: Both moving (coordinated action)
+                    elif my_motion_mag > 3 and other_motion_mag > 3:
+                        if my_motion_mag > 0 and other_motion_mag > 0:
+                            dot_product = (det['motion_vector'][0] * other_det['motion_vector'][0] + 
+                                         det['motion_vector'][1] * other_det['motion_vector'][1])
+                            cos_sim = dot_product / (my_motion_mag * other_motion_mag)
+                            
+                            if abs(cos_sim) > 0.6:
+                                motion_coherence = 0.9 * abs(cos_sim)
+                    
+                    # Case 3: QUICK BURST motion (like slapping)
+                    if norm_distance < 0.25 and (my_motion_mag > 3 or other_motion_mag > 3):
+                        quick_action_score = min((my_motion_mag + other_motion_mag) / 60.0, 1.0)
+                        motion_coherence = max(motion_coherence, quick_action_score * 1.2)
+                
+                # Combine factors with MOTION COHERENCE BOOST
+                pair_interaction = (
+                    proximity_score * 0.4 + 
+                    overlap_score * 0.3 + 
+                    motion_coherence * 0.3
+                )
+                
+                interaction_score = max(interaction_score, pair_interaction)
+                max_pair_motion_coherence = max(max_pair_motion_coherence, motion_coherence)
+            
+            det['interaction'] = min(interaction_score, 1.0)
+            det['motion_coherence'] = max_pair_motion_coherence
+        
+        # Calculate final action score
+        for det in current_detections:
+            # Check if this detection matches our locked pair
+            lock_bonus = 0
+            if self.locked_pair is not None and len(self.selection_history) > 0:
+                last_selection = self.selection_history[-1]
+                for locked_box in last_selection:
+                    if self._iou(det['box'], locked_box) > 0.4:
+                        lock_bonus = 0.5 * (self.lock_strength / 10.0)
+                        break
+            
+            action_score = (
+                det['conf'] * 0.07 +
+                det['center_prox'] * 0.08 +
+                det['size'] * 0.06 +
+                det['motion'] * 0.14 +
+                det['interaction'] * 0.25 +
+                det['motion_coherence'] * 0.18 +
+                det['temporal'] * 0.22 +
+                lock_bonus
+            )
+            det['score'] = action_score
+        
+        # Update history
+        self.prev_frame_data = current_detections
+        self.frame_count += 1
+        
+        # DYNAMIC GROUP DETECTION
+        if allow_dynamic_group:
+            high_interaction = [d for d in current_detections if d['interaction'] > 0.4]
+            
+            if 2 <= len(high_interaction) <= 4:
+                high_interaction.sort(key=lambda x: x['score'], reverse=True)
+                selected_boxes = [d['box'] for d in high_interaction]
+                self.selection_history.append(selected_boxes)
+                return selected_boxes
+        
+        # SMART PAIR SELECTION
+        if max_people and len(current_detections) >= max_people:
+            best_pair = None
+            best_pair_score = -1
+            
+            # Check locked pair first
+            if self.locked_pair is not None and len(self.selection_history) > 0:
+                last_selection = self.selection_history[-1]
+                if len(last_selection) >= 2:
+                    locked_matches = []
+                    for det in current_detections:
+                        for locked_box in last_selection[:2]:
+                            if self._iou(det['box'], locked_box) > 0.25:
+                                locked_matches.append(det)
+                                break
+                    
+                    if len(locked_matches) >= 2:
+                        det_i, det_j = locked_matches[0], locked_matches[1]
+                        
+                        motion_i_mag = np.sqrt(det_i['motion_vector'][0]**2 + det_i['motion_vector'][1]**2)
+                        motion_j_mag = np.sqrt(det_j['motion_vector'][0]**2 + det_j['motion_vector'][1]**2)
+                        complementary_motion_bonus = 0
+                        if abs(motion_i_mag - motion_j_mag) > 5:
+                            complementary_motion_bonus = 0.35
+                        
+                        avg_motion_coherence = (det_i['motion_coherence'] + det_j['motion_coherence']) / 2
+                        
+                        locked_pair_score = (
+                            (det_i['score'] + det_j['score']) / 2 + 
+                            det_i['interaction'] + det_j['interaction'] +
+                            complementary_motion_bonus +
+                            avg_motion_coherence * 0.5 +
+                            0.6
+                        )
+                        
+                        if locked_pair_score > 0.3:
+                            self.lock_strength = min(self.lock_strength + 1, 10)
+                            selected_boxes = [det_i['box'], det_j['box']]
+                            self.selection_history.append(selected_boxes)
+                            self.locked_pair = selected_boxes
+                            return selected_boxes
+            
+            # Search for best pair
+            for i in range(len(current_detections)):
+                for j in range(i + 1, len(current_detections)):
+                    det_i = current_detections[i]
+                    det_j = current_detections[j]
+                    
+                    motion_i_mag = np.sqrt(det_i['motion_vector'][0]**2 + det_i['motion_vector'][1]**2)
+                    motion_j_mag = np.sqrt(det_j['motion_vector'][0]**2 + det_j['motion_vector'][1]**2)
+                    
+                    complementary_motion_bonus = 0
+                    if abs(motion_i_mag - motion_j_mag) > 5:
+                        complementary_motion_bonus = 0.35
+                    
+                    temporal_boost = (det_i['temporal'] + det_j['temporal']) * 0.40
+                    
+                    avg_motion_coherence = (det_i['motion_coherence'] + det_j['motion_coherence']) / 2
+                    
+                    pair_score = (
+                        (det_i['score'] + det_j['score']) / 2 + 
+                        det_i['interaction'] + det_j['interaction'] +
+                        temporal_boost +
+                        complementary_motion_bonus +
+                        avg_motion_coherence * 0.5
+                    )
+                    
+                    if pair_score > best_pair_score:
+                        best_pair_score = pair_score
+                        best_pair = (i, j)
+            
+            if best_pair is not None and best_pair_score > 0.5:
+                idx_i, idx_j = best_pair
+                selected_boxes = [current_detections[idx_i]['box'], current_detections[idx_j]['box']]
+                
+                is_new_pair = True
+                if self.locked_pair is not None:
+                    iou_match_count = 0
+                    for sel_box in selected_boxes:
+                        for locked_box in self.locked_pair:
+                            if self._iou(sel_box, locked_box) > 0.3:
+                                iou_match_count += 1
+                                break
+                    if iou_match_count >= 2:
+                        is_new_pair = False
+                
+                if is_new_pair:
+                    if best_pair_score > 0.9:
+                        print(f"   🔄 Switching to new pair (score: {best_pair_score:.2f})")
+                        self.locked_pair = selected_boxes
+                        self.lock_strength = 1
+                    else:
+                        if self.locked_pair is not None and len(self.selection_history) > 0:
+                            self.lock_strength = max(self.lock_strength - 1, 0)
+                            if self.lock_strength > 0:
+                                print(f"   🔒 Keeping locked pair (new score: {best_pair_score:.2f} < 0.9)")
+                                return self.selection_history[-1][:2]
+                        self.locked_pair = selected_boxes
+                        self.lock_strength = 1
+                else:
+                    self.lock_strength = min(self.lock_strength + 1, 10)
+                    self.locked_pair = selected_boxes
+                
+                self.selection_history.append(selected_boxes)
+                return selected_boxes
+        
+        # Fallback
+        sorted_detections = sorted(current_detections, 
+                                  key=lambda x: x['score'], 
+                                  reverse=True)
+        
+        if max_people is None:
+            selected_boxes = [d['box'] for d in sorted_detections]
+        else:
+            selected_boxes = [d['box'] for d in sorted_detections[:max_people]]
+        
+        self.selection_history.append(selected_boxes)
+        return selected_boxes
+    
+    def detect_with_tracking(self, frame, detector, tracker, max_people=2):
+        """Detect action people and maintain tracking IDs"""
+        if len(self.locked_track_ids) >= 2:
+            all_action_boxes = self.detect(frame, detector, max_people=None)
+            tracked = tracker.update(all_action_boxes)
+            
+            locked_tracks = []
+            for track_id, box in tracked:
+                if track_id in self.locked_track_ids:
+                    locked_tracks.append((track_id, box))
+            
+            if len(locked_tracks) >= max_people:
+                return locked_tracks[:max_people]
+            
+            if len(locked_tracks) > 0 and len(locked_tracks) < max_people and self.locked_pair is not None:
+                for locked_box in self.locked_pair:
+                    found = False
+                    for track_id, box in tracked:
+                        if track_id not in [t[0] for t in locked_tracks]:
+                            if self._iou(box, locked_box) > 0.3:
+                                locked_tracks.append((track_id, box))
+                                self.locked_track_ids.add(track_id)
+                                found = True
+                                break
+                    if found and len(locked_tracks) >= max_people:
+                        break
+                
+                if len(locked_tracks) >= max_people:
+                    return locked_tracks[:max_people]
+        
+        action_boxes = self.detect(frame, detector, max_people=None)
+        tracked = tracker.update(action_boxes)
+        
+        if len(tracked) <= max_people:
+            if len(tracked) >= 2:
+                self.locked_track_ids = {track_id for track_id, _ in tracked[:max_people]}
+            return tracked
+        
+        scored_tracks = []
+        for track_id, box in tracked:
+            for det in self.prev_frame_data:
+                if self._iou(box, det['box']) > 0.5:
+                    scored_tracks.append((det['score'], track_id, box))
+                    break
+        
+        scored_tracks.sort(reverse=True)
+        top_tracks = [(tid, box) for _, tid, box in scored_tracks[:max_people]]
+        
+        if len(top_tracks) >= 2:
+            self.locked_track_ids = {track_id for track_id, _ in top_tracks}
+        
+        return top_tracks
+    
+    def _iou(self, box1, box2):
+        """Compute IoU between two boxes"""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        if x2_i < x1_i or y2_i < y1_i:
+            return 0.0
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        return intersection / union if union > 0 else 0.0
+    
+    def reset(self):
+        """Reset detector state"""
+        self.prev_frame_data = None
+        self.frame_count = 0
+        self.selection_history.clear()
+        self.locked_pair = None
+        self.lock_strength = 0
+        self.locked_track_ids = set()
+
+# =============================
+# Smoothed ROI Detection
+# =============================
+class SmoothedROIDetector:
+    """
+    Temporal smoothing for ROI detection with adaptive alpha based on motion speed.
+    
+    Features:
+    - Adaptive alpha: automatically adjusts smoothing based on ROI motion
+    - Slow motion/static scenes: Heavy smoothing (alpha=0.3) for stability
+    - Fast actions: Light smoothing (alpha=0.7) for responsiveness
+    - Camera shake resistance: Small jitters get filtered with heavy smoothing
+    """
+    def __init__(self, window_size=5, base_alpha=0.5, adaptive=True, debug=False):
+        """
+        Args:
+            window_size: Number of historical ROIs to keep
+            base_alpha: Default alpha when adaptive is disabled (0=full smoothing, 1=no smoothing)
+            adaptive: Enable adaptive alpha based on motion
+            debug: Print alpha values for debugging
+        """
+        self.window_size = window_size
+        self.base_alpha = base_alpha
+        self.alpha = base_alpha
+        self.adaptive = adaptive
+        self.debug = debug
+        
+        self.roi_history = deque(maxlen=window_size)
+        self.smoothed_roi = None
+        self.prev_roi = None
+        self.alpha_history = deque(maxlen=10)  # Track alpha values for debugging
+        
+    def update(self, current_roi):
+        """
+        Update with new ROI and return smoothed result.
+        
+        Args:
+            current_roi: Tuple of (x1, y1, x2, y2) or None
+            
+        Returns:
+            Smoothed ROI as (x1, y1, x2, y2) tuple or None
+        """
+        if current_roi is None:
+            if self.smoothed_roi is not None:
+                return tuple(self.smoothed_roi.astype(int))
+            return None
+        
+        self.roi_history.append(current_roi)
+        
+        if len(self.roi_history) == 0:
+            return None
+        
+        # Calculate adaptive alpha based on motion
+        if self.adaptive and self.prev_roi is not None:
+            self.alpha = self._calculate_adaptive_alpha(current_roi, self.prev_roi)
+            self.alpha_history.append(self.alpha)
+            
+            if self.debug:
+                avg_alpha = sum(self.alpha_history) / len(self.alpha_history)
+                print(f"   🎚️  Adaptive alpha: {self.alpha:.2f} (avg: {avg_alpha:.2f})")
+        else:
+            self.alpha = self.base_alpha
+            
+        # Initialize or update smoothed ROI
+        if self.smoothed_roi is None:
+            self.smoothed_roi = np.array(current_roi, dtype=np.float32)
+        else:
+            current = np.array(current_roi, dtype=np.float32)
+            self.smoothed_roi = self.alpha * current + (1 - self.alpha) * self.smoothed_roi
+        
+        self.prev_roi = current_roi
+        return tuple(self.smoothed_roi.astype(int))
+    
+    def _calculate_adaptive_alpha(self, current_roi, prev_roi):
+        """
+        Calculate adaptive alpha based on ROI motion magnitude.
+        
+        Logic:
+        - Measures ROI center displacement and size change
+        - Fast motion → higher alpha (0.6-0.7) for responsiveness
+        - Slow motion → lower alpha (0.3-0.4) for stability
+        - Camera shake (very small motion) → lowest alpha (0.2-0.3) for filtering
+        
+        Args:
+            current_roi: Current ROI (x1, y1, x2, y2)
+            prev_roi: Previous ROI (x1, y1, x2, y2)
+            
+        Returns:
+            Alpha value between 0.2 and 0.7
+        """
+        curr = np.array(current_roi, dtype=np.float32)
+        prev = np.array(prev_roi, dtype=np.float32)
+        
+        # Calculate ROI center displacement (normalized by typical image size)
+        curr_center = np.array([(curr[0] + curr[2]) / 2, (curr[1] + curr[3]) / 2])
+        prev_center = np.array([(prev[0] + prev[2]) / 2, (prev[1] + prev[3]) / 2])
+        displacement = np.linalg.norm(curr_center - prev_center)
+        normalized_displacement = displacement / 224.0  # Normalize by crop size
+        
+        # Calculate ROI size change (relative)
+        curr_size = (curr[2] - curr[0]) * (curr[3] - curr[1])
+        prev_size = (prev[2] - prev[0]) * (prev[3] - prev[1])
+        size_change = abs(curr_size - prev_size) / max(prev_size, 1)
+        
+        # Combine metrics into motion score
+        # Displacement is primary indicator, size change is secondary
+        motion_score = normalized_displacement + (size_change * 0.5)
+        
+        # Map motion_score to alpha with smooth transitions
+        # Very low motion (likely jitter/noise)
+        if motion_score < 0.02:
+            alpha = 0.25  # Maximum smoothing - filter jitter
+        # Slow motion (walking, slow gestures)
+        elif motion_score < 0.05:
+            alpha = 0.30  # Heavy smoothing for stability
+        # Low-moderate motion
+        elif motion_score < 0.08:
+            alpha = 0.40  # Moderate smoothing
+        # Moderate motion (normal actions)
+        elif motion_score < 0.12:
+            alpha = 0.50  # Balanced (base alpha)
+        # Fast motion (quick gestures)
+        elif motion_score < 0.18:
+            alpha = 0.60  # Light smoothing, more responsive
+        # Very fast motion (rapid actions like punches, kicks)
+        elif motion_score < 0.25:
+            alpha = 0.65  # Highly responsive
+        # Extreme motion (very rapid actions)
+        else:
+            alpha = 0.70  # Maximum responsiveness
+        
+        if self.debug:
+            print(f"   📊 Motion score: {motion_score:.4f} (disp={normalized_displacement:.4f}, size={size_change:.4f}) → alpha={alpha:.2f}")
+        
+        return alpha
+    
+    def get_stats(self):
+        """Get statistics about smoothing behavior"""
+        if len(self.alpha_history) == 0:
+            return None
+        
+        return {
+            'avg_alpha': sum(self.alpha_history) / len(self.alpha_history),
+            'min_alpha': min(self.alpha_history),
+            'max_alpha': max(self.alpha_history),
+            'current_alpha': self.alpha,
+            'history_size': len(self.roi_history)
+        }
+    
+    def reset(self):
+        """Reset all state"""
+        self.roi_history.clear()
+        self.smoothed_roi = None
+        self.prev_roi = None
+        self.alpha = self.base_alpha
+        self.alpha_history.clear()
+
+# =============================
+# Pose Estimation for Spatial Guidance
+# =============================
+class PoseExtractor:
+    """Extract YOLOv11 pose keypoints to guide spatial cropping"""
+    def __init__(self, model_name="yolo11n-pose.pt", conf_threshold=0.3):
+        print(f"🦴 Loading pose estimation model: {model_name}")
+        self.model = YOLO(model_name)
+        self.conf_threshold = conf_threshold
+        self.num_keypoints = 17
+        self.keypoint_names = [
+            'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+            'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+            'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+            'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
+        ]
+        
+    def get_all_keypoints_for_visualization(self, frame):
         results = self.model.predict(frame, conf=self.conf_threshold, verbose=False)
         
         if len(results) == 0 or results[0].keypoints is None:
@@ -177,7 +1062,7 @@ class PoseExtractor:
 yolo_people = YOLO("yolo11n.pt")
 
 class PersonTracker:
-    """Simple IoU-based person tracker to maintain consistent IDs"""
+    """Simple IoU-based person tracker"""
     def __init__(self, iou_threshold=0.3, max_lost_frames=10):
         self.tracks = {}
         self.next_id = 0
@@ -252,26 +1137,6 @@ class PersonTracker:
         self.tracks = {}
         self.next_id = 0
 
-def detect_all_people(frame, detector, tracker=None):
-    """Detect all persons with optional tracking"""
-    result = detector.predict(frame, conf=0.40, classes=[0], verbose=False)
-    boxes = []
-
-    for r in result:
-        for b in r.boxes:
-            x1, y1, x2, y2 = map(int, b.xyxy[0])
-            score = float(b.conf)
-            boxes.append((score, (x1, y1, x2, y2)))
-
-    boxes = sorted(boxes, key=lambda x: x[0], reverse=True)
-    detected_boxes = [b for _, b in boxes]
-    
-    if tracker is None:
-        return detected_boxes
-    else:
-        tracked = tracker.update(detected_boxes)
-        return tracked
-
 def merge_boxes(boxes):
     if len(boxes) == 0:
         return None
@@ -286,7 +1151,7 @@ def merge_boxes(boxes):
     return (x1_min, y1_min, x2_max, y2_max)
 
 def crop_roi(frame, roi, output_size):
-    """Crop frame to ROI at high resolution, then resize to output_size"""
+    """Crop frame to ROI at high resolution, then resize"""
     if roi is None:
         h, w, _ = frame.shape
         th, tw = output_size
@@ -314,105 +1179,18 @@ def crop_roi(frame, roi, output_size):
     return cv2.resize(crop, output_size)
 
 # =============================
-# Improved Frame Sampling for Static Actions
-# =============================
-def improved_frame_sampling(video_path, sequence_length=16, sampling_strategy="temporal_stride"):
-    """
-    Multiple sampling strategies for better temporal understanding
-    """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return []
-    
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    # Choose sampling strategy based on video characteristics
-    if sampling_strategy == "temporal_stride":
-        # For static actions: sample every 4-6 frames to see subtle changes
-        stride = max(4, total_frames // (sequence_length * 2))
-        indices = np.linspace(0, total_frames - 1, sequence_length * stride)[::stride][:sequence_length]
-        indices = indices.astype(int)
-        
-    elif sampling_strategy == "three_segment":
-        # Divide video into beginning, middle, end - good for action progression
-        segment_frames = sequence_length // 3
-        remaining = sequence_length % 3
-        
-        # Beginning segment
-        start_indices = np.linspace(0, total_frames // 3, segment_frames + remaining).astype(int)
-        # Middle segment  
-        mid_indices = np.linspace(total_frames // 3, 2 * total_frames // 3, segment_frames).astype(int)
-        # End segment
-        end_indices = np.linspace(2 * total_frames // 3, total_frames - 1, segment_frames).astype(int)
-        
-        indices = np.concatenate([start_indices, mid_indices, end_indices])
-        
-    elif sampling_strategy == "adaptive_motion":
-        # Sample more frames during high-motion periods
-        indices = adaptive_motion_sampling(cap, total_frames, sequence_length)
-    
-    else:  # uniform
-        indices = np.linspace(0, total_frames - 1, sequence_length).astype(int)
-    
-    cap.release()
-    return indices
-
-def adaptive_motion_sampling(cap, total_frames, sequence_length):
-    """Sample more frames during periods of high motion"""
-    # Read sample frames to detect motion
-    sample_interval = max(1, total_frames // 50)
-    frame_diff = []
-    prev_frame = None
-    
-    for i in range(0, total_frames, sample_interval):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ret, frame = cap.read()
-        if not ret:
-            continue
-            
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if prev_frame is not None:
-            diff = cv2.absdiff(prev_frame, gray)
-            frame_diff.append((i, diff.mean()))
-        prev_frame = gray
-    
-    if not frame_diff:
-        return np.linspace(0, total_frames - 1, sequence_length).astype(int)
-    
-    # Find high-motion regions
-    frame_diff = np.array(frame_diff)
-    motion_threshold = np.percentile(frame_diff[:, 1], 70)
-    high_motion_frames = frame_diff[frame_diff[:, 1] > motion_threshold, 0]
-    
-    # Sample strategically: more frames in high-motion regions
-    if len(high_motion_frames) > sequence_length // 2:
-        # If lots of motion, sample evenly from high-motion frames
-        high_motion_samples = np.random.choice(
-            high_motion_frames, 
-            size=min(sequence_length // 2, len(high_motion_frames)), 
-            replace=False
-        )
-        remaining_samples = sequence_length - len(high_motion_samples)
-        other_samples = np.linspace(0, total_frames - 1, remaining_samples * 2)[::2].astype(int)
-        indices = np.concatenate([high_motion_samples, other_samples])
-    else:
-        # Default to temporal stride
-        stride = max(4, total_frames // (sequence_length * 2))
-        indices = np.linspace(0, total_frames - 1, sequence_length * stride)[::stride][:sequence_length].astype(int)
-    
-    return np.sort(indices)
-
-# =============================
 # Video Sample Visualization
 # =============================
-def visualize_training_sample(video_path, label, pose_extractor, output_path="training_sample.mp4", 
-                              sample_rate=5):
-    """Creates a video sample visualization with bounding boxes, pose keypoints, and action ROI"""
+def visualize_training_sample(video_path, label, pose_extractor, adaptive_detector, 
+                             output_path="training_sample.mp4", sample_rate=5, debug=False):
+    """Creates a video sample visualization showing action detection"""
     print(f"\n🎬 Creating training sample visualization for: {video_path}")
     print(f"   Action label: {label}")
     print(f"   Detection sample rate: every {sample_rate} frame(s)")
     
+    # Set debug mode for the detector if passed
+    adaptive_detector.debug = debug
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"❌ Could not open video: {video_path}")
@@ -436,7 +1214,7 @@ def visualize_training_sample(video_path, label, pose_extractor, output_path="tr
         try:
             output_path_with_ext = output_path.replace('.mp4', ext).replace('.avi', ext)
             fourcc = cv2.VideoWriter_fourcc(*codec)
-            video_writer = cv2.VideoWriter(output_path_with_ext, fourcc, fps, (width, height + 60))
+            video_writer = cv2.VideoWriter(output_path_with_ext, fourcc, fps, (width, height + 100))
             if video_writer.isOpened():
                 output_path = output_path_with_ext
                 print(f"   Using codec: {codec}")
@@ -456,22 +1234,29 @@ def visualize_training_sample(video_path, label, pose_extractor, output_path="tr
     pbar = tqdm(total=total_frames, desc="Creating visualization")
     
     person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=10)
-    roi_smoother = SmoothedROIDetector(window_size=5, alpha=0.3)
+    action_detector = SmartActionDetector()
+    roi_smoother = SmoothedROIDetector(
+    window_size=3, 
+    base_alpha=0.5,
+    adaptive=True,  # Enable adaptive smoothing
+    debug=False
+    )
+
     
     track_colors = {}
-    color_palette = [(0, 255, 0), (255, 0, 255), (255, 255, 0), (0, 255, 255), 
-                     (255, 128, 0), (128, 255, 0), (0, 128, 255), (255, 0, 128)]
+    color_palette = [(0, 255, 0), (255, 0, 255), (255, 255, 0), (0, 255, 255)]
     
     last_tracked_people = []
     last_action_roi = None
     last_poses = []
+    focus_region = "full_body"
     
     # Pose visualization connections
     pose_connections = [
-        (0, 1), (0, 2), (1, 3), (2, 4),  # Face
-        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # Arms
-        (5, 11), (6, 12), (11, 12),  # Torso
-        (11, 13), (13, 15), (12, 14), (14, 16)  # Legs
+        (0, 1), (0, 2), (1, 3), (2, 4),
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+        (5, 11), (6, 12), (11, 12),
+        (11, 13), (13, 15), (12, 14), (14, 16)
     ]
     
     while True:
@@ -485,52 +1270,113 @@ def visualize_training_sample(video_path, label, pose_extractor, output_path="tr
             if frame_count % sample_rate == 0:
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
-                # Detect and track people
-                last_tracked_people = detect_all_people(frame_rgb, yolo_people, person_tracker)
+                # Use SMART ACTION DETECTION to find ACTION PEOPLE ONLY
+                last_tracked_people = action_detector.detect_with_tracking(
+                    frame_rgb, yolo_people, person_tracker, max_people=2
+                )
                 
-                # Extract boxes
+                # Extract boxes from ACTION people only
                 if last_tracked_people and isinstance(last_tracked_people[0], tuple):
                     boxes_only = [box for _, box in last_tracked_people]
                 else:
                     boxes_only = last_tracked_people
                 
-                # Get ACTION-FOCUSED ROI using pose
+                # Get ACTION-FOCUSED ROI using ADAPTIVE detection
                 if pose_extractor is not None and len(boxes_only) > 0:
-                    action_roi = pose_extractor.get_action_region_from_poses(frame_rgb, boxes_only)
+                    # Get ROI and focus region TOGETHER to keep them in sync
+                    action_roi, focus_region = adaptive_detector.detect_action_region(
+                        frame_rgb, boxes_only, pose_extractor, max_poses=2
+                    )
+                    
+                    print(f"   Frame {frame_count}: Focus region = {focus_region}")
+                    
+                    # Debug motion analysis
+                    adaptive_detector.debug_motion_analysis(frame_rgb, boxes_only, pose_extractor)
+                    
+                    # Get poses for visualization
+                    if CONFIG.get('visualize_skeletons', False):
+                        last_poses = []
+                        results = pose_extractor.model.predict(frame_rgb, conf=pose_extractor.conf_threshold, verbose=False)
+                        
+                        if len(results) > 0 and results[0].keypoints is not None:
+                            all_keypoints = results[0].keypoints.data.cpu().numpy()
+                            
+                            for action_box in boxes_only[:2]:
+                                ax1, ay1, ax2, ay2 = action_box
+                                
+                                best_match_idx = None
+                                best_match_score = 0
+                                
+                                for idx, kpts in enumerate(all_keypoints):
+                                    if np.sum(kpts[:, 2] > 0.3) >= 5:
+                                        visible_kpts = kpts[kpts[:, 2] > 0.3]
+                                        pose_center = visible_kpts[:, :2].mean(axis=0)
+                                        
+                                        if ax1 <= pose_center[0] <= ax2 and ay1 <= pose_center[1] <= ay2:
+                                            score = len(visible_kpts)
+                                            if score > best_match_score:
+                                                best_match_score = score
+                                                best_match_idx = idx
+                                
+                                if best_match_idx is not None:
+                                    last_poses.append(all_keypoints[best_match_idx])
+                                    
+                                    if len(last_poses) >= 2:
+                                        break
+                    else:
+                        last_poses = []
                 else:
                     action_roi = merge_boxes(boxes_only)
+                    last_poses = []
+                    focus_region = "full_body"
+                    print(f"   Frame {frame_count}: No pose detection, using FULL BODY")
                 
-                # Smooth the action ROI
                 last_action_roi = roi_smoother.update(action_roi)
-                
-                # Get keypoints for visualization
-                if pose_extractor is not None:
-                    last_poses = pose_extractor.get_all_keypoints_for_visualization(frame_rgb)
+
+            if debug and CONFIG.get('debug_motion_analysis', False):
+                adaptive_detector.debug_motion_analysis(frame_rgb, boxes_only, pose_extractor)
+            else:
+                # Print only the focus region without detailed motion analysis
+                if pose_extractor is not None and len(boxes_only) > 0:
+                    action_roi, focus_region = adaptive_detector.detect_action_region(
+                        frame_rgb, boxes_only, pose_extractor, max_poses=2
+                    )
+                    if not debug:  # Only print summary if not in debug mode
+                        print(f"   Frame {frame_count}: Focus region = {focus_region}")   
             
-            # Draw tracked person boxes (GREEN)
+            # Draw tracked person boxes with ACTION SCORE indicators
             for i, item in enumerate(last_tracked_people):
                 if isinstance(item, tuple):
                     track_id, (x1, y1, x2, y2) = item
                     if track_id not in track_colors:
                         track_colors[track_id] = color_palette[len(track_colors) % len(color_palette)]
                     color = track_colors[track_id]
-                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(display_frame, f"Person {track_id}", (x1, max(20, y1-10)), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 3)
+                    cv2.putText(display_frame, f"ACTION Person {track_id}", (x1, max(20, y1-10)), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                 else:
                     x1, y1, x2, y2 = item
-                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
             
             # Draw ACTION ROI (BLUE - thicker)
             if last_action_roi:
                 x1, y1, x2, y2 = last_action_roi
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), (255, 0, 0), 4)
-                cv2.putText(display_frame, "ACTION CROP", (x1, max(45, y1-40)), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 3)
+                
+                # Color code based on focus region
+                if focus_region == 'upper_body':
+                    color = (0, 255, 255)  # Yellow for upper body
+                    region_text = "UPPER BODY ACTION"
+                elif focus_region == 'lower_body':
+                    color = (0, 255, 0)    # Green for lower body  
+                    region_text = "LOWER BODY ACTION"
+                else:
+                    color = (255, 0, 0)    # Blue for full body
+                    region_text = "FULL BODY ACTION"
             
             # Draw pose keypoints and skeleton
             for pose_kpts in last_poses:
-                # Draw skeleton connections (CYAN)
                 for conn in pose_connections:
                     pt1_idx, pt2_idx = conn
                     if pose_kpts[pt1_idx, 2] > 0.3 and pose_kpts[pt2_idx, 2] > 0.3:
@@ -538,21 +1384,33 @@ def visualize_training_sample(video_path, label, pose_extractor, output_path="tr
                         pt2 = (int(pose_kpts[pt2_idx, 0]), int(pose_kpts[pt2_idx, 1]))
                         cv2.line(display_frame, pt1, pt2, (0, 255, 255), 2)
                 
-                # Draw keypoints (RED)
                 for kpt in pose_kpts:
                     if kpt[2] > 0.3:
                         cv2.circle(display_frame, (int(kpt[0]), int(kpt[1])), 4, (0, 0, 255), -1)
             
-            # Create label area
-            label_area = np.zeros((60, width, 3), dtype=np.uint8)
-            cv2.putText(label_area, f"ACTION: {label}", (20, 40), 
+            # Create enhanced label area with debug info
+            label_area = np.zeros((100, width, 3), dtype=np.uint8)
+            cv2.putText(label_area, f"ACTION: {label}", (20, 35), 
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-            cv2.putText(label_area, f"Frame: {frame_count}/{total_frames}", (width-250, 40), 
+            cv2.putText(label_area, f"Frame: {frame_count}/{total_frames}", (width-250, 35), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             
             num_people = len(last_tracked_people)
-            cv2.putText(label_area, f"People: {num_people} | Poses: {len(last_poses)}", (width-550, 40), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            skeleton_status = "ON" if CONFIG.get('visualize_skeletons', False) else "OFF"
+            
+            # Color code the focus region text
+            if focus_region == 'upper_body':
+                focus_color = (0, 255, 255)  # Yellow
+            elif focus_region == 'lower_body':
+                focus_color = (0, 255, 0)    # Green
+            else:
+                focus_color = (255, 255, 255)  # White
+            
+            cv2.putText(label_area, f"Action People: {num_people} | Focus: {focus_region}", 
+                       (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, focus_color, 2)
+            
+            cv2.putText(label_area, "Detection: Adaptive Action Region", 
+                       (width-450, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
             
             combined_frame = np.vstack([label_area, display_frame])
             video_writer.write(combined_frame)
@@ -584,6 +1442,8 @@ def create_sample_visualizations(dataset, pose_extractor, num_samples=2):
     
     selected_indices = random.sample(range(len(dataset.samples)), min(num_samples, len(dataset.samples)))
     
+    adaptive_detector = AdaptiveActionDetector()
+    
     for i, idx in enumerate(selected_indices):
         video_path, label_idx = dataset.samples[idx]
         label_name = dataset.idx_to_label[label_idx]
@@ -592,6 +1452,7 @@ def create_sample_visualizations(dataset, pose_extractor, num_samples=2):
             video_path, 
             label_name,
             pose_extractor,
+            adaptive_detector,
             output_filename,
             sample_rate=CONFIG.get('visualization_sample_rate', 5)
         )
@@ -618,9 +1479,9 @@ CONFIG = {
     "early_stopping_patience": 5,
     "min_delta": 0.001,
     "use_class_weights": True,
-    "augmentation_prob": 0.3,  # 30% chance of augmentation per frame
+    "augmentation_prob": 0.3,
     "sequence_length": 16,
-    "crop_size": (224, 224),  # Intel encoder requires 224x224
+    "crop_size": (224, 224),
     "model_save_path": "intel_finetuned_classifier_3d.pth",
     "checkpoint_path": r"D:\movie_highlighter\checkpoints\checkpoint_latest.pth",
     "save_checkpoint_every": 5,
@@ -631,29 +1492,42 @@ CONFIG = {
     "mean": [0.485, 0.456, 0.406],
     "std": [0.229, 0.224, 0.225],
     "create_visualizations": True,
-    "num_visualization_samples": 2,
+    "num_visualization_samples": 4,
     "visualization_sample_rate": 5,
     "use_roi_smoothing": True,
-    # Pose-guided cropping (NOT feature extraction)
+    "use_adaptive_cropping": True,  # Enable adaptive action region detection
+    "motion_threshold": 2.0,        # Lower threshold for better detection of body part involved
     "use_pose_guided_crop": True,
     "pose_model": "yolo11n-pose.pt",
     "pose_conf_threshold": 0.3,
-    # Improved frame sampling for static actions
-    "sampling_strategy": "temporal_stride",  # "temporal_stride", "three_segment", "adaptive_motion"
-    "default_stride": 4,  # For temporal_stride: sample every 4-6 frames
+    "visualize_skeletons": False,
+    "max_action_people": 2,
+    "allow_dynamic_group": True,
+    "sticky_frames": 10,
+    "interaction_threshold": 0.4,
+    "sampling_strategy": "temporal_stride",
+    "default_stride": 4,
     "min_stride": 3,
     "max_stride": 8,
+    "debug_mode": False,  # Set to True to enable verbose debug output
+    "debug_motion_analysis": False,  # Separate flag for motion analysis debug
+    "use_roi_smoothing": True,
+    "adaptive_smoothing": True,  # Enable adaptive alpha
+    "smoothing_base_alpha": 0.5,  # Base alpha when adaptive is off
+    "smoothing_window_size": 5,  # History window
+    "debug_smoothing": False,  # Set True to see alpha values
 }
+
 
 BASE_DIR = os.getcwd()
 ENCODER_XML = os.path.join(BASE_DIR, "models/intel_action/encoder/FP32/action-recognition-0001-encoder.xml")
 ENCODER_BIN = os.path.join(BASE_DIR, "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin")
 
 # =============================
-# Video Loading with Improved Frame Sampling
+# Video Loading with Adaptive Action Detection
 # =============================
-def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=False):
-    """Load video with improved frame sampling for static actions"""
+def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=False, debug=False):
+    """Load video with adaptive action-based person detection"""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         return []
@@ -667,31 +1541,31 @@ def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=F
     
     if sampling_strategy == "temporal_stride":
         stride = CONFIG.get("default_stride", 4)
-        # Adjust stride based on video length
         stride = max(CONFIG.get("min_stride", 3), 
                     min(CONFIG.get("max_stride", 8), 
                         total_frames // (CONFIG["sequence_length"] * 2)))
         
         indices = np.linspace(0, total_frames - 1, CONFIG["sequence_length"] * stride)
         indices = indices[::stride][:CONFIG["sequence_length"]].astype(int)
-        
-    elif sampling_strategy == "three_segment":
-        indices = improved_frame_sampling(path, CONFIG["sequence_length"], "three_segment")
-        
-    elif sampling_strategy == "adaptive_motion":
-        indices = improved_frame_sampling(path, CONFIG["sequence_length"], "adaptive_motion")
-        
-    else:  # uniform (fallback)
+    else:
         indices = np.linspace(0, total_frames - 1, CONFIG["sequence_length"]).astype(int)
-    
-    # Only print sampling info occasionally during training for debugging
-    if verbose and random.random() < 0.01:  # Only print 1% of the time
-        print(f"   Sampling: {len(indices)} frames with strategy '{sampling_strategy}' (stride: {stride if sampling_strategy == 'temporal_stride' else 'N/A'})")
     
     output_frames = []
     crop_size = CONFIG["crop_size"]
     
-    roi_smoother = SmoothedROIDetector(window_size=5, alpha=0.3) if CONFIG["use_roi_smoothing"] else None
+    # Initialize detectors
+    action_detector = SmartActionDetector()
+    adaptive_detector = AdaptiveActionDetector(
+        motion_threshold=CONFIG.get("motion_threshold", 5.0),
+        debug=debug
+    )
+    roi_smoother = SmoothedROIDetector(
+    window_size=5, 
+    base_alpha=CONFIG.get("smoothing_base_alpha", 0.5),
+    adaptive=CONFIG.get("adaptive_smoothing", True),
+    debug=CONFIG.get("debug_smoothing", False) or debug
+    ) if CONFIG["use_roi_smoothing"] else None
+
     person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=5) if CONFIG["use_roi_smoothing"] else None
 
     for idx in indices:
@@ -702,43 +1576,49 @@ def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=F
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Detect and track people
+        # Define 'people' before using it
         if person_tracker:
-            tracked = detect_all_people(frame, yolo_people, person_tracker)
+            tracked = action_detector.detect_with_tracking(
+                frame, yolo_people, person_tracker, 
+                max_people=CONFIG.get('max_action_people', 2)
+            )
             if tracked and isinstance(tracked[0], tuple):
                 people = [box for _, box in tracked]
             else:
                 people = tracked
         else:
-            people = detect_all_people(frame, yolo_people)
-        
-        # Get ACTION-FOCUSED ROI using pose guidance
-        if pose_extractor is not None and len(people) > 0:
-            roi = pose_extractor.get_action_region_from_poses(frame, people)
-        else:
-            # Fallback: merge all person boxes
+            people = action_detector.detect(
+                frame, yolo_people, 
+                max_people=CONFIG.get('max_action_people', 2)
+            )
+
+        # NOW 'people' is defined before this check
+        if CONFIG.get('use_adaptive_cropping', False) and pose_extractor is not None and len(people) > 0:
+            roi, focus_region = adaptive_detector.detect_action_region(
+                frame, people, pose_extractor, max_poses=2
+            )
+        elif pose_extractor is not None and len(people) > 0:
+            # Fallback to original pose extraction
             roi = merge_boxes(people)
+        else:
+            roi = merge_boxes(people) if len(people) > 0 else None
         
         # Smooth the ROI
-        if roi_smoother:
+        if roi_smoother and roi is not None:
             roi = roi_smoother.update(roi)
         
         # Crop at HIGH resolution, then resize to 224x224
-        # This preserves more detail than cropping directly at 224x224
         frame = crop_roi(frame, roi, crop_size)
         
         # Data augmentation for training only
         if is_training and random.random() < CONFIG.get('augmentation_prob', 0.3):
-            # Random brightness adjustment (helps with lighting variations)
             brightness_factor = random.uniform(0.8, 1.2)
             frame = np.clip(frame * brightness_factor, 0, 255).astype(np.uint8)
             
-            # Random contrast adjustment (helps model focus on color/texture changes)
             contrast_factor = random.uniform(0.8, 1.2)
             mean = frame.mean(axis=(0, 1), keepdims=True)
             frame = np.clip((frame - mean) * contrast_factor + mean, 0, 255).astype(np.uint8)
             
-            # Random horizontal flip (50% chance)
             if random.random() < 0.5:
                 frame = np.fliplr(frame)
         
@@ -755,13 +1635,14 @@ def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=F
     if len(output_frames) == 0:
         return []
     
-    # Pad if fewer frames than sequence_length
+    # Pad if needed
     if len(output_frames) < CONFIG["sequence_length"]:
         last = output_frames[-1]
         while len(output_frames) < CONFIG["sequence_length"]:
             output_frames.append(last.copy())
 
     return np.stack(output_frames, axis=0)
+
 # =============================
 # Dataset
 # =============================
@@ -808,12 +1689,11 @@ class VideoDataset(Dataset):
     def __getitem__(self, idx):
         video_path, label = self.video_samples[idx]
         
-        # Pass pose_extractor for guided cropping (not feature extraction)
         frames = load_video_normalized(
             video_path, 
-            pose_extractor=self.pose_extractor if CONFIG.get('use_pose_guided_crop') else None,
+            pose_extractor=self.pose_extractor if CONFIG.get('use_pose_guided_crop') or CONFIG.get('use_adaptive_cropping') else None,
             is_training=self.is_training,
-            verbose=False  # Disable verbose output during training
+            verbose=False
         )
         
         if len(frames) == 0:
@@ -942,15 +1822,13 @@ class EncoderLSTM(nn.Module):
         self.bidirectional = bidirectional
         self.lstm = nn.LSTM(feature_dim, hidden_dim, batch_first=True, bidirectional=bidirectional)
         
-        # Adjust output dimension based on bidirectional
         lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
         self.fc = nn.Linear(lstm_output_dim, num_classes)
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        out = out[:, -1, :]  # Take the last time step
+        out = out[:, -1, :]
         return self.fc(out)
-
 
 # =============================
 # Checkpoint Management
@@ -977,15 +1855,51 @@ def save_checkpoint(model, optimizer, epoch, best_val_acc, label_to_idx, idx_to_
     torch.save(checkpoint, checkpoint_path)
     print(f"💾 Checkpoint saved: {checkpoint_path} (epoch {epoch+1})")
 
-def load_checkpoint(checkpoint_path, model, optimizer=None):
+def load_checkpoint(checkpoint_path, model, optimizer=None, strict=True):
     """Load training checkpoint"""
     if not os.path.exists(checkpoint_path):
         print(f"❌ Checkpoint not found: {checkpoint_path}")
         return None
     
     print(f"📂 Loading checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=CONFIG['device'])
+    checkpoint = torch.load(checkpoint_path, map_location=CONFIG['device'], weights_only=False)
     
+    # Check if number of classes matches
+    saved_num_classes = checkpoint.get('num_classes', 0)
+    current_num_classes = model.fc.out_features
+    
+    if saved_num_classes != current_num_classes:
+        print(f"⚠️  Class mismatch detected:")
+        print(f"   Checkpoint: {saved_num_classes} classes")
+        print(f"   Current model: {current_num_classes} classes")
+        print(f"   Loading shared weights only (transfer learning mode)")
+        
+        # Load everything except the final classification layer
+        state_dict = checkpoint['model_state_dict']
+        model_dict = model.state_dict()
+        
+        # Filter out fc layer weights
+        pretrained_dict = {k: v for k, v in state_dict.items() 
+                          if k in model_dict and 'fc' not in k and v.shape == model_dict[k].shape}
+        
+        # Update current model dict
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        
+        print(f"   ✅ Loaded {len(pretrained_dict)} shared layers")
+        print(f"   🆕 Final classification layer randomly initialized for {current_num_classes} classes")
+        
+        # Don't load optimizer state when doing transfer learning
+        return {
+            'epoch': -1,  # Start from epoch 0
+            'best_val_acc': 0.0,
+            'best_val_loss': float('inf'),
+            'label_to_idx': checkpoint.get('label_to_idx', {}),
+            'idx_to_label': checkpoint.get('idx_to_label', {}),
+            'transfer_learning': True
+        }
+    
+    # Normal loading when classes match
     model.load_state_dict(checkpoint['model_state_dict'])
     
     if optimizer is not None and checkpoint.get('optimizer_state_dict') is not None:
@@ -1081,11 +1995,20 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
     if is_resuming:
         checkpoint = load_checkpoint(CONFIG['checkpoint_path'], model, optimizer)
         if checkpoint:
-            start_epoch = checkpoint.get('epoch', 0) + 1
-            best_val_acc = checkpoint.get('best_val_acc', 0.0)
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            if checkpoint.get('transfer_learning', False):
+                # Transfer learning mode - start fresh with lower learning rate
+                start_epoch = 0
+                best_val_acc = 0.0
+                best_val_loss = float('inf')
+                print("   🔄 Transfer learning: using pretrained features, training new classifier")
+            else:
+                # Normal resume
+                start_epoch = checkpoint.get('epoch', 0) + 1
+                best_val_acc = checkpoint.get('best_val_acc', 0.0)
+                best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         else:
-            print("⚠️  Failed to load checkpoint — starting from scratch with finetune LR.")
+            print("⚠️  Failed to load checkpoint — starting from scratch")
+
     
     if is_resuming:
         max_epochs = start_epoch + CONFIG.get('max_finetune_epochs', 15)
@@ -1140,7 +2063,6 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
             val_loss, val_acc, per_class_acc = validate_classifier(encoder, model, val_loader, device, criterion)
             print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
             
-            # Only print per-class accuracy every 5 epochs to reduce clutter
             if per_class_acc and (epoch + 1) % 5 == 0:
                 print(f"  Per-class accuracy:")
                 for label_idx in sorted(per_class_acc.keys()):
@@ -1198,33 +2120,30 @@ if __name__ == "__main__":
     set_seed(42)
     
     print("=" * 60)
-    print("🎯 ACTION RECOGNITION TRAINING (IMPROVED FRAME SAMPLING)")
+    print("🎯 ACTION RECOGNITION WITH ADAPTIVE ACTION DETECTION")
     print("=" * 60)
     
     if CONFIG.get('checkpoint_path'):
         print(f"\n📂 Config checkpoint path: {CONFIG['checkpoint_path']}")
     print(f"   Device: {CONFIG['device']}")
     print(f"   Batch size: {CONFIG['batch_size']}")
-    print(f"   Pose-guided cropping: {'ENABLED' if CONFIG.get('use_pose_guided_crop') else 'DISABLED'}")
+    print(f"   Adaptive action detection: ✅ ENABLED")
+    print(f"   Motion threshold: {CONFIG.get('motion_threshold', 5.0)}")
     print(f"   Class weighting: {'ENABLED' if CONFIG.get('use_class_weights') else 'DISABLED'}")
-    print(f"   Early stopping patience: {CONFIG['early_stopping_patience']} epochs")
-    print(f"   Frame sampling strategy: {CONFIG.get('sampling_strategy', 'temporal_stride')}")
-    print(f"   Default stride: {CONFIG.get('default_stride', 4)} frames")
     print("=" * 60)
     
-    # Initialize pose extractor for CROPPING (not feature extraction)
     pose_extractor = None
-    if CONFIG.get('use_pose_guided_crop', False):
+    if CONFIG.get('use_pose_guided_crop', False) or CONFIG.get('use_adaptive_cropping', False):
         print("\n🦴 Initializing pose-guided cropping...")
         pose_extractor = PoseExtractor(
             model_name=CONFIG.get('pose_model', 'yolo11n-pose.pt'),
             conf_threshold=CONFIG.get('pose_conf_threshold', 0.3)
         )
-        print("   ✅ Pose will guide ACTION REGION detection for better cropping")
-    else:
-        print("\n⚠️  Pose-guided cropping DISABLED - using full person boxes")
+        if CONFIG.get('use_adaptive_cropping'):
+            print("   ✅ Adaptive action region detection ENABLED")
+        else:
+            print("   ✅ Pose will guide ACTION REGION detection")
     
-    # Load datasets
     print("\n📁 Loading datasets...")
     train_dataset = VideoDataset(
         os.path.join(CONFIG['data_path'], "train"),
@@ -1254,18 +2173,14 @@ if __name__ == "__main__":
             num_samples=CONFIG.get('num_visualization_samples', 2)
         )
     
-    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
     
-    # Initialize encoder
     print(f"\n🔧 Initializing Intel encoder...")
     encoder = IntelFeatureExtractor(ENCODER_XML, ENCODER_BIN)
     
-    # Get label mappings
     label_to_idx, idx_to_label = train_dataset.get_label_mapping()
     
-    # Train model
     print(f"\n🚀 Starting training...")
     model = train_classifier(encoder, train_loader, val_loader, 
                             len(train_dataset.labels), label_to_idx, idx_to_label)
@@ -1273,7 +2188,27 @@ if __name__ == "__main__":
     if model:
         print(f"\n✅ Training complete!")
         print(f"   Final model saved to: {CONFIG['model_save_path']}")
+        print(f"   Adaptive action detection: ✅ Motion-based region focus")
     else:
         print(f"\n❌ Training failed!")
     
+    debug_mode = CONFIG.get('debug_mode', False)
+    
+    if debug_mode:
+        print("\n🐛 DEBUG MODE ENABLED - Verbose output active")
+
+    pose_extractor = None
+
+    if CONFIG.get('use_pose_guided_crop', False) or CONFIG.get('use_adaptive_cropping', False):
+        print("\n🦴 Initializing pose-guided cropping...")
+        pose_extractor = PoseExtractor(
+            model_name=CONFIG.get('pose_model', 'yolo11n-pose.pt'),
+            conf_threshold=CONFIG.get('pose_conf_threshold', 0.3)
+        )
+        if CONFIG.get('use_adaptive_cropping'):
+            print("   ✅ Adaptive action region detection ENABLED")
+            if debug_mode:
+                print("   🐛 Debug mode: Detailed motion analysis will be shown")
+
+
     print("=" * 60)
