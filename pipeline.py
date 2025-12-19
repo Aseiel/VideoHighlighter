@@ -422,6 +422,102 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         check_cancellation(cancel_flag, log, "video info extraction")
 
+        # --- Time Range Processing ---
+        USE_TIME_RANGE = gui_config.get("use_time_range", False)
+        RANGE_START = gui_config.get("range_start", 0)
+        RANGE_END = gui_config.get("range_end", None)
+
+        # Store original video path and duration for later use
+        original_video_path = video_path
+        original_video_duration = video_duration
+        processed_video_path = video_path
+        temp_trimmed_video = None
+
+        if USE_TIME_RANGE:
+            if RANGE_END is None or RANGE_END == 0:
+                RANGE_END = video_duration
+            
+            # Validate range
+            if RANGE_START >= RANGE_END:
+                log(f"⚠️ Invalid time range: start ({RANGE_START}s) >= end ({RANGE_END}s)")
+                return None
+            
+            if RANGE_START >= video_duration:
+                log(f"⚠️ Start time ({RANGE_START}s) exceeds video duration ({video_duration:.1f}s)")
+                return None
+            
+            # Clamp end time to video duration
+            RANGE_END = min(RANGE_END, video_duration)
+            range_duration = RANGE_END - RANGE_START
+            
+            log(f"🎯 Processing time range: {RANGE_START//60}:{RANGE_START%60:02d} to {RANGE_END//60}:{RANGE_END%60:02d}")
+            log(f"   Range duration: {range_duration//60}:{int(range_duration%60):02d} ({range_duration:.1f}s)")
+            log(f"   Skipping: {RANGE_START:.1f}s at start, {video_duration - RANGE_END:.1f}s at end")
+            
+            # Create temporary trimmed video
+            progress.update_progress(5, 100, "Pipeline", "Trimming video to selected range...")
+            
+            video_base_name = os.path.splitext(os.path.basename(video_path))[0]
+            temp_folder = os.path.dirname(video_path) or "."
+            temp_trimmed_video = os.path.join(temp_folder, f"{video_base_name}_temp_trimmed.mp4")
+            
+            try:
+                check_cancellation(cancel_flag, log, "video trimming")
+                
+                # Use FFmpeg to trim the video (fast, no re-encoding)
+                log(f"   Using FFmpeg to extract range...")
+                subprocess.run([
+                    "ffmpeg", "-y", "-v", "error",
+                    "-ss", str(RANGE_START),
+                    "-to", str(RANGE_END),
+                    "-i", video_path,
+                    "-c", "copy",  # Copy streams without re-encoding for speed
+                    temp_trimmed_video
+                ], check=True)
+                
+                log(f"✅ Video trimmed to: {temp_trimmed_video}")
+                processed_video_path = temp_trimmed_video
+                
+                # Update video_duration for the rest of the pipeline
+                video_duration = range_duration
+                
+                # Update video info for the trimmed video
+                cap = cv2.VideoCapture(processed_video_path)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                cap.release()
+                log(f"📊 Trimmed video: {video_duration:.2f}s, FPS: {fps}, frames: {total_frames}")
+                
+            except subprocess.CalledProcessError as e:
+                log(f"⚠️ FFmpeg trimming with copy failed, trying with re-encoding...")
+                try:
+                    # Fallback: re-encode if copy fails
+                    subprocess.run([
+                        "ffmpeg", "-y", "-v", "error",
+                        "-ss", str(RANGE_START),
+                        "-to", str(RANGE_END),
+                        "-i", video_path,
+                        temp_trimmed_video
+                    ], check=True)
+                    log(f"✅ Video trimmed (re-encoded) to: {temp_trimmed_video}")
+                    processed_video_path = temp_trimmed_video
+                    video_duration = range_duration
+                    
+                    # Update video info
+                    cap = cv2.VideoCapture(processed_video_path)
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                    cap.release()
+                    log(f"📊 Trimmed video: {video_duration:.2f}s, FPS: {fps}, frames: {total_frames}")
+                except Exception as e2:
+                    log(f"❌ Failed to trim video: {e2}")
+                    return None
+            except RuntimeError:
+                return None
+        else:
+            log("ℹ️ Processing full video")
+
+
         # --- Transcript processing ---
         transcript_segments = []
         keyword_matches = []
@@ -433,8 +529,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             log("🔹 Step 0.5: Processing transcript...")
             try:
                 check_cancellation(cancel_flag, log, "transcript processing")
-                # Note: You'll need to modify your transcript functions to accept cancel_flag
-                transcript_segments = get_transcript_segments(video_path, model_name=gui_config.get("transcript_model", "medium"), progress_fn=progress_fn, log_fn=log)
+                transcript_segments = get_transcript_segments(processed_video_path, model_name=gui_config.get("transcript_model", "medium"), progress_fn=progress_fn, log_fn=log)
                 
                 check_cancellation(cancel_flag, log, "transcript processing")
                 
@@ -486,7 +581,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 
                 # Call the actual motion detection function with video path
                 result = detect_scenes_motion_optimized(
-                    video_path,
+                    processed_video_path,
                     scene_threshold=70.0,
                     motion_threshold=100.0,
                     spike_factor=1.2,
@@ -525,8 +620,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         log("🔹 Step 3: Detecting audio peaks...")
         try:
             check_cancellation(cancel_flag, log, "audio peak detection")
-            # Note: You may need to modify extract_audio_peaks to accept cancel_flag
-            audio_peaks = extract_audio_peaks(video_path, cancel_flag=cancel_flag)
+            audio_peaks = extract_audio_peaks(processed_video_path, cancel_flag=cancel_flag)
             log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
         except RuntimeError:
             return None
@@ -591,7 +685,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
             # Run detection with cancellation support and bounding boxes
             object_detections = detect_objects_with_progress(
-                video_path,
+                processed_video_path,
                 yolo_model,
                 highlight_objects,
                 log_fn=log_fn,
@@ -686,7 +780,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"🎨 Action labels enabled, output: {action_annotated_path}")
                 
                 all_action_detections = run_action_detection(
-                    video_path=video_path,
+                    video_path=processed_video_path,
                     sample_rate=sample_rate,
                     debug=False,
                     interesting_actions=interesting_actions,
@@ -1241,18 +1335,19 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log("⚠️ No segments selected — nothing to cut.")
             elif len(segments) == 1:
                 check_cancellation(cancel_flag, log, "video cutting")
-                cut_video(video_path, segments[0][0], segments[0][1], OUTPUT_FILE)
+                cut_video(processed_video_path, segments[0][0], segments[0][1], OUTPUT_FILE)
             else:
                 temp_clips = []
                 # Get the directory of the output file to save temp clips in the same location
                 output_dir = os.path.dirname(OUTPUT_FILE)
-                video_base_name = os.path.splitext(os.path.basename(video_path))[0]
+                video_base_name = os.path.splitext(os.path.basename(processed_video_path))[0]
+
                 
                 for i, (s, e) in enumerate(segments):
                     check_cancellation(cancel_flag, log, f"video cutting clip {i+1}")
                     # Include the directory path for temp files
                     temp_name = os.path.join(output_dir, f"{video_base_name}_temp_clip_{i}.mp4")
-                    cut_video(video_path, s, e, temp_name)
+                    cut_video(processed_video_path, s, e, temp_name)
                     temp_clips.append(temp_name)
                     # Update progress for each clip
                     progress.update_progress(90 + (i+1) * 5 // len(segments), 100, "Pipeline", f"Cut clip {i+1}/{len(segments)}")
@@ -1349,6 +1444,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     pass
         except Exception:
             pass
+
+        # Clean up temporary trimmed video if it was created
+        if temp_trimmed_video and os.path.exists(temp_trimmed_video):
+            try:
+                os.remove(temp_trimmed_video)
+                log(f"🧹 Cleaned up temporary trimmed video")
+            except Exception as e:
+                log(f"⚠️ Could not remove temporary file: {e}")
 
         return OUTPUT_FILE
 
