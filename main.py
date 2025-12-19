@@ -2,11 +2,12 @@ import sys
 import os
 import threading
 import yaml
+import cv2
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QLineEdit, QSpinBox,
     QGroupBox, QTextEdit, QFormLayout, QProgressBar, QCheckBox,
-    QComboBox, QTabWidget, QListWidget
+    QComboBox, QTabWidget, QListWidget, QSlider
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from pipeline import run_highlighter
@@ -130,6 +131,101 @@ class VideoHighlighterGUI(QWidget):
         out_layout.addWidget(info_label)
         layout.addLayout(out_layout)
 
+        highlights_cfg = self.config_data.get("highlights", {})
+        scoring_cfg = self.config_data.get("scoring", {})
+
+        # --- Time Range Selection with Slider ---
+        time_range_group = QGroupBox("Processing Time Range")
+        time_range_layout = QVBoxLayout()
+
+        # Enable/disable checkbox
+        self.use_time_range_chk = QCheckBox("Process only specific time range")
+        self.use_time_range_chk.setChecked(highlights_cfg.get("use_time_range", False))
+        self.use_time_range_chk.toggled.connect(self.on_time_range_toggle)
+        time_range_layout.addWidget(self.use_time_range_chk)
+
+        # Video duration label
+        self.video_duration_label = QLabel("Select a video to see duration")
+        self.video_duration_label.setStyleSheet("color: #666; font-style: italic;")
+        time_range_layout.addWidget(self.video_duration_label)
+
+        # Range slider container
+        slider_container = QWidget()
+        slider_layout = QVBoxLayout()
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Start position slider
+        start_slider_layout = QHBoxLayout()
+        start_slider_layout.addWidget(QLabel("Start:"))
+        self.start_time_slider = QSlider(Qt.Horizontal)
+        self.start_time_slider.setMinimum(0)
+        self.start_time_slider.setMaximum(100)  # Will be updated when video is loaded
+        self.start_time_slider.setValue(0)
+        self.start_time_slider.setEnabled(False)
+        self.start_time_slider.valueChanged.connect(self.on_slider_changed)
+        self.start_time_label = QLabel("00:00")
+        self.start_time_label.setMinimumWidth(60)
+        self.start_time_label.setStyleSheet("font-weight: bold;")
+        start_slider_layout.addWidget(self.start_time_slider, stretch=1)
+        start_slider_layout.addWidget(self.start_time_label)
+        slider_layout.addLayout(start_slider_layout)
+
+        # End position slider
+        end_slider_layout = QHBoxLayout()
+        end_slider_layout.addWidget(QLabel("End:"))
+        self.end_time_slider = QSlider(Qt.Horizontal)
+        self.end_time_slider.setMinimum(0)
+        self.end_time_slider.setMaximum(100)  # Will be updated when video is loaded
+        self.end_time_slider.setValue(100)
+        self.end_time_slider.setEnabled(False)
+        self.end_time_slider.valueChanged.connect(self.on_slider_changed)
+        self.end_time_label = QLabel("00:00")
+        self.end_time_label.setMinimumWidth(60)
+        self.end_time_label.setStyleSheet("font-weight: bold;")
+        end_slider_layout.addWidget(self.end_time_slider, stretch=1)
+        end_slider_layout.addWidget(self.end_time_label)
+        slider_layout.addLayout(end_slider_layout)
+
+        slider_container.setLayout(slider_layout)
+        time_range_layout.addWidget(slider_container)
+
+        # Selection info
+        self.selection_info_label = QLabel("Selection: Full video")
+        self.selection_info_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 10pt;")
+        time_range_layout.addWidget(self.selection_info_label)
+
+        # Quick presets
+        presets_layout = QHBoxLayout()
+        presets_layout.addWidget(QLabel("Quick presets:"))
+        self.first_5min_btn = QPushButton("First 5min")
+        self.first_5min_btn.clicked.connect(lambda: self.set_slider_preset("first_5"))
+        self.first_5min_btn.setEnabled(False)
+        self.last_5min_btn = QPushButton("Last 5min")
+        self.last_5min_btn.clicked.connect(lambda: self.set_slider_preset("last_5"))
+        self.last_5min_btn.setEnabled(False)
+        self.last_10min_btn = QPushButton("Last 10min")
+        self.last_10min_btn.clicked.connect(lambda: self.set_slider_preset("last_10"))
+        self.last_10min_btn.setEnabled(False)
+        self.middle_btn = QPushButton("Middle")
+        self.middle_btn.clicked.connect(lambda: self.set_slider_preset("middle"))
+        self.middle_btn.setEnabled(False)
+        self.full_video_btn = QPushButton("Full video")
+        self.full_video_btn.clicked.connect(lambda: self.set_slider_preset("full"))
+        self.full_video_btn.setEnabled(False)
+        presets_layout.addWidget(self.first_5min_btn)
+        presets_layout.addWidget(self.last_5min_btn)
+        presets_layout.addWidget(self.last_10min_btn)
+        presets_layout.addWidget(self.middle_btn)
+        presets_layout.addWidget(self.full_video_btn)
+        presets_layout.addStretch()
+        time_range_layout.addLayout(presets_layout)
+
+        time_range_group.setLayout(time_range_layout)
+        layout.addWidget(time_range_group)
+
+        # Store video duration
+        self.current_video_duration = 0
+
         # --- Progress Section ---
         progress_group = QGroupBox("Processing Progress")
         progress_layout = QVBoxLayout()
@@ -150,9 +246,6 @@ class VideoHighlighterGUI(QWidget):
         basic_layout = QVBoxLayout()
         scores_box = QGroupBox("Points & durations")
         scores_layout = QFormLayout()
-
-        scoring_cfg = self.config_data.get("scoring", {})
-        highlights_cfg = self.config_data.get("highlights", {})
 
         # Scoring points
         self.spin_scene_points = QSpinBox(); self.spin_scene_points.setRange(0,100); self.spin_scene_points.setValue(scoring_cfg.get("scene_points", 0))
@@ -365,6 +458,10 @@ class VideoHighlighterGUI(QWidget):
             first_video = file_paths[0]
             base_name = os.path.splitext(os.path.basename(first_video))[0]
             self.output_input.setText(f"{base_name}_highlight.mp4")
+        
+        # Update video duration for time range slider (use first video)
+        if file_paths:
+            self.update_video_duration(file_paths[0])
 
     def remove_selected_file(self):
         """Remove selected file from the list"""
@@ -373,8 +470,9 @@ class VideoHighlighterGUI(QWidget):
             self.file_list.takeItem(current_row)
 
     def clear_files(self):
-        """Clear all files from the list"""
+        """Clear all files from the list and reset output name"""
         self.file_list.clear()
+        self.output_input.setText("highlight.mp4")
 
     def get_file_list(self):
         """Get list of all files in the list widget"""
@@ -405,6 +503,9 @@ class VideoHighlighterGUI(QWidget):
                 "exact_duration": int(self.spin_exact_duration.value()),
                 "keep_temp": self.keep_temp_chk.isChecked(),
                 "skip_highlights": self.skip_highlights_chk.isChecked(),
+                "use_time_range": self.use_time_range_chk.isChecked(),
+                "range_start_pct": self.start_time_slider.value(),
+                "range_end_pct": self.end_time_slider.value(),
             },
             "scoring": {
                 "scene_points": int(self.spin_scene_points.value()),
@@ -503,6 +604,168 @@ class VideoHighlighterGUI(QWidget):
         # Keep UI responsive
         QApplication.processEvents()
 
+    def format_time(self, seconds):
+        """Format seconds as MM:SS or HH:MM:SS"""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+
+    def on_time_range_toggle(self, checked):
+        """Enable/disable time range controls"""
+        self.start_time_slider.setEnabled(checked and self.current_video_duration > 0)
+        self.end_time_slider.setEnabled(checked and self.current_video_duration > 0)
+        self.first_5min_btn.setEnabled(checked and self.current_video_duration > 0)
+        self.last_5min_btn.setEnabled(checked and self.current_video_duration > 0)
+        self.last_10min_btn.setEnabled(checked and self.current_video_duration > 0)
+        self.middle_btn.setEnabled(checked and self.current_video_duration > 0)
+        self.full_video_btn.setEnabled(checked and self.current_video_duration > 0)
+        
+        if checked and self.current_video_duration == 0:
+            self.append_log("⚠️ Select a video first to enable time range")
+            self.use_time_range_chk.setChecked(False)
+        
+        self.update_selection_info()
+
+    def on_slider_changed(self):
+        """Handle slider value changes"""
+        # Ensure start is always before end
+        if self.start_time_slider.value() >= self.end_time_slider.value():
+            if self.sender() == self.start_time_slider:
+                # Start moved, adjust to be 1 second before end
+                self.start_time_slider.setValue(max(0, self.end_time_slider.value() - 1))
+            else:
+                # End moved, adjust to be 1 second after start
+                self.end_time_slider.setValue(min(self.start_time_slider.maximum(), 
+                                                self.start_time_slider.value() + 1))
+        
+        self.update_selection_info()
+
+    def update_selection_info(self):
+        """Update the selection information labels"""
+        if self.current_video_duration == 0:
+            self.start_time_label.setText("00:00")
+            self.end_time_label.setText("00:00")
+            self.selection_info_label.setText("Selection: No video loaded")
+            return
+        
+        # Calculate actual times
+        start_seconds = int((self.start_time_slider.value() / 100) * self.current_video_duration)
+        end_seconds = int((self.end_time_slider.value() / 100) * self.current_video_duration)
+        duration = end_seconds - start_seconds
+        
+        # Update labels
+        self.start_time_label.setText(self.format_time(start_seconds))
+        self.end_time_label.setText(self.format_time(end_seconds))
+        
+        # Update selection info
+        percentage = (duration / self.current_video_duration) * 100 if self.current_video_duration > 0 else 0
+        
+        if self.use_time_range_chk.isChecked():
+            self.selection_info_label.setText(
+                f"Selection: {self.format_time(duration)} ({percentage:.1f}% of video)"
+            )
+            self.selection_info_label.setStyleSheet("color: #2196F3; font-weight: bold; font-size: 10pt;")
+        else:
+            self.selection_info_label.setText("Selection: Full video")
+            self.selection_info_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 10pt;")
+
+    def update_video_duration(self, video_path):
+        """Update slider ranges based on video duration"""
+        try:
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            duration = int(total_frames / fps) if fps else 0
+            cap.release()
+            
+            if duration > 0:
+                self.current_video_duration = duration
+                
+                # Update sliders with 100 steps (0-100 representing 0%-100% of video)
+                self.start_time_slider.setMaximum(100)
+                self.end_time_slider.setMaximum(100)
+                
+                # Reset to full range
+                self.start_time_slider.setValue(0)
+                self.end_time_slider.setValue(100)
+                
+                # Update labels
+                self.video_duration_label.setText(
+                    f"Video duration: {self.format_time(duration)} ({duration}s)"
+                )
+                self.video_duration_label.setStyleSheet("color: #4CAF50; font-style: italic;")
+                
+                # Enable controls if checkbox is checked
+                if self.use_time_range_chk.isChecked():
+                    self.start_time_slider.setEnabled(True)
+                    self.end_time_slider.setEnabled(True)
+                    self.first_5min_btn.setEnabled(True)
+                    self.last_5min_btn.setEnabled(True)
+                    self.last_10min_btn.setEnabled(True)
+                    self.middle_btn.setEnabled(True)
+                    self.full_video_btn.setEnabled(True)
+                
+                self.update_selection_info()
+                return True
+            else:
+                self.current_video_duration = 0
+                self.video_duration_label.setText("Could not determine video duration")
+                self.video_duration_label.setStyleSheet("color: #f44336; font-style: italic;")
+                return False
+                
+        except Exception as e:
+            self.current_video_duration = 0
+            self.video_duration_label.setText(f"Error reading video: {e}")
+            self.video_duration_label.setStyleSheet("color: #f44336; font-style: italic;")
+            return False
+
+    def set_slider_preset(self, preset_type):
+        """Set quick preset time ranges using sliders"""
+        if self.current_video_duration == 0:
+            self.append_log("⚠️ No video loaded")
+            return
+        
+        duration = self.current_video_duration
+        
+        if preset_type == "first_5":
+            # First 5 minutes or entire video if shorter
+            end_seconds = min(300, duration)
+            start_pct = 0
+            end_pct = int((end_seconds / duration) * 100)
+        elif preset_type == "last_5":
+            # Last 5 minutes
+            start_seconds = max(0, duration - 300)
+            start_pct = int((start_seconds / duration) * 100)
+            end_pct = 100
+        elif preset_type == "last_10":
+            # Last 10 minutes
+            start_seconds = max(0, duration - 600)
+            start_pct = int((start_seconds / duration) * 100)
+            end_pct = 100
+        elif preset_type == "middle":
+            # Middle third of video
+            third = duration / 3
+            start_pct = int((third / duration) * 100)
+            end_pct = int((2 * third / duration) * 100)
+        elif preset_type == "full":
+            start_pct = 0
+            end_pct = 100
+        else:
+            return
+        
+        self.start_time_slider.setValue(start_pct)
+        self.end_time_slider.setValue(end_pct)
+        
+        start_time = int((start_pct / 100) * duration)
+        end_time = int((end_pct / 100) * duration)
+        self.append_log(f"✅ Preset '{preset_type}': {self.format_time(start_time)} to {self.format_time(end_time)}")
+
+
     def run_pipeline(self):
         """Start the pipeline processing (UPDATED for multi-file)"""
         video_paths = self.get_file_list()
@@ -588,7 +851,6 @@ class VideoHighlighterGUI(QWidget):
         exact_duration_val = int(self.spin_exact_duration.value())
         exact_duration = exact_duration_val if exact_duration_val > 0 else None
 
-
         # Helper function to get non-empty lists
         def get_list_from_input(input_field):
             text = input_field.text().strip()
@@ -663,6 +925,15 @@ class VideoHighlighterGUI(QWidget):
         if config.get('draw_object_boxes') or config.get('draw_action_labels'):
             self.append_log("🎨 Bounding box visualization enabled for temp files")
         self.append_log("")
+
+        if self.use_time_range_chk.isChecked() and self.current_video_duration > 0:
+            start_pct = self.start_time_slider.value() / 100
+            end_pct = self.end_time_slider.value() / 100
+            config["use_time_range"] = True
+            config["range_start"] = int(start_pct * self.current_video_duration)
+            config["range_end"] = int(end_pct * self.current_video_duration)
+        else:
+            config["use_time_range"] = False
 
         # UI state changes
         self.progress_bar.setVisible(True)
