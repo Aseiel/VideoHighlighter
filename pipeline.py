@@ -305,14 +305,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             
             # Auto-generate output filename
             video_gui_config = gui_config.copy() if gui_config else {}
-            if "output_file" not in video_gui_config or video_gui_config["output_file"] == "highlight.mp4":
-                base_name = os.path.splitext(single_video_path)[0]
-                video_gui_config["output_file"] = f"{base_name}_highlight.mp4"
-            else:
-                base_name = os.path.splitext(video_gui_config["output_file"])[0]
-                ext = os.path.splitext(video_gui_config["output_file"])[1]
-                video_gui_config["output_file"] = f"{base_name}_{idx}{ext}"
-            
+            base_name = os.path.splitext(single_video_path)[0]  # Always use current video's name
+            video_gui_config["output_file"] = f"{base_name}_highlight.mp4"
+                        
             # Recursive call for single video
             try:
                 result = run_highlighter(
@@ -424,8 +419,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- Time Range Processing ---
         USE_TIME_RANGE = gui_config.get("use_time_range", False)
-        RANGE_START = gui_config.get("range_start", 0)
+        RANGE_START = int(gui_config.get("range_start", 0))
         RANGE_END = gui_config.get("range_end", None)
+        if RANGE_END is not None:
+            RANGE_END = int(RANGE_END)
 
         # Store original video path and duration for later use
         original_video_path = video_path
@@ -447,7 +444,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 return None
             
             # Clamp end time to video duration
-            RANGE_END = min(RANGE_END, video_duration)
+            RANGE_END = int(min(RANGE_END, video_duration))
             range_duration = RANGE_END - RANGE_START
             
             log(f"🎯 Processing time range: {RANGE_START//60}:{RANGE_START%60:02d} to {RANGE_END//60}:{RANGE_END%60:02d}")
@@ -1321,10 +1318,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 print(f"     Boost added: +{boost_amount:.1f} points")
                 print(f"     Final score: {score[idx]:.1f}")
 
-
-
-
-
         check_cancellation(cancel_flag, log, "segment selection")
 
         # Cut and concatenate
@@ -1341,7 +1334,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # Get the directory of the output file to save temp clips in the same location
                 output_dir = os.path.dirname(OUTPUT_FILE)
                 video_base_name = os.path.splitext(os.path.basename(processed_video_path))[0]
-
                 
                 for i, (s, e) in enumerate(segments):
                     check_cancellation(cancel_flag, log, f"video cutting clip {i+1}")
@@ -1376,8 +1368,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         except Exception as e:
             log(f"⚠️ Error during cutting/concatenation: {e}")
             raise
-
-
 
         # Create matching subtitles for highlight video OR full video
         if CREATE_SUBTITLES and USE_TRANSCRIPT and transcript_segments:
