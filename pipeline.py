@@ -10,13 +10,13 @@ import yaml
 import csv
 import cv2
 from tqdm import tqdm
+from ultralytics import YOLO
 
 # modules
-from motion_scene_detect_optimized import detect_scenes_motion_optimized
-from action_recognition import run_action_detection, load_models
-from audio_peaks import extract_audio_peaks
-from video_cutter import cut_video
-from ultralytics import YOLO
+from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
+from modules.action_recognition import run_action_detection, load_models
+from modules.audio_peaks import extract_audio_peaks
+from modules.video_cutter import cut_video
 
 # Keep warnings about CUDA quiet
 warnings.filterwarnings("ignore", message="torch.cuda")
