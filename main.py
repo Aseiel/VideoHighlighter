@@ -11,10 +11,66 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from pipeline import run_highlighter
+from downloader import download_videos
 
 
 CONFIG_FILE = "config.yaml"
 
+class DownloadWorker(QThread):
+    """Worker thread for downloading videos"""
+    finished = Signal(list)  # List of downloaded file paths
+    progress = Signal(int, int, str, str)
+    log = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, url, save_dir, pattern):
+        super().__init__()
+        self.url = url
+        self.save_dir = save_dir
+        self.pattern = pattern
+        self._cancel_flag = threading.Event()
+        self._is_running = False
+
+    def run(self):
+        try:
+            self._is_running = True
+            self.log.emit(f"🚀 Starting download from: {self.url}")
+            
+            downloaded_files = download_videos(
+                search_url=self.url,
+                save_dir=self.save_dir,
+                pattern=self.pattern,
+                log_fn=self.log.emit,
+                progress_fn=lambda cur, tot, task, det: self.progress.emit(cur, tot, task, det),
+                cancel_flag=self._cancel_flag
+            )
+            
+            if self._cancel_flag.is_set():
+                self.log.emit("⏹️ Download was cancelled")
+                self.cancelled.emit()
+                self.finished.emit([])
+            else:
+                self.finished.emit(downloaded_files)
+                
+        except Exception as e:
+            self.log.emit(f"❌ Download error: {e}")
+            import traceback
+            self.log.emit(f"Full traceback: {traceback.format_exc()}")
+            self.finished.emit([])
+        finally:
+            self._is_running = False
+
+    def cancel(self):
+        if self._is_running:
+            self.log.emit("⏹️ Cancellation requested - stopping download...")
+            self._cancel_flag.set()
+            if not self.wait(5000):
+                self.log.emit("⚠️ Force terminating thread...")
+                self.terminate()
+                self.wait()
+
+    def is_cancelled(self):
+        return self._cancel_flag.is_set()
 
 class Worker(QThread):
     finished = Signal(object)
@@ -241,6 +297,65 @@ class VideoHighlighterGUI(QWidget):
         # --- Tabs ---
         tabs = QTabWidget()
 
+        # --- Tab 0: Download ---
+        download_tab = QWidget()
+        download_layout = QVBoxLayout()
+        
+        download_group = QGroupBox("Download Videos from Website")
+        download_form = QVBoxLayout()
+        
+        # URL input
+        url_layout = QHBoxLayout()
+        url_layout.addWidget(QLabel("Page URL:"))
+        self.download_url_input = QLineEdit()
+        self.download_url_input.setPlaceholderText("https://example.com/videos")
+        url_layout.addWidget(self.download_url_input)
+        download_form.addLayout(url_layout)
+        
+        # Pattern input
+        pattern_layout = QHBoxLayout()
+        pattern_layout.addWidget(QLabel("Link pattern:"))
+        self.download_pattern_input = QLineEdit("/video/")
+        self.download_pattern_input.setPlaceholderText("/video/")
+        self.download_pattern_input.setToolTip("Pattern to match in video links (e.g., /video/, /watch/)")
+        pattern_layout.addWidget(self.download_pattern_input)
+        download_form.addLayout(pattern_layout)
+        
+        # Save directory
+        save_dir_layout = QHBoxLayout()
+        save_dir_layout.addWidget(QLabel("Save directory:"))
+        self.download_save_dir_input = QLineEdit("D:\\movies")
+        save_dir_layout.addWidget(self.download_save_dir_input)
+        self.browse_save_dir_btn = QPushButton("Browse...")
+        self.browse_save_dir_btn.clicked.connect(self.browse_save_directory)
+        save_dir_layout.addWidget(self.browse_save_dir_btn)
+        download_form.addLayout(save_dir_layout)
+        
+        # Options
+        self.auto_add_downloaded_chk = QCheckBox("Automatically add downloaded videos to file list")
+        self.auto_add_downloaded_chk.setChecked(True)
+        download_form.addWidget(self.auto_add_downloaded_chk)
+        
+        # Download button
+        download_btn_layout = QHBoxLayout()
+        self.download_btn = QPushButton("🌐 Download Videos")
+        self.download_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px; }")
+        self.download_btn.clicked.connect(self.start_download)
+        download_btn_layout.addStretch()
+        download_btn_layout.addWidget(self.download_btn)
+        download_form.addLayout(download_btn_layout)
+        
+        # Info label
+        info_label = QLabel("ℹ️ Requires yt-dlp: pip install yt-dlp")
+        info_label.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
+        download_form.addWidget(info_label)
+        
+        download_group.setLayout(download_form)
+        download_layout.addWidget(download_group)
+        download_layout.addStretch()
+        download_tab.setLayout(download_layout)
+        tabs.addTab(download_tab, "Download")
+
         # --- Tab 1: Basic Settings ---
         basic_tab = QWidget()
         basic_layout = QVBoxLayout()
@@ -440,6 +555,140 @@ class VideoHighlighterGUI(QWidget):
 
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.check_worker_status)
+
+    # --- Downloader methods ---
+    def browse_save_directory(self):
+        """Browse for save directory"""
+        directory = QFileDialog.getExistingDirectory(
+            self, "Select Save Directory", self.download_save_dir_input.text()
+        )
+        if directory:
+            self.download_save_dir_input.setText(directory)
+
+    def start_download(self):
+        """Start the download process"""
+        url = self.download_url_input.text().strip()
+        save_dir = self.download_save_dir_input.text().strip()
+        pattern = self.download_pattern_input.text().strip() or "/video/"
+        
+        # Validation
+        if not url:
+            self.append_log("⚠️ Please enter a URL")
+            return
+        
+        if not save_dir:
+            self.append_log("⚠️ Please enter a save directory")
+            return
+        
+        # Check if URL is valid
+        if not url.startswith(("http://", "https://")):
+            self.append_log("⚠️ URL must start with http:// or https://")
+            return
+        
+        # Check if already running
+        if hasattr(self, 'download_worker') and self.download_worker and self.download_worker.isRunning():
+            self.append_log("⚠️ Download already in progress!")
+            return
+        
+        # Clear log and start
+        self.log_output.clear()
+        self.append_log("=== Starting Video Download ===")
+        self.append_log(f"🌐 URL: {url}")
+        self.append_log(f"📁 Save directory: {save_dir}")
+        self.append_log(f"🔍 Pattern: {pattern}")
+        self.append_log("")
+        
+        # UI state changes
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.task_label.setText("🌐 Extracting video links...")
+        self.download_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        
+        # Create and start download worker
+        self.download_worker = DownloadWorker(url, save_dir, pattern)
+        self.download_worker.log.connect(self.append_log)
+        self.download_worker.progress.connect(self.update_progress)
+        self.download_worker.finished.connect(self.download_done)
+        self.download_worker.cancelled.connect(self.download_cancelled)
+        
+        # Start status checking timer
+        self.status_timer.start(100)
+        
+        self.download_worker.start()
+
+    def download_done(self, downloaded_files):
+        """Handle download completion"""
+        self.status_timer.stop()
+        
+        if downloaded_files and not self.download_worker.is_cancelled():
+            self.append_log(f"\n✅ === DOWNLOAD COMPLETED ===")
+            self.append_log(f"📊 Successfully downloaded {len(downloaded_files)} videos")
+            
+            # List downloaded files
+            for file in downloaded_files:
+                self.append_log(f"  • {os.path.basename(file)}")
+            
+            # Auto-add to file list if checkbox is checked
+            if self.auto_add_downloaded_chk.isChecked() and downloaded_files:
+                self.append_log("\n📋 Adding videos to file list...")
+                existing = self.get_file_list()
+                added_count = 0
+                for file_path in downloaded_files:
+                    if file_path and os.path.exists(file_path) and file_path not in existing:
+                        self.file_list.addItem(file_path)
+                        added_count += 1
+                
+                if added_count > 0:
+                    self.append_log(f"✅ Added {added_count} videos to file list")
+                    
+                    # Update video duration for first video
+                    if self.file_list.count() > 0:
+                        first_video = self.file_list.item(0).text()
+                        self.update_video_duration(first_video)
+                    
+                    # Auto-set output filename based on first video
+                    first_video = downloaded_files[0]
+                    base_name = os.path.splitext(os.path.basename(first_video))[0]
+                    self.output_input.setText(f"{base_name}_highlight.mp4")
+            
+            self.task_label.setText("✅ Download Complete!")
+            self.task_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+        
+        elif not self.download_worker.is_cancelled():
+            self.append_log("\n⚠️ === DOWNLOAD COMPLETED WITH NO FILES ===")
+            self.append_log("❌ No videos were downloaded. Check the log for errors.")
+            self.task_label.setText("❌ Download Failed")
+            self.task_label.setStyleSheet("color: #f44336; font-weight: bold;")
+        
+        self.download_cleanup()
+
+    def download_cancelled(self):
+        """Handle download cancellation"""
+        self.status_timer.stop()
+        self.append_log("\n⏹️ === DOWNLOAD CANCELLED ===")
+        self.task_label.setText("⏹️ Cancelled")
+        self.task_label.setStyleSheet("color: #ff9800; font-weight: bold;")
+        self.download_cleanup()
+
+    def download_cleanup(self):
+        """Clean up UI state after download completion/cancellation"""
+        # Hide progress bar
+        self.progress_bar.setVisible(False)
+        
+        # Re-enable controls
+        self.download_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setText("Cancel")
+        
+        # Reset task label style after 5 seconds
+        QTimer.singleShot(5000, lambda: self.task_label.setStyleSheet("color: #666; font-weight: bold;"))
+        
+        # Clean up worker
+        if hasattr(self, 'download_worker') and self.download_worker:
+            if self.download_worker.isRunning():
+                self.download_worker.wait(1000)
+            self.download_worker = None
 
     # --- Multi-file support methods ---
     def browse_files(self):
