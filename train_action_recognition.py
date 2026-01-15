@@ -1253,10 +1253,10 @@ def visualize_training_sample(video_path, label, pose_extractor, adaptive_detect
     
     # Pose visualization connections
     pose_connections = [
-        (0, 1), (0, 2), (1, 3), (2, 4),
-        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-        (5, 11), (6, 12), (11, 12),
-        (11, 13), (13, 15), (12, 14), (14, 16)
+        (0, 1), (0, 2), (1, 3), (2, 4),  # Face
+        (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),  # Arms
+        (5, 11), (6, 12), (11, 12),  # Torso
+        (11, 13), (13, 15), (12, 14), (14, 16)  # Legs
     ]
     
     while True:
@@ -1487,7 +1487,7 @@ CONFIG = {
     "save_checkpoint_every": 5,
     "checkpoint_dir": "checkpoints",
     "min_train_per_action": 5,
-    "min_val_per_action": 0,
+    "min_val_per_action": 2,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "mean": [0.485, 0.456, 0.406],
     "std": [0.229, 0.224, 0.225],
@@ -1516,6 +1516,7 @@ CONFIG = {
     "smoothing_base_alpha": 0.5,  # Base alpha when adaptive is off
     "smoothing_window_size": 5,  # History window
     "debug_smoothing": False,  # Set True to see alpha values
+    "min_production_accuracy": 0.3,
 }
 
 
@@ -1536,7 +1537,7 @@ def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=F
     if total_frames <= 0:
         return []
 
-    # Use improved sampling strategy
+    # Deterministic frame sampling
     sampling_strategy = CONFIG.get("sampling_strategy", "temporal_stride")
     
     if sampling_strategy == "temporal_stride":
@@ -1545,81 +1546,85 @@ def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=F
                     min(CONFIG.get("max_stride", 8), 
                         total_frames // (CONFIG["sequence_length"] * 2)))
         
-        indices = np.linspace(0, total_frames - 1, CONFIG["sequence_length"] * stride)
-        indices = indices[::stride][:CONFIG["sequence_length"]].astype(int)
+        # Use consistent sampling - remove random offset
+        indices = np.arange(0, min(CONFIG["sequence_length"] * stride, total_frames), stride)
+        indices = indices[:CONFIG["sequence_length"]]
     else:
         indices = np.linspace(0, total_frames - 1, CONFIG["sequence_length"]).astype(int)
     
     output_frames = []
     crop_size = CONFIG["crop_size"]
     
-    # Initialize detectors
-    action_detector = SmartActionDetector()
+    # Create NEW detectors for EACH video to prevent state leakage
+    action_detector = SmartActionDetector(debug=debug)
     adaptive_detector = AdaptiveActionDetector(
         motion_threshold=CONFIG.get("motion_threshold", 5.0),
         debug=debug
     )
     roi_smoother = SmoothedROIDetector(
-    window_size=5, 
-    base_alpha=CONFIG.get("smoothing_base_alpha", 0.5),
-    adaptive=CONFIG.get("adaptive_smoothing", True),
-    debug=CONFIG.get("debug_smoothing", False) or debug
+        window_size=5, 
+        base_alpha=CONFIG.get("smoothing_base_alpha", 0.5),
+        adaptive=CONFIG.get("adaptive_smoothing", True),
+        debug=CONFIG.get("debug_smoothing", False) or debug
     ) if CONFIG["use_roi_smoothing"] else None
 
-    person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=5) if CONFIG["use_roi_smoothing"] else None
+    person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=5)
 
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         success, frame = cap.read()
         if not success:
+            # Handle missing frames better - repeat last valid frame
+            if len(output_frames) > 0:
+                output_frames.append(output_frames[-1].copy())
             continue
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Define 'people' before using it
-        if person_tracker:
-            tracked = action_detector.detect_with_tracking(
-                frame, yolo_people, person_tracker, 
-                max_people=CONFIG.get('max_action_people', 2)
-            )
-            if tracked and isinstance(tracked[0], tuple):
-                people = [box for _, box in tracked]
-            else:
-                people = tracked
+        # Detect action people
+        tracked = action_detector.detect_with_tracking(
+            frame, yolo_people, person_tracker, 
+            max_people=CONFIG.get('max_action_people', 2)
+        )
+        
+        if tracked and isinstance(tracked[0], tuple):
+            people = [box for _, box in tracked]
         else:
-            people = action_detector.detect(
-                frame, yolo_people, 
-                max_people=CONFIG.get('max_action_people', 2)
-            )
+            people = tracked
 
-        # NOW 'people' is defined before this check
+        # Get ROI
         if CONFIG.get('use_adaptive_cropping', False) and pose_extractor is not None and len(people) > 0:
             roi, focus_region = adaptive_detector.detect_action_region(
                 frame, people, pose_extractor, max_poses=2
             )
-        elif pose_extractor is not None and len(people) > 0:
-            # Fallback to original pose extraction
+        elif len(people) > 0:
             roi = merge_boxes(people)
         else:
-            roi = merge_boxes(people) if len(people) > 0 else None
+            roi = None
         
         # Smooth the ROI
         if roi_smoother and roi is not None:
             roi = roi_smoother.update(roi)
         
-        # Crop at HIGH resolution, then resize to 224x224
+        # Crop and resize
         frame = crop_roi(frame, roi, crop_size)
         
-        # Data augmentation for training only
-        if is_training and random.random() < CONFIG.get('augmentation_prob', 0.3):
-            brightness_factor = random.uniform(0.8, 1.2)
-            frame = np.clip(frame * brightness_factor, 0, 255).astype(np.uint8)
+        # More conservative augmentation
+        if is_training and random.random() < CONFIG.get('augmentation_prob', 0.2):
+            # Only apply ONE augmentation per frame
+            aug_choice = random.random()
             
-            contrast_factor = random.uniform(0.8, 1.2)
-            mean = frame.mean(axis=(0, 1), keepdims=True)
-            frame = np.clip((frame - mean) * contrast_factor + mean, 0, 255).astype(np.uint8)
-            
-            if random.random() < 0.5:
+            if aug_choice < 0.33:
+                # Brightness
+                brightness_factor = random.uniform(0.85, 1.15)  # Less aggressive
+                frame = np.clip(frame * brightness_factor, 0, 255).astype(np.uint8)
+            elif aug_choice < 0.66:
+                # Contrast
+                contrast_factor = random.uniform(0.85, 1.15)  # Less aggressive
+                mean = frame.mean(axis=(0, 1), keepdims=True)
+                frame = np.clip((frame - mean) * contrast_factor + mean, 0, 255).astype(np.uint8)
+            else:
+                # Horizontal flip (only for symmetric actions)
                 frame = np.fliplr(frame)
         
         # Normalize
@@ -1632,23 +1637,25 @@ def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=F
 
     cap.release()
     
+    # Better padding strategy
     if len(output_frames) == 0:
         return []
     
-    # Pad if needed
     if len(output_frames) < CONFIG["sequence_length"]:
-        last = output_frames[-1]
+        # Repeat the entire sequence cyclically instead of just padding with last frame
         while len(output_frames) < CONFIG["sequence_length"]:
-            output_frames.append(last.copy())
+            remaining = CONFIG["sequence_length"] - len(output_frames)
+            to_add = min(remaining, len(output_frames))
+            output_frames.extend(output_frames[:to_add])
 
-    return np.stack(output_frames, axis=0)
+    return np.stack(output_frames[:CONFIG["sequence_length"]], axis=0)
 
 # =============================
 # Dataset
 # =============================
 class VideoDataset(Dataset):
     def __init__(self, root, sequence_length=16, pose_extractor=None, is_training=True):
-        self.video_samples = []
+        self.samples = []  # Use only one attribute for samples
         self.sequence_length = sequence_length
         self.pose_extractor = pose_extractor
         self.is_training = is_training
@@ -1658,7 +1665,6 @@ class VideoDataset(Dataset):
             self.labels = []
             self.label_to_idx = {}
             self.idx_to_label = {}
-            self.samples = []
             return
 
         class_folders = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
@@ -1677,17 +1683,16 @@ class VideoDataset(Dataset):
                           glob.glob(os.path.join(label_path, "*.avi")) + \
                           glob.glob(os.path.join(label_path, "*.mov"))
             for video_path in video_files:
-                self.video_samples.append((video_path, self.label_to_idx[label]))
+                self.samples.append((video_path, self.label_to_idx[label]))
                 video_count += 1
 
         print(f"✅ Found {video_count} videos")
-        self.samples = self.video_samples
 
     def __len__(self):
-        return len(self.video_samples)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        video_path, label = self.video_samples[idx]
+        video_path, label = self.samples[idx]
         
         frames = load_video_normalized(
             video_path, 
@@ -1706,28 +1711,142 @@ class VideoDataset(Dataset):
         return self.label_to_idx, self.idx_to_label
 
 # =============================
+# Dataset validation function
+# =============================
+def validate_and_split_dataset(train_dataset, val_dataset):
+    """Check dataset and auto-split if validation is insufficient"""
+    from sklearn.model_selection import train_test_split
+    
+    min_train = CONFIG['min_train_per_action']
+    min_val = CONFIG['min_val_per_action']
+    
+    print(f"\n📊 Validating dataset size...")
+    print(f"  Minimum training videos per action: {min_train}")
+    print(f"  Minimum validation videos per action: {min_val}")
+    
+    # Count videos per action in BOTH sets
+    train_counts = {}
+    for video_path, label in train_dataset.samples:
+        action = train_dataset.idx_to_label[label]
+        if action not in train_counts:
+            train_counts[action] = []
+        train_counts[action].append((video_path, label))
+    
+    val_counts = {}
+    for video_path, label in val_dataset.samples:
+        action = val_dataset.idx_to_label[label]
+        if action not in val_counts:
+            val_counts[action] = []
+        val_counts[action].append((video_path, label))
+    
+    # Determine which actions are valid and which need splitting
+    valid_actions = []
+    new_train_samples = []
+    new_val_samples = []
+    
+    for action in train_dataset.labels:
+        train_vids = train_counts.get(action, [])
+        val_vids = val_counts.get(action, [])
+        
+        train_count = len(train_vids)
+        val_count = len(val_vids)
+        total_count = train_count + val_count
+        
+        # Check if action has enough TOTAL samples
+        if train_count < min_train:
+            print(f"  ❌ Action '{action}': Only {train_count} train videos (need {min_train}) - SKIPPED")
+            continue
+        
+        # Check if we need to split for validation
+        if val_count < min_val:
+            # Check if we have enough TOTAL samples to split
+            if total_count < min_train + min_val:
+                print(f"  ⚠️  Action '{action}': {total_count} total videos (need {min_train + min_val}) - SKIPPED")
+                continue
+            
+            # AUTO-SPLIT: We have enough total, but validation is insufficient
+            print(f"  🔄 Action '{action}': {train_count} train, {val_count} val → AUTO-SPLITTING")
+            
+            all_videos = train_vids + val_vids
+            
+            # Calculate split ratio to ensure minimum validation samples
+            val_ratio = max(min_val / total_count, 0.2)  # At least min_val or 20%
+            val_ratio = min(val_ratio, 0.3)  # Max 30%
+            
+            new_train, new_val = train_test_split(
+                all_videos,
+                test_size=val_ratio,
+                random_state=42
+            )
+            
+            new_train_samples.extend(new_train)
+            new_val_samples.extend(new_val)
+            valid_actions.append(action)
+            
+            print(f"     ✓ Split into: {len(new_train)} train, {len(new_val)} val")
+        else:
+            # Action already has enough samples in both sets
+            print(f"  ✅ Action '{action}': {train_count} train, {val_count} val - OK")
+            new_train_samples.extend(train_vids)
+            new_val_samples.extend(val_vids)
+            valid_actions.append(action)
+    
+    # Check if we have any valid actions
+    if len(valid_actions) == 0:
+        print("\n❌ No actions meet minimum requirements. Please collect more videos.")
+        return False, [], [], []
+    
+    # Summary
+    print(f"\n✅ Dataset validation complete!")
+    print(f"  Valid actions: {len(valid_actions)}/{len(train_dataset.labels)}")
+    print(f"  Final training samples: {len(new_train_samples)}")
+    print(f"  Final validation samples: {len(new_val_samples)}")
+    
+    if len(new_val_samples) == 0:
+        print(f"\n⚠️  WARNING: No validation samples after filtering!")
+        print(f"   Training will proceed but validation metrics will be unreliable.")
+    
+    return True, valid_actions, new_train_samples, new_val_samples
+
+
+# =============================
 # Class Weight Computation
 # =============================
 def compute_class_weights(train_dataset):
     """Compute inverse frequency weights for balanced training"""
+    # Count samples per class using the current dataset's samples
     label_counts = {}
-    for _, label in train_dataset.video_samples:
+    for _, label in train_dataset.samples:  # Use .samples, not .video_samples
         label_counts[label] = label_counts.get(label, 0) + 1
     
     total_samples = len(train_dataset)
-    num_classes = len(label_counts)
+    num_classes = len(train_dataset.labels)  # Use the actual number of classes
     
+    # Create weights for all current classes
     weights = []
     for class_idx in range(num_classes):
-        count = label_counts.get(class_idx, 1)
+        count = label_counts.get(class_idx, 1)  # Default to 1 to avoid division by zero
         weight = total_samples / (num_classes * count)
         weights.append(weight)
     
     print(f"\n⚖️  Class weights computed (inverse frequency):")
+    print(f"   Total samples: {total_samples}")
+    print(f"   Number of classes: {num_classes}")
+    
     for idx, weight in enumerate(weights):
-        class_name = train_dataset.idx_to_label[idx]
+        # Safely get class name
+        if idx in train_dataset.idx_to_label:
+            class_name = train_dataset.idx_to_label[idx]
+        else:
+            class_name = f"Class_{idx}"
         count = label_counts.get(idx, 0)
         print(f"   {class_name}: {count} samples, weight: {weight:.4f}")
+    
+    # Verify we have the right number of weights
+    if len(weights) != num_classes:
+        print(f"⚠️  WARNING: Expected {num_classes} weights, got {len(weights)}")
+        print(f"   Truncating to {num_classes} weights...")
+        weights = weights[:num_classes]
     
     return torch.FloatTensor(weights)
 
@@ -1817,18 +1936,107 @@ class IntelFeatureExtractor:
 # Model
 # =============================
 class EncoderLSTM(nn.Module):
-    def __init__(self, feature_dim=1024, hidden_dim=512, num_classes=2, bidirectional=True):
+    def __init__(self, feature_dim=512, hidden_dim=256, num_classes=31, 
+                 num_layers=2, dropout=0.3):
+        """
+        Enhanced classifier with:
+        - 2-layer bidirectional LSTM
+        - Attention mechanism
+        - Layer normalization
+        """
         super().__init__()
-        self.bidirectional = bidirectional
-        self.lstm = nn.LSTM(feature_dim, hidden_dim, batch_first=True, bidirectional=bidirectional)
         
-        lstm_output_dim = hidden_dim * 2 if bidirectional else hidden_dim
-        self.fc = nn.Linear(lstm_output_dim, num_classes)
-
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        # 2-layer bidirectional LSTM
+        self.lstm = nn.LSTM(
+            input_size=feature_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0
+        )
+        
+        # Layer normalization for stability
+        self.ln1 = nn.LayerNorm(hidden_dim * 2)  # *2 for bidirectional
+        
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        # Second normalization after attention
+        self.ln2 = nn.LayerNorm(hidden_dim * 2)
+        
+        # Dropout before classification
+        self.dropout = nn.Dropout(dropout)
+        
+        # Final classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_dim, num_classes)
+        )
+        
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights for better convergence"""
+        for name, param in self.lstm.named_parameters():
+            if 'weight_ih' in name:
+                nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param.data)
+            elif 'bias' in name:
+                param.data.fill_(0)
+                # Set forget gate bias to 1 (helps with gradient flow)
+                if len(param.shape) >= 1:
+                    n = param.shape[0]
+                    param.data[n//4:n//2].fill_(1.0)  # Forget gate
+        
+        for layer in [self.attention, self.classifier]:
+            for module in layer:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        module.bias.data.fill_(0.01)
+    
     def forward(self, x):
-        out, _ = self.lstm(x)
-        out = out[:, -1, :]
-        return self.fc(out)
+        """
+        x shape: (batch_size, sequence_length, feature_dim)
+        Returns: (batch_size, num_classes), attention_weights
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # LSTM with 2 layers
+        lstm_out, (hidden, cell) = self.lstm(x)
+        
+        # Layer normalization
+        lstm_out = self.ln1(lstm_out)
+        
+        # Attention mechanism
+        attention_weights = self.attention(lstm_out)
+        attention_weights = torch.nn.functional.softmax(attention_weights, dim=1)
+        
+        # Context vector: weighted sum of LSTM outputs
+        context = torch.sum(lstm_out * attention_weights, dim=1)
+        
+        # Second normalization
+        context = self.ln2(context)
+        
+        # Dropout
+        context = self.dropout(context)
+        
+        # Classification
+        logits = self.classifier(context)
+        
+        return logits, attention_weights.squeeze(-1)
 
 # =============================
 # Checkpoint Management
@@ -1931,28 +2139,29 @@ def validate_classifier(encoder, model, val_loader, device, criterion):
         for frames, labels in val_loader:
             frames, labels = frames.to(device), labels.to(device)
             feats = encoder.encode(frames.cpu()).to(device)
-            outputs = model(feats)
-            loss = criterion(outputs, labels)
-            preds = outputs.argmax(1)
             
+            # Enhanced model returns (outputs, attention_weights)
+            outputs, attention_weights = model(feats)
+            loss = criterion(outputs, labels)
+            
+            preds = outputs.argmax(1)
             total_correct += (preds == labels).sum().item()
             total_samples += labels.size(0)
             running_loss += loss.item() * labels.size(0)
             
+            # Per-class accuracy
             for label, pred in zip(labels.cpu().numpy(), preds.cpu().numpy()):
-                if label not in class_total:
-                    class_total[label] = 0
-                    class_correct[label] = 0
-                class_total[label] += 1
+                label = int(label)
+                class_total[label] = class_total.get(label, 0) + 1
                 if label == pred:
-                    class_correct[label] += 1
+                    class_correct[label] = class_correct.get(label, 0) + 1
     
     accuracy = total_correct / total_samples if total_samples > 0 else 0
     avg_loss = running_loss / total_samples if total_samples > 0 else float('inf')
     
     per_class_acc = {}
     for label in class_total:
-        per_class_acc[label] = class_correct[label] / class_total[label] if class_total[label] > 0 else 0
+        per_class_acc[label] = class_correct.get(label, 0) / class_total[label] if class_total[label] > 0 else 0
     
     return avg_loss, accuracy, per_class_acc
 
@@ -1966,13 +2175,30 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
     
     print(f"Feature dimension: {feature_dim}")
     
-    model = EncoderLSTM(feature_dim=feature_dim, hidden_dim=512, num_classes=num_classes, bidirectional=True).to(device)
+    model = EncoderLSTM(
+        feature_dim=feature_dim, 
+        hidden_dim=256,  # Reduced from 512 for 2-layer architecture
+        num_classes=num_classes,
+        num_layers=2,
+        dropout=0.3
+    ).to(device)
     
+    # Print model summary
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n📊 Enhanced Model Architecture:")
+    print(f"  - Input: (B, {CONFIG['sequence_length']}, {feature_dim})")
+    print(f"  - 2-layer BiLSTM: {256} hidden units, bidirectional")
+    print(f"  - Attention: Tanh-based")
+    print(f"  - Parameters: {total_params:,} total, {trainable_params:,} trainable")
+    print(f"  - Estimated size: ~{total_params * 4 / 1e6:.1f} MB")
+    
+    # Class weights and criterion
     if CONFIG.get('use_class_weights', True):
         class_weights = compute_class_weights(train_loader.dataset).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     else:
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
         print("\n⚠️  Training without class weights")
     
     is_resuming = CONFIG.get('checkpoint_path') and os.path.exists(CONFIG['checkpoint_path'])
@@ -1980,17 +2206,29 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
     if is_resuming:
         lr = CONFIG['finetune_learning_rate']
         print(f"🔄 Resume detected: using finetune LR {lr}")
+
     else:
         lr = CONFIG['base_learning_rate']
         print(f"🆕 Training from scratch: using base LR {lr}")
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Optimizer with gradient clipping
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=lr,
+        weight_decay=1e-4  # Increased for 2 layers
+    )
+    
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=CONFIG.get('base_epochs', 25),
+        eta_min=1e-6
+    )
     
     start_epoch = 0
     best_val_acc = 0.0
     best_val_loss = float('inf')
     best_model_state = None
-    checkpoint = None
 
     if is_resuming:
         checkpoint = load_checkpoint(CONFIG['checkpoint_path'], model, optimizer)
@@ -2033,11 +2271,16 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
                 feats = encoder.encode(frames.cpu())
             feats = feats.to(device)
             
-            outputs = model(feats)
+            # Handle attention outputs
+            outputs, attention_weights = model(feats)
             loss = criterion(outputs, labels)
             
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping (important for 2-layer LSTM)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             preds = outputs.argmax(1)
@@ -2050,27 +2293,35 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
                 'acc': f'{total_correct/total_samples:.4f}'
             })
         
+        # Update learning rate
+        scheduler.step()
+        
         train_loss = running_loss / total_samples if total_samples > 0 else float('inf')
         train_acc = total_correct / total_samples if total_samples > 0 else 0.0
 
         print(f"\nEpoch {epoch+1}/{max_epochs}")
         print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
+        print(f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
 
         val_loss = float('inf')
         val_acc = 0.0
         per_class_acc = {}
         if len(val_loader) > 0:
-            val_loss, val_acc, per_class_acc = validate_classifier(encoder, model, val_loader, device, criterion)
+            # Use enhanced validation function
+            val_loss, val_acc, per_class_acc = validate_classifier(
+                encoder, model, val_loader, device, criterion
+            )
             print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
             
-            if per_class_acc and (epoch + 1) % 5 == 0:
-                print(f"  Per-class accuracy:")
+            if per_class_acc:
+                print(f"  Per-class validation accuracy:")
                 for label_idx in sorted(per_class_acc.keys()):
                     class_name = idx_to_label[label_idx]
                     acc = per_class_acc[label_idx]
-                    print(f"    {class_name}: {acc:.4f}")
+                    status = "⚠️" if acc == 0.0 else "✓"
+                    print(f"    {status} {class_name}: {acc:.4f}")
 
-        improved = val_loss < (best_val_loss - CONFIG.get('min_delta', 0.0))
+        improved = val_loss < (best_val_loss - CONFIG.get('min_delta', 0.001))
         if improved:
             best_val_loss = val_loss
             best_val_acc = val_acc
@@ -2079,9 +2330,9 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
             print("   ⭐ Validation loss improved — saving best model state and resetting patience.")
         else:
             patience_counter += 1
-            print(f"   No improvement in validation loss ({patience_counter}/{CONFIG['early_stopping_patience']})")
+            print(f"   No improvement ({patience_counter}/{CONFIG['early_stopping_patience']})")
             if patience_counter >= CONFIG['early_stopping_patience']:
-                print("\n🛑 Early stopping triggered — stopping training.")
+                print("\n🛑 Early stopping triggered")
                 break
 
         if CONFIG.get('save_checkpoint_every') and (epoch + 1) % CONFIG['save_checkpoint_every'] == 0:
@@ -2089,82 +2340,365 @@ def train_classifier(encoder, train_loader, val_loader, num_classes, label_to_id
             checkpoint_path = os.path.join(CONFIG.get('checkpoint_dir', '.'), checkpoint_name)
             save_checkpoint(model, optimizer, epoch, best_val_acc, 
                           label_to_idx, idx_to_label, feature_dim, checkpoint_path, best_val_loss)
-
-        if CONFIG.get('checkpoint_dir'):
-            latest_checkpoint = os.path.join(CONFIG['checkpoint_dir'], 'checkpoint_latest.pth')
-            save_checkpoint(model, optimizer, epoch, best_val_acc, 
-                          label_to_idx, idx_to_label, feature_dim, latest_checkpoint, best_val_loss)
     
     if best_model_state:
         model.load_state_dict(best_model_state)
         print(f"\n✅ Loaded best model (val_loss={best_val_loss:.4f}, val_acc={best_val_acc:.4f})")
 
-    torch.save(model.state_dict(), CONFIG['model_save_path'])
-    mapping_path = CONFIG['model_save_path'].replace('.pth', '_mapping.json')
-    mapping_data = {
-        'label_to_idx': label_to_idx,
-        'idx_to_label': idx_to_label,
-        'feature_dim': feature_dim,
-        'sequence_length': CONFIG['sequence_length'],
-        'num_classes': num_classes
-    }
-    with open(mapping_path, 'w') as f:
-        json.dump(mapping_data, f, indent=2)
+    # Create wrapped model
+    wrapped_model = ActionRecognitionModel(
+        model=model,
+        label_to_idx=label_to_idx,
+        idx_to_label=idx_to_label,
+        feature_dim=feature_dim,
+        sequence_length=CONFIG['sequence_length']
+    )
     
-    return model
+    # Save using the wrapper
+    wrapped_model.save(CONFIG['model_save_path'])
+    
+    return wrapped_model
+
+# =============================
+# Action Recognition Model Wrapper
+# =============================
+class ActionRecognitionModel:
+    """Wrapper class for the trained model with metadata"""
+    def __init__(self, model, label_to_idx, idx_to_label, feature_dim, sequence_length):
+        self.model = model
+        self.label_to_idx = label_to_idx
+        self.idx_to_label = idx_to_label
+        self.feature_dim = feature_dim
+        self.sequence_length = sequence_length
+    
+    def save(self, path):
+        """Save model and metadata"""
+        torch.save(self.model.state_dict(), path)
+        mapping_path = path.replace('.pth', '_mapping.json')
+        mapping_data = {
+            'label_to_idx': self.label_to_idx,
+            'idx_to_label': self.idx_to_label,
+            'feature_dim': self.feature_dim,
+            'sequence_length': self.sequence_length,
+            'model_type': 'EncoderLSTM',
+            'hidden_dim': 256,
+            'num_layers': 2
+        }
+        with open(mapping_path, 'w') as f:
+            json.dump(mapping_data, f, indent=2)
+        print(f"✅ Model saved: {path}")
+        print(f"✅ Mapping saved: {mapping_path}")
+    
+    @classmethod
+    def load(cls, path, device='cpu'):
+        """Load model and metadata"""
+        mapping_path = path.replace('.pth', '_mapping.json')
+        with open(mapping_path, 'r') as f:
+            mapping_data = json.load(f)
+        
+        model = EncoderLSTM(
+            feature_dim=mapping_data['feature_dim'],
+            hidden_dim=mapping_data.get('hidden_dim', 256),
+            num_classes=len(mapping_data['label_to_idx']),
+            num_layers=mapping_data.get('num_layers', 2)
+        )
+        model.load_state_dict(torch.load(path, map_location=device))
+        model.to(device)
+        
+        return cls(
+            model=model,
+            label_to_idx=mapping_data['label_to_idx'],
+            idx_to_label={int(k): v for k, v in mapping_data['idx_to_label'].items()},
+            feature_dim=mapping_data['feature_dim'],
+            sequence_length=mapping_data['sequence_length']
+        )
+
+# =============================
+# Post-Training Label Filtering
+# =============================
+def create_production_model(encoder, trained_model, train_loader, val_loader, 
+                           device, min_val_accuracy=0.3):
+    """
+    Create production-ready model by removing classes that don't meet minimum accuracy.
+    
+    Args:
+        encoder: Feature extractor
+        trained_model: The ActionRecognitionModel after training
+        train_loader, val_loader: Data loaders
+        device: torch device
+        min_val_accuracy: Minimum validation accuracy required (default: 30%)
+    
+    Returns:
+        Filtered ActionRecognitionModel with only reliable classes
+    """
+    
+    print(f"\n🔍 CREATING PRODUCTION MODEL")
+    print(f"   Minimum required validation accuracy: {min_val_accuracy:.1%}")
+    print("=" * 80)
+    
+    # Evaluate per-class accuracy
+    trained_model.model.eval()
+    class_correct = {}
+    class_total = {}
+    class_predictions = {}  # For debugging
+    
+    with torch.no_grad():
+        for frames, labels in val_loader:
+            frames, labels = frames.to(device), labels.to(device)
+            
+            # Encode frames properly
+            feats = encoder.encode(frames.cpu()).to(device)
+            
+            # Model returns (outputs, attention_weights)
+            outputs, attention_weights = trained_model.model(feats)
+            preds = outputs.argmax(1)
+            
+            for label, pred in zip(labels, preds):
+                label_item = label.item()
+                pred_item = pred.item()
+                
+                if label_item not in class_total:
+                    class_total[label_item] = 0
+                    class_correct[label_item] = 0
+                    class_predictions[label_item] = []
+                
+                class_total[label_item] += 1
+                if label == pred:
+                    class_correct[label_item] += 1
+                
+                class_predictions[label_item].append(pred_item)
+    
+    # Determine which classes to keep
+    classes_to_keep = []
+    classes_to_remove = []
+    
+    print(f"\n📊 Per-Class Validation Analysis:")
+    print(f"{'Action':<30} {'Accuracy':<12} {'Samples':<10} {'Decision'}")
+    print("-" * 80)
+    
+    for class_idx in sorted(class_total.keys()):
+        class_name = trained_model.idx_to_label[class_idx]
+        correct = class_correct.get(class_idx, 0)
+        total = class_total[class_idx]
+        accuracy = correct / total if total > 0 else 0
+        
+        # Decision criteria
+        if accuracy >= min_val_accuracy:
+            decision = "✅ KEEP"
+            classes_to_keep.append(class_idx)
+        else:
+            decision = f"❌ REMOVE (too low)"
+            classes_to_remove.append(class_idx)
+            
+            # Show what it's confused with
+            if class_idx in class_predictions:
+                from collections import Counter
+                preds = class_predictions[class_idx]
+                most_common = Counter(preds).most_common(2)
+                confused_with = [trained_model.idx_to_label[idx] for idx, _ in most_common if idx != class_idx]
+                if confused_with:
+                    decision += f" (confused with: {', '.join(confused_with[:2])})"
+        
+        status = "✓" if accuracy >= min_val_accuracy else "⚠️"
+        print(f"{class_name:<30} {accuracy:<12.4f} {total:<10} {decision}")
+    
+    # Summary
+    print("\n" + "=" * 80)
+    print(f"📊 SUMMARY:")
+    print(f"   Total classes: {len(class_total)}")
+    print(f"   Classes meeting threshold: {len(classes_to_keep)} ✅")
+    print(f"   Classes below threshold: {len(classes_to_remove)} ❌")
+    
+    if len(classes_to_remove) > 0:
+        print(f"\n🗑️  Classes to be removed from production model:")
+        for idx in classes_to_remove:
+            name = trained_model.idx_to_label[idx]
+            acc = class_correct.get(idx, 0) / class_total[idx] if class_total.get(idx, 0) > 0 else 0
+            print(f"      • {name} ({acc:.1%} accuracy)")
+    
+    # Create new model with only reliable classes
+    if len(classes_to_remove) == 0:
+        print(f"\n✅ All classes meet minimum accuracy! No filtering needed.")
+        return trained_model
+    
+    print(f"\n🔨 Creating filtered production model...")
+    
+    # Create new label mappings
+    new_label_to_idx = {}
+    new_idx_to_label = {}
+    old_to_new_idx = {}
+    
+    for new_idx, old_idx in enumerate(sorted(classes_to_keep)):
+        old_label = trained_model.idx_to_label[old_idx]
+        new_label_to_idx[old_label] = new_idx
+        new_idx_to_label[new_idx] = old_label
+        old_to_new_idx[old_idx] = new_idx
+    
+    # Create new model architecture
+    new_model = EncoderLSTM(
+        feature_dim=trained_model.feature_dim,
+        hidden_dim=256,
+        num_classes=len(classes_to_keep),
+        num_layers=2,
+        dropout=0.3
+    ).to(device)
+    
+    # Copy weights for kept classes
+    old_state = trained_model.model.state_dict()
+    new_state = new_model.state_dict()
+    
+    # Copy LSTM weights (they're class-agnostic)
+    for key in old_state.keys():
+        if 'lstm' in key or 'ln1' in key or 'ln2' in key or 'attention' in key:
+            new_state[key] = old_state[key]
+    
+    # Copy classifier weights for kept classes only
+    old_fc_weight = old_state['classifier.3.weight']  # Final layer
+    old_fc_bias = old_state['classifier.3.bias']
+    
+    new_fc_weight = torch.zeros(len(classes_to_keep), old_fc_weight.shape[1])
+    new_fc_bias = torch.zeros(len(classes_to_keep))
+    
+    for old_idx in classes_to_keep:
+        new_idx = old_to_new_idx[old_idx]
+        new_fc_weight[new_idx] = old_fc_weight[old_idx]
+        new_fc_bias[new_idx] = old_fc_bias[old_idx]
+    
+    new_state['classifier.3.weight'] = new_fc_weight
+    new_state['classifier.3.bias'] = new_fc_bias
+    
+    # Copy other classifier layers
+    for key in ['classifier.0.weight', 'classifier.0.bias']:
+        if key in old_state:
+            new_state[key] = old_state[key]
+    
+    new_model.load_state_dict(new_state)
+    
+    # Create new ActionRecognitionModel
+    production_model = ActionRecognitionModel(
+        model=new_model,
+        label_to_idx=new_label_to_idx,
+        idx_to_label=new_idx_to_label,
+        feature_dim=trained_model.feature_dim,
+        sequence_length=trained_model.sequence_length
+    )
+    
+    print(f"\n✅ Production model created!")
+    print(f"   Classes: {len(new_label_to_idx)} (removed {len(classes_to_remove)})")
+    print(f"   Labels: {list(new_label_to_idx.keys())}")
+    
+    return production_model
 
 # =============================
 # Main
 # =============================
 if __name__ == "__main__":
+    # Set random seed for reproducibility
     set_seed(42)
+    print("✓ Random seed set to 42 for reproducibility\n")
     
-    print("=" * 60)
-    print("🎯 ACTION RECOGNITION WITH ADAPTIVE ACTION DETECTION")
-    print("=" * 60)
+    # Check if model files exist
+    if not os.path.exists(ENCODER_XML) or not os.path.exists(ENCODER_BIN):
+        print(f"Error: Intel model files not found at:")
+        print(f"  XML: {ENCODER_XML}")
+        print(f"  BIN: {ENCODER_BIN}")
+        print("Please download the model using the OpenVINO Model Downloader")
+        exit(1)
+
+    train_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "train"))
+    val_dataset = VideoDataset(os.path.join(CONFIG['data_path'], "val"))
     
-    if CONFIG.get('checkpoint_path'):
-        print(f"\n📂 Config checkpoint path: {CONFIG['checkpoint_path']}")
-    print(f"   Device: {CONFIG['device']}")
-    print(f"   Batch size: {CONFIG['batch_size']}")
-    print(f"   Adaptive action detection: ✅ ENABLED")
-    print(f"   Motion threshold: {CONFIG.get('motion_threshold', 5.0)}")
-    print(f"   Class weighting: {'ENABLED' if CONFIG.get('use_class_weights') else 'DISABLED'}")
-    print("=" * 60)
+    if len(train_dataset) == 0:
+        print("No training samples found! Please check your dataset structure.")
+        exit(1)
+        
+    print(f"\n📁 Initial Dataset Information:")
+    print(f"  Training samples:   {len(train_dataset)}")
+    print(f"  Validation samples: {len(val_dataset)}")
+    print(f"  Classes detected: {train_dataset.labels}")
     
+    # 🔧 VALIDATE AND AUTO-SPLIT
+    is_valid, valid_actions, new_train_samples, new_val_samples = validate_and_split_dataset(
+        train_dataset, 
+        val_dataset
+    )
+    
+    if not is_valid:
+        print("\n❌ Training aborted due to insufficient data.")
+        exit(1)
+    
+    # 🔧 UPDATE DATASETS WITH FILTERED/SPLIT SAMPLES
+    print(f"\n🔄 Updating datasets with validated data...")
+    
+    # Create new label mapping for filtered actions
+    new_label_to_idx = {action: idx for idx, action in enumerate(valid_actions)}
+    
+    # Rebuild samples with correct labels
+    def map_samples(samples, idx_to_label):
+        mapped = []
+        for video_path, old_label in samples:
+            action_name = idx_to_label.get(old_label)
+            if action_name in new_label_to_idx:
+                new_label = new_label_to_idx[action_name]
+                mapped.append((video_path, new_label))
+        return mapped
+    
+    # Get original mappings BEFORE updating
+    train_idx_to_label_original = train_dataset.idx_to_label.copy()
+    val_idx_to_label_original = val_dataset.idx_to_label.copy()
+    
+    # Map samples
+    train_dataset.samples = map_samples(new_train_samples, train_idx_to_label_original)
+    val_dataset.samples = map_samples(new_val_samples, val_idx_to_label_original)
+    
+    # Update dataset properties
+    new_idx_to_label = {idx: action for action, idx in new_label_to_idx.items()}
+    
+    train_dataset.labels = valid_actions
+    train_dataset.label_to_idx = new_label_to_idx.copy()
+    train_dataset.idx_to_label = new_idx_to_label.copy()
+    
+    val_dataset.labels = valid_actions
+    val_dataset.label_to_idx = new_label_to_idx.copy()
+    val_dataset.idx_to_label = new_idx_to_label.copy()
+    
+    print(f"\n✅ Final dataset after filtering and splitting:")
+    print(f"  Training samples: {len(train_dataset.samples)}")
+    print(f"  Validation samples: {len(val_dataset.samples)}")
+    print(f"  Classes: {valid_actions}")
+    
+    # Print detailed breakdown - SAFE VERSION
+    print(f"\n📊 Per-class breakdown:")
+    for action in valid_actions:
+        if action in new_label_to_idx:
+            label_idx = new_label_to_idx[action]
+            train_count = sum(1 for _, label in train_dataset.samples if label == label_idx)
+            val_count = sum(1 for _, label in val_dataset.samples if label == label_idx)
+            print(f"  {action}: {train_count} train, {val_count} val")
+    
+    # Get label mappings
+    label_to_idx, idx_to_label = train_dataset.get_label_mapping()
+    print(f"\n📝 Final label mapping:")
+    for label, idx in sorted(label_to_idx.items(), key=lambda x: x[1]):
+        print(f"  {idx}: {label}")
+    print()
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
+
+    # Initialize encoder
+    encoder = IntelFeatureExtractor(ENCODER_XML, ENCODER_BIN)
+
+    # Initialize pose extractor if visualization is enabled
     pose_extractor = None
-    if CONFIG.get('use_pose_guided_crop', False) or CONFIG.get('use_adaptive_cropping', False):
-        print("\n🦴 Initializing pose-guided cropping...")
+    if CONFIG.get('create_visualizations', False):
+        print("\n🦴 Initializing pose extractor for visualizations...")
         pose_extractor = PoseExtractor(
             model_name=CONFIG.get('pose_model', 'yolo11n-pose.pt'),
             conf_threshold=CONFIG.get('pose_conf_threshold', 0.3)
         )
-        if CONFIG.get('use_adaptive_cropping'):
-            print("   ✅ Adaptive action region detection ENABLED")
-        else:
-            print("   ✅ Pose will guide ACTION REGION detection")
-    
-    print("\n📁 Loading datasets...")
-    train_dataset = VideoDataset(
-        os.path.join(CONFIG['data_path'], "train"),
-        pose_extractor=pose_extractor,
-        is_training=True
-    )
-    val_dataset = VideoDataset(
-        os.path.join(CONFIG['data_path'], "val"),
-        pose_extractor=pose_extractor,
-        is_training=False
-    )
-    
-    print(f"\n📊 Dataset statistics:")
-    print(f"   Training samples: {len(train_dataset)}")
-    print(f"   Validation samples: {len(val_dataset)}")
-    print(f"   Number of classes: {len(train_dataset.labels)}")
-    
-    print_class_distribution(train_dataset, "Training set")
-    if len(val_dataset) > 0:
-        print_class_distribution(val_dataset, "Validation set")
-    
+
     # Create sample visualizations BEFORE training
     if CONFIG.get('create_visualizations', False) and pose_extractor is not None:
         create_sample_visualizations(
@@ -2172,43 +2706,63 @@ if __name__ == "__main__":
             pose_extractor,
             num_samples=CONFIG.get('num_visualization_samples', 2)
         )
-    
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
-    
-    print(f"\n🔧 Initializing Intel encoder...")
-    encoder = IntelFeatureExtractor(ENCODER_XML, ENCODER_BIN)
-    
-    label_to_idx, idx_to_label = train_dataset.get_label_mapping()
-    
-    print(f"\n🚀 Starting training...")
-    model = train_classifier(encoder, train_loader, val_loader, 
-                            len(train_dataset.labels), label_to_idx, idx_to_label)
-    
-    if model:
-        print(f"\n✅ Training complete!")
-        print(f"   Final model saved to: {CONFIG['model_save_path']}")
-        print(f"   Adaptive action detection: ✅ Motion-based region focus")
-    else:
-        print(f"\n❌ Training failed!")
-    
-    debug_mode = CONFIG.get('debug_mode', False)
-    
-    if debug_mode:
-        print("\n🐛 DEBUG MODE ENABLED - Verbose output active")
 
-    pose_extractor = None
-
-    if CONFIG.get('use_pose_guided_crop', False) or CONFIG.get('use_adaptive_cropping', False):
-        print("\n🦴 Initializing pose-guided cropping...")
-        pose_extractor = PoseExtractor(
-            model_name=CONFIG.get('pose_model', 'yolo11n-pose.pt'),
-            conf_threshold=CONFIG.get('pose_conf_threshold', 0.3)
+    # Train
+    print(f"\n🚀 Starting training...\n")
+    action_model = train_classifier(
+        encoder, 
+        train_loader, 
+        val_loader, 
+        num_classes=len(valid_actions),
+        label_to_idx=label_to_idx,
+        idx_to_label=idx_to_label
+    )
+    
+    # Final validation
+    if len(val_loader) > 0:
+        print(f"\n📊 Final Validation:")
+        device = torch.device("cpu")
+        
+        # Create criterion for final validation
+        if CONFIG.get('use_class_weights', True):
+            class_weights = compute_class_weights(train_loader.dataset).to(device)
+            criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+        else:
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        final_val_loss, final_val_acc, final_per_class_acc = validate_classifier(
+            encoder, action_model.model, val_loader, device, criterion
         )
-        if CONFIG.get('use_adaptive_cropping'):
-            print("   ✅ Adaptive action region detection ENABLED")
-            if debug_mode:
-                print("   🐛 Debug mode: Detailed motion analysis will be shown")
+        
+        print(f"  Final Validation Loss: {final_val_loss:.4f}")
+        print(f"  Final Validation Accuracy: {final_val_acc:.4f}")
+        
+        if final_per_class_acc:
+            print(f"\n  Final per-class validation accuracy:")
+            for label_idx in sorted(final_per_class_acc.keys()):
+                class_name = idx_to_label[label_idx]
+                acc = final_per_class_acc[label_idx]
+                status = "⚠️" if acc == 0.0 else "✓"
+                print(f"    {status} {class_name}: {acc:.4f}")
 
-
-    print("=" * 60)
+    # 🔧 CREATE PRODUCTION MODEL (filtered)
+    production_model = create_production_model(
+        encoder, 
+        action_model, 
+        train_loader, 
+        val_loader, 
+        device,
+        min_val_accuracy=CONFIG.get('min_production_accuracy', 0.3)  # 30% minimum
+    )
+        
+    # Save production model
+    production_path = CONFIG['model_save_path'].replace('.pth', '_production.pth')
+    production_model.save(production_path)
+   
+    print(f"\n✅ Training completed! Model and labels saved.")
+    print(f"✓ Model path: {CONFIG['model_save_path']}")
+    print(f"\n💡 Summary:")
+    print(f"  - Trained on {len(valid_actions)} actions")
+    print(f"  - Used {len(train_dataset.samples)} training videos")
+    print(f"  - Used {len(val_dataset.samples)} validation videos")
+    print(f"  - Auto-split was applied where validation was insufficient")
