@@ -14,14 +14,20 @@ OUTPUT_FOLDER = "output_videos"
 MIN_PEOPLE_REQUIRED = 2
 MAX_PEOPLE = 3
 PEOPLE_SAMPLE_FRAMES = 30
-STICKY_FRAMES = 15
-SMOOTHING_WINDOW = 8
+STICKY_FRAMES = 30
+SMOOTHING_WINDOW = 15  # Increased from 8 to 15 for smoother transitions
 CALIBRATION_FRAMES = 30
 PADDING_COLOR = (0, 0, 0)
-BOX_EXPANSION = 0.50
-ACTION_LOCK_FRAMES = 60
-MAX_MISSING_FRAMES = 30
-OVERLAP_MARGIN = 20
+BOX_EXPANSION = 0.70
+ACTION_LOCK_FRAMES = 90
+MAX_MISSING_FRAMES = 45
+OVERLAP_MARGIN = 15
+
+# Minimum box dimensions (as percentage of frame)
+MIN_BOX_WIDTH_RATIO = 0.35   # Increased from 0.25
+MIN_BOX_HEIGHT_RATIO = 0.40  # Increased from 0.25, more vertical
+MAX_ASPECT_RATIO = 1.4       # Narrower range for better people framing
+MIN_ASPECT_RATIO = 0.6       # Prefer portrait orientation
 
 # ROI Detection Settings
 USE_ROI_DETECTION = True  # Enable ROI-based action detection
@@ -29,14 +35,14 @@ USE_POSE_FOR_ROI = True   # Use pose estimation for better ROI
 ROI_CONFIDENCE_THRESHOLD = 0.15  # Lower threshold for pose detection
 MIN_POSE_KEYPOINTS = 2    # Minimum keypoints to consider a pose
 ROI_SMOOTHING = True      # Smooth ROI over time
-ROI_SMOOTH_WINDOW = 5     # Smoothing window size
+ROI_SMOOTH_WINDOW = 8     # Increased for smoother ROI transitions
 
 # Pose Settings (only if USE_POSE_FOR_ROI is True)
 USE_POSE_ESTIMATION = True
 USE_POSE_CENTERING = False  # Disable this when using ROI detection
 POSE_CONFIDENCE_THRESHOLD = 0.3
-MIN_EXPANSION = 0.50
-MAX_EXPANSION = 0.85
+MIN_EXPANSION = 0.60  # Increased from 0.50 for more generous crops
+MAX_EXPANSION = 1.0   # Increased from 0.85 for maximum flexibility
 # ===========================
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -70,12 +76,6 @@ def analyze_pose_activity(keypoints, box):
     
     activity_score = 0.0
     
-    # YOLO pose keypoints: 0-nose, 1-left_eye, 2-right_eye, 3-left_ear, 4-right_ear,
-    # 5-left_shoulder, 6-right_shoulder, 7-left_elbow, 8-right_elbow,
-    # 9-left_wrist, 10-right_wrist, 11-left_hip, 12-right_hip,
-    # 13-left_knee, 14-right_knee, 15-left_ankle, 16-right_ankle
-    
-    # Get keypoints with proper numpy array handling
     left_shoulder = keypoints[5] if len(keypoints) > 5 else None
     right_shoulder = keypoints[6] if len(keypoints) > 6 else None
     left_wrist = keypoints[9] if len(keypoints) > 9 else None
@@ -85,12 +85,9 @@ def analyze_pose_activity(keypoints, box):
     box_width = box_x2 - box_x1
     box_height = box_y2 - box_y1
     
-    # Check arms extension (away from body)
     arms_extended = 0
     
-    # Check left shoulder and wrist
     if left_shoulder is not None and left_wrist is not None:
-        # left_shoulder and left_wrist are numpy arrays [x, y, confidence]
         left_shoulder_conf = left_shoulder[2] if len(left_shoulder) > 2 else 0
         left_wrist_conf = left_wrist[2] if len(left_wrist) > 2 else 0
         
@@ -99,7 +96,6 @@ def analyze_pose_activity(keypoints, box):
             if arm_span > box_width * 0.3:
                 arms_extended += 1
     
-    # Check right shoulder and wrist
     if right_shoulder is not None and right_wrist is not None:
         right_shoulder_conf = right_shoulder[2] if len(right_shoulder) > 2 else 0
         right_wrist_conf = right_wrist[2] if len(right_wrist) > 2 else 0
@@ -109,7 +105,6 @@ def analyze_pose_activity(keypoints, box):
             if arm_span > box_width * 0.3:
                 arms_extended += 1
     
-    # Check arms raised (above shoulders)
     arms_raised = 0
     
     if left_shoulder is not None and left_wrist is not None:
@@ -128,14 +123,202 @@ def analyze_pose_activity(keypoints, box):
             if right_wrist[1] < right_shoulder[1] - box_height * 0.1:
                 arms_raised += 1
     
-    # Combine scores
     activity_score = (
         (arms_extended / 2.0) * 0.4 +
         (arms_raised / 2.0) * 0.3 +
-        0.3  # Base activity score
+        0.3
     )
     
     return min(activity_score, 1.0)
+
+# ===== NEW ACTIVITY-BASED ZONE ANALYSIS FUNCTIONS =====
+
+def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20):
+    """
+    Analyze actual activity in different regions of the video.
+    Returns activity scores for left, center, and right zones.
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Define zones
+    zone_width = frame_width / 3
+    zones = {
+        'left': (0, zone_width),
+        'center': (zone_width, 2 * zone_width),
+        'right': (2 * zone_width, frame_width)
+    }
+    
+    zone_activity = {'left': [], 'center': [], 'right': []}
+    zone_people_count = {'left': [], 'center': [], 'right': []}
+    
+    sample_indices = [int((i / sample_frames) * total_frames) for i in range(sample_frames)]
+    
+    for frame_idx in sample_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Get person detections
+        result = yolo_model.predict(rgb, conf=0.4, classes=[0], verbose=False)
+        boxes = []
+        for r in result:
+            for b in r.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                boxes.append((x1, y1, x2, y2))
+        
+        # Get pose data for activity scoring
+        pose_data = {}
+        if pose_model:
+            try:
+                pose_result = pose_model.predict(rgb, conf=0.3, verbose=False)
+                for pr in pose_result:
+                    if hasattr(pr, 'keypoints') and pr.keypoints is not None:
+                        for idx, (kp, box) in enumerate(zip(pr.keypoints.data, pr.boxes.xyxy)):
+                            x1, y1, x2, y2 = map(int, box)
+                            pose_data[(x1, y1, x2, y2)] = kp.cpu().numpy()
+            except:
+                pass
+        
+        # Analyze each zone
+        for zone_name, (zone_start, zone_end) in zones.items():
+            zone_boxes = []
+            zone_activities = []
+            
+            for box in boxes:
+                box_center_x = (box[0] + box[2]) / 2
+                
+                # Check if person is primarily in this zone
+                if zone_start <= box_center_x < zone_end:
+                    zone_boxes.append(box)
+                    
+                    # Calculate activity score for this person
+                    activity_score = 0.5  # Default baseline
+                    
+                    # Try to get pose-based activity
+                    for pose_box, keypoints in pose_data.items():
+                        if calculate_iou(box, pose_box) > 0.3:
+                            activity_score = analyze_pose_activity(keypoints, box)
+                            break
+                    
+                    zone_activities.append(activity_score)
+            
+            # Store results for this zone in this frame
+            zone_people_count[zone_name].append(len(zone_boxes))
+            if zone_activities:
+                zone_activity[zone_name].append(np.mean(zone_activities))
+            else:
+                zone_activity[zone_name].append(0.0)
+    
+    cap.release()
+    
+    # Calculate aggregate scores
+    zone_scores = {}
+    for zone_name in zones.keys():
+        avg_people = np.mean(zone_people_count[zone_name]) if zone_people_count[zone_name] else 0
+        avg_activity = np.mean(zone_activity[zone_name]) if zone_activity[zone_name] else 0
+        
+        # Combined score: considers both presence and activity
+        # High score = people present AND active
+        zone_scores[zone_name] = avg_people * avg_activity
+    
+    return zone_scores, zone_people_count, zone_activity
+
+def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sample_frames=20):
+    """
+    Enhanced strategy that considers both distribution AND activity.
+    Returns: (crop_count, positions_to_use, strategy_description)
+    """
+    print(f"   🔍 Analyzing video action zones...")
+    
+    # Get activity analysis
+    zone_scores, zone_people, zone_activity = analyze_region_activity(
+        video_path, yolo_model, pose_model, sample_frames
+    )
+    
+    print(f"   📊 Zone analysis:")
+    for zone in ['left', 'center', 'right']:
+        avg_people = np.mean(zone_people[zone]) if zone_people[zone] else 0
+        avg_activity = np.mean(zone_activity[zone]) if zone_activity[zone] else 0
+        score = zone_scores[zone]
+        print(f"      {zone.capitalize()}: {avg_people:.1f} people, "
+              f"{avg_activity:.2f} activity, {score:.2f} score")
+    
+    # Calculate total people estimate
+    max_people_by_zone = []
+    for zone in ['left', 'center', 'right']:
+        if zone_people[zone]:
+            max_people_by_zone.append(max(zone_people[zone]))
+    
+    estimated_total_people = sum(max_people_by_zone) if max_people_by_zone else 0
+    
+    # Special handling for 4+ people scenarios
+    if estimated_total_people >= 4:
+        print(f"   👥👥 High density detected (~{estimated_total_people} people total)")
+        
+        # Check for asymmetric distribution
+        left_avg = np.mean(zone_people['left']) if zone_people['left'] else 0
+        center_avg = np.mean(zone_people['center']) if zone_people['center'] else 0
+        right_avg = np.mean(zone_people['right']) if zone_people['right'] else 0
+        
+        # Determine the best strategy for high-density scenes
+        if left_avg >= 2.5 and left_avg > center_avg + right_avg:
+            return 1, ['left'], "high-density-left-focused"
+        elif right_avg >= 2.5 and right_avg > center_avg + left_avg:
+            return 1, ['right'], "high-density-right-focused"
+        elif left_avg >= 2 and right_avg >= 2:
+            return 2, ['left', 'right'], "high-density-both-sides"
+        else:
+            # Default for high-density: 2-crop
+            return 2, ['left', 'right'], "high-density-default"
+    
+    # Original logic for 1-3 people scenarios
+    MIN_SCORE_THRESHOLD = 0.3
+    MIN_PEOPLE_THRESHOLD = 0.5
+    
+    active_zones = []
+    for zone, score in zone_scores.items():
+        avg_people = np.mean(zone_people[zone]) if zone_people[zone] else 0
+        if score >= MIN_SCORE_THRESHOLD and avg_people >= MIN_PEOPLE_THRESHOLD:
+            active_zones.append(zone)
+    
+    # Decision logic based on active zones
+    if len(active_zones) == 0:
+        return 0, [], "no-action-detected"
+    
+    elif len(active_zones) == 1:
+        zone = active_zones[0]
+        return 1, [zone], f"single-zone-{zone}"
+    
+    elif len(active_zones) == 2:
+        zones_str = "-".join(active_zones)
+        
+        if set(active_zones) == {'left', 'center'}:
+            return 2, ['left', 'center'], f"two-zone-{zones_str}"
+        elif set(active_zones) == {'center', 'right'}:
+            return 2, ['center', 'right'], f"two-zone-{zones_str}"
+        elif set(active_zones) == {'left', 'right'}:
+            return 2, ['left', 'right'], f"two-zone-{zones_str}"
+    
+    else:
+        left_score = zone_scores['left']
+        center_score = zone_scores['center']
+        right_score = zone_scores['right']
+        
+        avg_outer = (left_score + right_score) / 2
+        if center_score > avg_outer * 2.0:
+            return 1, ['center'], "center-dominant"
+        
+        return 3, ['left', 'center', 'right'], "three-zone-full"
+    
+    return 2, ['left', 'right'], "default-two-zone"
+
+# ===== END OF NEW FUNCTIONS =====
 
 def get_pose_center_target(keypoints, box):
     """
@@ -148,7 +331,6 @@ def get_pose_center_target(keypoints, box):
     box_width = box_x2 - box_x1
     box_height = box_y2 - box_y1
     
-    # Get reliable keypoints
     reliable_kps = []
     for i in range(17):
         if keypoints[i][2] > POSE_CONFIDENCE_THRESHOLD:
@@ -157,12 +339,10 @@ def get_pose_center_target(keypoints, box):
     if len(reliable_kps) < MIN_POSE_KEYPOINTS:
         return None
     
-    # Calculate center of all reliable keypoints
     kp_center_x = np.mean([kp[0] for kp in reliable_kps])
     kp_center_y = np.mean([kp[1] for kp in reliable_kps])
     
-    # Weight important keypoints higher
-    important_indices = [5, 6, 11, 12, 0]  # shoulders, hips, nose
+    important_indices = [5, 6, 11, 12, 0]
     important_kps = []
     
     for idx in important_indices:
@@ -178,7 +358,6 @@ def get_pose_center_target(keypoints, box):
         target_x = kp_center_x
         target_y = kp_center_y
     
-    # Constrain within box
     target_x = max(box_x1 + box_width * 0.2, min(box_x2 - box_width * 0.2, target_x))
     target_y = max(box_y1 + box_height * 0.2, min(box_y2 - box_height * 0.2, target_y))
     
@@ -200,27 +379,22 @@ class ROIDetector:
         """
         h, w = frame.shape[:2]
         
-        # If no person boxes, return None
         if not person_boxes or len(person_boxes) == 0:
             if self.debug:
                 print("   ⚠️  No person boxes -> no ROI")
             return None, 'full_body'
         
-        # Get poses if pose model is available
         current_poses = []
         if pose_model and USE_POSE_FOR_ROI:
             current_poses = self._get_matched_poses(frame, person_boxes, pose_model, max_people)
         
-        # If poses detected, use pose-based ROI
         if len(current_poses) > 0:
             roi = self._get_pose_based_roi(current_poses, person_boxes, w, h)
             focus_region = self._determine_focus_region(current_poses)
         else:
-            # Fallback: merge person boxes
             roi = self._merge_boxes(person_boxes)
             focus_region = 'full_body'
             
-        # Smooth ROI if enabled
         if ROI_SMOOTHING and roi:
             self.roi_history.append(roi)
             if len(self.roi_history) >= 3:
@@ -249,12 +423,10 @@ class ROIDetector:
             best_match_score = 0
             
             for idx, kpts in enumerate(all_keypoints):
-                # Very permissive: accept poses with just 2 visible keypoints
                 if np.sum(kpts[:, 2] > ROI_CONFIDENCE_THRESHOLD) >= MIN_POSE_KEYPOINTS:
                     visible_kpts = kpts[kpts[:, 2] > ROI_CONFIDENCE_THRESHOLD]
                     pose_center = visible_kpts[:, :2].mean(axis=0)
                     
-                    # Check if pose center is within person box
                     if ax1 <= pose_center[0] <= ax2 and ay1 <= pose_center[1] <= ay2:
                         score = len(visible_kpts)
                         if score > best_match_score:
@@ -268,38 +440,109 @@ class ROIDetector:
         
         return matched_poses
     
+    def _smart_merge_boxes(self, boxes, frame_width, frame_height):
+        """Merge boxes intelligently considering interaction zones"""
+        if len(boxes) == 0:
+            return None
+        
+        if len(boxes) == 1:
+            # Expand single box for better framing
+            x1, y1, x2, y2 = boxes[0]
+            width = x2 - x1
+            height = y2 - y1
+            
+            # Add more padding for single person
+            padding_x = width * 0.3
+            padding_y = height * 0.4
+            
+            return (
+                max(0, int(x1 - padding_x)),
+                max(0, int(y1 - padding_y)),
+                min(frame_width, int(x2 + padding_x)),
+                min(frame_height, int(y2 + padding_y))
+            )
+        
+        # Merge multiple boxes
+        x1_min = min(b[0] for b in boxes)
+        y1_min = min(b[1] for b in boxes)
+        x2_max = max(b[2] for b in boxes)
+        y2_max = max(b[3] for b in boxes)
+        
+        width = x2_max - x1_min
+        height = y2_max - y1_min
+        
+        # Adaptive padding based on box distribution
+        box_centers = [(b[0]+b[2])/2 for b in boxes]
+        spread = max(box_centers) - min(box_centers)
+        
+        if spread < frame_width * 0.3:
+            # Boxes are close together - tighter padding
+            padding_x = width * 0.2
+            padding_y = height * 0.25
+        else:
+            # Boxes are spread out - generous padding
+            padding_x = width * 0.15
+            padding_y = height * 0.2
+        
+        merged_box = (
+            max(0, int(x1_min - padding_x)),
+            max(0, int(y1_min - padding_y)),
+            min(frame_width, int(x2_max + padding_x)),
+            min(frame_height, int(y2_max + padding_y))
+        )
+        
+        # Ensure minimum size
+        merged_width = merged_box[2] - merged_box[0]
+        merged_height = merged_box[3] - merged_box[1]
+        
+        if merged_width < frame_width * 0.25 or merged_height < frame_height * 0.3:
+            center_x = (merged_box[0] + merged_box[2]) // 2
+            center_y = (merged_box[1] + merged_box[3]) // 2
+            
+            min_width = max(merged_width, frame_width * 0.25)
+            min_height = max(merged_height, frame_height * 0.3)
+            
+            return (
+                max(0, int(center_x - min_width // 2)),
+                max(0, int(center_y - min_height // 2)),
+                min(frame_width, int(center_x + min_width // 2)),
+                min(frame_height, int(center_y + min_height // 2))
+            )
+        
+        return merged_box
+
     def _get_pose_based_roi(self, poses, person_boxes, frame_width, frame_height):
-        """Get ROI based on pose keypoints"""
+        """Get ROI based on pose keypoints - SIMPLIFIED VERSION"""
         all_points = []
         
         for pose in poses:
-            # Use all keypoints for ROI
             for idx in range(17):
                 if pose[idx, 2] > ROI_CONFIDENCE_THRESHOLD:
-                    all_points.append(pose[idx, :2])
+                    point = pose[idx, :2]
+                    all_points.append(point)
         
         if len(all_points) == 0:
-            # Fallback to person boxes
-            return self._merge_boxes(person_boxes)
+            return self._smart_merge_boxes(person_boxes, frame_width, frame_height)
         
-        all_points = np.array(all_points)
-        x_min, y_min = np.min(all_points, axis=0)
-        x_max, y_max = np.max(all_points, axis=0)
+        all_points_array = np.array(all_points)
+        x_min, y_min = np.min(all_points_array, axis=0)
+        x_max, y_max = np.max(all_points_array, axis=0)
         
-        # Add padding based on pose spread
         width = x_max - x_min
         height = y_max - y_min
-        padding_x = width * 0.4
-        padding_y = height * 0.4
+        
+        # ALWAYS USE GENEROUS PADDING - don't try to be clever
+        padding_x = width * 0.8  # Always 80% padding
+        padding_y = height * 0.8  # Always 80% padding
         
         x1 = max(0, int(x_min - padding_x))
         y1 = max(0, int(y_min - padding_y))
         x2 = min(frame_width, int(x_max + padding_x))
         y2 = min(frame_height, int(y_max + padding_y))
         
-        # Ensure minimum size
-        min_width = frame_width * 0.2
-        min_height = frame_height * 0.3
+        # But ensure it's not TOO small
+        min_width = frame_width * 0.3  # 30% of frame
+        min_height = frame_height * 0.3  # 30% of frame
         
         if (x2 - x1) < min_width:
             center_x = (x1 + x2) // 2
@@ -322,12 +565,10 @@ class ROIDetector:
         lower_count = 0
         
         for pose in poses:
-            # Count upper body keypoints (0-10)
             for idx in range(0, 11):
                 if pose[idx, 2] > ROI_CONFIDENCE_THRESHOLD:
                     upper_count += 1
             
-            # Count lower body keypoints (11-16)
             for idx in range(11, 17):
                 if pose[idx, 2] > ROI_CONFIDENCE_THRESHOLD:
                     lower_count += 1
@@ -351,7 +592,6 @@ class ROIDetector:
         x2_max = max(b[2] for b in boxes)
         y2_max = max(b[3] for b in boxes)
         
-        # Add some padding around merged boxes
         width = x2_max - x1_min
         height = y2_max - y1_min
         padding_x = width * 0.1
@@ -369,7 +609,6 @@ class ROIDetector:
         if len(self.roi_history) == 0:
             return None
         
-        # Calculate median box
         x1s = [b[0] for b in self.roi_history]
         y1s = [b[1] for b in self.roi_history]
         x2s = [b[2] for b in self.roi_history]
@@ -399,7 +638,6 @@ def calculate_motion_expansion(current_box, history, base_margin=0.50, pose_acti
     if len(recent_boxes) < 2:
         return max(base_margin, MIN_EXPANSION + (pose_activity * 0.3))
     
-    # Calculate max displacement
     max_dx = 0
     max_dy = 0
     
@@ -418,24 +656,20 @@ def calculate_motion_expansion(current_box, history, base_margin=0.50, pose_acti
         max_dx = max(max_dx, dx)
         max_dy = max(max_dy, dy)
     
-    # Check box size changes
     box_widths = [b[2] - b[0] for b in recent_boxes]
     box_heights = [b[3] - b[1] for b in recent_boxes]
     
     width_variance = max(box_widths) - min(box_widths)
     height_variance = max(box_heights) - min(box_heights)
     
-    # Current box size
     curr_w = current_box[2] - current_box[0]
     curr_h = current_box[3] - current_box[1]
     
-    # Calculate adaptive margin
     motion_factor_x = max_dx / max(curr_w, 1)
     motion_factor_y = max_dy / max(curr_h, 1)
     size_factor_x = width_variance / max(curr_w, 1)
     size_factor_y = height_variance / max(curr_h, 1)
     
-    # Combine factors
     motion_factor = max(
         motion_factor_x,
         motion_factor_y,
@@ -445,7 +679,6 @@ def calculate_motion_expansion(current_box, history, base_margin=0.50, pose_acti
     
     adaptive_margin = base_margin + (motion_factor * 2.5) + (pose_activity * 0.35)
     
-    # Enforce minimum and maximum
     adaptive_margin = max(adaptive_margin, MIN_EXPANSION)
     adaptive_margin = min(adaptive_margin, MAX_EXPANSION)
     
@@ -998,17 +1231,56 @@ def safe_crop(frame, box, action_idx=0, default_scale=0.25):
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     
-    min_size = 150
-    if (x2 - x1) < min_size:
+    # REDUCE MINIMUM DIMENSIONS for head-focused crops
+    # Check if this looks like a head crop (based on aspect ratio)
+    original_box_w = x2 - x1
+    original_box_h = y2 - y1
+    
+    # If it's a portrait-oriented box, it might be head-focused
+    is_portrait = original_box_h > original_box_w * 1.2
+    
+    if is_portrait:
+        # For head crops, allow smaller minimums
+        min_width = int(w * 0.25)  # Reduced from 0.30
+        min_height = int(h * 0.28)  # Reduced from 0.30
+    else:
+        # For regular crops, use standard minimums
+        min_width = int(w * 0.30)
+        min_height = int(h * 0.30)
+    
+    box_w = x2 - x1
+    box_h = y2 - y1
+    
+    # Only enforce minimums if box is REALLY small
+    if box_w < min_width and box_w < w * 0.2:  # Only expand if very small
         cx = (x1 + x2) // 2
-        x1 = int(max(0, cx - min_size//2))
-        x2 = int(min(w, cx + min_size//2))
-    if (y2 - y1) < min_size:
+        x1 = int(max(0, cx - min_width//2))
+        x2 = int(min(w, cx + min_width//2))
+        box_w = x2 - x1
+    
+    if box_h < min_height and box_h < h * 0.2:  # Only expand if very small
         cy = (y1 + y2) // 2
-        y1 = int(max(0, cy - min_size//2))
-        y2 = int(min(h, cy + min_size//2))
+        y1 = int(max(0, cy - min_height//2))
+        y2 = int(min(h, cy + min_height//2))
+        box_h = y2 - y1
+    
+    # Make aspect ratio requirements more lenient
+    aspect_ratio = box_w / max(box_h, 1)
+    
+    if aspect_ratio > 2.0:  # Too wide
+        target_h = int(box_w / 1.2)  # More lenient than 1.5
+        cy = (y1 + y2) // 2
+        y1 = int(max(0, cy - target_h//2))
+        y2 = int(min(h, cy + target_h//2))
+    elif aspect_ratio < 0.4:  # More lenient than 0.5 (allow taller boxes)
+        target_w = int(box_h * 0.7)  # More lenient than 0.8
+        cx = (x1 + x2) // 2
+        x1 = int(max(0, cx - target_w//2))
+        x2 = int(min(w, cx + target_w//2))
     
     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+    
+    # Final validation
     if x2 <= x1 or y2 <= y1:
         size = int(min(h, w) * default_scale)
         x1 = int(w//2 - size//2)
@@ -1025,14 +1297,12 @@ def expand_box(box, frame_shape, action_idx=0, margin=0.2):
     x1, y1, x2, y2 = map(int, box)
     bw, bh = x2 - x1, y2 - y1
     
-    if action_idx == 1:
-        ew = int(bw * margin * 0.9)
-        eh = int(bh * margin)
-    else:
-        ew = int(bw * margin)
-        eh = int(bh * margin)
+    # DOUBLE the expansion for all boxes
+    ew = int(bw * margin * 2.0)  # 2x expansion
+    eh = int(bh * margin * 2.0)  # 2x expansion
     
-    max_expand = min(bw, bh) * 0.45
+    # Remove the max_expand limit or make it very generous
+    max_expand = min(bw, bh) * 0.8  # Allow up to 80% expansion
     ew = min(ew, int(max_expand))
     eh = min(eh, int(max_expand))
     
@@ -1106,9 +1376,16 @@ def get_multi_calibration(video_path, detector, num_frames=40, crop_count=3):
     
     return (480, 480)
 
-def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop_count):
+def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop_count, positions_override=None):
     """Process video with dynamic number of crops (2 or 3) with ROI detection"""
-    positions = get_crop_positions(crop_count)
+    # Use override positions if provided, otherwise use default
+    if positions_override:
+        positions = positions_override
+        # Map 'center' to 'middle' for consistency with existing code
+        positions = ['middle' if pos == 'center' else pos for pos in positions]
+    else:
+        positions = get_crop_positions(crop_count)
+    
     position_text = f"{crop_count}-crop ({' & '.join(positions)})"
     
     print(f"\n🎬 Processing {position_text} (ROI-based action detection): {os.path.basename(input_path)}")
@@ -1168,7 +1445,15 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
         if crop_count == 3:
             action_indices = [0, 1, 2]
         elif crop_count == 2:
-            action_indices = [0, 2]
+            # Map positions to indices: left=0, center=1, right=2
+            if positions == ['left', 'right']:
+                action_indices = [0, 2]
+            elif positions == ['left', 'center']:
+                action_indices = [0, 1]
+            elif positions == ['center', 'right']:
+                action_indices = [1, 2]
+            else:
+                action_indices = [0, 2]  # Default fallback
         
         for i, action_idx in enumerate(action_indices):
             if i < len(actions) and actions[i] is not None:
@@ -1235,17 +1520,29 @@ def copy_video_to_output(input_path, output_folder):
         print(f"❌ Error copying {filename}: {e}")
         return None
 
+# ===== UPDATED MAIN FUNCTION WITH ACTIVITY-BASED ZONE DETECTION =====
+
 def main():
-    print("🚀 Starting SMART batch video processing (ROI-based action detection)...")
+    print("🚀 Starting SMART batch video processing (Activity-Based Zone Detection)...")
     print(f"Input folder: {INPUT_FOLDER}")
     print(f"Output folder: {OUTPUT_FOLDER}")
-    print(f"Config: base_expansion={BOX_EXPANSION}, min={MIN_EXPANSION}, max={MAX_EXPANSION}")
     print(f"ROI detection: {'ENABLED' if USE_ROI_DETECTION else 'DISABLED'}")
-    print(f"Pose for ROI: {'ENABLED' if USE_POSE_FOR_ROI else 'DISABLED'}")
-    print(f"ROI smoothing: {'ENABLED' if ROI_SMOOTHING else 'DISABLED'}")
+    print(f"Smart crop strategy: ENABLED ✨ (Activity-aware)")
     
     print("📦 Loading YOLO model...")
     yolo = YOLO("yolo11n.pt")
+    print("✅ YOLO model loaded")
+    
+    # Load pose model for activity analysis
+    pose_model = None
+    if USE_POSE_ESTIMATION or USE_ROI_DETECTION:
+        try:
+            print("🧍 Loading pose estimation model...")
+            pose_model = YOLO("yolo11n-pose.pt")
+            print("✅ Pose model loaded")
+        except Exception as e:
+            print(f"⚠️ Could not load pose model: {e}")
+            print("   Continuing without pose estimation")
     
     video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.flv', '*.wmv']
     video_files = []
@@ -1272,23 +1569,99 @@ def main():
         
         print(f"🔍 [{i}/{len(video_files)}] Investigating {filename}...")
         
+        # STEP 1: Count people (quick filter)
         start_time = time.time()
         people_count = count_people_in_video(video_path, yolo, PEOPLE_SAMPLE_FRAMES)
         elapsed = time.time() - start_time
-        
         print(f"   👥 Detected {people_count} person(s) in {elapsed:.1f}s")
         
-        crop_count = determine_crop_count(people_count)
+        # STEP 2: Determine crop strategy
+        crop_count = 0
+        positions = []
+        strategy = ""
         
-        if crop_count >= MIN_PEOPLE_REQUIRED:
-            if crop_count == 3:
-                print(f"   ✅ Processing {filename} with 3-crop (3+ people detected)")
-            elif crop_count == 2:
-                print(f"   ✅ Processing {filename} with 2-crop (2 people detected)")
+        if people_count >= MIN_PEOPLE_REQUIRED:
+            if people_count >= 4:
+                print(f"   👥👥 4+ people detected - analyzing distribution...")
+                
+                # Get zone analysis for distribution
+                zone_scores, zone_people, zone_activity = analyze_region_activity(
+                    video_path, yolo, pose_model, sample_frames=25
+                )
+                
+                # Calculate average people per zone
+                left_avg = np.mean(zone_people['left']) if zone_people['left'] else 0
+                center_avg = np.mean(zone_people['center']) if zone_people['center'] else 0
+                right_avg = np.mean(zone_people['right']) if zone_people['right'] else 0
+                
+                print(f"   📊 Zone distribution: Left={left_avg:.1f}, Center={center_avg:.1f}, Right={right_avg:.1f}")
+                
+                # Decision logic for 4+ people scenarios
+                # Scenario 1: 3 people on left, 2 on right (or similar)
+                if left_avg >= 2.5 and right_avg >= 1.5:
+                    print(f"   ↔️ Scenario: ~{left_avg:.0f} left, ~{right_avg:.0f} right - using left+right crops")
+                    crop_count = 2
+                    positions = ['left', 'right']
+                    strategy = "4plus-left-right-split"
+                
+                # Scenario 2: Strong concentration on left (3+ people)
+                elif left_avg >= 3 and left_avg > center_avg + right_avg:
+                    print(f"   ⬅️ Left concentration ({left_avg:.1f} people) - single left crop")
+                    crop_count = 1
+                    positions = ['left']
+                    strategy = "4plus-left-dominant"
+                
+                # Scenario 3: Strong concentration on right (3+ people)
+                elif right_avg >= 3 and right_avg > center_avg + left_avg:
+                    print(f"   ➡️ Right concentration ({right_avg:.1f} people) - single right crop")
+                    crop_count = 1
+                    positions = ['right']
+                    strategy = "4plus-right-dominant"
+                
+                # Scenario 4: People on both sides
+                elif left_avg >= 2 and right_avg >= 2:
+                    print(f"   ↔️ People on both sides - left+right crops")
+                    crop_count = 2
+                    positions = ['left', 'right']
+                    strategy = "4plus-both-sides"
+                
+                # Scenario 5: Center-heavy distribution
+                elif center_avg >= 3:
+                    print(f"   ⬆️ Center concentration ({center_avg:.1f} people) - center crop")
+                    crop_count = 1
+                    positions = ['center']
+                    strategy = "4plus-center-dominant"
+                
+                # Default: Use 2-crop for even distribution
+                else:
+                    print(f"   ⚖️ Even distribution - default to left+right crops")
+                    crop_count = 2
+                    positions = ['left', 'right']
+                    strategy = "4plus-even-distribution"
             
-            process_video_with_dynamic_crops(video_path, OUTPUT_FOLDER, yolo, crop_count)
+            else:
+                # For 2-3 people, use the existing smart strategy
+                crop_count, positions, strategy = determine_smart_crop_strategy_v2(
+                    video_path, yolo, pose_model, sample_frames=20
+                )
+                print(f"   ✅ Strategy: {crop_count}-crop ({strategy})")
+                print(f"      Positions: {positions}")
         else:
-            print(f"   📋 Copying {filename} as-is ({people_count} person(s))")
+            # Not enough people
+            crop_count = 0
+            positions = []
+            strategy = f"insufficient-people-{people_count}"
+            print(f"   📋 Not enough people for cropping")
+        
+        # STEP 3: Process or copy based on strategy
+        if crop_count >= MIN_PEOPLE_REQUIRED and len(positions) >= MIN_PEOPLE_REQUIRED:
+            print(f"   🎬 Processing with {crop_count}-crop: {positions}")
+            process_video_with_dynamic_crops(
+                video_path, OUTPUT_FOLDER, yolo, crop_count, 
+                positions_override=positions
+            )
+        else:
+            print(f"   📋 Copying {filename} as-is (strategy: {strategy})")
             copy_video_to_output(video_path, OUTPUT_FOLDER)
         
         all_handled_videos.append(video_path)
@@ -1325,6 +1698,7 @@ def main():
         print("📁 No new videos were processed (all were already done)")
     
     print("\n🎉 Batch processing complete!")
+
 
 if __name__ == "__main__":
     main()
