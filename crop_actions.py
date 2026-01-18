@@ -1,6 +1,7 @@
 import cv2
 from ultralytics import YOLO
 from collections import deque
+from pathlib import Path
 import numpy as np
 import os
 import glob
@@ -24,7 +25,8 @@ STICKY_FRAMES = 30
 SMOOTHING_WINDOW = 15
 CALIBRATION_FRAMES = 30
 PADDING_COLOR = (0, 0, 0)
-BOX_EXPANSION = 0.20
+BOX_EXPANSION = 0.20  # For good detections
+FALLBACK_BOX_EXPANSION = 0.50  # For fallback boxes - SEPARATE!
 ACTION_LOCK_FRAMES = 90
 MAX_MISSING_FRAMES = 45
 OVERLAP_MARGIN = 15
@@ -50,10 +52,257 @@ POSE_CONFIDENCE_THRESHOLD = 0.3
 MIN_EXPANSION = 0.1
 MAX_EXPANSION = 0.15
 
-PERSON_DETECTION_CONF_TRACKING = 0.15
-# ===========================
+PERSON_DETECTION_CONF_TRACKING = 0.15 # can affect window size!
+
+# ===== DEBUG VISUALIZATION CONFIG =====
+DEBUG_MODE = True  # Set to True to enable debug visualization
+DEBUG_SAMPLES = 4  # Number of sample frames to visualize
+DEBUG_OUTPUT_FOLDER = "debug_visualizations"  # Folder for debug images
+
+# NEW: Video debug settings
+DEBUG_CREATE_VIDEOS = True  # Create full debug videos
+DEBUG_VIDEO_FOLDER = "debug_videos"  # Folder for debug videos
+DEBUG_VIDEO_SIDE_BY_SIDE = False  # Show original + debug side-by-side
+DEBUG_SHOW_METRICS = True  # Show tracking metrics overlay
+# ======================================
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+
+if DEBUG_MODE and DEBUG_OUTPUT_FOLDER:
+    os.makedirs(DEBUG_OUTPUT_FOLDER, exist_ok=True)
+
+def create_debug_video_writer(video_path, output_folder, fps, frame_shape):
+    """
+    Create a video writer for debug visualization
+    """
+    base_name = Path(video_path).stem
+    debug_filename = f"{base_name}_debug_tracking.mp4"
+    debug_path = Path(output_folder) / debug_filename
+    
+    h, w = frame_shape[:2]
+    
+    # If side-by-side, double the width
+    if DEBUG_VIDEO_SIDE_BY_SIDE:
+        output_width = w * 2
+        output_height = h
+    else:
+        output_width = w
+        output_height = h
+    
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    writer = cv2.VideoWriter(str(debug_path), fourcc, fps, (output_width, output_height))
+    
+    return writer, debug_path
+
+def create_enhanced_debug_frame(frame, frame_idx, yolo_boxes, expanded_boxes, 
+                               smoothed_boxes, final_boxes, action_statuses, 
+                               positions, detector, debug_info=None):
+    """
+    Enhanced debug visualization with comprehensive tracking info
+    """
+    h, w = frame.shape[:2]
+    
+    # Create visualization frame
+    vis_frame = frame.copy()
+    
+    # Color scheme
+    colors = {
+        'yolo': (0, 0, 255),        # RED
+        'expanded': (0, 255, 255),  # YELLOW
+        'smoothed': (0, 255, 0),    # GREEN
+        'good_track': (255, 0, 0),  # BLUE
+        'fallback': (255, 0, 255),  # MAGENTA
+        'white': (255, 255, 255),
+        'black': (0, 0, 0)
+    }
+    
+    # 1. Draw YOLO detections (thin, red)
+    for i, box in enumerate(yolo_boxes):
+        if box:
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), colors['yolo'], 1)
+            cv2.putText(vis_frame, f"Y{i}", (x1, max(15, y1-5)), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, colors['yolo'], 1)
+    
+    # 2. Draw expanded boxes (dashed yellow)
+    for i, box in enumerate(expanded_boxes):
+        if box:
+            x1, y1, x2, y2 = map(int, box)
+            draw_dashed_rectangle(vis_frame, (x1, y1), (x2, y2), colors['expanded'], 2)
+    
+    # 3. Draw smoothed boxes (thin green)
+    for i, box in enumerate(smoothed_boxes):
+        if box:
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), colors['smoothed'], 2)
+    
+    # 4. Draw final crops with status-based colors (thick)
+    for i, (box, status) in enumerate(zip(final_boxes, action_statuses)):
+        if box:
+            x1, y1, x2, y2 = map(int, box)
+            
+            # Choose color
+            if status in ["FRESH_DETECTION", "TRACKED-good"]:
+                color = colors['good_track']
+                label_bg = (180, 0, 0)
+            else:
+                color = colors['fallback']
+                label_bg = (180, 0, 180)
+            
+            # Draw thick rectangle
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 3)
+            
+            # Draw corner markers
+            corner_len = 20
+            cv2.line(vis_frame, (x1, y1), (x1+corner_len, y1), color, 4)
+            cv2.line(vis_frame, (x1, y1), (x1, y1+corner_len), color, 4)
+            cv2.line(vis_frame, (x2, y1), (x2-corner_len, y1), color, 4)
+            cv2.line(vis_frame, (x2, y1), (x2, y1+corner_len), color, 4)
+            cv2.line(vis_frame, (x1, y2), (x1+corner_len, y2), color, 4)
+            cv2.line(vis_frame, (x1, y2), (x1, y2-corner_len), color, 4)
+            cv2.line(vis_frame, (x2, y2), (x2-corner_len, y2), color, 4)
+            cv2.line(vis_frame, (x2, y2), (x2, y2-corner_len), color, 4)
+            
+            # Position label
+            position = positions[i] if i < len(positions) else f"P{i}"
+            label = f"{position.upper()}"
+            
+            # Background for label
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.rectangle(vis_frame, 
+                         (x1, y1-30), 
+                         (x1+label_size[0]+10, y1-5), 
+                         label_bg, -1)
+            cv2.putText(vis_frame, label, (x1+5, y1-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors['white'], 2)
+            
+            # Center crosshair
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            cv2.circle(vis_frame, (center_x, center_y), 8, color, 2)
+            cv2.line(vis_frame, (center_x-15, center_y), (center_x+15, center_y), color, 2)
+            cv2.line(vis_frame, (center_x, center_y-15), (center_x, center_y+15), color, 2)
+    
+    # Add comprehensive info overlay
+    if DEBUG_SHOW_METRICS:
+        vis_frame = add_metrics_overlay(vis_frame, frame_idx, action_statuses, 
+                                       positions, detector, debug_info)
+    
+    return vis_frame
+
+def draw_dashed_rectangle(img, pt1, pt2, color, thickness=1, gap=10):
+    """Draw a dashed rectangle"""
+    x1, y1 = pt1
+    x2, y2 = pt2
+    
+    # Top edge
+    for x in range(x1, x2, gap*2):
+        cv2.line(img, (x, y1), (min(x+gap, x2), y1), color, thickness)
+    # Bottom edge
+    for x in range(x1, x2, gap*2):
+        cv2.line(img, (x, y2), (min(x+gap, x2), y2), color, thickness)
+    # Left edge
+    for y in range(y1, y2, gap*2):
+        cv2.line(img, (x1, y), (x1, min(y+gap, y2)), color, thickness)
+    # Right edge
+    for y in range(y1, y2, gap*2):
+        cv2.line(img, (x2, y), (x2, min(y+gap, y2)), color, thickness)
+
+
+def add_metrics_overlay(frame, frame_idx, action_statuses, positions, detector, debug_info):
+    """Add comprehensive metrics overlay"""
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+    
+    # Create semi-transparent background for metrics panel
+    panel_height = 180
+    cv2.rectangle(overlay, (0, 0), (w, panel_height), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+    
+    # Frame info
+    cv2.putText(frame, f"Frame: {frame_idx}", (20, 30), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    
+    if debug_info:
+        y_pos = 60
+        for key, value in debug_info.items():
+            text = f"{key}: {value}"
+            cv2.putText(frame, text, (20, y_pos), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            y_pos += 25
+    
+    # Tracking status for each position
+    status_x = w - 350
+    status_y = 30
+    cv2.putText(frame, "TRACKING STATUS:", (status_x, status_y), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    for i, (status, pos) in enumerate(zip(action_statuses, positions)):
+        y = status_y + 30 + (i * 35)
+        
+        # Status indicator color
+        if "DETECTION" in status or "good" in status:
+            status_color = (0, 255, 0)  # Green
+            indicator = "●"
+        elif "FALLBACK" in status or "poor" in status:
+            status_color = (0, 165, 255)  # Orange
+            indicator = "◐"
+        else:
+            status_color = (0, 0, 255)  # Red
+            indicator = "○"
+        
+        # Draw status
+        text = f"{indicator} {pos.upper()}: {status.replace('_', ' ')}"
+        cv2.putText(frame, text, (status_x, y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
+        
+        # Missing frames counter
+        if i < len(detector.missing_counters):
+            missing = detector.missing_counters[i]
+            if missing > 0:
+                cv2.putText(frame, f"({missing}f)", (status_x + 240, y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+    
+    # Legend at bottom
+    legend_y = h - 120
+    cv2.rectangle(overlay, (10, legend_y-10), (w-10, h-10), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+    
+    cv2.putText(frame, "LEGEND:", (20, legend_y), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    legend_items = [
+        ("RED", (0, 0, 255), "YOLO"),
+        ("YELLOW", (0, 255, 255), "Expanded"),
+        ("GREEN", (0, 255, 0), "Smoothed"),
+        ("BLUE", (255, 0, 0), "Good Track"),
+        ("MAGENTA", (255, 0, 255), "Fallback"),
+    ]
+    
+    x_offset = 120
+    for label, color, desc in legend_items:
+        cv2.rectangle(frame, (x_offset, legend_y-12), (x_offset+25, legend_y+5), color, -1)
+        cv2.putText(frame, desc, (x_offset+30, legend_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        x_offset += 120
+    
+    return frame
+
+def create_side_by_side_frame(original, debug):
+    """Create side-by-side comparison"""
+    h, w = original.shape[:2]
+    
+    # Add labels
+    cv2.putText(original, "ORIGINAL", (20, h-20), 
+               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    cv2.putText(debug, "DEBUG VIEW", (20, h-20), 
+               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    
+    # Concatenate horizontally
+    combined = np.hstack([original, debug])
+    
+    return combined
 
 def calculate_iou(box1, box2):
     """Calculate Intersection over Union"""
@@ -256,140 +505,177 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
 
     return zone_scores, zone_people_count, zone_activity
 
-def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sample_frames=20):
+def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sample_frames=20, people_count=0):
     """
-    Enhanced strategy with IMPROVED 3-person detection.
+    ACTION-AWARE cropping: Focus on where actions happen, not just people.
     Returns: (crop_count, positions_to_use, strategy_description)
+    
+    FIXED: Takes people_count as input to make intelligent decisions about 2-person videos
     """
-    print(f"   🔍 Analyzing video action zones...")
-
+    print(f"   🔍 Analyzing ACTION zones (not just people)...")
+    
     # Get activity analysis
     zone_scores, zone_people, zone_activity = analyze_region_activity(
         video_path, yolo_model, pose_model, sample_frames
     )
-
-    print(f"   📊 Zone analysis:")
+    
+    print(f"   📊 ACTION Zone analysis:")
+    
+    # Calculate ACTION metrics (not people metrics)
+    zone_action_potential = {}
+    
     for zone in ['left', 'center', 'right']:
-        avg_people = np.mean(zone_people[zone]) if zone_people[zone] else 0
-        avg_activity = np.mean(zone_activity[zone]) if zone_activity[zone] else 0
-        score = zone_scores[zone]
-        print(f"      {zone.capitalize()}: {avg_people:.1f} people, "
-              f"{avg_activity:.2f} activity, {score:.2f} score")
-
-    # Calculate total people estimate
-    max_people_by_zone = []
-    for zone in ['left', 'center', 'right']:
-        if zone_people[zone]:
-            max_people_by_zone.append(max(zone_people[zone]))
-
-    estimated_total_people = sum(max_people_by_zone) if max_people_by_zone else 0
-
-    # Get average people across all frames
-    all_people_counts = []
-    for zone in ['left', 'center', 'right']:
-        all_people_counts.extend(zone_people[zone])
-
-    avg_total_people = np.mean(all_people_counts) if all_people_counts else 0
-    max_total_people = max(all_people_counts) if all_people_counts else 0
-
-    print(f"   👥 People estimate: avg={avg_total_people:.1f}, max_any_frame={max_total_people:.0f}, sum_of_zones={estimated_total_people:.0f}")
-
-    # IMPROVED: Special handling for 3-person scenarios
-    if 2.5 <= avg_total_people <= 3.5 or max_total_people == 3:
-        print(f"   👥👥👥 3-person scenario detected!")
-
-        left_avg = np.mean(zone_people['left']) if zone_people['left'] else 0
-        center_avg = np.mean(zone_people['center']) if zone_people['center'] else 0
-        right_avg = np.mean(zone_people['right']) if zone_people['right'] else 0
-
-        # Check if all 3 zones have people
-        zones_with_people = sum([1 for avg in [left_avg, center_avg, right_avg] if avg >= 0.4])
-
-        if zones_with_people >= 3:
-            print(f"   ✅ 3 zones active - using 3-crop")
-            return 3, ['left', 'center', 'right'], "three-person-all-zones"
-
-        # Check for 2-zone distribution
-        elif left_avg >= 0.6 and right_avg >= 0.6:
-            print(f"   ✅ Left + Right zones - using 2-crop")
-            return 2, ['left', 'right'], "three-person-left-right"
-
-        elif left_avg >= 0.6 and center_avg >= 0.6:
-            print(f"   ✅ Left + Center zones - using 2-crop")
-            return 2, ['left', 'center'], "three-person-left-center"
-
-        elif center_avg >= 0.6 and right_avg >= 0.6:
-            print(f"   ✅ Center + Right zones - using 2-crop")
-            return 2, ['center', 'right'], "three-person-center-right"
-
-        # Fallback for 3 people
+        if zone_activity[zone]:
+            # Key metrics for action cropping:
+            # 1. Maximum activity level (peak action)
+            max_activity = max(zone_activity[zone])
+            
+            # 2. Percentage of frames with significant action (> 0.6)
+            high_action_frames = sum(1 for activity in zone_activity[zone] if activity > 0.6)
+            action_consistency = high_action_frames / len(zone_activity[zone])
+            
+            # 3. Action density (activity * people)
+            avg_people = np.mean(zone_people[zone]) if zone_people[zone] else 0
+            avg_activity = np.mean(zone_activity[zone])
+            action_density = avg_people * avg_activity
+            
+            zone_action_potential[zone] = {
+                'max_activity': max_activity,
+                'action_consistency': action_consistency,
+                'action_density': action_density,
+                'avg_activity': avg_activity,
+                'avg_people': avg_people,
+                'has_action': action_consistency > 0.3 or max_activity > 0.7
+            }
+            
+            print(f"      {zone.capitalize()}:")
+            print(f"        Max activity: {max_activity:.2f}")
+            print(f"        Action consistency: {action_consistency:.0%}")
+            print(f"        Action density: {action_density:.2f}")
+            print(f"        Avg people: {avg_people:.1f}")
+            print(f"        Has action: {'✓' if zone_action_potential[zone]['has_action'] else '✗'}")
+    
+    # Count zones with significant action
+    action_zones = [zone for zone in ['left', 'center', 'right'] 
+                    if zone in zone_action_potential and zone_action_potential[zone]['has_action']]
+    
+    print(f"   🎯 Zones with action: {len(action_zones)} ({action_zones})")
+    
+    # ===== IMPROVED 2-PERSON LOGIC =====
+    # Only apply strict 2-person logic if we're CONFIDENT it's exactly 2 people
+    # (not 3+ with some partially visible)
+    if people_count == 2:
+        print(f"   👥 2-person video detected - checking confidence and separation...")
+        
+        # Calculate total average people across all zones
+        total_avg_people = sum(
+            zone_action_potential[z]['avg_people'] 
+            for z in ['left', 'center', 'right'] 
+            if z in zone_action_potential
+        )
+        
+        print(f"   📊 Total avg people across zones: {total_avg_people:.1f}")
+        
+        # If total average is close to 3 or more, might be 3 people with partial visibility
+        # In that case, skip the strict 2-person logic
+        if total_avg_people >= 2.5:
+            print(f"   ⚠️ Total avg ({total_avg_people:.1f}) suggests possibly 3+ people with partial visibility")
+            print(f"   ➡️ Skipping strict 2-person check, using normal action-based logic")
         else:
-            print(f"   ✅ 3 people detected but clustered - using 2-crop default")
-            return 2, ['left', 'right'], "three-person-clustered"
-
-    # Special handling for 4+ people scenarios
-    if estimated_total_people >= 4 or avg_total_people >= 3.5:
-        print(f"   👥👥 High density detected (~{estimated_total_people} people total)")
-
-        left_avg = np.mean(zone_people['left']) if zone_people['left'] else 0
-        center_avg = np.mean(zone_people['center']) if zone_people['center'] else 0
-        right_avg = np.mean(zone_people['right']) if zone_people['right'] else 0
-
-        # Determine the best strategy for high-density scenes
-        if left_avg >= 2.5 and left_avg > center_avg + right_avg:
-            return 1, ['left'], "high-density-left-focused"
-        elif right_avg >= 2.5 and right_avg > center_avg + left_avg:
-            return 1, ['right'], "high-density-right-focused"
-        elif left_avg >= 2 and right_avg >= 2:
-            return 2, ['left', 'right'], "high-density-both-sides"
+            # Confident it's actually 2 people - apply strict separation check
+            print(f"   ✓ Confident this is actually 2 people (total avg: {total_avg_people:.1f})")
+            
+            # For 2 people, only crop if they're clearly in DIFFERENT zones
+            zones_with_people = []
+            for zone in ['left', 'center', 'right']:
+                if zone in zone_action_potential:
+                    avg_people = zone_action_potential[zone]['avg_people']
+                    if avg_people >= 0.7:  # Lowered from 0.8 for better detection
+                        zones_with_people.append(zone)
+            
+            print(f"   📍 Zones with people: {zones_with_people}")
+            
+            # If both people are in different zones AND there's action in both zones
+            if len(zones_with_people) >= 2 and len(action_zones) >= 2:
+                # Check if action zones match people zones
+                people_action_overlap = [z for z in zones_with_people if z in action_zones]
+                
+                if len(people_action_overlap) >= 2:
+                    print(f"   ✅ 2 people in separate zones with action - WILL CROP")
+                    return 2, people_action_overlap[:2], "two-person-separated-actions"
+                else:
+                    print(f"   📋 2 people but not enough action separation - NO CROP")
+                    return 0, [], "two-person-no-action-separation"
+            else:
+                print(f"   📋 2 people not separated enough - NO CROP")
+                return 0, [], "two-person-not-separated"
+    
+    # ===== ORIGINAL LOGIC FOR 3+ PEOPLE (or when 2-person check skipped) =====
+    
+    # Case 1: No significant action anywhere
+    if len(action_zones) == 0:
+        print(f"   📋 No clear action - using default left+right")
+        return 2, ['left', 'right'], "no-action-default"
+    
+    # Case 2: Single action zone
+    elif len(action_zones) == 1:
+        zone = action_zones[0]
+        print(f"   🎯 Single action zone: {zone}")
+        return 1, [zone], f"single-action-{zone}"
+    
+    # Case 3: Two action zones
+    elif len(action_zones) == 2:
+        print(f"   🎯 Two action zones: {action_zones}")
+        
+        # If actions are in left+center or center+right, they might be connected
+        if set(action_zones) == {'left', 'center'}:
+            # Check if these are separate actions or one continuous action
+            left_density = zone_action_potential['left']['action_density']
+            center_density = zone_action_potential['center']['action_density']
+            
+            # If center has much higher density, might be main action
+            if center_density > left_density * 2:
+                print(f"   🎯 Center dominant - cropping center only")
+                return 1, ['center'], "center-dominant-action"
+            else:
+                return 2, ['left', 'center'], "left-center-actions"
+                
+        elif set(action_zones) == {'center', 'right'}:
+            center_density = zone_action_potential['center']['action_density']
+            right_density = zone_action_potential['right']['action_density']
+            
+            if center_density > right_density * 2:
+                return 1, ['center'], "center-dominant-action"
+            else:
+                return 2, ['center', 'right'], "center-right-actions"
+        
+        else:  # left + right
+            return 2, ['left', 'right'], "left-right-actions"
+    
+    # Case 4: Three action zones
+    else:  # all 3 zones have action
+        print(f"   🎯 Three action zones detected")
+        
+        # Check if center is the main action hub
+        center_density = zone_action_potential['center']['action_density']
+        left_density = zone_action_potential['left']['action_density']
+        right_density = zone_action_potential['right']['action_density']
+        
+        # If center has significantly more action than sides
+        if center_density > (left_density + right_density) * 0.8:
+            print(f"   🎯 Center is action hub - cropping center only")
+            return 1, ['center'], "center-action-hub"
+        
+        # If sides have more action than center
+        elif (left_density + right_density) > center_density * 1.5:
+            print(f"   🎯 Sides have more action - cropping left+right")
+            return 2, ['left', 'right'], "side-actions-dominant"
+        
+        # Otherwise, crop all three
         else:
-            return 2, ['left', 'right'], "high-density-default"
-
-    # IMPROVED: Lower thresholds for detecting active zones
-    MIN_SCORE_THRESHOLD = 0.15  # Lowered from 0.3
-    MIN_PEOPLE_THRESHOLD = 0.3  # Lowered from 0.5
-
-    active_zones = []
-    for zone, score in zone_scores.items():
-        avg_people = np.mean(zone_people[zone]) if zone_people[zone] else 0
-        if score >= MIN_SCORE_THRESHOLD or avg_people >= MIN_PEOPLE_THRESHOLD:
-            active_zones.append(zone)
-
-    print(f"   🎯 Active zones: {active_zones}")
-
-    # Decision logic based on active zones
-    if len(active_zones) == 0:
-        return 0, [], "no-action-detected"
-
-    elif len(active_zones) == 1:
-        zone = active_zones[0]
-        return 1, [zone], f"single-zone-{zone}"
-
-    elif len(active_zones) == 2:
-        zones_str = "-".join(active_zones)
-
-        if set(active_zones) == {'left', 'center'}:
-            return 2, ['left', 'center'], f"two-zone-{zones_str}"
-        elif set(active_zones) == {'center', 'right'}:
-            return 2, ['center', 'right'], f"two-zone-{zones_str}"
-        elif set(active_zones) == {'left', 'right'}:
-            return 2, ['left', 'right'], f"two-zone-{zones_str}"
-
-    else:  # 3 active zones
-        left_score = zone_scores['left']
-        center_score = zone_scores['center']
-        right_score = zone_scores['right']
-
-        avg_outer = (left_score + right_score) / 2
-        if center_score > avg_outer * 2.0:
-            return 1, ['center'], "center-dominant"
-
-        return 3, ['left', 'center', 'right'], "three-zone-full"
-
-    return 2, ['left', 'right'], "default-two-zone"
-
-# ===== END OF NEW FUNCTIONS =====
-
+            print(f"   🎯 Balanced action across zones - cropping all three")
+            return 3, ['left', 'center', 'right'], "balanced-three-zone-actions"
+        
 def get_pose_center_target(keypoints, box):
     """
     Calculate optimal crop center based on pose keypoints.
@@ -958,34 +1244,138 @@ class MultiActionTracker:
         self.missing_counters = [0] * max_actions
 
     def update(self, boxes, frame_shape, frame_idx, crop_count=3):
-        """Update tracker with boxes, crop_count determines active slots"""
+        """
+        Update tracker with boxes, crop_count determines active slots.
+        
+        FIXED: Properly maps zone assignments to action indices
+        """
         h, w = frame_shape[:2]
 
+        # Define active indices based on crop count
         active_indices = []
         if crop_count == 3:
             active_indices = [0, 1, 2]
         elif crop_count == 2:
             active_indices = [0, 2]
-
-        if len(boxes) > crop_count:
-            boxes_sorted = sorted(boxes, key=lambda b: (b[0] + b[2]) / 2)
-
-            if crop_count == 2:
-                if len(boxes_sorted) >= 2:
-                    boxes = [boxes_sorted[0], boxes_sorted[-1]]
+        elif crop_count == 1:
+            active_indices = [0]
+        
+        # ========================================
+        # ZONE-BASED ASSIGNMENT
+        # ========================================
+        
+        # Define zones based on crop count
+        if crop_count == 3:
+            # Left, Middle, Right zones
+            zone_width = w / 3
+            zones = [
+                (0, zone_width),                    # Left zone
+                (zone_width, 2 * zone_width),       # Middle zone  
+                (2 * zone_width, w)                 # Right zone
+            ]
+            zone_names = ['left', 'middle', 'right']
+            zone_to_action = {0: 0, 1: 1, 2: 2}  # Direct mapping
+            
+        elif crop_count == 2:
+            # Left and Right zones (no middle)
+            half_width = w / 2
+            zones = [
+                (0, half_width),                    # Left zone
+                (half_width, w)                     # Right zone
+            ]
+            zone_names = ['left', 'right']
+            zone_to_action = {0: 0, 1: 2}  # Zone 0→Action 0, Zone 1→Action 2
+            
+        else:  # crop_count == 1
+            zones = [(0, w)]
+            zone_names = ['full']
+            zone_to_action = {0: 0}
+        
+        # Assign each detected box to its nearest zone
+        assigned_boxes = [None] * len(zones)
+        
+        if len(boxes) > 0:
+            for box in boxes:
+                box_center_x = (box[0] + box[2]) / 2
+                
+                # Find which zone this box belongs to
+                best_zone_idx = 0
+                min_distance = float('inf')
+                
+                for zone_idx, (zone_start, zone_end) in enumerate(zones):
+                    zone_center = (zone_start + zone_end) / 2
+                    distance = abs(box_center_x - zone_center)
+                    
+                    # Check if box center is actually IN this zone (preference)
+                    in_zone = zone_start <= box_center_x <= zone_end
+                    
+                    if in_zone:
+                        # If in zone, prioritize it
+                        distance = distance * 0.5  # Make it more attractive
+                    
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_zone_idx = zone_idx
+                
+                # Assign box to the best zone
+                # If zone already has a box, keep the one closer to zone center
+                if assigned_boxes[best_zone_idx] is None:
+                    assigned_boxes[best_zone_idx] = box
                 else:
-                    boxes = boxes_sorted
-            else:
-                boxes = boxes_sorted[:crop_count]
-        else:
-            boxes_sorted = sorted(boxes, key=lambda b: (b[0] + b[2]) / 2)
-            boxes = boxes_sorted
-
-        boxes = prevent_overlap(boxes, w)
-
+                    # Compare which box is better for this zone
+                    existing_box = assigned_boxes[best_zone_idx]
+                    existing_center_x = (existing_box[0] + existing_box[2]) / 2
+                    new_center_x = box_center_x
+                    
+                    zone_start, zone_end = zones[best_zone_idx]
+                    zone_center = (zone_start + zone_end) / 2
+                    
+                    existing_dist = abs(existing_center_x - zone_center)
+                    new_dist = abs(new_center_x - zone_center)
+                    
+                    # Keep the box closer to zone center
+                    if new_dist < existing_dist:
+                        assigned_boxes[best_zone_idx] = box
+        
+        # Debug: Show zone assignments
+        if frame_idx % 60 == 0:
+            print(f"\n🎯 Frame {frame_idx} Zone Assignments:")
+            for idx, (box, zone_name) in enumerate(zip(assigned_boxes, zone_names)):
+                if box:
+                    box_center_x = (box[0] + box[2]) / 2
+                    print(f"   {zone_name.capitalize()}: box at x={box_center_x:.0f}")
+                else:
+                    print(f"   {zone_name.capitalize()}: NO DETECTION")
+        
+        # ========================================
+        # CRITICAL FIX: Map zone boxes to action indices
+        # ========================================
+        action_boxes = [None] * self.max_actions
+        for zone_idx, box in enumerate(assigned_boxes):
+            action_idx = zone_to_action[zone_idx]
+            action_boxes[action_idx] = box
+        
+        # Use the properly mapped boxes
+        boxes = action_boxes
+        
+        # ========================================
+        # Prevent overlap
+        # ========================================
+        # Only prevent overlap for active boxes
+        active_boxes = [boxes[i] for i in active_indices]
+        active_boxes = prevent_overlap(active_boxes, w)
+        
+        # Put them back in the correct positions
         for i, action_idx in enumerate(active_indices):
-            if i < len(boxes):
-                box = boxes[i]
+            if i < len(active_boxes):
+                boxes[action_idx] = active_boxes[i]
+        
+        # ========================================
+        # Update tracking for each active action
+        # ========================================
+        for action_idx in active_indices:
+            if boxes[action_idx] is not None:
+                box = boxes[action_idx]
                 box = self._fine_tune_box(box, action_idx, (h, w))
                 self.histories[action_idx].append(box)
                 self.confidences[action_idx] = min(self.confidences[action_idx] + 1, 10)
@@ -993,6 +1383,9 @@ class MultiActionTracker:
             else:
                 self.missing_counters[action_idx] += 1
 
+        # ========================================
+        # Lock actions when confirmed
+        # ========================================
         for action_idx in active_indices:
             if (not self.actions_confirmed[action_idx] and 
                 self.confidences[action_idx] >= 8 and 
@@ -1003,6 +1396,7 @@ class MultiActionTracker:
                 print(f"🎯 Locked Action {action_idx+1} at position {action_idx}")
 
         return self._get_current_regions(h, w, crop_count)
+
 
     def _fine_tune_box(self, box, action_idx, frame_shape):
         h, w = frame_shape
@@ -1244,68 +1638,83 @@ class MultiActionDetector:
 
         return prevent_overlap(final_actions, w)
 
-    def _get_fallback(self, action_idx, frame_shape):
+    def _get_fallback(self, action_idx, frame_shape, positions=None, crop_count=3):
+        """
+        Improved fallback that respects the actual crop positions strategy.
+        
+        Args:
+            action_idx: Which action slot (0, 1, 2)
+            frame_shape: (h, w) tuple
+            positions: Actual positions being used (e.g., ['left', 'right'])
+            crop_count: How many crops total
+        """
         h, w = frame_shape
         
         print(f"⚠️ FALLBACK USED for action {action_idx}! missing_counter={self.missing_counters[action_idx]}")
+        print(f"   Positions: {positions}, Crop count: {crop_count}")
 
-        # IMPROVED: Use last good action with longer persistence
-        if (self.last_good_actions[action_idx] is not None and 
-            self.missing_counters[action_idx] < MAX_MISSING_FRAMES):
-            # Only warn if missing many frames
-            if self.missing_counters[action_idx] > 15:
-                print(f"  ⚠️ Using last good box for action {action_idx} (missing {self.missing_counters[action_idx]} frames)")
-            return self.last_good_actions[action_idx]
+        # If we have positions info, use it to map action_idx to actual position
+        actual_position = None
+        if positions and action_idx < len(positions):
+            actual_position = positions[action_idx]
         
-        # IMPROVED: If we have history, use median of recent boxes
-        if len(self.motion_histories[action_idx]) >= 3:
-            recent = list(self.motion_histories[action_idx])[-5:]
-            x1s = [b[0] for b in recent]
-            y1s = [b[1] for b in recent]
-            x2s = [b[2] for b in recent]
-            y2s = [b[3] for b in recent]
-            median_box = (
-                int(np.median(x1s)),
-                int(np.median(y1s)),
-                int(np.median(x2s)),
-                int(np.median(y2s))
-            )
-            if self.missing_counters[action_idx] > 15:
-                print(f"  📊 Using median of history for action {action_idx}")
-            return median_box
-
-        # LAST RESORT: Create default box
-        if self.missing_counters[action_idx] > 15:
-            print(f"  🆕 Creating new fallback box for action {action_idx}")
+        # Determine vertical position based on whether it's likely head/upper body
+        default_size = int(min(h, w) // 2.5)
         
-        # IMPROVED: Make default boxes larger and better positioned for heads
-        default_size = int(min(h, w) // 2.5)  # Larger than before (was // 3)
+        # Head-focused crops should be higher in frame
+        if actual_position and self._is_head_focused(actual_position):
+            vertical_offset = int(h * 0.35)  # Higher for heads
+        else:
+            vertical_offset = int(h * 0.45)  # Standard
         
-        # Position boxes with more vertical space (not perfectly centered)
-        # This helps capture mouth/chin area for tilted heads
-        vertical_offset = int(h * 0.45)  # Start at 45% from top (slightly higher than middle)
-        
-        if action_idx == 0:
+        # Map position to actual screen location
+        if actual_position == 'left':
             return (
                 int(w//8), 
                 vertical_offset,
                 int(w//8 + default_size), 
                 vertical_offset + default_size
             )
-        elif action_idx == 1:
+        elif actual_position == 'center' or actual_position == 'middle':
             return (
                 int(w//2 - default_size//2), 
                 vertical_offset,
                 int(w//2 + default_size//2), 
                 vertical_offset + default_size
             )
-        else:
+        elif actual_position == 'right':
             return (
                 int(w*7//8 - default_size), 
                 vertical_offset,
                 int(w*7//8), 
                 vertical_offset + default_size
             )
+        
+        # Fallback to old logic if no position info
+        print(f"⚠️ No position info for fallback idx={action_idx}")
+        return self._get_legacy_fallback(action_idx, frame_shape)
+
+    def _is_head_focused(self, position):
+        """Check if this crop should focus on head/upper body."""
+        # You might want to track this per position
+        # For now, assume all are head-focused
+        return True
+
+    def _get_legacy_fallback(self, action_idx, frame_shape):
+        """Original fallback logic for compatibility."""
+        h, w = frame_shape
+        default_size = int(min(h, w) // 2.5)
+        vertical_offset = int(h * 0.45)
+        
+        if action_idx == 0:
+            return (int(w//8), vertical_offset, int(w//8 + default_size), 
+                    vertical_offset + default_size)
+        elif action_idx == 1:
+            return (int(w//2 - default_size//2), vertical_offset,
+                    int(w//2 + default_size//2), vertical_offset + default_size)
+        else:
+            return (int(w*7//8 - default_size), vertical_offset,
+                    int(w*7//8), vertical_offset + default_size)
 
 class MultiSmoother:
     def __init__(self, num_actions=3, window_size=8):
@@ -1367,48 +1776,49 @@ def safe_crop(frame, box, action_idx=0, default_scale=0.25):
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     
+    # REDUCE MINIMUM DIMENSIONS for head-focused crops
+    # Check if this looks like a head crop (based on aspect ratio)
     original_box_w = x2 - x1
     original_box_h = y2 - y1
     
-    # Check if this looks like a head/portrait crop
+    # If it's a portrait-oriented box, it might be head-focused
     is_portrait = original_box_h > original_box_w * 1.2
     
     if is_portrait:
-        # For head crops, use smaller minimums but ensure we capture face
-        min_width = int(w * 0.22)   # Even smaller to preserve original crop
-        min_height = int(h * 0.25)  # Smaller to preserve original crop
+        # For head crops, allow smaller minimums
+        min_width = int(w * 0.25)  # Reduced from 0.30
+        min_height = int(h * 0.28)  # Reduced from 0.30
     else:
         # For regular crops, use standard minimums
         min_width = int(w * 0.30)
-        min_height = int(w * 0.30)
+        min_height = int(h * 0.30)
     
     box_w = x2 - x1
     box_h = y2 - y1
     
     # Only enforce minimums if box is REALLY small
-    if box_w < min_width and box_w < w * 0.15:  # More lenient threshold
+    if box_w < min_width and box_w < w * 0.2:  # Only expand if very small
         cx = (x1 + x2) // 2
         x1 = int(max(0, cx - min_width//2))
         x2 = int(min(w, cx + min_width//2))
         box_w = x2 - x1
     
-    if box_h < min_height and box_h < h * 0.15:  # More lenient threshold
+    if box_h < min_height and box_h < h * 0.2:  # Only expand if very small
         cy = (y1 + y2) // 2
         y1 = int(max(0, cy - min_height//2))
         y2 = int(min(h, cy + min_height//2))
         box_h = y2 - y1
     
-    # IMPROVED: More lenient aspect ratio for tilted heads
+    # Make aspect ratio requirements more lenient
     aspect_ratio = box_w / max(box_h, 1)
     
-    # Only fix extreme aspect ratios
-    if aspect_ratio > 2.5:  # Very wide
-        target_h = int(box_w / 1.5)
+    if aspect_ratio > 2.0:  # Too wide
+        target_h = int(box_w / 1.2)  # More lenient than 1.5
         cy = (y1 + y2) // 2
         y1 = int(max(0, cy - target_h//2))
         y2 = int(min(h, cy + target_h//2))
-    elif aspect_ratio < 0.3:  # Very tall - even more lenient
-        target_w = int(box_h * 0.6)
+    elif aspect_ratio < 0.4:  # More lenient than 0.5 (allow taller boxes)
+        target_w = int(box_h * 0.7)  # More lenient than 0.8
         cx = (x1 + x2) // 2
         x1 = int(max(0, cx - target_w//2))
         x2 = int(min(w, cx + target_w//2))
@@ -1424,36 +1834,119 @@ def safe_crop(frame, box, action_idx=0, default_scale=0.25):
     
     return frame[y1:y2, x1:x2]
 
-def expand_box(box, frame_shape, action_idx=0, margin=0.2, is_fallback=False):
+def expand_box(box, frame_shape, frame_count, action_idx=0, margin=0.2, is_fallback=False):
     if box is None:
         print(f"DEBUG: expand_box called with None for action_idx={action_idx}")
-        return None
+        # Only create a new box if the input is None
+        h, w = frame_shape[:2]
+        default_size = int(min(h, w) // 2.5)
+        vertical_offset = int(h * 0.45)
+        
+        if action_idx == 0:
+            return (
+                int(w//8), 
+                vertical_offset,
+                int(w//8 + default_size), 
+                vertical_offset + default_size
+            )
+        elif action_idx == 1:
+            return (
+                int(w//2 - default_size//2), 
+                vertical_offset,
+                int(w//2 + default_size//2), 
+                vertical_offset + default_size
+            )
+        else:
+            return (
+                int(w*7//8 - default_size), 
+                vertical_offset,
+                int(w*7//8), 
+                vertical_offset + default_size
+            )
     
+    # ✅ ACTUALLY EXPAND THE GIVEN BOX
     h, w = frame_shape[:2]
     x1, y1, x2, y2 = map(int, box)
     
-    bw, bh = x2 - x1, y2 - y1
-    
-    # If this is a fallback box, use generous expansion to start with a good size
+    # ✅ Use FALLBACK_BOX_EXPANSION if is_fallback is True
     if is_fallback:
-        margin = 0.50  # Fallback boxes need more initial padding
+        margin = FALLBACK_BOX_EXPANSION
     
-    # Expansion for all boxes
+    # DEBUG
+    if frame_count % 30 == 0 and is_fallback:
+        print(f"DEBUG expand_box: Frame {frame_count}, idx={action_idx}, margin={margin:.2f}")
+        print(f"  Original: ({x1}, {y1}, {x2}, {y2}) size: {x2-x1}x{y2-y1}")
+    
+    # Calculate expansion amounts
+    bw, bh = x2 - x1, y2 - y1
     ew = int(bw * margin)
     eh = int(bh * margin)
     
-    # Cap expansion to reasonable limit
-    max_expand = min(bw, bh) * 0.8
-    ew = min(ew, int(max_expand))
-    eh = min(eh, int(max_expand))
+    # DEBUG - Show raw expansion before clipping
+    if frame_count % 30 == 0 and is_fallback:
+        print(f"  Raw expansion: {ew} horizontal, {eh} vertical")
     
-    x1 = int(max(0, x1 - ew))
-    y1 = int(max(0, y1 - eh))
-    x2 = int(min(w, x2 + ew))
-    y2 = int(min(h, y2 + eh))
+    # Cap expansion to ensure box stays within frame
+    max_left_expansion = x1  # Can't go more left than 0
+    max_right_expansion = w - x2  # Can't go more right than w
     
-    return (x1, y1, x2, y2)
-
+    # For boxes near edges, distribute expansion more evenly
+    if action_idx == 0:  # Left crop
+        # Left box: more expansion on right side, less on left
+        left_exp = min(ew // 3, max_left_expansion)
+        right_exp = min(ew, max_right_expansion)
+        if frame_count % 30 == 0 and is_fallback:
+            print(f"  Left crop: left_exp={left_exp}, right_exp={right_exp}")
+    elif action_idx == 2:  # Right crop
+        # Right box: more expansion on left side, less on right
+        left_exp = min(ew, max_left_expansion)
+        right_exp = min(ew // 3, max_right_expansion)
+        if frame_count % 30 == 0 and is_fallback:
+            print(f"  Right crop: left_exp={left_exp}, right_exp={right_exp}")
+            print(f"  Distance to right edge: {w - x2}px, max_right_expansion={max_right_expansion}")
+    else:  # Middle crop
+        # Middle box: equal expansion both sides
+        left_exp = min(ew // 2, max_left_expansion)
+        right_exp = min(ew // 2, max_right_expansion)
+        if frame_count % 30 == 0 and is_fallback:
+            print(f"  Middle crop: left_exp={left_exp}, right_exp={right_exp}")
+    
+    # Same for vertical expansion
+    max_top_expansion = y1
+    max_bottom_expansion = h - y2
+    top_exp = min(eh // 2, max_top_expansion)
+    bottom_exp = min(eh // 2, max_bottom_expansion)
+    
+    # Apply the expansion
+    x1_new = int(max(0, x1 - left_exp))
+    x2_new = int(min(w, x2 + right_exp))
+    y1_new = int(max(0, y1 - top_exp))
+    y2_new = int(min(h, y2 + bottom_exp))
+    
+    # DEBUG - Show after expansion
+    if frame_count % 30 == 0 and is_fallback:
+        print(f"  After expansion: ({x1_new}, {y1_new}, {x2_new}, {y2_new}) size: {x2_new-x1_new}x{y2_new-y1_new}")
+    
+    # Ensure minimum size for all boxes
+    min_width = int(w * 0.3)
+    min_height = int(h * 0.3)
+    
+    if (x2_new - x1_new) < min_width:
+        center_x = (x1_new + x2_new) // 2
+        x1_new = max(0, center_x - min_width // 2)
+        x2_new = min(w, center_x + min_width // 2)
+        if frame_count % 30 == 0 and is_fallback:
+            print(f"  Adjusted width to minimum: {min_width}")
+    
+    if (y2_new - y1_new) < min_height:
+        center_y = (y1_new + y2_new) // 2
+        y1_new = max(0, center_y - min_height // 2)
+        y2_new = min(h, center_y + min_height // 2)
+        if frame_count % 30 == 0 and is_fallback:
+            print(f"  Adjusted height to minimum: {min_height}")
+    
+    return (x1_new, y1_new, x2_new, y2_new)
+    
 def pad_to_size(crop, target_size, color=(0, 0, 0)):
     target_w, target_h = target_size
 
@@ -1533,8 +2026,115 @@ def has_good_tracking_quality(detector, action_idx: int) -> bool:
     return len(history) >= 5 and missing < 10
 
 
+def visualize_crop_process(frame, frame_idx, yolo_boxes, expanded_boxes, smoothed_boxes, 
+                          final_boxes, action_statuses, positions, debug_info=None):
+    """
+    Create debug visualization showing the crop process step by step.
+    
+    Args:
+        frame: Original frame
+        frame_idx: Frame number
+        yolo_boxes: Original YOLO detections (RED)
+        expanded_boxes: Expanded boxes after margin application (YELLOW)
+        smoothed_boxes: Smoothed boxes after temporal filtering (GREEN)
+        final_boxes: Final crop regions (BLUE for good tracking, MAGENTA for fallback)
+        action_statuses: Status for each action (for coloring)
+        positions: Position names (left, middle, right)
+        debug_info: Additional debug information
+    """
+    # Create a copy of the frame for visualization
+    vis_frame = frame.copy()
+    
+    # 1. Draw original YOLO detections (RED)
+    for i, box in enumerate(yolo_boxes):
+        if box:
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(vis_frame, f"YOLO {i}", (x1, max(20, y1-5)), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    
+    # 2. Draw expanded boxes (YELLOW)
+    for i, box in enumerate(expanded_boxes):
+        if box:
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            cv2.putText(vis_frame, f"Exp {i}", (x1, max(40, y1-25)), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    
+    # 3. Draw smoothed boxes (GREEN)
+    for i, box in enumerate(smoothed_boxes):
+        if box:
+            x1, y1, x2, y2 = map(int, box)
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(vis_frame, f"Smoothed {i}", (x1, max(60, y1-45)), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    
+    # 4. Draw final crop regions with status-based colors
+    for i, (box, status) in enumerate(zip(final_boxes, action_statuses)):
+        if box:
+            x1, y1, x2, y2 = map(int, box)
+            
+            # Choose color based on tracking status
+            if status in ["FRESH_DETECTION", "TRACKED-good"]:
+                color = (255, 0, 0)  # BLUE for good tracking
+            elif status in ["PURE_FALLBACK", "FRESH_FALLBACK", "TRACKED-poor"]:
+                color = (255, 0, 255)  # MAGENTA for fallback
+            else:
+                color = (255, 255, 255)  # WHITE for unknown
+            
+            # Draw thicker box for final crop
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 3)
+            
+            # Add position and status text
+            position = positions[i] if i < len(positions) else f"Pos{i}"
+            status_text = status.replace("_", " ")
+            cv2.putText(vis_frame, f"{position}: {status_text}", 
+                       (x1, max(80, y1-65)), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            # Draw center point
+            center_x = (x1 + x2) // 2
+            center_y = (y1 + y2) // 2
+            cv2.circle(vis_frame, (center_x, center_y), 5, color, -1)
+    
+    # Add frame info overlay
+    h, w = frame.shape[:2]
+    info_y = 30
+    
+    # Create semi-transparent overlay for text
+    overlay = vis_frame.copy()
+    cv2.rectangle(overlay, (10, 10), (w-10, 130), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, vis_frame, 0.4, 0, vis_frame)
+    
+    # Add debug information
+    cv2.putText(vis_frame, f"Frame: {frame_idx}", (20, info_y), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
+    if debug_info:
+        for j, (key, value) in enumerate(debug_info.items()):
+            cv2.putText(vis_frame, f"{key}: {value}", (20, info_y + 30 + j*25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Add legend
+    legend_y = h - 150
+    legend_items = [
+        ("RED", (0, 0, 255), "YOLO Detection"),
+        ("YELLOW", (0, 255, 255), "Expanded Box"),
+        ("GREEN", (0, 255, 0), "Smoothed Box"),
+        ("BLUE", (255, 0, 0), "Good Tracking"),
+        ("MAGENTA", (255, 0, 255), "Fallback"),
+    ]
+    
+    for i, (label, color, desc) in enumerate(legend_items):
+        cv2.rectangle(vis_frame, (20, legend_y + i*25 - 15), (50, legend_y + i*25 + 5), color, -1)
+        cv2.putText(vis_frame, f"{desc}", (60, legend_y + i*25), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    return vis_frame
+
+
 def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop_count, positions_override=None):
-    """Process video with dynamic number of crops (2 or 3) with ROI detection"""
+    """Process video with dynamic number of crops (2 or 3) with ROI detection and debug visualization"""
     # Use override positions if provided, otherwise use default
     if positions_override:
         positions = positions_override
@@ -1559,6 +2159,13 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
             print("   Continuing without pose-based ROI detection")
 
     base_name = os.path.splitext(os.path.basename(input_path))[0]
+    
+    # Create debug folder for this video if debug mode is enabled
+    debug_video_folder = None
+    if DEBUG_MODE:
+        debug_video_folder = os.path.join(DEBUG_OUTPUT_FOLDER, base_name)
+        os.makedirs(debug_video_folder, exist_ok=True)
+        print(f"📊 Debug visualization enabled: {debug_video_folder}")
 
     output_files = []
     for position in positions:
@@ -1584,7 +2191,12 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
         writer = cv2.VideoWriter(output_path, fourcc, fps, TARGET_SIZE)
         writers.append(writer)
 
+    # NEW: Create debug video writer
+    debug_writer = None
+    debug_path = None
+
     frame_count = 0
+    debug_sample_count = 0
     print(f"📹 Processing with synchronized {position_text} (ROI detection: {'ON' if USE_ROI_DETECTION else 'OFF'})...")
 
     while True:
@@ -1592,13 +2204,44 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
         if not ret:
             break
 
+        # Initialize debug video writer on first frame
+        if DEBUG_MODE and DEBUG_CREATE_VIDEOS and debug_writer is None:
+            h, w = frame.shape[:2]
+            os.makedirs(DEBUG_VIDEO_FOLDER, exist_ok=True)
+            debug_writer, debug_path = create_debug_video_writer(
+                input_path, DEBUG_VIDEO_FOLDER, fps, (h, w)
+            )
+            print(f"📹 Creating debug video: {os.path.basename(debug_path)}")
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Get YOLO detections for debug visualization
+        yolo_boxes = []
+        if DEBUG_MODE and debug_sample_count < DEBUG_SAMPLES:
+            result = yolo_model.predict(rgb, conf=PERSON_DETECTION_CONF_TRACKING, classes=[0], verbose=False)
+            for r in result:
+                for b in r.boxes:
+                    x1, y1, x2, y2 = map(int, b.xyxy[0])
+                    box_w, box_h = x2 - x1, y2 - y1
+                    area = box_w * box_h
+                    frame_area = frame.shape[0] * frame.shape[1]
+                    aspect = box_w / box_h if box_h > 0 else 1
+                    
+                    if (0.02 < area / frame_area < 0.5 and 0.5 < aspect < 2.0):
+                        yolo_boxes.append((x1, y1, x2, y2))
         
         # Detect actions with ROI-based detector
         actions = detector.detect(rgb, yolo_model, crop_count, pose_model, detector.roi_detector)
-        
+        print(f"DEBUG Frame {frame_count}: actions returned = {actions}")
+        print(f"  missing_counters = {detector.missing_counters}")
+        print(f"  last_good_actions = {detector.last_good_actions}")
+
+
         expanded_actions = []
         action_indices = []
+        action_statuses = []  # Track status for each action
+        
+        # ✅ FIXED: Determine action indices OUTSIDE the loop
         if crop_count == 3:
             action_indices = [0, 1, 2]
         elif crop_count == 2:
@@ -1612,113 +2255,159 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
             else:
                 action_indices = [0, 2]  # Default fallback
         
-            for i, action_idx in enumerate(action_indices):
-                # ──── 1. Determine source of the box & tracking quality ────
-                if i < len(actions) and actions[i] is not None:
-                    # We have a current-frame detection
-                    current_box = actions[i]
+        # ✅ FIXED: Main processing loop
+        for i, action_idx in enumerate(action_indices):
+            if i < len(actions) and actions[i] is not None:
+                current_box = actions[i]
+                missing = detector.missing_counters[action_idx] if action_idx < len(detector.missing_counters) else 0
+                hist_len = len(detector.motion_histories[action_idx]) if action_idx < len(detector.motion_histories) else 0
+                pose_activity = detector.pose_activities[action_idx] if action_idx < len(detector.pose_activities) else 0.0
+                history = detector.motion_histories[action_idx] if action_idx < len(detector.motion_histories) else deque(maxlen=10)
+                
+                # ✅ FIXED LOGIC: Determine status based on missing counter
+                # missing == 0 means we have a REAL FRESH detection from YOLO
+                # missing > 0 means we're using a tracked/fallback box
+                
+                if missing == 0:
+                    # We have a fresh detection from YOLO!
+                    status = "FRESH_DETECTION"
+                    use_fallback_expansion = False
                     
-                    missing = detector.missing_counters[action_idx]
-                    hist_len = len(detector.motion_histories[action_idx])
-                    
-                    if missing == 0:
-                        # Fresh detection this frame → most trustworthy
-                        status = "FRESH"
-                        adaptive_margin = calculate_motion_expansion(
-                            current_box,
-                            detector.motion_histories[action_idx],
-                            base_margin=BOX_EXPANSION,
-                            pose_activity=detector.pose_activities[action_idx]
-                        )
-                        use_fallback_expansion = False
-                        
-                    else:
-                        # Using previous track (missing > 0)
-                        if missing <= 8 and hist_len >= 5:
-                            # Reasonable recent history → still trust somewhat
-                            status = f"TRACKED-ok (miss={missing})"
-                            adaptive_margin = calculate_motion_expansion(
-                                current_box,
-                                detector.motion_histories[action_idx],
-                                base_margin=BOX_EXPANSION * 0.7,     # ← slightly conservative
-                                pose_activity=detector.pose_activities[action_idx]
-                            )
-                            use_fallback_expansion = False
-                        else:
-                            # Long missing or almost no history → be very careful
-                            status = f"TRACKED-poor (miss={missing}, hist={hist_len})"
-                            adaptive_margin = 0.0
-                            use_fallback_expansion = True
-                            
-                else:
-                    # No detection at all this frame
-                    status = "PURE_FALLBACK"
-                    fallback_box = detector._get_fallback(action_idx, frame.shape[:2])
-                    
-                    if fallback_box is None:
-                        expanded_actions.append(None)
-                        if frame_count % 60 == 0:
-                            print(f"  F {frame_count} | idx={action_idx} | {status} → NO BOX")
-                        continue
-                        
-                    current_box = fallback_box
-                    adaptive_margin = 0.4          # moderate value for blind fallback
-                    use_fallback_expansion = True
-
-                # ──── 2. Debug print (only occasionally) ────
-                if frame_count % 45 == 0:
-                    miss = detector.missing_counters[action_idx] if action_idx < len(detector.missing_counters) else -1
-                    hist = len(detector.motion_histories[action_idx]) if action_idx < len(detector.motion_histories) else 0
-                    print(f"  F {frame_count} | idx={action_idx} | miss={miss:2d} | hist={hist:2d} | {status:16} | margin={adaptive_margin:.3f}")
-
-                # ──── 3. Actually expand the box ────
-                expanded = expand_box(
-                    current_box,
-                    frame.shape,
-                    action_idx=action_idx,
-                    margin=adaptive_margin,
-                    is_fallback=use_fallback_expansion
-                )
-                expanded_actions.append(expanded)
-            else:
-                # Pure fallback
-                h_tmp, w_tmp = frame.shape[:2]
-                fallback_box = detector._get_fallback(action_idx, (h_tmp, w_tmp))
-                if fallback_box:
-                    expanded = expand_box(
-                        fallback_box,
-                        frame.shape,
-                        action_idx=action_idx,
-                        margin=0.5,  # Pure fallback gets 0.5
-                        is_fallback=True
+                    # Use small expansion for fresh detections
+                    adaptive_margin = calculate_motion_expansion(
+                        current_box, history, 
+                        base_margin=BOX_EXPANSION,  # 0.20
+                        pose_activity=pose_activity
                     )
-                    expanded_actions.append(expanded)
+                    
+                elif missing > 0 and missing <= 8 and hist_len >= 5:
+                    # TRACKED with good history
+                    status = "TRACKED-good"
+                    use_fallback_expansion = False
+                    adaptive_margin = BOX_EXPANSION  # 0.20
+                    
                 else:
-                    expanded_actions.append(None)
-      
+                    # POOR tracking or stale (missing > 8 or low history)
+                    status = "TRACKED-poor"
+                    use_fallback_expansion = True
+                    adaptive_margin = FALLBACK_BOX_EXPANSION  # 0.50
+                    
+            else:
+                # ✅ PURE FALLBACK - no box from detector at all
+                status = "PURE_FALLBACK"
+                current_box = detector._get_fallback(
+                    action_idx, 
+                    frame.shape[:2],
+                    positions=positions,
+                    crop_count=crop_count
+                )
+                adaptive_margin = FALLBACK_BOX_EXPANSION  # 0.50
+                use_fallback_expansion = True
+                
+                # Create dummy history for the fallback box
+                history = deque(maxlen=10)
+                history.append(current_box)
+
+            # Store status for visualization
+            action_statuses.append(status)
+            
+            # ──── Debug print (only occasionally) ────
+            if frame_count % 45 == 0:
+                miss = detector.missing_counters[action_idx] if action_idx < len(detector.missing_counters) else -1
+                hist = len(detector.motion_histories[action_idx]) if action_idx < len(detector.motion_histories) else 0
+                print(f"  F {frame_count} | idx={action_idx} | miss={miss:2d} | hist={hist:2d} | {status:16} | margin={adaptive_margin:.3f}")
+
+            # ──── Actually expand the box ────
+            expanded = expand_box(
+                current_box,
+                frame.shape,
+                frame_count,
+                action_idx=action_idx,
+                margin=adaptive_margin,
+                is_fallback=use_fallback_expansion
+            )
+            expanded_actions.append(expanded)
+            
+        # ✅ FIXED: This is now outside the loop, as it should be
         h, w = frame.shape[:2]
         expanded_actions = prevent_overlap(expanded_actions, w)
         
         smoothed_actions = smoother.smooth(*expanded_actions)
+                
+        # NEW: Write debug frame
+        if DEBUG_MODE and DEBUG_CREATE_VIDEOS and debug_writer:
+            debug_info = {
+                "Crop Count": crop_count,
+                "Positions": ", ".join(positions),
+                "Target": f"{TARGET_SIZE[0]}x{TARGET_SIZE[1]}"
+            }
+            
+            debug_frame = create_enhanced_debug_frame(
+                frame, frame_count, yolo_boxes, expanded_actions,
+                smoothed_actions, smoothed_actions, action_statuses,
+                positions, detector, debug_info
+            )
+            
+            if DEBUG_VIDEO_SIDE_BY_SIDE:
+                combined_frame = create_side_by_side_frame(frame.copy(), debug_frame)
+                debug_writer.write(combined_frame)
+            else:
+                debug_writer.write(debug_frame)
+
+        # Save debug visualization for first few samples
+        if DEBUG_MODE and debug_sample_count < DEBUG_SAMPLES and frame_count % 30 == 0:
+            # Create debug info dictionary
+            debug_info = {
+                "Crop Count": crop_count,
+                "Positions": ", ".join(positions),
+                "Frame": f"{frame_count}/{total_frames}",
+                "Target Size": f"{TARGET_SIZE[0]}x{TARGET_SIZE[1]}"
+            }
+            
+            # Create visualization - pass all required parameters
+            vis_frame = visualize_crop_process(
+                frame, frame_count, yolo_boxes, expanded_actions, 
+                smoothed_actions, smoothed_actions, action_statuses, 
+                positions, debug_info
+            )
+            
+            # Save debug image
+            debug_filename = f"{base_name}_frame_{frame_count:06d}_debug.jpg"
+            debug_path = os.path.join(debug_video_folder, debug_filename)
+            cv2.imwrite(debug_path, vis_frame)
+            
+            print(f"📸 Saved debug visualization: {debug_filename}")
+            debug_sample_count += 1
+            
+            # Also save individual crops for reference
+            for i, crop_box in enumerate(smoothed_actions):
+                if crop_box is not None and i < len(positions):
+                    crop = safe_crop(frame, crop_box, action_idx=i, default_scale=0.25)
+                    if crop is not None and crop.size > 0:
+                        crop_filename = f"{base_name}_frame_{frame_count:06d}_crop_{positions[i]}.jpg"
+                        crop_path = os.path.join(debug_video_folder, crop_filename)
+                        cv2.imwrite(crop_path, crop)
         
+        # Process each crop
         for i in range(crop_count):
-            if i < len(smoothed_actions):
+            if i < len(smoothed_actions) and smoothed_actions[i] is not None:
                 action_idx = action_indices[i] if i < len(action_indices) else i
                 crop = safe_crop(frame, smoothed_actions[i], action_idx=action_idx, default_scale=0.25)
                 
-                # FIX: Check if crop is valid
+                # ✅ ADDED: Check if crop is valid before processing
                 if crop is None or crop.size == 0:
-                    # Create a black frame as fallback
+                    print(f"⚠️ Frame {frame_count}: Empty crop for idx={action_idx}")
                     padded = np.zeros((TARGET_SIZE[1], TARGET_SIZE[0], 3), dtype=np.uint8)
                 else:
                     padded = pad_to_size(crop, TARGET_SIZE, PADDING_COLOR)
                 
                 writers[i].write(padded)
             else:
-                # No crop available - write black frame
+                # No crop available - write black frame with warning
+                if frame_count % 60 == 0:
+                    print(f"⚠️ Frame {frame_count}: No smoothed action for crop {i}")
                 padded = np.zeros((TARGET_SIZE[1], TARGET_SIZE[0], 3), dtype=np.uint8)
                 writers[i].write(padded)
-
         
         frame_count += 1
         if frame_count % 50 == 0:
@@ -1727,9 +2416,20 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
     cap.release()
     for writer in writers:
         writer.release()
+
+    # NEW: Release debug writer
+    if DEBUG_MODE and DEBUG_CREATE_VIDEOS and debug_writer:
+        debug_writer.release()
+        print(f"✅ Debug video saved: {os.path.basename(debug_path)}")
+
     
     print(f"✅ {position_text} processing complete for {os.path.basename(input_path)}!")
     print(f" Frames processed: {frame_count}")
+    
+    if DEBUG_MODE and debug_video_folder:
+        print(f"📊 Debug visualizations saved to: {debug_video_folder}")
+        print(f"📸 Debug samples captured: {debug_sample_count}")
+    
     for i, output_path in enumerate(output_files):
         position = positions[i]
         print(f" Output {position}: {os.path.basename(output_path)}")
@@ -1747,15 +2447,25 @@ def copy_video_to_output(input_path, output_folder):
     except Exception as e:
         print(f"❌ Error copying {filename}: {e}")
         return None
-
-# ===== UPDATED MAIN FUNCTION WITH ACTIVITY-BASED ZONE DETECTION =====
+    
 
 def main():
     print("🚀 Starting SMART batch video processing (Activity-Based Zone Detection)...")
     print(f"Input folder: {INPUT_FOLDER}")
     print(f"Output folder: {OUTPUT_FOLDER}")
     print(f"ROI detection: {'ENABLED' if USE_ROI_DETECTION else 'DISABLED'}")
-    print(f"Smart crop strategy: ENABLED ✨ (Activity-aware)")
+    print(f"Smart crop strategy: ENABLED ✨ (Activity-aware, fully automatic)")
+    
+    if DEBUG_MODE:
+        print(f"🔍 DEBUG MODE ENABLED - Visualizing {DEBUG_SAMPLES} samples per video")
+        print(f"📁 Debug output folder: {DEBUG_OUTPUT_FOLDER}")
+        print("🎨 Visualization colors:")
+        print("   RED (0, 0, 255) - Original YOLO detections")
+        print("   YELLOW (0, 255, 255) - Expanded boxes")
+        print("   GREEN (0, 255, 0) - Smoothed boxes")
+        print("   BLUE (255, 0, 0) - Final crop regions (good tracking)")
+        print("   MAGENTA (255, 0, 255) - Final crop regions (fallback mode)")
+        print("-" * 60)
 
     print("📦 Loading YOLO model...")
     yolo = YOLO("yolo11n.pt")
@@ -1825,42 +2535,36 @@ def main():
                 print(f"   📊 Zone distribution: Left={left_avg:.1f}, Center={center_avg:.1f}, Right={right_avg:.1f}")
 
                 # Decision logic for 4+ people scenarios
-                # Scenario 1: 3 people on left, 2 on right (or similar)
                 if left_avg >= 2.5 and right_avg >= 1.5:
                     print(f"   ↔️ Scenario: ~{left_avg:.0f} left, ~{right_avg:.0f} right - using left+right crops")
                     crop_count = 2
                     positions = ['left', 'right']
                     strategy = "4plus-left-right-split"
 
-                # Scenario 2: Strong concentration on left (3+ people)
                 elif left_avg >= 3 and left_avg > center_avg + right_avg:
                     print(f"   ⬅️ Left concentration ({left_avg:.1f} people) - single left crop")
                     crop_count = 1
                     positions = ['left']
                     strategy = "4plus-left-dominant"
 
-                # Scenario 3: Strong concentration on right (3+ people)
                 elif right_avg >= 3 and right_avg > center_avg + left_avg:
                     print(f"   ➡️ Right concentration ({right_avg:.1f} people) - single right crop")
                     crop_count = 1
                     positions = ['right']
                     strategy = "4plus-right-dominant"
 
-                # Scenario 4: People on both sides
                 elif left_avg >= 2 and right_avg >= 2:
                     print(f"   ↔️ People on both sides - left+right crops")
                     crop_count = 2
                     positions = ['left', 'right']
                     strategy = "4plus-both-sides"
 
-                # Scenario 5: Center-heavy distribution
                 elif center_avg >= 3:
                     print(f"   ⬆️ Center concentration ({center_avg:.1f} people) - center crop")
                     crop_count = 1
                     positions = ['center']
                     strategy = "4plus-center-dominant"
 
-                # Default: Use 2-crop for even distribution
                 else:
                     print(f"   ⚖️ Even distribution - default to left+right crops")
                     crop_count = 2
@@ -1869,8 +2573,9 @@ def main():
 
             else:
                 # For 2-3 people, use the existing smart strategy
+                # PASS people_count to enable smart 2-person logic
                 crop_count, positions, strategy = determine_smart_crop_strategy_v2(
-                    video_path, yolo, pose_model, sample_frames=20
+                    video_path, yolo, pose_model, sample_frames=20, people_count=people_count
                 )
                 print(f"   ✅ Strategy: {crop_count}-crop ({strategy})")
                 print(f"      Positions: {positions}")
@@ -1882,6 +2587,7 @@ def main():
             print(f"   📋 Not enough people for cropping")
 
         # STEP 3: Process or copy based on strategy
+        # Fully automatic - if crop_count is 0, copy; otherwise crop
         if crop_count >= MIN_PEOPLE_REQUIRED and len(positions) >= MIN_PEOPLE_REQUIRED:
             print(f"   🎬 Processing with {crop_count}-crop: {positions}")
             process_video_with_dynamic_crops(
@@ -1889,7 +2595,8 @@ def main():
                 positions_override=positions
             )
         else:
-            print(f"   📋 Copying {filename} as-is (strategy: {strategy})")
+            reason = "strategy" if crop_count == 0 else "people count"
+            print(f"   📋 Copying {filename} as-is (reason: {reason}, strategy: {strategy})")
             copy_video_to_output(video_path, OUTPUT_FOLDER)
 
         all_handled_videos.append(video_path)
@@ -1905,6 +2612,15 @@ def main():
 
     if all_handled_videos:
         print(f"✅ Processed {len(all_handled_videos)} video(s)")
+        
+        if DEBUG_MODE:
+            print(f"🔍 Debug visualizations saved to: {DEBUG_OUTPUT_FOLDER}")
+            for video_path in all_handled_videos:
+                base_name = os.path.splitext(os.path.basename(video_path))[0]
+                debug_folder = os.path.join(DEBUG_OUTPUT_FOLDER, base_name)
+                if os.path.exists(debug_folder):
+                    debug_files = glob.glob(os.path.join(debug_folder, "*_debug.jpg"))
+                    print(f"   {base_name}: {len(debug_files)} debug images")
 
     if all_handled_videos:
         print("\n" + "="*50)
@@ -1928,4 +2644,10 @@ def main():
     print("\n🎉 Batch processing complete!")
 
 if __name__ == "__main__":
-    main()
+    print("Script starting...")
+    try:
+        main()
+    except Exception as e:
+        print(f"\n❌ SCRIPT CRASHED: {e}")
+        import traceback
+        traceback.print_exc()
