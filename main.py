@@ -1,8 +1,11 @@
 import sys
 import os
+import subprocess
 import threading
+import time
 import yaml
 import cv2
+import re
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QLineEdit, QSpinBox,
@@ -11,67 +14,160 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from pipeline import run_highlighter
-from downloader import download_videos
+from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError
 
 
 CONFIG_FILE = "config.yaml"
 
 class DownloadWorker(QThread):
-    """Worker thread for downloading videos"""
-    finished = Signal(list)  # List of downloaded file paths
-    progress = Signal(int, int, str, str)
-    log = Signal(str)
-    cancelled = Signal()
+    """
+    Worker thread for downloading videos (with optional immediate processing after each file).
+    
+    Emits signals for:
+    - progress updates
+    - logging
+    - finished list of downloaded paths
+    - cancellation
+    - individual video processed (when immediate processing is active)
+    """
+    finished = Signal(list)              # List of downloaded file paths
+    progress = Signal(int, int, str, str)  # current, total, status, message
+    log = Signal(str)                    # log messages
+    cancelled = Signal()                 # emitted when cancelled
+    video_processed = Signal(str, dict)  # filepath, processing result dict
 
-    def __init__(self, url, save_dir, pattern):
+    # NEW: Signal to safely add items to GUI list widget from worker thread
+    add_to_file_list = Signal(str)       # emits filepath to be added
+
+    def __init__(self, url, save_dir, pattern, time_range=None, download_full=True,
+                 use_percentages=False, immediate_processing=False, max_concurrent=1,
+                 process_callback=None):
         super().__init__()
         self.url = url
         self.save_dir = save_dir
         self.pattern = pattern
-        self._cancel_flag = threading.Event()
+        self.time_range = time_range                  # (start, end) seconds or percentages
+        self.download_full = download_full
+        self.use_percentages = use_percentages
+        self.immediate_processing = immediate_processing
+        self.max_concurrent = max_concurrent
+        self.process_callback = process_callback      # called after each download if immediate_processing
+        self._cancelled = False
         self._is_running = False
+        self._download_results = []                   # store all download metadata
 
     def run(self):
         try:
             self._is_running = True
             self.log.emit(f"🚀 Starting download from: {self.url}")
-            
-            downloaded_files = download_videos(
-                search_url=self.url,
-                save_dir=self.save_dir,
-                pattern=self.pattern,
-                log_fn=self.log.emit,
-                progress_fn=lambda cur, tot, task, det: self.progress.emit(cur, tot, task, det),
-                cancel_flag=self._cancel_flag
-            )
-            
-            if self._cancel_flag.is_set():
+
+            # Decide which downloader to use
+            if self.immediate_processing:
+                try:
+                    from downloader import download_videos_with_immediate_processing
+                    use_new_downloader = True
+                except ImportError:
+                    self.log.emit("⚠️ Immediate processing module not found → falling back to standard mode")
+                    use_new_downloader = False
+            else:
+                use_new_downloader = False
+
+            def log_fn(message):
+                self.log.emit(message)
+
+            def progress_fn(current, total, status, message):
+                self.progress.emit(current, total, status, message)
+
+            # Define processing callback wrapper
+            def wrapped_process_callback(filepath, metadata):
+                if self._cancelled:
+                    return {'cancelled': True}
+
+                self.log.emit(f"🔧 Processing: {os.path.basename(filepath)}")
+
+                if self.process_callback:
+                    try:
+                        result = self.process_callback(filepath, metadata)
+                        self.log.emit(f"✅ Processed: {os.path.basename(filepath)}")
+                        # Emit signal so GUI can react (e.g. show highlight created)
+                        self.video_processed.emit(filepath, result)
+                        return result
+                    except Exception as e:
+                        self.log.emit(f"❌ Processing failed: {e}")
+                        return {'error': str(e)}
+                return {'status': 'processed'}
+
+            if use_new_downloader:
+                results = download_videos_with_immediate_processing(
+                    search_url=self.url,
+                    save_dir=self.save_dir,
+                    pattern=self.pattern,
+                    log_fn=log_fn,
+                    progress_fn=progress_fn,
+                    process_callback=wrapped_process_callback,
+                    cancel_flag=self,                           # pass self → uses .is_set() / .is_cancelled()
+                    time_range=self.time_range,
+                    download_full=self.download_full,
+                    use_percentages=self.use_percentages,
+                    max_workers=self.max_concurrent
+                )
+
+                # Collect downloaded files
+                downloaded_files = []
+                for result in results:
+                    if result.get('success') and result.get('filepath'):
+                        downloaded_files.append(result['filepath'])
+                        self._download_results.append(result)
+
+            else:
+                # Fallback / legacy path (adjust if you still have old function)
+                from downloader import download_videos  # assuming this exists
+                downloaded_files = download_videos(
+                    search_url=self.url,
+                    save_dir=self.save_dir,
+                    pattern=self.pattern,
+                    log_fn=log_fn,
+                    progress_fn=progress_fn,
+                    cancel_flag=self,
+                    time_range=self.time_range,
+                    download_full=self.download_full,
+                    use_percentages=self.use_percentages
+                )
+
+            if self._cancelled:
                 self.log.emit("⏹️ Download was cancelled")
                 self.cancelled.emit()
                 self.finished.emit([])
             else:
                 self.finished.emit(downloaded_files)
-                
+
         except Exception as e:
-            self.log.emit(f"❌ Download error: {e}")
+            self.log.emit(f"❌ Download thread error: {e}")
             import traceback
-            self.log.emit(f"Full traceback: {traceback.format_exc()}")
+            self.log.emit(traceback.format_exc())
             self.finished.emit([])
         finally:
             self._is_running = False
 
     def cancel(self):
+        """Request cancellation – called from GUI"""
         if self._is_running:
             self.log.emit("⏹️ Cancellation requested - stopping download...")
-            self._cancel_flag.set()
+            self._cancelled = True
+            # Give some time for graceful stop
             if not self.wait(5000):
-                self.log.emit("⚠️ Force terminating thread...")
+                self.log.emit("⚠️ Thread did not stop gracefully → forcing termination")
                 self.terminate()
                 self.wait()
 
     def is_cancelled(self):
-        return self._cancel_flag.is_set()
+        """Public method used by downloader module to check cancellation"""
+        return self._cancelled
 
+    def is_set(self):
+        """Compatibility alias – matches threading.Event.is_set()"""
+        return self._cancelled
+    
 class Worker(QThread):
     finished = Signal(object)
     progress = Signal(int, int, str, str)
@@ -142,6 +238,9 @@ class VideoHighlighterGUI(QWidget):
 
         layout = QVBoxLayout()
 
+        # Store video duration
+        self.current_video_duration = 0
+
         # --- File picker ---
         file_group = QGroupBox("Input Videos")
         file_layout = QVBoxLayout()
@@ -167,7 +266,6 @@ class VideoHighlighterGUI(QWidget):
         self.file_list.setMaximumHeight(120)
         file_layout.addWidget(self.file_list)
 
-        # Load saved paths if any
         saved_paths = self.config_data.get("video", {}).get("paths", [])
         if saved_paths:
             for path in saved_paths:
@@ -201,7 +299,7 @@ class VideoHighlighterGUI(QWidget):
         time_range_layout.addWidget(self.use_time_range_chk)
 
         # Video duration label
-        self.video_duration_label = QLabel("Select a video to see duration")
+        self.video_duration_label = QLabel("Set time range in percentages (0-100%) - loads actual times when video is selected")
         self.video_duration_label.setStyleSheet("color: #666; font-style: italic;")
         time_range_layout.addWidget(self.video_duration_label)
 
@@ -215,12 +313,12 @@ class VideoHighlighterGUI(QWidget):
         start_slider_layout.addWidget(QLabel("Start:"))
         self.start_time_slider = QSlider(Qt.Horizontal)
         self.start_time_slider.setMinimum(0)
-        self.start_time_slider.setMaximum(100)  # Will be updated when video is loaded
-        self.start_time_slider.setValue(0)
+        self.start_time_slider.setMaximum(100)
+        self.start_time_slider.setValue(highlights_cfg.get("range_start_pct", 0))
         self.start_time_slider.setEnabled(False)
         self.start_time_slider.valueChanged.connect(self.on_slider_changed)
-        self.start_time_label = QLabel("00:00")
-        self.start_time_label.setMinimumWidth(60)
+        self.start_time_label = QLabel("0%")
+        self.start_time_label.setMinimumWidth(80)
         self.start_time_label.setStyleSheet("font-weight: bold;")
         start_slider_layout.addWidget(self.start_time_slider, stretch=1)
         start_slider_layout.addWidget(self.start_time_label)
@@ -231,12 +329,12 @@ class VideoHighlighterGUI(QWidget):
         end_slider_layout.addWidget(QLabel("End:"))
         self.end_time_slider = QSlider(Qt.Horizontal)
         self.end_time_slider.setMinimum(0)
-        self.end_time_slider.setMaximum(100)  # Will be updated when video is loaded
-        self.end_time_slider.setValue(100)
+        self.end_time_slider.setMaximum(100)
+        self.end_time_slider.setValue(highlights_cfg.get("range_end_pct", 100))
         self.end_time_slider.setEnabled(False)
         self.end_time_slider.valueChanged.connect(self.on_slider_changed)
-        self.end_time_label = QLabel("00:00")
-        self.end_time_label.setMinimumWidth(60)
+        self.end_time_label = QLabel("100%")
+        self.end_time_label.setMinimumWidth(80)
         self.end_time_label.setStyleSheet("font-weight: bold;")
         end_slider_layout.addWidget(self.end_time_slider, stretch=1)
         end_slider_layout.addWidget(self.end_time_label)
@@ -279,8 +377,8 @@ class VideoHighlighterGUI(QWidget):
         time_range_group.setLayout(time_range_layout)
         layout.addWidget(time_range_group)
 
-        # Store video duration
-        self.current_video_duration = 0
+        # Initialize the selection info display with saved values
+        self.update_selection_info()
 
         # --- Progress Section ---
         progress_group = QGroupBox("Processing Progress")
@@ -300,42 +398,131 @@ class VideoHighlighterGUI(QWidget):
         # --- Tab 0: Download ---
         download_tab = QWidget()
         download_layout = QVBoxLayout()
-        
+
         download_group = QGroupBox("Download Videos from Website")
         download_form = QVBoxLayout()
-        
+
         # URL input
         url_layout = QHBoxLayout()
         url_layout.addWidget(QLabel("Page URL:"))
         self.download_url_input = QLineEdit()
+        self.download_url_input.setText(self.config_data.get("download", {}).get("last_url", ""))
         self.download_url_input.setPlaceholderText("https://example.com/videos")
         url_layout.addWidget(self.download_url_input)
         download_form.addLayout(url_layout)
-        
+
         # Pattern input
         pattern_layout = QHBoxLayout()
         pattern_layout.addWidget(QLabel("Link pattern:"))
-        self.download_pattern_input = QLineEdit("/video/")
+        self.download_pattern_input = QLineEdit()
+        self.download_pattern_input.setText(self.config_data.get("download", {}).get("link_pattern", "/video/"))
         self.download_pattern_input.setPlaceholderText("/video/")
         self.download_pattern_input.setToolTip("Pattern to match in video links (e.g., /video/, /watch/)")
         pattern_layout.addWidget(self.download_pattern_input)
         download_form.addLayout(pattern_layout)
-        
+
         # Save directory
         save_dir_layout = QHBoxLayout()
         save_dir_layout.addWidget(QLabel("Save directory:"))
-        self.download_save_dir_input = QLineEdit("D:\\movies")
+        self.download_save_dir_input = QLineEdit()
+        self.download_save_dir_input.setText(self.config_data.get("download", {}).get("save_dir", "D:\\movies"))
         save_dir_layout.addWidget(self.download_save_dir_input)
         self.browse_save_dir_btn = QPushButton("Browse...")
         self.browse_save_dir_btn.clicked.connect(self.browse_save_directory)
         save_dir_layout.addWidget(self.browse_save_dir_btn)
         download_form.addLayout(save_dir_layout)
-        
+
+        # Time range selection for downloads
+        time_range_group = QGroupBox("Download Time Range (Optional)")
+        time_range_layout = QVBoxLayout()
+
+        # Full download checkbox (default: unchecked = download only time range)
+        self.download_full_chk = QCheckBox("Download full video")
+        self.download_full_chk.setChecked(False)  # Default: download only time range
+        self.download_full_chk.setToolTip("When unchecked, only downloads the specified time range")
+        time_range_layout.addWidget(self.download_full_chk)
+
+        # Time range inputs
+        time_input_layout = QHBoxLayout()
+        time_input_layout.addWidget(QLabel("Start time (seconds):"))
+        self.download_start_input = QSpinBox()
+        self.download_start_input.setRange(0, 86400)  # 0 to 24 hours
+        self.download_start_input.setValue(0)
+        self.download_start_input.setEnabled(True)  # Enabled by default
+        time_input_layout.addWidget(self.download_start_input)
+
+        time_input_layout.addWidget(QLabel("End time (seconds):"))
+        self.download_end_input = QSpinBox()
+        self.download_end_input.setRange(1, 86400)  # 1 second to 24 hours
+        self.download_end_input.setValue(300)  # Default: 5 minutes
+        self.download_end_input.setEnabled(True)  # Enabled by default
+        time_input_layout.addWidget(self.download_end_input)
+
+        time_range_layout.addLayout(time_input_layout)
+
+        # Duration label
+        self.download_duration_label = QLabel("Duration: 300s (5:00)")
+        time_range_layout.addWidget(self.download_duration_label)
+
+        # Connect signals
+        self.download_start_input.valueChanged.connect(self.update_download_duration)
+        self.download_end_input.valueChanged.connect(self.update_download_duration)
+        self.download_full_chk.toggled.connect(self.on_download_full_toggle)
+
+        time_range_group.setLayout(time_range_layout)
+        download_form.addWidget(time_range_group)
+
+        # Download time range options
+        download_time_group = QGroupBox("Download Time Range")
+        download_time_layout = QVBoxLayout()
+
+        # Checkbox to use the same time range as processing
+        self.use_same_time_range_chk = QCheckBox("Use same time range as processing")
+        self.use_same_time_range_chk.setChecked(False)  # Default: download full
+        self.use_same_time_range_chk.setToolTip("When checked, downloads only the time range specified in 'Processing Time Range' section")
+        download_time_layout.addWidget(self.use_same_time_range_chk)
+
+        # Info label
+        download_time_info = QLabel("ℹ️ Unchecked: Download full videos\n   Checked: Download only selected time range")
+        download_time_info.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
+        download_time_layout.addWidget(download_time_info)
+
+        download_time_group.setLayout(download_time_layout)
+        download_form.addWidget(download_time_group)
+
         # Options
         self.auto_add_downloaded_chk = QCheckBox("Automatically add downloaded videos to file list")
-        self.auto_add_downloaded_chk.setChecked(True)
+        self.auto_add_downloaded_chk.setChecked(self.config_data.get("download", {}).get("auto_add", True))
         download_form.addWidget(self.auto_add_downloaded_chk)
-        
+
+        # Auto-process checkbox
+        self.auto_process_chk = QCheckBox("Automatically start processing after download completes")
+        self.auto_process_chk.setChecked(self.config_data.get("download", {}).get("auto_process", False))
+        self.auto_process_chk.setToolTip("When enabled, the highlighter pipeline will start automatically after videos are downloaded")
+        download_form.addWidget(self.auto_process_chk)
+
+        # Immediate processing checkbox
+        self.immediate_processing_chk = QCheckBox("Process each video immediately after download")
+        self.immediate_processing_chk.setChecked(self.config_data.get("download", {}).get("immediate_processing", True))
+        self.immediate_processing_chk.setToolTip("Process videos as soon as they're downloaded, instead of waiting for all downloads to complete")
+        download_form.addWidget(self.immediate_processing_chk)
+
+        # Concurrent downloads spinner
+        concurrent_layout = QHBoxLayout()
+        concurrent_layout.addWidget(QLabel("Concurrent downloads:"))
+        self.concurrent_spinbox = QSpinBox()
+        self.concurrent_spinbox.setRange(1, 10)
+        self.concurrent_spinbox.setValue(self.config_data.get("download", {}).get("concurrent_downloads", 1))
+        self.concurrent_spinbox.setToolTip("Number of videos to download simultaneously (higher = faster but more resource intensive)")
+        self.concurrent_spinbox.setEnabled(self.immediate_processing_chk.isChecked())
+        concurrent_layout.addWidget(self.concurrent_spinbox)
+        concurrent_layout.addStretch()
+        download_form.addLayout(concurrent_layout)
+
+        # Connect checkbox to enable/disable spinner
+        self.immediate_processing_chk.toggled.connect(self.concurrent_spinbox.setEnabled)
+
+
         # Download button
         download_btn_layout = QHBoxLayout()
         self.download_btn = QPushButton("🌐 Download Videos")
@@ -344,6 +531,12 @@ class VideoHighlighterGUI(QWidget):
         download_btn_layout.addStretch()
         download_btn_layout.addWidget(self.download_btn)
         download_form.addLayout(download_btn_layout)
+
+        # Combine highlights
+        self.auto_combine_chk = QCheckBox("Automatically combine all highlights into one video")
+        self.auto_combine_chk.setChecked(self.config_data.get("download", {}).get("auto_combine", True))
+        self.auto_combine_chk.setToolTip("When enabled, all individual highlights will be combined into one master video")
+        download_form.addWidget(self.auto_combine_chk)
         
         # Info label
         info_label = QLabel("ℹ️ Requires yt-dlp: pip install yt-dlp")
@@ -553,8 +746,22 @@ class VideoHighlighterGUI(QWidget):
 
         self.setLayout(layout)
 
+        # Load download config
+        download_cfg = self.config_data.get("download", {})
+        self.use_same_time_range_chk.setChecked(download_cfg.get("use_same_time_range", False))
+
+
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.check_worker_status)
+
+        # Load download time range settings (AFTER all widgets are created)
+        download_cfg = self.config_data.get("download", {})
+        self.download_full_chk.setChecked(download_cfg.get("download_full", False))
+        self.download_start_input.setValue(download_cfg.get("time_range_start", 0))
+        self.download_end_input.setValue(download_cfg.get("time_range_end", 300))
+
+        # Initialize the UI state
+        self.on_download_full_toggle(self.download_full_chk.isChecked())
 
     # --- Downloader methods ---
     def browse_save_directory(self):
@@ -570,6 +777,39 @@ class VideoHighlighterGUI(QWidget):
         url = self.download_url_input.text().strip()
         save_dir = self.download_save_dir_input.text().strip()
         pattern = self.download_pattern_input.text().strip() or "/video/"
+        
+        # Get immediate processing settings
+        immediate_processing = self.immediate_processing_chk.isChecked()
+        max_concurrent = self.concurrent_spinbox.value() if immediate_processing else 1
+        
+        # Get time range settings
+        use_same_time_range = self.use_same_time_range_chk.isChecked()
+        time_range = None
+        use_percentages = False
+        
+        if use_same_time_range:
+            if not self.use_time_range_chk.isChecked():
+                self.append_log("⚠️ 'Process only specific time range' is not enabled")
+                return
+            
+            # Get percentage values directly from sliders
+            start_pct = self.start_time_slider.value()
+            end_pct = self.end_time_slider.value()
+            
+            if end_pct <= start_pct:
+                self.append_log("⚠️ Invalid time range - end must be greater than start")
+                return
+            
+            time_range = (float(start_pct), float(end_pct))
+            use_percentages = True  # Use percentages directly!
+            download_full = False
+            
+            # Log the percentage range
+            self.append_log(f"⏱️ Downloading percentage range: {start_pct}% - {end_pct}%")
+            self.append_log(f"   (yt-dlp will handle the percentage conversion automatically)")
+        else:
+            download_full = True
+            self.append_log("📥 Downloading full videos")
         
         # Validation
         if not url:
@@ -596,6 +836,19 @@ class VideoHighlighterGUI(QWidget):
         self.append_log(f"🌐 URL: {url}")
         self.append_log(f"📁 Save directory: {save_dir}")
         self.append_log(f"🔍 Pattern: {pattern}")
+        
+        if immediate_processing:
+            self.append_log(f"⚡ Mode: Immediate processing after each download")
+            self.append_log(f"   Concurrent downloads: {max_concurrent}")
+        else:
+            self.append_log("📦 Mode: Batch download (process all videos at once)")
+        
+        if download_full:
+            self.append_log("📥 Downloading: Full videos")
+        else:
+            start_pct, end_pct = time_range
+            self.append_log(f"⏱️ Downloading: Percentage range {start_pct}% - {end_pct}%")
+        
         self.append_log("")
         
         # UI state changes
@@ -605,84 +858,298 @@ class VideoHighlighterGUI(QWidget):
         self.download_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         
-        # Create and start download worker
-        self.download_worker = DownloadWorker(url, save_dir, pattern)
+        # Define processing callback for immediate processing
+        def process_video_callback(filepath, metadata):
+            """Process video immediately after download using the pipeline"""
+            try:
+                filename = os.path.basename(filepath)
+                self.append_log(f"\n{'='*60}")
+                self.append_log(f"🎬 IMMEDIATE PROCESSING: {filename}")
+                self.append_log(f"{'='*60}")
+                
+                # Add video to file list if auto-add is enabled
+                if self.auto_add_downloaded_chk.isChecked():
+                    existing = self.get_file_list()
+                    if filepath not in existing:
+                        # Add to GUI list safely (this is called from worker thread)
+                        self.file_list.addItem(filepath)
+                        self.append_log(f"📋 Added to file list: {filename}")
+                
+                # Build config for this single video
+                config = self.build_pipeline_config()
+                
+                # Set output path for this specific video
+                source_dir = os.path.dirname(filepath)
+                base_name = os.path.splitext(os.path.basename(filepath))[0]
+                output_file = os.path.join(source_dir, f"{base_name}_highlight.mp4")
+                config['output_file'] = output_file
+                
+                self.append_log(f"📁 Output will be: {os.path.basename(output_file)}")
+                self.append_log("")
+                
+                # Create a simple pipeline wrapper that runs synchronously
+                # Use the pipeline functions directly instead of run_highlighter
+                # which might be designed for GUI threading
+                
+                try:
+                    # Import necessary pipeline components
+                    from pipeline import create_highlight
+                    # Or use your pipeline's main function with a simpler approach
+                    result = run_highlighter_sync(
+                        filepath,
+                        config=config,
+                        log_fn=lambda msg: self.append_log(f"  [{filename}] {msg}")
+                    )
+                    
+                    if result:
+                        self.append_log(f"✅ Highlight created: {os.path.basename(result)}")
+                        self.append_log(f"{'='*60}\n")
+                        
+                        return {
+                            'processed_at': time.time(),
+                            'filename': filename,
+                            'highlight_file': result,
+                            'success': True
+                        }
+                    else:
+                        self.append_log(f"⚠️ Processing completed but no highlight generated")
+                        self.append_log(f"{'='*60}\n")
+                        return {'success': False, 'error': 'No highlight generated'}
+                        
+                except Exception as e:
+                    self.append_log(f"❌ Processing error: {e}")
+                    import traceback
+                    self.append_log(f"Traceback:\n{traceback.format_exc()}")
+                    self.append_log(f"{'='*60}\n")
+                    return {'success': False, 'error': str(e)}
+                    
+            except Exception as e:
+                self.append_log(f"❌ Callback setup error: {e}")
+                return {'success': False, 'error': str(e)}
+                
+        # Create download worker with processing callback
+        self.download_worker = DownloadWorker(
+            url, save_dir, pattern,
+            time_range=time_range,
+            download_full=download_full,
+            use_percentages=use_percentages,
+            immediate_processing=immediate_processing,
+            max_concurrent=max_concurrent,
+            process_callback=process_video_callback if immediate_processing else None
+        )
+        
+        # Connect signals
         self.download_worker.log.connect(self.append_log)
         self.download_worker.progress.connect(self.update_progress)
         self.download_worker.finished.connect(self.download_done)
         self.download_worker.cancelled.connect(self.download_cancelled)
+        if immediate_processing:
+            self.download_worker.video_processed.connect(self.on_video_processed)
         
-        # Start status checking timer
         self.status_timer.start(100)
-        
         self.download_worker.start()
 
+    def build_pipeline_config(self):
+        """Build pipeline configuration from GUI settings"""
+        
+        def get_list_from_input(input_field):
+            text = input_field.text().strip()
+            if not text:
+                return None
+            items = [s.strip() for s in text.split(",") if s.strip()]
+            return items if items else None
+        
+        highlight_objects = get_list_from_input(self.objects_input)
+        interesting_actions = get_list_from_input(self.actions_input)
+        use_transcript = self.transcript_checkbox.isChecked()
+        search_keywords = get_list_from_input(self.search_keywords_input) if use_transcript else []
+        
+        exact_duration_val = int(self.spin_exact_duration.value())
+        exact_duration = exact_duration_val if exact_duration_val > 0 else None
+        
+        config = {
+            "scene_points": int(self.spin_scene_points.value()),
+            "motion_event_points": int(self.spin_motion_event_points.value()),
+            "motion_peak_points": int(self.spin_motion_peak.value()),
+            "audio_peak_points": int(self.spin_audio_peak.value()),
+            "keyword_points": int(self.spin_keyword_points.value()),
+            "transcript_points": int(self.spin_transcript_points.value()),
+            "beginning_points": 0,
+            "ending_points": 0,
+            "object_points": int(self.spin_object.value()),
+            "action_points": int(self.spin_action.value()),
+            "clip_time": int(self.spin_clip_time.value()),
+            "max_duration": int(self.spin_max_duration.value()),
+            "exact_duration": exact_duration,
+            "multi_signal_boost": 1.2,
+            "min_signals_for_boost": 2,
+            "keep_temp": self.keep_temp_chk.isChecked(),
+            "highlight_objects": highlight_objects,
+            "interesting_actions": interesting_actions,
+            "actions_require_objects": self.actions_require_objects_chk.isChecked(),
+            "use_transcript": use_transcript,
+            "transcript_model": self.transcript_model_combo.currentText(),
+            "search_keywords": search_keywords,
+            "create_subtitles": self.subtitles_checkbox.isChecked() and use_transcript,
+            "source_lang": self.source_lang_combo.currentText(),
+            "target_lang": self.target_lang_combo.currentText(),
+            "skip_highlights": self.skip_highlights_chk.isChecked(),
+            "frame_skip": int(self.frame_skip_spin.value()),
+            "object_frame_skip": int(self.obj_frame_skip_spin.value()),
+            "yolo_pt_path": self.yolo_pt_path.text().strip() or None,
+            "openvino_model_folder": self.openvino_model_folder.text().strip() or None,
+            "sample_rate": int(self.sample_rate_spin.value()),
+            "draw_object_boxes": self.bbox_objects_chk.isChecked(),
+            "draw_action_labels": self.bbox_actions_chk.isChecked(),
+        }
+        
+        # Add time range if enabled
+        if self.use_time_range_chk.isChecked() and self.current_video_duration > 0:
+            start_pct = self.start_time_slider.value() / 100
+            end_pct = self.end_time_slider.value() / 100
+            config["use_time_range"] = True
+            config["range_start"] = int(start_pct * self.current_video_duration)
+            config["range_end"] = int(end_pct * self.current_video_duration)
+        else:
+            config["use_time_range"] = False
+        
+        # Remove None values
+        return {k: v for k, v in config.items() if v is not None}
+
+
+    def on_video_processed(self, filepath, result):
+        """Handle when a video is processed immediately after download"""
+        filename = os.path.basename(filepath)
+        if result.get('success'):
+            self.append_log(f"✅ {filename} downloaded and processed successfully")
+        else:
+            self.append_log(f"⚠️ {filename} downloaded but processing failed")
+
+
+    def on_download_full_toggle(self, checked):
+        """Enable/disable time range inputs based on full download checkbox"""
+        self.download_start_input.setEnabled(not checked)
+        self.download_end_input.setEnabled(not checked)
+        if checked:
+            self.download_duration_label.setText("Downloading full videos")
+        else:
+            self.update_download_duration()
+
+    def update_download_duration(self):
+        """Update the duration label for download time range"""
+        if self.download_full_chk.isChecked():
+            return
+        
+        start = self.download_start_input.value()
+        end = self.download_end_input.value()
+        
+        # Ensure end is after start
+        if end <= start:
+            end = start + 1
+            self.download_end_input.setValue(end)
+        
+        duration = end - start
+        minutes = duration // 60
+        seconds = duration % 60
+        
+        self.download_duration_label.setText(
+            f"Duration: {duration}s ({minutes}:{seconds:02d})"
+        )
+
     def download_done(self, downloaded_files):
-        """Handle download completion"""
+        """Handle download completion with immediate processing support"""
         self.status_timer.stop()
         
-        if downloaded_files and not self.download_worker.is_cancelled():
+        if hasattr(self, 'download_worker') and self.download_worker and self.download_worker.is_cancelled():
+            self.append_log("\n⏹️ === DOWNLOAD CANCELLED ===")
+            self.task_label.setText("⏹️ Cancelled")
+            self.task_label.setStyleSheet("color: #ff9800; font-weight: bold;")
+            self.download_cleanup()
+            return
+        
+        if downloaded_files:
             self.append_log(f"\n✅ === DOWNLOAD COMPLETED ===")
             self.append_log(f"📊 Successfully downloaded {len(downloaded_files)} videos")
             
-            # List downloaded files
-            for file in downloaded_files:
-                self.append_log(f"  • {os.path.basename(file)}")
-            
-            # Auto-add to file list if checkbox is checked
-            if self.auto_add_downloaded_chk.isChecked() and downloaded_files:
-                self.append_log("\n📋 Adding videos to file list...")
-                existing = self.get_file_list()
-                added_count = 0
-                for file_path in downloaded_files:
-                    if file_path and os.path.exists(file_path) and file_path not in existing:
-                        self.file_list.addItem(file_path)
-                        added_count += 1
+            # Check if immediate processing was enabled
+            if self.immediate_processing_chk.isChecked():
+                # Count successful processing
+                if hasattr(self.download_worker, '_download_results'):
+                    processed_count = sum(1 for r in self.download_worker._download_results 
+                                        if r.get('processed', False))
+                    self.append_log(f"🎬 Successfully processed {processed_count}/{len(downloaded_files)} videos")
+                    
+                    # List all results
+                    for result in self.download_worker._download_results:
+                        if result.get('success') and result.get('processed'):
+                            highlight = result.get('process_result', {}).get('highlight_file')
+                            if highlight:
+                                self.append_log(f"  ✅ {os.path.basename(highlight)}")
                 
-                if added_count > 0:
-                    self.append_log(f"✅ Added {added_count} videos to file list")
+                # Combine highlights if enabled and we have multiple
+                if self.auto_combine_chk.isChecked() and len(downloaded_files) > 1:
+                    self.append_log("\n🎬 Combining all highlights...")
+                    highlight_files = []
                     
-                    # Update video duration for first video
-                    if self.file_list.count() > 0:
-                        first_video = self.file_list.item(0).text()
-                        self.update_video_duration(first_video)
+                    if hasattr(self.download_worker, '_download_results'):
+                        for result in self.download_worker._download_results:
+                            highlight = result.get('process_result', {}).get('highlight_file')
+                            if highlight and os.path.exists(highlight):
+                                highlight_files.append(highlight)
                     
-                    # Auto-set output filename based on first video
-                    first_video = downloaded_files[0]
-                    base_name = os.path.splitext(os.path.basename(first_video))[0]
-                    self.output_input.setText(f"{base_name}_highlight.mp4")
+                    if len(highlight_files) > 1:
+                        first_video_dir = os.path.dirname(highlight_files[0])
+                        combined_output = os.path.join(first_video_dir, "all_highlights_combined.mp4")
+                        combined_file = self.combine_highlights(highlight_files, combined_output)
+                        
+                        if combined_file:
+                            self.append_log(f"🎉 Combined highlight: {combined_file}")
             
-            self.task_label.setText("✅ Download Complete!")
+            self.task_label.setText("✅ Complete!")
             self.task_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
-        
-        elif not self.download_worker.is_cancelled():
+        else:
             self.append_log("\n⚠️ === DOWNLOAD COMPLETED WITH NO FILES ===")
-            self.append_log("❌ No videos were downloaded. Check the log for errors.")
             self.task_label.setText("❌ Download Failed")
             self.task_label.setStyleSheet("color: #f44336; font-weight: bold;")
         
         self.download_cleanup()
 
+    def auto_start_pipeline(self):
+        """Automatically start pipeline processing after download"""
+        # Clean up download state
+        self.download_cleanup()
+        
+        # Small delay to ensure UI updates
+        QApplication.processEvents()
+        
+        # Now start the pipeline
+        self.run_pipeline()
+
     def download_cancelled(self):
         """Handle download cancellation"""
         self.status_timer.stop()
-        self.append_log("\n⏹️ === DOWNLOAD CANCELLED ===")
-        self.task_label.setText("⏹️ Cancelled")
+        self.append_log("\n⏹️ === DOWNLOAD CANCELLED BY USER ===")
+        self.task_label.setText("⏹️ Download Cancelled")
         self.task_label.setStyleSheet("color: #ff9800; font-weight: bold;")
         self.download_cleanup()
 
     def download_cleanup(self):
         """Clean up UI state after download completion/cancellation"""
-        # Hide progress bar
-        self.progress_bar.setVisible(False)
+        # Hide progress bar only if not auto-processing
+        if not self.auto_process_chk.isChecked() or self.file_list.count() == 0:
+            self.progress_bar.setVisible(False)
         
         # Re-enable controls
         self.download_btn.setEnabled(True)
-        self.cancel_btn.setEnabled(False)
-        self.cancel_btn.setText("Cancel")
         
-        # Reset task label style after 5 seconds
-        QTimer.singleShot(5000, lambda: self.task_label.setStyleSheet("color: #666; font-weight: bold;"))
+        # Only re-enable cancel if not auto-processing
+        if not self.auto_process_chk.isChecked() or self.file_list.count() == 0:
+            self.cancel_btn.setEnabled(False)
+            self.cancel_btn.setText("Cancel")
+        
+        # Reset task label style after 5 seconds (only if not auto-processing)
+        if not self.auto_process_chk.isChecked() or self.file_list.count() == 0:
+            QTimer.singleShot(5000, lambda: self.task_label.setStyleSheet("color: #666; font-weight: bold;"))
         
         # Clean up worker
         if hasattr(self, 'download_worker') and self.download_worker:
@@ -722,11 +1189,67 @@ class VideoHighlighterGUI(QWidget):
         """Clear all files from the list and reset output name"""
         self.file_list.clear()
         self.output_input.setText("highlight.mp4")
+        # Reset video duration info
+        self.current_video_duration = 0
+        self.video_duration_label.setText("Select a video to enable time range controls")
+        self.video_duration_label.setStyleSheet("color: #666; font-style: italic;")
+        self.update_selection_info()
 
     def get_file_list(self):
         """Get list of all files in the list widget"""
         return [self.file_list.item(i).text() for i in range(self.file_list.count())]
-
+    
+    def combine_highlights(self, highlight_files, output_path):
+        """Combine multiple highlight videos into one"""
+        if not highlight_files:
+            self.append_log("⚠️ No highlight files to combine")
+            return None
+        
+        try:
+            # Filter out None values and non-existent files
+            valid_files = [f for f in highlight_files if f and os.path.exists(f)]
+            
+            if not valid_files:
+                self.append_log("⚠️ No valid highlight files found")
+                return None
+            
+            if len(valid_files) == 1:
+                self.append_log("ℹ️ Only one highlight file, no combining needed")
+                return valid_files[0]
+            
+            self.append_log(f"🎬 Combining {len(valid_files)} highlights into one video...")
+            
+            # Create concat list file
+            output_dir = os.path.dirname(output_path) or "."
+            concat_file = os.path.join(output_dir, "combine_highlights_list.txt")
+            
+            with open(concat_file, "w") as f:
+                for video_file in valid_files:
+                    # Use absolute paths for safety
+                    abs_path = os.path.abspath(video_file)
+                    f.write(f"file '{abs_path}'\n")
+            
+            # Combine using FFmpeg
+            subprocess.run([
+                "ffmpeg", "-y", "-v", "error", 
+                "-f", "concat", "-safe", "0",
+                "-i", concat_file, 
+                "-c", "copy",  # Fast - no re-encoding
+                output_path
+            ], check=True)
+            
+            # Clean up concat list
+            try:
+                os.remove(concat_file)
+            except:
+                pass
+            
+            self.append_log(f"✅ Combined highlight saved: {output_path}")
+            return output_path
+            
+        except Exception as e:
+            self.append_log(f"❌ Failed to combine highlights: {e}")
+            return None
 
     # --- Config persistence ---
     def load_config(self):
@@ -745,6 +1268,20 @@ class VideoHighlighterGUI(QWidget):
 
         data = {
             "video": {"paths": self.get_file_list()},
+            "download": {
+                "last_url": self.download_url_input.text().strip(),
+                "link_pattern": self.download_pattern_input.text().strip() or "/video/",
+                "save_dir": self.download_save_dir_input.text().strip(),
+                "auto_add": self.auto_add_downloaded_chk.isChecked(),
+                "auto_process": self.auto_process_chk.isChecked(),
+                "auto_combine": self.auto_combine_chk.isChecked(),
+                "use_same_time_range": self.use_same_time_range_chk.isChecked(),
+                "immediate_processing": self.immediate_processing_chk.isChecked(),  # NEW
+                "concurrent_downloads": self.concurrent_spinbox.value(),  # NEW
+                "download_full": self.download_full_chk.isChecked(),  # Already exists
+                "time_range_start": self.download_start_input.value(),  # Already exists
+                "time_range_end": self.download_end_input.value(),  # Already exists
+            },
             "highlights": {
                 "clip_time": int(self.spin_clip_time.value()),
                 "output": self.output_input.text().strip(),
@@ -801,7 +1338,7 @@ class VideoHighlighterGUI(QWidget):
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             yaml.dump(data, f, sort_keys=False, allow_unicode=True)
-
+            
     def closeEvent(self, event):
         self.save_config()
         event.accept()
@@ -866,17 +1403,17 @@ class VideoHighlighterGUI(QWidget):
 
     def on_time_range_toggle(self, checked):
         """Enable/disable time range controls"""
-        self.start_time_slider.setEnabled(checked and self.current_video_duration > 0)
-        self.end_time_slider.setEnabled(checked and self.current_video_duration > 0)
-        self.first_5min_btn.setEnabled(checked and self.current_video_duration > 0)
-        self.last_5min_btn.setEnabled(checked and self.current_video_duration > 0)
-        self.last_10min_btn.setEnabled(checked and self.current_video_duration > 0)
-        self.middle_btn.setEnabled(checked and self.current_video_duration > 0)
-        self.full_video_btn.setEnabled(checked and self.current_video_duration > 0)
+        # Always enable sliders when checkbox is checked, even without video
+        self.start_time_slider.setEnabled(checked)
+        self.end_time_slider.setEnabled(checked)
         
-        if checked and self.current_video_duration == 0:
-            self.append_log("⚠️ Select a video first to enable time range")
-            self.use_time_range_chk.setChecked(False)
+        # Preset buttons only work when video duration is known
+        has_duration = self.current_video_duration > 0
+        self.first_5min_btn.setEnabled(checked and has_duration)
+        self.last_5min_btn.setEnabled(checked and has_duration)
+        self.last_10min_btn.setEnabled(checked and has_duration)
+        self.middle_btn.setEnabled(checked and has_duration)
+        self.full_video_btn.setEnabled(checked and has_duration)
         
         self.update_selection_info()
 
@@ -896,27 +1433,40 @@ class VideoHighlighterGUI(QWidget):
 
     def update_selection_info(self):
         """Update the selection information labels"""
+        start_pct = self.start_time_slider.value()
+        end_pct = self.end_time_slider.value()
+        
         if self.current_video_duration == 0:
-            self.start_time_label.setText("00:00")
-            self.end_time_label.setText("00:00")
-            self.selection_info_label.setText("Selection: No video loaded")
+            # No video loaded - show percentages
+            self.start_time_label.setText(f"{start_pct}%")
+            self.end_time_label.setText(f"{end_pct}%")
+            
+            if self.use_time_range_chk.isChecked():
+                range_pct = end_pct - start_pct
+                self.selection_info_label.setText(
+                    f"Selection: {start_pct}% to {end_pct}% ({range_pct}% of video)"
+                )
+                self.selection_info_label.setStyleSheet("color: #2196F3; font-weight: bold; font-size: 10pt;")
+            else:
+                self.selection_info_label.setText("Selection: Full video")
+                self.selection_info_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 10pt;")
             return
         
-        # Calculate actual times
-        start_seconds = int((self.start_time_slider.value() / 100) * self.current_video_duration)
-        end_seconds = int((self.end_time_slider.value() / 100) * self.current_video_duration)
+        # Calculate actual times when video is loaded
+        start_seconds = int((start_pct / 100) * self.current_video_duration)
+        end_seconds = int((end_pct / 100) * self.current_video_duration)
         duration = end_seconds - start_seconds
         
-        # Update labels
-        self.start_time_label.setText(self.format_time(start_seconds))
-        self.end_time_label.setText(self.format_time(end_seconds))
+        # Update labels with time and percentage
+        self.start_time_label.setText(f"{self.format_time(start_seconds)} ({start_pct}%)")
+        self.end_time_label.setText(f"{self.format_time(end_seconds)} ({end_pct}%)")
         
         # Update selection info
-        percentage = (duration / self.current_video_duration) * 100 if self.current_video_duration > 0 else 0
+        percentage = end_pct - start_pct
         
         if self.use_time_range_chk.isChecked():
             self.selection_info_label.setText(
-                f"Selection: {self.format_time(duration)} ({percentage:.1f}% of video)"
+                f"Selection: {self.format_time(duration)} ({percentage}% of video)"
             )
             self.selection_info_label.setStyleSheet("color: #2196F3; font-weight: bold; font-size: 10pt;")
         else:
@@ -939,9 +1489,8 @@ class VideoHighlighterGUI(QWidget):
                 self.start_time_slider.setMaximum(100)
                 self.end_time_slider.setMaximum(100)
                 
-                # Reset to full range
-                self.start_time_slider.setValue(0)
-                self.end_time_slider.setValue(100)
+                # Keep existing slider values (don't reset user's choice)
+                # Only update the display labels
                 
                 # Update labels
                 self.video_duration_label.setText(
@@ -1087,7 +1636,7 @@ class VideoHighlighterGUI(QWidget):
         output_base = self.output_input.text().strip() or "highlight.mp4"
         
         # If multiple files, we'll handle output paths per file in the pipeline
-        # For single file, use the source video's directory
+        # For single file, use the same directory as source video
         if len(video_paths) == 1:
             # Single file - use the same directory as source video
             source_dir = os.path.dirname(video_paths[0])
@@ -1211,18 +1760,39 @@ class VideoHighlighterGUI(QWidget):
         self.worker.start()
 
     def cancel_pipeline(self):
-        """Cancel the running pipeline"""
-        if self.worker and self.worker.isRunning():
+        """Cancel the running pipeline or download"""
+        # Check if download is running
+        if hasattr(self, 'download_worker') and self.download_worker and self.download_worker.isRunning():
             self.append_log("\n⏹️ === CANCELLATION REQUESTED ===")
-            self.task_label.setText("⏹️ Cancelling...")
+            self.append_log("⏹️ Stopping download...")
+            self.task_label.setText("⏹️ Cancelling download...")
             self.cancel_btn.setEnabled(False)
             self.cancel_btn.setText("Cancelling...")
-            
-            # Request cancellation
+            self.download_worker.cancel()
+            QTimer.singleShot(10000, self.force_download_cleanup)
+            return
+        
+        # Check if pipeline is running
+        if self.worker and self.worker.isRunning():
+            self.append_log("\n⏹️ === CANCELLATION REQUESTED ===")
+            self.append_log("⏹️ Stopping pipeline...")
+            self.task_label.setText("⏹️ Cancelling pipeline...")
+            self.cancel_btn.setEnabled(False)
+            self.cancel_btn.setText("Cancelling...")
             self.worker.cancel()
-            
-            # Set a timeout for forced termination
-            QTimer.singleShot(10000, self.force_worker_cleanup)  # 10 second timeout
+            QTimer.singleShot(10000, self.force_worker_cleanup)
+            return
+        
+        # Nothing is running
+        self.append_log("⚠️ Nothing to cancel - no active process")
+
+    def force_download_cleanup(self):
+        """Force cleanup if download worker doesn't stop gracefully"""
+        if hasattr(self, 'download_worker') and self.download_worker and self.download_worker.isRunning():
+            self.append_log("⚠️ Forcing download termination...")
+            self.download_worker.terminate()
+            self.download_worker.wait(3000)
+            self.download_cleanup()
 
     def force_worker_cleanup(self):
         """Force cleanup if worker doesn't stop gracefully"""
@@ -1242,6 +1812,9 @@ class VideoHighlighterGUI(QWidget):
             # Handle both single file (string) and multiple files (list of tuples)
             if isinstance(output_file, list):
                 self.append_log(f"🎬 Processed {len(output_file)} videos:")
+                
+                highlight_files = []  # Track valid highlight files
+                
                 for item in output_file:
                     # Handle tuple format: (input_path, output_path)
                     if isinstance(item, tuple):
@@ -1252,6 +1825,7 @@ class VideoHighlighterGUI(QWidget):
                     
                     if file:
                         self.append_log(f"   • {file}")
+                        highlight_files.append(file)  # Add to list for combining
                         
                         # Check for additional files for each video
                         base_name = os.path.splitext(file)[0]
@@ -1264,6 +1838,35 @@ class VideoHighlighterGUI(QWidget):
                             self.append_log(f"     📄 Transcript: {transcript_file}")
                     else:
                         self.append_log(f"   ❌ Failed to process")
+                
+                # Combine highlights if enabled and we have multiple files
+                if len(highlight_files) > 1 and self.auto_combine_chk.isChecked():
+                    self.append_log("")
+                    self.append_log("=" * 60)
+                    
+                    # Auto-generate combined output name in same directory as first highlight
+                    first_video_dir = os.path.dirname(highlight_files[0])
+                    combined_output = os.path.join(first_video_dir, "all_highlights_combined.mp4")
+                    
+                    # Call the combine method
+                    combined_file = self.combine_highlights(highlight_files, combined_output)
+                    
+                    if combined_file:
+                        self.append_log(f"🎉 All highlights combined into: {combined_file}")
+                        
+                        # Calculate and display total duration
+                        try:
+                            cap = cv2.VideoCapture(combined_file)
+                            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                            duration = total_frames / fps if fps else 0
+                            cap.release()
+                            self.append_log(f"   Total duration: {int(duration//60)}:{int(duration%60):02d} ({duration:.1f}s)")
+                        except Exception as e:
+                            self.append_log(f"   (Could not determine duration: {e})")
+                    
+                    self.append_log("=" * 60)
+                
             else:
                 # Single file
                 self.append_log(f"🎬 Output saved to: {output_file}")
