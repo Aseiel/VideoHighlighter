@@ -10,9 +10,9 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QLineEdit, QSpinBox,
     QGroupBox, QTextEdit, QFormLayout, QProgressBar, QCheckBox,
-    QComboBox, QTabWidget, QListWidget, QSlider
+    QComboBox, QTabWidget, QListWidget, QSlider, 
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
 from pipeline import run_highlighter
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError
 
@@ -381,14 +381,25 @@ class VideoHighlighterGUI(QWidget):
         self.update_selection_info()
 
         # --- Progress Section ---
-        progress_group = QGroupBox("Processing Progress")
+        progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout()
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        progress_layout.addWidget(self.progress_bar)
+
+        progress_layout.addWidget(QLabel("Download"))
+        self.download_progress_bar = QProgressBar()
+        self.download_progress_bar.setVisible(False)
+        self.download_progress_bar.setRange(0, 100)
+        progress_layout.addWidget(self.download_progress_bar)
+
+        progress_layout.addWidget(QLabel("Processing"))
+        self.process_progress_bar = QProgressBar()
+        self.process_progress_bar.setVisible(False)
+        self.process_progress_bar.setRange(0, 100)
+        progress_layout.addWidget(self.process_progress_bar)
+
         self.task_label = QLabel("Ready")
         self.task_label.setStyleSheet("color: #666; font-weight: bold;")
         progress_layout.addWidget(self.task_label)
+
         progress_group.setLayout(progress_layout)
         layout.addWidget(progress_group)
 
@@ -852,81 +863,142 @@ class VideoHighlighterGUI(QWidget):
         self.append_log("")
         
         # UI state changes
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
+        self.download_progress_bar.setVisible(True)
+        self.download_progress_bar.setRange(0, 100)
+        self.download_progress_bar.setValue(0)
+        self.process_progress_bar.setVisible(False)
+        self.process_progress_bar.setRange(0, 100)
+        self.process_progress_bar.setValue(0)
         self.task_label.setText("🌐 Extracting video links...")
         self.download_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         
         # Define processing callback for immediate processing
         def process_video_callback(filepath, metadata):
-            """Process video immediately after download using the pipeline"""
+            """Process video immediately after download using the pipeline.
+            Skips processing if *_highlight.mp4 already exists next to the file.
+            """
             try:
                 filename = os.path.basename(filepath)
+                base_name = os.path.splitext(filename)[0]
+                source_dir = os.path.dirname(filepath)
+
+                # Expected highlight output path
+                output_file = os.path.join(source_dir, f"{base_name}_highlight.mp4")
+
+                # Decide whether to skip existing highlights
+                # If you later add a checkbox like self.skip_existing_highlights_chk, this will pick it up.
+                skip_existing = True
+                if hasattr(self, "skip_existing_highlights_chk"):
+                    skip_existing = self.skip_existing_highlights_chk.isChecked()
+
+                # Header in log
                 self.append_log(f"\n{'='*60}")
                 self.append_log(f"🎬 IMMEDIATE PROCESSING: {filename}")
                 self.append_log(f"{'='*60}")
-                
-                # Add video to file list if auto-add is enabled
+
+                # Auto-add downloaded video to file list (GUI-thread safe)
                 if self.auto_add_downloaded_chk.isChecked():
                     existing = self.get_file_list()
                     if filepath not in existing:
-                        # Add to GUI list safely (this is called from worker thread)
-                        self.file_list.addItem(filepath)
+                        QMetaObject.invokeMethod(
+                            self.file_list, "addItem",
+                            Qt.QueuedConnection,
+                            Q_ARG(str, filepath)
+                        )
                         self.append_log(f"📋 Added to file list: {filename}")
-                
+
+                # --- SKIP if highlight already exists ---
+                if skip_existing and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                    self.append_log(f"⏭️ Skipping processing (highlight exists): {os.path.basename(output_file)}")
+                    self.append_log(f"{'='*60}\n")
+
+                    return {
+                        'processed_at': time.time(),
+                        'filename': filename,
+                        'highlight_file': output_file,
+                        'success': True,
+                        'skipped': True
+                    }
+
                 # Build config for this single video
                 config = self.build_pipeline_config()
-                
-                # Set output path for this specific video
-                source_dir = os.path.dirname(filepath)
-                base_name = os.path.splitext(os.path.basename(filepath))[0]
-                output_file = os.path.join(source_dir, f"{base_name}_highlight.mp4")
                 config['output_file'] = output_file
-                
+
                 self.append_log(f"📁 Output will be: {os.path.basename(output_file)}")
                 self.append_log("")
-                
-                # Create a simple pipeline wrapper that runs synchronously
-                # Use the pipeline functions directly instead of run_highlighter
-                # which might be designed for GUI threading
-                
+
+                # Run pipeline synchronously (this blocks the download worker thread by design)
                 try:
-                    # Import necessary pipeline components
-                    from pipeline import create_highlight
-                    # Or use your pipeline's main function with a simpler approach
-                    result = run_highlighter_sync(
-                        filepath,
-                        config=config,
-                        log_fn=lambda msg: self.append_log(f"  [{filename}] {msg}")
+                    from pipeline import run_highlighter
+                    cancel_flag = threading.Event()
+
+                    # Show indeterminate processing state in GUI
+                    QMetaObject.invokeMethod(
+                        self, "set_process_busy",
+                        Qt.QueuedConnection,
+                        Q_ARG(str, f"🔧 Processing: {filename} | Initializing…")
                     )
-                    
-                    if result:
-                        self.append_log(f"✅ Highlight created: {os.path.basename(result)}")
+
+                    # Thread-safe logging back to GUI
+                    def log_fn(msg):
+                        QMetaObject.invokeMethod(
+                            self, "append_log",
+                            Qt.QueuedConnection,
+                            Q_ARG(str, f"  [{filename}] {msg}")
+                        )
+
+                    # Thread-safe progress updates back to GUI
+                    def progress_fn(current, total, task, details):
+                        QMetaObject.invokeMethod(
+                            self, "update_process_progress",
+                            Qt.QueuedConnection,
+                            Q_ARG(int, int(current)),
+                            Q_ARG(int, int(total)),
+                            Q_ARG(str, f"{filename} | {task}"),
+                            Q_ARG(str, str(details))
+                        )
+
+                    result = run_highlighter(
+                        filepath,
+                        gui_config=config,
+                        log_fn=log_fn,
+                        progress_fn=progress_fn,
+                        cancel_flag=cancel_flag
+                    )
+
+                    # If pipeline returns a path, use it; otherwise fall back to our expected output_file
+                    highlight_path = result or output_file
+
+                    if highlight_path and os.path.exists(highlight_path) and os.path.getsize(highlight_path) > 0:
+                        self.append_log(f"✅ Highlight created: {os.path.basename(highlight_path)}")
                         self.append_log(f"{'='*60}\n")
-                        
+
                         return {
                             'processed_at': time.time(),
                             'filename': filename,
-                            'highlight_file': result,
-                            'success': True
+                            'highlight_file': highlight_path,
+                            'success': True,
+                            'skipped': False
                         }
-                    else:
-                        self.append_log(f"⚠️ Processing completed but no highlight generated")
-                        self.append_log(f"{'='*60}\n")
-                        return {'success': False, 'error': 'No highlight generated'}
-                        
+
+                    self.append_log("⚠️ Processing completed but no highlight generated (or file missing/empty)")
+                    self.append_log(f"{'='*60}\n")
+                    return {'success': False, 'error': 'No highlight generated'}
+
                 except Exception as e:
                     self.append_log(f"❌ Processing error: {e}")
                     import traceback
                     self.append_log(f"Traceback:\n{traceback.format_exc()}")
                     self.append_log(f"{'='*60}\n")
                     return {'success': False, 'error': str(e)}
-                    
+
             except Exception as e:
                 self.append_log(f"❌ Callback setup error: {e}")
+                import traceback
+                self.append_log(f"Traceback:\n{traceback.format_exc()}")
                 return {'success': False, 'error': str(e)}
-                
+            
         # Create download worker with processing callback
         self.download_worker = DownloadWorker(
             url, save_dir, pattern,
@@ -940,7 +1012,7 @@ class VideoHighlighterGUI(QWidget):
         
         # Connect signals
         self.download_worker.log.connect(self.append_log)
-        self.download_worker.progress.connect(self.update_progress)
+        self.download_worker.progress.connect(self.update_download_progress)
         self.download_worker.finished.connect(self.download_done)
         self.download_worker.cancelled.connect(self.download_cancelled)
         if immediate_processing:
@@ -1137,7 +1209,10 @@ class VideoHighlighterGUI(QWidget):
         """Clean up UI state after download completion/cancellation"""
         # Hide progress bar only if not auto-processing
         if not self.auto_process_chk.isChecked() or self.file_list.count() == 0:
-            self.progress_bar.setVisible(False)
+            self.download_progress_bar.setVisible(False)
+            # If you're not auto-processing, also hide processing bar
+            self.process_progress_bar.setVisible(False)
+
         
         # Re-enable controls
         self.download_btn.setEnabled(True)
@@ -1200,7 +1275,7 @@ class VideoHighlighterGUI(QWidget):
         return [self.file_list.item(i).text() for i in range(self.file_list.count())]
     
     def combine_highlights(self, highlight_files, output_path):
-        """Combine multiple highlight videos into one"""
+        """Combine multiple highlight videos into one with proper resolution/framerate handling"""
         if not highlight_files:
             self.append_log("⚠️ No highlight files to combine")
             return None
@@ -1219,38 +1294,210 @@ class VideoHighlighterGUI(QWidget):
             
             self.append_log(f"🎬 Combining {len(valid_files)} highlights into one video...")
             
-            # Create concat list file
-            output_dir = os.path.dirname(output_path) or "."
-            concat_file = os.path.join(output_dir, "combine_highlights_list.txt")
+            # Create output directory if it doesn't exist
+            output_dir = os.path.dirname(output_path)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
             
+            # Use a temporary file for concatenation
+            temp_output = output_path.replace('.mp4', '_temp.mp4')
+            
+            # METHOD 1: Try simple concatenation first with re-encoding
+            self.append_log("🔄 Attempting optimized concatenation...")
+            
+            # Create concat list file
+            concat_file = os.path.join(output_dir or ".", "concat_list.txt")
             with open(concat_file, "w") as f:
                 for video_file in valid_files:
-                    # Use absolute paths for safety
                     abs_path = os.path.abspath(video_file)
                     f.write(f"file '{abs_path}'\n")
             
-            # Combine using FFmpeg
-            subprocess.run([
-                "ffmpeg", "-y", "-v", "error", 
-                "-f", "concat", "-safe", "0",
-                "-i", concat_file, 
-                "-c", "copy",  # Fast - no re-encoding
-                output_path
-            ], check=True)
-            
-            # Clean up concat list
             try:
-                os.remove(concat_file)
-            except:
-                pass
-            
-            self.append_log(f"✅ Combined highlight saved: {output_path}")
-            return output_path
-            
+                # First, normalize all videos to a common format using a simpler approach
+                self.append_log("⚙️ Normalizing videos to common format...")
+                
+                # Get common parameters
+                target_fps = 30  # Default
+                target_width = 1920
+                target_height = 1080
+                
+                # Build simpler ffmpeg command without complex filter graph
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", concat_file,
+                    "-vf", f"fps={target_fps},scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,setsar=1",
+                    "-af", "aresample=async=1000",  # Async resample helps with timestamp issues
+                    "-c:v", "libx264",
+                    "-preset", "fast",  # Use 'fast' instead of 'medium' for better performance
+                    "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-vsync", "cfr",  # Constant framerate
+                    "-async", "1",    # Audio sync method
+                    temp_output
+                ]
+                
+                self.append_log(f"🔧 Running: {' '.join(cmd)}")
+                
+                # Run ffmpeg with progress
+                result = subprocess.run(
+                    cmd, 
+                    capture_output=True, 
+                    text=True,
+                    timeout=600  # 10 minute timeout
+                )
+                
+                if result.returncode != 0:
+                    self.append_log(f"⚠️ First method failed: {result.stderr[:500]}")
+                    raise Exception("First concatenation method failed")
+                
+                # Clean up
+                try:
+                    os.remove(concat_file)
+                except:
+                    pass
+                
+                # Rename temp file to final output
+                if os.path.exists(temp_output):
+                    # If output file exists, remove it first
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    os.rename(temp_output, output_path)
+                    
+                    self.append_log(f"✅ Combined video saved: {output_path}")
+                    
+                    # Get final info
+                    try:
+                        cmd = [
+                            "ffprobe", "-v", "error",
+                            "-select_streams", "v:0",
+                            "-show_entries", "stream=r_frame_rate,width,height,bit_rate",
+                            "-show_entries", "format=duration,size",
+                            "-of", "json",
+                            output_path
+                        ]
+                        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                        import json
+                        info = json.loads(result.stdout)
+                        
+                        if 'streams' in info and len(info['streams']) > 0:
+                            stream = info['streams'][0]
+                            width = stream.get('width', 'N/A')
+                            height = stream.get('height', 'N/A')
+                            fps = stream.get('r_frame_rate', 'N/A')
+                            
+                        if 'format' in info:
+                            format_info = info['format']
+                            duration = float(format_info.get('duration', 0))
+                            size = int(format_info.get('size', 0)) / (1024 * 1024)  # MB
+                            
+                            self.append_log(f"📊 Final: {width}x{height}, {fps} fps, {duration:.1f}s, {size:.1f}MB")
+                            
+                    except Exception as e:
+                        self.append_log(f"✅ Combined video saved: {output_path}")
+                        self.append_log(f"⚠️ Could not get output info: {e}")
+                    
+                    return output_path
+                else:
+                    self.append_log("❌ No output file created")
+                    return None
+                    
+            except subprocess.TimeoutExpired:
+                self.append_log("❌ Process timed out after 10 minutes")
+                return None
+                
+            except Exception as e:
+                self.append_log(f"⚠️ First method failed: {e}")
+                # Clean up temp files
+                try:
+                    os.remove(concat_file)
+                except:
+                    pass
+                try:
+                    if os.path.exists(temp_output):
+                        os.remove(temp_output)
+                except:
+                    pass
+                
+                # METHOD 2: Alternative approach - process files individually then concatenate
+                self.append_log("🔄 Trying alternative method (processing individually)...")
+                
+                try:
+                    temp_files = []
+                    temp_dir = os.path.join(output_dir or ".", "temp_combine")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    
+                    # Process each file individually to common format
+                    for i, video_file in enumerate(valid_files):
+                        self.append_log(f"  Processing {i+1}/{len(valid_files)}: {os.path.basename(video_file)}")
+                        
+                        temp_file = os.path.join(temp_dir, f"temp_{i:03d}.mp4")
+                        temp_files.append(temp_file)
+                        
+                        cmd = [
+                            "ffmpeg", "-y", "-i", video_file,
+                            "-vf", f"fps=30,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1",
+                            "-af", "aresample=48000:async=1",
+                            "-c:v", "libx264",
+                            "-preset", "fast",
+                            "-crf", "23",
+                            "-pix_fmt", "yuv420p",
+                            "-c:a", "aac",
+                            "-b:a", "192k",
+                            "-movflags", "+faststart",
+                            "-vsync", "cfr",
+                            temp_file
+                        ]
+                        
+                        subprocess.run(cmd, capture_output=True, check=True, timeout=300)
+                    
+                    # Now concatenate the normalized files
+                    concat_file2 = os.path.join(temp_dir, "concat_list.txt")
+                    with open(concat_file2, "w") as f:
+                        for temp_file in temp_files:
+                            f.write(f"file '{os.path.abspath(temp_file)}'\n")
+                    
+                    # Simple concatenation (copy) since all files now have same format
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", concat_file2,
+                        "-c", "copy",
+                        "-movflags", "+faststart",
+                        output_path
+                    ]
+                    
+                    subprocess.run(cmd, capture_output=True, check=True, timeout=300)
+                    
+                    # Clean up temp files
+                    try:
+                        os.remove(concat_file2)
+                        for temp_file in temp_files:
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                        os.rmdir(temp_dir)
+                    except:
+                        pass
+                    
+                    self.append_log(f"✅ Combined video saved (alternative method): {output_path}")
+                    return output_path
+                    
+                except Exception as e2:
+                    self.append_log(f"❌ Alternative method also failed: {e2}")
+                    return None
+                
         except Exception as e:
             self.append_log(f"❌ Failed to combine highlights: {e}")
+            import traceback
+            self.append_log(f"Traceback:\n{traceback.format_exc()}")
             return None
 
+            
     # --- Config persistence ---
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -1368,25 +1615,72 @@ class VideoHighlighterGUI(QWidget):
         self.source_lang_combo.setEnabled(final_state)
         self.target_lang_combo.setEnabled(final_state)
 
-    def append_log(self, text):
-        """Append text to log and auto-scroll"""
+    @Slot(str)
+    def append_log(self, text: str):
+        """Thread-safe log append (always executes on GUI thread)."""
+        app = QApplication.instance()
+        gui_thread = app.thread() if app else None
+
+        if gui_thread and QThread.currentThread() != gui_thread:
+            QMetaObject.invokeMethod(
+                self, "append_log",
+                Qt.QueuedConnection,
+                Q_ARG(str, text)
+            )
+            return
+
+        # --- GUI thread only below ---
         self.log_output.append(text)
-        # Auto-scroll to bottom
         scrollbar = self.log_output.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
-        # Process events to keep UI responsive
-        QApplication.processEvents()
 
     def update_progress(self, current, total, task_name, details=""):
-        """Update progress bar and task label"""
-        if total > 0:
-            percentage = min(100, max(0, int((current/total)*100)))
-            self.progress_bar.setValue(percentage)
-            self.progress_bar.setVisible(True)
-            self.task_label.setText(f"🔄 {task_name}: {percentage}% - {details}")
+        # Decide which bar based on task_name or status
+        if "download" in task_name.lower() or "extract" in task_name.lower():
+            self.update_download_progress(current, total, task_name, details)
         else:
-            self.task_label.setText(f"🔄 {task_name} - {details}")
-        
+            self.update_process_progress(current, total, task_name, details)
+
+    @Slot(str)
+    def set_download_busy(self, text: str):
+        self.download_progress_bar.setVisible(True)
+        self.download_progress_bar.setRange(0, 0)  # indeterminate
+        self.task_label.setText(text)
+
+    @Slot(str)
+    def set_process_busy(self, text: str):
+        self.process_progress_bar.setVisible(True)
+        self.process_progress_bar.setRange(0, 0)  # indeterminate
+        self.task_label.setText(text)
+
+    @Slot(int, int, str, str)
+    def update_download_progress(self, current: int, total: int, task_name: str, details: str = ""):
+        if total > 0:
+            self.download_progress_bar.setRange(0, 100)
+            pct = min(100, max(0, int((current / total) * 100)))
+            self.download_progress_bar.setValue(pct)
+            self.download_progress_bar.setVisible(True)
+            self.task_label.setText(f"⬇️ {task_name}: {pct}% - {details}")
+        else:
+            self.download_progress_bar.setVisible(True)
+            self.download_progress_bar.setRange(0, 0)
+            self.task_label.setText(f"⬇️ {task_name} - {details}")
+
+        QApplication.processEvents()
+
+    @Slot(int, int, str, str)
+    def update_process_progress(self, current: int, total: int, task_name: str, details: str = ""):
+        if total > 0:
+            self.process_progress_bar.setRange(0, 100)
+            pct = min(100, max(0, int((current / total) * 100)))
+            self.process_progress_bar.setValue(pct)
+            self.process_progress_bar.setVisible(True)
+            self.task_label.setText(f"🔧 {task_name}: {pct}% - {details}")
+        else:
+            self.process_progress_bar.setVisible(True)
+            self.process_progress_bar.setRange(0, 0)
+            self.task_label.setText(f"🔧 {task_name} - {details}")
+
         # Keep UI responsive
         QApplication.processEvents()
 
@@ -1734,8 +2028,10 @@ class VideoHighlighterGUI(QWidget):
             config["use_time_range"] = False
 
         # UI state changes
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
+        self.process_progress_bar.setVisible(True)
+        self.process_progress_bar.setRange(0, 100)
+        self.process_progress_bar.setValue(0)
+        self.download_progress_bar.setVisible(False)
         self.task_label.setText("🚀 Initializing...")
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
@@ -1750,7 +2046,7 @@ class VideoHighlighterGUI(QWidget):
         # Create and start worker
         self.worker = Worker(video_paths, config)
         self.worker.log.connect(self.append_log)
-        self.worker.progress.connect(self.update_progress)
+        self.worker.progress.connect(self.update_process_progress)
         self.worker.finished.connect(self.pipeline_done)
         self.worker.cancelled.connect(self.pipeline_cancelled)
         
@@ -1902,7 +2198,10 @@ class VideoHighlighterGUI(QWidget):
     def pipeline_cleanup(self):
         """Clean up UI state after pipeline completion/cancellation"""
         # Hide progress bar
-        self.progress_bar.setVisible(False)
+        self.process_progress_bar.setVisible(False)
+        # (Optional) keep download bar hidden too
+        self.download_progress_bar.setVisible(False)
+
         
         # Re-enable controls
         self.run_btn.setEnabled(True)
