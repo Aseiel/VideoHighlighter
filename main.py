@@ -1275,7 +1275,7 @@ class VideoHighlighterGUI(QWidget):
         return [self.file_list.item(i).text() for i in range(self.file_list.count())]
     
     def combine_highlights(self, highlight_files, output_path):
-        """Combine multiple highlight videos into one with proper resolution/framerate handling"""
+        """Combine multiple highlight videos into one with robust resolution/framerate handling"""
         if not highlight_files:
             self.append_log("⚠️ No highlight files to combine")
             return None
@@ -1294,80 +1294,162 @@ class VideoHighlighterGUI(QWidget):
             
             self.append_log(f"🎬 Combining {len(valid_files)} highlights into one video...")
             
+            # Analyze all input videos to determine target specs
+            self.append_log("🔍 Analyzing input videos...")
+            video_specs = []
+            for video_file in valid_files:
+                try:
+                    cmd = [
+                        "ffprobe", "-v", "error",
+                        "-select_streams", "v:0",
+                        "-show_entries", "stream=width,height,r_frame_rate",
+                        "-of", "json",
+                        video_file
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    import json
+                    info = json.loads(result.stdout)
+                    
+                    if 'streams' in info and len(info['streams']) > 0:
+                        stream = info['streams'][0]
+                        width = stream.get('width', 1920)
+                        height = stream.get('height', 1080)
+                        fps_str = stream.get('r_frame_rate', '30/1')
+                        
+                        # Parse fps fraction (e.g., "30000/1001" or "30/1")
+                        if '/' in fps_str:
+                            num, den = fps_str.split('/')
+                            fps = float(num) / float(den)
+                        else:
+                            fps = float(fps_str)
+                        
+                        video_specs.append({
+                            'file': video_file,
+                            'width': width,
+                            'height': height,
+                            'fps': fps
+                        })
+                        self.append_log(f"  {os.path.basename(video_file)}: {width}x{height} @ {fps:.2f}fps")
+                except Exception as e:
+                    self.append_log(f"  ⚠️ Could not analyze {os.path.basename(video_file)}: {e}")
+            
+            if not video_specs:
+                self.append_log("❌ Could not analyze any input videos")
+                return None
+            
+            # Determine target resolution (use most common or largest)
+            widths = [s['width'] for s in video_specs]
+            heights = [s['height'] for s in video_specs]
+            target_width = max(set(widths), key=widths.count)  # Most common width
+            target_height = max(set(heights), key=heights.count)  # Most common height
+            target_fps = 30  # Standard fps
+            
+            self.append_log(f"🎯 Target format: {target_width}x{target_height} @ {target_fps}fps")
+            
             # Create output directory if it doesn't exist
             output_dir = os.path.dirname(output_path)
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
             
-            # Use a temporary file for concatenation
-            temp_output = output_path.replace('.mp4', '_temp.mp4')
+            # Create temp directory for normalized files
+            temp_dir = os.path.join(output_dir or ".", "temp_combine")
+            os.makedirs(temp_dir, exist_ok=True)
             
-            # METHOD 1: Try simple concatenation first with re-encoding
-            self.append_log("🔄 Attempting optimized concatenation...")
+            # Normalize each video to common format
+            self.append_log("⚙️ Normalizing all videos to common format...")
+            normalized_files = []
             
-            # Create concat list file
-            concat_file = os.path.join(output_dir or ".", "concat_list.txt")
-            with open(concat_file, "w") as f:
-                for video_file in valid_files:
-                    abs_path = os.path.abspath(video_file)
-                    f.write(f"file '{abs_path}'\n")
-            
-            try:
-                # First, normalize all videos to a common format using a simpler approach
-                self.append_log("⚙️ Normalizing videos to common format...")
+            for i, spec in enumerate(video_specs):
+                video_file = spec['file']
+                temp_file = os.path.join(temp_dir, f"normalized_{i:03d}.mp4")
+                normalized_files.append(temp_file)
                 
-                # Get common parameters
-                target_fps = 30  # Default
-                target_width = 1920
-                target_height = 1080
+                self.append_log(f"  Processing {i+1}/{len(video_specs)}: {os.path.basename(video_file)}")
                 
-                # Build simpler ffmpeg command without complex filter graph
+                # Normalize: scale, pad, set fps, and re-encode
                 cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "concat",
-                    "-safe", "0",
-                    "-i", concat_file,
-                    "-vf", f"fps={target_fps},scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,setsar=1",
-                    "-af", "aresample=async=1000",  # Async resample helps with timestamp issues
+                    "ffmpeg", "-y", "-i", video_file,
+                    # VIDEO: Scale to fit, pad to exact size, set fps, ensure proper timestamps
+                    "-vf", f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                        f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
+                        f"setsar=1,fps={target_fps},setpts=N/FRAME_RATE/TB",
+                    # AUDIO: Resample and re-timestamp
+                    "-af", "aresample=48000,asetpts=N/SR/TB",
+                    # VIDEO CODEC: Consistent encoding settings
                     "-c:v", "libx264",
-                    "-preset", "fast",  # Use 'fast' instead of 'medium' for better performance
+                    "-preset", "medium",
                     "-crf", "23",
                     "-pix_fmt", "yuv420p",
+                    "-profile:v", "high",
+                    "-level", "4.0",
+                    "-g", str(target_fps * 2),  # GOP size = 2 seconds
+                    "-keyint_min", str(target_fps),
+                    "-sc_threshold", "0",
+                    # AUDIO CODEC
                     "-c:a", "aac",
                     "-b:a", "192k",
-                    "-movflags", "+faststart",
-                    "-vsync", "cfr",  # Constant framerate
-                    "-async", "1",    # Audio sync method
-                    temp_output
+                    "-ar", "48000",
+                    # TIMING & SYNC
+                    "-vsync", "cfr",  # Constant frame rate
+                    "-async", "1",  # Audio sync
+                    "-max_muxing_queue_size", "1024",
+                    "-fflags", "+genpts",
+                    "-avoid_negative_ts", "make_zero",
+                    temp_file
                 ]
                 
-                self.append_log(f"🔧 Running: {' '.join(cmd)}")
-                
-                # Run ffmpeg with progress
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,  # 5 minute timeout per file
+                        check=True
+                    )
+                    
+                    # Verify the normalized file
+                    if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                        self.append_log(f"    ✅ Normalized successfully")
+                    else:
+                        raise Exception("Normalized file is empty or missing")
+                        
+                except subprocess.CalledProcessError as e:
+                    self.append_log(f"    ❌ Normalization failed: {e.stderr[:200]}")
+                    raise
+                except Exception as e:
+                    self.append_log(f"    ❌ Error: {e}")
+                    raise
+            
+            # Now concatenate the normalized files
+            self.append_log("🔗 Concatenating normalized videos...")
+            concat_file = os.path.join(temp_dir, "concat_list.txt")
+            with open(concat_file, "w", encoding="utf-8") as f:
+                for temp_file in normalized_files:
+                    abs_path = os.path.abspath(temp_file).replace('\\', '/')
+                    f.write(f"file '{abs_path}'\n")
+            
+            # Simple concatenation (copy) since all files now have identical format
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_file,
+                "-c", "copy",  # Direct copy - no re-encoding
+                "-movflags", "+faststart",
+                output_path
+            ]
+            
+            try:
                 result = subprocess.run(
-                    cmd, 
-                    capture_output=True, 
+                    cmd,
+                    capture_output=True,
                     text=True,
-                    timeout=600  # 10 minute timeout
+                    timeout=120,
+                    check=True
                 )
                 
-                if result.returncode != 0:
-                    self.append_log(f"⚠️ First method failed: {result.stderr[:500]}")
-                    raise Exception("First concatenation method failed")
-                
-                # Clean up
-                try:
-                    os.remove(concat_file)
-                except:
-                    pass
-                
-                # Rename temp file to final output
-                if os.path.exists(temp_output):
-                    # If output file exists, remove it first
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                    os.rename(temp_output, output_path)
-                    
+                # Verify output
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                     self.append_log(f"✅ Combined video saved: {output_path}")
                     
                     # Get final info
@@ -1375,7 +1457,7 @@ class VideoHighlighterGUI(QWidget):
                         cmd = [
                             "ffprobe", "-v", "error",
                             "-select_streams", "v:0",
-                            "-show_entries", "stream=r_frame_rate,width,height,bit_rate",
+                            "-show_entries", "stream=r_frame_rate,width,height",
                             "-show_entries", "format=duration,size",
                             "-of", "json",
                             output_path
@@ -1398,105 +1480,44 @@ class VideoHighlighterGUI(QWidget):
                             self.append_log(f"📊 Final: {width}x{height}, {fps} fps, {duration:.1f}s, {size:.1f}MB")
                             
                     except Exception as e:
-                        self.append_log(f"✅ Combined video saved: {output_path}")
-                        self.append_log(f"⚠️ Could not get output info: {e}")
-                    
-                    return output_path
-                else:
-                    self.append_log("❌ No output file created")
-                    return None
-                    
-            except subprocess.TimeoutExpired:
-                self.append_log("❌ Process timed out after 10 minutes")
-                return None
-                
-            except Exception as e:
-                self.append_log(f"⚠️ First method failed: {e}")
-                # Clean up temp files
-                try:
-                    os.remove(concat_file)
-                except:
-                    pass
-                try:
-                    if os.path.exists(temp_output):
-                        os.remove(temp_output)
-                except:
-                    pass
-                
-                # METHOD 2: Alternative approach - process files individually then concatenate
-                self.append_log("🔄 Trying alternative method (processing individually)...")
-                
-                try:
-                    temp_files = []
-                    temp_dir = os.path.join(output_dir or ".", "temp_combine")
-                    os.makedirs(temp_dir, exist_ok=True)
-                    
-                    # Process each file individually to common format
-                    for i, video_file in enumerate(valid_files):
-                        self.append_log(f"  Processing {i+1}/{len(valid_files)}: {os.path.basename(video_file)}")
-                        
-                        temp_file = os.path.join(temp_dir, f"temp_{i:03d}.mp4")
-                        temp_files.append(temp_file)
-                        
-                        cmd = [
-                            "ffmpeg", "-y", "-i", video_file,
-                            "-vf", f"fps=30,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1",
-                            "-af", "aresample=48000:async=1",
-                            "-c:v", "libx264",
-                            "-preset", "fast",
-                            "-crf", "23",
-                            "-pix_fmt", "yuv420p",
-                            "-c:a", "aac",
-                            "-b:a", "192k",
-                            "-movflags", "+faststart",
-                            "-vsync", "cfr",
-                            temp_file
-                        ]
-                        
-                        subprocess.run(cmd, capture_output=True, check=True, timeout=300)
-                    
-                    # Now concatenate the normalized files
-                    concat_file2 = os.path.join(temp_dir, "concat_list.txt")
-                    with open(concat_file2, "w") as f:
-                        for temp_file in temp_files:
-                            f.write(f"file '{os.path.abspath(temp_file)}'\n")
-                    
-                    # Simple concatenation (copy) since all files now have same format
-                    cmd = [
-                        "ffmpeg", "-y",
-                        "-f", "concat",
-                        "-safe", "0",
-                        "-i", concat_file2,
-                        "-c", "copy",
-                        "-movflags", "+faststart",
-                        output_path
-                    ]
-                    
-                    subprocess.run(cmd, capture_output=True, check=True, timeout=300)
+                        pass  # Info is optional
                     
                     # Clean up temp files
                     try:
-                        os.remove(concat_file2)
-                        for temp_file in temp_files:
+                        os.remove(concat_file)
+                        for temp_file in normalized_files:
                             if os.path.exists(temp_file):
                                 os.remove(temp_file)
                         os.rmdir(temp_dir)
-                    except:
-                        pass
+                    except Exception as e:
+                        self.append_log(f"⚠️ Could not clean up temp files: {e}")
                     
-                    self.append_log(f"✅ Combined video saved (alternative method): {output_path}")
                     return output_path
+                else:
+                    raise Exception("Output file is empty or missing")
                     
-                except Exception as e2:
-                    self.append_log(f"❌ Alternative method also failed: {e2}")
-                    return None
+            except Exception as e:
+                self.append_log(f"❌ Failed to concatenate: {e}")
+                
+                # Clean up on failure
+                try:
+                    if os.path.exists(concat_file):
+                        os.remove(concat_file)
+                    for temp_file in normalized_files:
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                    if os.path.exists(temp_dir):
+                        os.rmdir(temp_dir)
+                except:
+                    pass
+                
+                return None
                 
         except Exception as e:
             self.append_log(f"❌ Failed to combine highlights: {e}")
             import traceback
             self.append_log(f"Traceback:\n{traceback.format_exc()}")
             return None
-
             
     # --- Config persistence ---
     def load_config(self):
