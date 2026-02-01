@@ -305,23 +305,30 @@ def create_side_by_side_frame(original, debug):
     return combined
 
 def calculate_iou(box1, box2):
-    """Calculate Intersection over Union"""
+    """
+    Calculate Intersection over Union (IoU) between two boxes.
+    """
     x1_1, y1_1, x2_1, y2_1 = box1
     x1_2, y1_2, x2_2, y2_2 = box2
-
+    
+    # Calculate intersection
     x1_i = max(x1_1, x1_2)
     y1_i = max(y1_1, y1_2)
     x2_i = min(x2_1, x2_2)
     y2_i = min(y2_1, y2_2)
-
-    if x2_i <= x1_i or y2_i <= y1_i:
+    
+    if x2_i < x1_i or y2_i < y1_i:
         return 0.0
-
+    
     intersection = (x2_i - x1_i) * (y2_i - y1_i)
+    
+    # Calculate union
     area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
     area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union = area1 + area2 - intersection
+    
+    return intersection / union if union > 0 else 0.0
 
-    return intersection / (area1 + area2 - intersection)
 
 def analyze_pose_activity(keypoints, box):
     """Analyze pose keypoints to determine activity level."""
@@ -385,24 +392,25 @@ def analyze_pose_activity(keypoints, box):
 
     return min(activity_score, 1.0)
 
-# ===== NEW ACTIVITY-BASED ZONE ANALYSIS FUNCTIONS =====
+# ===== ACTIVITY-BASED ZONE ANALYSIS FUNCTIONS =====
 
 def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20):
     """
     Analyze actual activity in different regions of the video.
-    Uses LOWER confidence threshold for better partial person detection.
+    Hybrid approach: Handles both corner people AND multi-person scenes.
+    Merges overlapping detections to prevent false splits in close-ups.
     """
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Define zones
+    # Define zones with overlap to catch corner people
     zone_width = frame_width / 3
     zones = {
-        'left': (0, zone_width),
-        'center': (zone_width, 2 * zone_width),
-        'right': (2 * zone_width, frame_width)
+        'left': (0, zone_width * 1.2),
+        'center': (zone_width * 0.8, 2.2 * zone_width),
+        'right': (1.8 * zone_width, frame_width)
     }
 
     zone_activity = {'left': [], 'center': [], 'right': []}
@@ -420,30 +428,46 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
 
         # IMPROVED: Use lower confidence for zone analysis
         result = yolo_model.predict(rgb, conf=PERSON_DETECTION_CONF_ZONES, classes=[0], verbose=False)
-        boxes = []
+        raw_boxes = []
+        corner_boxes = []
+        
         for r in result:
             for b in r.boxes:
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
                 box_w, box_h = x2 - x1, y2 - y1
                 area = box_w * box_h
                 frame_area = frame_width * frame_height
-
-                # IMPROVED: Lower minimum area threshold
-                if area / frame_area < MIN_PERSON_AREA_RATIO:
-                    continue
-
-                # Allow wider aspect ratios for partial people
                 aspect = box_w / max(box_h, 1)
-                if aspect < 0.15 or aspect > 6:  # More lenient
-                    continue
+                conf = float(b.conf)
 
-                boxes.append((x1, y1, x2, y2))
+                # Check if person is in a corner
+                in_corner = is_in_corner(x1, y1, x2, y2, frame_width, frame_height)
+                
+                # TWO PATHS: Corner detection vs Regular detection
+                if in_corner:
+                    # CORNER PATH: More lenient thresholds
+                    if area / frame_area >= MIN_PERSON_AREA_RATIO * 0.5:
+                        if aspect >= 0.12 and aspect <= 8:
+                            if conf > 0.25:
+                                raw_boxes.append((x1, y1, x2, y2, conf, True))  # True = is_corner
+                else:
+                    # REGULAR PATH: Standard thresholds for multi-person scenes
+                    if area / frame_area < MIN_PERSON_AREA_RATIO:
+                        continue
+                    if aspect < 0.15 or aspect > 6:
+                        continue
+                    raw_boxes.append((x1, y1, x2, y2, conf, False))  # False = not corner
+
+        # CRITICAL FIX: Merge overlapping boxes (removes face+hand false splits)
+        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.3)
+        corner_boxes = [box for box, is_corner in boxes if is_corner]
+        boxes = [box for box, _ in boxes]
 
         # Get pose data for activity scoring
         pose_data = {}
         if pose_model:
             try:
-                pose_result = pose_model.predict(rgb, conf=0.2, verbose=False)  # Lower conf
+                pose_result = pose_model.predict(rgb, conf=0.2, verbose=False)
                 for pr in pose_result:
                     if hasattr(pr, 'keypoints') and pr.keypoints is not None:
                         for idx, (kp, box) in enumerate(zip(pr.keypoints.data, pr.boxes.xyxy)):
@@ -460,8 +484,6 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
             for box in boxes:
                 box_center_x = (box[0] + box[2]) / 2
                 box_width = box[2] - box[0]
-
-                # IMPROVED: Check if ANY part of person is in this zone (not just center)
                 box_left = box[0]
                 box_right = box[2]
 
@@ -470,22 +492,23 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
                 overlap_end = min(zone_end, box_right)
                 overlap = max(0, overlap_end - overlap_start)
 
-                # If at least 30% of box width overlaps with zone, count it
-                if overlap > box_width * 0.3:
+                # ADAPTIVE THRESHOLD: More lenient for corner boxes
+                is_corner_box = box in corner_boxes
+                overlap_threshold = 0.2 if is_corner_box else 0.3
+                
+                if overlap > box_width * overlap_threshold:
                     zone_boxes.append(box)
 
-                    # Calculate activity score for this person
-                    activity_score = 0.5  # Default baseline
-
-                    # Try to get pose-based activity
+                    # Calculate activity score
+                    activity_score = 0.5
                     for pose_box, keypoints in pose_data.items():
-                        if calculate_iou(box, pose_box) > 0.2:  # Lower IOU threshold
+                        if calculate_iou(box, pose_box) > 0.2:
                             activity_score = analyze_pose_activity(keypoints, box)
                             break
 
                     zone_activities.append(activity_score)
 
-            # Store results for this zone in this frame
+            # Store results
             zone_people_count[zone_name].append(len(zone_boxes))
             if zone_activities:
                 zone_activity[zone_name].append(np.mean(zone_activities))
@@ -499,11 +522,82 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
     for zone_name in zones.keys():
         avg_people = np.mean(zone_people_count[zone_name]) if zone_people_count[zone_name] else 0
         avg_activity = np.mean(zone_activity[zone_name]) if zone_activity[zone_name] else 0
-
-        # Combined score: considers both presence and activity
         zone_scores[zone_name] = avg_people * avg_activity
 
     return zone_scores, zone_people_count, zone_activity
+
+
+def is_in_corner(x1, y1, x2, y2, frame_width, frame_height, margin=0.15):
+    """
+    Check if a bounding box is in any corner of the frame.
+    """
+    left_edge = x1 < frame_width * margin
+    right_edge = x2 > frame_width * (1 - margin)
+    top_edge = y1 < frame_height * margin
+    bottom_edge = y2 > frame_height * (1 - margin)
+    
+    # Check all four corners
+    in_top_left = left_edge and top_edge
+    in_top_right = right_edge and top_edge
+    in_bottom_left = left_edge and bottom_edge
+    in_bottom_right = right_edge and bottom_edge
+    
+    return in_top_left or in_top_right or in_bottom_left or in_bottom_right
+
+def merge_overlapping_boxes(raw_boxes, iou_threshold=0.3):
+    """
+    Merge overlapping bounding boxes to prevent detecting face+hand as separate people.
+    Uses greedy NMS approach.
+    
+    Args:
+        raw_boxes: List of (x1, y1, x2, y2, confidence, is_corner)
+        iou_threshold: IoU threshold for merging (0.3 means 30% overlap triggers merge)
+    
+    Returns:
+        List of merged boxes as ((x1, y1, x2, y2), is_corner)
+    """
+    if not raw_boxes:
+        return []
+    
+    # Sort by confidence (highest first)
+    raw_boxes = sorted(raw_boxes, key=lambda x: x[4], reverse=True)
+    
+    merged = []
+    used = [False] * len(raw_boxes)
+    
+    for i, (x1_i, y1_i, x2_i, y2_i, conf_i, is_corner_i) in enumerate(raw_boxes):
+        if used[i]:
+            continue
+            
+        # Start with this box
+        merge_group = [(x1_i, y1_i, x2_i, y2_i, conf_i, is_corner_i)]
+        used[i] = True
+        
+        # Find all boxes that overlap with this one
+        for j, (x1_j, y1_j, x2_j, y2_j, conf_j, is_corner_j) in enumerate(raw_boxes):
+            if used[j] or i == j:
+                continue
+                
+            iou = calculate_iou((x1_i, y1_i, x2_i, y2_i), (x1_j, y1_j, x2_j, y2_j))
+            
+            # If significant overlap, merge them
+            if iou > iou_threshold:
+                merge_group.append((x1_j, y1_j, x2_j, y2_j, conf_j, is_corner_j))
+                used[j] = True
+        
+        # Create merged bounding box (takes the union of all boxes in group)
+        x1_merged = min(box[0] for box in merge_group)
+        y1_merged = min(box[1] for box in merge_group)
+        x2_merged = max(box[2] for box in merge_group)
+        y2_merged = max(box[3] for box in merge_group)
+        
+        # Keep corner status if ANY box in group is a corner box
+        is_corner_merged = any(box[5] for box in merge_group)
+        
+        merged.append(((x1_merged, y1_merged, x2_merged, y2_merged), is_corner_merged))
+    
+    return merged
+
 
 def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sample_frames=20, people_count=0):
     """
@@ -1966,7 +2060,7 @@ def pad_to_size(crop, target_size, color=(0, 0, 0)):
     return canvas
 
 def get_multi_calibration(video_path, detector, num_frames=40, crop_count=3):
-    """Calibration that adapts to crop count"""
+    """Calibration that adapts to crop count and rounds to standard resolutions"""
     cap = cv2.VideoCapture(video_path)
     all_sizes = []
     tracker = MultiActionTracker(max_actions=3)
@@ -1994,21 +2088,92 @@ def get_multi_calibration(video_path, detector, num_frames=40, crop_count=3):
 
     cap.release()
 
+    # Standard resolutions in the 480-720 range
+    STANDARD_RESOLUTIONS = [
+        (480, 480),    # Square
+        (640, 480),    # 4:3
+        (720, 480),    # 3:2 (DV NTSC)
+        (640, 360),    # 16:9 (360p)
+        (854, 480),    # 16:9 (480p)
+        (720, 540),    # 4:3
+        (720, 720),    # Square HD
+        (960, 540),    # qHD
+    ]
+    
+    # Rounding tolerance (within 15% of target size)
+    TOLERANCE = 0.15
+
     if all_sizes:
+        # Calculate target size based on percentiles
         target_w = int(np.percentile([w for w, h in all_sizes], 80))
         target_h = int(np.percentile([h for w, h in all_sizes], 80))
 
-        aspect = target_w / target_h
-        if aspect > 1.6:
-            target_w = int(target_h * 1.4)
-        elif aspect < 0.7:
-            target_h = int(target_w * 1.4)
-
+        # Calculate aspect ratio
+        aspect = target_w / max(target_h, 1)
+        
+        print(f"🔧 Raw calibration: {target_w}x{target_h} (aspect: {aspect:.2f})")
+        
+        # Find the closest standard resolution
+        best_res = None
+        best_score = float('inf')
+        
+        for std_w, std_h in STANDARD_RESOLUTIONS:
+            # Check if within aspect ratio tolerance
+            std_aspect = std_w / std_h
+            aspect_diff = abs(aspect - std_aspect)
+            
+            if aspect_diff > 0.2:  # Skip if aspect ratio is too different
+                continue
+            
+            # Calculate size difference score
+            size_score = abs(target_w - std_w) / target_w + abs(target_h - std_h) / target_h
+            
+            # Prioritize resolutions within tolerance
+            if (abs(target_w - std_w) / target_w <= TOLERANCE and 
+                abs(target_h - std_h) / target_h <= TOLERANCE):
+                size_score *= 0.5  # Prefer resolutions within tolerance
+            
+            if size_score < best_score:
+                best_score = size_score
+                best_res = (std_w, std_h)
+        
+        # If no good match found, use the calculated size but round to nearest standard
+        if best_res is None:
+            print(f"⚠️ No standard resolution match found for {target_w}x{target_h}")
+            
+            # Round to nearest standard width/height separately
+            std_widths = [480, 640, 720, 854, 960]
+            std_heights = [360, 480, 540, 720]
+            
+            # Find closest standard width
+            closest_w = min(std_widths, key=lambda x: abs(x - target_w))
+            
+            # Find closest standard height that maintains reasonable aspect
+            target_aspect = target_w / target_h
+            best_h = None
+            best_aspect_diff = float('inf')
+            
+            for h in std_heights:
+                aspect = closest_w / h
+                aspect_diff = abs(aspect - target_aspect)
+                if aspect_diff < best_aspect_diff:
+                    best_aspect_diff = aspect_diff
+                    best_h = h
+            
+            best_res = (closest_w, best_h)
+        
+        target_w, target_h = best_res
+        
+        # Ensure minimum size
         target_w = max(target_w, 400)
         target_h = max(target_h, 400)
+        
+        print(f"✅ Rounded to standard: {target_w}x{target_h}")
         return (target_w, target_h)
 
-    return (480, 480)
+    # Fallback to standard 480p if no detection
+    print("⚠️ No detections for calibration, using default 480p")
+    return (854, 480)
 
 def is_currently_using_tracked_box(detector, action_idx: int) -> bool:
     """MAIN logic: True if currently re-using a previously tracked (missing) box"""
