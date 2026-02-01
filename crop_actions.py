@@ -598,6 +598,23 @@ def merge_overlapping_boxes(raw_boxes, iou_threshold=0.3):
     
     return merged
 
+def pick_best_zones_by_presence(zone_people, zone_activity, k=2):
+    # Score = avg_people + small weight on avg_activity
+    # Tie-breaker preference: center > right > left
+    preference = {"center": 2, "right": 1, "left": 0}
+
+    scores = []
+    for z in ["left", "center", "right"]:
+        avg_p = float(np.mean(zone_people[z])) if zone_people[z] else 0.0
+        avg_a = float(np.mean(zone_activity[z])) if zone_activity[z] else 0.0
+        score = avg_p + 0.25 * avg_a
+        scores.append((score, preference[z], z, avg_p, avg_a))
+
+    # sort by score desc, then preference desc
+    scores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    picked = [s[2] for s in scores[:k]]
+    return picked, scores
+
 
 def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sample_frames=20, people_count=0):
     """
@@ -606,6 +623,11 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
     
     FIXED: Takes people_count as input to make intelligent decisions about 2-person videos
     """
+    # Helper function to sort positions spatially (left to right)
+    def sort_positions(positions):
+        spatial_order = {"left": 0, "center": 1, "middle": 1, "right": 2}
+        return sorted(positions, key=lambda p: spatial_order.get(p, 1))
+    
     print(f"   🔍 Analyzing ACTION zones (not just people)...")
     
     # Get activity analysis
@@ -695,8 +717,9 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
                 people_action_overlap = [z for z in zones_with_people if z in action_zones]
                 
                 if len(people_action_overlap) >= 2:
+                    people_action_overlap = sort_positions(people_action_overlap[:2])  # ✅ SORT!
                     print(f"   ✅ 2 people in separate zones with action - WILL CROP")
-                    return 2, people_action_overlap[:2], "two-person-separated-actions"
+                    return 2, people_action_overlap, "two-person-separated-actions"
                 else:
                     print(f"   📋 2 people but not enough action separation - NO CROP")
                     return 0, [], "two-person-no-action-separation"
@@ -708,8 +731,10 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
     
     # Case 1: No significant action anywhere
     if len(action_zones) == 0:
-        print(f"   📋 No clear action - using default left+right")
-        return 2, ['left', 'right'], "no-action-default"
+        best2, dbg = pick_best_zones_by_presence(zone_people, zone_activity, k=2)
+        best2 = sort_positions(best2)  # ✅ SORT!
+        print(f"   📋 No clear action - using presence-based zones: {best2}")
+        return 2, best2, f"no-action-presence-{best2[0]}-{best2[1]}"
     
     # Case 2: Single action zone
     elif len(action_zones) == 1:
@@ -719,6 +744,7 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
     
     # Case 3: Two action zones
     elif len(action_zones) == 2:
+        action_zones = sort_positions(action_zones)  # ✅ SORT!
         print(f"   🎯 Two action zones: {action_zones}")
         
         # If actions are in left+center or center+right, they might be connected
@@ -732,7 +758,7 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
                 print(f"   🎯 Center dominant - cropping center only")
                 return 1, ['center'], "center-dominant-action"
             else:
-                return 2, ['left', 'center'], "left-center-actions"
+                return 2, action_zones, "left-center-actions"
                 
         elif set(action_zones) == {'center', 'right'}:
             center_density = zone_action_potential['center']['action_density']
@@ -741,13 +767,14 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
             if center_density > right_density * 2:
                 return 1, ['center'], "center-dominant-action"
             else:
-                return 2, ['center', 'right'], "center-right-actions"
+                return 2, action_zones, "center-right-actions"
         
         else:  # left + right
-            return 2, ['left', 'right'], "left-right-actions"
+            return 2, action_zones, "left-right-actions"
     
     # Case 4: Three action zones
     else:  # all 3 zones have action
+        action_zones = sort_positions(action_zones)  # ✅ SORT!
         print(f"   🎯 Three action zones detected")
         
         # Check if center is the main action hub
@@ -769,7 +796,7 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
         else:
             print(f"   🎯 Balanced action across zones - cropping all three")
             return 3, ['left', 'center', 'right'], "balanced-three-zone-actions"
-        
+                
 def get_pose_center_target(keypoints, box):
     """
     Calculate optimal crop center based on pose keypoints.
@@ -1337,159 +1364,117 @@ class MultiActionTracker:
         self.confidences = [0] * max_actions
         self.missing_counters = [0] * max_actions
 
-    def update(self, boxes, frame_shape, frame_idx, crop_count=3):
+    def update(self, boxes, frame_shape, frame_idx, crop_count=3, positions=None):
         """
-        Update tracker with boxes, crop_count determines active slots.
-        
-        FIXED: Properly maps zone assignments to action indices
+        Update tracker with boxes.
+
+        KEY RULE:
+        - positions defines which slots are active and in what OUTPUT order.
+        - mapping: left->0, middle/center->1, right->2
+        - returns regions in the SAME ORDER as `positions`
         """
         h, w = frame_shape[:2]
 
-        # Define active indices based on crop count
-        active_indices = []
-        if crop_count == 3:
-            active_indices = [0, 1, 2]
-        elif crop_count == 2:
-            active_indices = [0, 2]
-        elif crop_count == 1:
-            active_indices = [0]
-        
-        # ========================================
-        # ZONE-BASED ASSIGNMENT
-        # ========================================
-        
-        # Define zones based on crop count
-        if crop_count == 3:
-            # Left, Middle, Right zones
-            zone_width = w / 3
-            zones = [
-                (0, zone_width),                    # Left zone
-                (zone_width, 2 * zone_width),       # Middle zone  
-                (2 * zone_width, w)                 # Right zone
-            ]
-            zone_names = ['left', 'middle', 'right']
-            zone_to_action = {0: 0, 1: 1, 2: 2}  # Direct mapping
-            
-        elif crop_count == 2:
-            # Left and Right zones (no middle)
-            half_width = w / 2
-            zones = [
-                (0, half_width),                    # Left zone
-                (half_width, w)                     # Right zone
-            ]
-            zone_names = ['left', 'right']
-            zone_to_action = {0: 0, 1: 2}  # Zone 0→Action 0, Zone 1→Action 2
-            
-        else:  # crop_count == 1
-            zones = [(0, w)]
-            zone_names = ['full']
-            zone_to_action = {0: 0}
-        
-        # Assign each detected box to its nearest zone
-        assigned_boxes = [None] * len(zones)
-        
-        if len(boxes) > 0:
+        # ----------------------------
+        # 1) Normalize positions
+        # ----------------------------
+        if positions:
+            positions = ["middle" if p == "center" else p for p in positions]
+        else:
+            positions = ["left", "middle", "right"] if crop_count == 3 else (["left", "right"] if crop_count == 2 else ["middle"])
+
+        pos_to_idx = {"left": 0, "middle": 1, "right": 2}
+        active_actions_indicies = [pos_to_idx[p] for p in positions if p in pos_to_idx]
+
+        # Sanity fallback
+        if not active_actions_indicies:
+            active_actions_indicies = [0, 1, 2] if crop_count == 3 else ([0, 2] if crop_count == 2 else [1])
+            positions = ["left", "middle", "right"] if crop_count == 3 else (["left", "right"] if crop_count == 2 else ["middle"])
+
+        # ----------------------------
+        # 2) Build X targets for each output slot (order == positions)
+        # ----------------------------
+        slot_targets = []
+        for p in positions:
+            if p == "left":
+                slot_targets.append(w * (1/6))
+            elif p == "middle":
+                slot_targets.append(w * 0.5)
+            else:  # right
+                slot_targets.append(w * (5/6))
+
+        # ----------------------------
+        # 3) Assign detections to output slots by nearest target X
+        #    (each slot gets at most 1 box)
+        # ----------------------------
+        assigned_per_slot = [None] * len(positions)
+
+        if boxes:
             for box in boxes:
-                box_center_x = (box[0] + box[2]) / 2
-                
-                # Find which zone this box belongs to
-                best_zone_idx = 0
-                min_distance = float('inf')
-                
-                for zone_idx, (zone_start, zone_end) in enumerate(zones):
-                    zone_center = (zone_start + zone_end) / 2
-                    distance = abs(box_center_x - zone_center)
-                    
-                    # Check if box center is actually IN this zone (preference)
-                    in_zone = zone_start <= box_center_x <= zone_end
-                    
-                    if in_zone:
-                        # If in zone, prioritize it
-                        distance = distance * 0.5  # Make it more attractive
-                    
-                    if distance < min_distance:
-                        min_distance = distance
-                        best_zone_idx = zone_idx
-                
-                # Assign box to the best zone
-                # If zone already has a box, keep the one closer to zone center
-                if assigned_boxes[best_zone_idx] is None:
-                    assigned_boxes[best_zone_idx] = box
+                cx = (box[0] + box[2]) / 2
+
+                # find best slot
+                best_slot = min(range(len(slot_targets)), key=lambda i: abs(cx - slot_targets[i]))
+
+                # if slot empty, take it; else keep the one closer to target
+                if assigned_per_slot[best_slot] is None:
+                    assigned_per_slot[best_slot] = box
                 else:
-                    # Compare which box is better for this zone
-                    existing_box = assigned_boxes[best_zone_idx]
-                    existing_center_x = (existing_box[0] + existing_box[2]) / 2
-                    new_center_x = box_center_x
-                    
-                    zone_start, zone_end = zones[best_zone_idx]
-                    zone_center = (zone_start + zone_end) / 2
-                    
-                    existing_dist = abs(existing_center_x - zone_center)
-                    new_dist = abs(new_center_x - zone_center)
-                    
-                    # Keep the box closer to zone center
-                    if new_dist < existing_dist:
-                        assigned_boxes[best_zone_idx] = box
-        
-        # Debug: Show zone assignments
-        if frame_idx % 60 == 0:
-            print(f"\n🎯 Frame {frame_idx} Zone Assignments:")
-            for idx, (box, zone_name) in enumerate(zip(assigned_boxes, zone_names)):
-                if box:
-                    box_center_x = (box[0] + box[2]) / 2
-                    print(f"   {zone_name.capitalize()}: box at x={box_center_x:.0f}")
-                else:
-                    print(f"   {zone_name.capitalize()}: NO DETECTION")
-        
-        # ========================================
-        # CRITICAL FIX: Map zone boxes to action indices
-        # ========================================
+                    existing = assigned_per_slot[best_slot]
+                    ex_cx = (existing[0] + existing[2]) / 2
+                    if abs(cx - slot_targets[best_slot]) < abs(ex_cx - slot_targets[best_slot]):
+                        assigned_per_slot[best_slot] = box
+
+        # Map slot boxes into action-index boxes (0/1/2)
         action_boxes = [None] * self.max_actions
-        for zone_idx, box in enumerate(assigned_boxes):
-            action_idx = zone_to_action[zone_idx]
-            action_boxes[action_idx] = box
-        
-        # Use the properly mapped boxes
-        boxes = action_boxes
-        
-        # ========================================
-        # Prevent overlap
-        # ========================================
-        # Only prevent overlap for active boxes
-        active_boxes = [boxes[i] for i in active_indices]
-        active_boxes = prevent_overlap(active_boxes, w)
-        
-        # Put them back in the correct positions
-        for i, action_idx in enumerate(active_indices):
-            if i < len(active_boxes):
-                boxes[action_idx] = active_boxes[i]
-        
-        # ========================================
-        # Update tracking for each active action
-        # ========================================
-        for action_idx in active_indices:
-            if boxes[action_idx] is not None:
-                box = boxes[action_idx]
-                box = self._fine_tune_box(box, action_idx, (h, w))
+        for slot_i, action_idx in enumerate(active_actions_indicies):
+            action_boxes[action_idx] = assigned_per_slot[slot_i]
+
+        # ----------------------------
+        # 4) Prevent overlap only among active boxes (in output order),
+        #    then put back into action_boxes
+        # ----------------------------
+        active_boxes_in_output_order = [action_boxes[idx] for idx in active_actions_indicies]
+        active_boxes_in_output_order = prevent_overlap(active_boxes_in_output_order, w)
+        for slot_i, action_idx in enumerate(active_actions_indicies):
+            action_boxes[action_idx] = active_boxes_in_output_order[slot_i]
+
+        # ----------------------------
+        # 5) Update tracking state for active actions only
+        # ----------------------------
+        for action_idx in active_actions_indicies:
+            if action_boxes[action_idx] is not None:
+                box = self._fine_tune_box(action_boxes[action_idx], action_idx, (h, w))
                 self.histories[action_idx].append(box)
                 self.confidences[action_idx] = min(self.confidences[action_idx] + 1, 10)
                 self.missing_counters[action_idx] = 0
             else:
                 self.missing_counters[action_idx] += 1
 
-        # ========================================
         # Lock actions when confirmed
-        # ========================================
-        for action_idx in active_indices:
-            if (not self.actions_confirmed[action_idx] and 
-                self.confidences[action_idx] >= 8 and 
+        for action_idx in active_actions_indicies:
+            if (not self.actions_confirmed[action_idx] and
+                self.confidences[action_idx] >= 8 and
                 len(self.histories[action_idx]) >= 15):
                 self.locked_actions[action_idx] = self._get_optimal_box(
-                    self.histories[action_idx], action_idx, (h, w))
+                    self.histories[action_idx], action_idx, (h, w)
+                )
                 self.actions_confirmed[action_idx] = True
-                print(f"🎯 Locked Action {action_idx+1} at position {action_idx}")
+                print(f"🎯 Locked Action idx={action_idx} ({positions[active_actions_indicies.index(action_idx)]})")
 
-        return self._get_current_regions(h, w, crop_count)
+        # ----------------------------
+        # 6) Return current regions IN OUTPUT ORDER (matches positions)
+        # ----------------------------
+        regions = []
+        for action_idx in active_actions_indicies:
+            if self.actions_confirmed[action_idx] and self.locked_actions[action_idx]:
+                regions.append(self.locked_actions[action_idx])
+            elif self.histories[action_idx]:
+                regions.append(self._get_median_box(self.histories[action_idx]))
+            else:
+                regions.append(None)
+
+        return prevent_overlap(regions, w)
 
 
     def _fine_tune_box(self, box, action_idx, frame_shape):
@@ -1565,16 +1550,17 @@ class MultiActionTracker:
             int(np.median(y2s))
         )
 
-    def _get_current_regions(self, h, w, crop_count=3):
+    def _get_current_regions(self, h, w, crop_count=3, positions=None):
         """Get current regions based on crop count"""
         regions = []
 
-        if crop_count == 3:
-            indices = [0, 1, 2]
-        elif crop_count == 2:
-            indices = [0, 2]
+        if positions:
+            positions = ["middle" if p == "center" else p for p in positions]
+            pos_to_idx = {"left": 0, "middle": 1, "right": 2}
+            indices = [pos_to_idx[p] for p in positions if p in pos_to_idx]
         else:
-            return []
+            indices = [0, 1, 2] if crop_count == 3 else [0, 2]
+
 
         for action_idx in indices:
             if self.actions_confirmed[action_idx] and self.locked_actions[action_idx]:
@@ -1600,10 +1586,28 @@ class MultiActionDetector:
         # Initialize ROI detector if enabled
         self.roi_detector = ROIDetector(debug=False) if use_roi_detection else None
 
-    def detect(self, frame, detector, crop_count=3, pose_model=None, roi_detector=None):
+    def detect(self, frame, detector, crop_count=3, pose_model=None, positions=None):
         """Detect actions with ROI-based focusing"""
         self.frame_idx += 1
         h, w = frame.shape[:2]
+
+
+        # ✅ FIX: define active_actions_indicies here (same logic as tracker.update)
+        if positions:
+            positions = ["middle" if p == "center" else p for p in positions]
+        else:
+            positions = (
+                ["left", "middle", "right"] if crop_count == 3
+                else (["left", "right"] if crop_count == 2 else ["middle"])
+            )
+
+        pos_to_idx = {"left": 0, "middle": 1, "right": 2}
+        active_actions_indicies = [pos_to_idx[p] for p in positions if p in pos_to_idx]
+
+        # fallback sanity
+        if not active_actions_indicies:
+            active_actions_indicies = [0, 1, 2] if crop_count == 3 else ([0, 2] if crop_count == 2 else [1])
+            positions = ["left", "middle", "right"] if crop_count == 3 else (["left", "right"] if crop_count == 2 else ["middle"])
 
         # print(f"\nDEBUG: Frame {self.frame_idx}, crop_count={crop_count}")
 
@@ -1644,7 +1648,14 @@ class MultiActionDetector:
                     boxes = filtered_boxes
 
         # Update tracker with boxes
-        actions = self.tracker.update(boxes, (h, w), self.frame_idx, crop_count)
+        actions = self.tracker.update(
+            boxes,
+            (h, w),
+            self.frame_idx,
+            crop_count,
+            positions=positions
+        )
+
 
         # If ROI is available and we have actions, adjust actions to be within ROI
         if action_roi and len(actions) > 0:
@@ -1694,15 +1705,17 @@ class MultiActionDetector:
             except Exception as e:
                 print(f"⚠️ Pose estimation failed: {e}")
 
-        # Calculate pose activity for each action
-        for i, action in enumerate(actions):
+        # Calculate pose activity + tracking stats for each ACTIVE action index
+        for slot_i, action_idx in enumerate(active_actions_indicies):
+            action = actions[slot_i] if slot_i < len(actions) else None
+
             if action is not None:
-                # Find matching pose data
                 activity = 0.0
+
+                # Find matching pose data
                 if pose_data:
                     best_match = None
-                    best_overlap = 0
-
+                    best_overlap = 0.0
                     for pose_box, keypoints in pose_data.items():
                         overlap = calculate_iou(action, pose_box)
                         if overlap > best_overlap:
@@ -1712,25 +1725,32 @@ class MultiActionDetector:
                     if best_match is not None and best_overlap > 0.3:
                         activity = analyze_pose_activity(best_match, action)
 
-                self.pose_activities[i] = activity
-                self.motion_histories[i].append(action)
-                self.last_good_actions[i] = action
-                self.missing_counters[i] = 0
+                self.pose_activities[action_idx] = activity
+                self.motion_histories[action_idx].append(action)
+                self.last_good_actions[action_idx] = action
+                self.missing_counters[action_idx] = 0
             else:
-                self.missing_counters[i] += 1
+                self.missing_counters[action_idx] += 1
+
 
         # Fill in missing actions with fallbacks
         final_actions = []
-        active_indices = [0, 1, 2] if crop_count == 3 else [0, 2]
 
-        for i, action_idx in enumerate(active_indices):
-            if i < len(actions) and actions[i] is not None:
-                final_actions.append(actions[i])
+        for slot_i, action_idx in enumerate(active_actions_indicies):
+            if slot_i < len(actions) and actions[slot_i] is not None:
+                final_actions.append(actions[slot_i])
             else:
-                final_actions.append(self._get_fallback(action_idx, (h, w)))
+                # Pass positions + crop_count so fallback knows where it is
+                final_actions.append(self._get_fallback(
+                    action_idx,
+                    (h, w),
+                    positions=positions,
+                    crop_count=crop_count
+                ))
                 self.pose_activities[action_idx] = 0.0
 
         return prevent_overlap(final_actions, w)
+
 
     def _get_fallback(self, action_idx, frame_shape, positions=None, crop_count=3):
         """
@@ -1749,8 +1769,19 @@ class MultiActionDetector:
 
         # If we have positions info, use it to map action_idx to actual position
         actual_position = None
-        if positions and action_idx < len(positions):
-            actual_position = positions[action_idx]
+        if positions:
+            # positions is in output order; map action_idx back to the corresponding position name
+            if crop_count == 3:
+                idx_to_name = {0: 'left', 1: 'middle', 2: 'right'}
+                actual_position = idx_to_name.get(action_idx)
+            else:
+                # For 2-crop, positions list itself defines what we are outputting.
+                # Convert to action indices and match.
+                pos_to_idx = {'left': 0, 'center': 1, 'middle': 1, 'right': 2}
+                mapped = [pos_to_idx[p] for p in positions]
+                if action_idx in mapped:
+                    actual_position = positions[mapped.index(action_idx)]
+
         
         # Determine vertical position based on whether it's likely head/upper body
         default_size = int(min(h, w) // 2.5)
@@ -2350,7 +2381,7 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
     detector = MultiActionDetector(max_actions=MAX_PEOPLE, use_roi_detection=USE_ROI_DETECTION)
     smoother = MultiSmoother(num_actions=MAX_PEOPLE, window_size=SMOOTHING_WINDOW)
 
-    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writers = []
     for output_path in output_files:
         writer = cv2.VideoWriter(output_path, fourcc, fps, TARGET_SIZE)
@@ -2396,7 +2427,7 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
                         yolo_boxes.append((x1, y1, x2, y2))
         
         # Detect actions with ROI-based detector
-        actions = detector.detect(rgb, yolo_model, crop_count, pose_model, detector.roi_detector)
+        actions = detector.detect(rgb, yolo_model, crop_count=crop_count, pose_model=pose_model, positions=positions)
         print(f"DEBUG Frame {frame_count}: actions returned = {actions}")
         print(f"  missing_counters = {detector.missing_counters}")
         print(f"  last_good_actions = {detector.last_good_actions}")
