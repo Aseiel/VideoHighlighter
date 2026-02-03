@@ -14,12 +14,12 @@ INPUT_FOLDER = "input_videos"
 OUTPUT_FOLDER = "output_videos"
 MIN_PEOPLE_REQUIRED = 2
 MAX_PEOPLE = 3
-PEOPLE_SAMPLE_FRAMES = 30
+PEOPLE_SAMPLE_FRAMES = 40
 
 # IMPROVED: Lower confidence thresholds for better partial person detection
-PERSON_DETECTION_CONF = 0.25  # Lowered from 0.4 - catches partial people
-PERSON_DETECTION_CONF_ZONES = 0.20  # Even lower for zone analysis
-MIN_PERSON_AREA_RATIO = 0.001  # Lowered from 0.003 - allows smaller people
+PERSON_DETECTION_CONF = 0.10  # Lowered from 0.4 - catches partial people
+PERSON_DETECTION_CONF_ZONES = 0.12  # Even lower for zone analysis
+MIN_PERSON_AREA_RATIO = 0.0005  # Lowered from 0.003 - allows smaller people
 
 STICKY_FRAMES = 30
 SMOOTHING_WINDOW = 15
@@ -52,7 +52,7 @@ POSE_CONFIDENCE_THRESHOLD = 0.3
 MIN_EXPANSION = 0.1
 MAX_EXPANSION = 0.15
 
-PERSON_DETECTION_CONF_TRACKING = 0.15 # can affect window size!
+PERSON_DETECTION_CONF_TRACKING = 0.12 # can affect window size!
 
 # ===== DEBUG VISUALIZATION CONFIG =====
 DEBUG_MODE = True  # Set to True to enable debug visualization
@@ -64,6 +64,27 @@ DEBUG_CREATE_VIDEOS = True  # Create full debug videos
 DEBUG_VIDEO_FOLDER = "debug_videos"  # Folder for debug videos
 DEBUG_VIDEO_SIDE_BY_SIDE = False  # Show original + debug side-by-side
 DEBUG_SHOW_METRICS = True  # Show tracking metrics overlay
+
+# ===== NEW: ENHANCED PEOPLE DETECTION =====
+# Detect partial people and interaction zones
+USE_PARTIAL_PERSON_DETECTION = True
+PARTIAL_PERSON_MIN_AREA_RATIO = 0.0005  # Even smaller for legs-only, torsos, etc.
+INTERACTION_ZONE_EXPANSION = 0.3  # Expand detection zones to catch nearby partial people
+POSE_KEYPOINT_CLUSTER_DETECTION = True  # Detect people by keypoint clusters
+MIN_KEYPOINT_CLUSTER_SIZE = 2  # Minimum keypoints to count as a person
+KEYPOINT_CLUSTER_RADIUS = 120  # Pixels - how close keypoints must be
+
+# People counting adjustment
+PEOPLE_COUNT_CONFIDENCE_BOOST = True  # Use multiple detection methods
+COMBINE_BBOX_AND_POSE_COUNTS = True  # Merge bbox and pose detections
+ADJACENCY_BONUS = True  # If 2 detected, check if 3rd is likely nearby
+
+
+# COHERENCE DETECTION SETTINGS
+USE_COHERENCE_DETECTION = True
+COHERENCE_THRESHOLD_HIGH = 0.6  # Above this = same action
+COHERENCE_THRESHOLD_LOW = 0.4   # Below this = different actions
+MIN_COHERENCE_SAMPLES = 5
 # ======================================
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -97,9 +118,9 @@ def create_debug_video_writer(video_path, output_folder, fps, frame_shape):
 
 def create_enhanced_debug_frame(frame, frame_idx, yolo_boxes, expanded_boxes, 
                                smoothed_boxes, final_boxes, action_statuses, 
-                               positions, detector, debug_info=None):
+                               positions, detector, debug_info=None, people_info=None):
     """
-    Enhanced debug visualization with comprehensive tracking info
+    Enhanced debug visualization with comprehensive tracking info and people count
     """
     h, w = frame.shape[:2]
     
@@ -184,10 +205,10 @@ def create_enhanced_debug_frame(frame, frame_idx, yolo_boxes, expanded_boxes,
             cv2.line(vis_frame, (center_x-15, center_y), (center_x+15, center_y), color, 2)
             cv2.line(vis_frame, (center_x, center_y-15), (center_x, center_y+15), color, 2)
     
-    # Add comprehensive info overlay
+    # Add comprehensive info overlay INCLUDING PEOPLE COUNT
     if DEBUG_SHOW_METRICS:
         vis_frame = add_metrics_overlay(vis_frame, frame_idx, action_statuses, 
-                                       positions, detector, debug_info)
+                                       positions, detector, debug_info, people_info)
     
     return vis_frame
 
@@ -210,68 +231,105 @@ def draw_dashed_rectangle(img, pt1, pt2, color, thickness=1, gap=10):
         cv2.line(img, (x2, y), (x2, min(y+gap, y2)), color, thickness)
 
 
-def add_metrics_overlay(frame, frame_idx, action_statuses, positions, detector, debug_info):
-    """Add comprehensive metrics overlay"""
+def add_metrics_overlay(frame, frame_idx, action_statuses, positions, detector, debug_info, people_info=None):
+    """Add comprehensive metrics overlay including people count"""
     h, w = frame.shape[:2]
     overlay = frame.copy()
-    
+
     # Create semi-transparent background for metrics panel
-    panel_height = 180
+    panel_height = 200  # Increased height for people count info
     cv2.rectangle(overlay, (0, 0), (w, panel_height), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-    
+
     # Frame info
-    cv2.putText(frame, f"Frame: {frame_idx}", (20, 30), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    
+    cv2.putText(frame, f"Frame: {frame_idx}", (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    # Start text cursor under frame line
+    y_pos = 60
+
+    # Add people count info if available
+    # Add people count info if available
+    if people_info:
+        final_count = people_info.get('final_count', 'N/A')
+        count_ok = (isinstance(final_count, (int, float)) and final_count >= 2)
+
+        # Video-level estimate
+        cv2.putText(frame, f"People (video estimate): {final_count}", (20, y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 255, 255) if count_ok else (255, 255, 255), 2)
+        y_pos += 35
+
+        # Per-frame detections
+        current_detected = people_info.get('current_frame_detected', None)
+        if current_detected is not None:
+            cv2.putText(frame, f"People (this frame): {current_detected}", (20, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            y_pos += 35
+
+        stats = people_info.get('stats', {})
+        if stats:
+            stats_texts = [
+                f"Mean: {stats.get('mean', 0):.1f}",
+                f"Median: {stats.get('median', 0):.1f}",
+                f"Max: {stats.get('max', 0)}"
+            ]
+            for text in stats_texts:
+                cv2.putText(frame, text, (20, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                y_pos += 25
+
+        if 'crop_strategy' in people_info:
+            strategy_text = f"Strategy: {people_info['crop_strategy']}"
+            cv2.putText(frame, strategy_text, (20, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            y_pos += 30
+
+    # Original debug info (now always safe)
     if debug_info:
-        y_pos = 60
         for key, value in debug_info.items():
             text = f"{key}: {value}"
-            cv2.putText(frame, text, (20, y_pos), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(frame, text, (20, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             y_pos += 25
-    
-    # Tracking status for each position
+
+    # Tracking status for each position (right side)
     status_x = w - 350
     status_y = 30
-    cv2.putText(frame, "TRACKING STATUS:", (status_x, status_y), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    
+    cv2.putText(frame, "TRACKING STATUS:", (status_x, status_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
     for i, (status, pos) in enumerate(zip(action_statuses, positions)):
         y = status_y + 30 + (i * 35)
-        
-        # Status indicator color
+
         if "DETECTION" in status or "good" in status:
-            status_color = (0, 255, 0)  # Green
+            status_color = (0, 255, 0)
             indicator = "●"
         elif "FALLBACK" in status or "poor" in status:
-            status_color = (0, 165, 255)  # Orange
+            status_color = (0, 165, 255)
             indicator = "◐"
         else:
-            status_color = (0, 0, 255)  # Red
+            status_color = (0, 0, 255)
             indicator = "○"
-        
-        # Draw status
+
         text = f"{indicator} {pos.upper()}: {status.replace('_', ' ')}"
-        cv2.putText(frame, text, (status_x, y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
-        
-        # Missing frames counter
+        cv2.putText(frame, text, (status_x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
+
         if i < len(detector.missing_counters):
             missing = detector.missing_counters[i]
             if missing > 0:
-                cv2.putText(frame, f"({missing}f)", (status_x + 240, y), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
-    
+                cv2.putText(frame, f"({missing}f)", (status_x + 240, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+
     # Legend at bottom
     legend_y = h - 120
-    cv2.rectangle(overlay, (10, legend_y-10), (w-10, h-10), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (10, legend_y - 10), (w - 10, h - 10), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-    
-    cv2.putText(frame, "LEGEND:", (20, legend_y), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-    
+
+    cv2.putText(frame, "LEGEND:", (20, legend_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
     legend_items = [
         ("RED", (0, 0, 255), "YOLO"),
         ("YELLOW", (0, 255, 255), "Expanded"),
@@ -279,14 +337,14 @@ def add_metrics_overlay(frame, frame_idx, action_statuses, positions, detector, 
         ("BLUE", (255, 0, 0), "Good Track"),
         ("MAGENTA", (255, 0, 255), "Fallback"),
     ]
-    
+
     x_offset = 120
     for label, color, desc in legend_items:
-        cv2.rectangle(frame, (x_offset, legend_y-12), (x_offset+25, legend_y+5), color, -1)
-        cv2.putText(frame, desc, (x_offset+30, legend_y), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.rectangle(frame, (x_offset, legend_y - 12), (x_offset + 25, legend_y + 5), color, -1)
+        cv2.putText(frame, desc, (x_offset + 30, legend_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         x_offset += 120
-    
+
     return frame
 
 def create_side_by_side_frame(original, debug):
@@ -305,9 +363,7 @@ def create_side_by_side_frame(original, debug):
     return combined
 
 def calculate_iou(box1, box2):
-    """
-    Calculate Intersection over Union (IoU) between two boxes.
-    """
+    """Calculate Intersection over Union (IoU) between two boxes."""
     x1_1, y1_1, x2_1, y2_1 = box1
     x1_2, y1_2, x2_2, y2_2 = box2
     
@@ -328,6 +384,7 @@ def calculate_iou(box1, box2):
     union = area1 + area2 - intersection
     
     return intersection / union if union > 0 else 0.0
+
 
 
 def analyze_pose_activity(keypoints, box):
@@ -445,21 +502,20 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
                 
                 # TWO PATHS: Corner detection vs Regular detection
                 if in_corner:
-                    # CORNER PATH: More lenient thresholds
-                    if area / frame_area >= MIN_PERSON_AREA_RATIO * 0.5:
-                        if aspect >= 0.12 and aspect <= 8:
-                            if conf > 0.25:
-                                raw_boxes.append((x1, y1, x2, y2, conf, True))  # True = is_corner
+                    if area / frame_area >= MIN_PERSON_AREA_RATIO * 0.3:  # Lowered from 0.5x
+                        if aspect >= 0.05 and aspect <= 12:  # Wider range for distorted partials
+                            if conf > 0.20:  # Lowered from 0.25
+                                raw_boxes.append((x1, y1, x2, y2, conf, True))
                 else:
                     # REGULAR PATH: Standard thresholds for multi-person scenes
                     if area / frame_area < MIN_PERSON_AREA_RATIO:
                         continue
-                    if aspect < 0.15 or aspect > 6:
+                    if aspect < 0.08 or aspect > 10:
                         continue
                     raw_boxes.append((x1, y1, x2, y2, conf, False))  # False = not corner
 
         # CRITICAL FIX: Merge overlapping boxes (removes face+hand false splits)
-        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.3)
+        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.25)
         corner_boxes = [box for box, is_corner in boxes if is_corner]
         boxes = [box for box, _ in boxes]
 
@@ -546,7 +602,7 @@ def is_in_corner(x1, y1, x2, y2, frame_width, frame_height, margin=0.15):
 
 def merge_overlapping_boxes(raw_boxes, iou_threshold=0.3):
     """
-    Merge overlapping bounding boxes to prevent detecting face+hand as separate people.
+        Merge overlapping bounding boxes to prevent detecting face+hand as separate people.
     Uses greedy NMS approach.
     
     Args:
@@ -585,18 +641,18 @@ def merge_overlapping_boxes(raw_boxes, iou_threshold=0.3):
                 merge_group.append((x1_j, y1_j, x2_j, y2_j, conf_j, is_corner_j))
                 used[j] = True
         
-        # Create merged bounding box (takes the union of all boxes in group)
+        # Create merged bounding box
         x1_merged = min(box[0] for box in merge_group)
         y1_merged = min(box[1] for box in merge_group)
         x2_merged = max(box[2] for box in merge_group)
         y2_merged = max(box[3] for box in merge_group)
         
-        # Keep corner status if ANY box in group is a corner box
         is_corner_merged = any(box[5] for box in merge_group)
         
         merged.append(((x1_merged, y1_merged, x2_merged, y2_merged), is_corner_merged))
     
     return merged
+
 
 def pick_best_zones_by_presence(zone_people, zone_activity, k=2):
     # Score = avg_people + small weight on avg_activity
@@ -615,6 +671,176 @@ def pick_best_zones_by_presence(zone_people, zone_activity, k=2):
     picked = [s[2] for s in scores[:k]]
     return picked, scores
 
+def analyze_action_coherence(video_path, yolo_model, pose_model, sample_frames=15):
+    """
+    Analyze whether multiple people are performing coherent (same) actions.
+    Returns coherence score (0.0 = completely different, 1.0 = perfectly synchronized)
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    coherence_scores = []
+    sample_indices = [int((i / sample_frames) * total_frames) for i in range(sample_frames)]
+    
+    for frame_idx in sample_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Get people detections
+        result = yolo_model.predict(rgb, conf=PERSON_DETECTION_CONF_ZONES, classes=[0], verbose=False)
+        people_boxes = []
+        
+        for r in result:
+            for b in r.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                box_w, box_h = x2 - x1, y2 - y1
+                area = box_w * box_h
+                frame_area = frame.shape[0] * frame.shape[1]
+                
+                if area / frame_area >= MIN_PERSON_AREA_RATIO:
+                    people_boxes.append((x1, y1, x2, y2))
+        
+        # If not exactly 2 people, skip or adjust logic
+        if len(people_boxes) != 2:
+            continue
+        
+        # Get pose data for both people
+        pose_data = {}
+        if pose_model:
+            pose_result = pose_model.predict(rgb, conf=0.3, verbose=False)
+            for pr in pose_result:
+                if hasattr(pr, 'keypoints') and pr.keypoints is not None:
+                    for idx, (kp, box) in enumerate(zip(pr.keypoints.data, pr.boxes.xyxy)):
+                        x1, y1, x2, y2 = map(int, box)
+                        pose_data[(x1, y1, x2, y2)] = kp.cpu().numpy()
+        
+        # If we have pose data for both, analyze action coherence
+        if len(pose_data) >= 2:
+            # Find which pose matches which person box
+            person_poses = []
+            for person_box in people_boxes:
+                best_pose = None
+                best_iou = 0
+                for pose_box, keypoints in pose_data.items():
+                    iou = calculate_iou(person_box, pose_box)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_pose = keypoints
+                if best_pose is not None:
+                    person_poses.append(best_pose)
+            
+            # If we have poses for both people, calculate coherence
+            if len(person_poses) == 2:
+                coherence = calculate_pose_coherence(person_poses[0], person_poses[1])
+                coherence_scores.append(coherence)
+    
+    cap.release()
+    
+    if coherence_scores:
+        return np.mean(coherence_scores)
+    return 0.5  # Default moderate coherence
+
+def calculate_pose_coherence(pose1, pose2, threshold=0.3):
+    """
+    Calculate how similar two poses are (0.0-1.0).
+    Higher = more similar/coordinated actions.
+    """
+    # Keypoint indices for key body parts
+    KEY_INDICES = [0, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]  # nose, shoulders, elbows, wrists, hips, knees, ankles
+    
+    similar_count = 0
+    total_compared = 0
+    
+    for idx in KEY_INDICES:
+        if idx < len(pose1) and idx < len(pose2):
+            conf1 = pose1[idx][2] if len(pose1[idx]) > 2 else 0
+            conf2 = pose2[idx][2] if len(pose2[idx]) > 2 else 0
+            
+            # Only compare if both keypoints are confident
+            if conf1 > threshold and conf2 > threshold:
+                # Get positions
+                x1, y1 = pose1[idx][0], pose1[idx][1]
+                x2, y2 = pose2[idx][0], pose2[idx][1]
+                
+                # Normalize by body size (approximate)
+                # Use shoulder width as reference
+                shoulder_width1 = 0
+                if len(pose1) > 6:
+                    if pose1[5][2] > threshold and pose1[6][2] > threshold:
+                        shoulder_width1 = abs(pose1[5][0] - pose1[6][0])
+                
+                shoulder_width2 = 0
+                if len(pose2) > 6:
+                    if pose2[5][2] > threshold and pose2[6][2] > threshold:
+                        shoulder_width2 = abs(pose2[5][0] - pose2[6][0])
+                
+                ref_shoulder = max(shoulder_width1, shoulder_width2, 50)  # Minimum reference
+                
+                # Calculate normalized distance between same body parts
+                dx = abs(x1 - x2) / ref_shoulder
+                dy = abs(y1 - y2) / ref_shoulder
+                
+                # If body parts are close (similar positions), they might be coordinated
+                if dx < 0.5 and dy < 0.5:
+                    similar_count += 1
+                
+                total_compared += 1
+    
+    if total_compared > 0:
+        return similar_count / total_compared
+    return 0.0
+
+def calculate_movement_synchrony(person_boxes_history, max_frames=20):
+    """
+    Calculate if two people move in sync over time.
+    Returns sync score (0.0-1.0).
+    """
+    if len(person_boxes_history) < 2:
+        return 0.5
+    
+    # Get recent movement vectors
+    movements = []
+    for i in range(min(len(person_boxes_history), max_frames)):
+        if i >= len(person_boxes_history[0]) or i >= len(person_boxes_history[1]):
+            continue
+        
+        box1 = person_boxes_history[0][-i-1] if len(person_boxes_history[0]) > 0 else None
+        box2 = person_boxes_history[1][-i-1] if len(person_boxes_history[1]) > 0 else None
+        
+        if box1 and box2:
+            # Calculate centers
+            cx1 = (box1[0] + box1[2]) / 2
+            cy1 = (box1[1] + box1[3]) / 2
+            cx2 = (box2[0] + box2[2]) / 2
+            cy2 = (box2[1] + box2[3]) / 2
+            
+            movements.append((cx1, cy1, cx2, cy2))
+    
+    if len(movements) < 5:
+        return 0.5
+    
+    # Calculate correlation of movements
+    x1_movements = [movements[i][0] - movements[i-1][0] for i in range(1, len(movements))]
+    y1_movements = [movements[i][1] - movements[i-1][1] for i in range(1, len(movements))]
+    x2_movements = [movements[i][2] - movements[i-1][2] for i in range(1, len(movements))]
+    y2_movements = [movements[i][3] - movements[i-1][3] for i in range(1, len(movements))]
+    
+    # Normalize
+    if len(x1_movements) > 1:
+        x_corr = np.corrcoef(x1_movements, x2_movements)[0, 1]
+        y_corr = np.corrcoef(y1_movements, y2_movements)[0, 1]
+        
+        # Handle NaN
+        x_corr = 0 if np.isnan(x_corr) else max(0, x_corr)
+        y_corr = 0 if np.isnan(y_corr) else max(0, y_corr)
+        
+        return (x_corr + y_corr) / 2
+    return 0.5
+
 
 def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sample_frames=20, people_count=0):
     """
@@ -627,6 +853,13 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
     def sort_positions(positions):
         spatial_order = {"left": 0, "center": 1, "middle": 1, "right": 2}
         return sorted(positions, key=lambda p: spatial_order.get(p, 1))
+    
+    # ===== NEW: HANDLE SINGLE PERSON EXPLICITLY =====
+    if people_count == 1:
+        print(f"   👤 Single person detected - NO CROP (would split body parts)")
+        return 0, [], "single-person-no-crop"
+    # ================================================
+
     
     print(f"   🔍 Analyzing ACTION zones (not just people)...")
     
@@ -661,7 +894,7 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
                 'action_density': action_density,
                 'avg_activity': avg_activity,
                 'avg_people': avg_people,
-                'has_action': action_consistency > 0.3 or max_activity > 0.7
+                'has_action': action_consistency > 0.15 or max_activity > 0.55
             }
             
             print(f"      {zone.capitalize()}:")
@@ -681,51 +914,83 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
     # Only apply strict 2-person logic if we're CONFIDENT it's exactly 2 people
     # (not 3+ with some partially visible)
     if people_count == 2:
-        print(f"   👥 2-person video detected - checking confidence and separation...")
+        print(f"   👥 2-person video detected - checking action coherence...")
         
-        # Calculate total average people across all zones
-        total_avg_people = sum(
-            zone_action_potential[z]['avg_people'] 
-            for z in ['left', 'center', 'right'] 
-            if z in zone_action_potential
-        )
+        # Calculate coherence scores
+        pose_coherence = 0.5
+        if pose_model:
+            pose_coherence = analyze_action_coherence(video_path, yolo_model, pose_model, sample_frames=10)
+            print(f"   🧘 Pose coherence: {pose_coherence:.2f} (0=different, 1=same)")
         
-        print(f"   📊 Total avg people across zones: {total_avg_people:.1f}")
+        # Determine zones with people
+        zones_with_people = []
+        for zone in ['left', 'center', 'right']:
+            if zone in zone_action_potential:
+                avg_people = zone_action_potential[zone]['avg_people']
+                if avg_people >= 0.7:
+                    zones_with_people.append(zone)
         
-        # If total average is close to 3 or more, might be 3 people with partial visibility
-        # In that case, skip the strict 2-person logic
-        if total_avg_people >= 2.5:
-            print(f"   ⚠️ Total avg ({total_avg_people:.1f}) suggests possibly 3+ people with partial visibility")
-            print(f"   ➡️ Skipping strict 2-person check, using normal action-based logic")
-        else:
-            # Confident it's actually 2 people - apply strict separation check
-            print(f"   ✓ Confident this is actually 2 people (total avg: {total_avg_people:.1f})")
+        print(f"   📍 Zones with people: {zones_with_people}")
+        
+        # ===== DECISION LOGIC =====
+        
+        # Case A: Both people in SAME zone (likely collaborative action)
+        if len(zones_with_people) == 1:
+            zone = zones_with_people[0]
+            print(f"   👥 Both people in {zone} zone")
             
-            # For 2 people, only crop if they're clearly in DIFFERENT zones
-            zones_with_people = []
-            for zone in ['left', 'center', 'right']:
-                if zone in zone_action_potential:
-                    avg_people = zone_action_potential[zone]['avg_people']
-                    if avg_people >= 0.7:  # Lowered from 0.8 for better detection
-                        zones_with_people.append(zone)
-            
-            print(f"   📍 Zones with people: {zones_with_people}")
-            
-            # If both people are in different zones AND there's action in both zones
-            if len(zones_with_people) >= 2 and len(action_zones) >= 2:
-                # Check if action zones match people zones
-                people_action_overlap = [z for z in zones_with_people if z in action_zones]
-                
-                if len(people_action_overlap) >= 2:
-                    people_action_overlap = sort_positions(people_action_overlap[:2])  # ✅ SORT!
-                    print(f"   ✅ 2 people in separate zones with action - WILL CROP")
-                    return 2, people_action_overlap, "two-person-separated-actions"
-                else:
-                    print(f"   📋 2 people but not enough action separation - NO CROP")
-                    return 0, [], "two-person-no-action-separation"
+            # Check if they're doing the same action
+            if pose_coherence > 0.6:
+                print(f"   🤝 High coherence ({pose_coherence:.2f}) - COLLABORATIVE action")
+                print(f"   ➡️ Cropping single {zone} zone (showing both together)")
+                return 1, [zone], f"two-person-collaborative-{zone}"
             else:
-                print(f"   📋 2 people not separated enough - NO CROP")
-                return 0, [], "two-person-not-separated"
+                print(f"   🏃 Low coherence ({pose_coherence:.2f}) - DIFFERENT actions in same zone")
+                if zone == 'center':
+                    print(f"   ➡️ Center zone with different actions - cropping left+right")
+                    return 2, ['left', 'right'], "two-person-different-center"
+                else:
+                    print(f"   ➡️ Side zone with different actions - no crop (too cramped)")
+                    return 0, [], "two-person-cramped-different"
+        
+        # Case B: People in DIFFERENT zones
+        elif len(zones_with_people) >= 2:
+            print(f"   ↔️ People in different zones")
+            
+            # Check action separation
+            action_zones = [z for z in zones_with_people 
+                          if zone_action_potential[z]['has_action']]
+            
+            print(f"   🎯 Action zones: {action_zones}")
+            
+            # If both zones have action AND low coherence -> separate crops
+            if len(action_zones) >= 2 and pose_coherence < 0.4:
+                action_zones = sort_positions(action_zones[:2])
+                print(f"   🎯 Low coherence + action in both zones -> SEPARATE crops")
+                return 2, action_zones, "two-person-separate-actions"
+            
+            # If high coherence but in different zones -> could be reaching across
+            elif pose_coherence > 0.6:
+                # Find the main action zone
+                main_zone = max(action_zones, 
+                              key=lambda z: zone_action_potential[z]['action_density'], 
+                              default='center')
+                print(f"   🤝 High coherence across zones -> MAIN action in {main_zone}")
+                return 1, [main_zone], "two-person-coherent-across-zones"
+            
+            else:
+                # Default: crop both if separated
+                zones_with_people = sort_positions(zones_with_people[:2])
+                print(f"   ⚖️ Default: crop separated people")
+                return 2, zones_with_people, "two-person-default-separated"
+        
+        # Case C: Can't determine clearly
+        else:
+            print(f"   ❓ Ambiguous 2-person scenario")
+            best2, dbg = pick_best_zones_by_presence(zone_people, zone_activity, k=2)
+            best2 = sort_positions(best2)
+            print(f"   📋 Fallback to presence-based: {best2}")
+            return 2, best2, f"two-person-fallback-{best2[0]}-{best2[1]}"
     
     # ===== ORIGINAL LOGIC FOR 3+ PEOPLE (or when 2-person check skipped) =====
     
@@ -1221,15 +1486,23 @@ def get_crop_positions(crop_count):
     else:
         return []
 
-def count_people_in_video(video_path, yolo_model, sample_frames=30):
+def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames=30, return_details=False):
     """
-    Count people in video with IMPROVED detection for partial people.
+    ENHANCED people counting with:
+    1. Partial person detection (legs only, torsos, etc.)
+    2. Pose keypoint clustering
+    3. Interaction zone analysis
+    4. Multi-method fusion
+    
+    Returns more accurate count even when people are partially visible or overlapping.
     """
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     if total_frames == 0:
         cap.release()
+        if return_details:
+            return {'final_count': 0, 'raw_counts': [], 'stats': {}, 'method': 'no-frames'}
         return 0
 
     frame_indices = []
@@ -1240,7 +1513,11 @@ def count_people_in_video(video_path, yolo_model, sample_frames=30):
             pos = int((i / sample_frames) * total_frames)
             frame_indices.append(pos)
 
-    people_counts = []
+    # Track counts from different methods
+    bbox_counts = []
+    pose_counts = []
+    combined_counts = []
+    frame_details = []
 
     for idx, frame_idx in enumerate(frame_indices):
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -1249,75 +1526,338 @@ def count_people_in_video(video_path, yolo_model, sample_frames=30):
         if not ret:
             continue
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # IMPROVED: Lower confidence threshold
-        result = yolo_model.predict(rgb, conf=PERSON_DETECTION_CONF, classes=[0], verbose=False)
-
-        frame_count = 0
         h, w = frame.shape[:2]
         frame_area = h * w
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
+        # ===== METHOD 1: BOUNDING BOX DETECTION (Enhanced) =====
+        result = yolo_model.predict(rgb, conf=PERSON_DETECTION_CONF, classes=[0], verbose=False)
+        
+        bbox_detections = []
+        partial_detections = []
+        
         for r in result:
             for b in r.boxes:
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
                 conf = float(b.conf)
-
                 box_w, box_h = x2 - x1, y2 - y1
                 area = box_w * box_h
-
-                # IMPROVED: Lower minimum area
-                if area / frame_area < MIN_PERSON_AREA_RATIO:
-                    continue
-
-                # IMPROVED: More lenient aspect ratio for partial people
                 aspect = box_w / max(box_h, 1)
-                if aspect < 0.15 or aspect > 6:
-                    continue
 
-                frame_count += 1
+                # Standard detection
+                if area / frame_area >= MIN_PERSON_AREA_RATIO:
+                    if aspect >= 0.15 and aspect <= 6:
+                        bbox_detections.append({
+                            'box': (x1, y1, x2, y2),
+                            'conf': conf,
+                            'area': area,
+                            'type': 'full'
+                        })
+                        continue
 
-        people_counts.append(frame_count)
+                # ENHANCED: Partial person detection
+                if USE_PARTIAL_PERSON_DETECTION:
+                    if area / frame_area >= PARTIAL_PERSON_MIN_AREA_RATIO:
+                        # Very tall thin boxes = legs only
+                        if aspect >= 0.1 and aspect <= 0.4 and box_h > h * 0.2:
+                            partial_detections.append({
+                                'box': (x1, y1, x2, y2),
+                                'conf': conf,
+                                'area': area,
+                                'type': 'legs'
+                            })
+                        # Wide short boxes = torso/sitting
+                        elif aspect >= 1.2 and aspect <= 4 and box_w > w * 0.1:
+                            partial_detections.append({
+                                'box': (x1, y1, x2, y2),
+                                'conf': conf,
+                                'area': area,
+                                'type': 'torso'
+                            })
+
+        # Merge overlapping full detections
+        merged_bbox = merge_overlapping_boxes(
+            [(d['box'][0], d['box'][1], d['box'][2], d['box'][3], d['conf'], False) 
+             for d in bbox_detections],
+            iou_threshold=0.3
+        )
+        bbox_count = len(merged_bbox)
+
+        # ===== METHOD 2: POSE KEYPOINT CLUSTERING =====
+        pose_count = 0
+        keypoint_clusters = []
+        
+        if pose_model and POSE_KEYPOINT_CLUSTER_DETECTION:
+            try:
+                pose_result = pose_model.predict(rgb, conf=0.2, verbose=False)
+                
+                if len(pose_result) > 0 and hasattr(pose_result[0], 'keypoints'):
+                    all_keypoints = pose_result[0].keypoints.data.cpu().numpy()
+                    
+                    # Cluster keypoints by proximity
+                    keypoint_clusters = cluster_keypoints_by_person(
+                        all_keypoints, 
+                        min_keypoints=MIN_KEYPOINT_CLUSTER_SIZE,
+                        radius=KEYPOINT_CLUSTER_RADIUS
+                    )
+                    pose_count = len(keypoint_clusters)
+                    
+            except Exception as e:
+                print(f"⚠️ Pose detection failed: {e}")
+
+        # ===== METHOD 3: COMBINED ANALYSIS =====
+        combined_count = bbox_count
+        
+        if COMBINE_BBOX_AND_POSE_COUNTS:
+            # Use the MAXIMUM of bbox and pose counts as baseline
+            combined_count = max(bbox_count, pose_count)
+            
+            # If we have partial detections, check if they represent additional people
+            if len(partial_detections) > 0:
+                # Check if partial detections are near existing full detections
+                additional_people = count_additional_from_partials(
+                    merged_bbox, partial_detections, w, h
+                )
+                combined_count += additional_people
+
+            # ADJACENCY BONUS: If we detected 2 people but there are signs of a 3rd
+            if combined_count == 2 and ADJACENCY_BONUS:
+                if has_evidence_of_third_person(
+                    merged_bbox, partial_detections, keypoint_clusters, w, h
+                ):
+                    print(f"  🔍 Frame {idx}: Adjacency bonus - likely 3rd person")
+                    combined_count = 3
+
+        bbox_counts.append(bbox_count)
+        pose_counts.append(pose_count)
+        combined_counts.append(combined_count)
+        
+        frame_details.append({
+            'frame_idx': int(frame_idx),
+            'bbox_count': int(bbox_count),
+            'pose_count': int(pose_count),
+            'combined_count': int(combined_count),
+            'partial_detections': len(partial_detections)
+        })
 
         if idx % 10 == 0:
-            print(f"  Frame {idx+1}/{len(frame_indices)}: {frame_count} people")
+            print(f"  Frame {idx+1}/{len(frame_indices)}: bbox={bbox_count}, pose={pose_count}, combined={combined_count}")
 
     cap.release()
 
-    if not people_counts:
+    if not combined_counts:
+        if return_details:
+            return {'final_count': 0, 'raw_counts': [], 'stats': {}, 'method': 'no-detections'}
         return 0
 
-    print(f"  Raw counts: {people_counts}")
+    # ===== FINAL COUNT DETERMINATION =====
+    print(f"  📊 Detection summary:")
+    print(f"     BBox counts: {bbox_counts}")
+    print(f"     Pose counts: {pose_counts}")
+    print(f"     Combined counts: {combined_counts}")
 
-    counts_array = np.array(people_counts)
+    # Use combined counts as primary method
+    counts_array = np.array(combined_counts)
     mean_count = np.mean(counts_array)
     median_count = np.median(counts_array)
+    max_count = max(combined_counts)
 
-    counter = Counter(people_counts)
+    counter = Counter(combined_counts)
     most_common = counter.most_common(3)
 
-    print(f"  Statistics: mean={mean_count:.1f}, median={median_count}")
+    print(f"  Statistics: mean={mean_count:.1f}, median={median_count}, max={max_count}")
     print(f"  Most common: {most_common}")
 
-    # IMPROVED: Use mean instead of median for better 3-person detection
-    candidate_counts = [mean_count, median_count]
+    # Decision logic: favor higher counts when evidence is strong
+    candidate_counts = []
+    
+    # Add mean if reasonable
+    if mean_count >= 2:
+        candidate_counts.append(mean_count)
+    
+    # Add median
+    candidate_counts.append(median_count)
+    
+    # Add mode if it appears frequently enough
     for count, freq in most_common:
-        if freq >= len(people_counts) * 0.20:  # Lowered from 0.25
+        if freq >= len(combined_counts) * 0.15:  # Lower threshold - 15%
             candidate_counts.append(count)
+    
+    # Add max if it appears in at least 20% of frames
+    max_freq = combined_counts.count(max_count) / len(combined_counts)
+    if max_freq >= 0.2:
+        candidate_counts.append(max_count)
 
     final_count = int(round(max(candidate_counts)))
 
-    max_seen = max(people_counts)
-    if max_seen >= 2 and final_count < 2:
-        print(f"  ⚠️  Overriding: saw {max_seen} people in at least one frame")
-        final_count = max_seen
+    # Override logic: if max_count is significantly higher and appears enough times
+    if max_count >= 3:
+        bbox_max = max(bbox_counts) if bbox_counts else 0
+        pose_max = max(pose_counts) if pose_counts else 0
+        if bbox_max >= 3 or pose_max >= 3:
+            print(f"  ⚠️ Strong evidence of 3: bbox_max={bbox_max}, pose_max={pose_max}")
+            final_count = max(final_count, 3)
 
-    # IMPROVED: Better 3-person detection
-    if mean_count >= 2.4 and max_seen >= 3 and final_count < 3:
-        print(f"  ⚠️  Overriding to 3: mean={mean_count:.1f}, max={max_seen}")
+    # Special case: if mean is 2.3+ and max is 3+, likely 3 people
+    if mean_count >= 2.3 and max_count >= 3 and final_count < 3:
+        print(f"  ⚠️ Overriding to 3: mean={mean_count:.1f}, max={max_count}")
         final_count = 3
 
+    if return_details:
+        return {
+            'final_count': final_count,
+            'raw_counts': combined_counts,
+            'bbox_counts': bbox_counts,
+            'pose_counts': pose_counts,
+            'stats': {
+                'mean': float(mean_count),
+                'median': float(median_count),
+                'max': int(max_count),
+                'most_common': most_common
+            },
+            'frame_details': frame_details,
+            'method': 'enhanced-multi-method'
+        }
+    
     return final_count
+
+
+def cluster_keypoints_by_person(all_keypoints, min_keypoints=3, radius=100):
+    """
+    Cluster pose keypoints into separate people based on spatial proximity.
+    Handles cases where bbox detection misses someone but pose keypoints are visible.
+    """
+    clusters = []
+    used_keypoints = set()
+    
+    for person_idx, keypoints in enumerate(all_keypoints):
+        # Get confident keypoints
+        confident_kps = []
+        for kp_idx, kp in enumerate(keypoints):
+            if kp[2] > 0.3:  # Confidence threshold
+                confident_kps.append((kp[0], kp[1], kp_idx))
+        
+        if len(confident_kps) < min_keypoints:
+            continue
+        
+        # Check if this cluster overlaps with existing clusters
+        is_new_person = True
+        for cluster in clusters:
+            # Check distance to cluster centroid
+            cluster_center = np.mean([[kp[0], kp[1]] for kp in cluster['keypoints']], axis=0)
+            person_center = np.mean([[kp[0], kp[1]] for kp in confident_kps], axis=0)
+            
+            distance = np.linalg.norm(cluster_center - person_center)
+            
+            if distance < radius:
+                # Merge into existing cluster
+                cluster['keypoints'].extend(confident_kps)
+                is_new_person = False
+                break
+        
+        if is_new_person:
+            clusters.append({
+                'keypoints': confident_kps,
+                'center': np.mean([[kp[0], kp[1]] for kp in confident_kps], axis=0)
+            })
+    
+    return clusters
+
+
+def count_additional_from_partials(full_detections, partial_detections, frame_w, frame_h):
+    """
+    Count how many additional people are represented by partial detections.
+    Only count partials that are NOT overlapping with full detections.
+    """
+    if not partial_detections:
+        return 0
+    
+    additional = 0
+    
+    for partial in partial_detections:
+        px1, py1, px2, py2 = partial['box']
+        
+        # Check if this partial overlaps with any full detection
+        overlaps_with_full = False
+        for full_box, _ in full_detections:
+            fx1, fy1, fx2, fy2 = full_box
+            
+            # Calculate IoU
+            iou = calculate_iou(partial['box'], full_box)
+            
+            if iou > 0.1:  # 10% overlap
+                overlaps_with_full = True
+                break
+        
+        # If it doesn't overlap, it might be an additional person
+        if not overlaps_with_full:
+            # Additional heuristics:
+            # - Legs-only detections at bottom of frame
+            # - Torso detections that are substantial
+            
+            if partial['type'] == 'legs':
+                # Legs should be in bottom 60% of frame
+                if py1 > frame_h * 0.4:
+                    additional += 1
+            elif partial['type'] == 'torso':
+                # Torso should be substantial
+                area = (px2 - px1) * (py2 - py1)
+                if area > (frame_w * frame_h) * 0.02:
+                    additional += 1
+    
+    # Cap at 1 additional person from partials to avoid over-counting
+    return min(additional, 1)
+
+
+def has_evidence_of_third_person(full_detections, partial_detections, keypoint_clusters, frame_w, frame_h):
+    """
+    IMPROVED: More aggressive 3rd person detection
+    """
+    if len(full_detections) != 2:
+        return False
+    
+    # Check 1: Partial detections (✅ IMPROVED distance threshold)
+    if partial_detections:
+        for partial in partial_detections:
+            px1, py1, px2, py2 = partial['box']
+            pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
+            
+            min_dist = float('inf')
+            for full_box, _ in full_detections:
+                fx1, fy1, fx2, fy2 = full_box
+                fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+                
+                dist = np.sqrt((pcx - fcx)**2 + (pcy - fcy)**2)
+                min_dist = min(min_dist, dist)
+            
+            # ✅ IMPROVED: Lower threshold (20% vs 25%)
+            if min_dist > frame_w * 0.20:  # Was 0.25
+                return True
+    
+    # Check 2: Keypoint clusters
+    if len(keypoint_clusters) > 2:
+        return True
+    
+    # Check 3: Spatial arrangement (✅ IMPROVED middle zone detection)
+    (box1, _), (box2, _) = full_detections
+    x1_center = (box1[0] + box1[2]) / 2
+    x2_center = (box2[0] + box2[2]) / 2
+    
+    if abs(x1_center - x2_center) > frame_w * 0.5:
+        # ✅ IMPROVED: Wider middle zone
+        middle_zone = (min(x1_center, x2_center) + abs(x1_center - x2_center) * 0.20,  # Was 0.25
+                      min(x1_center, x2_center) + abs(x1_center - x2_center) * 0.80)  # Was 0.75
+        
+        for partial in partial_detections:
+            px1, px2 = partial['box'][0], partial['box'][2]
+            pcx = (px1 + px2) / 2
+            
+            if middle_zone[0] < pcx < middle_zone[1]:
+                return True
+    
+    return False
+
+
 
 def prevent_overlap(boxes, frame_width, margin=OVERLAP_MARGIN):
     """Adjust boxes to prevent overlap while maintaining left-middle-right order."""
@@ -1587,12 +2127,20 @@ class MultiActionDetector:
         self.roi_detector = ROIDetector(debug=False) if use_roi_detection else None
 
     def detect(self, frame, detector, crop_count=3, pose_model=None, positions=None):
-        """Detect actions with ROI-based focusing"""
+        """
+        Detect actions with ROI-based focusing.
+
+        UPDATED:
+        - Keeps torso-only and legs-only detections (partial people).
+        - Uses separate shape/size heuristics to avoid garbage boxes.
+        - Allows lower confidence for partials without flooding full detections.
+        """
         self.frame_idx += 1
         h, w = frame.shape[:2]
 
-
-        # ✅ FIX: define active_actions_indicies here (same logic as tracker.update)
+        # ----------------------------
+        # 1) Normalize positions / active indices
+        # ----------------------------
         if positions:
             positions = ["middle" if p == "center" else p for p in positions]
         else:
@@ -1604,50 +2152,106 @@ class MultiActionDetector:
         pos_to_idx = {"left": 0, "middle": 1, "right": 2}
         active_actions_indicies = [pos_to_idx[p] for p in positions if p in pos_to_idx]
 
-        # fallback sanity
         if not active_actions_indicies:
             active_actions_indicies = [0, 1, 2] if crop_count == 3 else ([0, 2] if crop_count == 2 else [1])
             positions = ["left", "middle", "right"] if crop_count == 3 else (["left", "right"] if crop_count == 2 else ["middle"])
 
-        # print(f"\nDEBUG: Frame {self.frame_idx}, crop_count={crop_count}")
+        # ----------------------------
+        # 2) YOLO detections
+        # ----------------------------
+        # You can tune this; partials often need it lower.
+        TRACK_CONF = PERSON_DETECTION_CONF_TRACKING  # e.g. 0.06–0.12
+        result = detector.predict(frame, conf=TRACK_CONF, classes=[0], verbose=False)
 
-        # Get detection boxes
-        result = detector.predict(frame, conf=PERSON_DETECTION_CONF_TRACKING, classes=[0], verbose=False)
         boxes = []
+        frame_area = float(h * w)
+
+        # Per-type confidence gating (prevents "conf too low -> chairs become people")
+        CONF_FULL = max(0.10, TRACK_CONF)  # full-ish should be a bit stricter
+        CONF_PARTIAL = max(0.06, TRACK_CONF)  # partials can be lower
+
+        def touches_border(x1, y1, x2, y2, margin=0.03):
+            return (
+                x1 < w * margin or x2 > w * (1 - margin) or
+                y1 < h * margin or y2 > h * (1 - margin)
+            )
+
         for r in result:
             for b in r.boxes:
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
                 conf = float(b.conf)
-                box_w, box_h = x2 - x1, y2 - y1
-                area = box_w * box_h
-                frame_area = h * w
-                min_ratio = 0.02
-                max_ratio = 0.5
-                aspect = box_w / box_h if box_h > 0 else 1
 
-                if (min_ratio < area / frame_area < max_ratio and 
-                    0.5 < aspect < 2.0):
+                box_w = max(1, x2 - x1)
+                box_h = max(1, y2 - y1)
+                area = box_w * box_h
+                area_ratio = area / frame_area
+                aspect = box_w / float(box_h)
+
+                border = touches_border(x1, y1, x2, y2)
+
+                # ---- FULL-ish person (more normal aspect) ----
+                is_fullish = (
+                    area_ratio > 0.015 and
+                    0.35 < aspect < 3.5 and
+                    box_h > h * 0.20
+                )
+
+                # ---- LEGS-only (tall + thin) ----
+                is_legs = (
+                    area_ratio > 0.0015 and
+                    aspect < 0.45 and
+                    box_h > h * 0.20
+                )
+
+                # ---- TORSO-only (wide + short-ish) ----
+                # keep some minimum height so banners / tables don't dominate
+                is_torso = (
+                    area_ratio > 0.0020 and
+                    aspect > 1.2 and
+                    box_w > w * 0.10 and
+                    box_h > h * 0.12
+                )
+
+                # Optional: bias partial acceptance near borders (helps corners)
+                # If you want partials everywhere, remove `border and` from that line.
+                accept_partial = (is_legs or is_torso)
+
+                # Confidence gating:
+                # - full-ish requires CONF_FULL
+                # - partial can pass with CONF_PARTIAL (often needed for corners)
+                keep = False
+                if is_fullish and conf >= CONF_FULL:
+                    keep = True
+                elif accept_partial and conf >= CONF_PARTIAL:
+                    # if you want to be stricter and ONLY keep partials near edges:
+                    # keep = border
+                    keep = True
+
+                # Extra cheap anti-noise guard:
+                # reject absurdly huge "person" boxes
+                if keep and area_ratio < 0.70:
                     boxes.append((x1, y1, x2, y2))
 
-        # Get ROI if ROI detection is enabled
+        # ----------------------------
+        # 3) ROI detection (optional)
+        # ----------------------------
         action_roi = None
         if self.use_roi_detection and self.roi_detector and len(boxes) > 0:
             action_roi, focus_region = self.roi_detector.detect_action_roi(
                 frame, boxes, pose_model, max_people=crop_count
             )
 
-            # If ROI is detected, use it to filter and adjust boxes
             if action_roi:
-                # Filter boxes to only include those that overlap with ROI
                 filtered_boxes = []
                 for box in boxes:
-                    if calculate_iou(box, action_roi) > 0.1:  # At least 10% overlap
+                    if calculate_iou(box, action_roi) > 0.05:  # more lenient for partials
                         filtered_boxes.append(box)
-
-                if len(filtered_boxes) > 0:
+                if filtered_boxes:
                     boxes = filtered_boxes
 
-        # Update tracker with boxes
+        # ----------------------------
+        # 4) Update tracker
+        # ----------------------------
         actions = self.tracker.update(
             boxes,
             (h, w),
@@ -1656,30 +2260,29 @@ class MultiActionDetector:
             positions=positions
         )
 
-
-        # If ROI is available and we have actions, adjust actions to be within ROI
+        # ----------------------------
+        # 5) Constrain actions to ROI (optional)
+        # ----------------------------
         if action_roi and len(actions) > 0:
             adjusted_actions = []
             roi_x1, roi_y1, roi_x2, roi_y2 = action_roi
 
-            for i, action in enumerate(actions):
+            for action in actions:
                 if action is None:
                     adjusted_actions.append(None)
                     continue
 
                 ax1, ay1, ax2, ay2 = action
 
-                # Constrain action box within ROI
                 ax1 = max(roi_x1, ax1)
                 ay1 = max(roi_y1, ay1)
                 ax2 = min(roi_x2, ax2)
                 ay2 = min(roi_y2, ay2)
 
-                # Ensure valid box
                 if ax2 > ax1 and ay2 > ay1:
                     adjusted_actions.append((ax1, ay1, ax2, ay2))
                 else:
-                    # If box becomes invalid, use ROI center
+                    # fallback: ROI-centered box
                     center_x = (roi_x1 + roi_x2) // 2
                     center_y = (roi_y1 + roi_y2) // 2
                     size = min(roi_x2 - roi_x1, roi_y2 - roi_y1) // 2
@@ -1692,27 +2295,27 @@ class MultiActionDetector:
 
             actions = adjusted_actions
 
-        # Get pose data if available (for activity scoring)
+        # ----------------------------
+        # 6) Pose activity / tracking stats (unchanged)
+        # ----------------------------
         pose_data = {}
         if pose_model and USE_POSE_ESTIMATION:
             try:
                 pose_result = pose_model.predict(frame, conf=0.3, verbose=False)
                 for pr in pose_result:
                     if hasattr(pr, 'keypoints') and pr.keypoints is not None:
-                        for idx, (kp, box) in enumerate(zip(pr.keypoints.data, pr.boxes.xyxy)):
-                            x1, y1, x2, y2 = map(int, box)
-                            pose_data[(x1, y1, x2, y2)] = kp.cpu().numpy()
+                        for kp, box in zip(pr.keypoints.data, pr.boxes.xyxy):
+                            px1, py1, px2, py2 = map(int, box)
+                            pose_data[(px1, py1, px2, py2)] = kp.cpu().numpy()
             except Exception as e:
                 print(f"⚠️ Pose estimation failed: {e}")
 
-        # Calculate pose activity + tracking stats for each ACTIVE action index
         for slot_i, action_idx in enumerate(active_actions_indicies):
             action = actions[slot_i] if slot_i < len(actions) else None
 
             if action is not None:
                 activity = 0.0
 
-                # Find matching pose data
                 if pose_data:
                     best_match = None
                     best_overlap = 0.0
@@ -1722,7 +2325,7 @@ class MultiActionDetector:
                             best_overlap = overlap
                             best_match = keypoints
 
-                    if best_match is not None and best_overlap > 0.3:
+                    if best_match is not None and best_overlap > 0.2:  # more lenient for partials
                         activity = analyze_pose_activity(best_match, action)
 
                 self.pose_activities[action_idx] = activity
@@ -1732,15 +2335,14 @@ class MultiActionDetector:
             else:
                 self.missing_counters[action_idx] += 1
 
-
-        # Fill in missing actions with fallbacks
+        # ----------------------------
+        # 7) Fill missing actions with fallbacks
+        # ----------------------------
         final_actions = []
-
         for slot_i, action_idx in enumerate(active_actions_indicies):
             if slot_i < len(actions) and actions[slot_i] is not None:
                 final_actions.append(actions[slot_i])
             else:
-                # Pass positions + crop_count so fallback knows where it is
                 final_actions.append(self._get_fallback(
                     action_idx,
                     (h, w),
@@ -2329,7 +2931,8 @@ def visualize_crop_process(frame, frame_idx, yolo_boxes, expanded_boxes, smoothe
     return vis_frame
 
 
-def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop_count, positions_override=None):
+def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop_count, 
+                                    positions_override=None, people_info=None):
     """Process video with dynamic number of crops (2 or 3) with ROI detection and debug visualization"""
     # Use override positions if provided, otherwise use default
     if positions_override:
@@ -2413,7 +3016,9 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
 
         # Get YOLO detections for debug visualization
         yolo_boxes = []
-        if DEBUG_MODE and debug_sample_count < DEBUG_SAMPLES:
+        need_frame_people_count = DEBUG_MODE and (DEBUG_CREATE_VIDEOS or DEBUG_SHOW_METRICS)
+
+        if need_frame_people_count:
             result = yolo_model.predict(rgb, conf=PERSON_DETECTION_CONF_TRACKING, classes=[0], verbose=False)
             for r in result:
                 for b in r.boxes:
@@ -2422,16 +3027,20 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
                     area = box_w * box_h
                     frame_area = frame.shape[0] * frame.shape[1]
                     aspect = box_w / box_h if box_h > 0 else 1
-                    
+
                     if (0.02 < area / frame_area < 0.5 and 0.5 < aspect < 2.0):
                         yolo_boxes.append((x1, y1, x2, y2))
+
+        # Build per-frame people_info for overlay (don’t mutate shared dict)
+        frame_people_info = None
+        if people_info is not None and need_frame_people_count:
+            frame_people_info = dict(people_info)
+            frame_people_info["current_frame_detected"] = len(yolo_boxes)
+
+
         
         # Detect actions with ROI-based detector
         actions = detector.detect(rgb, yolo_model, crop_count=crop_count, pose_model=pose_model, positions=positions)
-        print(f"DEBUG Frame {frame_count}: actions returned = {actions}")
-        print(f"  missing_counters = {detector.missing_counters}")
-        print(f"  last_good_actions = {detector.last_good_actions}")
-
 
         expanded_actions = []
         action_indices = []
@@ -2461,9 +3070,6 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
                 history = detector.motion_histories[action_idx] if action_idx < len(detector.motion_histories) else deque(maxlen=10)
                 
                 # ✅ FIXED LOGIC: Determine status based on missing counter
-                # missing == 0 means we have a REAL FRESH detection from YOLO
-                # missing > 0 means we're using a tracked/fallback box
-                
                 if missing == 0:
                     # We have a fresh detection from YOLO!
                     status = "FRESH_DETECTION"
@@ -2507,12 +3113,6 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
             # Store status for visualization
             action_statuses.append(status)
             
-            # ──── Debug print (only occasionally) ────
-            if frame_count % 45 == 0:
-                miss = detector.missing_counters[action_idx] if action_idx < len(detector.missing_counters) else -1
-                hist = len(detector.motion_histories[action_idx]) if action_idx < len(detector.motion_histories) else 0
-                print(f"  F {frame_count} | idx={action_idx} | miss={miss:2d} | hist={hist:2d} | {status:16} | margin={adaptive_margin:.3f}")
-
             # ──── Actually expand the box ────
             expanded = expand_box(
                 current_box,
@@ -2530,7 +3130,7 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
         
         smoothed_actions = smoother.smooth(*expanded_actions)
                 
-        # NEW: Write debug frame
+        # NEW: Write debug frame with people_info
         if DEBUG_MODE and DEBUG_CREATE_VIDEOS and debug_writer:
             debug_info = {
                 "Crop Count": crop_count,
@@ -2541,7 +3141,7 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
             debug_frame = create_enhanced_debug_frame(
                 frame, frame_count, yolo_boxes, expanded_actions,
                 smoothed_actions, smoothed_actions, action_statuses,
-                positions, detector, debug_info
+                positions, detector, debug_info, frame_people_info
             )
             
             if DEBUG_VIDEO_SIDE_BY_SIDE:
@@ -2703,11 +3303,24 @@ def main():
 
         print(f"🔍 [{i}/{len(video_files)}] Investigating {filename}...")
 
-        # STEP 1: Count people (quick filter)
+        # ✨ NEW: Enhanced people counting
         start_time = time.time()
-        people_count = count_people_in_video(video_path, yolo, PEOPLE_SAMPLE_FRAMES)
+        people_info = count_people_in_video(
+            video_path, yolo, pose_model, 
+            sample_frames=PEOPLE_SAMPLE_FRAMES, 
+            return_details=True
+        )
+        people_count = people_info['final_count']
         elapsed = time.time() - start_time
+        
         print(f"   👥 Detected {people_count} person(s) in {elapsed:.1f}s")
+        print(f"      Method: {people_info['method']}")
+        
+        # Show detection breakdown if available
+        if 'bbox_counts' in people_info and 'pose_counts' in people_info:
+            bbox_avg = np.mean(people_info['bbox_counts'])
+            pose_avg = np.mean(people_info['pose_counts'])
+            print(f"      Avg BBox: {bbox_avg:.1f}, Avg Pose: {pose_avg:.1f}")
 
         # STEP 2: Determine crop strategy
         crop_count = 0
@@ -2782,14 +3395,55 @@ def main():
             strategy = f"insufficient-people-{people_count}"
             print(f"   📋 Not enough people for cropping")
 
+        # Add crop strategy to people_info for debugging
+        people_info['crop_strategy'] = strategy
+        people_info['crop_count'] = crop_count
+        people_info['positions'] = positions
+
         # STEP 3: Process or copy based on strategy
         # Fully automatic - if crop_count is 0, copy; otherwise crop
         if crop_count >= MIN_PEOPLE_REQUIRED and len(positions) >= MIN_PEOPLE_REQUIRED:
             print(f"   🎬 Processing with {crop_count}-crop: {positions}")
-            process_video_with_dynamic_crops(
-                video_path, OUTPUT_FOLDER, yolo, crop_count, 
-                positions_override=positions
+            
+            # Modify process_video_with_dynamic_crops to accept people_info
+            output_files = process_video_with_dynamic_crops(
+                video_path,
+                OUTPUT_FOLDER,
+                yolo,
+                crop_count,
+                positions_override=positions,
+                people_info=people_info,   # ✅ ADD THIS
             )
+
+            
+            # Also save people count info to debug folder
+            if DEBUG_MODE:
+                debug_folder = os.path.join(DEBUG_OUTPUT_FOLDER, os.path.splitext(filename)[0])
+                os.makedirs(debug_folder, exist_ok=True)
+                
+                # Save people count info as JSON
+                people_info_path = os.path.join(debug_folder, "people_count_info.json")
+                import json
+                
+                # Convert numpy types to Python native types for JSON serialization
+                def convert_to_serializable(obj):
+                    if isinstance(obj, (np.integer, np.floating)):
+                        return obj.item()
+                    elif isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    elif isinstance(obj, list):
+                        return [convert_to_serializable(item) for item in obj]
+                    elif isinstance(obj, dict):
+                        return {key: convert_to_serializable(value) for key, value in obj.items()}
+                    else:
+                        return obj
+                
+                serializable_info = convert_to_serializable(people_info)
+                
+                with open(people_info_path, 'w') as f:
+                    json.dump(serializable_info, f, indent=2)
+                
+                print(f"   💾 Saved people count info to: {os.path.basename(people_info_path)}")
         else:
             reason = "strategy" if crop_count == 0 else "people count"
             print(f"   📋 Copying {filename} as-is (reason: {reason}, strategy: {strategy})")
