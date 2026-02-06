@@ -1636,6 +1636,25 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             except Exception as e:
                 log(f"⚠️ Could not remove temporary file: {e}")
 
+        # ========== TIMELINE VISUALIZATION ==========
+        if gui_config.get("create_timeline_viewer", False):
+            try:
+                from signal_timeline_viewer import show_timeline_viewer
+                log("🎨 Launching Signal Timeline Viewer...")
+                # Launch in separate thread/process so it doesn't block
+                import threading
+                timeline_thread = threading.Thread(
+                    target=show_timeline_viewer,
+                    args=(processed_video_path, analysis_data),
+                    daemon=True
+                )
+                timeline_thread.start()
+            except Exception as e:
+                log(f"⚠️ Timeline viewer failed: {e}")
+        # ============================================
+
+        return OUTPUT_FILE
+
         return OUTPUT_FILE
 
     except RuntimeError as e:

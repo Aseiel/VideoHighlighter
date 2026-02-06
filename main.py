@@ -14,8 +14,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
 from pipeline import run_highlighter
-from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError
+from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 
+# At app startup
+reset_duration_method_cache()
 
 CONFIG_FILE = "config.yaml"
 
@@ -733,6 +735,10 @@ class VideoHighlighterGUI(QWidget):
         self.keep_temp_chk.clicked.connect(lambda: self.keep_temp_chk.setText(
             "Keep temp clips: ON" if self.keep_temp_chk.isChecked() else "Keep temp clips: OFF"))
 
+        self.timeline_btn = QPushButton("📊 Show Timeline Viewer")
+        self.timeline_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px; }")
+        self.timeline_btn.clicked.connect(self.open_timeline_viewer)
+
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setStyleSheet("QPushButton:enabled { background-color: #ff4444; color: white; font-weight: bold; }")
@@ -744,6 +750,7 @@ class VideoHighlighterGUI(QWidget):
 
         ctrl_layout.addWidget(self.cancel_btn)
         ctrl_layout.addWidget(self.keep_temp_chk)
+        ctrl_layout.addWidget(self.timeline_btn)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.run_btn)
         layout.addLayout(ctrl_layout)
@@ -2244,6 +2251,48 @@ class VideoHighlighterGUI(QWidget):
             if self.worker.isRunning():
                 self.worker.wait(1000)  # Wait up to 1 second
             self.worker = None
+
+    def open_timeline_viewer(self):
+        """Open timeline viewer for the selected video"""
+        video_paths = self.get_file_list()
+        
+        if not video_paths:
+            self.append_log("⚠️ No video selected. Please add a video first.")
+            return
+        
+        # Use the first video in the list
+        video_path = video_paths[0]
+        
+        if not os.path.exists(video_path):
+            self.append_log(f"⚠️ Video file not found: {video_path}")
+            return
+        
+        try:
+            from signal_timeline_viewer import SignalTimelineWindow
+            
+            # Check if cache exists
+            from modules.video_cache import VideoAnalysisCache
+            cache = VideoAnalysisCache()
+            cache_data = cache.load(video_path)
+            
+            if not cache_data:
+                self.append_log("⚠️ No analysis cache found for this video.")
+                self.append_log("   Please run the highlighter pipeline first to generate analysis data.")
+                return
+            
+            self.append_log(f"📊 Opening timeline viewer for: {os.path.basename(video_path)}")
+            
+            # Create and show the timeline window
+            self.timeline_window = SignalTimelineWindow(video_path, cache_data)
+            self.timeline_window.show()
+            
+        except ImportError as e:
+            self.append_log(f"❌ Failed to import timeline viewer: {e}")
+            self.append_log("   Make sure signal_timeline_viewer.py is in the same directory.")
+        except Exception as e:
+            self.append_log(f"❌ Failed to open timeline viewer: {e}")
+            import traceback
+            self.append_log(traceback.format_exc())
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
