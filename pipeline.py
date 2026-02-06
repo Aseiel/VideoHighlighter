@@ -12,10 +12,11 @@ import cv2
 from tqdm import tqdm
 from ultralytics import YOLO
 
+from action_recognition import run_action_detection, load_models
 # modules
-from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
-from modules.action_recognition import run_action_detection, load_models
 from modules.audio_peaks import extract_audio_peaks
+from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
+from modules.video_cache import VideoAnalysisCache, CachedAnalysisData
 from modules.video_cutter import cut_video
 
 # Keep warnings about CUDA quiet
@@ -59,6 +60,7 @@ def check_cancellation(cancel_flag, log_fn, step_name="operation"):
 def check_xpu_availability(log_fn=print):
     """Check if Intel XPU is available and return (available, device_str)."""
     try:
+        # Try to import but don't fail if not available
         import intel_extension_for_pytorch as ipex
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             device_count = torch.xpu.device_count()
@@ -224,9 +226,8 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
                         if objs:
                             sec_objects.setdefault(sec, []).extend(objs)  # keep key as int
                             objects_found += len(objs)
-
                         else:
-                        # For frames we skip detection, still write original frame if creating annotated video
+                            # For frames we skip detection, still write original frame if creating annotated video
                             if video_writer and draw_boxes:
                                 video_writer.write(frame)
 
@@ -239,11 +240,10 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
         log_fn(f"❌ Object detection error: {e}")
     finally:
         cap.release()
-        if video_writer:  # NEW
-            video_writer.release()  # NEW
-            if draw_boxes:  # NEW
-                log_fn(f"✅ Object detection annotated video saved: {annotated_output}")  # NEW
-
+        if video_writer:
+            video_writer.release()
+            if draw_boxes:
+                log_fn(f"✅ Object detection annotated video saved: {annotated_output}")
 
         if not (cancel_flag and cancel_flag.is_set()):
             progress.update_progress(total_seconds, total_seconds, "Object Detection",
@@ -263,6 +263,53 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
                 log_fn(f"⚠️ Failed to save CSV: {e}")
 
     return sec_objects
+
+
+def collect_analysis_data(video_path, video_duration, fps, transcript_segments, 
+                         object_detections, action_detections, scenes, 
+                         motion_events, motion_peaks, audio_peaks, source_lang="en"):
+    """
+    Collect all analysis results into a structured dictionary for caching.
+    """
+    return {
+        "video_metadata": {
+            "duration": video_duration,
+            "fps": fps,
+            "resolution": "unknown",
+            "total_frames": int(video_duration * fps),
+            "file_size": os.path.getsize(video_path) if os.path.exists(video_path) else 0
+        },
+        "transcript": {
+            "segments": transcript_segments if transcript_segments else [],
+            "language": source_lang
+        },
+        "objects": [
+            {
+                "timestamp": sec,
+                "objects": objs,
+                "count": len(objs)
+            }
+            for sec, objs in object_detections.items()
+        ],
+        "actions": [
+            {
+                "timestamp": timestamp,
+                "frame_id": frame_id,
+                "action_id": action_id,
+                "confidence": score,
+                "action_name": action_name
+            }
+            for (timestamp, frame_id, action_id, score, action_name) in action_detections
+        ],
+        "scenes": [
+            {"start": start, "end": end}
+            for start, end in scenes
+        ],
+        "motion_events": motion_events,
+        "motion_peaks": motion_peaks,
+        "audio_peaks": audio_peaks,
+        "pipeline_version": "1.0"
+    }
 
 
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None, 
@@ -369,7 +416,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # Check cancellation after config load
         check_cancellation(cancel_flag, log, "initialization")
-
 
         # Merge CLI/gui-style values with defaults
         OUTPUT_FILE = gui_config.get("output_file") or config.get("video", {}).get("output", "highlight.mp4")
@@ -514,113 +560,188 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         else:
             log("ℹ️ Processing full video")
 
+        # ========== CACHE CHECK ==========
+        # Initialize cache
+        use_cache = gui_config.get("use_cache", True)
+        force_reprocess = gui_config.get("force_reprocess", False)
+        
+        # Initialize variables that might come from cache
+        transcript_segments = []
+        object_detections = {}
+        action_detections = []
+        scenes = []
+        motion_events = []
+        motion_peaks = []
+        audio_peaks = []
+        using_cache = False
+        
+        if use_cache and not force_reprocess:
+            cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
+            cache_path = cache._get_cache_path(processed_video_path)
+            
+            if os.path.exists(cache_path):
+                try:
+                    start_time_cache = time.time()
+                    cached_data = cache.load(processed_video_path)
+                    load_time = time.time() - start_time_cache
+                    
+                    # Verify it's for the same video (check duration, etc.)
+                    if cached_data:
+                        cache_video_duration = cached_data.get("video_metadata", {}).get("duration", 0)
+                        if abs(cache_video_duration - video_duration) < 1.0:  # Within 1 second
+                            log(f"✅ Loaded from cache ({load_time:.2f}s)")
+                            
+                            # Extract data from cache
+                            transcript_segments = cached_data.get("transcript", {}).get("segments", [])
+                            object_detections_raw = cached_data.get("objects", [])
+                            action_detections_raw = cached_data.get("actions", [])
+                            scenes_raw = cached_data.get("scenes", [])
+                            motion_events = cached_data.get("motion_events", [])
+                            motion_peaks = cached_data.get("motion_peaks", [])
+                            audio_peaks = cached_data.get("audio_peaks", [])
+                            
+                            # Convert to pipeline format
+                            for obj in object_detections_raw:
+                                sec = int(obj.get("timestamp", 0))
+                                object_detections[sec] = obj.get("objects", [])
+                            
+                            for action in action_detections_raw:
+                                action_detections.append((
+                                    action.get("timestamp", 0),
+                                    action.get("frame_id", 0),
+                                    action.get("action_id", -1),
+                                    action.get("confidence", 0),
+                                    action.get("action_name", "")
+                                ))
+                            
+                            scenes = [(s.get("start", 0), s.get("end", 0)) for s in scenes_raw]
+                            
+                            # Mark that we're using cached data
+                            using_cache = True
+                            log(f"✅ Loaded: {len(transcript_segments)} transcript segments, "
+                                f"{len(object_detections)} object seconds, {len(action_detections)} actions")
+                        else:
+                            log(f"⚠️ Cache duration mismatch: {cache_video_duration}s vs {video_duration}s")
+                            cached_data = None
+                except Exception as e:
+                    log(f"⚠️ Cache load error: {e}")
+                    cached_data = None
+            else:
+                log("ℹ️ No cache found for this video")
+        else:
+            log("ℹ️ Cache disabled or forced reprocess")
+        
+        using_cache = cached_data is not None if 'cached_data' in locals() else False
+        # ========== END CACHE CHECK ==========
 
         # --- Transcript processing ---
-        transcript_segments = []
-        keyword_matches = []
-        USE_TRANSCRIPT = gui_config.get("use_transcript", False) and TRANSCRIPT_AVAILABLE
-        SEARCH_KEYWORDS = gui_config.get("search_keywords", [])
+        if not using_cache:
+            # Original transcript processing code
+            if USE_TRANSCRIPT:
+                progress.update_progress(5, 100, "Pipeline", "Processing transcript...")
+                log("🔹 Step 0.5: Processing transcript...")
+                try:
+                    check_cancellation(cancel_flag, log, "transcript processing")
+                    transcript_segments = get_transcript_segments(processed_video_path, model_name=gui_config.get("transcript_model", "medium"), progress_fn=progress_fn, log_fn=log)
+                    
+                    check_cancellation(cancel_flag, log, "transcript processing")
+                    
+                    # Save transcript
+                    base_name = os.path.splitext(video_path)[0]
+                    transcript_file = f"{base_name}_transcript.txt"
+                    transcript_text = create_enhanced_transcript(transcript_segments)
+                    with open(transcript_file, "w", encoding="utf-8") as f:
+                        f.write(transcript_text)
+                    log(f"✅ Transcript saved: {transcript_file}")
+                except RuntimeError:
+                    return None
+                except Exception as e:
+                    log(f"⚠ Transcript processing failed: {e}")
+                    transcript_segments = []
 
-        if USE_TRANSCRIPT:
-            progress.update_progress(5, 100, "Pipeline", "Processing transcript...")
-            log("🔹 Step 0.5: Processing transcript...")
-            try:
-                check_cancellation(cancel_flag, log, "transcript processing")
-                transcript_segments = get_transcript_segments(processed_video_path, model_name=gui_config.get("transcript_model", "medium"), progress_fn=progress_fn, log_fn=log)
-                
-                check_cancellation(cancel_flag, log, "transcript processing")
-                
-                # Save transcript
-                base_name = os.path.splitext(video_path)[0]
-                transcript_file = f"{base_name}_transcript.txt"
-                transcript_text = create_enhanced_transcript(transcript_segments)
-                with open(transcript_file, "w", encoding="utf-8") as f:
-                    f.write(transcript_text)
-                log(f"✅ Transcript saved: {transcript_file}")
-            except RuntimeError:
-                return None
-            except Exception as e:
-                log(f"⚠ Transcript processing failed: {e}")
-                transcript_segments = []
-
-            if SEARCH_KEYWORDS and transcript_segments:
-                check_cancellation(cancel_flag, log, "keyword search")
-                log(f"🔹 Searching transcript for keywords: {SEARCH_KEYWORDS}")
-                keyword_matches = search_transcript_for_keywords(transcript_segments, SEARCH_KEYWORDS, context_seconds=CLIP_TIME//2)
-                log(f"✅ Found {len(keyword_matches)} keyword matches")
+                if SEARCH_KEYWORDS and transcript_segments:
+                    check_cancellation(cancel_flag, log, "keyword search")
+                    log(f"🔹 Searching transcript for keywords: {SEARCH_KEYWORDS}")
+                    keyword_matches = search_transcript_for_keywords(transcript_segments, SEARCH_KEYWORDS, context_seconds=CLIP_TIME//2)
+                    log(f"✅ Found {len(keyword_matches)} keyword matches")
+            else:
+                log("ℹ Transcript processing disabled")
         else:
-            log("ℹ Transcript processing disabled")
+            log("ℹ️ Using cached transcript")
+            # transcript_segments already loaded from cache
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
         start_time = time.time()
 
         # --- 1+2 Detect scenes + motion + peaks with live progress ---
-        progress.update_progress(10, 100, "Pipeline", "Detecting motion and scenes...")
+        if not using_cache:
+            progress.update_progress(10, 100, "Pipeline", "Detecting motion and scenes...")
+            
+            # Check if we should skip motion detection based on GUI config
+            scene_points = gui_config.get("scene_points", 0)
+            motion_event_points = gui_config.get("motion_event_points", 0) 
+            motion_peak_points = gui_config.get("motion_peak_points", 0)
 
-        # Check if we should skip motion detection based on GUI config
-        scene_points = gui_config.get("scene_points", 0)
-        motion_event_points = gui_config.get("motion_event_points", 0) 
-        motion_peak_points = gui_config.get("motion_peak_points", 0)
+            # Skip motion detection if all motion-related points are 0
+            if scene_points == 0 and motion_event_points == 0 and motion_peak_points == 0:
+                log("ℹ️ Skipping motion detection (all scene/motion points set to 0)")
+                scenes, motion_events, motion_peaks = [], [], []
+                progress.update_progress(25, 100, "Pipeline", "Motion detection skipped - no motion scoring enabled")
+            else:
+                log("🔹 Step 1+2: Detecting scenes, motion events, and motion peaks (this may take time)...")
 
-        # Skip motion detection if all motion-related points are 0
-        if scene_points == 0 and motion_event_points == 0 and motion_peak_points == 0:
-            log("ℹ️ Skipping motion detection (all scene/motion points set to 0)")
-            scenes, motion_events, motion_peaks = [], [], []
-            progress.update_progress(25, 100, "Pipeline", "Motion detection skipped - no motion scoring enabled")
-        else:
-            log("🔹 Step 1+2: Detecting scenes, motion events, and motion peaks (this may take time)...")
+                scenes, motion_events, motion_peaks = [], [], []
 
-            scenes, motion_events, motion_peaks = [], [], []
-
-            try:
-                check_cancellation(cancel_flag, log, "motion detection")
-                
-                # Call the actual motion detection function with video path
-                result = detect_scenes_motion_optimized(
-                    processed_video_path,
-                    scene_threshold=70.0,
-                    motion_threshold=100.0,
-                    spike_factor=1.2,
-                    freeze_seconds=4,
-                    freeze_factor=0.8,
-                    device=motion_device,
-                    cancel_flag=cancel_flag
-                )
-                
-                # Unpack the results
-                if result and len(result) == 3:
-                    scenes, motion_events, motion_peaks = result
-                    log(f"✅ Motion detection results: {len(scenes)} scenes, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks")
-                else:
-                    log(f"⚠️ Unexpected motion detection result format: {result}")
+                try:
+                    check_cancellation(cancel_flag, log, "motion detection")
                     
-            except RuntimeError:
-                return None
-            except Exception as e:
-                log(f"❌ Motion detection failed: {e}")
-                import traceback
-                log(f"Full error: {traceback.format_exc()}")
+                    # Call the actual motion detection function with video path
+                    result = detect_scenes_motion_optimized(
+                        processed_video_path,
+                        scene_threshold=70.0,
+                        motion_threshold=100.0,
+                        spike_factor=1.2,
+                        freeze_seconds=4,
+                        freeze_factor=0.8,
+                        device=motion_device,
+                        cancel_flag=cancel_flag
+                    )
+                    
+                    # Unpack the results
+                    if result and len(result) == 3:
+                        scenes, motion_events, motion_peaks = result
+                        log(f"✅ Motion detection results: {len(scenes)} scenes, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks")
+                    else:
+                        log(f"⚠️ Unexpected motion detection result format: {result}")
+                        
+                except RuntimeError:
+                    return None
+                except Exception as e:
+                    log(f"❌ Motion detection failed: {e}")
+                    import traceback
+                    log(f"Full error: {traceback.format_exc()}")
 
-            # Add progress update after motion detection
-            progress.update_progress(25, 100, "Pipeline", f"Motion detection complete: {len(scenes)} scenes, {len(motion_events)} events, {len(motion_peaks)} peaks")
+                # Add progress update after motion detection
+                progress.update_progress(25, 100, "Pipeline", f"Motion detection complete: {len(scenes)} scenes, {len(motion_events)} events, {len(motion_peaks)} peaks")
+        else:
+            log("ℹ️ Using cached motion analysis")
+            progress.update_progress(25, 100, "Pipeline", "Loaded cached motion analysis")
 
-        check_cancellation(cancel_flag, log, "motion detection completion")
-
-
-        # Add progress update after motion detection
-        progress.update_progress(25, 100, "Pipeline", f"Motion detection complete: {len(scenes)} scenes, {len(motion_events)} events, {len(motion_peaks)} peaks")
         check_cancellation(cancel_flag, log, "motion detection completion")
 
         # 3 Audio peaks
-        progress.update_progress(30, 100, "Pipeline", "Analyzing audio...")
-        log("🔹 Step 3: Detecting audio peaks...")
-        try:
-            check_cancellation(cancel_flag, log, "audio peak detection")
-            audio_peaks = extract_audio_peaks(processed_video_path, cancel_flag=cancel_flag)
-            log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
-        except RuntimeError:
-            return None
+        if not using_cache:
+            progress.update_progress(30, 100, "Pipeline", "Analyzing audio...")
+            log("🔹 Step 3: Detecting audio peaks...")
+            try:
+                check_cancellation(cancel_flag, log, "audio peak detection")
+                audio_peaks = extract_audio_peaks(processed_video_path, cancel_flag=cancel_flag)
+                log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
+            except RuntimeError:
+                return None
+        else:
+            log("ℹ️ Using cached audio peaks")
 
         # 4 Object detection setup
         progress.update_progress(40, 100, "Pipeline", "Setting up object detection...")
@@ -635,6 +756,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             from openvino.runtime import Core
             ie = Core()
             log(f"🔹 OpenVINO available devices: {ie.available_devices}")
+        except ImportError:
+            log("ℹ️ OpenVINO not available")
         except Exception as e:
             log(f"⚠️ OpenVINO device check failed: {e}")
 
@@ -663,36 +786,37 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             yolo_model = None
 
         # --- Object detection ---
-        highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", []))
+        if not using_cache:
+            if not highlight_objects:
+                log("ℹ Skipping object detection (no objects to highlight)")
+                object_detections = {}
+            else:
+                frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME if CLIP_TIME > 0 else 5)
+                
+                # Get bounding box settings
+                draw_object_boxes = gui_config.get("draw_object_boxes", False)
+                object_annotated_path = None
+                if draw_object_boxes:
+                    video_basename = os.path.splitext(os.path.basename(video_path))[0]
+                    temp_folder = os.path.dirname(video_path) or "."
+                    object_annotated_path = os.path.join(temp_folder, f"{video_basename}_objects_annotated.mp4")
+                    log(f"🎨 Object bounding boxes enabled, output: {object_annotated_path}")
 
-        if not highlight_objects:
-            log("ℹ Skipping object detection (no objects to highlight)")
-            object_detections = {}
+                # Run detection with cancellation support and bounding boxes
+                object_detections = detect_objects_with_progress(
+                    processed_video_path,
+                    yolo_model,
+                    highlight_objects,
+                    log_fn=log_fn,
+                    progress_fn=progress_fn,
+                    frame_skip=frame_skip_for_obj,
+                    cancel_flag=cancel_flag,
+                    draw_boxes=draw_object_boxes,
+                    annotated_output=object_annotated_path
+                )
+                log(f"✅ Object detection complete: {len(object_detections)} seconds with objects")
         else:
-            frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME if CLIP_TIME > 0 else 5)
-            
-            # Get bounding box settings
-            draw_object_boxes = gui_config.get("draw_object_boxes", False)
-            object_annotated_path = None
-            if draw_object_boxes:
-                video_basename = os.path.splitext(os.path.basename(video_path))[0]
-                temp_folder = os.path.dirname(video_path) or "."
-                object_annotated_path = os.path.join(temp_folder, f"{video_basename}_objects_annotated.mp4")
-                log(f"🎨 Object bounding boxes enabled, output: {object_annotated_path}")
-
-            # Run detection with cancellation support and bounding boxes
-            object_detections = detect_objects_with_progress(
-                processed_video_path,
-                yolo_model,
-                highlight_objects,
-                log_fn=log_fn,
-                progress_fn=progress_fn,
-                frame_skip=frame_skip_for_obj,
-                cancel_flag=cancel_flag,
-                draw_boxes=draw_object_boxes,
-                annotated_output=object_annotated_path
-            )
-
+            log("ℹ️ Using cached object detections")
 
         print("Detections per second:", len(object_detections))
 
@@ -759,13 +883,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         selected_sequences = []
 
-
         # --- Action recognition with grouping ---
-        action_detections = []
-        sample_rate = gui_config.get("sample_rate", 5)
-
         interesting_actions = gui_config.get("interesting_actions", [])
-        if interesting_actions:
+        
+        if not using_cache and interesting_actions:
             try:
                 # NEW: Get action label settings
                 draw_action_labels = gui_config.get("draw_action_labels", False)
@@ -788,7 +909,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     use_person_detection=True,
                     max_people=2
                 )
-
 
                 check_cancellation(cancel_flag, log, "action recognition processing")
 
@@ -885,7 +1005,46 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log(f"⚠ Action recognition failed: {e}")
                 import traceback
                 log(f"Full error: {traceback.format_exc()}")
-                            
+        elif using_cache:
+            log("ℹ️ Using cached action detections")
+        elif not interesting_actions:
+            log("ℹ️ No interesting actions specified, skipping action recognition")
+
+        # ========== SAVE TO CACHE IF NOT USING CACHE ==========
+        if not using_cache and use_cache and not (cancel_flag and cancel_flag.is_set()):
+            try:
+                # Collect analysis data
+                analysis_data = collect_analysis_data(
+                    video_path=processed_video_path,
+                    video_duration=video_duration,
+                    fps=fps,
+                    transcript_segments=transcript_segments,
+                    object_detections=object_detections,
+                    action_detections=action_detections,
+                    scenes=scenes,
+                    motion_events=motion_events,
+                    motion_peaks=motion_peaks,
+                    audio_peaks=audio_peaks,
+                    source_lang=SOURCE_LANG
+                )
+                
+                # Add analysis parameters for future validation
+                analysis_data["analysis_parameters"] = {
+                    "highlight_objects": gui_config.get("highlight_objects", []),
+                    "interesting_actions": gui_config.get("interesting_actions", []),
+                    "transcript_model": gui_config.get("transcript_model", "medium"),
+                    "sample_rate": sample_rate
+                }
+                
+                # Save to cache
+                cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
+                cache.save(processed_video_path, analysis_data)
+                log("✅ Analysis results cached for future use")
+                
+            except Exception as e:
+                log(f"⚠️ Failed to save cache: {e}")
+        # ========== END CACHE SAVE ==========
+
         # 6 Compute scores per second
         progress.update_progress(80, 100, "Pipeline", "Computing scores...")
         check_cancellation(cancel_flag, log, "score computation")
@@ -1335,11 +1494,22 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 output_dir = os.path.dirname(OUTPUT_FILE)
                 video_base_name = os.path.splitext(os.path.basename(processed_video_path))[0]
                 
+                # Sanitize the base name to avoid issues with special characters
+                import re
+                video_base_name = re.sub(r"['\"]", "", video_base_name)
+                video_base_name = re.sub(r"[@#$%^&*()]", "_", video_base_name)
+                
                 for i, (s, e) in enumerate(segments):
                     check_cancellation(cancel_flag, log, f"video cutting clip {i+1}")
                     # Include the directory path for temp files
                     temp_name = os.path.join(output_dir, f"{video_base_name}_temp_clip_{i}.mp4")
+                    log(f"  Creating temp clip: {temp_name}")
                     cut_video(processed_video_path, s, e, temp_name)
+                    
+                    # Verify the file was created
+                    if not os.path.exists(temp_name):
+                        raise Exception(f"Failed to create temp clip: {temp_name}")
+                    
                     temp_clips.append(temp_name)
                     # Update progress for each clip
                     progress.update_progress(90 + (i+1) * 5 // len(segments), 100, "Pipeline", f"Cut clip {i+1}/{len(segments)}")
@@ -1347,11 +1517,34 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 check_cancellation(cancel_flag, log, "video concatenation")
                 
                 concat_file = os.path.join(output_dir, "concat_list.txt")
-                with open(concat_file, "w") as f:
+                log(f"📝 Writing concat file: {concat_file}")
+                with open(concat_file, "w", encoding='utf-8') as f:
                     for t in temp_clips:
-                        f.write(f"file '{t}'\n")
+                        # Use absolute path and convert to forward slashes
+                        abs_path = os.path.abspath(t).replace('\\', '/')
+                        f.write(f"file '{abs_path}'\n")
+                
+                # DEBUG: Print concat file contents
+                log("📋 Concat file contents:")
+                with open(concat_file, "r", encoding='utf-8') as f:
+                    log(f.read())
+                
+                # Normalize concat file path
+                concat_file_normalized = concat_file.replace('\\', '/')
+                
+                # Sanitize OUTPUT_FILE name too
+                output_filename = os.path.basename(OUTPUT_FILE)
+                output_filename_clean = re.sub(r"['\"]", "", output_filename)
+                output_filename_clean = re.sub(r"[@#$%^&*()]", "_", output_filename_clean)
+                OUTPUT_FILE_CLEAN = os.path.join(output_dir, output_filename_clean)
+                
+                log(f"🎬 Running FFmpeg concatenation to: {OUTPUT_FILE_CLEAN}")
                 subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
-                                "-i", concat_file, "-c", "copy", OUTPUT_FILE], check=True)
+                                "-i", concat_file_normalized, "-c", "copy", OUTPUT_FILE_CLEAN], check=True)
+                
+                # Update OUTPUT_FILE to the cleaned version
+                OUTPUT_FILE = OUTPUT_FILE_CLEAN
+                
                 if not KEEP_TEMP:
                     for t in temp_clips:
                         try:
