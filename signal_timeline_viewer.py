@@ -313,10 +313,11 @@ class EditTimelineScene(QGraphicsScene):
     clip_added = Signal(float, float)  # start, end
     clip_removed = Signal(int)  # index
     
-    def __init__(self, video_path, video_duration, parent=None):
+    def __init__(self, video_path, video_duration, parent=None, cache=None):  # ADD cache parameter
         super().__init__(parent)
         self.video_path = video_path
         self.video_duration = video_duration
+        self.cache = cache  # Store cache reference
         self.clips = []  # List of (start_time, end_time) tuples
         self.clip_items = []  # List of EditClipItem objects
         self.pixels_per_second = 50
@@ -334,7 +335,122 @@ class EditTimelineScene(QGraphicsScene):
         
         self.setSceneRect(0, 0, 1000, self.clip_height + 40)
         self.build_timeline()
+
+    def contextMenuEvent(self, event):
+        """Show context menu for loading different highlight versions"""
+        menu = QMenu()
+        
+        # Load from cache action
+        load_action = menu.addAction("📂 Load from Cache...")
+        load_action.triggered.connect(self.load_from_cache_menu)
+        
+        # Save to cache action
+        save_action = menu.addAction("💾 Save to Cache")
+        save_action.triggered.connect(lambda: self.save_clips_to_cache())
+        
+        menu.exec(event.screenPos())
     
+    def load_from_cache_menu(self):
+        """Show dialog to load different highlight versions from cache"""
+        if not self.cache or not hasattr(self.cache, 'get_highlight_history'):
+            QMessageBox.warning(None, "Cache Error", 
+                               "Enhanced cache not available. Cannot load from cache.")
+            return
+        
+        # Get highlight history
+        history = self.cache.get_highlight_history(self.video_path)
+        if not history:
+            QMessageBox.information(None, "No Cache", 
+                                   "No cached highlight versions found for this video.")
+            return
+        
+        # Create selection dialog
+        dialog = QDialog()
+        dialog.setWindowTitle("Load Highlight Version")
+        dialog.resize(500, 400)
+        layout = QVBoxLayout(dialog)
+        
+        list_widget = QListWidget()
+        for i, entry in enumerate(history):
+            created = entry.get('created_at', 'Unknown')
+            segments = entry.get('segments_count', 0)
+            duration = entry.get('total_duration', 0)
+            item_text = f"Version {i+1}: {segments} clips, {duration:.1f}s ({created})"
+            list_widget.addItem(item_text)
+        
+        layout.addWidget(QLabel("Select cached highlight version:"))
+        layout.addWidget(list_widget)
+        
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(lambda: self.load_selected_version(dialog, list_widget, history))
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        dialog.exec()
+    
+    def load_selected_version(self, dialog, list_widget, history):
+        """Load selected highlight version"""
+        selected = list_widget.currentRow()
+        if 0 <= selected < len(history):
+            entry = history[selected]
+            segments = entry.get('segments', [])
+            
+            if segments:
+                self.clips = segments
+                self.build_timeline()
+                QMessageBox.information(None, "Loaded", 
+                                       f"Loaded {len(segments)} clips from cache.")
+        
+        dialog.accept()
+
+
+    def save_clips_to_cache(self, parameters=None):
+        """Save current clips to cache for future use"""
+        if not self.cache or not hasattr(self.cache, 'save_highlight_segments'):
+            print("⚠️ Cache not available for saving")
+            return False
+        
+        # Default parameters if none provided
+        if parameters is None:
+            parameters = {
+                'max_duration': 420,
+                'clip_time': 10,
+                'highlight_objects': [],
+                'interesting_actions': [],
+                'scene_points': 0,
+                'motion_event_points': 0,
+                'motion_peak_points': 3,
+                'exact_duration': None
+            }
+        
+        # Prepare segments metadata
+        segments_metadata = []
+        for start, end in self.clips:
+            segments_metadata.append({
+                'score': 1.0,
+                'signals': {'user_edited': 1.0},
+                'primary_reason': 'manual_selection'
+            })
+        
+        # Save to cache
+        try:
+            success = self.cache.save_highlight_segments(
+                self.video_path,
+                parameters,
+                self.clips,
+                segments_metadata,
+                score_info={'user_edited': True}
+            )
+            
+            if success:
+                print(f"✅ Saved {len(self.clips)} clips to cache")
+                return True
+            return False
+        except Exception as e:
+            print(f"❌ Failed to save clips to cache: {e}")
+            return False
+
     def keyPressEvent(self, event):
         """Handle key presses for deleting clips"""
         if event.key() == Qt.Key_Delete or event.key() == Qt.Key_Backspace:
@@ -376,21 +492,62 @@ class EditTimelineScene(QGraphicsScene):
             self.clip_removed.emit(index)
 
     def load_initial_clips(self):
-        """Load initial clips from highlights in cache (simulated for now)"""
-        # In a real implementation, this would load from cache
-        # For now, create some example clips
+        """Load initial clips from highlight cache or from analysis final_segments"""
+        self.clips = []
+
+        # 1) Try ANY cached highlight version (not just default params)
+        if self.cache and hasattr(self.cache, "get_highlight_history"):
+            history = self.cache.get_highlight_history(self.video_path)
+            if history:
+                # Use the most recent highlight version
+                entry = history[0]  # Most recent first
+                segments = entry.get('segments', [])
+                if segments:
+                    self.clips = segments
+                    print(f"✅ Loaded {len(self.clips)} highlight segments from cache (most recent)")
+                    return
+        
+        # 2) Fallback: Check if pipeline saved segments in analysis cache
+        cache_data = None
+        parent = self.parent()
+        while parent is not None and not hasattr(parent, "cache_data"):
+            parent = parent.parent()
+
+        if parent is not None and hasattr(parent, "cache_data"):
+            cache_data = parent.cache_data
+
+        if cache_data and "final_segments" in cache_data:
+            loaded = []
+            for segment in cache_data.get("final_segments", []):
+                if isinstance(segment, (list, tuple)) and len(segment) >= 2:
+                    start, end = float(segment[0]), float(segment[1])
+                    if end > start and (end - start) >= 0.5:
+                        loaded.append((start, end))
+
+            if loaded:
+                self.clips = loaded
+                print(f"✅ Loaded {len(self.clips)} segments from cache_data['final_segments']")
+                return
+        
+        # 3) Last resort: sample clips
+        print("⚠️ No cached highlights found, creating sample clips")
         if self.video_duration > 30:
-            # Create 3 sample clips at interesting times
-            self.clips = [
-                (5.0, 12.0),
-                (25.0, 35.0),
-                (45.0, 55.0)
-            ]
+            sample_points = [(0.1, 0.2), (0.3, 0.4), (0.7, 0.8)]
+            for start_ratio, end_ratio in sample_points:
+                start = self.video_duration * start_ratio
+                end = self.video_duration * end_ratio
+                duration = end - start
+                if duration > 15:
+                    end = start + 15
+                elif duration < 3:
+                    end = start + 3
+                if end <= self.video_duration:
+                    self.clips.append((start, end))
         else:
-            # For short videos, create one clip
-            self.clips = [
-                (max(0, self.video_duration / 4), min(self.video_duration, self.video_duration * 3 / 4))
-            ]
+            start = max(0, self.video_duration / 4)
+            end = min(self.video_duration, self.video_duration * 3 / 4)
+            if end - start >= 3:
+                self.clips.append((start, end))
     
     def build_timeline(self):
         """Build the edit timeline visualization"""
@@ -2002,6 +2159,8 @@ class SignalTimelineWindow(QMainWindow):
         self.video_path = video_path
         self.cache_data = cache_data or self.load_cache_data()
         
+        self.cache = self.get_cache_instance()
+
         if not self.cache_data:
             print("❌ No cache data available")
             self.close()
@@ -2028,6 +2187,16 @@ class SignalTimelineWindow(QMainWindow):
         
         self.init_ui()
     
+
+    def get_cache_instance(self):
+        """Get cache instance for highlight loading"""
+        try:
+            from modules.video_cache import VideoAnalysisCache
+            return VideoAnalysisCache(enable_highlight_cache=True)
+        except Exception as e:
+            print(f"⚠️ Could not initialize cache: {e}")
+            return None
+
     def load_cache_data(self):
         """Load cache data for the video"""
         try:
@@ -2080,7 +2249,7 @@ class SignalTimelineWindow(QMainWindow):
         self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration)
         self.signal_view = SignalTimelineView(self.signal_scene)
         
-        # IMPORTANT: Enable drag and drop on the viewport
+        # Enable drag and drop on the viewport
         self.signal_view.viewport().setAcceptDrops(True)
         
         self.signal_scene.time_clicked.connect(self.on_time_clicked)
@@ -2097,7 +2266,7 @@ class SignalTimelineWindow(QMainWindow):
         edit_layout = QVBoxLayout(edit_widget)
         
         # Edit timeline
-        self.edit_scene = EditTimelineScene(self.video_path, self.video_duration)
+        self.edit_scene = EditTimelineScene(self.video_path, self.video_duration, cache=self.cache)
         self.edit_view = QGraphicsView(self.edit_scene)
         self.edit_view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.edit_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
@@ -2274,17 +2443,19 @@ class SignalTimelineWindow(QMainWindow):
         # Add clip button
         self.add_clip_btn = QPushButton("➕ Add Clip at Current Time")
         self.add_clip_btn.clicked.connect(self.on_add_clip_clicked)
-        self.add_clip_btn.setToolTip("Add a 5-second clip at the currently selected time")
         
-        # Remove selected clips button (alternative to Delete key)
+        # Remove selected clips button
         self.remove_clips_btn = QPushButton("🗑️ Delete Selected Clips")
         self.remove_clips_btn.clicked.connect(self.on_remove_clips_clicked)
-        self.remove_clips_btn.setToolTip("Remove selected clips from edit timeline (or press Delete)")
+        
+        # Save to cache button - ADD THIS
+        self.save_cache_btn = QPushButton("💾 Save to Cache")
+        self.save_cache_btn.clicked.connect(self.on_save_cache_clicked)  # CONNECT IT!
+        self.save_cache_btn.setToolTip("Save current edit timeline to cache for future use")
         
         # Export button
         self.export_btn = QPushButton("📤 Export Edit")
         self.export_btn.clicked.connect(self.on_export_clicked)
-        self.export_btn.setToolTip("Export the edited timeline")
         
         # Duration label
         self.edit_duration_label = QLabel("Edit duration: 0.0s")
@@ -2292,12 +2463,13 @@ class SignalTimelineWindow(QMainWindow):
         
         layout.addWidget(self.add_clip_btn)
         layout.addWidget(self.remove_clips_btn)
+        layout.addWidget(self.save_cache_btn)  # ADD TO LAYOUT
         layout.addWidget(self.export_btn)
         layout.addStretch()
         layout.addWidget(self.edit_duration_label)
         
         return controls
-    
+
     def create_controls_dock(self):
         """Create dock widget with controls including filters"""
         dock = QDockWidget("Controls", self)
@@ -2417,6 +2589,60 @@ class SignalTimelineWindow(QMainWindow):
                 self.current_filters_label.setText(" | ".join(filter_details))
             else:
                 self.current_filters_label.setText("No filters applied")
+
+    def get_highlights_from_signal_data(self):
+        """Extract highlights from signal timeline cache data"""
+        # This would require access to the main window's cache data
+        # For now, we'll check if parent has cache_data
+        highlights = []
+        
+        try:
+            # Try to get parent window
+            parent = self.parent()
+            while parent and not hasattr(parent, 'cache_data'):
+                parent = parent.parent()
+            
+            if parent and hasattr(parent, 'cache_data'):
+                cache_data = parent.cache_data
+                
+                # Look for highlight segments in cache data
+                if 'final_segments' in cache_data:
+                    for segment in cache_data['final_segments']:
+                        if isinstance(segment, (list, tuple)) and len(segment) >= 2:
+                            start, end = segment[0], segment[1]
+                            if end > start:  # Valid duration
+                                highlights.append((start, end))
+                
+                # Also check for segments under analysis data
+                elif 'analysis' in cache_data and 'final_segments' in cache_data['analysis']:
+                    for segment in cache_data['analysis']['final_segments']:
+                        if isinstance(segment, (list, tuple)) and len(segment) >= 2:
+                            start, end = segment[0], segment[1]
+                            if end > start:
+                                highlights.append((start, end))
+        except Exception as e:
+            print(f"⚠️ Error extracting highlights from signal data: {e}")
+        
+        return highlights
+
+    @Slot()
+    def on_save_cache_clicked(self):
+        """Save current edit timeline to cache"""
+        if hasattr(self, 'edit_scene'):
+            # Try to save using the cache system
+            try:
+                if hasattr(self.edit_scene, 'save_clips_to_cache'):
+                    success = self.edit_scene.save_clips_to_cache()
+                    if success:
+                        self.statusBar().showMessage("✅ Edit timeline saved to cache", 3000)
+                    else:
+                        self.statusBar().showMessage("⚠️ Failed to save to cache", 3000)
+                else:
+                    self.statusBar().showMessage("⚠️ Cache saving not available in this scene", 3000)
+            except Exception as e:
+                self.statusBar().showMessage(f"⚠️ Error saving to cache: {str(e)[:50]}...", 3000)
+        else:
+            self.statusBar().showMessage("⚠️ No edit timeline available", 3000)
 
     @Slot(str, int)
     def toggle_layer(self, layer_name, state):
