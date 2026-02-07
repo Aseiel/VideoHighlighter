@@ -22,6 +22,7 @@ Optional GUI for easy interaction.
 
 ![VideoHighlighter](assets/Highlighter.png)
 ![Transcript Subtitles](assets/Transcript_Subtitles.png)
+![Transcript Subtitles](assets/TimelineViewer.png)
 ![Action Recognition](assets/power_rangers_actions_annotated.gif)
 
 
