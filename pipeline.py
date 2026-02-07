@@ -1314,6 +1314,83 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         total_final_duration = sum(e - s for s, e in segments)
         print(f"Total highlight duration: {total_final_duration:.1f}s")
 
+        # ========== SAVE HIGHLIGHT SEGMENTS TO CACHE ==========
+        if segments and use_cache and not (cancel_flag and cancel_flag.is_set()):
+            try:
+                # Prepare parameters for cache
+                highlight_parameters = {
+                    'max_duration': MAX_DURATION,
+                    'exact_duration': EXACT_DURATION if EXACT_DURATION else None,
+                    'clip_time': CLIP_TIME,
+                    'highlight_objects': highlight_objects,
+                    'interesting_actions': interesting_actions,
+                    'scene_points': SCENE_POINTS,
+                    'motion_event_points': MOTION_EVENT_POINTS,
+                    'motion_peak_points': MOTION_PEAK_POINTS,
+                    'audio_peak_points': AUDIO_PEAK_POINTS,
+                    'keyword_points': KEYWORD_POINTS,
+                    'object_points': OBJECT_POINTS,
+                    'action_points': ACTION_POINTS
+                }
+                
+                # Create segments metadata with scores
+                segments_metadata = []
+                for start, end in segments:
+                    duration = end - start
+                    
+                    # Calculate average score in this segment
+                    avg_score = 0
+                    if start < len(score) and end < len(score):
+                        segment_indices = range(int(start), min(int(end) + 1, len(score)))
+                        if segment_indices:
+                            avg_score = np.mean([score[i] for i in segment_indices])
+                    
+                    # Determine primary reason
+                    primary_reason = "multiple_signals"
+                    if start in object_detections:
+                        primary_reason = "objects"
+                    elif start in detections_by_sec:
+                        primary_reason = "actions"
+                    elif start in motion_peaks_set:
+                        primary_reason = "motion_peaks"
+                    elif start in audio_set:
+                        primary_reason = "audio_peaks"
+                    
+                    segments_metadata.append({
+                        'score': avg_score,
+                        'signals': {
+                            'objects': 1.0 if start in object_detections else 0.0,
+                            'actions': 1.0 if start in detections_by_sec else 0.0,
+                            'motion': 1.0 if start in motion_peaks_set else 0.0,
+                            'audio': 1.0 if start in audio_set else 0.0
+                        },
+                        'primary_reason': primary_reason
+                    })
+                
+                # Save to highlight cache
+                cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
+                success = cache.save_highlight_segments(
+                    processed_video_path,
+                    highlight_parameters,
+                    segments,
+                    segments_metadata,
+                    score_info={
+                        'total_score': np.sum(score),
+                        'max_score': np.max(score),
+                        'avg_score': np.mean(score)
+                    }
+                )
+                
+                if success:
+                    log(f"✅ Saved {len(segments)} highlight segments to cache")
+                else:
+                    log("⚠️ Failed to save highlight segments to cache")
+                    
+            except Exception as e:
+                log(f"⚠️ Error saving highlight cache: {e}")
+        # ========== END HIGHLIGHT CACHE SAVE ==========
+
+
         # Show the actual selected segments with BETTER confidence information
         print(f"\nACTUAL SELECTED SEGMENTS (PEAK CONFIDENCE):")
         for i, (seg_start, seg_end) in enumerate(segments):
