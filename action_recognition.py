@@ -50,28 +50,28 @@ def load_label_mappings():
 # Call this at startup
 load_label_mappings()
 
-def get_action_name(action_id):
-    """Get action name - try custom labels first, then Kinetics-400"""
-    if CUSTOM_LABELS and action_id in CUSTOM_LABELS:
+def get_action_name(action_id, model_type='custom'):
+    """Get action name from specific model type"""
+    if model_type == 'custom' and CUSTOM_LABELS and action_id in CUSTOM_LABELS:
         return CUSTOM_LABELS[action_id]
-    elif KINETICS_400_LABELS:
+    elif model_type == 'intel' and KINETICS_400_LABELS:
         return KINETICS_400_LABELS.get(str(action_id), f"action_{action_id}")
     else:
         return f"action_{action_id}"
 
 def get_id_from_name(name):
-    """Get action ID - try custom labels first, then Kinetics-400"""
-    # Try custom labels
+    """Get action ID and model type - searches both custom and Intel labels"""
+    # Try custom labels first
     if CUSTOM_LABELS:
         for idx, action_name in CUSTOM_LABELS.items():
             if action_name.lower() == name.lower():
-                return idx
+                return idx, 'custom'
 
     # Try Kinetics-400
     if KINETICS_400_LABELS:
         for k, v in KINETICS_400_LABELS.items():
             if v.lower() == name.lower():
-                return int(k)
+                return int(k), 'intel'
     
     raise ValueError(f"Action '{name}' not found in any label set")
 
@@ -443,7 +443,7 @@ class ParallelYOLODetector:
         self.executor.shutdown(wait=False)
 
 # =============================
-# Load models
+# Load models - DUAL MODEL SUPPORT
 # =============================
 def load_models(device="AUTO"):
     ie = Core()
@@ -465,29 +465,57 @@ def load_models(device="AUTO"):
     encoder_model = ie.read_model(model=ENCODER_XML, weights=ENCODER_BIN)
     compiled_encoder = ie.compile_model(model=encoder_model, device_name=selected_device)
 
+    # Load BOTH decoders if available
     custom_decoder_xml = BASE_DIR / "action_classifier_3d.xml"
     custom_decoder_bin = BASE_DIR / "action_classifier_3d.bin"
+    intel_decoder_xml = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
+    intel_decoder_bin = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 
+    models_info = {
+        'custom': None,
+        'intel': None
+    }
+
+    # Load custom decoder if available
     if custom_decoder_xml.exists() and custom_decoder_bin.exists():
-        print("✓ Using custom fine-tuned decoder model")
-        decoder_model_path = custom_decoder_xml
-        decoder_weights_path = custom_decoder_bin
+        print("✓ Loading custom fine-tuned decoder model")
+        custom_decoder_model = ie.read_model(model=custom_decoder_xml, weights=custom_decoder_bin)
+        compiled_custom_decoder = ie.compile_model(model=custom_decoder_model, device_name=selected_device)
+        models_info['custom'] = {
+            'compiled': compiled_custom_decoder,
+            'input': compiled_custom_decoder.input(0),
+            'output': compiled_custom_decoder.output(0),
+            'labels': CUSTOM_LABELS
+        }
     else:
-        print("⚠️ Custom model not found, falling back to Intel Kinetics-400 decoder")
-        decoder_model_path = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
-        decoder_weights_path = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
+        print("⚠️ Custom decoder model not found")
 
-        if not decoder_model_path.exists() or not decoder_weights_path.exists():
-            raise FileNotFoundError(f"❌ Neither custom nor Intel default decoder found!")
+    # Load Intel decoder if available
+    if intel_decoder_xml.exists() and intel_decoder_bin.exists():
+        print("✓ Loading Intel Kinetics-400 decoder model")
+        intel_decoder_model = ie.read_model(model=intel_decoder_xml, weights=intel_decoder_bin)
+        compiled_intel_decoder = ie.compile_model(model=intel_decoder_model, device_name=selected_device)
+        models_info['intel'] = {
+            'compiled': compiled_intel_decoder,
+            'input': compiled_intel_decoder.input(0),
+            'output': compiled_intel_decoder.output(0),
+            'labels': KINETICS_400_LABELS
+        }
+    else:
+        print("⚠️ Intel decoder model not found")
 
-    decoder_model = ie.read_model(model=decoder_model_path, weights=decoder_weights_path)
-    compiled_decoder = ie.compile_model(model=decoder_model, device_name=selected_device)
+    # Check that at least one decoder is available
+    if models_info['custom'] is None and models_info['intel'] is None:
+        raise FileNotFoundError(f"❌ No decoder models found!")
 
-    print("✓ Model loading complete.\n")
+    print("✓ Model loading complete.")
+    print(f"  - Custom model: {'✓ Available' if models_info['custom'] else '✗ Not available'}")
+    print(f"  - Intel model: {'✓ Available' if models_info['intel'] else '✗ Not available'}")
+    print()
 
     return (
         compiled_encoder, compiled_encoder.input(0), compiled_encoder.output(0),
-        compiled_decoder, compiled_decoder.input(0), compiled_decoder.output(0),
+        models_info,
         selected_device
     )
 
@@ -539,7 +567,7 @@ def draw_detections_with_actions(frame, tracked_people, action_roi, detected_act
         frame: Input frame
         tracked_people: List of (track_id, bbox) tuples
         action_roi: Action region of interest bbox
-        detected_actions: List of (action_name, score) tuples
+        detected_actions: List of (action_name, score, model_type) tuples
         focus_region: Focus region type (upper_body, lower_body, full_body)
     """
     annotated = frame.copy()
@@ -638,9 +666,18 @@ def draw_action_panel(frame, detected_actions, max_labels=3):
     
      # Draw each action
     y_offset = panel_y + 50
-    for i, (action_name, score) in enumerate(top_actions):
-        # Choose color based on confidence
-        text_color = (0, 255, 0) if score > 0.5 else (0, 255, 255)
+    for i, item in enumerate(top_actions):
+        # Handle both tuple formats (with and without model_type)
+        if len(item) == 3:
+            action_name, score, model_type = item
+            # Choose color based on model type
+            if model_type == 'custom':
+                text_color = (0, 255, 0)  # Green for custom
+            else:
+                text_color = (255, 165, 0)  # Orange for Intel
+        else:
+            action_name, score = item
+            text_color = (0, 255, 255)  # Yellow for unknown
         
         action_text = f"{i+1}. {action_name}"
         score_text = f"{score:.2%}"
@@ -671,7 +708,7 @@ def draw_action_panel(frame, detected_actions, max_labels=3):
         y_offset += 35
 
 # =============================
-# Run action detection with bounding boxes
+# Run action detection with DUAL MODEL support
 # =============================
 def softmax(x):
     e = np.exp(x - np.max(x))
@@ -684,12 +721,14 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                          draw_bboxes=True, annotated_output=None,
                          use_person_detection=True, max_people=2,
                          yolo_workers=1, yolo_skip_frames=2, downscale_factor=0.5,
-                         warm_up_seconds=2):
+                         warm_up_seconds=2, include_model_type=False):
     """
-    Run action recognition with bounding box visualization
+    Run action recognition with dual model support and bounding box visualization
     
     Args:
         warm_up_seconds: Pre-fill buffer with N seconds of frames before starting inference
+        include_model_type: If True, return tuples with 6 elements including model_type.
+                           If False (default), return 5-element tuples for backward compatibility.
     """
     # Set CPU optimizations for better multi-core utilization
     try:
@@ -702,12 +741,22 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     except:
         print("⚠️ Could not detect CPU count, using default thread settings")
     
+    # Parse interesting actions and determine which model to use for each
+    action_to_model = {}
     if interesting_actions is not None:
         interesting_actions_set = set([s.lower() for s in interesting_actions])
+        for action_name in interesting_actions:
+            try:
+                action_id, model_type = get_id_from_name(action_name)
+                action_to_model[action_name.lower()] = (action_id, model_type)
+                print(f"📌 Action '{action_name}' found in {model_type} model (ID: {action_id})")
+            except ValueError as e:
+                print(f"⚠️ {e}")
+                raise
     else:
         interesting_actions_set = None
 
-    compiled_encoder, encoder_input, encoder_output, compiled_decoder, decoder_input, decoder_output, actual_device = load_models(device)
+    compiled_encoder, encoder_input, encoder_output, models_info, actual_device = load_models(device)
     encoder_engine = AsyncBatchedInferenceEngine(compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
 
     # Initialize person detection if enabled
@@ -775,9 +824,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     print(f"\n🔥 WARM-UP: Pre-filling sequence buffer with {warm_up_seconds} seconds of frames...")
     warm_up_frames_needed = min(int(fps * warm_up_seconds), SEQUENCE_LENGTH)
     warm_up_frame_count = 0
-    warm_up_frames_for_video = []
     
-    # Create a temporary buffer for warm-up frames
     while warm_up_frame_count < warm_up_frames_needed:
         ret, warm_up_frame = cap.read()
         if not ret:
@@ -898,7 +945,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     # =============================================
     with open(log_file, mode="w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["timestamp_mmss", "frame_id", "action_id", "action_name", "score", "timestamp_seconds"])
+        writer.writerow(["timestamp_mmss", "frame_id", "action_id", "action_name", "score", "timestamp_seconds", "model_type"])
         
         # Continue processing from where warm-up left off
         while True:
@@ -1029,8 +1076,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     # Use the complete sequence for inference
                     if len(sequence_buffer) == SEQUENCE_LENGTH:
                         sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
-                        predictions = compiled_decoder([sequence_array])[decoder_output].flatten()
-                        probabilities = softmax(predictions)
                         
                         # Clear recent detections for this frame
                         frame_detections = []
@@ -1042,30 +1087,77 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                         use_timestamp_str = f"{use_mins:02d}:{use_secs:02d}"
 
                         if interesting_actions_set:
-                            # Check only the requested actions
+                            # Check only the requested actions using the appropriate model
                             for action_name in interesting_actions_set:
-                                action_id = get_id_from_name(action_name)
+                                action_id, model_type = action_to_model[action_name.lower()]
+                                
+                                # Get the appropriate model
+                                model_data = models_info[model_type]
+                                if model_data is None:
+                                    print(f"⚠️ Model '{model_type}' not available for action '{action_name}'")
+                                    continue
+                                
+                                # Run inference on the specific model
+                                predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
+                                probabilities = softmax(predictions)
+                                
+                                # Check if action_id is valid for this model
+                                if action_id >= len(probabilities):
+                                    print(f"⚠️ Action ID {action_id} out of range for {model_type} model (size: {len(probabilities)})")
+                                    continue
+                                
                                 score = float(probabilities[action_id])
                                 if score >= confidence_threshold:
-                                    writer.writerow([use_timestamp_str, use_frame_id, action_id, action_name, score, use_timestamp_secs])
-                                    all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name))
-                                    frame_detections.append((action_name, score))
+                                    writer.writerow([use_timestamp_str, use_frame_id, action_id, action_name, score, use_timestamp_secs, model_type])
+                                    
+                                    # Add to all_actions with or without model_type based on compatibility flag
+                                    if include_model_type:
+                                        all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name, model_type))
+                                    else:
+                                        all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name))
+                                    
+                                    frame_detections.append((action_name, score, model_type))
                                     detection_count += 1
                                     if debug:
-                                        print(f"{use_timestamp_str} -> {action_name} (score:{score:.3f})")
+                                        print(f"{use_timestamp_str} -> {action_name} [{model_type}] (score:{score:.3f})")
                         else:
-                            # fallback to top-k
-                            top_indices = np.argsort(probabilities)[-top_k:][::-1]
-                            for idx in top_indices:
-                                score = float(probabilities[idx])
-                                action_name = get_action_name(idx)
-                                if score >= confidence_threshold:
-                                    writer.writerow([use_timestamp_str, use_frame_id, idx, action_name, score, use_timestamp_secs])
+                            # Run inference on ALL available models and combine results
+                            all_probabilities = {}
+                            
+                            for model_type, model_data in models_info.items():
+                                if model_data is None:
+                                    continue
+                                
+                                predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
+                                probabilities = softmax(predictions)
+                                
+                                # Get top-k from this model
+                                top_indices = np.argsort(probabilities)[-top_k:][::-1]
+                                for idx in top_indices:
+                                    score = float(probabilities[idx])
+                                    if score >= confidence_threshold:
+                                        action_name = get_action_name(idx, model_type)
+                                        # Use a unique key combining action name and model type
+                                        key = (action_name, model_type)
+                                        all_probabilities[key] = (idx, score, action_name, model_type)
+                            
+                            # Sort all results by score
+                            sorted_results = sorted(all_probabilities.values(), key=lambda x: x[1], reverse=True)
+                            
+                            # Take top-k overall
+                            for idx, score, action_name, model_type in sorted_results[:top_k]:
+                                writer.writerow([use_timestamp_str, use_frame_id, idx, action_name, score, use_timestamp_secs, model_type])
+                                
+                                # Add to all_actions with or without model_type based on compatibility flag
+                                if include_model_type:
+                                    all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name, model_type))
+                                else:
                                     all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name))
-                                    frame_detections.append((action_name, score))
-                                    detection_count += 1
-                                    if debug:
-                                        print(f"{use_timestamp_str} -> {action_name} (score:{score:.3f})")
+                                
+                                frame_detections.append((action_name, score, model_type))
+                                detection_count += 1
+                                if debug:
+                                    print(f"{use_timestamp_str} -> {action_name} [{model_type}] (score:{score:.3f})")
                         
                         # Update recent detections (sorted by score)
                         if frame_detections:
@@ -1102,7 +1194,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 progress_callback(processed_frames, expected_processed_frames, "Action Recognition", progress_msg)
                 last_gui_update = current_time
 
-        # Flush last frame
+        # Flush last frame (similar logic as above)
         if prev_req is not None:
             features = encoder_engine.wait_and_get(prev_req)[0]
             features = np.reshape(features, (-1,))
@@ -1113,10 +1205,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
             if len(sequence_buffer) == SEQUENCE_LENGTH:
                 sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
-                logits = compiled_decoder([sequence_array])[decoder_output].flatten()
-                probabilities = softmax(logits)
                 
-                # For flush, use the last prev_timestamp_secs
                 use_timestamp_secs = prev_timestamp_secs
                 use_frame_id = prev_frame_id
                 use_mins, use_secs = divmod(int(use_timestamp_secs), 60)
@@ -1125,27 +1214,63 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 frame_detections = []
                 if interesting_actions_set:
                     for action_name in interesting_actions_set:
-                        action_id = get_id_from_name(action_name)
+                        action_id, model_type = action_to_model[action_name.lower()]
+                        model_data = models_info[model_type]
+                        if model_data is None:
+                            continue
+                        
+                        predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
+                        probabilities = softmax(predictions)
+                        
+                        if action_id >= len(probabilities):
+                            continue
+                        
                         score = float(probabilities[action_id])
                         if score >= confidence_threshold:
-                            writer.writerow([use_timestamp_str, use_frame_id, action_id, action_name, score, use_timestamp_secs])
-                            all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name))
-                            frame_detections.append((action_name, score))
+                            writer.writerow([use_timestamp_str, use_frame_id, action_id, action_name, score, use_timestamp_secs, model_type])
+                            
+                            # Add to all_actions with or without model_type based on compatibility flag
+                            if include_model_type:
+                                all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name, model_type))
+                            else:
+                                all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name))
+                            
+                            frame_detections.append((action_name, score, model_type))
                             detection_count += 1
                             if debug:
-                                print(f"{use_timestamp_str} -> {action_name} (score:{score:.3f})")
+                                print(f"{use_timestamp_str} -> {action_name} [{model_type}] (score:{score:.3f})")
                 else:
-                    top_indices = np.argsort(probabilities)[-top_k:][::-1]
-                    for idx in top_indices:
-                        score = float(probabilities[idx])
-                        action_name = get_action_name(idx)
-                        if score >= confidence_threshold:
-                            writer.writerow([use_timestamp_str, use_frame_id, idx, action_name, score, use_timestamp_secs])
+                    all_probabilities = {}
+                    for model_type, model_data in models_info.items():
+                        if model_data is None:
+                            continue
+                        
+                        predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
+                        probabilities = softmax(predictions)
+                        
+                        top_indices = np.argsort(probabilities)[-top_k:][::-1]
+                        for idx in top_indices:
+                            score = float(probabilities[idx])
+                            if score >= confidence_threshold:
+                                action_name = get_action_name(idx, model_type)
+                                key = (action_name, model_type)
+                                all_probabilities[key] = (idx, score, action_name, model_type)
+                    
+                    sorted_results = sorted(all_probabilities.values(), key=lambda x: x[1], reverse=True)
+                    
+                    for idx, score, action_name, model_type in sorted_results[:top_k]:
+                        writer.writerow([use_timestamp_str, use_frame_id, idx, action_name, score, use_timestamp_secs, model_type])
+                        
+                        # Add to all_actions with or without model_type based on compatibility flag
+                        if include_model_type:
+                            all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name, model_type))
+                        else:
                             all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name))
-                            frame_detections.append((action_name, score))
-                            detection_count += 1
-                            if debug:
-                                print(f"{use_timestamp_str} -> {action_name} (score:{score:.3f})")
+                        
+                        frame_detections.append((action_name, score, model_type))
+                        detection_count += 1
+                        if debug:
+                            print(f"{use_timestamp_str} -> {action_name} [{model_type}] (score:{score:.3f})")
                 
                 if frame_detections:
                     frame_detections.sort(key=lambda x: x[1], reverse=True)
@@ -1194,12 +1319,26 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 def print_top_actions(all_actions, top_n=20):
     sorted_actions = sorted(all_actions, key=lambda x: x[3], reverse=True)
     print(f"\nTop {min(top_n, len(sorted_actions))} actions (by confidence):")
-    for i, (timestamp, frame_id, action_id, score, action_name) in enumerate(sorted_actions[:top_n]):
-        mins, secs = divmod(int(timestamp), 60)
-        print(f"{i+1:2d}. {mins:02d}:{secs:02d} -> {action_name} (score:{score:.3f})")
+    for i, item in enumerate(sorted_actions[:top_n]):
+        if len(item) == 6:
+            timestamp, frame_id, action_id, score, action_name, model_type = item
+            mins, secs = divmod(int(timestamp), 60)
+            print(f"{i+1:2d}. {mins:02d}:{secs:02d} -> {action_name} [{model_type}] (score:{score:.3f})")
+        else:
+            timestamp, frame_id, action_id, score, action_name = item
+            mins, secs = divmod(int(timestamp), 60)
+            print(f"{i+1:2d}. {mins:02d}:{secs:02d} -> {action_name} (score:{score:.3f})")
 
 def print_most_common_actions(all_actions, top_n=20):
-    counter = Counter([a[4] for a in all_actions])
+    # Extract action names, handling both tuple formats
+    action_names = []
+    for item in all_actions:
+        if len(item) == 6:
+            action_names.append(item[4])  # action_name at index 4
+        else:
+            action_names.append(item[4])  # action_name at index 4
+    
+    counter = Counter(action_names)
     print(f"\nTop {min(top_n, len(counter))} most common actions:")
     for i, (action_name, count) in enumerate(counter.most_common(top_n)):
         print(f"{i+1:2d}. {action_name} ({count} occurrences)")
@@ -1207,7 +1346,14 @@ def print_most_common_actions(all_actions, top_n=20):
 def detect_action_sequences(all_actions, score_threshold=0.01, min_duration=1.0):
     sequences = []
     current_seq = None
-    for timestamp, frame_id, action_id, score, action_name in all_actions:
+    for item in all_actions:
+        # Handle both tuple formats
+        if len(item) == 6:
+            timestamp, frame_id, action_id, score, action_name, model_type = item
+        else:
+            timestamp, frame_id, action_id, score, action_name = item
+            model_type = 'unknown'
+        
         if score < score_threshold:
             if current_seq:
                 current_seq['end_time'] = timestamp
@@ -1221,7 +1367,7 @@ def detect_action_sequences(all_actions, score_threshold=0.01, min_duration=1.0)
             if current_seq:
                 sequences.append(current_seq)
             current_seq = {'action_name': action_name, 'start_time': timestamp,
-                           'end_time': timestamp, 'max_score': score}
+                           'end_time': timestamp, 'max_score': score, 'model_type': model_type}
     if current_seq:
         sequences.append(current_seq)
     sequences = [seq for seq in sequences if (seq['end_time'] - seq['start_time']) >= min_duration]
@@ -1234,7 +1380,8 @@ def print_action_sequences(all_actions):
         duration = seq['end_time'] - seq['start_time']
         start_mins, start_secs = divmod(int(seq['start_time']), 60)
         end_mins, end_secs = divmod(int(seq['end_time']), 60)
-        print(f"{i+1:2d}. {seq['action_name']} Duration: {duration:.1f}s "
+        model_info = f" [{seq.get('model_type', 'unknown')}]" if 'model_type' in seq else ""
+        print(f"{i+1:2d}. {seq['action_name']}{model_info} Duration: {duration:.1f}s "
               f"({start_mins:02d}:{start_secs:02d} - {end_mins:02d}:{end_secs:02d}) "
               f"Max score: {seq['max_score']:.3f}")
 
@@ -1242,10 +1389,10 @@ def print_action_sequences(all_actions):
 # CLI
 # =============================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Action Recognition with Bounding Boxes")
+    parser = argparse.ArgumentParser(description="Action Recognition with Dual Model Support")
     parser.add_argument("--input", type=str, required=True, help="Input video path")
     parser.add_argument("--device", type=str, default="AUTO", help="Device (AUTO, CPU, GPU)")
-    parser.add_argument("--sample-rate", type=int, default=5, help="Frame sampling rate")  # Lowered default to 5 for better responsiveness
+    parser.add_argument("--sample-rate", type=int, default=5, help="Frame sampling rate")
     parser.add_argument("--log-file", type=str, default="action_log.csv", help="CSV log output")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
     parser.add_argument("--show-video", action="store_true", help="Show video preview")
@@ -1265,7 +1412,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("=" * 60)
-    print("🎯 ACTION RECOGNITION WITH PARALLEL PROCESSING")
+    print("🎯 ACTION RECOGNITION WITH DUAL MODEL SUPPORT")
     print("=" * 60)
     print(f"Input: {args.input}")
     print(f"Device: {args.device}")

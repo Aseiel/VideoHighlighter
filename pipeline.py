@@ -885,10 +885,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- Action recognition with grouping ---
         interesting_actions = gui_config.get("interesting_actions", [])
-        
+
         if not using_cache and interesting_actions:
             try:
-                # NEW: Get action label settings
+                # Get action label settings
                 draw_action_labels = gui_config.get("draw_action_labels", False)
                 action_annotated_path = None
                 if draw_action_labels:
@@ -897,6 +897,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     action_annotated_path = os.path.join(temp_folder, f"{video_basename}_actions_annotated.mp4")
                     log(f"🎨 Action labels enabled, output: {action_annotated_path}")
                 
+                # Call action detection with include_model_type=False for backward compatibility
                 all_action_detections = run_action_detection(
                     video_path=processed_video_path,
                     sample_rate=sample_rate,
@@ -907,108 +908,128 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     draw_bboxes=True,
                     annotated_output=action_annotated_path,
                     use_person_detection=True,
-                    max_people=2
+                    max_people=2,
+                    include_model_type=False  # ← CRITICAL: Use old 5-element format
                 )
 
                 check_cancellation(cancel_flag, log, "action recognition processing")
 
                 if all_action_detections:
-                    print("DEBUG: First 10 individual actions as returned:")
-                    for i, action in enumerate(all_action_detections[:10]):
-                        # Handle both 4 and 5 element formats
-                        if len(action) == 4:
-                            timestamp, frame_id, score, action_name = action
-                            print(f"  {i+1}. {timestamp:.1f}s -> {action_name} (confidence: {score:.3f})")
-                        else:
-                            timestamp, frame_id, action_id, score, action_name = action
-                            print(f"  {i+1}. {timestamp:.1f}s -> {action_name} (confidence: {score:.3f})")
-
-                # Ensure consistent data format (convert to 5-element tuples)
-                normalized_detections = []
-                for detection in all_action_detections:
-                    if len(detection) == 4:
-                        # Convert (timestamp, frame_id, score, action_name) to (timestamp, frame_id, -1, score, action_name)
-                        timestamp, frame_id, score, action_name = detection
-                        normalized_detections.append((timestamp, frame_id, -1, score, action_name))
-                    else:
-                        normalized_detections.append(detection)
-                
-                # 1️⃣ Group consecutive actions chronologically - BUT GROUP EACH ACTION TYPE SEPARATELY
-                sequences_by_action = defaultdict(list)
-
-                # First, separate actions by type
-                for action in all_action_detections:
-                    if len(action) == 4:
-                        timestamp, frame_id, score, action_name = action
-                        sequences_by_action[action_name].append((timestamp, frame_id, -1, score, action_name))
-                    else:
-                        timestamp, frame_id, action_id, score, action_name = action
-                        sequences_by_action[action_name].append(action)
-
-                # Now group each action type independently
-                grouped_by_action = {}
-                for action_name, action_list in sequences_by_action.items():
-                    grouped_by_action[action_name] = group_consecutive_adaptive(action_list, max_gap=1.3, jump_threshold=0.01)
-                    print(f"DEBUG: {action_name}: {len(action_list)} detections → {len(grouped_by_action[action_name])} sequences")
-
-                # 2️⃣ Select best sequences FROM EACH action with per-action quota
-                MAX_ACTION_DURATION = target_duration * 3
-                selected_sequences = []
-
-                # Calculate quota per action (distribute duration fairly)
-                num_actions = len(grouped_by_action)
-                quota_per_action = MAX_ACTION_DURATION / num_actions if num_actions > 0 else 0
-
-                print(f"DEBUG: Allocating {quota_per_action:.1f}s per action type ({num_actions} types)")
-
-                # Select best sequences from EACH action independently
-                for action_name, action_sequences in grouped_by_action.items():  # ← Use grouped_by_action directly!
-                    # Sort this action's sequences by confidence
-                    sorted_action_seqs = sorted(action_sequences, key=lambda x: x[3], reverse=True)
+                    log(f"✅ Action detection complete: {len(all_action_detections)} detections")
                     
-                    action_duration = 0
-                    for sequence in sorted_action_seqs:
-                        start_time, end_time, duration, confidence, action_name = sequence
+                    # DEBUG: Print format of returned data
+                    if len(all_action_detections) > 0:
+                        first_detection = all_action_detections[0]
+                        log(f"DEBUG: Detection format - {len(first_detection)} elements: {first_detection}")
+                    
+                    # NORMALIZE: Ensure all detections are 5-element tuples
+                    normalized_detections = []
+                    for detection in all_action_detections:
+                        if len(detection) == 5:
+                            # Already correct format: (timestamp, frame_id, action_id, score, action_name)
+                            normalized_detections.append(detection)
+                        elif len(detection) == 4:
+                            # Old format: (timestamp, frame_id, score, action_name)
+                            timestamp, frame_id, score, action_name = detection
+                            normalized_detections.append((timestamp, frame_id, -1, score, action_name))
+                        elif len(detection) == 6:
+                            # New format with model_type: (timestamp, frame_id, action_id, score, action_name, model_type)
+                            timestamp, frame_id, action_id, score, action_name, model_type = detection
+                            normalized_detections.append((timestamp, frame_id, action_id, score, action_name))
+                        else:
+                            log(f"⚠️ Unexpected detection format with {len(detection)} elements: {detection}")
+                            continue
+                    
+                    all_action_detections = normalized_detections
+                    log(f"✅ Normalized {len(all_action_detections)} detections to 5-element format")
+
+                    # 1️⃣ Group consecutive actions chronologically - GROUP EACH ACTION TYPE SEPARATELY
+                    sequences_by_action = defaultdict(list)
+
+                    # First, separate actions by type
+                    for timestamp, frame_id, action_id, score, action_name in all_action_detections:
+                        sequences_by_action[action_name].append((timestamp, frame_id, action_id, score, action_name))
+
+                    # Now group each action type independently
+                    grouped_by_action = {}
+                    for action_name, action_list in sequences_by_action.items():
+                        grouped_by_action[action_name] = group_consecutive_adaptive(
+                            action_list, 
+                            max_gap=1.3, 
+                            jump_threshold=0.01
+                        )
+                        log(f"DEBUG: {action_name}: {len(action_list)} detections → {len(grouped_by_action[action_name])} sequences")
+
+                    # 2️⃣ Select best sequences FROM EACH action with per-action quota
+                    MAX_ACTION_DURATION = target_duration * 3
+                    selected_sequences = []
+
+                    # Calculate quota per action (distribute duration fairly)
+                    num_actions = len(grouped_by_action)
+                    quota_per_action = MAX_ACTION_DURATION / num_actions if num_actions > 0 else 0
+
+                    log(f"DEBUG: Allocating {quota_per_action:.1f}s per action type ({num_actions} types)")
+
+                    # Select best sequences from EACH action independently
+                    for action_name, action_sequences in grouped_by_action.items():
+                        # Sort this action's sequences by confidence
+                        sorted_action_seqs = sorted(action_sequences, key=lambda x: x[3], reverse=True)
                         
-                        # Stop when this action hits its quota
-                        if action_duration >= quota_per_action:
-                            break
-                        
-                        selected_sequences.append(sequence)
-                        action_duration += duration
-                        
-                        print(f"DEBUG: Selected {action_name} at {seconds_to_mmss(start_time)}-{seconds_to_mmss(end_time)} "
-                            f"({duration:.1f}s, conf: {confidence:.3f}) - Action total: {action_duration:.1f}s/{quota_per_action:.1f}s")
+                        action_duration = 0
+                        for sequence in sorted_action_seqs:
+                            start_time, end_time, duration, confidence, action_name = sequence
+                            
+                            # Stop when this action hits its quota
+                            if action_duration >= quota_per_action:
+                                break
+                            
+                            selected_sequences.append(sequence)
+                            action_duration += duration
+                            
+                            log(f"DEBUG: Selected {action_name} at {seconds_to_mmss(start_time)}-{seconds_to_mmss(end_time)} "
+                                f"({duration:.1f}s, conf: {confidence:.3f}) - Action total: {action_duration:.1f}s/{quota_per_action:.1f}s")
 
-                print(f"\nDEBUG: Selected {len(selected_sequences)} sequences from {num_actions} action types")
+                    log(f"\nDEBUG: Selected {len(selected_sequences)} sequences from {num_actions} action types")
 
-                # 3️⃣ Convert back to individual action format for pipeline compatibility
-                action_detections = []
-                for start_time, end_time, duration, confidence, action_name in selected_sequences:
-                    # pick best detection in this group
-                    detections_in_group = [
-                        a for a in all_action_detections
-                        if a[4] == action_name and start_time <= a[0] <= end_time
-                    ]
-                    if detections_in_group:
-                        best_detection = max(detections_in_group, key=lambda a: a[3])  # highest confidence
-                        action_detections.append(best_detection)
+                    # 3️⃣ Convert back to individual action format for pipeline compatibility
+                    action_detections = []
+                    for start_time, end_time, duration, confidence, action_name in selected_sequences:
+                        # Find best detection in this group
+                        detections_in_group = [
+                            det for det in all_action_detections
+                            if det[4] == action_name and start_time <= det[0] <= end_time
+                        ]
+                        if detections_in_group:
+                            best_detection = max(detections_in_group, key=lambda a: a[3])  # highest confidence
+                            action_detections.append(best_detection)
 
-                # Calculate total duration from selected sequences
-                total_duration = sum(duration for _, _, duration, _, _ in selected_sequences)
+                    # Calculate total duration from selected sequences
+                    total_duration = sum(duration for _, _, duration, _, _ in selected_sequences)
 
-                # Sort chronologically for pipeline
-                action_detections = sorted(action_detections, key=lambda x: x[0])
-                log(f"✅ Action recognition: {len(action_detections)} action sequences selected (total duration: {total_duration:.1f}s)")
+                    # Sort chronologically for pipeline
+                    action_detections = sorted(action_detections, key=lambda x: x[0])
+                    log(f"✅ Action recognition: {len(action_detections)} action sequences selected (total duration: {total_duration:.1f}s)")
 
             except Exception as e:
                 log(f"⚠ Action recognition failed: {e}")
                 import traceback
                 log(f"Full error: {traceback.format_exc()}")
+                action_detections = []
         elif using_cache:
             log("ℹ️ Using cached action detections")
+            # action_detections already loaded from cache - ensure it's in 5-element format
+            if action_detections and len(action_detections) > 0:
+                first_det = action_detections[0]
+                if len(first_det) == 6:
+                    # Convert from 6-element to 5-element format
+                    action_detections = [
+                        (timestamp, frame_id, action_id, score, action_name)
+                        for timestamp, frame_id, action_id, score, action_name, _ in action_detections
+                    ]
+                    log(f"✅ Converted cached detections from 6-element to 5-element format")
         elif not interesting_actions:
             log("ℹ️ No interesting actions specified, skipping action recognition")
+            action_detections = []
 
         # ========== SAVE TO CACHE IF NOT USING CACHE ==========
         if not using_cache and use_cache and not (cancel_flag and cancel_flag.is_set()):
@@ -1652,8 +1673,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             except Exception as e:
                 log(f"⚠️ Timeline viewer failed: {e}")
         # ============================================
-
-        return OUTPUT_FILE
 
         return OUTPUT_FILE
 
