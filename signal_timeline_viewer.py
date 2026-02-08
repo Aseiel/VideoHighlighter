@@ -633,7 +633,7 @@ class EditTimelineScene(QGraphicsScene):
                 self.clips.append((start, end))
     
     def build_timeline(self):
-        """Build the edit timeline visualization - FIXED VERSION"""
+        """Build the edit timeline visualization"""
         print("build_timeline() called")
         self.clear()
         self.clip_items = []
@@ -1070,10 +1070,10 @@ class SignalTimelineScene(QGraphicsScene):
 
     
     def draw_waveform_layer(self, y_pos, height):
-        """Draw the waveform visualization layer - FIXED VERSION"""
+        """Draw the waveform visualization layer"""
         if not self.waveform or len(self.waveform) == 0 or not self.waveform_visible:
-            print(f"🎵 draw_waveform_layer: Skipped - no data or not visible")
-            return y_pos
+            # IMPORTANT: Return the SAME y_pos when not drawing
+            return y_pos  # Don't add any height
         
         print(f"🎵 draw_waveform_layer: Drawing at y={y_pos} with height={height}, {len(self.waveform)} points")
         
@@ -1087,7 +1087,7 @@ class SignalTimelineScene(QGraphicsScene):
         label.setPos(5, waveform_y - 20)
         label.setDefaultTextColor(QColor(180, 220, 255))
         
-        # Draw the actual waveform - FIXED SCALING
+        # Draw the actual waveform
         if len(self.waveform) > 0 and self.video_duration > 0:
             # Calculate proper scaling
             total_width = self.sceneRect().width()
@@ -1207,15 +1207,25 @@ class SignalTimelineScene(QGraphicsScene):
         print(f"   - Waveform data: {self.waveform is not None}, length: {len(self.waveform)}")
         print(f"   - Waveform visible: {self.waveform_visible}")
         
+        # If we have a view connected, store its current transform
+        views = self.views()
+        old_transform = None
+        old_h_scroll = None
+        if views:
+            view = views[0]
+            old_transform = view.transform()
+            old_h_scroll = view.horizontalScrollBar().value()
+        
         # Calculate width based on video duration
         width = self.video_duration * self.pixels_per_second
         
-        # Calculate height - START with base for time ruler
-        height = 50  # Base height for time ruler and labels
+        # Start with base height for time ruler
+        height = 50  # Time ruler and labels
         
-        # Add waveform height if it will be drawn
-        waveform_height = 80 if self.waveform_visible and self.waveform and len(self.waveform) > 0 else 0
-        height += waveform_height
+        # ONLY add waveform height if it's visible AND has data
+        if self.waveform_visible and self.waveform and len(self.waveform) > 0:
+            height += 80  # Waveform height
+            height += self.layer_spacing  # Add spacing after waveform
         
         # Add height for other visible layers
         for _, tracks in self.group_order:
@@ -1231,25 +1241,47 @@ class SignalTimelineScene(QGraphicsScene):
                 if self.visible_layers.get(key, True):
                     height += self.layer_height + self.layer_spacing
         
-        print(f"   - Calculated size: {width}x{height} pixels")
-        print(f"   - Waveform height allocated: {waveform_height}")
-        
         self.setSceneRect(0, 0, width, height)
-        
-        # Clear previous items
         self.clear()
         self.bars = []
         
-        # Draw background with subtle grid
+        # Draw background and time markers FIRST
         self.draw_background()
+        self.draw_time_markers()
         
-        # FIX: Start drawing below time markers
-        current_y = 40  # Start below time markers
+        # Start drawing below time markers
+        current_y = 40
         
-        # Draw waveform FIRST (if visible)
-        if waveform_height > 0:
-            print(f"   - Drawing waveform at y={current_y}")
-            current_y = self.draw_waveform_layer(current_y, waveform_height)
+        # Draw waveform if visible
+        if self.waveform_visible and self.waveform and len(self.waveform) > 0:
+            current_y = self.draw_waveform_layer(current_y, 80)
+        
+        # Draw other layers (rest of your existing code...)
+        
+        # Draw time markers
+        self.draw_time_markers()
+        
+        # Restore current time indicator if it was set
+        if hasattr(self, 'current_time_seconds'):
+            self.set_current_time(self.current_time_seconds)
+        
+        # Restore view transform if we had one
+        if views and old_transform:
+            view = views[0]
+            
+            # Calculate the horizontal scaling needed to maintain same visible area
+            old_visible_width = self.sceneRect().width() / old_transform.m11()
+            new_visible_width = width
+            
+            # Only adjust horizontal scale if scene width changed significantly
+            if abs(old_visible_width - new_visible_width) > 10:
+                scale_factor = new_visible_width / old_visible_width
+                new_transform = old_transform.scale(scale_factor, 1.0)
+                view.setTransform(new_transform)
+                view.horizontalScrollBar().setValue(old_h_scroll)
+        
+        print(f"✅ Timeline rebuilt successfully, final height={height}")
+
         
         
         # Draw other layers
@@ -2437,6 +2469,29 @@ class SignalTimelineWindow(QMainWindow):
             print(f"✅ Using cached waveform ({len(self.waveform)} points)")
             # Waveform is already passed to scene in init_ui()
 
+    def update_waveform_checkbox_state(self):
+        """Enable/disable + sync the waveform checkbox with actual waveform availability."""
+        if not hasattr(self, "waveform_checkbox"):
+            return
+        if not hasattr(self, "signal_scene") or self.signal_scene is None:
+            return
+
+        has_waveform = bool(self.signal_scene.waveform) and len(self.signal_scene.waveform) > 0
+
+        # Avoid triggering toggle_waveform while we programmatically change the checkbox
+        self.waveform_checkbox.blockSignals(True)
+        try:
+            self.waveform_checkbox.setEnabled(has_waveform)
+
+            # If we have waveform data, reflect the scene's visibility state.
+            # If we don't, force unchecked.
+            if has_waveform:
+                self.waveform_checkbox.setChecked(bool(self.signal_scene.waveform_visible))
+            else:
+                self.waveform_checkbox.setChecked(False)
+        finally:
+            self.waveform_checkbox.blockSignals(False)
+
     def _apply_pending_waveform(self):
         if hasattr(self, '_pending_waveform_data'):
             data = self._pending_waveform_data
@@ -2609,7 +2664,7 @@ class SignalTimelineWindow(QMainWindow):
         return sorted(list(objs))
     
     def init_ui(self):
-        """Initialize the user interface with edit timeline - FIXED VERSION"""
+        """Initialize the user interface with edit timeline"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
@@ -3047,59 +3102,69 @@ class SignalTimelineWindow(QMainWindow):
 
     @Slot(int)
     def toggle_waveform(self, state):
-        """Toggle waveform visibility - FIXED VERSION"""
+        """Toggle waveform visibility"""
         # Prevent multiple rapid toggles
-        if not hasattr(self, '_waveform_toggle_locked'):
-            self._waveform_toggle_locked = False
-        
-        if self._waveform_toggle_locked:
+        if not hasattr(self, 'signal_scene'):
             return
         
-        self._waveform_toggle_locked = True
+        visible = bool(state == Qt.Checked)
         
-        try:
-            visible = bool(state == Qt.Checked)
-            
-            # Don't process if we're in the middle of loading
-            if not hasattr(self, 'signal_scene'):
-                return
-            
-            # Get actual waveform state
-            has_waveform = self.signal_scene.waveform is not None and len(self.signal_scene.waveform) > 0
-            
-            print(f"🎵 toggle_waveform: visible={visible}, has_waveform={has_waveform}")
-            
-            if visible and not has_waveform:
-                # No data available, revert checkbox
-                self.waveform_checkbox.setChecked(False)
-                self.statusBar().showMessage("⚠️ No waveform data available", 3000)
-                return
-            
-            if has_waveform:
-                # Force a complete rebuild with waveform
-                self.signal_scene.waveform_visible = visible
-                
-                # Clear and rebuild with proper width calculation
-                width = self.video_duration * self.signal_scene.pixels_per_second
-                height = self.signal_scene.sceneRect().height()
-                
-                # Set new scene rect to ensure proper dimensions
-                self.signal_scene.setSceneRect(0, 0, width, height)
-                
-                # Force complete rebuild
-                self.signal_scene.build_timeline()
-                
-                # Update view
-                self.signal_view.fitInView(self.signal_scene.sceneRect(), Qt.KeepAspectRatioByExpanding)
-                
-                if visible:
-                    self.statusBar().showMessage(f"✅ Waveform visible ({len(self.signal_scene.waveform)} points)", 2000)
-                else:
-                    self.statusBar().showMessage("Waveform hidden", 2000)
+        # Check if we actually have waveform data
+        has_waveform = self.signal_scene.waveform is not None and len(self.signal_scene.waveform) > 0
         
-        finally:
-            # Unlock after a short delay to prevent rapid toggling
-            QTimer.singleShot(500, lambda: setattr(self, '_waveform_toggle_locked', False))
+        if visible and not has_waveform:
+            # No data available, revert checkbox
+            self.waveform_checkbox.setChecked(False)
+            self.statusBar().showMessage("⚠️ No waveform data available", 3000)
+            return
+        
+        # Store current view transform for restoration
+        view_transform = self.signal_view.transform()
+        
+        # Store current scroll position
+        h_scroll = self.signal_view.horizontalScrollBar().value()
+        v_scroll = self.signal_view.verticalScrollBar().value()
+        
+        # Store current scene position under cursor
+        cursor_pos = self.signal_view.mapFromGlobal(QCursor.pos())
+        cursor_scene_pos = self.signal_view.mapToScene(cursor_pos)
+        
+        # Set visibility
+        self.signal_scene.waveform_visible = visible
+        
+        # FORCE complete rebuild with proper dimensions
+        self.signal_scene.build_timeline()
+        
+        # Calculate the scaling factor needed to maintain the same horizontal zoom
+        old_width = self.signal_scene.sceneRect().width() / view_transform.m11() if view_transform.m11() != 0 else 1
+        new_width = self.signal_scene.sceneRect().width()
+        
+        # Apply scaling to maintain horizontal zoom
+        if old_width > 0 and new_width > 0:
+            # Calculate how much we need to scale to maintain the same visible width
+            scale_factor = new_width / old_width
+            
+            # Create a new transform with adjusted scaling
+            new_transform = view_transform.scale(scale_factor, 1.0)
+            self.signal_view.setTransform(new_transform)
+        
+        # Restore scroll positions
+        self.signal_view.horizontalScrollBar().setValue(h_scroll)
+        self.signal_view.verticalScrollBar().setValue(v_scroll)
+        
+        # Adjust view to maintain cursor position if possible
+        if cursor_scene_pos.x() >= 0 and cursor_scene_pos.x() <= self.signal_scene.sceneRect().width():
+            # Calculate how much the scene shifted
+            scene_shift = cursor_scene_pos.y() - self.signal_view.mapToScene(cursor_pos).y()
+            if abs(scene_shift) > 10:  # Significant shift
+                self.signal_view.verticalScrollBar().setValue(
+                    v_scroll + int(scene_shift * self.signal_view.transform().m22())
+                )
+        
+        if visible:
+            self.statusBar().showMessage(f"✅ Waveform visible ({len(self.signal_scene.waveform)} points)", 2000)
+        else:
+            self.statusBar().showMessage("Waveform hidden", 2000)
         
     @Slot(int)
     def change_waveform_opacity(self, value):
