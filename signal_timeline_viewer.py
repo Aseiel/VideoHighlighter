@@ -28,6 +28,85 @@ from PySide6.QtGui import (
 import subprocess
 
 
+class WaveformVisualizer:
+    """Extracts and stores waveform data for visualization"""
+    
+    def __init__(self, video_path):
+        self.video_path = video_path
+        self.waveform_data = None  # List of (min_val, max_val) tuples
+        self.duration = 0
+        self.sample_rate = 44100
+    
+    def extract_waveform(self, num_points=1000):
+        import os, tempfile, subprocess, wave
+        import numpy as np
+
+        fd, wav_file = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)  # IMPORTANT: don't keep the file handle open
+
+        try:
+            print(f"🎵 Extracting audio from: {self.video_path}")
+
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i", self.video_path,
+                "-map", "0:a:0",          # pick first audio stream explicitly
+                "-vn",
+                "-ac", "1",
+                "-ar", str(self.sample_rate),
+                "-c:a", "pcm_s16le",
+                wav_file,
+                "-hide_banner",
+                "-loglevel", "error",
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print("❌ FFmpeg failed")
+                print("stderr:", result.stderr.strip())
+                return None
+
+            if not os.path.exists(wav_file) or os.path.getsize(wav_file) < 44:
+                print("❌ WAV output missing/too small (likely no audio or ffmpeg write failed)")
+                return None
+
+            with wave.open(wav_file, "rb") as wf:
+                rate = wf.getframerate()
+                frames = wf.readframes(wf.getnframes())
+            audio = np.frombuffer(frames, dtype=np.int16)
+
+            if audio.size == 0 or rate <= 0:
+                print("❌ No audio samples decoded")
+                return None
+
+            self.duration = audio.size / rate
+
+            step = max(1, audio.size // num_points)
+            waveform = []
+            for i in range(0, audio.size, step):
+                chunk = audio[i:i + step]
+                if chunk.size:
+                    waveform.append((float(chunk.min()) / 32768.0, float(chunk.max()) / 32768.0))
+
+            self.waveform_data = waveform
+            print(f"✅ Waveform extracted: {len(waveform)} points, duration={self.duration:.2f}s")
+            return waveform
+
+        except Exception as e:
+            print(f"❌ Waveform extraction error: {e}")
+            import traceback; traceback.print_exc()
+            return None
+
+        finally:
+            try:
+                if os.path.exists(wav_file):
+                    os.remove(wav_file)
+            except:
+                pass
+
+
+
 class TimelineBar:
     """Represents a single signal bar on the timeline"""
     def __init__(self, start_time, end_time, y_position, height, color, label, 
@@ -71,6 +150,8 @@ class DraggableTimelineBar(QGraphicsRectItem):
     def __init__(self, bar, x, width, parent=None):
         super().__init__(parent)
         self.bar = bar
+        self.setRect(0, 0, width, bar.height)
+        self.setPos(x, bar.y_position)
         
         # Set the rectangle position and size
         self.setRect(0, 0, width, bar.height)
@@ -98,43 +179,56 @@ class DraggableTimelineBar(QGraphicsRectItem):
         self.mouse_press_pos = None
     
     def mousePressEvent(self, event):
-        """Store mouse press position"""
         if event.button() == Qt.LeftButton:
             self.mouse_press_pos = event.pos()
             self.setCursor(QCursor(Qt.ClosedHandCursor))
+
+            scene = self.scene()
+            if scene:
+                time = event.scenePos().x() / scene.pixels_per_second
+
+                # Optional: waveform click -> auto clip
+                if scene.waveform_visible and scene.waveform and scene.video_duration > 0:
+                    sample_index = int(time * len(scene.waveform) / scene.video_duration)
+                    if 0 <= sample_index < len(scene.waveform):
+                        min_val, max_val = scene.waveform[sample_index]
+                        amplitude = (abs(min_val) + abs(max_val)) / 2
+                        if amplitude > 0.3:
+                            start = max(0, time - 1.5)
+                            end = min(scene.video_duration, time + 1.5)
+                            scene.waveform_clicked.emit(start, end, amplitude)
+
+                scene.time_clicked.emit(time)
+
+                if event.modifiers() & Qt.ControlModifier:
+                    scene.add_to_edit_requested.emit(time)
+
             event.accept()
-        else:
-            super().mousePressEvent(event)
+            return
+
+        super().mousePressEvent(event)
+
     
     def mouseMoveEvent(self, event):
-        """Start drag when mouse moves enough"""
         if not (event.buttons() & Qt.LeftButton) or self.mouse_press_pos is None:
             super().mouseMoveEvent(event)
             return
-        
-        # Check if we've moved enough to start a drag
+
         if (event.pos() - self.mouse_press_pos).manhattanLength() < QApplication.startDragDistance():
-            super().mouseMoveEvent(event)
             return
-        
-        # Start drag operation
+
         self.start_drag(event)
     
     def mouseReleaseEvent(self, event):
-        """Reset on mouse release"""
         if event.button() == Qt.LeftButton:
             self.mouse_press_pos = None
             self.setCursor(QCursor(Qt.OpenHandCursor))
-        
         super().mouseReleaseEvent(event)
+
     
     def start_drag(self, event):
-        """Start the drag operation"""
-        # Create mime data
-        mime_data = QMimeData()
-        
-        # Store bar data as JSON
         import json
+        mime_data = QMimeData()
         bar_data = {
             'type': 'timeline_bar',
             'start_time': self.bar.start_time,
@@ -144,29 +238,25 @@ class DraggableTimelineBar(QGraphicsRectItem):
             'metadata': self.bar.metadata
         }
         mime_data.setText(json.dumps(bar_data))
-        
-        # Create drag object
-        drag = QDrag(event.widget() if event.widget() else self.scene().views()[0])
+
+        view = self.scene().views()[0] if self.scene() and self.scene().views() else None
+        drag = QDrag(view.viewport() if view else event.widget())
         drag.setMimeData(mime_data)
-        
-        # Create drag pixmap
+
         rect = self.rect()
         pixmap = QPixmap(int(rect.width()), int(rect.height()))
         pixmap.fill(Qt.transparent)
-        
+
         painter = QPainter(pixmap)
         painter.setBrush(self.brush())
         painter.setPen(self.pen())
-        painter.drawRect(0, 0, rect.width() - 1, rect.height() - 1)
+        painter.drawRect(0, 0, int(rect.width()) - 1, int(rect.height()) - 1)
         painter.end()
-        
+
         drag.setPixmap(pixmap)
         drag.setHotSpot(QPoint(int(rect.width() / 2), int(rect.height() / 2)))
-        
-        # Execute drag (don't care about result)
         drag.exec(Qt.CopyAction)
-        
-        # Reset cursor
+
         self.setCursor(QCursor(Qt.OpenHandCursor))
         self.mouse_press_pos = None
     
@@ -460,36 +550,29 @@ class EditTimelineScene(QGraphicsScene):
             super().keyPressEvent(event)
     
     def remove_selected_clips(self):
-        """Remove selected clips"""
-        # Get selected items
-        selected_items = [item for item in self.selectedItems() if isinstance(item, EditClipItem)]
+        selected_items = [item for item in self.items() if isinstance(item, EditClipItem) and item.isSelected()]
         
         if not selected_items:
             return
         
-        # Sort by index (reverse so we don't mess up indices while removing)
-        selected_items.sort(key=lambda x: x.index, reverse=True)
+        # Collect indices first (from high to low)
+        indices_to_remove = sorted(
+            (self.clip_items.index(item) for item in selected_items),
+            reverse=True
+        )
         
-        # Store indices that were removed (for signal)
-        removed_indices = []
+        for idx in indices_to_remove:
+            # Remove graphics item
+            if self.clip_items[idx] in self.items():
+                self.removeItem(self.clip_items[idx])
+            
+            # Remove data
+            self.clip_items.pop(idx)
+            self.clips.pop(idx)
+            
+            self.clip_removed.emit(idx)
         
-        # Remove from both lists
-        for item in selected_items:
-            if item in self.clip_items:
-                index = self.clip_items.index(item)
-                if 0 <= index < len(self.clips):
-                    # Store the index
-                    removed_indices.append(index)
-                    # Remove from lists
-                    self.clip_items.pop(index)
-                    self.clips.pop(index)
-        
-        # Rebuild timeline with updated indices
         self.build_timeline()
-        
-        # Emit signals for each removed clip
-        for index in sorted(removed_indices):
-            self.clip_removed.emit(index)
 
     def load_initial_clips(self):
         """Load initial clips from highlight cache or from analysis final_segments"""
@@ -550,7 +633,8 @@ class EditTimelineScene(QGraphicsScene):
                 self.clips.append((start, end))
     
     def build_timeline(self):
-        """Build the edit timeline visualization"""
+        """Build the edit timeline visualization - FIXED VERSION"""
+        print("build_timeline() called")
         self.clear()
         self.clip_items = []
         
@@ -859,12 +943,26 @@ class SignalTimelineScene(QGraphicsScene):
     
     time_clicked = Signal(float)
     add_to_edit_requested = Signal(float)
-    filter_changed = Signal(dict)  # New: emit when filters change
+    filter_changed = Signal(dict)
+    waveform_clicked = Signal(float, float, float)
     
-    def __init__(self, cache_data, video_duration, parent=None):
+    def __init__(self, cache_data, video_duration, parent=None, waveform=None):
         super().__init__(parent)
         self.cache_data = cache_data
         self.video_duration = max(video_duration, 1.0)
+        
+        # Waveform visualization
+        self.waveform = waveform or []
+        self.waveform_visible = bool(self.waveform)
+        self.waveform_opacity = 0.7
+        
+        print(f"🎵 SignalTimelineScene init: waveform={len(self.waveform)} points, visible={self.waveform_visible}")
+
+        if self.waveform_visible:
+            # Generate colors for waveform
+            self.waveform_colors = self.generate_waveform_colors()
+        else:
+            self.waveform_colors = []
         
         # Dynamic zoom for short videos
         if video_duration < 30:
@@ -931,7 +1029,104 @@ class SignalTimelineScene(QGraphicsScene):
         
         self.bars = []
         self.build_timeline()
+
+
     
+    def generate_waveform_colors(self):
+        """Generate color gradient for waveform based on amplitude"""
+        colors = []
+        for i in range(256):
+            # Create gradient from dark blue to bright cyan to yellow to red
+            if i < 64:  # Quiet: dark blue to cyan
+                r = int(50 + (i / 64) * 100)
+                g = int(100 + (i / 64) * 155)
+                b = 200
+            elif i < 128:  # Medium: cyan to yellow
+                r = int(150 + ((i-64) / 64) * 105)
+                g = 255
+                b = int(200 - ((i-64) / 64) * 200)
+            else:  # Loud: yellow to red
+                r = 255
+                g = int(255 - ((i-128) / 128) * 155)
+                b = 0
+            colors.append(QColor(r, g, b, int(150 * self.waveform_opacity)))
+        return colors
+
+    
+    def set_waveform_data(self, waveform_data):
+        """Set waveform data for visualization"""
+        self.waveform = waveform_data or []
+        
+        # IMPORTANT: Set visibility based on actual data
+        self.waveform_visible = True if waveform_data and len(waveform_data) > 0 else False
+        
+        # Recompute colors with current opacity
+        self.waveform_colors = self.generate_waveform_colors()
+        
+        print(f"✅ SignalTimelineScene.set_waveform_data: {len(self.waveform) if self.waveform else 0} points, visible={self.waveform_visible}")
+        
+        # Rebuild timeline to include waveform
+        self.build_timeline()
+
+    
+    def draw_waveform_layer(self, y_pos, height):
+        """Draw the waveform visualization layer - FIXED VERSION"""
+        if not self.waveform or len(self.waveform) == 0 or not self.waveform_visible:
+            print(f"🎵 draw_waveform_layer: Skipped - no data or not visible")
+            return y_pos
+        
+        print(f"🎵 draw_waveform_layer: Drawing at y={y_pos} with height={height}, {len(self.waveform)} points")
+        
+        # Draw waveform background
+        waveform_y = y_pos
+        self.addRect(0, waveform_y, self.sceneRect().width(), height, 
+                    QPen(Qt.NoPen), QBrush(QColor(10, 10, 20, 50)))
+        
+        # Draw waveform label
+        label = self.addText("AUDIO WAVEFORM", QFont("Arial", 10, QFont.Weight.Bold))
+        label.setPos(5, waveform_y - 20)
+        label.setDefaultTextColor(QColor(180, 220, 255))
+        
+        # Draw the actual waveform - FIXED SCALING
+        if len(self.waveform) > 0 and self.video_duration > 0:
+            # Calculate proper scaling
+            total_width = self.sceneRect().width()
+            points_per_pixel = len(self.waveform) / total_width
+            
+            for i, (min_val, max_val) in enumerate(self.waveform):
+                # Calculate x position based on time, not index
+                time_pos = (i / len(self.waveform)) * self.video_duration
+                x = time_pos * self.pixels_per_second
+                
+                # Skip if beyond visible area
+                if x > total_width:
+                    break
+                
+                # Calculate amplitude
+                amplitude = (abs(min_val) + abs(max_val)) / 2
+                amplitude_index = min(255, int(amplitude * 500))
+                
+                # Get color
+                if self.waveform_colors and amplitude_index < len(self.waveform_colors):
+                    color = self.waveform_colors[amplitude_index]
+                    color.setAlpha(min(255, color.alpha() + 50))
+                else:
+                    color = QColor(100, 150, 255, 200)
+                
+                # Calculate y positions
+                y_center = waveform_y + height // 2
+                y_min = y_center + int(min_val * height // 2 * 0.8)
+                y_max = y_center + int(max_val * height // 2 * 0.8)
+                
+                # Draw vertical line - ensure minimum width
+                line_width = max(2, self.pixels_per_second / (len(self.waveform) / self.video_duration))
+                pen = QPen(color, min(5, line_width))  # Cap at 5 pixels thick
+                self.addLine(x, y_min, x, y_max, pen)
+        
+        return y_pos + height + self.layer_spacing
+
+
+
     def _extract_action_types(self):
         """Extract unique action names from cache data"""
         actions = set()
@@ -1007,15 +1202,22 @@ class SignalTimelineScene(QGraphicsScene):
         return [obj for obj, visible in self.visible_objects.items() if visible]
     
     def build_timeline(self):
-        """Build all timeline elements with improved layout"""
-        self.clear()
-        self.bars = []
+        """Rebuild the timeline with waveform"""
+        print(f"🔄 SignalTimelineScene.build_timeline() called")
+        print(f"   - Waveform data: {self.waveform is not None}, length: {len(self.waveform)}")
+        print(f"   - Waveform visible: {self.waveform_visible}")
         
-        # Set scene size
+        # Calculate width based on video duration
         width = self.video_duration * self.pixels_per_second
-        height = 100  # Base height for time ruler
         
-        # Calculate height based on visible layers
+        # Calculate height - START with base for time ruler
+        height = 50  # Base height for time ruler and labels
+        
+        # Add waveform height if it will be drawn
+        waveform_height = 80 if self.waveform_visible and self.waveform and len(self.waveform) > 0 else 0
+        height += waveform_height
+        
+        # Add height for other visible layers
         for _, tracks in self.group_order:
             for track in tracks:
                 key = track.lower().replace(' ', '_')
@@ -1029,17 +1231,32 @@ class SignalTimelineScene(QGraphicsScene):
                 if self.visible_layers.get(key, True):
                     height += self.layer_height + self.layer_spacing
         
+        print(f"   - Calculated size: {width}x{height} pixels")
+        print(f"   - Waveform height allocated: {waveform_height}")
+        
         self.setSceneRect(0, 0, width, height)
+        
+        # Clear previous items
+        self.clear()
+        self.bars = []
         
         # Draw background with subtle grid
         self.draw_background()
         
-        # Draw layers
-        current_y = 30
+        # FIX: Start drawing below time markers
+        current_y = 40  # Start below time markers
         
+        # Draw waveform FIRST (if visible)
+        if waveform_height > 0:
+            print(f"   - Drawing waveform at y={current_y}")
+            current_y = self.draw_waveform_layer(current_y, waveform_height)
+        
+        
+        # Draw other layers
         # Layer 1: Transcript
         if self.visible_layers.get('transcript', True):
             current_y = self.draw_transcript_layer(current_y)
+
         
         # Layer 2: Actions (with better naming)
         if self.visible_layers.get('actions', True):
@@ -1069,12 +1286,15 @@ class SignalTimelineScene(QGraphicsScene):
         if self.visible_layers.get('highlights', True):
             current_y = self.draw_highlights_layer(current_y)
         
-        # Draw time markers - FIX: Make sure this method exists!
+        # Draw time markers
         self.draw_time_markers()
         
         # Restore current time indicator if it was set
         if hasattr(self, 'current_time_seconds'):
             self.set_current_time(self.current_time_seconds)
+        
+        print(f"✅ Timeline rebuilt successfully, final height={height}")
+
         
     def draw_background(self):
         """Draw gradient background with subtle grid"""
@@ -1088,6 +1308,10 @@ class SignalTimelineScene(QGraphicsScene):
             x = sec * self.pixels_per_second
             pen = QPen(QColor(45, 45, 55) if sec % 30 else QColor(70, 70, 90), 1)
             self.addLine(x, 0, x, self.sceneRect().height(), pen)
+        
+        # FIX: Draw time markers AFTER background but BEFORE waveform
+        self.draw_time_markers()
+
     
     def draw_transcript_layer(self, y_pos):
         """Draw transcript segments with improved labeling"""
@@ -1629,117 +1853,104 @@ class SignalTimelineScene(QGraphicsScene):
 
 class ConfidenceFilterDialog(QDialog):
     """Dialog for filtering by confidence level"""
-    
     def __init__(self, scene, parent=None):
         super().__init__(parent)
         self.scene = scene
         self.setWindowTitle("Confidence Filter")
         self.setModal(False)
         self.resize(400, 300)
-        
         self.init_ui()
-    
-    def init_ui(self):
-        """Initialize the user interface with edit timeline"""
 
+    def init_ui(self):
+        """Initialize the confidence filter UI"""
         layout = QVBoxLayout(self)
         
         # Title
         title = QLabel("Filter by Confidence Level")
         title.setStyleSheet("font-weight: bold; font-size: 14px; color: #a0c0ff;")
-        title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
         # Description
-        desc = QLabel("Show only actions/objects with confidence in range:")
+        desc = QLabel("Adjust the confidence range to filter actions and objects.\nConfidence range: 0.0 (low) to 1.0 (high)")
+        desc.setStyleSheet("color: #cccccc; font-size: 11px;")
         desc.setWordWrap(True)
         layout.addWidget(desc)
         
-        # Confidence range slider
-        range_group = QGroupBox("Confidence Range (0.0 - 1.0)")
-        range_layout = QVBoxLayout()
-        
         # Current range display
         self.range_label = QLabel(f"Current: {self.scene.min_confidence:.2f} - {self.scene.max_confidence:.2f}")
-        self.range_label.setAlignment(Qt.AlignCenter)
-        range_layout.addWidget(self.range_label)
+        self.range_label.setStyleSheet("font-weight: bold; color: #a0ffa0;")
+        layout.addWidget(self.range_label)
         
-        # Min confidence slider
-        min_layout = QHBoxLayout()
-        min_layout.addWidget(QLabel("Min:"))
+        # Minimum confidence slider
+        min_group = QGroupBox("Minimum Confidence")
+        min_layout = QVBoxLayout()
+        
         self.min_slider = QSlider(Qt.Horizontal)
-        self.min_slider.setRange(0, 100)  # 0-100 for 0.0-1.0
+        self.min_slider.setRange(0, 100)
         self.min_slider.setValue(int(self.scene.min_confidence * 100))
         self.min_slider.valueChanged.connect(self.on_slider_changed)
-        min_layout.addWidget(self.min_slider)
-        self.min_value_label = QLabel(f"{self.scene.min_confidence:.2f}")
-        min_layout.addWidget(self.min_value_label)
-        range_layout.addLayout(min_layout)
         
-        # Max confidence slider
-        max_layout = QHBoxLayout()
-        max_layout.addWidget(QLabel("Max:"))
+        self.min_value_label = QLabel(f"{self.scene.min_confidence:.2f}")
+        self.min_value_label.setStyleSheet("color: #ffa0a0;")
+        
+        min_layout.addWidget(self.min_slider)
+        min_layout.addWidget(self.min_value_label)
+        min_group.setLayout(min_layout)
+        layout.addWidget(min_group)
+        
+        # Maximum confidence slider
+        max_group = QGroupBox("Maximum Confidence")
+        max_layout = QVBoxLayout()
+        
         self.max_slider = QSlider(Qt.Horizontal)
         self.max_slider.setRange(0, 100)
         self.max_slider.setValue(int(self.scene.max_confidence * 100))
         self.max_slider.valueChanged.connect(self.on_slider_changed)
-        max_layout.addWidget(self.max_slider)
+        
         self.max_value_label = QLabel(f"{self.scene.max_confidence:.2f}")
+        self.max_value_label.setStyleSheet("color: #ffa0a0;")
+        
+        max_layout.addWidget(self.max_slider)
         max_layout.addWidget(self.max_value_label)
-        range_layout.addLayout(max_layout)
+        max_group.setLayout(max_layout)
+        layout.addWidget(max_group)
         
-        range_group.setLayout(range_layout)
-        layout.addWidget(range_group)
-        
-        # Quick preset buttons
-        preset_group = QGroupBox("Quick Presets")
+        # Preset buttons
         preset_layout = QHBoxLayout()
         
-        high_btn = QPushButton("High (≥0.7)")
+        high_btn = QPushButton("High (0.7-1.0)")
         high_btn.clicked.connect(lambda: self.set_range(0.7, 1.0))
         
-        medium_btn = QPushButton("Medium (≥0.4)")
-        medium_btn.clicked.connect(lambda: self.set_range(0.4, 1.0))
+        medium_btn = QPushButton("Medium (0.4-0.7)")
+        medium_btn.clicked.connect(lambda: self.set_range(0.4, 0.7))
         
-        all_btn = QPushButton("Show All")
+        low_btn = QPushButton("Low (0.0-0.4)")
+        low_btn.clicked.connect(lambda: self.set_range(0.0, 0.4))
+        
+        all_btn = QPushButton("All (0.0-1.0)")
         all_btn.clicked.connect(lambda: self.set_range(0.0, 1.0))
         
         preset_layout.addWidget(high_btn)
         preset_layout.addWidget(medium_btn)
+        preset_layout.addWidget(low_btn)
         preset_layout.addWidget(all_btn)
-        
-        preset_group.setLayout(preset_layout)
-        layout.addWidget(preset_group)
+        layout.addLayout(preset_layout)
         
         # Statistics
-        stats = self.calculate_statistics()
-        stats_group = QGroupBox("Statistics")
-        stats_layout = QVBoxLayout()
+        self.stats_label = QLabel()
+        self.stats_label.setStyleSheet("color: #cccccc; font-size: 10px; margin-top: 10px;")
+        self.stats_label.setWordWrap(True)
+        layout.addWidget(self.stats_label)
         
-        stats_text = f"""
-        Total actions: {stats['total_actions']}
-        Visible actions: {stats['visible_actions']}
-        
-        Total objects: {stats['total_objects']}
-        Visible objects: {stats['visible_objects']}
-        
-        Filtered out: {stats['filtered_out']} items
-        """
-        
-        stats_label = QLabel(stats_text)
-        stats_label.setStyleSheet("font-family: monospace;")
-        stats_layout.addWidget(stats_label)
-        
-        stats_group.setLayout(stats_layout)
-        layout.addWidget(stats_group)
+        # Update initial statistics
+        self.update_statistics()
         
         # Dialog buttons
         buttons = QDialogButtonBox(
             QDialogButtonBox.Apply | QDialogButtonBox.Close
         )
         buttons.button(QDialogButtonBox.Apply).clicked.connect(self.apply_filters)
-        buttons.rejected.connect(self.reject)
-        
+        buttons.button(QDialogButtonBox.Close).clicked.connect(self.close)
         layout.addWidget(buttons)
         
         # Apply dark theme
@@ -1749,9 +1960,16 @@ class ConfidenceFilterDialog(QDialog):
             }
             QGroupBox {
                 color: #d0e0ff;
-                border: 1px solid #444466;
+                border: 1px solid #3a3a50;
                 border-radius: 6px;
-                margin-top: 10px;
+                margin-top: 14px;
+                padding-top: 10px;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 6px;
             }
             QSlider::groove:horizontal {
                 height: 8px;
@@ -1764,8 +1982,18 @@ class ConfidenceFilterDialog(QDialog):
                 margin: -5px 0;
                 border-radius: 9px;
             }
+            QPushButton {
+                background-color: #2a2a44;
+                color: white;
+                border: 1px solid #4a4a6a;
+                padding: 6px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #3a3a5c;
+            }
         """)
-    
+
     def on_slider_changed(self):
         """Update labels when sliders change"""
         min_val = self.min_slider.value() / 100.0
@@ -1779,39 +2007,57 @@ class ConfidenceFilterDialog(QDialog):
         self.min_value_label.setText(f"{min_val:.2f}")
         self.max_value_label.setText(f"{max_val:.2f}")
         self.range_label.setText(f"Current: {min_val:.2f} - {max_val:.2f}")
-    
+        
+        # Update statistics preview (without applying)
+        self.update_statistics()
+
     def set_range(self, min_val, max_val):
         """Set range from preset"""
         self.min_slider.setValue(int(min_val * 100))
         self.max_slider.setValue(int(max_val * 100))
         self.on_slider_changed()
-    
-    def calculate_statistics(self):
-        """Calculate filter statistics"""
+
+    def update_statistics(self):
+        """Update filter statistics preview"""
+        min_val = self.min_slider.value() / 100.0
+        max_val = self.max_slider.value() / 100.0
+        
+        # Count items that would be visible with these settings
         total_actions = len(self.scene.cache_data.get('actions', []))
         total_objects = len(self.scene.cache_data.get('objects', []))
         
-        # Count visible items based on current filters
         visible_actions = 0
         for action in self.scene.cache_data.get('actions', []):
-            if self.scene.should_show_action(action):
-                visible_actions += 1
+            confidence = action.get('confidence')
+            if confidence is not None:
+                if confidence > 1.0:
+                    confidence = confidence / 10.0
+                if min_val <= confidence <= max_val:
+                    visible_actions += 1
+            else:
+                visible_actions += 1  # Count items without confidence
         
         visible_objects = 0
         for obj_data in self.scene.cache_data.get('objects', []):
-            if self.scene.should_show_object(obj_data):
+            confidence = obj_data.get('confidence')
+            if confidence is not None:
+                if confidence > 1.0:
+                    confidence = confidence / 10.0
+                if min_val <= confidence <= max_val:
+                    visible_objects += 1
+            else:
                 visible_objects += 1
         
         filtered_out = (total_actions + total_objects) - (visible_actions + visible_objects)
         
-        return {
-            'total_actions': total_actions,
-            'visible_actions': visible_actions,
-            'total_objects': total_objects,
-            'visible_objects': visible_objects,
-            'filtered_out': filtered_out
-        }
-    
+        stats_text = f"""
+Statistics (Preview):
+- Total actions: {total_actions} → Visible: {visible_actions}
+- Total objects: {total_objects} → Visible: {visible_objects}
+- Filtered out: {filtered_out} items
+"""
+        self.stats_label.setText(stats_text.strip())
+
     def apply_filters(self):
         """Apply the confidence filters"""
         min_val = self.min_slider.value() / 100.0
@@ -1819,17 +2065,8 @@ class ConfidenceFilterDialog(QDialog):
         
         self.scene.set_confidence_filter(min_val, max_val)
         
-        # Update statistics
-        stats = self.calculate_statistics()
-        stats_text = f"""
-        Total actions: {stats['total_actions']}
-        Visible actions: {stats['visible_actions']}
-        
-        Total objects: {stats['total_objects']}
-        Visible objects: {stats['visible_objects']}
-        
-        Filtered out: {stats['filtered_out']} items
-        """
+        # Update statistics with actual results
+        self.update_statistics()
 
 
 class SignalTimelineView(QGraphicsView):
@@ -2153,12 +2390,13 @@ class FilterDialog(QDialog):
 
 class SignalTimelineWindow(QMainWindow):
     """Main window for signal timeline viewer with edit timeline and filters"""
+    waveform_ready = Signal(object)
     
     def __init__(self, video_path, cache_data=None):
         super().__init__()
         self.video_path = video_path
         self.cache_data = cache_data or self.load_cache_data()
-        
+        self.waveform_ready.connect(self.update_waveform_data)
         self.cache = self.get_cache_instance()
 
         if not self.cache_data:
@@ -2185,8 +2423,153 @@ class SignalTimelineWindow(QMainWindow):
         # Make window semi-transparent
         self.setWindowOpacity(0.98)
         
+        # Load waveform from cache - store it in instance variable
+        self.waveform = self.load_waveform_from_cache()
+        
+        # Initialize UI - PASS waveform to constructor
         self.init_ui()
-    
+        
+        # Start background extraction if we don't have cached waveform
+        if not self.waveform or len(self.waveform) == 0:
+            print("⚠️ No cached waveform or empty waveform, starting extraction...")
+            self.init_waveform()
+        else:
+            print(f"✅ Using cached waveform ({len(self.waveform)} points)")
+            # Waveform is already passed to scene in init_ui()
+
+    def _apply_pending_waveform(self):
+        if hasattr(self, '_pending_waveform_data'):
+            data = self._pending_waveform_data
+            delattr(self, '_pending_waveform_data')
+
+            if not hasattr(self, 'signal_scene') or self.signal_scene is None:
+                print("⚠️ No signal_scene yet, cannot apply waveform")
+                return
+
+            self.update_waveform_data(data)
+
+    def load_waveform_from_cache(self):
+        """Try to load waveform from cache data"""
+        try:
+            if self.cache_data:
+                # Check in various possible locations
+                waveform_data = None
+                
+                # Try direct access
+                if 'waveform_data' in self.cache_data:
+                    waveform_data = self.cache_data['waveform_data']
+                
+                # Try under video_metadata
+                elif 'video_metadata' in self.cache_data and 'waveform' in self.cache_data['video_metadata']:
+                    waveform_data = self.cache_data['video_metadata']['waveform']
+                
+                if waveform_data and len(waveform_data) > 0:
+                    print(f"✅ Loaded waveform from cache ({len(waveform_data)} points)")
+                    return waveform_data
+                else:
+                    print(f"⚠️ Waveform data found but empty")
+        except Exception as e:
+            print(f"⚠️ Could not load cached waveform: {e}")
+        
+        return None
+
+
+    def init_waveform(self):
+        """Initialize waveform visualization in background with better debugging"""
+        # First check if video even has audio
+        try:
+            result = subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1",
+                self.video_path
+            ], capture_output=True, text=True, timeout=8)
+
+            if result.returncode != 0 or not result.stdout.strip():
+                print("⚠️ Video has NO AUDIO STREAM → no waveform possible")
+                self.statusBar().showMessage("Video has no audio track", 5000)
+                return
+            else:
+                print("✓ Video contains audio stream")
+        except Exception as e:
+            print(f"⚠️ Could not check audio stream: {e}")
+
+        # Start extraction in background
+        import threading
+
+        def extract_waveform():
+            print("🎵 [thread] Starting waveform extraction...")
+            visualizer = WaveformVisualizer(self.video_path)
+            data = visualizer.extract_waveform(num_points=2000)
+
+            if data is None:
+                print("❌ [thread] extract_waveform() returned None")
+                self.waveform_ready.emit(None)
+            else:
+                print(f"✅ [thread] extract_waveform() returned list len={len(data)} first={data[0] if data else None}")
+                self.waveform_ready.emit(data)
+
+            def apply():
+                print("🧵 [ui] apply() called")
+                if data is None:
+                    self.statusBar().showMessage("Failed to extract waveform (None)", 6000)
+                else:
+                    self.update_waveform_data(data)
+
+            QTimer.singleShot(0, apply)
+
+        thread = threading.Thread(target=extract_waveform, daemon=True)
+        thread.start()
+
+    def update_waveform_data(self, waveform_data):
+        print(f"🧩 update_waveform_data() called with {len(waveform_data) if waveform_data else 0} points")
+        
+        if not waveform_data or len(waveform_data) == 0:
+            print("❌ No waveform data received → skipping update")
+            return
+        
+        print(f"✅ update_waveform_data received: {len(waveform_data)} points")
+        
+        self.waveform = waveform_data
+        self.save_waveform_to_cache(waveform_data)
+        
+        if hasattr(self, 'signal_scene') and self.signal_scene is not None:
+            # Update scene with new waveform data
+            self.signal_scene.set_waveform_data(waveform_data)
+            
+            # Force checkbox update after scene is built
+            QTimer.singleShot(100, lambda: self.update_waveform_checkbox_state())
+            
+            # Force a view update
+            QTimer.singleShot(150, lambda: self.signal_view.viewport().update())
+            
+            self.statusBar().showMessage(
+                f"✅ Waveform loaded ({len(waveform_data)} points)", 5000
+            )
+        else:
+            print(f"Scene not ready yet, storing waveform data")
+            self._pending_waveform_data = waveform_data
+
+
+    def save_waveform_to_cache(self, waveform_data):
+        """Save waveform to cache for future use"""
+        try:
+            if not self.cache_data:
+                self.cache_data = {}
+            
+            if 'video_metadata' not in self.cache_data:
+                self.cache_data['video_metadata'] = {}
+            
+            self.cache_data['video_metadata']['waveform'] = waveform_data
+            print(f"💾 Saved waveform to cache ({len(waveform_data)} points)")
+        except Exception as e:
+            print(f"⚠️ Could not save waveform to cache: {e}")
+
+    def set_waveform_data(self, waveform_data):
+        self.waveform = waveform_data or []
+        self.waveform_visible = True if self.waveform else False  # FORCE ON when data exists
+        self.waveform_colors = self.generate_waveform_colors()
+        self.build_timeline()
+
 
     def get_cache_instance(self):
         """Get cache instance for highlight loading"""
@@ -2226,7 +2609,7 @@ class SignalTimelineWindow(QMainWindow):
         return sorted(list(objs))
     
     def init_ui(self):
-        """Initialize the user interface with edit timeline"""
+        """Initialize the user interface with edit timeline - FIXED VERSION"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
@@ -2245,22 +2628,31 @@ class SignalTimelineWindow(QMainWindow):
         signal_widget = QWidget()
         signal_layout = QVBoxLayout(signal_widget)
         
-        # Signal timeline
-        self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration)
+        # IMPORTANT: Always pass current waveform data (might be None initially)
+        print(f"🎵 init_ui: Creating scene with waveform data ({len(self.waveform) if self.waveform else 0} points)")
+        
+        # Create scene with current waveform data (may be empty initially)
+        self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration, waveform=self.waveform)
         self.signal_view = SignalTimelineView(self.signal_scene)
         
         # Enable drag and drop on the viewport
         self.signal_view.viewport().setAcceptDrops(True)
         
+        # Connect signals
         self.signal_scene.time_clicked.connect(self.on_time_clicked)
         self.signal_scene.add_to_edit_requested.connect(self.on_add_to_edit_requested)
         self.signal_scene.filter_changed.connect(self.on_filter_changed)
+        
+        # Check if waveform clicked signal exists
+        if hasattr(self.signal_scene, 'waveform_clicked'):
+            self.signal_scene.waveform_clicked.connect(self.on_waveform_clicked)
         
         signal_layout.addWidget(QLabel("Signal Timeline (Drag items to edit timeline below)"))
         signal_layout.addWidget(self.signal_view)
         
         splitter.addWidget(signal_widget)
-        
+
+       
         # Create edit timeline view (bottom)
         edit_widget = QWidget()
         edit_layout = QVBoxLayout(edit_widget)
@@ -2478,6 +2870,34 @@ class SignalTimelineWindow(QMainWindow):
         controls_widget = QWidget()
         layout = QVBoxLayout(controls_widget)
         
+        # Waveform controls
+        waveform_group = QGroupBox("Waveform")
+        waveform_layout = QVBoxLayout()
+
+        # Waveform visibility toggle
+        self.waveform_checkbox = QCheckBox("Show Waveform")
+
+        # Initialize checkbox state
+        self.waveform_checkbox.setChecked(False)  # Start unchecked
+        self.waveform_checkbox.setEnabled(False)  # Disabled until data loads
+
+        # Connect signal
+        self.waveform_checkbox.stateChanged.connect(self.toggle_waveform)
+        waveform_layout.addWidget(self.waveform_checkbox)
+
+        # Waveform opacity slider
+        opacity_layout = QHBoxLayout()
+        opacity_layout.addWidget(QLabel("Opacity:"))
+        self.waveform_opacity_slider = QSlider(Qt.Horizontal)
+        self.waveform_opacity_slider.setRange(30, 100)
+        self.waveform_opacity_slider.setValue(70)
+        self.waveform_opacity_slider.valueChanged.connect(self.change_waveform_opacity)
+        opacity_layout.addWidget(self.waveform_opacity_slider)
+        waveform_layout.addLayout(opacity_layout)
+        
+        waveform_group.setLayout(waveform_layout)
+        layout.addWidget(waveform_group)
+        
         # ADD FILTER CONTROLS
         filter_controls = self.create_filter_controls()
         layout.addWidget(filter_controls)
@@ -2625,6 +3045,70 @@ class SignalTimelineWindow(QMainWindow):
         
         return highlights
 
+    @Slot(int)
+    def toggle_waveform(self, state):
+        """Toggle waveform visibility - FIXED VERSION"""
+        # Prevent multiple rapid toggles
+        if not hasattr(self, '_waveform_toggle_locked'):
+            self._waveform_toggle_locked = False
+        
+        if self._waveform_toggle_locked:
+            return
+        
+        self._waveform_toggle_locked = True
+        
+        try:
+            visible = bool(state == Qt.Checked)
+            
+            # Don't process if we're in the middle of loading
+            if not hasattr(self, 'signal_scene'):
+                return
+            
+            # Get actual waveform state
+            has_waveform = self.signal_scene.waveform is not None and len(self.signal_scene.waveform) > 0
+            
+            print(f"🎵 toggle_waveform: visible={visible}, has_waveform={has_waveform}")
+            
+            if visible and not has_waveform:
+                # No data available, revert checkbox
+                self.waveform_checkbox.setChecked(False)
+                self.statusBar().showMessage("⚠️ No waveform data available", 3000)
+                return
+            
+            if has_waveform:
+                # Force a complete rebuild with waveform
+                self.signal_scene.waveform_visible = visible
+                
+                # Clear and rebuild with proper width calculation
+                width = self.video_duration * self.signal_scene.pixels_per_second
+                height = self.signal_scene.sceneRect().height()
+                
+                # Set new scene rect to ensure proper dimensions
+                self.signal_scene.setSceneRect(0, 0, width, height)
+                
+                # Force complete rebuild
+                self.signal_scene.build_timeline()
+                
+                # Update view
+                self.signal_view.fitInView(self.signal_scene.sceneRect(), Qt.KeepAspectRatioByExpanding)
+                
+                if visible:
+                    self.statusBar().showMessage(f"✅ Waveform visible ({len(self.signal_scene.waveform)} points)", 2000)
+                else:
+                    self.statusBar().showMessage("Waveform hidden", 2000)
+        
+        finally:
+            # Unlock after a short delay to prevent rapid toggling
+            QTimer.singleShot(500, lambda: setattr(self, '_waveform_toggle_locked', False))
+        
+    @Slot(int)
+    def change_waveform_opacity(self, value):
+        """Change waveform opacity"""
+        if hasattr(self, 'signal_scene'):
+            self.signal_scene.waveform_opacity = value / 100.0
+            self.signal_scene.waveform_colors = self.signal_scene.generate_waveform_colors()
+            self.signal_scene.build_timeline()
+
     @Slot()
     def on_save_cache_clicked(self):
         """Save current edit timeline to cache"""
@@ -2669,6 +3153,17 @@ class SignalTimelineWindow(QMainWindow):
         seconds = int(self.current_time % 60)
         milliseconds = int((self.current_time % 1) * 1000)
         self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}")
+
+    @Slot(float, float, float)
+    def on_waveform_clicked(self, start_time, end_time, amplitude):
+        """Handle waveform clicks - auto-create a clip"""
+        print(f"🎵 Waveform clicked at {start_time:.2f}s, amplitude: {amplitude:.2f}")
+        if amplitude > 0.3:  # Loud section
+            # Add to edit timeline
+            if hasattr(self, 'edit_scene'):
+                self.edit_scene.add_clip(start_time, end_time)
+                self.update_edit_duration()
+                self.statusBar().showMessage(f"Added audio clip: {start_time:.1f}s to {end_time:.1f}s", 2000)
     
     @Slot(float)
     def on_add_to_edit_requested(self, time):

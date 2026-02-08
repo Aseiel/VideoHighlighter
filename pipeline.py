@@ -267,7 +267,8 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
 
 def collect_analysis_data(video_path, video_duration, fps, transcript_segments, 
                          object_detections, action_detections, scenes, 
-                         motion_events, motion_peaks, audio_peaks, source_lang="en"):
+                         motion_events, motion_peaks, audio_peaks, source_lang="en",
+                         waveform_data=None):
     """
     Collect all analysis results into a structured dictionary for caching.
     """
@@ -737,6 +738,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             try:
                 check_cancellation(cancel_flag, log, "audio peak detection")
                 audio_peaks = extract_audio_peaks(processed_video_path, cancel_flag=cancel_flag)
+                from modules.audio_peaks import extract_waveform_data
+                waveform_data = extract_waveform_data(video_path, num_points=1000)
                 log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
             except RuntimeError:
                 return None
@@ -1046,7 +1049,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     motion_events=motion_events,
                     motion_peaks=motion_peaks,
                     audio_peaks=audio_peaks,
-                    source_lang=SOURCE_LANG
+                    source_lang=SOURCE_LANG,
+                    waveform_data=waveform_data
                 )
                 
                 # Add analysis parameters for future validation
@@ -1096,21 +1100,25 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         
         # Fill scores using the detected signals
         for start, end in scenes:
-            idx = int(start)
-            if idx < len(score):
+            idx = int(round(start))
+            if 0 <= idx < len(score):
                 scene_score[idx] += SCENE_POINTS
+
         for t in motion_events:
-            idx = int(t)
-            if idx < len(score):
+            idx = int(round(t))
+            if 0 <= idx < len(score):
                 motion_event_score[idx] += MOTION_EVENT_POINTS
+
         for t in motion_peaks:
-            idx = int(t)
-            if idx < len(score):
+            idx = int(round(t))
+            if 0 <= idx < len(score):
                 motion_peak_score[idx] += MOTION_PEAK_POINTS
+
         for t in audio_peaks:
-            idx = int(t)
-            if idx < len(score):
+            idx = int(round(t))
+            if 0 <= idx < len(score):
                 audio_score[idx] += AUDIO_PEAK_POINTS
+
 
         # object scoring
         total_detections = sum(len(objs) for objs in object_detections.values())
