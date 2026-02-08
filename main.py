@@ -688,14 +688,32 @@ class VideoHighlighterGUI(QWidget):
         misc_layout = QFormLayout()
         self.frame_skip_spin = QSpinBox(); self.frame_skip_spin.setRange(1,30); self.frame_skip_spin.setValue(advanced_cfg.get("frame_skip", 5))
         self.obj_frame_skip_spin = QSpinBox(); self.obj_frame_skip_spin.setRange(1,60); self.obj_frame_skip_spin.setValue(advanced_cfg.get("object_frame_skip", 10))
+
+
+        # === CREATE THE YOLO MODEL COMBOBOX ===
+        self.yolo_model_combo = QComboBox()
+        self.yolo_model_combo.addItem("Nano (fastest, lowest accuracy)", "n")
+        self.yolo_model_combo.addItem("Small (fast, good balance)", "s")
+        self.yolo_model_combo.addItem("Medium (balanced)", "m")
+        self.yolo_model_combo.addItem("Large (accurate, slower)", "l")
+        self.yolo_model_combo.addItem("Extra-Large (most accurate, slowest)", "x")
+
+        current_model = advanced_cfg.get("yolo_model_size", "n")
+        idx = self.yolo_model_combo.findData(current_model)
+        self.yolo_model_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+
+        # === YOLO MODEL DROPDOWN ===
         self.yolo_pt_path = QLineEdit(advanced_cfg.get("yolo_pt_path", ""))
         self.openvino_model_folder = QLineEdit(advanced_cfg.get("openvino_model_folder", ""))
         self.sample_rate_spin = QSpinBox()
         self.sample_rate_spin.setRange(1,30)  # 1 = process every frame, 30 = every 30th frame
         self.sample_rate_spin.setValue(advanced_cfg.get("sample_rate", 5))  # default 5
+
         misc_layout.addRow("Frame skip (motion):", self.frame_skip_spin)
         misc_layout.addRow("Frame skip (objects):", self.obj_frame_skip_spin)
         misc_layout.addRow("Sample rate (actions):", self.sample_rate_spin)
+        misc_layout.addRow("YOLO model size:", self.yolo_model_combo)
         misc_layout.addRow("YOLO .pt path (optional):", self.yolo_pt_path)
         misc_layout.addRow("OpenVINO model folder (optional):", self.openvino_model_folder)
         misc_box.setLayout(misc_layout)
@@ -1075,6 +1093,7 @@ class VideoHighlighterGUI(QWidget):
             "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
+            "yolo_model_size": self.yolo_model_combo.currentData(),
             "yolo_pt_path": self.yolo_pt_path.text().strip() or None,
             "openvino_model_folder": self.openvino_model_folder.text().strip() or None,
             "sample_rate": int(self.sample_rate_spin.value()),
@@ -1551,11 +1570,11 @@ class VideoHighlighterGUI(QWidget):
                 "auto_process": self.auto_process_chk.isChecked(),
                 "auto_combine": self.auto_combine_chk.isChecked(),
                 "use_same_time_range": self.use_same_time_range_chk.isChecked(),
-                "immediate_processing": self.immediate_processing_chk.isChecked(),  # NEW
-                "concurrent_downloads": self.concurrent_spinbox.value(),  # NEW
-                "download_full": self.download_full_chk.isChecked(),  # Already exists
-                "time_range_start": self.download_start_input.value(),  # Already exists
-                "time_range_end": self.download_end_input.value(),  # Already exists
+                "immediate_processing": self.immediate_processing_chk.isChecked(),
+                "concurrent_downloads": self.concurrent_spinbox.value(),
+                "download_full": self.download_full_chk.isChecked(),
+                "time_range_start": self.download_start_input.value(),
+                "time_range_end": self.download_end_input.value(),
             },
             "highlights": {
                 "clip_time": int(self.spin_clip_time.value()),
@@ -1603,6 +1622,7 @@ class VideoHighlighterGUI(QWidget):
                 "frame_skip": int(self.frame_skip_spin.value()),
                 "object_frame_skip": int(self.obj_frame_skip_spin.value()),
                 "sample_rate": int(self.sample_rate_spin.value()),
+                "yolo_model_size": self.yolo_model_combo.currentData(),
                 "yolo_pt_path": self.yolo_pt_path.text().strip(),
                 "openvino_model_folder": self.openvino_model_folder.text().strip(),
             },
@@ -2014,6 +2034,7 @@ class VideoHighlighterGUI(QWidget):
             "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
+            "yolo_model_size": self.yolo_model_combo.currentData(),
             "yolo_pt_path": self.yolo_pt_path.text().strip() or None,
             "openvino_model_folder": self.openvino_model_folder.text().strip() or None,
             "sample_rate": int(self.sample_rate_spin.value()),
