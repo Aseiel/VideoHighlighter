@@ -268,10 +268,27 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
 def collect_analysis_data(video_path, video_duration, fps, transcript_segments, 
                          object_detections, action_detections, scenes, 
                          motion_events, motion_peaks, audio_peaks, source_lang="en",
-                         waveform_data=None):
+                         waveform_data=None, keyword_segments_only=False, search_keywords=None):
     """
     Collect all analysis results into a structured dictionary for caching.
+    
+    Args:
+        keyword_segments_only: If True and search_keywords provided, only cache segments containing keywords
+        search_keywords: List of keywords to filter transcript segments
     """
+    # Filter transcript segments if we're only caching keyword-relevant parts
+    filtered_transcript_segments = transcript_segments
+    if keyword_segments_only and search_keywords and transcript_segments:
+        # Create a set of keywords for faster lookup
+        keyword_set = {kw.lower() for kw in search_keywords}
+        filtered_transcript_segments = []
+        
+        for segment in transcript_segments:
+            segment_text = segment.get("text", "").lower()
+            # Check if any keyword is in the segment text
+            if any(keyword in segment_text for keyword in keyword_set):
+                filtered_transcript_segments.append(segment)
+    
     return {
         "video_metadata": {
             "duration": video_duration,
@@ -281,8 +298,10 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
             "file_size": os.path.getsize(video_path) if os.path.exists(video_path) else 0
         },
         "transcript": {
-            "segments": transcript_segments if transcript_segments else [],
-            "language": source_lang
+            "segments": filtered_transcript_segments if keyword_segments_only else transcript_segments,
+            "language": source_lang,
+            "cached_full_transcript": not keyword_segments_only,  # Flag to know if we cached full or partial
+            "keyword_filtered": keyword_segments_only
         },
         "objects": [
             {
@@ -309,7 +328,11 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
         "motion_events": motion_events,
         "motion_peaks": motion_peaks,
         "audio_peaks": audio_peaks,
-        "pipeline_version": "1.0"
+        "pipeline_version": "1.0",
+        "cache_flags": {
+            "keyword_segments_only": keyword_segments_only,
+            "search_keywords": search_keywords if keyword_segments_only else None
+        }
     }
 
 
@@ -434,6 +457,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         TRANSCRIPT_POINTS = int(gui_config.get("transcript_points", 0))
         SOURCE_LANG = gui_config.get("source_lang", "en")
         TARGET_LANG = gui_config.get("target_lang", None)
+
+        keyword_matches = []
 
         target_duration = EXACT_DURATION if EXACT_DURATION else MAX_DURATION
         duration_mode = "EXACT" if EXACT_DURATION else "MAX"
@@ -565,7 +590,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # Initialize cache
         use_cache = gui_config.get("use_cache", True)
         force_reprocess = gui_config.get("force_reprocess", False)
-        
+
         # Initialize variables that might come from cache
         transcript_segments = []
         object_detections = {}
@@ -575,7 +600,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         motion_peaks = []
         audio_peaks = []
         using_cache = False
-        
+
         if use_cache and not force_reprocess:
             cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
             cache_path = cache._get_cache_path(processed_video_path)
@@ -590,37 +615,66 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     if cached_data:
                         cache_video_duration = cached_data.get("video_metadata", {}).get("duration", 0)
                         if abs(cache_video_duration - video_duration) < 1.0:  # Within 1 second
-                            log(f"✅ Loaded from cache ({load_time:.2f}s)")
+                            # Check if the cache matches our current keyword requirements
+                            cache_keyword_filtered = cached_data.get("transcript", {}).get("keyword_filtered", False)
+                            cache_search_keywords = cached_data.get("cache_flags", {}).get("search_keywords", [])
                             
-                            # Extract data from cache
-                            transcript_segments = cached_data.get("transcript", {}).get("segments", [])
-                            object_detections_raw = cached_data.get("objects", [])
-                            action_detections_raw = cached_data.get("actions", [])
-                            scenes_raw = cached_data.get("scenes", [])
-                            motion_events = cached_data.get("motion_events", [])
-                            motion_peaks = cached_data.get("motion_peaks", [])
-                            audio_peaks = cached_data.get("audio_peaks", [])
+                            # We can use cached data if:
+                            # 1. We don't need transcript at all (not using transcript)
+                            # 2. Cache has full transcript and we need full transcript
+                            # 3. Cache has keyword-filtered transcript and we need keyword-filtered with same keywords
+                            current_keywords = SEARCH_KEYWORDS if USE_TRANSCRIPT else []
                             
-                            # Convert to pipeline format
-                            for obj in object_detections_raw:
-                                sec = int(obj.get("timestamp", 0))
-                                object_detections[sec] = obj.get("objects", [])
+                            cache_compatible = False
+                            if not USE_TRANSCRIPT:
+                                cache_compatible = True
+                            elif not cache_keyword_filtered:
+                                # Cache has full transcript, we can use it regardless of our keyword needs
+                                cache_compatible = True
+                            elif cache_keyword_filtered and current_keywords:
+                                # Check if cache has the keywords we need
+                                cached_keywords_set = set(cache_search_keywords or [])
+                                current_keywords_set = set([kw.lower() for kw in current_keywords])
+                                if cached_keywords_set.issuperset(current_keywords_set):
+                                    cache_compatible = True
                             
-                            for action in action_detections_raw:
-                                action_detections.append((
-                                    action.get("timestamp", 0),
-                                    action.get("frame_id", 0),
-                                    action.get("action_id", -1),
-                                    action.get("confidence", 0),
-                                    action.get("action_name", "")
-                                ))
-                            
-                            scenes = [(s.get("start", 0), s.get("end", 0)) for s in scenes_raw]
-                            
-                            # Mark that we're using cached data
-                            using_cache = True
-                            log(f"✅ Loaded: {len(transcript_segments)} transcript segments, "
-                                f"{len(object_detections)} object seconds, {len(action_detections)} actions")
+                            if cache_compatible:
+                                log(f"✅ Loaded from cache ({load_time:.2f}s)")
+                                
+                                # Extract data from cache
+                                transcript_segments = cached_data.get("transcript", {}).get("segments", [])
+                                object_detections_raw = cached_data.get("objects", [])
+                                action_detections_raw = cached_data.get("actions", [])
+                                scenes_raw = cached_data.get("scenes", [])
+                                motion_events = cached_data.get("motion_events", [])
+                                motion_peaks = cached_data.get("motion_peaks", [])
+                                audio_peaks = cached_data.get("audio_peaks", [])
+                                
+                                # Convert to pipeline format
+                                for obj in object_detections_raw:
+                                    sec = int(obj.get("timestamp", 0))
+                                    object_detections[sec] = obj.get("objects", [])
+                                
+                                for action in action_detections_raw:
+                                    action_detections.append((
+                                        action.get("timestamp", 0),
+                                        action.get("frame_id", 0),
+                                        action.get("action_id", -1),
+                                        action.get("confidence", 0),
+                                        action.get("action_name", "")
+                                    ))
+                                
+                                scenes = [(s.get("start", 0), s.get("end", 0)) for s in scenes_raw]
+                                
+                                # Mark that we're using cached data
+                                using_cache = True
+                                cache_status = "full" if not cache_keyword_filtered else f"keyword-filtered ({len(cache_search_keywords or [])} keywords)"
+                                log(f"✅ Loaded: {len(transcript_segments)} transcript segments ({cache_status}), "
+                                    f"{len(object_detections)} object seconds, {len(action_detections)} actions")
+                            else:
+                                log(f"⚠️ Cache incompatible: cached with {'keyword-filtered' if cache_keyword_filtered else 'full'} transcript, "
+                                    f"need {'keyword-filtered' if current_keywords else 'full'} transcript")
+                                cached_data = None
                         else:
                             log(f"⚠️ Cache duration mismatch: {cache_video_duration}s vs {video_duration}s")
                             cached_data = None
@@ -631,7 +685,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log("ℹ️ No cache found for this video")
         else:
             log("ℹ️ Cache disabled or forced reprocess")
-        
+
         using_cache = cached_data is not None if 'cached_data' in locals() else False
         # ========== END CACHE CHECK ==========
 
@@ -1062,7 +1116,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # ========== SAVE TO CACHE IF NOT USING CACHE ==========
         if not using_cache and use_cache and not (cancel_flag and cancel_flag.is_set()):
             try:
-                # Collect analysis data
+                # Determine if we should cache only keyword segments
+                keyword_segments_only = bool(SEARCH_KEYWORDS and USE_TRANSCRIPT)
+                
+                # Collect analysis data with keyword filtering if needed
                 analysis_data = collect_analysis_data(
                     video_path=processed_video_path,
                     video_duration=video_duration,
@@ -1075,7 +1132,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     motion_peaks=motion_peaks,
                     audio_peaks=audio_peaks,
                     source_lang=SOURCE_LANG,
-                    waveform_data=waveform_data
+                    waveform_data=waveform_data,
+                    keyword_segments_only=keyword_segments_only,
+                    search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None
                 )
                 
                 # Add analysis parameters for future validation
@@ -1083,13 +1142,19 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     "highlight_objects": gui_config.get("highlight_objects", []),
                     "interesting_actions": gui_config.get("interesting_actions", []),
                     "transcript_model": gui_config.get("transcript_model", "medium"),
-                    "sample_rate": sample_rate
+                    "sample_rate": sample_rate,
+                    "search_keywords": SEARCH_KEYWORDS if keyword_segments_only else None,
+                    "keyword_segments_only": keyword_segments_only
                 }
                 
                 # Save to cache
                 cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
                 cache.save(processed_video_path, analysis_data)
-                log("✅ Analysis results cached for future use")
+                
+                if keyword_segments_only:
+                    log(f"✅ Analysis results cached (keyword-filtered: {len(analysis_data['transcript']['segments'])} segments)")
+                else:
+                    log(f"✅ Analysis results cached (full transcript: {len(analysis_data['transcript']['segments'])} segments)")
                 
             except Exception as e:
                 log(f"⚠️ Failed to save cache: {e}")
