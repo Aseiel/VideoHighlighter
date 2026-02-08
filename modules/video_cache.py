@@ -179,6 +179,7 @@ class VideoAnalysisCache:
                 "video_hash": self._get_video_hash(video_path),
                 "cached_at": datetime.now().isoformat(),
                 "cache_version": "1.0",
+                'waveform_data': waveform_data,
                 **analysis_data,
             }
 
