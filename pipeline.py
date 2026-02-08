@@ -665,11 +665,36 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"🔹 Searching transcript for keywords: {SEARCH_KEYWORDS}")
                     keyword_matches = search_transcript_for_keywords(transcript_segments, SEARCH_KEYWORDS, context_seconds=CLIP_TIME//2)
                     log(f"✅ Found {len(keyword_matches)} keyword matches")
-            else:
-                log("ℹ Transcript processing disabled")
+                    
+                    # 🆕 ADD THIS DEBUG BLOCK:
+                    if keyword_matches:
+                        log(f"\n📊 KEYWORD MATCH DETAILS:")
+                        for i, match in enumerate(keyword_matches[:10]):  # Show first 10
+                            main_seg = match["main_segment"]
+                            keyword = match.get("keyword", "unknown")
+                            start_sec = int(main_seg["start"])
+                            end_sec = int(main_seg["end"])
+                            text = main_seg.get("text", "")[:50]  # First 50 chars
+                            log(f"   Match {i+1}: '{keyword}' at {start_sec}-{end_sec}s")
+                            log(f"            Text: \"{text}...\"")
+                    else:
+                        log(f"⚠️ No keyword matches found!")
+                        log(f"   Searched for: {SEARCH_KEYWORDS}")
+                        log(f"   In {len(transcript_segments)} transcript segments")
+                else:
+                    keyword_matches = []
+
         else:
             log("ℹ️ Using cached transcript")
             # transcript_segments already loaded from cache
+            
+            # 🆕 ADD THIS BLOCK - Re-run keyword search on cached transcript
+            if SEARCH_KEYWORDS and transcript_segments:
+                log(f"🔹 Searching cached transcript for keywords: {SEARCH_KEYWORDS}")
+                keyword_matches = search_transcript_for_keywords(transcript_segments, SEARCH_KEYWORDS, context_seconds=CLIP_TIME//2)
+                log(f"✅ Found {len(keyword_matches)} keyword matches")
+            else:
+                keyword_matches = []
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
@@ -1097,6 +1122,15 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         MIN_SIGNALS_FOR_BOOST = gui_config.get("min_signals_for_boost", config.get("min_signals_for_boost", 2))
         OBJECT_POINTS = gui_config.get("object_points", config.get("object_points", 10))
         ACTION_POINTS = gui_config.get("action_points", config.get("action_points", 10))
+        keyword_set = set()
+        if keyword_matches:
+            for match in keyword_matches:
+                main_seg = match["main_segment"]
+                start_sec = int(main_seg["start"])
+                end_sec = int(main_seg["end"])
+                for sec in range(start_sec, end_sec + 1):
+                    keyword_set.add(sec)
+
         
         # Fill scores using the detected signals
         for start, end in scenes:
@@ -1119,6 +1153,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             if 0 <= idx < len(score):
                 audio_score[idx] += AUDIO_PEAK_POINTS
 
+        for sec in keyword_set:
+            if 0 <= sec < len(keyword_score):
+                keyword_score[sec] += KEYWORD_POINTS
 
         # object scoring
         total_detections = sum(len(objs) for objs in object_detections.values())
@@ -1198,7 +1235,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         motion_set = set(int(t) for t in motion_events)
         motion_peaks_set = set(int(t) for t in motion_peaks)
         audio_set = set(int(t) for t in audio_peaks)
-        keyword_set = set()
         object_set = set(object_detections.keys())
         action_set = set(detections_by_sec.keys())
 
