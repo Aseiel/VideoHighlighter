@@ -86,7 +86,8 @@ def check_xpu_availability(log_fn=print):
 def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=print,
                                  progress_fn=None, frame_skip=5, cancel_flag=None,
                                  csv_output="object_log.csv", draw_boxes=False,
-                                 annotated_output=None):
+                                 annotated_output=None, yolo_model_size="n",
+                                 yolo_pt_path=None, openvino_model_folder=None):
     """Object detection with progress tracking, cancellation support, and optional CSV export in mm:ss format"""
 
     cap = cv2.VideoCapture(video_path)
@@ -828,10 +829,21 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # 4 Object detection setup
         progress.update_progress(40, 100, "Pipeline", "Setting up object detection...")
         check_cancellation(cancel_flag, log, "object detection setup")
-        
+
         # Get list of objects to highlight from GUI or config
         highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", []))
-        openvino_model_folder = gui_config.get("openvino_model_folder", "yolo11n_openvino_model/")
+
+        yolo_model_size = str(gui_config.get("yolo_model_size") or "n").lower()
+        openvino_model_folder = gui_config.get(
+            "openvino_model_folder",
+            f"yolo11{yolo_model_size}_openvino_model/"
+        )
+        yolo_pt_path = gui_config.get("yolo_pt_path", f"yolo11{yolo_model_size}.pt")
+
+
+        # Also update the default PT path based on model size
+        default_pt_path = f"yolo11{yolo_model_size}.pt"
+        log(f"🎯 YOLO model size: {yolo_model_size} (using {default_pt_path})")
 
         # Check OpenVINO devices (best-effort)
         try:
@@ -847,8 +859,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         if not os.path.exists(openvino_model_folder):
             try:
                 check_cancellation(cancel_flag, log, "YOLO model export")
-                log("⚠️ OpenVINO folder not found. Exporting YOLO model (requires yolo11n.pt)...")
-                yolo_model_export = YOLO(gui_config.get("yolo_pt_path", "yolo11n.pt"))
+                log(f"⚠️ OpenVINO folder not found. Exporting YOLO model (requires {default_pt_path})...")
+                
+                # Use the PT path from config, or fall back to default based on model size
+                yolo_pt_path = gui_config.get("yolo_pt_path", default_pt_path)
+                yolo_model_export = YOLO(yolo_pt_path)
                 export_result = yolo_model_export.export(format="openvino")
                 log(f"✅ Model exported to: {export_result}")
             except RuntimeError:
@@ -894,8 +909,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     frame_skip=frame_skip_for_obj,
                     cancel_flag=cancel_flag,
                     draw_boxes=draw_object_boxes,
-                    annotated_output=object_annotated_path
+                    annotated_output=object_annotated_path,
+                    yolo_model_size=yolo_model_size,
+                    yolo_pt_path=yolo_pt_path,
+                    openvino_model_folder=openvino_model_folder
                 )
+
                 log(f"✅ Object detection complete: {len(object_detections)} seconds with objects")
         else:
             log("ℹ️ Using cached object detections")

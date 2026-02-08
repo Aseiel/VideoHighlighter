@@ -10,9 +10,8 @@ import numpy as np
 # ---------------- CONFIG ----------------
 NUM_WORKERS = 4
 FRAME_SKIP = 5
-openvino_model_folder = "yolo11n_openvino_model/"
+openvino_model_folder = "yolo11n_openvino_model/"  # Default, will be overridden
 highlight_objects = []  # Add your objects of interest here, e.g., ["person", "car"]
-model_path_default = "yolo11n.pt"
 
 # Bounding box visualization settings
 BBOX_COLORS = {
@@ -128,15 +127,28 @@ def get_video_segments(video_path, num_segments):
     return segments, fps, total_frames
 
 # ---------------- Worker ----------------
-def worker_process(video_path, start_frame, end_frame, objects_of_interest, return_dict, worker_id, fps, progress_queue=None, draw_boxes=False, annotated_output_path=None):
+def worker_process(video_path, start_frame, end_frame, objects_of_interest, return_dict, worker_id, fps, 
+                  model_path, openvino_folder=None, progress_queue=None, draw_boxes=False, annotated_output_path=None):
     """
     Worker process for object detection
     
     Args:
+        model_path: Path to YOLO model (.pt file)
+        openvino_folder: Path to OpenVINO model folder (optional, will use if exists)
         draw_boxes: If True, create annotated video output
         annotated_output_path: Path for annotated video (worker will append _workerN.mp4)
     """
-    model = YOLO(model_path_default)
+    # Try to load OpenVINO model first, fall back to PT model
+    if openvino_folder and os.path.exists(openvino_folder):
+        try:
+            model = YOLO(openvino_folder, task="detect")
+            print(f"Worker {worker_id}: Loaded OpenVINO model from {openvino_folder}")
+        except Exception as e:
+            print(f"Worker {worker_id}: Failed to load OpenVINO model, falling back to PT: {e}")
+            model = YOLO(model_path)
+    else:
+        model = YOLO(model_path)
+    
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     
@@ -198,7 +210,8 @@ def worker_process(video_path, start_frame, end_frame, objects_of_interest, retu
 
 # ---------------- Main function for module ----------------
 def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="objects_log.csv", 
-                        progress_fn=None, draw_boxes=False, annotated_output=None):
+                        progress_fn=None, draw_boxes=False, annotated_output=None,
+                        yolo_model_size="n", yolo_pt_path=None, openvino_model_folder=None):
     """
     Run object detection on video
     
@@ -210,6 +223,9 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
         progress_fn: Progress callback function
         draw_boxes: If True, create annotated video with bounding boxes
         annotated_output: Path for annotated video output (only used if draw_boxes=True)
+        yolo_model_size: YOLO model size ('n', 's', 'm', 'l', 'x')
+        yolo_pt_path: Custom path to YOLO .pt file (optional, overrides default)
+        openvino_model_folder: Custom path to OpenVINO model folder (optional, overrides default)
     
     Returns:
         dict: Dictionary of {second: [objects]} detections
@@ -231,6 +247,25 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
     # Update global FRAME_SKIP with the parameter value
     global FRAME_SKIP
     FRAME_SKIP = frame_skip
+
+    # Determine model paths based on parameters
+    if yolo_pt_path and os.path.exists(yolo_pt_path):
+        # Use custom PT path if provided and exists
+        model_path = yolo_pt_path
+        print(f"🎯 Using custom YOLO model: {model_path}")
+    else:
+        # Use default based on model size
+        model_path = f"yolo11{yolo_model_size}.pt"
+        print(f"🎯 Using YOLO model: {model_path} (size: {yolo_model_size})")
+    
+    # Determine OpenVINO folder
+    if openvino_model_folder and os.path.exists(openvino_model_folder):
+        openvino_folder = openvino_model_folder
+        print(f"🎯 Using OpenVINO model folder: {openvino_folder}")
+    else:
+        # Use default OpenVINO folder name based on model size
+        openvino_folder = f"yolo11{yolo_model_size}_openvino_model/"
+        print(f"🎯 Using default OpenVINO folder: {openvino_folder}")
 
     segments, fps, total_frames = get_video_segments(video_path, NUM_WORKERS)
     manager = Manager()
@@ -264,7 +299,7 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
         p = Process(
             target=worker_process,
             args=(video_path, seg[0], seg[1], highlight_objects, return_dict, i, fps, 
-                  progress_queue, draw_boxes, worker_annotated_path)
+                  model_path, openvino_folder, progress_queue, draw_boxes, worker_annotated_path)
         )
         p.start()
         processes.append(p)
@@ -377,12 +412,16 @@ if __name__ == "__main__":
     
     if os.path.exists(test_video):
         run_object_detection(
-            test_video, 
-            test_objects, 
+            video_path=test_video, 
+            highlight_objects=test_objects, 
+            frame_skip=5,
             csv_file="objects_log.csv",
             progress_fn=example_progress_fn,
             draw_boxes=True,
-            annotated_output="test_video_objects_annotated.mp4"
+            annotated_output="test_video_objects_annotated.mp4",
+            yolo_model_size="n",  # or "s", "m", "l", "x"
+            yolo_pt_path=None,    # Optional custom path
+            openvino_model_folder=None  # Optional custom OpenVINO folder
         )
     else:
         print(f"Test video {test_video} not found.")
