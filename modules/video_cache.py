@@ -12,6 +12,7 @@ import json
 import hashlib
 import os
 import time
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
@@ -21,6 +22,91 @@ import shutil
 
 
 # ========== DATA CLASSES (unchanged external API) ==========
+
+def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int, video_duration: float):
+    # “Analysis params” = anything that changes the computed analysis artifacts
+    # Keep values JSON-serializable and stable (sort lists)
+    highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", [])) or []
+    interesting_actions = gui_config.get("interesting_actions", []) or []
+    search_keywords = gui_config.get("search_keywords", []) or []
+
+    # Time range settings (if enabled)
+    use_time_range = bool(gui_config.get("use_time_range", False))
+    range_start = int(gui_config.get("range_start", 0) or 0)
+    range_end = gui_config.get("range_end", None)
+    range_end = int(range_end) if range_end is not None else None
+
+    # YOLO settings
+    yolo_model_size = str(gui_config.get("yolo_model_size") or "n").lower()
+    openvino_model_folder = gui_config.get("openvino_model_folder", f"yolo11{yolo_model_size}_openvino_model/")
+    yolo_pt_path = gui_config.get("yolo_pt_path", f"yolo11{yolo_model_size}.pt")
+
+    params = {
+        # bump this when you change the meaning/format of cached analysis
+        "analysis_cache_schema": "analysis_v2",
+
+        # core toggles
+        "use_transcript": bool(gui_config.get("use_transcript", False)),
+        "transcript_model": str(gui_config.get("transcript_model", "medium")),
+        "search_keywords": sorted([str(k).lower() for k in search_keywords]),
+
+        "highlight_objects": sorted([str(o) for o in highlight_objects]),
+        "interesting_actions": sorted([str(a) for a in interesting_actions]),
+
+        # object/action sampling knobs
+        "object_frame_skip": int(gui_config.get("object_frame_skip", gui_config.get("clip_time", 10) or 10)),
+        "sample_rate": int(sample_rate),
+
+        # action detector knobs used in your call
+        "action_use_person_detection": True,
+        "action_max_people": int(gui_config.get("action_max_people", 2) or 2),
+
+        # yolo identity
+        "yolo_model_size": yolo_model_size,
+        "yolo_pt_path": str(yolo_pt_path),
+        "openvino_model_folder": str(openvino_model_folder),
+
+        # time-range
+        "use_time_range": use_time_range,
+        "range_start": range_start if use_time_range else 0,
+        "range_end": range_end if use_time_range else None,
+
+        # optional: points affect scoring, not analysis — but if you cache “analysis only”
+        # you can omit scoring params. If you cache waveforms/peaks based on thresholds,
+        # include them.
+        "scene_threshold": float(gui_config.get("scene_threshold", 70.0)),
+        "motion_threshold": float(gui_config.get("motion_threshold", 100.0)),
+        "spike_factor": float(gui_config.get("spike_factor", 1.2)),
+        "freeze_seconds": float(gui_config.get("freeze_seconds", 4)),
+        "freeze_factor": float(gui_config.get("freeze_factor", 0.8)),
+    }
+    return params
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=path.name + ".",
+        suffix=".tmp",
+        dir=str(path.parent)
+    )
+    tmp_path = Path(tmp_path)
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp_path), str(path))  # atomic on same filesystem
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
 
 @dataclass
 class HighlightSegment:
@@ -90,8 +176,34 @@ class CachedAnalysisData:
         # keep legacy field too if present
         self.motion_scores = cache_data.get("motion_scores", [])
 
-    def get_transcript_segments(self) -> List[Dict[str, Any]]:
-        return self.transcript.get("segments", [])
+    def get_transcript(self, start: float, end: float, 
+                                    mode: str = "overlap") -> List[Dict[str, Any]]:
+        """
+        Get transcript segments in time range.
+        
+        mode:
+            - "overlap": segments that overlap with the range (default)
+            - "contained": only segments fully within the range
+            - "strict": segments where start >= range_start AND end <= range_end
+        """
+        segments = self.transcript.get("segments", [])
+        
+        if mode == "contained":
+            return [
+                seg for seg in segments 
+                if seg.get("start", 0) >= start and seg.get("end", 0) <= end
+            ]
+        elif mode == "strict":
+            return [
+                seg for seg in segments
+                if start <= seg.get("start", 0) and seg.get("end", 0) <= end
+            ]
+        else:  # overlap (most permissive)
+            return [
+                seg for seg in segments
+                if not (seg.get("end", 0) < start or seg.get("start", 0) > end)
+            ]
+
 
     def get_objects_in_timerange(self, start: float, end: float) -> List[Dict[str, Any]]:
         return [obj for obj in self.objects if start <= obj.get("timestamp", 0) <= end]
@@ -101,6 +213,7 @@ class CachedAnalysisData:
 
     def get_scenes_in_timerange(self, start: float, end: float) -> List[Dict[str, Any]]:
         return [scene for scene in self.scenes if not (scene.get("end", 0) < start or scene.get("start", 0) > end)]
+
 
 
 # ========== SINGLE CACHE CLASS ==========
@@ -166,32 +279,72 @@ class VideoAnalysisCache:
 
     # ---------- analysis cache API (backward compatible) ----------
 
-    def exists(self, video_path: str) -> bool:
+    def _make_signature(self, params: Dict[str, Any]) -> str:
+        payload = json.dumps(params, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+    def _get_analysis_cache_path_for_signature(self, video_path: str, signature: str) -> Path:
+        """
+        Signature-based analysis cache path.
+        Creates a new cache file when parameters change.
+        """
+        video_hash = self._get_video_hash(video_path)
+        return self.cache_dir / f"{video_hash}.{signature}.cache.json"
+
+    def exists(self, video_path: str, params: Optional[Dict[str, Any]] = None) -> bool:
         with self._lock:
+            if params is not None:
+                signature = self._make_signature(params)
+                return self._get_analysis_cache_path_for_signature(video_path, signature).exists()
             return self._get_cache_path(video_path).exists()
 
-    def save(self, video_path: str, analysis_data: Dict[str, Any]) -> None:
+    def save(self, video_path: str, analysis_data: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Save analysis cache.
+        - Atomic write (no partial cache)
+        - If params provided: use signature-based filename so parameter changes create a new cache file
+        - If params is None: fall back to legacy path (<video_hash>.cache.json) for backward compatibility
+        """
         with self._lock:
-            cache_path = self._get_cache_path(video_path)
+            video_hash = self._get_video_hash(video_path)
+
+            if params is not None:
+                signature = self._make_signature(params)
+                cache_path = self._get_analysis_cache_path_for_signature(video_path, signature)
+            else:
+                signature = None
+                cache_path = self._get_cache_path(video_path)  # legacy <video_hash>.cache.json
 
             cache_data = {
                 "video_path": str(Path(video_path).absolute()),
-                "video_hash": self._get_video_hash(video_path),
+                "video_hash": video_hash,
                 "cached_at": datetime.now().isoformat(),
-                "cache_version": "1.0",
-                'waveform_data': waveform_data,
+                "cache_version": "1.1",
+                "cache_complete": True,
+                "analysis_signature": signature,
+                "analysis_parameters": params,
                 **analysis_data,
             }
 
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+            atomic_write_json(cache_path, cache_data)
 
             self.stats["saves"] += 1
             print(f"✓ Cache saved: {cache_path}")
 
-    def load(self, video_path: str) -> Optional[Dict[str, Any]]:
+    def load(self, video_path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Load analysis cache.
+        - If params provided: load signature-based cache (new cache per parameter change)
+        - If params is None: fall back to legacy cache path
+        """
         with self._lock:
-            cache_path = self._get_cache_path(video_path)
+            if params is not None:
+                signature = self._make_signature(params)
+                cache_path = self._get_analysis_cache_path_for_signature(video_path, signature)
+            else:
+                signature = None
+                cache_path = self._get_cache_path(video_path)
+
             if not cache_path.exists():
                 self.stats["misses"] += 1
                 return None
@@ -203,6 +356,16 @@ class VideoAnalysisCache:
                 current_hash = self._get_video_hash(video_path)
                 if cache_data.get("video_hash") != current_hash:
                     print("⚠ Cache is outdated (video file changed), will re-process")
+                    self.stats["misses"] += 1
+                    return None
+
+                if cache_data.get("cache_complete") is not True:
+                    print("⚠ Cache incomplete, will re-process")
+                    self.stats["misses"] += 1
+                    return None
+
+                # Extra safety: if params were passed, ensure signature matches too
+                if params is not None and cache_data.get("analysis_signature") != signature:
                     self.stats["misses"] += 1
                     return None
 
