@@ -947,16 +947,24 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # 3 Audio peaks
         if not using_cache:
-            progress.update_progress(30, 100, "Pipeline", "Analyzing audio...")
-            log("🔹 Step 3: Detecting audio peaks...")
-            try:
-                check_cancellation(cancel_flag, log, "audio peak detection")
-                audio_peaks = extract_audio_peaks(processed_video_path, cancel_flag=cancel_flag)
-                from modules.audio_peaks import extract_waveform_data
-                waveform_data = extract_waveform_data(video_path, num_points=1000)
-                log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
-            except RuntimeError:
-                return None
+            # Check if we should skip audio detection based on GUI config
+            audio_peak_points = gui_config.get("audio_peak_points", 0)
+            
+            if audio_peak_points == 0:
+                log("ℹ️ Skipping audio peak detection (audio_peak_points set to 0)")
+                audio_peaks = []
+                progress.update_progress(30, 100, "Pipeline", "Audio detection skipped - no audio scoring enabled")
+            else:
+                progress.update_progress(30, 100, "Pipeline", "Analyzing audio...")
+                log("🔹 Step 3: Detecting audio peaks...")
+                try:
+                    check_cancellation(cancel_flag, log, "audio peak detection")
+                    audio_peaks = extract_audio_peaks(processed_video_path, cancel_flag=cancel_flag)
+                    from modules.audio_peaks import extract_waveform_data
+                    waveform_data = extract_waveform_data(video_path, num_points=1000)
+                    log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
+                except RuntimeError:
+                    return None
         else:
             log("ℹ️ Using cached audio peaks")
 
