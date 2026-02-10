@@ -81,7 +81,6 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
     }
     return params
 
-
 class ProgressTracker:
     """Simple progress tracker that works with or without GUI callback"""
     def __init__(self, progress_fn=None, log_fn=print):
@@ -336,6 +335,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
     Args:
         keyword_segments_only: If True and search_keywords provided, only cache segments containing keywords
         search_keywords: List of keywords to filter transcript segments
+        waveform_data: Optional waveform data for timeline visualization
     """
     # Filter transcript segments if we're only caching keyword-relevant parts
     filtered_transcript_segments = transcript_segments
@@ -350,7 +350,20 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
             if any(keyword in segment_text for keyword in keyword_set):
                 filtered_transcript_segments.append(segment)
     
-    return {
+    # Ensure action_detections is in a cacheable format
+    actions_for_cache = []
+    for detection in action_detections:
+        if len(detection) >= 5:
+            timestamp, frame_id, action_id, score, action_name = detection[:5]
+            actions_for_cache.append({
+                "timestamp": float(timestamp),
+                "frame_id": int(frame_id),
+                "action_id": int(action_id),
+                "confidence": float(score),
+                "action_name": str(action_name)
+            })
+    
+    analysis_data = {
         "video_metadata": {
             "duration": video_duration,
             "fps": fps,
@@ -361,7 +374,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
         "transcript": {
             "segments": filtered_transcript_segments if keyword_segments_only else transcript_segments,
             "language": source_lang,
-            "cached_full_transcript": not keyword_segments_only,  # Flag to know if we cached full or partial
+            "cached_full_transcript": not keyword_segments_only,
             "keyword_filtered": keyword_segments_only
         },
         "objects": [
@@ -372,29 +385,31 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
             }
             for sec, objs in object_detections.items()
         ],
-        "actions": [
-            {
-                "timestamp": timestamp,
-                "frame_id": frame_id,
-                "action_id": action_id,
-                "confidence": score,
-                "action_name": action_name
-            }
-            for (timestamp, frame_id, action_id, score, action_name) in action_detections
-        ],
+        "actions": actions_for_cache,  # Use the properly formatted actions
         "scenes": [
             {"start": start, "end": end}
             for start, end in scenes
         ],
         "motion_events": motion_events,
         "motion_peaks": motion_peaks,
-        "audio_peaks": audio_peaks,
         "pipeline_version": "1.0",
         "cache_flags": {
             "keyword_segments_only": keyword_segments_only,
             "search_keywords": search_keywords if keyword_segments_only else None
         }
     }
+    
+    # Add audio data (including waveform for timeline viewer)
+    # Store in a structured way for easy access
+    analysis_data["audio"] = {
+        "peaks": audio_peaks,
+        "waveform": waveform_data
+    }
+    
+    # Also keep legacy key for backward compatibility
+    analysis_data["audio_peaks"] = audio_peaks
+    
+    return analysis_data
 
 
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None, 
@@ -651,92 +666,16 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # Goal:
         # - Cache MUST be invalidated automatically when settings change (objects/actions/transcript/time-range/etc.)
         # - Use VideoAnalysisCache signature-based files via load(..., params=analysis_params)
-        # - Avoid legacy _get_cache_path probing (it ignores signature caches)
+        # - Maintain backward compatibility
+        # - Ensure timeline viewer gets all necessary data
 
-        def _normalize_str_list(xs):
-            if not xs:
-                return []
-            return sorted([str(x).strip() for x in xs if str(x).strip()])
-
-        def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int):
-            """
-            Parameters that affect *analysis outputs* (transcript / objects / actions / scenes / motion / audio).
-            When any of these change, analysis cache should be a MISS -> recompute.
-            """
-            highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", [])) or []
-            interesting_actions = gui_config.get("interesting_actions", []) or []
-            search_keywords = gui_config.get("search_keywords", []) or []
-
-            # Time-range settings (important: full video cache must not be reused for a trimmed range)
-            use_time_range = bool(gui_config.get("use_time_range", False))
-            range_start = int(gui_config.get("range_start", 0) or 0)
-            range_end = gui_config.get("range_end", None)
-            range_end = int(range_end) if range_end is not None else None
-
-            # YOLO identity/settings
-            yolo_model_size_local = str(gui_config.get("yolo_model_size") or "n").lower()
-            openvino_model_folder_local = gui_config.get(
-                "openvino_model_folder",
-                f"yolo11{yolo_model_size_local}_openvino_model/"
-            )
-            yolo_pt_path_local = gui_config.get("yolo_pt_path", f"yolo11{yolo_model_size_local}.pt")
-
-            # Object sampling
-            # NOTE: your pipeline uses frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME ...)
-            # but CLIP_TIME is defined later. Here we only include explicit GUI value if present,
-            # otherwise a stable default. We will override later once CLIP_TIME is known if you want.
-            object_frame_skip_local = int(gui_config.get("object_frame_skip", 0) or 0)
-
-            # Transcript settings
-            use_transcript = bool(gui_config.get("use_transcript", False)) and TRANSCRIPT_AVAILABLE
-            transcript_model = str(gui_config.get("transcript_model", "medium"))
-
-            # Motion detection thresholds (currently hardcoded in your call; include them if you later expose via GUI)
-            scene_threshold = float(gui_config.get("scene_threshold", 70.0))
-            motion_threshold = float(gui_config.get("motion_threshold", 100.0))
-            spike_factor = float(gui_config.get("spike_factor", 1.2))
-            freeze_seconds = float(gui_config.get("freeze_seconds", 4))
-            freeze_factor = float(gui_config.get("freeze_factor", 0.8))
-
-            # Action detector knobs used in your run_action_detection call
-            action_use_person_detection = bool(gui_config.get("action_use_person_detection", True))
-            action_max_people = int(gui_config.get("action_max_people", 2) or 2)
-
-            params = {
-                # bump this string whenever you change cache meanings/structures
-                "analysis_cache_schema": "analysis_v2",
-
-                # transcript
-                "use_transcript": use_transcript,
-                "transcript_model": transcript_model,
-                "search_keywords": sorted([str(k).lower().strip() for k in _normalize_str_list(search_keywords)]),
-
-                # objects
-                "highlight_objects": _normalize_str_list(highlight_objects),
-                "yolo_model_size": yolo_model_size_local,
-                "yolo_pt_path": str(yolo_pt_path_local),
-                "openvino_model_folder": str(openvino_model_folder_local),
-                "object_frame_skip": object_frame_skip_local,
-
-                # actions
-                "interesting_actions": _normalize_str_list(interesting_actions),
-                "sample_rate": int(sample_rate),
-                "action_use_person_detection": action_use_person_detection,
-                "action_max_people": action_max_people,
-
-                # time range
-                "use_time_range": use_time_range,
-                "range_start": range_start if use_time_range else 0,
-                "range_end": range_end if use_time_range else None,
-
-                # motion thresholds
-                "scene_threshold": scene_threshold,
-                "motion_threshold": motion_threshold,
-                "spike_factor": spike_factor,
-                "freeze_seconds": freeze_seconds,
-                "freeze_factor": freeze_factor,
-            }
-            return params
+        # Build analysis parameters that affect cache signature
+        analysis_params = build_analysis_cache_params(
+            gui_config=gui_config,
+            config=config,
+            sample_rate=sample_rate,
+            video_duration=video_duration
+        )
 
         # Initialize cache controls
         use_cache = gui_config.get("use_cache", True)
@@ -750,78 +689,110 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         motion_events = []
         motion_peaks = []
         audio_peaks = []
+        waveform_data = None  # For timeline viewer
         using_cache = False
-        cached_data = None  # keep explicit
 
-        # Build analysis params signature (settings-change -> new signature -> new cache file)
-        analysis_params = build_analysis_cache_params(gui_config, config, sample_rate)
-
-        # If you want object_frame_skip to follow CLIP_TIME when GUI doesn't specify it,
-        # you can patch it later (after CLIP_TIME is defined). Here we keep it stable.
-
+        # Try to load from cache if enabled
         if use_cache and not force_reprocess:
             cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
             try:
                 start_time_cache = time.time()
+                # Use signature-based loading
                 cached_data = cache.load(processed_video_path, params=analysis_params)
                 load_time = time.time() - start_time_cache
-
+                
                 if cached_data:
-                    # Optional safety: verify duration match (useful if trimming logic changed)
+                    # Verify it's for the same video (check duration, etc.)
                     cache_video_duration = cached_data.get("video_metadata", {}).get("duration", 0)
-                    if abs(cache_video_duration - video_duration) < 1.0:  # within 1s
-                        log(f"✅ Loaded from cache ({load_time:.2f}s) [signature match]")
-
-                        # Extract data from cache
-                        transcript_segments = cached_data.get("transcript", {}).get("segments", [])
-                        object_detections_raw = cached_data.get("objects", [])
-                        action_detections_raw = cached_data.get("actions", [])
-                        scenes_raw = cached_data.get("scenes", [])
-                        motion_events = cached_data.get("motion_events", [])
-                        motion_peaks = cached_data.get("motion_peaks", [])
-                        audio_peaks = cached_data.get("audio_peaks", [])
-
-                        # Convert to pipeline format
-                        object_detections = {}
-                        for obj in object_detections_raw:
-                            sec = int(obj.get("timestamp", 0))
-                            object_detections[sec] = obj.get("objects", [])
-
-                        action_detections = []
-                        for action in action_detections_raw:
-                            # Expect cache format: dicts with keys timestamp/frame_id/action_id/confidence/action_name
-                            action_detections.append((
-                                action.get("timestamp", 0),
-                                action.get("frame_id", 0),
-                                action.get("action_id", -1),
-                                action.get("confidence", 0),
-                                action.get("action_name", "")
-                            ))
-
-                        scenes = [(s.get("start", 0), s.get("end", 0)) for s in scenes_raw]
-
-                        using_cache = True
-                        log(f"✅ Loaded: {len(transcript_segments)} transcript segments, "
-                            f"{len(object_detections)} object seconds, {len(action_detections)} actions, "
-                            f"{len(scenes)} scenes, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks, "
-                            f"{len(audio_peaks)} audio peaks")
+                    if abs(cache_video_duration - video_duration) < 1.0:  # Within 1 second
+                        # Check if the cache matches our current keyword requirements
+                        cache_keyword_filtered = cached_data.get("transcript", {}).get("keyword_filtered", False)
+                        cache_search_keywords = cached_data.get("cache_flags", {}).get("search_keywords", [])
+                        
+                        # We can use cached data if:
+                        # 1. We don't need transcript at all (not using transcript)
+                        # 2. Cache has full transcript and we need full transcript
+                        # 3. Cache has keyword-filtered transcript and we need keyword-filtered with same keywords
+                        current_keywords = SEARCH_KEYWORDS if USE_TRANSCRIPT else []
+                        
+                        cache_compatible = False
+                        if not USE_TRANSCRIPT:
+                            cache_compatible = True
+                        elif not cache_keyword_filtered:
+                            # Cache has full transcript, we can use it regardless of our keyword needs
+                            cache_compatible = True
+                        elif cache_keyword_filtered and current_keywords:
+                            # Check if cache has the keywords we need
+                            cached_keywords_set = set(cache_search_keywords or [])
+                            current_keywords_set = set([kw.lower() for kw in current_keywords])
+                            if cached_keywords_set.issuperset(current_keywords_set):
+                                cache_compatible = True
+                        
+                        if cache_compatible:
+                            log(f"✅ Loaded from cache ({load_time:.2f}s) [signature match]")
+                            
+                            # Extract data from cache - Ensure all data is loaded
+                            transcript_segments = cached_data.get("transcript", {}).get("segments", [])
+                            object_detections_raw = cached_data.get("objects", [])
+                            action_detections_raw = cached_data.get("actions", [])  # This was missing!
+                            scenes_raw = cached_data.get("scenes", [])
+                            motion_events = cached_data.get("motion_events", [])
+                            motion_peaks = cached_data.get("motion_peaks", [])
+                            
+                            # Get audio data - handle both new and old formats
+                            audio_block = cached_data.get("audio") or {}
+                            if isinstance(audio_block, dict) and "peaks" in audio_block:
+                                audio_peaks = audio_block.get("peaks", [])
+                                waveform_data = audio_block.get("waveform")
+                            else:
+                                # Legacy format
+                                audio_peaks = cached_data.get("audio_peaks", [])
+                                waveform_data = cached_data.get("waveform") or cached_data.get("waveform_data")
+                            
+                            # Convert to pipeline format
+                            object_detections = {}
+                            for obj in object_detections_raw:
+                                sec = int(obj.get("timestamp", 0))
+                                object_detections[sec] = obj.get("objects", [])
+                            
+                            # Convert action detections to proper format
+                            action_detections = []
+                            if action_detections_raw:
+                                for action in action_detections_raw:
+                                    # Handle both 5-element and 6-element formats
+                                    if len(action) >= 5:
+                                        action_detections.append((
+                                            action.get("timestamp", 0),
+                                            action.get("frame_id", 0),
+                                            action.get("action_id", -1),
+                                            action.get("confidence", 0),
+                                            action.get("action_name", "")
+                                        ))
+                            
+                            scenes = [(s.get("start", 0), s.get("end", 0)) for s in scenes_raw]
+                            
+                            # Mark that we're using cached data
+                            using_cache = True
+                            cache_status = "full" if not cache_keyword_filtered else f"keyword-filtered ({len(cache_search_keywords or [])} keywords)"
+                            log(f"✅ Loaded from cache: {len(transcript_segments)} transcript segments ({cache_status}), "
+                                f"{len(object_detections)} object seconds, {len(action_detections)} actions, "
+                                f"{len(scenes)} scenes, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks, "
+                                f"{len(audio_peaks)} audio peaks")
+                        else:
+                            log(f"⚠️ Cache incompatible: cached with {'keyword-filtered' if cache_keyword_filtered else 'full'} transcript, "
+                                f"need {'keyword-filtered' if current_keywords else 'full'} transcript")
+                            cached_data = None
                     else:
-                        log(f"⚠️ Cache duration mismatch: cached {cache_video_duration:.2f}s vs current {video_duration:.2f}s")
+                        log(f"⚠️ Cache duration mismatch: {cache_video_duration}s vs {video_duration}s")
                         cached_data = None
-                        using_cache = False
-                else:
-                    log("ℹ️ No cache found for this video+settings (signature miss)")
-                    using_cache = False
-
             except Exception as e:
                 log(f"⚠️ Cache load error: {e}")
                 cached_data = None
-                using_cache = False
         else:
             log("ℹ️ Cache disabled or forced reprocess")
-            using_cache = False
-            cached_data = None
 
+        # Ensure using_cache is properly set
+        using_cache = 'cached_data' in locals() and cached_data is not None
         # ========== END CACHE CHECK ==========
 
         # --- Transcript processing ---
@@ -946,27 +917,74 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         check_cancellation(cancel_flag, log, "motion detection completion")
 
         # 3 Audio peaks
-        if not using_cache:
+        # - If audio_peak_points == 0: skip *peaks* but still compute waveform (for timeline viewer)
+        # - If using cache: load peaks + waveform from cache (support both new and legacy key layouts)
+
+        audio_peaks = audio_peaks if 'audio_peaks' in locals() else []
+        waveform_data = None
+
+        def _get_cached_waveform(cached):
+            if not cached:
+                return None
+            # New preferred layout: {"audio": {"waveform": ...}}
+            audio_block = cached.get("audio") or {}
+            if isinstance(audio_block, dict) and "waveform" in audio_block:
+                return audio_block.get("waveform")
+            # Legacy layouts
+            return cached.get("waveform") or cached.get("waveform_data")
+
+        def _get_cached_audio_peaks(cached):
+            if not cached:
+                return []
+            # New preferred layout: {"audio": {"peaks": [...]}}
+            audio_block = cached.get("audio") or {}
+            if isinstance(audio_block, dict) and "peaks" in audio_block:
+                return audio_block.get("peaks") or []
+            # Legacy layout: top-level "audio_peaks"
+            return cached.get("audio_peaks") or []
+
+        if using_cache:
+            log("ℹ️ Using cached audio data")
+            audio_peaks = _get_cached_audio_peaks(cached_data)
+            waveform_data = _get_cached_waveform(cached_data)
+
+            # If waveform wasn't cached in older runs, compute it now (cheap) so timeline works
+            if waveform_data is None:
+                try:
+                    from modules.audio_peaks import extract_waveform_data
+                    waveform_data = extract_waveform_data(processed_video_path, num_points=1000)
+                    log("✅ Waveform computed (was missing in cache)")
+                except Exception as e:
+                    log(f"⚠️ Failed to compute waveform: {e}")
+
+        else:
             # Check if we should skip audio detection based on GUI config
             audio_peak_points = gui_config.get("audio_peak_points", 0)
-            
+
+            # Always try to compute waveform for the timeline viewer
+            try:
+                from modules.audio_peaks import extract_waveform_data
+                waveform_data = extract_waveform_data(processed_video_path, num_points=1000)
+            except Exception as e:
+                log(f"⚠️ Waveform extraction failed: {e}")
+                waveform_data = None
+
             if audio_peak_points == 0:
                 log("ℹ️ Skipping audio peak detection (audio_peak_points set to 0)")
                 audio_peaks = []
-                progress.update_progress(30, 100, "Pipeline", "Audio detection skipped - no audio scoring enabled")
+                progress.update_progress(
+                    30, 100, "Pipeline",
+                    "Audio peaks skipped (no audio scoring) — waveform computed for timeline"
+                )
             else:
                 progress.update_progress(30, 100, "Pipeline", "Analyzing audio...")
                 log("🔹 Step 3: Detecting audio peaks...")
                 try:
                     check_cancellation(cancel_flag, log, "audio peak detection")
                     audio_peaks = extract_audio_peaks(processed_video_path, cancel_flag=cancel_flag)
-                    from modules.audio_peaks import extract_waveform_data
-                    waveform_data = extract_waveform_data(video_path, num_points=1000)
                     log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
                 except RuntimeError:
                     return None
-        else:
-            log("ℹ️ Using cached audio peaks")
 
         # 4 Object detection setup
         progress.update_progress(40, 100, "Pipeline", "Setting up object detection...")
@@ -1152,7 +1170,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     annotated_output=action_annotated_path,
                     use_person_detection=True,
                     max_people=2,
-                    include_model_type=False  # ← CRITICAL: Use old 5-element format
+                    include_model_type=False
                 )
 
                 check_cancellation(cancel_flag, log, "action recognition processing")
@@ -1299,18 +1317,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 )
                 
                 # Add analysis parameters for future validation
-                analysis_data["analysis_parameters"] = {
-                    "highlight_objects": gui_config.get("highlight_objects", []),
-                    "interesting_actions": gui_config.get("interesting_actions", []),
-                    "transcript_model": gui_config.get("transcript_model", "medium"),
-                    "sample_rate": sample_rate,
-                    "search_keywords": SEARCH_KEYWORDS if keyword_segments_only else None,
-                    "keyword_segments_only": keyword_segments_only
-                }
+                analysis_data["analysis_parameters"] = analysis_params
                 
-                # Save to cache
+                # Save to cache with signature-based naming
                 cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
-                cache.save(processed_video_path, analysis_data, params=analysis_params)
+                cache.save(processed_video_path, analysis_data)
                 
                 if keyword_segments_only:
                     log(f"✅ Analysis results cached (keyword-filtered: {len(analysis_data['transcript']['segments'])} segments)")
@@ -2009,6 +2020,24 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             try:
                 from signal_timeline_viewer import show_timeline_viewer
                 log("🎨 Launching Signal Timeline Viewer...")
+                
+                # Create analysis_data if not already created for cache
+                if 'analysis_data' not in locals() or analysis_data is None:
+                    analysis_data = collect_analysis_data(
+                        video_path=processed_video_path,
+                        video_duration=video_duration,
+                        fps=fps,
+                        transcript_segments=transcript_segments,
+                        object_detections=object_detections,
+                        action_detections=action_detections,
+                        scenes=scenes,
+                        motion_events=motion_events,
+                        motion_peaks=motion_peaks,
+                        audio_peaks=audio_peaks,
+                        source_lang=SOURCE_LANG,
+                        waveform_data=waveform_data
+                    )
+                
                 # Launch in separate thread/process so it doesn't block
                 import threading
                 timeline_thread = threading.Thread(
