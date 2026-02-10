@@ -25,7 +25,12 @@ from PySide6.QtGui import (
     QLinearGradient, QRadialGradient, QCursor, QAction,
     QPainterPath, QFontMetrics, QDrag, QPixmap
 )
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimediaWidgets import QVideoWidget
 import subprocess
+
+# modules
+from video_ai_editor.video_preview import TimelineWithPreview
 
 
 class WaveformVisualizer:
@@ -2469,6 +2474,360 @@ class SignalTimelineWindow(QMainWindow):
             print(f"✅ Using cached waveform ({len(self.waveform)} points)")
             # Waveform is already passed to scene in init_ui()
 
+    def launch_preview(self):
+        """Launch video preview window"""
+        self.preview_window = TimelineWithPreview.launch_preview(self)
+
+    def closeEvent(self, event):
+        """Close preview when timeline closes"""
+        if hasattr(self, 'preview_window') and self.preview_window:
+            self.preview_window.close()
+        super().closeEvent(event)
+
+    def create_video_preview_dock(self):
+        """Create dock with video preview player using Qt's built-in player"""
+        from PySide6.QtCore import Qt, QUrl
+        from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+        from PySide6.QtMultimediaWidgets import QVideoWidget
+        
+        # Create the dock widget
+        dock = QDockWidget("Video Preview", self)
+        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        
+        # Create the main widget for the dock
+        preview_widget = QWidget()
+        layout = QVBoxLayout(preview_widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        
+        # Preview label
+        preview_label = QLabel("🎬 Video Preview")
+        preview_label.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        preview_label.setStyleSheet("color: #a0c0ff; padding: 4px;")
+        layout.addWidget(preview_label)
+        
+        # Create video widget
+        self.video_widget = QVideoWidget()
+        self.video_widget.setMinimumSize(400, 300)
+        self.video_widget.setStyleSheet("""
+            QVideoWidget {
+                background-color: black;
+                border: 2px solid #3a3a5a;
+                border-radius: 6px;
+            }
+        """)
+        layout.addWidget(self.video_widget)
+        
+        # Create media player
+        self.video_player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.video_player.setAudioOutput(self.audio_output)
+        self.video_player.setVideoOutput(self.video_widget)
+        
+        # Load the video
+        video_url = QUrl.fromLocalFile(self.video_path)
+        self.video_player.setSource(video_url)
+        
+        # Create controls widget
+        controls_widget = QWidget()
+        controls_layout = QHBoxLayout(controls_widget)
+        controls_layout.setContentsMargins(0, 8, 0, 0)
+        
+        # Play/Pause button
+        self.play_btn = QPushButton("▶ Play")
+        self.play_btn.clicked.connect(self.toggle_video_playback)
+        self.play_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3a5fcd;
+                color: white;
+                font-weight: bold;
+                padding: 8px 16px;
+                border-radius: 4px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #4a6fdd;
+            }
+        """)
+        controls_layout.addWidget(self.play_btn)
+        
+        # Time slider
+        self.time_slider = QSlider(Qt.Horizontal)
+        self.time_slider.setRange(0, 100)
+        self.time_slider.sliderMoved.connect(self.seek_video)
+        controls_layout.addWidget(self.time_slider)
+        
+        # Time label
+        self.time_label = QLabel("00:00 / 00:00")
+        self.time_label.setStyleSheet("""
+            QLabel {
+                color: #a0ffa0;
+                font-family: 'Consolas', monospace;
+                font-weight: bold;
+                padding: 8px;
+                background-color: #1a1a2a;
+                border-radius: 4px;
+                min-width: 120px;
+                qproperty-alignment: AlignCenter;
+            }
+        """)
+        controls_layout.addWidget(self.time_label)
+        
+        controls_layout.addStretch()
+        
+        # Volume slider
+        volume_layout = QHBoxLayout()
+        volume_layout.addWidget(QLabel("🔊"))
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(80)
+        self.volume_slider.valueChanged.connect(self.set_volume)
+        self.volume_slider.setFixedWidth(80)
+        volume_layout.addWidget(self.volume_slider)
+        controls_layout.addLayout(volume_layout)
+        
+        # Add controls to main layout
+        layout.addWidget(controls_widget)
+        
+        # Connect video player signals
+        self.video_player.durationChanged.connect(self.update_video_duration)
+        self.video_player.positionChanged.connect(self.update_video_position)
+        self.video_player.playbackStateChanged.connect(self.update_play_button)
+        
+        # Set initial volume
+        self.audio_output.setVolume(0.8)
+        
+        dock.setWidget(preview_widget)
+        return dock
+
+    def toggle_video_playback(self):
+        """Toggle video playback in the preview"""
+        if self.video_player.playbackState() == QMediaPlayer.PlayingState:
+            self.video_player.pause()
+            self.play_btn.setText("▶ Play")
+        else:
+            self.video_player.play()
+            self.play_btn.setText("⏸ Pause")
+
+    def seek_video(self, position):
+        """Seek video to specific position"""
+        if self.video_player.duration() > 0:
+            new_position = (position / 100.0) * self.video_player.duration()
+            self.video_player.setPosition(int(new_position))
+
+    def set_volume(self, value):
+        """Set video volume"""
+        self.audio_output.setVolume(value / 100.0)
+
+    def update_video_duration(self, duration):
+        """Update video duration display"""
+        if duration > 0:
+            self.time_slider.setRange(0, 100)
+            total_seconds = duration // 1000
+            mins = total_seconds // 60
+            secs = total_seconds % 60
+            self.total_duration_str = f"{mins:02d}:{secs:02d}"
+            self.update_time_display(self.video_player.position())
+
+    def update_video_position(self, position):
+        """Update video position display"""
+        if self.video_player.duration() > 0:
+            # Update slider
+            percent = (position / self.video_player.duration()) * 100
+            self.time_slider.blockSignals(True)
+            self.time_slider.setValue(int(percent))
+            self.time_slider.blockSignals(False)
+            
+            # Update time label
+            self.update_time_display(position)
+            
+            # Sync with timeline if playing
+            if self.video_player.playbackState() == QMediaPlayer.PlayingState:
+                self.current_time = position / 1000.0
+                self.signal_scene.set_current_time(self.current_time)
+
+    def update_time_display(self, position):
+        """Update the time display label"""
+        current_seconds = position // 1000
+        mins = current_seconds // 60
+        secs = current_seconds % 60
+        current_time_str = f"{mins:02d}:{secs:02d}"
+        
+        if hasattr(self, 'total_duration_str'):
+            self.time_label.setText(f"{current_time_str} / {self.total_duration_str}")
+        else:
+            self.time_label.setText(f"{current_time_str}")
+
+    def update_play_button(self, state):
+        """Update play button based on playback state"""
+        if state == QMediaPlayer.PlayingState:
+            self.play_btn.setText("⏸ Pause")
+        else:
+            self.play_btn.setText("▶ Play")
+
+    def update_preview_time_label(self):
+        """Update the time label in preview"""
+        if hasattr(self, 'preview_time_label'):
+            current_mins = int(self.current_time // 60)
+            current_secs = int(self.current_time % 60)
+            total_mins = int(self.video_duration // 60)
+            total_secs = int(self.video_duration % 60)
+            self.preview_time_label.setText(f"{current_mins:02d}:{current_secs:02d} / {total_mins:02d}:{total_secs:02d}")
+
+
+    def simulate_playback(self):
+        """Simulate video playback progress"""
+        if hasattr(self, 'preview_playing') and self.preview_playing:
+            # Increment time
+            self.current_time += 0.1  # 100ms increments
+            
+            # Check if we reached the end
+            if self.current_time >= self.video_duration:
+                self.current_time = 0  # Loop back to start
+            
+            # Update timeline
+            self.signal_scene.set_current_time(self.current_time)
+            
+            # Update preview display
+            if hasattr(self, 'video_display'):
+                self.video_display.setText(f"▶ Playing at {self.current_time:.1f}s")
+            
+            # Update time label
+            self.update_preview_time_label()
+
+    def toggle_preview_playback(self):
+        """Start external player but show status in preview"""
+        if not hasattr(self, 'preview_playing'):
+            self.preview_playing = False
+        
+        if not self.preview_playing:
+            # Start external player
+            self.play_video_time(self.current_time)  # This opens external player
+            
+            # Mark as playing in preview
+            self.preview_playing = True
+            self.preview_play_btn.setText("⏸ Pause")
+            
+            # Show status in preview window
+            if hasattr(self, 'video_display'):
+                self.video_display.setText(f"▶ Playing in external player\nTime: {self.current_time:.1f}s")
+                self.video_display.setStyleSheet("""
+                    QLabel {
+                        background-color: #1a3a2a;
+                        color: #a0ffa0;
+                        border: 2px solid #4a7a5a;
+                        border-radius: 6px;
+                        font-size: 14px;
+                        padding: 20px;
+                    }
+                """)
+            
+            self.statusBar().showMessage(f"▶ Playing in external player at {self.current_time:.1f}s", 2000)
+        else:
+            # Can't actually pause external player, just update UI
+            self.preview_playing = False
+            self.preview_play_btn.setText("▶ Play")
+            
+            if hasattr(self, 'video_display'):
+                self.video_display.setText(f"⏸ Click to play\nLast time: {self.current_time:.1f}s")
+                self.video_display.setStyleSheet("""
+                    QLabel {
+                        background-color: #0a0a14;
+                        color: #c0d0ff;
+                        border: 2px solid #3a3a5a;
+                        border-radius: 6px;
+                        font-size: 14px;
+                        padding: 20px;
+                    }
+                """)
+            
+            self.statusBar().showMessage("⏸ Preview paused", 2000)
+
+    def update_preview_display_playing(self):
+        """Update display to show playing state"""
+        if hasattr(self, 'video_display'):
+            self.video_display.setText(f"▶ Playing at {self.current_time:.1f}s")
+            self.video_display.setStyleSheet("""
+                QLabel {
+                    background-color: #1a3a2a;
+                    color: #a0ffa0;
+                    border: 2px solid #4a7a5a;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    padding: 20px;
+                }
+            """)
+
+    def update_preview_display_paused(self):
+        """Update display to show paused state"""
+        if hasattr(self, 'video_display'):
+            self.video_display.setText(f"⏸ Paused at {self.current_time:.1f}s")
+            self.video_display.setStyleSheet("""
+                QLabel {
+                    background-color: #0a0a14;
+                    color: #c0d0ff;
+                    border: 2px solid #3a3a5a;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    padding: 20px;
+                }
+            """)
+
+    def update_preview_display(self):
+        """Update preview display during playback"""
+        if hasattr(self, 'preview_playing') and self.preview_playing:
+            # Simulate time progression (if using external player, this won't be accurate)
+            # For now, just show that we're playing
+            pass
+
+    def toggle_ai_overlay_preview(self, state):
+        """Toggle AI overlay in preview"""
+        from PySide6.QtCore import Qt
+        
+        if state == Qt.Checked:
+            self.statusBar().showMessage("AI Overlays: ON (requires annotated video)", 2000)
+        else:
+            self.statusBar().showMessage("AI Overlays: OFF", 2000)
+        
+        # Update the display based on overlay state
+        self.update_preview_display_based_on_state()
+
+    def update_preview_display_based_on_state(self):
+        """Update preview display based on current state"""
+        if not hasattr(self, 'video_display'):
+            return
+        
+        if hasattr(self, 'preview_playing') and self.preview_playing:
+            state_text = "Playing"
+            bg_color = "#1a3a2a"
+            text_color = "#a0ffa0"
+            border_color = "#4a7a5a"
+        else:
+            state_text = "Paused"
+            bg_color = "#0a0a14"
+            text_color = "#c0d0ff"
+            border_color = "#3a3a5a"
+        
+        if hasattr(self, 'preview_overlay_toggle') and self.preview_overlay_toggle.isChecked():
+            overlay_text = "\nAI Overlays: ON"
+            bg_color = "#2a1a3a"  # Purple for AI mode
+            text_color = "#ffa0ff"
+            border_color = "#7a4a7a"
+        else:
+            overlay_text = "\nAI Overlays: OFF"
+        
+        self.video_display.setText(f"{state_text} at {self.current_time:.1f}s{overlay_text}")
+        self.video_display.setStyleSheet(f"""
+            QLabel {{
+                background-color: {bg_color};
+                color: {text_color};
+                border: 2px solid {border_color};
+                border-radius: 6px;
+                font-size: 14px;
+                padding: 20px;
+            }}
+        """)
+
     def update_waveform_checkbox_state(self):
         """Enable/disable + sync the waveform checkbox with actual waveform availability."""
         if not hasattr(self, "waveform_checkbox"):
@@ -2752,7 +3111,16 @@ class SignalTimelineWindow(QMainWindow):
         # Add controls panel
         controls_dock = self.create_controls_dock()
         self.addDockWidget(Qt.RightDockWidgetArea, controls_dock)
-        
+
+        # 🎬 ADD VIDEO PREVIEW DOCK
+        try:
+            preview_dock = self.create_video_preview_dock()
+            self.addDockWidget(Qt.LeftDockWidgetArea, preview_dock)
+        except Exception as e:
+            print(f"⚠️ Could not create preview dock: {e}")
+            # Continue without preview
+
+
         # Apply dark theme
         self.apply_dark_theme()
         
@@ -3209,9 +3577,14 @@ class SignalTimelineWindow(QMainWindow):
         """Handle timeline click"""
         self.current_time = max(0, min(self.video_duration, time))
         
-        # Update signal scene - ensure it stores the time
+        # Update signal scene
         self.signal_scene.current_time_seconds = self.current_time
         self.signal_scene.set_current_time(self.current_time)
+        
+        # Seek video player to this time
+        if hasattr(self, 'video_player'):
+            milliseconds = int(self.current_time * 1000)
+            self.video_player.setPosition(milliseconds)
         
         # Update label
         minutes = int(self.current_time // 60)
@@ -3437,57 +3810,54 @@ class SignalTimelineWindow(QMainWindow):
     
     @Slot()
     def play_video_at_current_time(self):
-        """Open video at the selected timestamp with exact time"""
+        """Play video at current time IN PREVIEW WINDOW"""
         if not hasattr(self, 'current_time') or self.current_time < 0:
             self.statusBar().showMessage("⚠️ Click timeline to select a timestamp first", 2000)
             return
         
+        # Play in the preview window
         self.play_video_time(self.current_time)
-    
+
+        
+        # Seek to current time
+        milliseconds = int(self.current_time * 1000)
+        self.video_player.setPosition(milliseconds)
+        
+        # Play the video
+        self.video_player.play()
+        self.play_btn.setText("⏸ Pause")
+        
+        self.statusBar().showMessage(f"▶ Playing at {self.current_time:.1f}s", 2000)
+
+
     def play_video_clip(self, start_time, end_time):
-        """Play a specific clip"""
+        """Play a specific clip in the preview"""
         duration = end_time - start_time
         self.statusBar().showMessage(f"Playing clip: {start_time:.1f}s for {duration:.1f}s", 3000)
         
-        # Play from start_time
-        self.play_video_time(start_time)
-    
+        # Seek to start time
+        milliseconds = int(start_time * 1000)
+        self.video_player.setPosition(milliseconds)
+        
+        # Play the video
+        self.video_player.play()
+        self.play_btn.setText("⏸ Pause")
+        
+        # Set up timer to stop at end time
+        if hasattr(self, 'clip_timer'):
+            self.clip_timer.stop()
+        
+        self.clip_timer = QTimer()
+        self.clip_timer.setSingleShot(True)
+        self.clip_timer.timeout.connect(lambda: self.video_player.pause())
+        self.clip_timer.start(int(duration * 1000))
+
     def play_video_time(self, time):
-        """Play video at specific time"""
-        exact_time = time
-        
-        # Try different players
-        players_to_try = [
-            ('mpv', ['mpv', f'--start={exact_time}', self.video_path]),
-            ('vlc', ['vlc', '--start-time', str(exact_time), self.video_path]),
-            ('ffplay', ['ffplay', '-ss', str(exact_time), '-autoexit', self.video_path]),
-        ]
-        
-        for player_name, command in players_to_try:
-            try:
-                # Check if player exists
-                if sys.platform == 'win32':
-                    check_cmd = ['where', player_name]
-                else:
-                    check_cmd = ['which', player_name]
-                
-                result = subprocess.run(check_cmd, capture_output=True)
-                if result.returncode == 0:
-                    # Launch player
-                    subprocess.Popen(
-                        command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                    )
-                    
-                    self.statusBar().showMessage(f"▶ Playing with {player_name} at {exact_time:.2f}s", 3000)
-                    return
-                    
-            except Exception as e:
-                continue
-        
-        self.statusBar().showMessage("⚠️ Install mpv, VLC, or ffplay for video playback", 4000)
+        """Play video at specific time in preview"""
+        # This replaces the external player call
+        self.current_time = time
+        self.play_video_at_current_time()
+
     
     def apply_dark_theme(self):
         """Apply modern dark theme"""
