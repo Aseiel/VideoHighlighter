@@ -12,6 +12,7 @@ from collections import Counter, deque
 from ultralytics import YOLO
 import concurrent.futures
 import os
+import gc  # Added for explicit garbage collection
 
 # =============================
 # Load labels - support both Kinetics-400 and custom models
@@ -151,8 +152,9 @@ class PersonTracker:
         return [(track_id, data['box']) for track_id, data in sorted_tracks]
     
     def reset(self):
-        self.tracks = {}
+        self.tracks.clear()
         self.next_id = 0
+        gc.collect()
 
 class SmartActionDetector:
     """Detects people most likely performing actions"""
@@ -327,6 +329,12 @@ class SmartActionDetector:
         area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
         union = area1 + area2 - intersection
         return intersection / union if union > 0 else 0.0
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.prev_frame_data = None
+        self.selection_history.clear()
+        gc.collect()
 
 def merge_boxes(boxes):
     if len(boxes) == 0:
@@ -369,7 +377,8 @@ class AsyncBatchedInferenceEngine:
 
     def wait_and_get(self, request):
         request.wait()
-        return request.get_tensor(self.output_layer).data
+        result = request.get_tensor(self.output_layer).data
+        return result
 
     def get_stats(self):
         elapsed = time.time() - self.start_time
@@ -379,12 +388,17 @@ class AsyncBatchedInferenceEngine:
             'elapsed_time': elapsed,
             'inference_fps': fps
         }
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.requests.clear()
+        gc.collect()
 
 # =============================
-# PARALLEL YOLO DETECTOR
+# PARALLEL YOLO DETECTOR - FIXED
 # =============================
 class ParallelYOLODetector:
-    """Parallel YOLO detection with frame skipping"""
+    """Parallel YOLO detection with frame skipping - MEMORY LEAK FIXED"""
     def __init__(self, model_name="yolo11n.pt", num_workers=1, skip_frames=2):
         self.model = YOLO(model_name)
         self.skip_frames = skip_frames
@@ -395,52 +409,89 @@ class ParallelYOLODetector:
         # Thread pool for async inference
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
         self.future_cache = {}
+        self._shutdown = False
     
     def detect_async(self, frame):
         """Run YOLO detection asynchronously with frame skipping"""
+        if self._shutdown:
+            return self.get_latest_detections()
+        
         self.frame_counter += 1
         
         # Skip frames if configured
         if self.skip_frames > 1 and self.frame_counter % self.skip_frames != 0:
-            with self.detection_lock:
-                return self.last_detections
+            return self.get_latest_detections()
+        
+        # Make a copy of the frame to avoid holding reference to original
+        frame_copy = frame.copy()
         
         # Submit async task
-        future = self.executor.submit(self._detect_sync, frame)
+        future = self.executor.submit(self._detect_sync, frame_copy)
         self.future_cache[self.frame_counter] = future
         
-        # Clean old futures
-        to_remove = [k for k in self.future_cache.keys() 
-                    if k < self.frame_counter - 5]
+        # Clean old futures more aggressively - keep only last 2 frames
+        to_remove = [k for k in list(self.future_cache.keys()) 
+                    if k < self.frame_counter - 2]
         for k in to_remove:
-            del self.future_cache[k]
+            old_future = self.future_cache.pop(k, None)
+            if old_future and not old_future.done():
+                old_future.cancel()
         
-        return future
+        # Trigger garbage collection every 100 frames
+        if self.frame_counter % 100 == 0:
+            gc.collect()
+        
+        return self.get_latest_detections()
     
     def _detect_sync(self, frame):
         """Synchronous YOLO detection"""
-        # Use fixed size for faster processing
-        results = self.model.predict(frame, conf=0.40, classes=[0], 
-                                    verbose=False, imgsz=640)
-        
-        boxes = []
-        for r in results:
-            for b in r.boxes:
-                x1, y1, x2, y2 = map(int, b.xyxy[0])
-                boxes.append((x1, y1, x2, y2))
-        
-        with self.detection_lock:
-            self.last_detections = boxes
-        
-        return boxes
+        try:
+            # Use fixed size for faster processing
+            results = self.model.predict(frame, conf=0.40, classes=[0], 
+                                        verbose=False, imgsz=640)
+            
+            boxes = []
+            for r in results:
+                for b in r.boxes:
+                    x1, y1, x2, y2 = map(int, b.xyxy[0])
+                    boxes.append((x1, y1, x2, y2))
+            
+            with self.detection_lock:
+                self.last_detections = boxes
+            
+            return boxes
+        except Exception as e:
+            print(f"YOLO detection error: {e}")
+            return []
+        finally:
+            # Explicitly delete frame to free memory
+            del frame
+            del results
     
     def get_latest_detections(self):
         """Get most recent detections without blocking"""
         with self.detection_lock:
-            return self.last_detections if self.last_detections else []
+            return self.last_detections.copy() if self.last_detections else []
     
     def shutdown(self):
-        self.executor.shutdown(wait=False)
+        """Properly shutdown executor and clean up"""
+        self._shutdown = True
+        
+        # Cancel all pending futures
+        for future in list(self.future_cache.values()):
+            if not future.done():
+                future.cancel()
+        self.future_cache.clear()
+        
+        # Shutdown executor and wait for completion with timeout
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        
+        # Clear last detections
+        with self.detection_lock:
+            self.last_detections = None
+        
+        # Force garbage collection
+        gc.collect()
 
 # =============================
 # Load models - DUAL MODEL SUPPORT
@@ -524,25 +575,28 @@ def load_models(device="AUTO"):
 # =============================
 def preprocess_frame(frame, input_shape, roi=None):
     """Preprocess frame, optionally cropping to ROI first with optimizations"""
+    # Make a copy first to avoid modifying original
+    frame_to_process = frame
+    
     if roi is not None:
         x1, y1, x2, y2 = roi
-        frame = frame[y1:y2, x1:x2]
+        frame_to_process = frame[y1:y2, x1:x2].copy()
     
     N, C, H, W = input_shape
-    h, w = frame.shape[:2]
+    h, w = frame_to_process.shape[:2]
     
     # Auto-downscale for very high resolution frames
     if h > 1080 or w > 1920:
         scale_factor = min(720 / h, 1280 / w)
         new_h, new_w = int(h * scale_factor), int(w * scale_factor)
-        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        h, w = frame.shape[:2]
+        frame_to_process = cv2.resize(frame_to_process, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        h, w = frame_to_process.shape[:2]
     
     scale = min(W / w, H / h)
     new_w, new_h = int(w * scale), int(h * scale)
     
     # Use faster interpolation for resize
-    frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    frame_resized = cv2.resize(frame_to_process, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
     
     pad_top = (H - new_h) // 2
     pad_bottom = H - new_h - pad_top
@@ -554,7 +608,15 @@ def preprocess_frame(frame, input_shape, roi=None):
     
     # Use memory-efficient conversion
     frame_padded = np.ascontiguousarray(frame_padded.transpose(2, 0, 1))
-    return np.expand_dims(frame_padded, axis=0).astype(np.float32)
+    result = np.expand_dims(frame_padded, axis=0).astype(np.float32)
+    
+    # Clean up intermediate arrays
+    del frame_resized
+    del frame_padded
+    if roi is not None:
+        del frame_to_process
+    
+    return result
 
 # =============================
 # Draw visualization with bounding boxes
@@ -780,200 +842,72 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     expected_processed_frames = total_frames // sample_rate
     
     video_writer = None
-    if draw_bboxes and annotated_output:
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        # Auto-downscale output for high-res videos
-        if frame_height > 1080 and downscale_factor < 1.0:
-            frame_width = int(frame_width * downscale_factor)
-            frame_height = int(frame_height * downscale_factor)
-            print(f"📏 Downscaling output to {frame_width}x{frame_height}")
-        
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(annotated_output, fourcc, fps, (frame_width, frame_height))
-        print(f"🎨 Creating annotated video: {annotated_output}")
+    try:
+        if draw_bboxes and annotated_output:
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Auto-downscale output for high-res videos
+            if frame_height > 1080 and downscale_factor < 1.0:
+                frame_width = int(frame_width * downscale_factor)
+                frame_height = int(frame_height * downscale_factor)
+                print(f"📏 Downscaling output to {frame_width}x{frame_height}")
+            
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video_writer = cv2.VideoWriter(annotated_output, fourcc, fps, (frame_width, frame_height))
+            print(f"🎨 Creating annotated video: {annotated_output}")
 
-    sequence_buffer = []
-    all_actions = []
-    prev_req = None
-    prev_timestamp_secs = None
-    prev_frame_id = None
-    frame_id = 0
-    processed_frames = 0
-    detection_count = 0
-    
-    recent_detections = deque(maxlen=SEQUENCE_LENGTH)
-    current_tracked_people = []
-    current_action_roi = None
-    current_focus_region = "full_body"
+        sequence_buffer = []
+        all_actions = []
+        prev_req = None
+        prev_timestamp_secs = None
+        prev_frame_id = None
+        frame_id = 0
+        processed_frames = 0
+        detection_count = 0
+        
+        recent_detections = deque(maxlen=SEQUENCE_LENGTH)
+        current_tracked_people = []
+        current_action_roi = None
+        current_focus_region = "full_body"
 
-    start_time = time.time()
-    last_gui_update = start_time
-    
-    # Performance counters
-    yolo_time = 0
-    preprocess_time = 0
-    inference_time = 0
-    draw_time = 0
-    last_perf_print = start_time
-    
-    # =============================================
-    # WARM-UP PHASE: Pre-fill sequence buffer
-    # =============================================
-    print(f"\n🔥 WARM-UP: Pre-filling sequence buffer with {warm_up_seconds} seconds of frames...")
-    warm_up_frames_needed = min(int(fps * warm_up_seconds), SEQUENCE_LENGTH)
-    warm_up_frame_count = 0
-    
-    while warm_up_frame_count < warm_up_frames_needed:
-        ret, warm_up_frame = cap.read()
-        if not ret:
-            break
+        start_time = time.time()
+        last_gui_update = start_time
         
-        # Process person detection during warm-up (for video annotation)
-        if use_person_detection and yolo_detector:
-            yolo_start = time.time()
-            
-            # Auto-downscale processing frame for faster YOLO
-            h, w = warm_up_frame.shape[:2]
-            if h > 1080 or w > 1920:
-                processing_frame = cv2.resize(
-                    warm_up_frame, 
-                    (int(w * downscale_factor), int(h * downscale_factor)),
-                    interpolation=cv2.INTER_AREA
-                )
-            else:
-                processing_frame = warm_up_frame.copy()
-            
-            frame_rgb = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2RGB)
-            
-            # Async YOLO detection
-            yolo_detector.detect_async(frame_rgb)
-            
-            # Get latest detections (non-blocking)
-            raw_boxes = yolo_detector.get_latest_detections()
-            
-            if raw_boxes:
-                # Scale boxes back to original size if downscaled
-                if processing_frame.shape != warm_up_frame.shape:
-                    scale_h = warm_up_frame.shape[0] / processing_frame.shape[0]
-                    scale_w = warm_up_frame.shape[1] / processing_frame.shape[1]
-                    raw_boxes = [
-                        (int(x1 * scale_w), int(y1 * scale_h), 
-                         int(x2 * scale_w), int(y2 * scale_h))
-                        for (x1, y1, x2, y2) in raw_boxes
-                    ]
-                
-                # Process with action detector
-                action_boxes = action_detector.detect_from_boxes(
-                    frame_rgb, raw_boxes, max_people=max_people
-                )
-                
-                # Track people
-                tracked = person_tracker.update(action_boxes)
-                current_tracked_people = tracked
-                
-                # Compute action ROI
-                current_action_roi = merge_boxes(action_boxes) if action_boxes else None
-            
-            yolo_time += time.time() - yolo_start
+        # Performance counters
+        yolo_time = 0
+        preprocess_time = 0
+        inference_time = 0
+        draw_time = 0
+        last_perf_print = start_time
+        last_gc_time = start_time
         
-        # Preprocess and infer for warm-up frames (to fill buffer)
-        preprocess_start = time.time()
-        processed_frame = preprocess_frame(warm_up_frame, encoder_input.shape, 
-                                         roi=current_action_roi if use_person_detection else None)
-        preprocess_time += time.time() - preprocess_start
+        # =============================================
+        # WARM-UP PHASE: Pre-fill sequence buffer
+        # =============================================
+        print(f"\n🔥 WARM-UP: Pre-filling sequence buffer with {warm_up_seconds} seconds of frames...")
+        warm_up_frames_needed = min(int(fps * warm_up_seconds), SEQUENCE_LENGTH)
+        warm_up_frame_count = 0
         
-        inference_start = time.time()
-        req = encoder_engine.infer_async(processed_frame)
-        features = encoder_engine.wait_and_get(req)[0]
-        features = np.reshape(features, (-1,))
-        sequence_buffer.append(features)
-        inference_time += time.time() - inference_start
-        
-        # Write annotated frame for warm-up period
-        if video_writer and draw_bboxes:
-            draw_start = time.time()
-            
-            # During warm-up, show "Initializing..." message
-            warm_up_annotated = warm_up_frame.copy()
-            h, w = warm_up_annotated.shape[:2]
-            
-            # Draw status message
-            status_text = f"Initializing... ({warm_up_frame_count+1}/{warm_up_frames_needed})"
-            text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
-            text_x = (w - text_size[0]) // 2
-            text_y = (h + text_size[1]) // 2
-            
-            cv2.putText(warm_up_annotated, status_text, (text_x, text_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-            
-            # Draw bounding boxes if detected
-            if use_person_detection:
-                warm_up_annotated = draw_detections_with_actions(
-                    warm_up_annotated, 
-                    current_tracked_people,
-                    current_action_roi,
-                    [],  # No actions during warm-up
-                    current_focus_region
-                )
-            
-            # Resize if output is downscaled
-            if warm_up_annotated.shape[0] != frame_height or warm_up_annotated.shape[1] != frame_width:
-                warm_up_annotated = cv2.resize(
-                    warm_up_annotated, 
-                    (frame_width, frame_height),
-                    interpolation=cv2.INTER_LINEAR
-                )
-            
-            video_writer.write(warm_up_annotated)
-            draw_time += time.time() - draw_start
-        
-        warm_up_frame_count += 1
-        frame_id += 1
-        
-        # Progress update
-        if progress_callback and time.time() - last_gui_update > 0.1:
-            progress_msg = f"Warm-up: {warm_up_frame_count}/{warm_up_frames_needed} frames"
-            progress_callback(warm_up_frame_count, warm_up_frames_needed, "Warm-up", progress_msg)
-            last_gui_update = time.time()
-    
-    print(f"✅ Warm-up complete: Buffer has {len(sequence_buffer)}/{SEQUENCE_LENGTH} frames")
-    
-    # =============================================
-    # MAIN PROCESSING LOOP
-    # =============================================
-    with open(log_file, mode="w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp_mmss", "frame_id", "action_id", "action_name", "score", "timestamp_seconds", "model_type"])
-        
-        # Continue processing from where warm-up left off
-        while True:
-            if cancel_flag and cancel_flag.is_set():
-                print("⚠️ Action detection canceled by user.")
-                break
-
-            ret, frame = cap.read()
+        while warm_up_frame_count < warm_up_frames_needed:
+            ret, warm_up_frame = cap.read()
             if not ret:
                 break
             
-            original_frame = frame.copy()
-            frame_id += 1
-            
-            # Process person detection with parallel YOLO
+            # Process person detection during warm-up (for video annotation)
             if use_person_detection and yolo_detector:
                 yolo_start = time.time()
                 
                 # Auto-downscale processing frame for faster YOLO
-                h, w = frame.shape[:2]
+                h, w = warm_up_frame.shape[:2]
                 if h > 1080 or w > 1920:
                     processing_frame = cv2.resize(
-                        frame, 
+                        warm_up_frame, 
                         (int(w * downscale_factor), int(h * downscale_factor)),
                         interpolation=cv2.INTER_AREA
                     )
                 else:
-                    processing_frame = frame.copy()
+                    processing_frame = warm_up_frame.copy()
                 
                 frame_rgb = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2RGB)
                 
@@ -985,9 +919,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 
                 if raw_boxes:
                     # Scale boxes back to original size if downscaled
-                    if processing_frame.shape != frame.shape:
-                        scale_h = frame.shape[0] / processing_frame.shape[0]
-                        scale_w = frame.shape[1] / processing_frame.shape[1]
+                    if processing_frame.shape != warm_up_frame.shape:
+                        scale_h = warm_up_frame.shape[0] / processing_frame.shape[0]
+                        scale_w = warm_up_frame.shape[1] / processing_frame.shape[1]
                         raw_boxes = [
                             (int(x1 * scale_w), int(y1 * scale_h), 
                              int(x2 * scale_w), int(y2 * scale_h))
@@ -1006,284 +940,481 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     # Compute action ROI
                     current_action_roi = merge_boxes(action_boxes) if action_boxes else None
                 
+                # Clean up
+                del processing_frame
+                del frame_rgb
                 yolo_time += time.time() - yolo_start
             
-            # Write annotated frame
+            # Preprocess and infer for warm-up frames (to fill buffer)
+            preprocess_start = time.time()
+            processed_frame = preprocess_frame(warm_up_frame, encoder_input.shape, 
+                                             roi=current_action_roi if use_person_detection else None)
+            preprocess_time += time.time() - preprocess_start
+            
+            inference_start = time.time()
+            req = encoder_engine.infer_async(processed_frame)
+            features = encoder_engine.wait_and_get(req)[0]
+            features = np.reshape(features, (-1,))
+            sequence_buffer.append(features)
+            inference_time += time.time() - inference_start
+            
+            # Clean up
+            del processed_frame
+            del features
+            
+            # Write annotated frame for warm-up period
             if video_writer and draw_bboxes:
                 draw_start = time.time()
                 
-                # Get current timestamp for display
-                current_timestamp_secs = frame_id / fps
-                mins, secs = divmod(int(current_timestamp_secs), 60)
-                timestamp_str = f"{mins:02d}:{secs:02d}"
+                # During warm-up, show "Initializing..." message
+                warm_up_annotated = warm_up_frame.copy()
+                h, w = warm_up_annotated.shape[:2]
                 
-                # Draw detections
-                annotated = draw_detections_with_actions(
-                    original_frame, 
-                    current_tracked_people,
-                    current_action_roi,
-                    list(recent_detections) if len(sequence_buffer) >= SEQUENCE_LENGTH else [],
-                    current_focus_region
-                )
+                # Draw status message
+                status_text = f"Initializing... ({warm_up_frame_count+1}/{warm_up_frames_needed})"
+                text_size = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
+                text_x = (w - text_size[0]) // 2
+                text_y = (h + text_size[1]) // 2
                 
-                # Add timestamp overlay
-                cv2.putText(annotated, timestamp_str, (10, 30),
+                cv2.putText(warm_up_annotated, status_text, (text_x, text_y),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
                 
-                # Add status indicator if buffer not full
-                if len(sequence_buffer) < SEQUENCE_LENGTH:
-                    buffer_status = f"Buffer: {len(sequence_buffer)}/{SEQUENCE_LENGTH}"
-                    cv2.putText(annotated, buffer_status, (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                # Draw bounding boxes if detected
+                if use_person_detection:
+                    warm_up_annotated = draw_detections_with_actions(
+                        warm_up_annotated, 
+                        current_tracked_people,
+                        current_action_roi,
+                        [],  # No actions during warm-up
+                        current_focus_region
+                    )
                 
                 # Resize if output is downscaled
-                if annotated.shape[0] != frame_height or annotated.shape[1] != frame_width:
-                    annotated = cv2.resize(
-                        annotated, 
+                if warm_up_annotated.shape[0] != frame_height or warm_up_annotated.shape[1] != frame_width:
+                    warm_up_annotated = cv2.resize(
+                        warm_up_annotated, 
                         (frame_width, frame_height),
                         interpolation=cv2.INTER_LINEAR
                     )
                 
-                video_writer.write(annotated)
+                video_writer.write(warm_up_annotated)
+                del warm_up_annotated
                 draw_time += time.time() - draw_start
             
-            # Process frames for action recognition (with sampling)
-            if frame_id % sample_rate == 0:
-                timestamp_secs = frame_id / fps
-                mins, secs = divmod(int(timestamp_secs), 60)
-                timestamp_str = f"{mins:02d}:{secs:02d}"
+            warm_up_frame_count += 1
+            frame_id += 1
+            
+            # Progress update
+            if progress_callback and time.time() - last_gui_update > 0.1:
+                progress_msg = f"Warm-up: {warm_up_frame_count}/{warm_up_frames_needed} frames"
+                progress_callback(warm_up_frame_count, warm_up_frames_needed, "Warm-up", progress_msg)
+                last_gui_update = time.time()
+        
+        print(f"✅ Warm-up complete: Buffer has {len(sequence_buffer)}/{SEQUENCE_LENGTH} frames")
+        
+        # =============================================
+        # MAIN PROCESSING LOOP
+        # =============================================
+        with open(log_file, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp_mmss", "frame_id", "action_id", "action_name", "score", "timestamp_seconds", "model_type"])
+            
+            # Continue processing from where warm-up left off
+            while True:
+                if cancel_flag and cancel_flag.is_set():
+                    print("⚠️ Action detection canceled by user.")
+                    break
 
-                # Preprocess with ROI if available
-                preprocess_start = time.time()
-                processed_frame = preprocess_frame(frame, encoder_input.shape, 
-                                                 roi=current_action_roi if use_person_detection else None)
-                preprocess_time += time.time() - preprocess_start
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 
-                inference_start = time.time()
-                req = encoder_engine.infer_async(processed_frame)
-                inference_time += time.time() - inference_start
-
-                # If we have a previous request and enough frames in buffer
-                if prev_req is not None and len(sequence_buffer) >= SEQUENCE_LENGTH:
-                    features = encoder_engine.wait_and_get(prev_req)[0]
-                    features = np.reshape(features, (-1,))
-                    sequence_buffer.append(features)
+                original_frame = frame.copy()
+                frame_id += 1
+                
+                # Process person detection with parallel YOLO
+                if use_person_detection and yolo_detector:
+                    yolo_start = time.time()
                     
-                    # Keep only the most recent SEQUENCE_LENGTH frames
-                    if len(sequence_buffer) > SEQUENCE_LENGTH:
-                        sequence_buffer.pop(0)
+                    # Auto-downscale processing frame for faster YOLO
+                    h, w = frame.shape[:2]
+                    if h > 1080 or w > 1920:
+                        processing_frame = cv2.resize(
+                            frame, 
+                            (int(w * downscale_factor), int(h * downscale_factor)),
+                            interpolation=cv2.INTER_AREA
+                        )
+                    else:
+                        processing_frame = frame.copy()
                     
-                    # Use the complete sequence for inference
-                    if len(sequence_buffer) == SEQUENCE_LENGTH:
-                        sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
+                    frame_rgb = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Async YOLO detection
+                    yolo_detector.detect_async(frame_rgb)
+                    
+                    # Get latest detections (non-blocking)
+                    raw_boxes = yolo_detector.get_latest_detections()
+                    
+                    if raw_boxes:
+                        # Scale boxes back to original size if downscaled
+                        if processing_frame.shape != frame.shape:
+                            scale_h = frame.shape[0] / processing_frame.shape[0]
+                            scale_w = frame.shape[1] / processing_frame.shape[1]
+                            raw_boxes = [
+                                (int(x1 * scale_w), int(y1 * scale_h), 
+                                 int(x2 * scale_w), int(y2 * scale_h))
+                                for (x1, y1, x2, y2) in raw_boxes
+                            ]
                         
-                        # Clear recent detections for this frame
-                        frame_detections = []
+                        # Process with action detector
+                        action_boxes = action_detector.detect_from_boxes(
+                            frame_rgb, raw_boxes, max_people=max_people
+                        )
+                        
+                        # Track people
+                        tracked = person_tracker.update(action_boxes)
+                        current_tracked_people = tracked
+                        
+                        # Compute action ROI
+                        current_action_roi = merge_boxes(action_boxes) if action_boxes else None
+                    
+                    # Clean up intermediate frames
+                    del processing_frame
+                    del frame_rgb
+                    yolo_time += time.time() - yolo_start
+                
+                # Write annotated frame
+                if video_writer and draw_bboxes:
+                    draw_start = time.time()
+                    
+                    # Get current timestamp for display
+                    current_timestamp_secs = frame_id / fps
+                    mins, secs = divmod(int(current_timestamp_secs), 60)
+                    timestamp_str = f"{mins:02d}:{secs:02d}"
+                    
+                    # Draw detections
+                    annotated = draw_detections_with_actions(
+                        original_frame, 
+                        current_tracked_people,
+                        current_action_roi,
+                        list(recent_detections) if len(sequence_buffer) >= SEQUENCE_LENGTH else [],
+                        current_focus_region
+                    )
+                    
+                    # Add timestamp overlay
+                    cv2.putText(annotated, timestamp_str, (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                    
+                    # Add status indicator if buffer not full
+                    if len(sequence_buffer) < SEQUENCE_LENGTH:
+                        buffer_status = f"Buffer: {len(sequence_buffer)}/{SEQUENCE_LENGTH}"
+                        cv2.putText(annotated, buffer_status, (10, 60),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                    
+                    # Resize if output is downscaled
+                    if annotated.shape[0] != frame_height or annotated.shape[1] != frame_width:
+                        annotated = cv2.resize(
+                            annotated, 
+                            (frame_width, frame_height),
+                            interpolation=cv2.INTER_LINEAR
+                        )
+                    
+                    video_writer.write(annotated)
+                    del annotated
+                    draw_time += time.time() - draw_start
+                
+                # Process frames for action recognition (with sampling)
+                if frame_id % sample_rate == 0:
+                    timestamp_secs = frame_id / fps
+                    mins, secs = divmod(int(timestamp_secs), 60)
+                    timestamp_str = f"{mins:02d}:{secs:02d}"
 
-                        # Use prev_timestamp_secs and prev_frame_id for logging
-                        use_timestamp_secs = prev_timestamp_secs
-                        use_frame_id = prev_frame_id
-                        use_mins, use_secs = divmod(int(use_timestamp_secs), 60)
-                        use_timestamp_str = f"{use_mins:02d}:{use_secs:02d}"
+                    # Preprocess with ROI if available
+                    preprocess_start = time.time()
+                    processed_frame = preprocess_frame(frame, encoder_input.shape, 
+                                                     roi=current_action_roi if use_person_detection else None)
+                    preprocess_time += time.time() - preprocess_start
+                    
+                    inference_start = time.time()
+                    req = encoder_engine.infer_async(processed_frame)
+                    inference_time += time.time() - inference_start
+                    
+                    # Clean up processed frame immediately
+                    del processed_frame
 
-                        if interesting_actions_set:
-                            # Check only the requested actions using the appropriate model
-                            for action_name in interesting_actions_set:
-                                action_id, model_type = action_to_model[action_name.lower()]
+                    # If we have a previous request and enough frames in buffer
+                    if prev_req is not None and len(sequence_buffer) >= SEQUENCE_LENGTH:
+                        features = encoder_engine.wait_and_get(prev_req)[0]
+                        features = np.reshape(features, (-1,))
+                        sequence_buffer.append(features.copy())
+                        del features
+                        
+                        # Keep only the most recent SEQUENCE_LENGTH frames
+                        if len(sequence_buffer) > SEQUENCE_LENGTH:
+                            sequence_buffer.pop(0)
+                        
+                        # Use the complete sequence for inference
+                        if len(sequence_buffer) == SEQUENCE_LENGTH:
+                            sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
+                            
+                            # Clear recent detections for this frame
+                            frame_detections = []
+
+                            # Use prev_timestamp_secs and prev_frame_id for logging
+                            use_timestamp_secs = prev_timestamp_secs
+                            use_frame_id = prev_frame_id
+                            use_mins, use_secs = divmod(int(use_timestamp_secs), 60)
+                            use_timestamp_str = f"{use_mins:02d}:{use_secs:02d}"
+
+                            if interesting_actions_set:
+                                # Check only the requested actions using the appropriate model
+                                for action_name in interesting_actions_set:
+                                    action_id, model_type = action_to_model[action_name.lower()]
+                                    
+                                    # Get the appropriate model
+                                    model_data = models_info[model_type]
+                                    if model_data is None:
+                                        print(f"⚠️ Model '{model_type}' not available for action '{action_name}'")
+                                        continue
+                                    
+                                    # Run inference on the specific model
+                                    predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
+                                    probabilities = softmax(predictions)
+                                    
+                                    # Check if action_id is valid for this model
+                                    if action_id >= len(probabilities):
+                                        print(f"⚠️ Action ID {action_id} out of range for {model_type} model (size: {len(probabilities)})")
+                                        continue
+                                    
+                                    score = float(probabilities[action_id])
+                                    if score >= confidence_threshold:
+                                        writer.writerow([use_timestamp_str, use_frame_id, action_id, action_name, score, use_timestamp_secs, model_type])
+                                        
+                                        # Add to all_actions with or without model_type based on compatibility flag
+                                        if include_model_type:
+                                            all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name, model_type))
+                                        else:
+                                            all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name))
+                                        
+                                        frame_detections.append((action_name, score, model_type))
+                                        detection_count += 1
+                                        if debug:
+                                            print(f"{use_timestamp_str} -> {action_name} [{model_type}] (score:{score:.3f})")
+                                    
+                                    # Clean up
+                                    del predictions
+                                    del probabilities
+                            else:
+                                # Run inference on ALL available models and combine results
+                                all_probabilities = {}
                                 
-                                # Get the appropriate model
-                                model_data = models_info[model_type]
-                                if model_data is None:
-                                    print(f"⚠️ Model '{model_type}' not available for action '{action_name}'")
-                                    continue
+                                for model_type, model_data in models_info.items():
+                                    if model_data is None:
+                                        continue
+                                    
+                                    predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
+                                    probabilities = softmax(predictions)
+                                    
+                                    # Get top-k from this model
+                                    top_indices = np.argsort(probabilities)[-top_k:][::-1]
+                                    for idx in top_indices:
+                                        score = float(probabilities[idx])
+                                        if score >= confidence_threshold:
+                                            action_name = get_action_name(idx, model_type)
+                                            # Use a unique key combining action name and model type
+                                            key = (action_name, model_type)
+                                            all_probabilities[key] = (idx, score, action_name, model_type)
+                                    
+                                    # Clean up
+                                    del predictions
+                                    del probabilities
                                 
-                                # Run inference on the specific model
-                                predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
-                                probabilities = softmax(predictions)
+                                # Sort all results by score
+                                sorted_results = sorted(all_probabilities.values(), key=lambda x: x[1], reverse=True)
                                 
-                                # Check if action_id is valid for this model
-                                if action_id >= len(probabilities):
-                                    print(f"⚠️ Action ID {action_id} out of range for {model_type} model (size: {len(probabilities)})")
-                                    continue
-                                
-                                score = float(probabilities[action_id])
-                                if score >= confidence_threshold:
-                                    writer.writerow([use_timestamp_str, use_frame_id, action_id, action_name, score, use_timestamp_secs, model_type])
+                                # Take top-k overall
+                                for idx, score, action_name, model_type in sorted_results[:top_k]:
+                                    writer.writerow([use_timestamp_str, use_frame_id, idx, action_name, score, use_timestamp_secs, model_type])
                                     
                                     # Add to all_actions with or without model_type based on compatibility flag
                                     if include_model_type:
-                                        all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name, model_type))
+                                        all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name, model_type))
                                     else:
-                                        all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name))
+                                        all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name))
                                     
                                     frame_detections.append((action_name, score, model_type))
                                     detection_count += 1
                                     if debug:
                                         print(f"{use_timestamp_str} -> {action_name} [{model_type}] (score:{score:.3f})")
-                        else:
-                            # Run inference on ALL available models and combine results
-                            all_probabilities = {}
                             
-                            for model_type, model_data in models_info.items():
-                                if model_data is None:
-                                    continue
-                                
-                                predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
-                                probabilities = softmax(predictions)
-                                
-                                # Get top-k from this model
-                                top_indices = np.argsort(probabilities)[-top_k:][::-1]
-                                for idx in top_indices:
-                                    score = float(probabilities[idx])
-                                    if score >= confidence_threshold:
-                                        action_name = get_action_name(idx, model_type)
-                                        # Use a unique key combining action name and model type
-                                        key = (action_name, model_type)
-                                        all_probabilities[key] = (idx, score, action_name, model_type)
+                            # Update recent detections (sorted by score)
+                            if frame_detections:
+                                frame_detections.sort(key=lambda x: x[1], reverse=True)
+                                recent_detections.clear()
+                                recent_detections.extend(frame_detections[:3])
                             
-                            # Sort all results by score
-                            sorted_results = sorted(all_probabilities.values(), key=lambda x: x[1], reverse=True)
+                            # Clean up
+                            del sequence_array
+
+                    prev_req = req
+                    prev_timestamp_secs = timestamp_secs
+                    prev_frame_id = frame_id
+                    processed_frames += 1
+
+                # Clean up original frame
+                del original_frame
+                del frame
+                
+                # Periodic garbage collection (every 2 seconds)
+                current_time = time.time()
+                if current_time - last_gc_time > 2.0:
+                    gc.collect()
+                    last_gc_time = current_time
+                
+                # Print performance stats periodically
+                if current_time - last_perf_print > 5.0:
+                    elapsed = current_time - start_time
+                    total_elapsed = current_time - start_time
+                    print(f"\n📊 Progress: {frame_id}/{total_frames} frames "
+                          f"({frame_id/total_elapsed:.1f} fps) | "
+                          f"YOLO: {yolo_time:.1f}s | "
+                          f"Inference: {inference_time:.1f}s | "
+                          f"CPU cores: {os.cpu_count() if hasattr(os, 'cpu_count') else 'N/A'}")
+                    last_perf_print = current_time
+                
+                if progress_callback and (current_time - last_gui_update > 0.1):
+                    elapsed = current_time - start_time
+                    processing_fps = processed_frames / elapsed if elapsed > 0 else 0
+                    engine_stats = encoder_engine.get_stats()
+                    progress_msg = (f"Frame {processed_frames}/{expected_processed_frames} | "
+                                    f"Detections: {detection_count} | "
+                                    f"Processing: {processing_fps:.1f} FPS | "
+                                    f"Inference: {engine_stats['inference_fps']:.1f} FPS | "
+                                    f"Device: {actual_device}")
+                    progress_callback(processed_frames, expected_processed_frames, "Action Recognition", progress_msg)
+                    last_gui_update = current_time
+
+            # Flush last frame (similar logic as above)
+            if prev_req is not None:
+                features = encoder_engine.wait_and_get(prev_req)[0]
+                features = np.reshape(features, (-1,))
+                sequence_buffer.append(features.copy())
+                del features
+                
+                if len(sequence_buffer) > SEQUENCE_LENGTH:
+                    sequence_buffer.pop(0)
+
+                if len(sequence_buffer) == SEQUENCE_LENGTH:
+                    sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
+                    
+                    use_timestamp_secs = prev_timestamp_secs
+                    use_frame_id = prev_frame_id
+                    use_mins, use_secs = divmod(int(use_timestamp_secs), 60)
+                    use_timestamp_str = f"{use_mins:02d}:{use_secs:02d}"
+
+                    frame_detections = []
+                    if interesting_actions_set:
+                        for action_name in interesting_actions_set:
+                            action_id, model_type = action_to_model[action_name.lower()]
+                            model_data = models_info[model_type]
+                            if model_data is None:
+                                continue
                             
-                            # Take top-k overall
-                            for idx, score, action_name, model_type in sorted_results[:top_k]:
-                                writer.writerow([use_timestamp_str, use_frame_id, idx, action_name, score, use_timestamp_secs, model_type])
+                            predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
+                            probabilities = softmax(predictions)
+                            
+                            if action_id >= len(probabilities):
+                                continue
+                            
+                            score = float(probabilities[action_id])
+                            if score >= confidence_threshold:
+                                writer.writerow([use_timestamp_str, use_frame_id, action_id, action_name, score, use_timestamp_secs, model_type])
                                 
                                 # Add to all_actions with or without model_type based on compatibility flag
                                 if include_model_type:
-                                    all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name, model_type))
+                                    all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name, model_type))
                                 else:
-                                    all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name))
+                                    all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name))
                                 
                                 frame_detections.append((action_name, score, model_type))
                                 detection_count += 1
                                 if debug:
                                     print(f"{use_timestamp_str} -> {action_name} [{model_type}] (score:{score:.3f})")
+                            
+                            del predictions
+                            del probabilities
+                    else:
+                        all_probabilities = {}
+                        for model_type, model_data in models_info.items():
+                            if model_data is None:
+                                continue
+                            
+                            predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
+                            probabilities = softmax(predictions)
+                            
+                            top_indices = np.argsort(probabilities)[-top_k:][::-1]
+                            for idx in top_indices:
+                                score = float(probabilities[idx])
+                                if score >= confidence_threshold:
+                                    action_name = get_action_name(idx, model_type)
+                                    key = (action_name, model_type)
+                                    all_probabilities[key] = (idx, score, action_name, model_type)
+                            
+                            del predictions
+                            del probabilities
                         
-                        # Update recent detections (sorted by score)
-                        if frame_detections:
-                            frame_detections.sort(key=lambda x: x[1], reverse=True)
-                            recent_detections.clear()
-                            recent_detections.extend(frame_detections[:3])
-
-                prev_req = req
-                prev_timestamp_secs = timestamp_secs
-                prev_frame_id = frame_id
-                processed_frames += 1
-
-            # Print performance stats periodically
-            current_time = time.time()
-            if current_time - last_perf_print > 5.0:
-                elapsed = current_time - start_time
-                total_elapsed = current_time - start_time
-                print(f"\n📊 Progress: {frame_id}/{total_frames} frames "
-                      f"({frame_id/total_elapsed:.1f} fps) | "
-                      f"YOLO: {yolo_time:.1f}s | "
-                      f"Inference: {inference_time:.1f}s | "
-                      f"CPU cores: {os.cpu_count() if hasattr(os, 'cpu_count') else 'N/A'}")
-                last_perf_print = current_time
-            
-            if progress_callback and (current_time - last_gui_update > 0.1):
-                elapsed = current_time - start_time
-                processing_fps = processed_frames / elapsed if elapsed > 0 else 0
-                engine_stats = encoder_engine.get_stats()
-                progress_msg = (f"Frame {processed_frames}/{expected_processed_frames} | "
-                                f"Detections: {detection_count} | "
-                                f"Processing: {processing_fps:.1f} FPS | "
-                                f"Inference: {engine_stats['inference_fps']:.1f} FPS | "
-                                f"Device: {actual_device}")
-                progress_callback(processed_frames, expected_processed_frames, "Action Recognition", progress_msg)
-                last_gui_update = current_time
-
-        # Flush last frame (similar logic as above)
-        if prev_req is not None:
-            features = encoder_engine.wait_and_get(prev_req)[0]
-            features = np.reshape(features, (-1,))
-            sequence_buffer.append(features)
-            
-            if len(sequence_buffer) > SEQUENCE_LENGTH:
-                sequence_buffer.pop(0)
-
-            if len(sequence_buffer) == SEQUENCE_LENGTH:
-                sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
-                
-                use_timestamp_secs = prev_timestamp_secs
-                use_frame_id = prev_frame_id
-                use_mins, use_secs = divmod(int(use_timestamp_secs), 60)
-                use_timestamp_str = f"{use_mins:02d}:{use_secs:02d}"
-
-                frame_detections = []
-                if interesting_actions_set:
-                    for action_name in interesting_actions_set:
-                        action_id, model_type = action_to_model[action_name.lower()]
-                        model_data = models_info[model_type]
-                        if model_data is None:
-                            continue
+                        sorted_results = sorted(all_probabilities.values(), key=lambda x: x[1], reverse=True)
                         
-                        predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
-                        probabilities = softmax(predictions)
-                        
-                        if action_id >= len(probabilities):
-                            continue
-                        
-                        score = float(probabilities[action_id])
-                        if score >= confidence_threshold:
-                            writer.writerow([use_timestamp_str, use_frame_id, action_id, action_name, score, use_timestamp_secs, model_type])
+                        for idx, score, action_name, model_type in sorted_results[:top_k]:
+                            writer.writerow([use_timestamp_str, use_frame_id, idx, action_name, score, use_timestamp_secs, model_type])
                             
                             # Add to all_actions with or without model_type based on compatibility flag
                             if include_model_type:
-                                all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name, model_type))
+                                all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name, model_type))
                             else:
-                                all_actions.append((use_timestamp_secs, use_frame_id, action_id, score, action_name))
+                                all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name))
                             
                             frame_detections.append((action_name, score, model_type))
                             detection_count += 1
                             if debug:
                                 print(f"{use_timestamp_str} -> {action_name} [{model_type}] (score:{score:.3f})")
-                else:
-                    all_probabilities = {}
-                    for model_type, model_data in models_info.items():
-                        if model_data is None:
-                            continue
-                        
-                        predictions = model_data['compiled']([sequence_array])[model_data['output']].flatten()
-                        probabilities = softmax(predictions)
-                        
-                        top_indices = np.argsort(probabilities)[-top_k:][::-1]
-                        for idx in top_indices:
-                            score = float(probabilities[idx])
-                            if score >= confidence_threshold:
-                                action_name = get_action_name(idx, model_type)
-                                key = (action_name, model_type)
-                                all_probabilities[key] = (idx, score, action_name, model_type)
                     
-                    sorted_results = sorted(all_probabilities.values(), key=lambda x: x[1], reverse=True)
+                    if frame_detections:
+                        frame_detections.sort(key=lambda x: x[1], reverse=True)
+                        recent_detections.clear()
+                        recent_detections.extend(frame_detections[:3])
                     
-                    for idx, score, action_name, model_type in sorted_results[:top_k]:
-                        writer.writerow([use_timestamp_str, use_frame_id, idx, action_name, score, use_timestamp_secs, model_type])
-                        
-                        # Add to all_actions with or without model_type based on compatibility flag
-                        if include_model_type:
-                            all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name, model_type))
-                        else:
-                            all_actions.append((use_timestamp_secs, use_frame_id, idx, score, action_name))
-                        
-                        frame_detections.append((action_name, score, model_type))
-                        detection_count += 1
-                        if debug:
-                            print(f"{use_timestamp_str} -> {action_name} [{model_type}] (score:{score:.3f})")
-                
-                if frame_detections:
-                    frame_detections.sort(key=lambda x: x[1], reverse=True)
-                    recent_detections.clear()
-                    recent_detections.extend(frame_detections[:3])
+                    del sequence_array
 
-    cap.release()
-    if video_writer:
-        video_writer.release()
-        print(f"✅ Annotated video saved: {annotated_output}")
-    
-    if yolo_detector:
-        yolo_detector.shutdown()
+    finally:
+        # CLEANUP - Ensure all resources are freed
+        print("\n🧹 Cleaning up resources...")
+        
+        cap.release()
+        if video_writer:
+            video_writer.release()
+            print(f"✅ Annotated video saved: {annotated_output}")
+        
+        if yolo_detector:
+            yolo_detector.shutdown()
+        
+        if person_tracker:
+            person_tracker.reset()
+        
+        if action_detector:
+            action_detector.cleanup()
+        
+        if encoder_engine:
+            encoder_engine.cleanup()
+        
+        # Clear buffers
+        sequence_buffer.clear()
+        recent_detections.clear()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        print("✅ Cleanup complete")
 
     if progress_callback:
         total_time = time.time() - start_time
@@ -1389,7 +1520,7 @@ def print_action_sequences(all_actions):
 # CLI
 # =============================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Action Recognition with Dual Model Support")
+    parser = argparse.ArgumentParser(description="Action Recognition with Dual Model Support - Memory Optimized")
     parser.add_argument("--input", type=str, required=True, help="Input video path")
     parser.add_argument("--device", type=str, default="AUTO", help="Device (AUTO, CPU, GPU)")
     parser.add_argument("--sample-rate", type=int, default=5, help="Frame sampling rate")
@@ -1412,7 +1543,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("=" * 60)
-    print("🎯 ACTION RECOGNITION WITH DUAL MODEL SUPPORT")
+    print("🎯 ACTION RECOGNITION - MEMORY OPTIMIZED")
     print("=" * 60)
     print(f"Input: {args.input}")
     print(f"Device: {args.device}")
@@ -1425,26 +1556,31 @@ if __name__ == "__main__":
         print(f"Annotated output: {args.annotated_output}")
     print("=" * 60)
 
-    results = run_action_detection(
-        video_path=args.input,
-        device=args.device,
-        sample_rate=args.sample_rate,
-        log_file=args.log_file,
-        debug=args.debug,
-        top_k=args.top_k,
-        confidence_threshold=args.confidence,
-        show_video=args.show_video,
-        draw_bboxes=args.draw_bboxes,
-        annotated_output=args.annotated_output,
-        use_person_detection=args.use_person_detection,
-        max_people=args.max_people,
-        interesting_actions=args.interesting_actions,
-        yolo_workers=args.yolo_workers,
-        yolo_skip_frames=args.yolo_skip,
-        downscale_factor=args.downscale_factor
-    )
-    
-    print_top_actions(results)
-    print_most_common_actions(results)
-    print_action_sequences(results)
-    print(f"\n✅ Processing complete. Found {len(results)} action detections.")
+    try:
+        results = run_action_detection(
+            video_path=args.input,
+            device=args.device,
+            sample_rate=args.sample_rate,
+            log_file=args.log_file,
+            debug=args.debug,
+            top_k=args.top_k,
+            confidence_threshold=args.confidence,
+            show_video=args.show_video,
+            draw_bboxes=args.draw_bboxes,
+            annotated_output=args.annotated_output,
+            use_person_detection=args.use_person_detection,
+            max_people=args.max_people,
+            interesting_actions=args.interesting_actions,
+            yolo_workers=args.yolo_workers,
+            yolo_skip_frames=args.yolo_skip,
+            downscale_factor=args.downscale_factor
+        )
+        
+        print_top_actions(results)
+        print_most_common_actions(results)
+        print_action_sequences(results)
+        print(f"\n✅ Processing complete. Found {len(results)} action detections.")
+    finally:
+        # Final cleanup
+        gc.collect()
+        print("🧹 Final cleanup complete")
