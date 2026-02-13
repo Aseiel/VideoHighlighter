@@ -3769,12 +3769,18 @@ class SignalTimelineWindow(QMainWindow):
     def on_waveform_clicked(self, start_time, end_time, amplitude):
         """Handle waveform clicks - auto-create a clip"""
         print(f"🎵 Waveform clicked at {start_time:.2f}s, amplitude: {amplitude:.2f}")
-        if amplitude > 0.3:  # Loud section
+        # Option A: Increase threshold so only very loud sections add clips
+        if amplitude > 0.8:  # Much higher threshold
             # Add to edit timeline
             if hasattr(self, 'edit_scene'):
                 self.edit_scene.add_clip(start_time, end_time)
                 self.update_edit_duration()
                 self.statusBar().showMessage(f"Added audio clip: {start_time:.1f}s to {end_time:.1f}s", 2000)
+        
+        # Option B: Remove auto-add entirely, just seek
+        # Just seek to the clicked time without adding clip
+        self.current_time = start_time
+        self.signal_scene.set_current_time(start_time)
     
     @Slot(float)
     def on_add_to_edit_requested(self, time):
