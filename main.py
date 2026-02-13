@@ -638,13 +638,20 @@ class VideoHighlighterGUI(QWidget):
         self.transcript_checkbox.setChecked(transcript_cfg.get("enabled", False))
         self.transcript_checkbox.toggled.connect(self.on_transcript_toggle)
         transcript_form.addRow("Use transcript:", self.transcript_checkbox)
-        
+
+        # Source language for transcription
+        self.transcript_source_lang = QComboBox()
+        self.transcript_source_lang.addItems(["auto","en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
+        self.transcript_source_lang.setCurrentText(transcript_cfg.get("source_lang", "en"))
+        self.transcript_source_lang.setEnabled(transcript_cfg.get("enabled", False))
+        transcript_form.addRow("Source language:", self.transcript_source_lang)
+
         self.transcript_model_combo = QComboBox()
         self.transcript_model_combo.addItems(["tiny","base","small","medium","large"])
         self.transcript_model_combo.setCurrentText(transcript_cfg.get("model", "base"))
         self.transcript_model_combo.setEnabled(transcript_cfg.get("enabled", False))
         transcript_form.addRow("Whisper model:", self.transcript_model_combo)
-        
+
         self.search_keywords_input = QLineEdit(",".join(transcript_cfg.get("search_keywords", [])))
         self.search_keywords_input.setPlaceholderText("goal, score, win")
         self.search_keywords_input.setEnabled(transcript_cfg.get("enabled", False))
@@ -660,18 +667,18 @@ class VideoHighlighterGUI(QWidget):
         # Disable subtitle checkbox if transcript is not enabled
         self.subtitles_checkbox.setEnabled(transcript_cfg.get("enabled", False))
         subtitle_form.addRow("Create subtitles:", self.subtitles_checkbox)
-        
-        self.source_lang_combo = QComboBox()
-        self.source_lang_combo.addItems(["en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
-        self.source_lang_combo.setCurrentText(subtitles_cfg.get("source_lang", "en"))
-        self.source_lang_combo.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
-        subtitle_form.addRow("Source language:", self.source_lang_combo)
-        
-        self.target_lang_combo = QComboBox()
-        self.target_lang_combo.addItems(["en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
-        self.target_lang_combo.setCurrentText(subtitles_cfg.get("target_lang", "pl"))
-        self.target_lang_combo.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
-        subtitle_form.addRow("Target language:", self.target_lang_combo)
+
+        self.subtitle_source_lang = QComboBox()
+        self.subtitle_source_lang.addItems(["en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
+        self.subtitle_source_lang.setCurrentText(subtitles_cfg.get("source_lang", "en"))
+        self.subtitle_source_lang.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
+        subtitle_form.addRow("Source language:", self.subtitle_source_lang)
+
+        self.subtitle_target_lang = QComboBox()
+        self.subtitle_target_lang.addItems(["en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
+        self.subtitle_target_lang.setCurrentText(subtitles_cfg.get("target_lang", "pl"))
+        self.subtitle_target_lang.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
+        subtitle_form.addRow("Target language:", self.subtitle_target_lang)
         subtitle_group.setLayout(subtitle_form)
         transcript_layout.addWidget(subtitle_group)
 
@@ -1086,10 +1093,11 @@ class VideoHighlighterGUI(QWidget):
             "actions_require_objects": self.actions_require_objects_chk.isChecked(),
             "use_transcript": use_transcript,
             "transcript_model": self.transcript_model_combo.currentText(),
+            "transcript_source_lang": self.transcript_source_lang.currentText(),
             "search_keywords": search_keywords,
             "create_subtitles": self.subtitles_checkbox.isChecked() and use_transcript,
-            "source_lang": self.source_lang_combo.currentText(),
-            "target_lang": self.target_lang_combo.currentText(),
+            "source_lang": self.subtitle_source_lang.currentText(),
+            "target_lang": self.subtitle_target_lang.currentText(),
             "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
@@ -1100,7 +1108,7 @@ class VideoHighlighterGUI(QWidget):
             "draw_object_boxes": self.bbox_objects_chk.isChecked(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
         }
-        
+      
         # Add time range if enabled
         if self.use_time_range_chk.isChecked() and self.current_video_duration > 0:
             start_pct = self.start_time_slider.value() / 100
@@ -1611,12 +1619,13 @@ class VideoHighlighterGUI(QWidget):
             "transcript": {
                 "enabled": self.transcript_checkbox.isChecked(),
                 "model": self.transcript_model_combo.currentText(),
+                "source_lang": self.transcript_source_lang.currentText(),
                 "search_keywords": get_text_list(self.search_keywords_input),
             },
             "subtitles": {
                 "enabled": self.subtitles_checkbox.isChecked(),
-                "source_lang": self.source_lang_combo.currentText(),
-                "target_lang": self.target_lang_combo.currentText(),
+                "source_lang": self.subtitle_source_lang.currentText(),
+                "target_lang": self.subtitle_target_lang.currentText(),
             },
             "advanced": {
                 "frame_skip": int(self.frame_skip_spin.value()),
@@ -1645,6 +1654,7 @@ class VideoHighlighterGUI(QWidget):
 
     def on_transcript_toggle(self, checked):
         """Handle transcript checkbox toggle"""
+        self.transcript_source_lang.setEnabled(checked)
         self.transcript_model_combo.setEnabled(checked)
         self.search_keywords_input.setEnabled(checked)
         self.subtitles_checkbox.setEnabled(checked)
@@ -1660,8 +1670,9 @@ class VideoHighlighterGUI(QWidget):
         transcript_enabled = self.transcript_checkbox.isChecked()
         final_state = checked and transcript_enabled
         
-        self.source_lang_combo.setEnabled(final_state)
-        self.target_lang_combo.setEnabled(final_state)
+        self.subtitle_source_lang.setEnabled(final_state)
+        self.subtitle_target_lang.setEnabled(final_state)
+
 
     @Slot(str)
     def append_log(self, text: str):
@@ -2027,10 +2038,11 @@ class VideoHighlighterGUI(QWidget):
             "actions_require_objects": self.actions_require_objects_chk.isChecked(),
             "use_transcript": use_transcript,
             "transcript_model": self.transcript_model_combo.currentText(),
+            "transcript_source_lang": self.transcript_source_lang.currentText(),
             "search_keywords": search_keywords,
             "create_subtitles": self.subtitles_checkbox.isChecked() and use_transcript,
-            "source_lang": self.source_lang_combo.currentText(),
-            "target_lang": self.target_lang_combo.currentText(),
+            "source_lang": self.subtitle_source_lang.currentText(),
+            "target_lang": self.subtitle_target_lang.currentText(),
             "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
@@ -2174,7 +2186,7 @@ class VideoHighlighterGUI(QWidget):
                         
                         # Check for additional files for each video
                         base_name = os.path.splitext(file)[0]
-                        srt_file = f"{base_name}_{self.target_lang_combo.currentText()}.srt"
+                        srt_file = f"{base_name}_{self.subtitle_target_lang.currentText()}.srt"
                         transcript_file = f"{base_name}_transcript.txt"
                         
                         if os.path.exists(srt_file): 

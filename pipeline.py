@@ -527,12 +527,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # Transcript settings
         USE_TRANSCRIPT = gui_config.get("use_transcript", False) and TRANSCRIPT_AVAILABLE
         TRANSCRIPT_MODEL = gui_config.get("transcript_model", "base")
+        TRANSCRIPT_SOURCE_LANG = gui_config.get("transcript_source_lang", "en")
         SEARCH_KEYWORDS = gui_config.get("search_keywords", [])
         CREATE_SUBTITLES = gui_config.get("create_subtitles", False)
         TRANSCRIPT_ONLY = gui_config.get("transcript_only", False)
         TRANSCRIPT_POINTS = int(gui_config.get("transcript_points", 0))
-        SOURCE_LANG = gui_config.get("source_lang", "en")
-        TARGET_LANG = gui_config.get("target_lang", None)
+        SOURCE_LANG = gui_config.get("source_lang", "en")  # For subtitles
+        TARGET_LANG = gui_config.get("target_lang", None)  # For subtitles
 
         keyword_matches = []
 
@@ -803,7 +804,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log("🔹 Step 0.5: Processing transcript...")
                 try:
                     check_cancellation(cancel_flag, log, "transcript processing")
-                    transcript_segments = get_transcript_segments(processed_video_path, model_name=gui_config.get("transcript_model", "medium"), progress_fn=progress_fn, log_fn=log)
+                    transcript_segments = get_transcript_segments(
+                        processed_video_path, 
+                        model_name=TRANSCRIPT_MODEL, 
+                        progress_fn=progress_fn, 
+                        log_fn=log,
+                        language=TRANSCRIPT_SOURCE_LANG
+                    )
+
                     
                     check_cancellation(cancel_flag, log, "transcript processing")
                     
@@ -1310,7 +1318,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     motion_events=motion_events,
                     motion_peaks=motion_peaks,
                     audio_peaks=audio_peaks,
-                    source_lang=SOURCE_LANG,
+                    source_lang=TRANSCRIPT_SOURCE_LANG,
                     waveform_data=waveform_data,
                     keyword_segments_only=keyword_segments_only,
                     search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None
