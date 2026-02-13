@@ -71,16 +71,20 @@ def split_audio(video_file, chunk_length=600):
     
     return sorted(chunks)
 
-def get_transcript_segments(video_file, model_name="small", progress_fn=None, log_fn=print, chunk_length=600, cleanup=True):
+def get_transcript_segments(video_file, model_name="small", progress_fn=None, log_fn=print, 
+                           chunk_length=600, cleanup=True, language="en"):
     """
     Transcribe video safely by splitting into chunks.
     - Uses Whisper for transcription
     - Filters hallucinations
     - Preserves timestamps with offsets
     - Shows progress via progress_fn
+    - language: Source language code (e.g., "en", "pl", "fr", "auto" for auto-detect)
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log_fn(f"Using device for Whisper: {device}")
+    
+    log_fn(f"🔤 Language parameter received: {language}")
 
     model = whisper.load_model(model_name, device=device)
     log_fn("Splitting video into chunks...")
@@ -101,25 +105,38 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
 
         log_fn(f"➡️ Transcribing chunk {idx+1}/{len(chunks)}: {chunk}")
 
-        result = model.transcribe(
-            chunk,
-            language="en",
-            task="transcribe",
-            temperature=0.0,  # No randomness
-            beam_size=1,      # Greedy decoding
-            best_of=1,        # Single attempt
-            patience=1.0,
-            condition_on_previous_text=False,
-            compression_ratio_threshold=2.4,  # Detect repetition
-            logprob_threshold=-1.0,           # Filter low confidence
-            no_speech_threshold=0.6,          # Silence detection
-            verbose=False
-        )
+        # Prepare transcription parameters
+        transcribe_params = {
+            "task": "transcribe",
+            "temperature": 0.0,  # No randomness
+            "beam_size": 1,      # Greedy decoding
+            "best_of": 1,        # Single attempt
+            "patience": 1.0,
+            "condition_on_previous_text": False,
+            "compression_ratio_threshold": 2.4,  # Detect repetition
+            "logprob_threshold": -1.0,           # Filter low confidence
+            "no_speech_threshold": 0.6,          # Silence detection
+            "verbose": False
+        }
+        
+        # Add language if not auto-detect
+        if language != "auto":
+            transcribe_params["language"] = language
+                        
+        result = model.transcribe(chunk, **transcribe_params)
+        
+        detected_lang = result.get('language', 'unknown')
+        
+        # Warn if language mismatch
+        if detected_lang != language and language != "auto":
+            log_fn(f"⚠️ WARNING: Expected '{language}' but Whisper detected '{detected_lang}'")
+            log_fn(f"   This may indicate unclear audio or incorrect language setting")
 
         # Offset for proper timestamps
         offset = idx * chunk_length
         for seg in result.get("segments", []):
             text = seg["text"].strip()
+            
             if len(text) >= 3 and is_valid_speech(text):
                 all_segments.append({
                     "start": float(seg["start"]) + offset,
