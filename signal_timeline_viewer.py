@@ -1,3 +1,4 @@
+
 """
 Complete Signal Timeline Viewer with Filters and Edit Timeline
 - Signal visualization with filtering
@@ -8,6 +9,8 @@ Complete Signal Timeline Viewer with Filters and Edit Timeline
 
 import sys
 import os
+from pathlib import Path
+import json
 import numpy as np
 from collections import defaultdict
 from PySide6.QtWidgets import (
@@ -31,7 +34,7 @@ import subprocess
 import os
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 
 # modules
@@ -753,12 +756,13 @@ class EditTimelineScene(QGraphicsScene):
         self.build_timeline()
 
     def load_initial_clips(self):
-        """Load initial clips from highlight cache or from analysis final_segments"""
+        """Load initial clips from highlight cache"""
         self.clips = []
 
-        # 1) Try ANY cached highlight version (not just default params)
-        if self.cache and hasattr(self.cache, "get_highlight_history"):
-            history = self.cache.get_highlight_history(self.video_path)
+        # Try ANY cached highlight version (not just default params)
+        if self.cache and hasattr(self.cache, 'get_highlight_history'):
+            # Try with None to get all versions
+            history = self.cache.get_highlight_history(self.video_path, analysis_params=None)
             if history:
                 # Use the most recent highlight version
                 entry = history[0]  # Most recent first
@@ -767,7 +771,7 @@ class EditTimelineScene(QGraphicsScene):
                     self.clips = segments
                     print(f"✅ Loaded {len(self.clips)} highlight segments from cache (most recent)")
                     return
-        
+   
         # 2) Fallback: Check if pipeline saved segments in analysis cache
         cache_data = None
         parent = self.parent()
@@ -1713,13 +1717,17 @@ class SignalTimelineScene(QGraphicsScene):
         label.setDefaultTextColor(QColor(180, 220, 255))
         
         if 'motion_events' in self.cache_data:
+            print(f"DEBUG: Drawing {len(self.cache_data['motion_events'])} motion events")
             for timestamp in self.cache_data['motion_events']:
                 x = timestamp * self.pixels_per_second
                 # Draw vertical line with varying height based on intensity
                 pen = QPen(self.colors['motion_events'], 2)
                 self.addLine(x, y_pos, x, y_pos + self.layer_height, pen)
+        else:
+            print("DEBUG: No motion_events key in cache_data")
         
         return y_pos + self.layer_height + self.layer_spacing
+
     
     def draw_motion_peaks_layer(self, y_pos):
         """Draw motion peaks"""
@@ -2603,18 +2611,79 @@ class SignalTimelineWindow(QMainWindow):
     waveform_ready = Signal(object)
     
     def __init__(self, video_path, cache_data=None):
+        # Add this IMMEDIATELY at the start of __init__
+        debug_log(f"SignalTimelineWindow.__init__ CALLED with video_path={video_path}")
+        debug_log(f"  cache_data provided: {cache_data is not None}")
+        debug_log(f"\n{'='*60}")
+        debug_log(f"🔍 [TIMELINE] SignalTimelineWindow.__init__ START")
+        debug_log(f"{'='*60}")
+        debug_log(f"  - video_path: {video_path}")
+        debug_log(f"  - cache_data provided: {cache_data is not None}")
+        debug_log(f"  - cache_data type: {type(cache_data)}")
+        
+        if cache_data is not None:
+            debug_log(f"  - cache_data keys: {list(cache_data.keys()) if cache_data else 'None'}")
+        
         super().__init__()
         self.video_path = video_path
-        self.cache_data = cache_data or self.load_cache_data()
-        self.waveform_ready.connect(self.update_waveform_data)
-        self.cache = self.get_cache_instance()
-
-        if not self.cache_data:
-            print("❌ No cache data available")
-            self.close()
-            return
         
-        self.video_duration = self.cache_data.get('video_metadata', {}).get('duration', 0)
+        # If cache_data was provided, use it directly
+        if cache_data is not None:
+            debug_log(f"  ✓ Using provided cache_data")
+            self.cache_data = cache_data
+        else:
+            debug_log(f"  ⚠️ No cache_data provided, attempting to load...")
+            self.cache_data = self.load_cache_data()
+            
+            # If still no cache_data, create minimal structure
+            if not self.cache_data:
+                debug_log(f"  ⚠️ Creating minimal cache data structure")
+                self.cache_data = {
+                    "video_metadata": {"duration": 0, "fps": 30},
+                    "transcript": {"segments": []},
+                    "objects": [],
+                    "actions": [],
+                    "scenes": [],
+                    "motion_events": [],
+                    "motion_peaks": [],
+                    "audio_peaks": []
+                }
+        
+        debug_log(f"\n  📊 FINAL CACHE DATA STATE:")
+        debug_log(f"  - self.cache_data is None? {self.cache_data is None}")
+        if self.cache_data:
+            debug_log(f"  - self.cache_data keys: {list(self.cache_data.keys())}")
+            # Check for motion data specifically
+            debug_log(f"    - 'motion_events' present: {'motion_events' in self.cache_data}")
+            debug_log(f"    - 'motion_peaks' present: {'motion_peaks' in self.cache_data}")
+            debug_log(f"    - 'scenes' present: {'scenes' in self.cache_data}")
+            debug_log(f"    - 'video_metadata' present: {'video_metadata' in self.cache_data}")
+            
+            if 'video_metadata' in self.cache_data:
+                debug_log(f"      - duration: {self.cache_data['video_metadata'].get('duration', 'N/A')}")
+        
+        # Get video duration from cache or fallback
+        self.video_duration = self.cache_data.get('video_metadata', {}).get('duration', 0) if self.cache_data else 0
+        debug_log(f"  - video_duration from cache: {self.video_duration}")
+        
+        # If we still don't have duration, try to get it from the video file
+        if self.video_duration == 0 and os.path.exists(video_path):
+            try:
+                import cv2
+                debug_log(f"  - Attempting to get duration from video file...")
+                cap = cv2.VideoCapture(video_path)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.video_duration = total_frames / fps if fps else 0
+                cap.release()
+                debug_log(f"  - Got video duration from file: {self.video_duration:.1f}s")
+            except Exception as e:
+                debug_log(f"  ⚠️ Could not get video duration: {e}")
+                self.video_duration = 60  # fallback
+        
+        self.cache = self.get_cache_instance()
+        debug_log(f"  - cache instance: {self.cache is not None}")
+        
         self.current_time = 0
         
         # Track clip removals for batch updates
@@ -2627,6 +2696,10 @@ class SignalTimelineWindow(QMainWindow):
         self.action_types = self._extract_action_types()
         self.object_classes = self._extract_object_classes()
         
+        debug_log(f"\n  📊 EXTRACTED INFO:")
+        debug_log(f"  - action_types: {self.action_types}")
+        debug_log(f"  - object_classes: {self.object_classes}")
+        
         self.setWindowTitle(f"Signal Timeline - {os.path.basename(video_path)}")
         self.setGeometry(100, 100, 1600, 1000)
         
@@ -2635,17 +2708,22 @@ class SignalTimelineWindow(QMainWindow):
         
         # Load waveform from cache - store it in instance variable
         self.waveform = self.load_waveform_from_cache()
+        debug_log(f"  - waveform loaded: {self.waveform is not None}, length: {len(self.waveform) if self.waveform else 0}")
         
         # Initialize UI - PASS waveform to constructor
+        debug_log(f"\n  🎨 Initializing UI...")
         self.init_ui()
         
         # Start background extraction if we don't have cached waveform
         if not self.waveform or len(self.waveform) == 0:
-            print("⚠️ No cached waveform or empty waveform, starting extraction...")
+            debug_log(f"  ⚠️ No cached waveform or empty waveform, starting extraction...")
             self.init_waveform()
         else:
-            print(f"✅ Using cached waveform ({len(self.waveform)} points)")
-            # Waveform is already passed to scene in init_ui()
+            debug_log(f"  ✅ Using cached waveform ({len(self.waveform)} points)")
+        
+        debug_log(f"\n{'='*60}")
+        debug_log(f"✅ [TIMELINE] SignalTimelineWindow.__init__ COMPLETE")
+        debug_log(f"{'='*60}\n")
 
     def launch_preview(self):
         """Launch video preview window"""
@@ -3157,25 +3235,146 @@ class SignalTimelineWindow(QMainWindow):
         self.waveform_colors = self.generate_waveform_colors()
         self.build_timeline()
 
-
     def get_cache_instance(self):
         """Get cache instance for highlight loading"""
-        try:
-            from modules.video_cache import VideoAnalysisCache
-            return VideoAnalysisCache(enable_highlight_cache=True)
-        except Exception as e:
-            print(f"⚠️ Could not initialize cache: {e}")
-            return None
-
-    def load_cache_data(self):
-        """Load cache data for the video"""
+        print(f"\n🔍 [TIMELINE] get_cache_instance")
         try:
             from modules.video_cache import VideoAnalysisCache
             cache = VideoAnalysisCache()
-            return cache.load(self.video_path)
+            
+            # List all cache files
+            cache_dir = Path("./cache")
+            if cache_dir.exists():
+                cache_files = list(cache_dir.glob("*.cache.json"))
+                print(f"  - Cache directory contains {len(cache_files)} cache files:")
+                for f in cache_files:
+                    size_kb = f.stat().st_size / 1024
+                    print(f"    - {f.name} ({size_kb:.1f} KB)")
+                    
+                    # Try to peek inside
+                    try:
+                        with open(f, 'r') as fh:
+                            data = json.load(fh)
+                            print(f"      Keys: {data.keys()}")
+                            if 'video_path' in data:
+                                print(f"      Video: {data['video_path']}")
+                    except:
+                        print(f"      Could not read file")
+            
+            return cache
         except Exception as e:
-            print(f"Failed to load cache: {e}")
+            print(f"  ❌ Could not initialize cache: {e}")
             return None
+
+    def load_cache_data(self):
+        """Load cache data for the video with extensive debugging"""
+        print(f"\n{'='*60}")
+        print(f"🔍 [TIMELINE] load_cache_data START")
+        print(f"{'='*60}")
+        print(f"  - video_path: {self.video_path}")
+        
+        try:
+            from modules.video_cache import VideoAnalysisCache
+            cache = VideoAnalysisCache()
+            print(f"  ✓ Created VideoAnalysisCache instance")
+            
+            # Get video hash for debugging
+            video_hash = cache._get_video_hash(self.video_path)
+            print(f"  - Video hash: {video_hash}")
+            
+            # List all cache files first
+            cache_dir = Path("./cache")
+            all_cache_files = list(cache_dir.glob("*.cache.json"))
+            print(f"\n  📁 All cache files in directory ({len(all_cache_files)}):")
+            for f in all_cache_files:
+                size_kb = f.stat().st_size / 1024
+                print(f"    - {f.name} ({size_kb:.1f} KB)")
+            
+            # Look for any cache file with this video hash (wildcard match)
+            matching_files = list(cache_dir.glob(f"{video_hash}*.cache.json"))
+            print(f"\n  🔍 Files matching video hash ({len(matching_files)}):")
+            
+            for cache_file in matching_files:
+                print(f"    - {cache_file.name}")
+                try:
+                    # Try to load it directly
+                    with open(cache_file, 'r') as f:
+                        cache_data = json.load(f)
+                    
+                    # Verify it's for this video
+                    if cache_data.get("video_hash") == video_hash:
+                        print(f"      ✓ Successfully loaded cache file")
+                        print(f"      ✓ Contains keys: {list(cache_data.keys())}")
+                        
+                        # Check for motion data specifically
+                        print(f"      - motion_events present: {'motion_events' in cache_data}")
+                        print(f"      - motion_peaks present: {'motion_peaks' in cache_data}")
+                        print(f"      - scenes present: {'scenes' in cache_data}")
+                        
+                        if 'motion_events' in cache_data:
+                            print(f"      - motion_events count: {len(cache_data['motion_events'])}")
+                        if 'motion_peaks' in cache_data:
+                            print(f"      - motion_peaks count: {len(cache_data['motion_peaks'])}")
+                        if 'scenes' in cache_data:
+                            print(f"      - scenes count: {len(cache_data['scenes'])}")
+                        
+                        print(f"\n  ✅ Successfully loaded cache data from direct file read")
+                        print(f"{'='*60}\n")
+                        return cache_data
+                except Exception as e:
+                    print(f"      ✗ Failed to load: {e}")
+                    continue
+            
+            # If we get here, try with default params as fallback
+            print(f"\n  🔄 Attempting to load with default params...")
+            default_params = {
+                "analysis_cache_schema": "analysis_v2",
+                "use_transcript": False,
+                "transcript_model": "base",
+                "search_keywords": [],
+                "highlight_objects": [],
+                "interesting_actions": [],
+                "object_frame_skip": 10,
+                "sample_rate": 5,
+                "action_use_person_detection": True,
+                "action_max_people": 2,
+                "yolo_model_size": "n",
+                "yolo_pt_path": "yolo11n.pt",
+                "openvino_model_folder": "yolo11n_openvino_model/",
+                "use_time_range": False,
+                "range_start": 0,
+                "range_end": None,
+                "scene_threshold": 70.0,
+                "motion_threshold": 100.0,
+                "spike_factor": 1.2,
+                "freeze_seconds": 4,
+                "freeze_factor": 0.8,
+            }
+            
+            cache_data = cache.load(self.video_path, params=default_params)
+            if cache_data:
+                print(f"  ✓ Found param-based cache")
+                print(f"  ✓ Contains keys: {list(cache_data.keys())}")
+                print(f"\n{'-'*40}")
+                return cache_data
+            
+            # Try legacy load (no params)
+            print(f"\n  🔄 Attempting legacy load (no params)...")
+            cache_data = cache.load(self.video_path)
+            if cache_data:
+                print(f"  ✓ Found legacy cache")
+                print(f"  ✓ Contains keys: {list(cache_data.keys())}")
+                return cache_data
+            
+            print(f"\n  ⚠️ No cache found in any format - creating empty dict")
+            
+        except Exception as e:
+            print(f"  ❌ Error in load_cache_data: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        print(f"\n{'='*60}\n")
+        return {}
     
     def _extract_action_types(self):
         """Extract unique action names for info display"""
@@ -4199,10 +4398,43 @@ class SignalTimelineWindow(QMainWindow):
         """)
 
 
+# Also write to a debug file
+DEBUG_FILE = "timeline_debug.log"
+
+
+def debug_log(msg):
+    """Write debug message to both console and file"""
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    full_msg = f"[{timestamp}] {msg}"
+    
+    # Use the original print function directly
+    import builtins
+    builtins.print(full_msg, flush=True)
+    
+    # Write to file
+    with open(DEBUG_FILE, "a", encoding="utf-8") as f:
+        f.write(full_msg + "\n")
+        f.flush()
+
+# Keep original print safe
+original_print = print
+
+# Now replace debug_log at the module level
+print = debug_log
+
+debug_log("="*60)
+debug_log("🚀 TIMELINE VIEWER STARTING")
+debug_log("="*60)
+debug_log(f"Python version: {sys.version}")
+debug_log(f"Current working directory: {os.getcwd()}")
+debug_log(f"Script location: {__file__}")
+
+
+
 def show_timeline_viewer(video_path, cache_data=None):
     """
     Launch the signal timeline viewer with edit timeline
-    
+
     Args:
         video_path: Path to video file
         cache_data: Optional cache data dict (will load from cache if not provided)
@@ -4210,15 +4442,37 @@ def show_timeline_viewer(video_path, cache_data=None):
     Returns:
         int: Application exit code
     """
+    debug_log("="*60)
+    debug_log(f"🎬 show_timeline_viewer called")
+    debug_log(f"  - video_path: {video_path}")
+    debug_log(f"  - cache_data provided: {cache_data is not None}")
+    debug_log(f"  - video_path exists: {os.path.exists(video_path)}")
+    
     app = QApplication.instance()
     if app is None:
+        debug_log("  - Creating new QApplication")
         app = QApplication(sys.argv)
+    else:
+        debug_log("  - Using existing QApplication")
     
-    window = SignalTimelineWindow(video_path, cache_data)
+    debug_log("  🔵 ABOUT TO CREATE SignalTimelineWindow...")
+    try:
+        window = SignalTimelineWindow(video_path, cache_data)
+        debug_log("  🟢 SignalTimelineWindow CREATED successfully")
+    except Exception as e:
+        debug_log(f"  ❌ ERROR creating SignalTimelineWindow: {e}")
+        import traceback
+        traceback.print_exc()
+        return -1
+    
+    debug_log("  - Showing window...")
     window.show()
     
-    return app.exec()
-
+    debug_log("  - Entering event loop...")
+    result = app.exec()
+    debug_log(f"  - Event loop exited with code: {result}")
+    
+    return result
 
 if __name__ == "__main__":
     # Test with a video file
