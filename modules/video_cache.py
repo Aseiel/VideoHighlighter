@@ -96,7 +96,22 @@ def atomic_write_json(path: Path, data: dict) -> None:
 
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            # Use custom encoder to handle numpy types
+            class NumpyEncoder(json.JSONEncoder):
+                def default(self, obj):
+                    # Handle numpy integers
+                    if hasattr(obj, 'dtype') and hasattr(obj, 'item'):
+                        return obj.item()
+                    # Handle numpy floats
+                    elif hasattr(obj, 'dtype') and hasattr(obj, 'tolist'):
+                        return obj.tolist() if hasattr(obj, 'shape') and len(obj.shape) > 0 else float(obj)
+                    # Handle numpy arrays
+                    elif hasattr(obj, 'tolist'):
+                        return obj.tolist()
+                    # Let the base class default method raise the TypeError
+                    return super().default(obj)
+            
+            json.dump(data, f, indent=2, ensure_ascii=False, cls=NumpyEncoder)
             f.flush()
             os.fsync(f.fileno())
         os.replace(str(tmp_path), str(path))  # atomic on same filesystem
@@ -233,18 +248,29 @@ class VideoAnalysisCache:
         enable_highlight_cache: bool = True,
         max_highlight_versions: int = 10,
     ):
+        print(f"\n🔧 [DEBUG] VideoAnalysisCache.__init__")
+        print(f"  - cache_dir: {cache_dir}")
+        print(f"  - enable_highlight_cache: {enable_highlight_cache}")
+        
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  ✓ Cache directory: {self.cache_dir.absolute()}")
 
         self.max_cache_size = int(max_cache_size_mb) * 1024 * 1024
         self.enable_highlight_cache = bool(enable_highlight_cache)
         self.max_highlight_versions = int(max_highlight_versions)
+        
+        # Initialize base_cache as self reference
+        self.base_cache = self
+        print(f"  ✓ Initialized base_cache = self")
 
         self._lock = threading.RLock()
+        print(f"  ✓ Created thread lock")
 
         # enhanced directory structure
         (self.cache_dir / "highlights").mkdir(exist_ok=True)
         (self.cache_dir / "temp").mkdir(exist_ok=True)
+        print(f"  ✓ Created subdirectories: highlights/, temp/")
 
         self.stats = {
             "hits": 0,
@@ -253,6 +279,8 @@ class VideoAnalysisCache:
             "highlight_hits": 0,
             "highlight_misses": 0,
         }
+        print(f"  ✓ Initialized stats")
+        print(f"🔧 [DEBUG] __init__ complete\n")
 
     # ---------- hashing / paths ----------
 
@@ -460,82 +488,82 @@ class VideoAnalysisCache:
 
     # ---------- highlight segments cache ----------
 
-    def save_highlight_segments(
-        self,
-        video_path: str,
-        parameters: Dict[str, Any],
-        segments: List[Tuple[float, float]],
-        segments_metadata: Optional[List[Dict[str, Any]]] = None,
-        score_info: Optional[Dict[str, Any]] = None,
-    ) -> bool:
+# modules/video_cache.py
+
+    def save_highlight_segments(self, video_path, parameters, segments, segments_metadata, score_info, analysis_params=None):
+        """Save highlight segments with metadata for history
+        
+        Args:
+            video_path: Path to video file
+            parameters: Highlight generation parameters
+            segments: List of (start, end) segment tuples
+            segments_metadata: Metadata for each segment
+            score_info: Overall scoring information
+            analysis_params: Analysis parameters used to generate the cache (for signature-based loading)
+        """
         if not self.enable_highlight_cache:
+            print(f"  ❌ enable_highlight_cache is False, returning False")
             return False
-
-        with self._lock:
-            try:
-                video_hash = self._get_video_hash(video_path)
-                params_hash = self._get_parameters_hash(parameters)
-
-                highlight_segments: List[HighlightSegment] = []
-                for i, (start, end) in enumerate(segments):
-                    duration = float(end - start)
-                    md = segments_metadata[i] if segments_metadata and i < len(segments_metadata) else {}
-
-                    highlight_segments.append(
-                        HighlightSegment(
-                            start_time=float(start),
-                            end_time=float(end),
-                            duration=duration,
-                            score=float(md.get("score", 0.0)),
-                            signals=md.get("signals", {}) or {},
-                            primary_reason=md.get("primary_reason", "") or "",
-                        )
-                    )
-
-                total_duration = sum(float(e - s) for s, e in segments)
-                target_duration = parameters.get("exact_duration") or parameters.get("max_duration", 420)
-                exact_duration = parameters.get("exact_duration")
-
-                highlight_meta = HighlightMetadata(
-                    video_path=str(Path(video_path).absolute()),
-                    video_hash=video_hash,
-                    parameters_hash=params_hash,
-                    total_duration=float(total_duration),
-                    target_duration=float(target_duration),
-                    duration_mode="EXACT" if exact_duration else "MAX",
-                    segments_count=len(segments),
-                    parameters=parameters,
-                    score_distribution=score_info or {},
-                )
-
-                highlight_data = {
-                    "metadata": highlight_meta.to_dict(),
-                    "segments": [s.to_dict() for s in highlight_segments],
-                    "created_at": datetime.now().isoformat(),
-                }
-
-                # prepare paths
-                hl_dir = self._highlight_dir(video_hash)
-                hl_dir.mkdir(exist_ok=True)
-
-                highlight_path = hl_dir / f"{params_hash}.json"
-                temp_path = self.cache_dir / "temp" / f"highlight_{video_hash}_{params_hash}.tmp"
-
-                with open(temp_path, "w", encoding="utf-8") as f:
-                    json.dump(highlight_data, f, indent=2, ensure_ascii=False)
-
-                # atomic move
-                shutil.move(str(temp_path), str(highlight_path))
-
-                self._cleanup_old_highlights(video_hash)
-
-                print("✅ Highlight segments cached")
-                return True
-
-            except Exception as e:
-                print(f"❌ Failed to save highlight cache: {e}")
-                return False
-
+        
+        try:
+            # Create the highlight history entry
+            history_entry = {
+                'segments': segments,
+                'segments_count': len(segments),
+                'total_duration': sum(end - start for start, end in segments),
+                'parameters': parameters,
+                'segments_metadata': segments_metadata,
+                'score_info': score_info,
+                'created_at': str(__import__('datetime').datetime.now())
+            }
+            print(f"  ✓ Created history_entry")
+            
+            # Get existing data or create new - USE self.load() instead of self.base_cache.load()
+            print(f"  🔄 Loading existing cache data for {video_path}")
+            cache_data = self.load(video_path, params=analysis_params) or {}
+            print(f"  ✓ Loaded cache_data with keys: {cache_data.keys() if cache_data else 'empty dict'}")
+            
+            # Initialize or update highlight history
+            if 'highlight_history' not in cache_data:
+                print(f"  📝 Initializing new highlight_history list")
+                cache_data['highlight_history'] = []
+            else:
+                print(f"  📊 Existing highlight_history has {len(cache_data['highlight_history'])} entries")
+            
+            # Add new entry at the beginning
+            cache_data['highlight_history'].insert(0, history_entry)
+            print(f"  ✓ Added new history entry at position 0")
+            
+            # Keep only last 10 entries
+            old_len = len(cache_data['highlight_history'])
+            cache_data['highlight_history'] = cache_data['highlight_history'][:self.max_highlight_versions]
+            new_len = len(cache_data['highlight_history'])
+            if old_len != new_len:
+                print(f"  ✂️ Trimmed history from {old_len} to {new_len} entries")
+            
+            # Also save as current highlight segments (for backward compatibility)
+            cache_data['highlight_segments'] = segments
+            cache_data['highlight_metadata'] = {
+                'parameters': parameters,
+                'segments_metadata': segments_metadata,
+                'score_info': score_info,
+                'created_at': history_entry['created_at']
+            }
+            print(f"  ✓ Updated current highlight_segments and highlight_metadata")
+            
+            # Save back to cache - USE self.save() instead of self.base_cache.save()
+            print(f"  💾 Saving updated cache data...")
+            self.save(video_path, cache_data, params=analysis_params)
+            print(f"  ✅ Save completed successfully!")
+            
+            return True
+            
+        except Exception as e:
+            print(f"  ❌ Exception in save_highlight_segments: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
     def load_highlight_segments(
         self, video_path: str, parameters: Dict[str, Any]
     ) -> Optional[Tuple[HighlightMetadata, List[HighlightSegment]]]:
@@ -593,41 +621,112 @@ class VideoAnalysisCache:
 
     # ---------- stats / history ----------
 
-    def get_highlight_history(self, video_path: str) -> List[Dict[str, Any]]:
-        with self._lock:
-            try:
-                video_hash = self._get_video_hash(video_path)
-                hl_dir = self._highlight_dir(video_hash)
-                if not hl_dir.exists():
-                    return []
-
-                history: List[Dict[str, Any]] = []
-                for fpath in hl_dir.glob("*.json"):
+    def get_highlight_history(self, video_path, analysis_params=None):
+        """Get history of highlight versions for a video
+        
+        Args:
+            video_path: Path to video file
+            analysis_params: Analysis parameters for signature-based cache lookup
+        """
+        print(f"\n🔍 [DEBUG] get_highlight_history called for: {video_path}")
+        history = []
+        
+        try:
+            video_hash = self._get_video_hash(video_path)
+            cache_dir = Path(self.cache_dir)
+            
+            print(f"  - Video hash: {video_hash}")
+            print(f"  - analysis_params provided: {analysis_params is not None}")
+            
+            # Method 1: If params provided, try exact signature match first
+            if analysis_params is not None:
+                signature = self._make_signature(analysis_params)
+                exact_cache_path = self._get_analysis_cache_path_for_signature(video_path, signature)
+                print(f"  - Looking for exact signature cache: {exact_cache_path.name}")
+                
+                if exact_cache_path.exists():
                     try:
-                        with open(fpath, "r", encoding="utf-8") as f:
-                            highlight_data = json.load(f)
-
-                        metadata = highlight_data.get("metadata", {}) or {}
-                        segs = highlight_data.get("segments", []) or []
-
-                        history.append(
-                            {
-                                "created_at": highlight_data.get("created_at"),
-                                "parameters": metadata.get("parameters", {}),
-                                "total_duration": metadata.get("total_duration", 0),
-                                "segments_count": len(segs),
-                                "segments": [(s["start_time"], s["end_time"]) for s in segs],
-                            }
-                        )
-                    except Exception:
-                        continue
-
-                history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-                return history
-
-            except Exception as e:
-                print(f"⚠️ Error getting highlight history: {e}")
-                return []
+                        with open(exact_cache_path, 'r') as f:
+                            cache_data = json.load(f)
+                        
+                        # Check for highlight history
+                        if 'highlight_history' in cache_data:
+                            history.extend(cache_data['highlight_history'])
+                            print(f"  ✓ Found {len(cache_data['highlight_history'])} entries in exact signature cache")
+                        
+                        # Check for legacy highlight segments
+                        elif 'highlight_segments' in cache_data and cache_data['highlight_segments']:
+                            segments = cache_data.get('highlight_segments', [])
+                            metadata = cache_data.get('highlight_metadata', {})
+                            history.append({
+                                'segments': segments,
+                                'segments_count': len(segments),
+                                'total_duration': sum(end - start for start, end in segments),
+                                'parameters': metadata.get('parameters', {}),
+                                'score_info': metadata.get('score_info', {}),
+                                'created_at': metadata.get('created_at', 'Unknown')
+                            })
+                            print(f"  ✓ Added legacy history from exact signature cache")
+                    except Exception as e:
+                        print(f"  ⚠️ Error reading exact cache: {e}")
+            
+            # Method 2: Look for any cache file with this video hash
+            print(f"  - Looking for any cache files with hash {video_hash}")
+            matching_files = list(cache_dir.glob(f"{video_hash}*.cache.json"))
+            print(f"  - Found {len(matching_files)} cache files matching hash:")
+            
+            for cache_file in matching_files:
+                try:
+                    print(f"    - Reading {cache_file.name}")
+                    with open(cache_file, 'r') as f:
+                        cache_data = json.load(f)
+                    
+                    # Check for highlight history
+                    if 'highlight_history' in cache_data:
+                        print(f"      - Found highlight_history with {len(cache_data['highlight_history'])} entries")
+                        history.extend(cache_data['highlight_history'])
+                    
+                    # Check for legacy highlight segments
+                    elif 'highlight_segments' in cache_data and cache_data['highlight_segments']:
+                        segments = cache_data.get('highlight_segments', [])
+                        metadata = cache_data.get('highlight_metadata', {})
+                        print(f"      - Found legacy highlight_segments with {len(segments)} segments")
+                        history.append({
+                            'segments': segments,
+                            'segments_count': len(segments),
+                            'total_duration': sum(end - start for start, end in segments),
+                            'parameters': metadata.get('parameters', {}),
+                            'score_info': metadata.get('score_info', {}),
+                            'created_at': metadata.get('created_at', 'Unknown')
+                        })
+                except Exception as e:
+                    print(f"      ⚠️ Error reading {cache_file.name}: {e}")
+                    continue
+            
+            # Remove duplicates based on created_at timestamp
+            seen = set()
+            unique_history = []
+            for entry in history:
+                created = entry.get('created_at', '')
+                if created not in seen:
+                    seen.add(created)
+                    unique_history.append(entry)
+            
+            # Sort by created_at (most recent first)
+            unique_history.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+            
+            print(f"  📤 Returning {len(unique_history)} unique history entries")
+            if unique_history:
+                print(f"  - First entry created at: {unique_history[0].get('created_at', 'Unknown')}")
+                print(f"  - First entry segments count: {unique_history[0].get('segments_count', 0)}")
+            
+            return unique_history
+            
+        except Exception as e:
+            print(f"  ❌ Exception in get_highlight_history: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     def get_cache_stats(self) -> Dict[str, Any]:
         with self._lock:

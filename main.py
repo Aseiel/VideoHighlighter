@@ -2303,15 +2303,62 @@ class VideoHighlighterGUI(QWidget):
         try:
             from signal_timeline_viewer import SignalTimelineWindow
             
-            # Check if cache exists
-            from modules.video_cache import VideoAnalysisCache
+            # Check if cache exists - use the same parameters as in pipeline
+            from modules.video_cache import VideoAnalysisCache, build_analysis_cache_params
+            
+            # Build the same parameters that were used when processing
+            # We need to recreate the analysis_params that were used
+            # Let's get the current config from GUI
+            config = self.build_pipeline_config()
+            
+            # Get video duration for parameter building
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            video_duration = total_frames / fps if fps else 0
+            cap.release()
+            
+            # Build analysis params that match what was used
+            sample_rate = int(self.sample_rate_spin.value())
+            
+            # Load config.yaml defaults
+            cfg_data = {}
+            if os.path.exists("config.yaml"):
+                with open("config.yaml", "r") as f:
+                    cfg_data = yaml.safe_load(f) or {}
+            
+            analysis_params = build_analysis_cache_params(
+                gui_config=config,
+                config=cfg_data,
+                sample_rate=sample_rate,
+                video_duration=video_duration
+            )
+            
+            # Try to load with these params first
             cache = VideoAnalysisCache()
-            cache_data = cache.load(video_path)
+            cache_data = cache.load(video_path, params=analysis_params)
             
             if not cache_data:
-                self.append_log("⚠️ No analysis cache found for this video.")
-                self.append_log("   Please run the highlighter pipeline first to generate analysis data.")
-                return
+                # If not found, try looking for ANY cache file with this video hash
+                import json
+                from pathlib import Path
+                
+                video_hash = cache._get_video_hash(video_path)
+                cache_dir = Path("./cache")
+                matching_files = list(cache_dir.glob(f"{video_hash}*.cache.json"))
+                
+                if matching_files:
+                    # Load the most recent one
+                    latest_file = max(matching_files, key=lambda p: p.stat().st_mtime)
+                    self.append_log(f"📁 Found cache file: {latest_file.name}")
+                    
+                    with open(latest_file, 'r') as f:
+                        cache_data = json.load(f)
+                    self.append_log(f"✅ Loaded cache data from file")
+                else:
+                    self.append_log("⚠️ No analysis cache found for this video.")
+                    self.append_log("   Please run the highlighter pipeline first to generate analysis data.")
+                    return
             
             self.append_log(f"📊 Opening timeline viewer for: {os.path.basename(video_path)}")
             

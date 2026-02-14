@@ -328,13 +328,15 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
 def collect_analysis_data(video_path, video_duration, fps, transcript_segments, 
                          object_detections, action_detections, scenes, 
                          motion_events, motion_peaks, audio_peaks, source_lang="en",
-                         waveform_data=None, keyword_segments_only=False, search_keywords=None):
+                         waveform_data=None, keyword_segments_only=False, 
+                         search_keywords=None, keyword_matches=None):  # Add this parameter
     """
     Collect all analysis results into a structured dictionary for caching.
-    
+
     Args:
         keyword_segments_only: If True and search_keywords provided, only cache segments containing keywords
         search_keywords: List of keywords to filter transcript segments
+        keyword_matches: Pre-computed keyword matches to cache
         waveform_data: Optional waveform data for timeline visualization
     """
     # Filter transcript segments if we're only caching keyword-relevant parts
@@ -363,13 +365,18 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                 "action_name": str(action_name)
             })
     
+    # Convert numpy arrays/lists to Python native types
+    motion_events_clean = [float(t) for t in motion_events]
+    motion_peaks_clean = [float(t) for t in motion_peaks]
+    audio_peaks_clean = [float(t) for t in audio_peaks]
+    
     analysis_data = {
         "video_metadata": {
-            "duration": video_duration,
-            "fps": fps,
+            "duration": float(video_duration),
+            "fps": float(fps),
             "resolution": "unknown",
             "total_frames": int(video_duration * fps),
-            "file_size": os.path.getsize(video_path) if os.path.exists(video_path) else 0
+            "file_size": int(os.path.getsize(video_path)) if os.path.exists(video_path) else 0
         },
         "transcript": {
             "segments": filtered_transcript_segments if keyword_segments_only else transcript_segments,
@@ -377,21 +384,22 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
             "cached_full_transcript": not keyword_segments_only,
             "keyword_filtered": keyword_segments_only
         },
+        "keyword_matches": keyword_matches or [],
         "objects": [
             {
-                "timestamp": sec,
-                "objects": objs,
+                "timestamp": int(sec),
+                "objects": [str(obj) for obj in objs],
                 "count": len(objs)
             }
             for sec, objs in object_detections.items()
         ],
-        "actions": actions_for_cache,  # Use the properly formatted actions
+        "actions": actions_for_cache,
         "scenes": [
-            {"start": start, "end": end}
+            {"start": float(start), "end": float(end)}
             for start, end in scenes
         ],
-        "motion_events": motion_events,
-        "motion_peaks": motion_peaks,
+        "motion_events": motion_events_clean,
+        "motion_peaks": motion_peaks_clean,
         "pipeline_version": "1.0",
         "cache_flags": {
             "keyword_segments_only": keyword_segments_only,
@@ -402,15 +410,14 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
     # Add audio data (including waveform for timeline viewer)
     # Store in a structured way for easy access
     analysis_data["audio"] = {
-        "peaks": audio_peaks,
+        "peaks": audio_peaks_clean,
         "waveform": waveform_data
     }
     
     # Also keep legacy key for backward compatibility
-    analysis_data["audio_peaks"] = audio_peaks
+    analysis_data["audio_peaks"] = audio_peaks_clean
     
     return analysis_data
-
 
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None, 
                     log_fn=print, progress_fn=None, cancel_flag=None):
@@ -709,6 +716,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         # Check if the cache matches our current keyword requirements
                         cache_keyword_filtered = cached_data.get("transcript", {}).get("keyword_filtered", False)
                         cache_search_keywords = cached_data.get("cache_flags", {}).get("search_keywords", [])
+                        cache_language = cached_data.get("transcript", {}).get("language", "en")  # Add this line
                         
                         # We can use cached data if:
                         # 1. We don't need transcript at all (not using transcript)
@@ -720,14 +728,19 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         if not USE_TRANSCRIPT:
                             cache_compatible = True
                         elif not cache_keyword_filtered:
-                            # Cache has full transcript, we can use it regardless of our keyword needs
-                            cache_compatible = True
-                        elif cache_keyword_filtered and current_keywords:
-                            # Check if cache has the keywords we need
-                            cached_keywords_set = set(cache_search_keywords or [])
-                            current_keywords_set = set([kw.lower() for kw in current_keywords])
-                            if cached_keywords_set.issuperset(current_keywords_set):
+                            # Cache has full transcript - ONLY COMPATIBLE IF LANGUAGES MATCH
+                            if cache_language == TRANSCRIPT_SOURCE_LANG:
                                 cache_compatible = True
+                            else:
+                                log(f"⚠️ Cache language mismatch: cached '{cache_language}' vs requested '{TRANSCRIPT_SOURCE_LANG}'")
+                        elif cache_keyword_filtered and current_keywords:
+                            # Check if cache has the keywords we need and language matches
+                            cached_keywords_set = set([kw.lower() for kw in (cache_search_keywords or [])])
+                            current_keywords_set = set([kw.lower() for kw in current_keywords])
+                            if cached_keywords_set.issuperset(current_keywords_set) and cache_language == TRANSCRIPT_SOURCE_LANG:
+                                cache_compatible = True
+                            else:
+                                log(f"⚠️ Cache incompatible: language mismatch or keywords not matching")
                         
                         if cache_compatible:
                             log(f"✅ Loaded from cache ({load_time:.2f}s) [signature match]")
@@ -735,11 +748,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             # Extract data from cache - Ensure all data is loaded
                             transcript_segments = cached_data.get("transcript", {}).get("segments", [])
                             object_detections_raw = cached_data.get("objects", [])
-                            action_detections_raw = cached_data.get("actions", [])  # This was missing!
+                            action_detections_raw = cached_data.get("actions", [])
                             scenes_raw = cached_data.get("scenes", [])
                             motion_events = cached_data.get("motion_events", [])
                             motion_peaks = cached_data.get("motion_peaks", [])
-                            
+                            keyword_matches = cached_data.get("keyword_matches", [])
+
+
                             # Get audio data - handle both new and old formats
                             audio_block = cached_data.get("audio") or {}
                             if isinstance(audio_block, dict) and "peaks" in audio_block:
@@ -772,6 +787,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             
                             scenes = [(s.get("start", 0), s.get("end", 0)) for s in scenes_raw]
                             
+                            # Extract keyword matches from cache
+                            keyword_matches = cached_data.get("keyword_matches", [])
+
                             # Mark that we're using cached data
                             using_cache = True
                             cache_status = "full" if not cache_keyword_filtered else f"keyword-filtered ({len(cache_search_keywords or [])} keywords)"
@@ -798,8 +816,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- Transcript processing ---
         if not using_cache:
-            # Original transcript processing code
-            if USE_TRANSCRIPT:
+                # Original transcript processing code
                 progress.update_progress(5, 100, "Pipeline", "Processing transcript...")
                 log("🔹 Step 0.5: Processing transcript...")
                 try:
@@ -854,15 +871,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         else:
             log("ℹ️ Using cached transcript")
-            # transcript_segments already loaded from cache
+            # transcript_segments and keyword_matches already loaded from cache
             
-            # 🆕 ADD THIS BLOCK - Re-run keyword search on cached transcript
-            if SEARCH_KEYWORDS and transcript_segments:
-                log(f"🔹 Searching cached transcript for keywords: {SEARCH_KEYWORDS}")
-                keyword_matches = search_transcript_for_keywords(transcript_segments, SEARCH_KEYWORDS, context_seconds=CLIP_TIME//2)
-                log(f"✅ Found {len(keyword_matches)} keyword matches")
+            if keyword_matches:
+                log(f"✅ Loaded {len(keyword_matches)} keyword matches from cache")
             else:
-                keyword_matches = []
+                log("ℹ️ No keyword matches in cache (none were found or no keywords specified)")
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
@@ -1309,19 +1323,20 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # Collect analysis data with keyword filtering if needed
                 analysis_data = collect_analysis_data(
                     video_path=processed_video_path,
-                    video_duration=video_duration,
-                    fps=fps,
+                    video_duration=float(video_duration),  # Ensure float
+                    fps=float(fps),  # Ensure float
                     transcript_segments=transcript_segments,
                     object_detections=object_detections,
                     action_detections=action_detections,
                     scenes=scenes,
-                    motion_events=motion_events,
-                    motion_peaks=motion_peaks,
-                    audio_peaks=audio_peaks,
+                    motion_events=[float(t) for t in motion_events],  # Convert numpy floats
+                    motion_peaks=[float(t) for t in motion_peaks],  # Convert numpy floats
+                    audio_peaks=[float(t) for t in audio_peaks],  # Convert numpy floats
                     source_lang=TRANSCRIPT_SOURCE_LANG,
                     waveform_data=waveform_data,
                     keyword_segments_only=keyword_segments_only,
-                    search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None
+                    search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None,
+                    keyword_matches=keyword_matches
                 )
                 
                 # Add analysis parameters for future validation
@@ -1329,15 +1344,17 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 
                 # Save to cache with signature-based naming
                 cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
-                cache.save(processed_video_path, analysis_data)
+                cache.save(processed_video_path, analysis_data, params=analysis_params)
                 
                 if keyword_segments_only:
-                    log(f"✅ Analysis results cached (keyword-filtered: {len(analysis_data['transcript']['segments'])} segments)")
+                    log(f"✅ Analysis results cached (keyword-filtered: {len(analysis_data['transcript']['segments'])} segments, language: {TRANSCRIPT_SOURCE_LANG})")
                 else:
-                    log(f"✅ Analysis results cached (full transcript: {len(analysis_data['transcript']['segments'])} segments)")
+                    log(f"✅ Analysis results cached (full transcript: {len(analysis_data['transcript']['segments'])} segments, language: {TRANSCRIPT_SOURCE_LANG})")
                 
             except Exception as e:
                 log(f"⚠️ Failed to save cache: {e}")
+                import traceback
+                log(f"Full error: {traceback.format_exc()}")
         # ========== END CACHE SAVE ==========
 
         # 6 Compute scores per second
@@ -1622,17 +1639,18 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     'action_points': ACTION_POINTS
                 }
                 
-                # Create segments metadata with scores
+                # Create segments metadata with scores - CONVERT NUMPY TYPES TO PYTHON NATIVE
                 segments_metadata = []
                 for start, end in segments:
                     duration = end - start
                     
-                    # Calculate average score in this segment
-                    avg_score = 0
+                    # Calculate average score in this segment - CONVERT to Python float
+                    avg_score = 0.0
                     if start < len(score) and end < len(score):
                         segment_indices = range(int(start), min(int(end) + 1, len(score)))
                         if segment_indices:
-                            avg_score = np.mean([score[i] for i in segment_indices])
+                            # Explicitly convert numpy float to Python float
+                            avg_score = float(np.mean([score[i] for i in segment_indices]))
                     
                     # Determine primary reason
                     primary_reason = "multiple_signals"
@@ -1645,16 +1663,24 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     elif start in audio_set:
                         primary_reason = "audio_peaks"
                     
+                    # Make sure all values are Python native types
                     segments_metadata.append({
-                        'score': avg_score,
+                        'score': float(avg_score) if avg_score != 0 else 0.0,
                         'signals': {
                             'objects': 1.0 if start in object_detections else 0.0,
                             'actions': 1.0 if start in detections_by_sec else 0.0,
                             'motion': 1.0 if start in motion_peaks_set else 0.0,
                             'audio': 1.0 if start in audio_set else 0.0
                         },
-                        'primary_reason': primary_reason
+                        'primary_reason': str(primary_reason)
                     })
+                
+                # Convert score_info values to Python native types
+                score_info_python = {
+                    'total_score': float(np.sum(score)),
+                    'max_score': float(np.max(score)),
+                    'avg_score': float(np.mean(score))
+                }
                 
                 # Save to highlight cache
                 cache = VideoAnalysisCache(cache_dir=gui_config.get("cache_dir", "./cache"))
@@ -1663,11 +1689,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     highlight_parameters,
                     segments,
                     segments_metadata,
-                    score_info={
-                        'total_score': np.sum(score),
-                        'max_score': np.max(score),
-                        'avg_score': np.mean(score)
-                    }
+                    score_info_python,  # Use the converted version
+                    analysis_params=analysis_params
                 )
                 
                 if success:
@@ -1677,6 +1700,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     
             except Exception as e:
                 log(f"⚠️ Error saving highlight cache: {e}")
+                import traceback
+                log(f"Full error: {traceback.format_exc()}")
         # ========== END HIGHLIGHT CACHE SAVE ==========
 
 
