@@ -359,7 +359,7 @@ class AsyncBatchedInferenceEngine:
 class ParallelYOLODetector:
     """Parallel YOLO detection with frame skipping - optimized for throughput"""
 
-    def __init__(self, model_name="yolo11n.pt", num_workers=2, skip_frames=4):
+    def __init__(self, model_name="yolo11n.pt", num_workers=1, skip_frames=2):
         self.model = YOLO(model_name)
         self.skip_frames = skip_frames
         self.frame_counter = 0
@@ -431,7 +431,7 @@ class ParallelYOLODetector:
 class PreprocessPipeline:
     """Offloads frame preprocessing to a thread pool so it overlaps with inference"""
 
-    def __init__(self, num_workers=2):
+    def __init__(self, num_workers=1):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
 
     def submit(self, frame, input_shape, roi=None):
@@ -703,7 +703,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                          progress_callback=None, cancel_flag=None,
                          draw_bboxes=True, annotated_output=None,
                          use_person_detection=True, max_people=2,
-                         yolo_workers=2, yolo_skip_frames=4, downscale_factor=0.5,
+                         yolo_workers=1, yolo_skip_frames=2, downscale_factor=0.5,
                          warm_up_seconds=2, include_model_type=False,
                          openvino_threads=None, preprocess_workers=2):
     """
@@ -1372,9 +1372,9 @@ if __name__ == "__main__":
                         help="Maximum number of people to track")
     parser.add_argument("--interesting-actions", type=str, nargs="+",
                         help="Specific actions to detect")
-    parser.add_argument("--yolo-workers", type=int, default=2,
+    parser.add_argument("--yolo-workers", type=int, default=1,
                         help="Number of parallel YOLO workers")
-    parser.add_argument("--yolo-skip", type=int, default=4,
+    parser.add_argument("--yolo-skip", type=int, default=2,
                         help="Skip YOLO detection every N frames")
     parser.add_argument("--downscale-factor", type=float, default=0.5,
                         help="Downscale factor for high-res videos (0.1-1.0)")
