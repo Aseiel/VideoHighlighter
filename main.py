@@ -37,8 +37,6 @@ class DownloadWorker(QThread):
     log = Signal(str)                    # log messages
     cancelled = Signal()                 # emitted when cancelled
     video_processed = Signal(str, dict)  # filepath, processing result dict
-
-    # NEW: Signal to safely add items to GUI list widget from worker thread
     add_to_file_list = Signal(str)       # emits filepath to be added
 
     def __init__(self, url, save_dir, pattern, time_range=None, download_full=True,
@@ -565,10 +563,11 @@ class VideoHighlighterGUI(QWidget):
         # --- Tab 1: Basic Settings ---
         basic_tab = QWidget()
         basic_layout = QVBoxLayout()
-        scores_box = QGroupBox("Points & durations")
-        scores_layout = QFormLayout()
 
-        # Scoring points
+        # ── Group 1: Scoring Points ──
+        points_box = QGroupBox("Scoring Points")
+        points_layout = QFormLayout()
+
         self.spin_scene_points = QSpinBox(); self.spin_scene_points.setRange(0,100); self.spin_scene_points.setValue(scoring_cfg.get("scene_points", 0))
         self.spin_motion_event_points = QSpinBox(); self.spin_motion_event_points.setRange(0,100); self.spin_motion_event_points.setValue(scoring_cfg.get("motion_event_points", 0))
         self.spin_motion_peak = QSpinBox(); self.spin_motion_peak.setRange(0,100); self.spin_motion_peak.setValue(scoring_cfg.get("motion_peak_points", 3))
@@ -577,24 +576,91 @@ class VideoHighlighterGUI(QWidget):
         self.spin_transcript_points = QSpinBox(); self.spin_transcript_points.setRange(0,100); self.spin_transcript_points.setValue(scoring_cfg.get("transcript_points", 2))
         self.spin_object = QSpinBox(); self.spin_object.setRange(0,100); self.spin_object.setValue(scoring_cfg.get("object_points", 1))
         self.spin_action = QSpinBox(); self.spin_action.setRange(0,1000); self.spin_action.setValue(scoring_cfg.get("action_points", 10))
-        self.spin_clip_time = QSpinBox(); self.spin_clip_time.setRange(1,300); self.spin_clip_time.setValue(highlights_cfg.get("clip_time", 10))
+
+        points_layout.addRow("Scene points:", self.spin_scene_points)
+        points_layout.addRow("Motion event points:", self.spin_motion_event_points)
+        points_layout.addRow("Motion peak points:", self.spin_motion_peak)
+        points_layout.addRow("Audio peak points:", self.spin_audio_peak)
+        points_layout.addRow("Keyword points (keywords in transcript):", self.spin_keyword_points)
+        points_layout.addRow("Transcript points (all words):", self.spin_transcript_points)
+        points_layout.addRow("Object points:", self.spin_object)
+        points_layout.addRow("Action points:", self.spin_action)
+
+        points_box.setLayout(points_layout)
+        basic_layout.addWidget(points_box)
+
+        # ── Group 2: Duration & Cutting ──
+        duration_box = QGroupBox("Duration && Cutting")
+        duration_layout = QVBoxLayout()
+
+        # Main duration controls (always visible)
+        duration_form = QFormLayout()
+
         self.spin_max_duration = QSpinBox(); self.spin_max_duration.setRange(1,3600); self.spin_max_duration.setValue(highlights_cfg.get("max_duration", 420))
         self.spin_exact_duration = QSpinBox(); self.spin_exact_duration.setRange(0,3600); self.spin_exact_duration.setValue(highlights_cfg.get("exact_duration", 0))
+        self.spin_clip_time = QSpinBox(); self.spin_clip_time.setRange(0,300); self.spin_clip_time.setValue(highlights_cfg.get("clip_time", 10))
 
-         # Add to form layout
-        scores_layout.addRow("Scene points:", self.spin_scene_points)
-        scores_layout.addRow("Motion event points:", self.spin_motion_event_points)
-        scores_layout.addRow("Motion peak points:", self.spin_motion_peak)
-        scores_layout.addRow("Audio peak points:", self.spin_audio_peak)
-        scores_layout.addRow("Keyword points (keywords in transcript):", self.spin_keyword_points)
-        scores_layout.addRow("Transcript points (all words):", self.spin_transcript_points)
-        scores_layout.addRow("Object points:", self.spin_object)
-        scores_layout.addRow("Action points:", self.spin_action)
-        scores_layout.addRow("Clip time (s):", self.spin_clip_time)
-        scores_layout.addRow("Max highlight duration (s):", self.spin_max_duration)
-        scores_layout.addRow("Exact duration (s, 0 = off):", self.spin_exact_duration)
-        scores_box.setLayout(scores_layout)
-        basic_layout.addWidget(scores_box)
+        duration_form.addRow("Max highlight duration (s):", self.spin_max_duration)
+        duration_form.addRow("Exact duration (s, 0 = off):", self.spin_exact_duration)
+        duration_form.addRow("Clip time (s, 0 = auto):", self.spin_clip_time)
+
+        duration_layout.addLayout(duration_form)
+
+        # Auto-segmentation info label (always visible, updates dynamically)
+        self.auto_seg_info_label = QLabel("")
+        self.auto_seg_info_label.setStyleSheet("color: #2196F3; font-style: italic; padding: 4px;")
+        self.auto_seg_info_label.setWordWrap(True)
+        duration_layout.addWidget(self.auto_seg_info_label)
+
+        # ── Auto-segmentation controls (shown only when clip_time = 0) ──
+        self.auto_seg_group = QGroupBox("Auto-Segmentation Settings")
+        auto_seg_layout = QFormLayout()
+
+        self.spin_auto_min_clip = QSpinBox()
+        self.spin_auto_min_clip.setRange(1, 30)
+        self.spin_auto_min_clip.setValue(highlights_cfg.get("auto_min_clip", 2))
+        self.spin_auto_min_clip.setSuffix(" s")
+        self.spin_auto_min_clip.setToolTip("Shortest clip the auto-cutter will produce")
+
+        self.spin_auto_max_clip = QSpinBox()
+        self.spin_auto_max_clip.setRange(3, 120)
+        self.spin_auto_max_clip.setValue(highlights_cfg.get("auto_max_clip", 30))
+        self.spin_auto_max_clip.setSuffix(" s")
+        self.spin_auto_max_clip.setToolTip("Longest single clip before it gets trimmed to the best sub-window")
+
+        self.spin_auto_merge_gap = QSpinBox()
+        self.spin_auto_merge_gap.setRange(0, 10)
+        self.spin_auto_merge_gap.setValue(highlights_cfg.get("auto_merge_gap", 2))
+        self.spin_auto_merge_gap.setSuffix(" s")
+        self.spin_auto_merge_gap.setToolTip("Merge interest regions that are within this gap into one clip")
+
+        auto_seg_layout.addRow("Min clip length:", self.spin_auto_min_clip)
+        auto_seg_layout.addRow("Max clip length:", self.spin_auto_max_clip)
+        auto_seg_layout.addRow("Merge gap:", self.spin_auto_merge_gap)
+
+        self.auto_seg_group.setLayout(auto_seg_layout)
+        duration_layout.addWidget(self.auto_seg_group)
+
+        duration_box.setLayout(duration_layout)
+        basic_layout.addWidget(duration_box)
+
+        # ── Connect clip_time spinner to show/hide auto-seg controls ──
+        def on_clip_time_changed(value):
+            is_auto = (value == 0)
+            self.auto_seg_group.setVisible(is_auto)
+            if is_auto:
+                self.auto_seg_info_label.setText(
+                    "🔧 Auto mode: the app will determine clip boundaries from signal structure "
+                    "(action durations, scene cuts, keyword timing, object clusters, audio/motion peaks)."
+                )
+            else:
+                self.auto_seg_info_label.setText(
+                    f"✂️ Fixed mode: each highlight clip will be {value}s long."
+                )
+
+        self.spin_clip_time.valueChanged.connect(on_clip_time_changed)
+        # Trigger once to set initial state
+        on_clip_time_changed(self.spin_clip_time.value())
 
         # Highlight object classes
         obj_layout = QHBoxLayout()
@@ -1105,6 +1171,9 @@ class VideoHighlighterGUI(QWidget):
             "yolo_pt_path": self.yolo_pt_path.text().strip() or None,
             "openvino_model_folder": self.openvino_model_folder.text().strip() or None,
             "sample_rate": int(self.sample_rate_spin.value()),
+            "auto_min_clip": float(self.spin_auto_min_clip.value()),
+            "auto_max_clip": float(self.spin_auto_max_clip.value()),
+            "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
             "draw_object_boxes": self.bbox_objects_chk.isChecked(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
         }
@@ -1591,6 +1660,9 @@ class VideoHighlighterGUI(QWidget):
                 "exact_duration": int(self.spin_exact_duration.value()),
                 "keep_temp": self.keep_temp_chk.isChecked(),
                 "skip_highlights": self.skip_highlights_chk.isChecked(),
+                "auto_min_clip": int(self.spin_auto_min_clip.value()),
+                "auto_max_clip": int(self.spin_auto_max_clip.value()),
+                "auto_merge_gap": int(self.spin_auto_merge_gap.value()),
                 "use_time_range": self.use_time_range_chk.isChecked(),
                 "range_start_pct": self.start_time_slider.value(),
                 "range_end_pct": self.end_time_slider.value(),
@@ -2050,6 +2122,9 @@ class VideoHighlighterGUI(QWidget):
             "yolo_pt_path": self.yolo_pt_path.text().strip() or None,
             "openvino_model_folder": self.openvino_model_folder.text().strip() or None,
             "sample_rate": int(self.sample_rate_spin.value()),
+            "auto_min_clip": float(self.spin_auto_min_clip.value()),
+            "auto_max_clip": float(self.spin_auto_max_clip.value()),
+            "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
             "draw_object_boxes": self.bbox_objects_chk.isChecked(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
         }
