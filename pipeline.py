@@ -18,6 +18,7 @@ from modules.audio_peaks import extract_audio_peaks
 from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData
 from modules.video_cutter import cut_video
+from modules.auto_segments import build_auto_segments
 
 # Keep warnings about CUDA quiet
 warnings.filterwarnings("ignore", message="torch.cuda")
@@ -816,7 +817,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- Transcript processing ---
         if not using_cache:
-                # Original transcript processing code
+            # Original transcript processing code
+            if USE_TRANSCRIPT:
                 progress.update_progress(5, 100, "Pipeline", "Processing transcript...")
                 log("🔹 Step 0.5: Processing transcript...")
                 try:
@@ -871,12 +873,15 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         else:
             log("ℹ️ Using cached transcript")
-            # transcript_segments and keyword_matches already loaded from cache
+            # transcript_segments already loaded from cache
             
-            if keyword_matches:
-                log(f"✅ Loaded {len(keyword_matches)} keyword matches from cache")
+            # 🆕 ADD THIS BLOCK - Re-run keyword search on cached transcript
+            if SEARCH_KEYWORDS and transcript_segments:
+                log(f"🔹 Searching cached transcript for keywords: {SEARCH_KEYWORDS}")
+                keyword_matches = search_transcript_for_keywords(transcript_segments, SEARCH_KEYWORDS, context_seconds=CLIP_TIME//2)
+                log(f"✅ Found {len(keyword_matches)} keyword matches")
             else:
-                log("ℹ️ No keyword matches in cache (none were found or no keywords specified)")
+                keyword_matches = []
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
@@ -1542,77 +1547,126 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         if 'segments_logged' not in globals():
             globals()['segments_logged'] = False
 
-        # Only use scored seconds depending on mode
-        if duration_mode == "EXACT":
-            candidate_indices = np.arange(len(score))  # allow seconds with 0 point score 
-        else:  # "MAX"
-            candidate_indices = np.where(score > 0)[0]
-
-        # Get scores for candidate indices
-        candidate_scores = score[candidate_indices]
-
-        # Get confidence values for tie-breaking
-        candidate_confidences = np.zeros(len(candidate_indices))
-        for idx, sec in enumerate(candidate_indices):
-            if sec in detections_by_sec:
-                candidate_confidences[idx] = max(conf for _, conf in detections_by_sec[sec])
-
-        # Sort by score descending, then by confidence descending for ties
-        sorted_indices = np.lexsort((-candidate_confidences, -candidate_scores))  # negative for descending
-        top_indices_all = candidate_indices[sorted_indices]
-
-        # DEBUG: Print top 20 actions moments being considered
-        print(f"\n=== TOP 20 ACTION MOMENTS BEING CONSIDERED ===")
-        for i, sec in enumerate(top_indices_all[:20]):
-            timestamp = f"{sec//60:02d}:{sec%60:02d}"
+        # --- Rebuild selected_sequences if needed (e.g. loaded from cache) ---
+        # selected_sequences is built during fresh action detection but not
+        # populated when using cache. Auto-segmentation needs it, so rebuild
+        # from action_detections using the same grouping logic.
+        if not selected_sequences and action_detections:
+            log("🔄 Rebuilding action sequences from cached detections...")
             
-            # Get confidence for this second
-            confidence = 0.0
-            if sec in detections_by_sec:
-                confidence = max(conf for _, conf in detections_by_sec[sec])
+            # Group by action type
+            sequences_by_action = defaultdict(list)
+            for detection in action_detections:
+                if len(detection) >= 5:
+                    timestamp, frame_id, action_id, score_val, action_name = detection[:5]
+                    sequences_by_action[action_name].append(
+                        (timestamp, frame_id, action_id, score_val, action_name)
+                    )
+
+            # Group consecutive detections per action type
+            grouped_by_action = {}
+            for action_name, action_list in sequences_by_action.items():
+                grouped_by_action[action_name] = group_consecutive_adaptive(
+                    action_list, max_gap=1.3, jump_threshold=0.01
+                )
+                log(f"   {action_name}: {len(action_list)} detections → "
+                    f"{len(grouped_by_action[action_name])} sequences")
+
+            # Select best sequences per action (same quota logic as fresh run)
+            num_actions = len(grouped_by_action)
+            MAX_ACTION_DURATION = target_duration * 3
+            quota_per_action = MAX_ACTION_DURATION / num_actions if num_actions > 0 else 0
+
+            selected_sequences = []
+            for action_name, action_seqs in grouped_by_action.items():
+                sorted_seqs = sorted(action_seqs, key=lambda x: x[3], reverse=True)
+                action_duration = 0
+                for seq in sorted_seqs:
+                    start_time_seq, end_time_seq, duration_seq, confidence, name = seq
+                    if action_duration >= quota_per_action:
+                        break
+                    selected_sequences.append(seq)
+                    action_duration += duration_seq
+
+            log(f"✅ Rebuilt {len(selected_sequences)} action sequences from "
+                f"{len(action_detections)} cached detections")
+
+        if CLIP_TIME == 0:
+            # ========== AUTO-SEGMENTATION MODE ==========
+            log("🔧 CLIP_TIME=0 → using auto-segmentation (variable-length clips)")
             
-            print(f"{i+1}. Second {sec} ({timestamp}): {score[sec]:.1f} points, confidence: {confidence:.3f}")
+            segments, auto_regions = build_auto_segments(
+                video_duration=video_duration,
+                score=score,
+                scenes=scenes,
+                motion_events=motion_events,
+                motion_peaks=motion_peaks,
+                audio_peaks=audio_peaks,
+                object_detections=object_detections,
+                action_sequences=selected_sequences,  # from action grouping above
+                keyword_matches=keyword_matches,
+                target_duration=target_duration,
+                duration_mode=duration_mode,
+                min_clip=float(gui_config.get("auto_min_clip", 1.5)),
+                max_clip=float(gui_config.get("auto_max_clip", 30.0)),
+                merge_gap=float(gui_config.get("auto_merge_gap", 1.5)),
+                log_fn=log,
+            )
             
-        segments = []
-        used_seconds = set()
+        else:
+            # ========== FIXED-WINDOW MODE (original logic) ==========
+            # Only use scored seconds depending on mode
+            if duration_mode == "EXACT":
+                candidate_indices = np.arange(len(score))
+            else:
+                candidate_indices = np.where(score > 0)[0]
 
-        for sec in top_indices_all:
-            if sec in used_seconds:
-                continue
+            candidate_scores = score[candidate_indices]
 
-            start = max(0, sec - CLIP_TIME // 2)
-            end = min(video_duration, start + CLIP_TIME)
+            candidate_confidences = np.zeros(len(candidate_indices))
+            for idx, sec in enumerate(candidate_indices):
+                if sec in detections_by_sec:
+                    candidate_confidences[idx] = max(conf for _, conf in detections_by_sec[sec])
 
-            # Adjust start/end to ensure full CLIP_TIME
-            if end - start < CLIP_TIME and end < video_duration:
+            sorted_indices = np.lexsort((-candidate_confidences, -candidate_scores))
+            top_indices_all = candidate_indices[sorted_indices]
+
+            segments = []
+            used_seconds = set()
+
+            for sec in top_indices_all:
+                if sec in used_seconds:
+                    continue
+
+                start = max(0, sec - CLIP_TIME // 2)
                 end = min(video_duration, start + CLIP_TIME)
-            if end - start < CLIP_TIME and start > 0:
-                start = max(0, end - CLIP_TIME)
 
-            # Skip if any second is already used
-            if any(s in used_seconds for s in range(int(start), int(end))):
-                continue
+                if end - start < CLIP_TIME and end < video_duration:
+                    end = min(video_duration, start + CLIP_TIME)
+                if end - start < CLIP_TIME and start > 0:
+                    start = max(0, end - CLIP_TIME)
 
-            # Adjust segment to not exceed target duration ---
-            current_duration = sum(e - s for s, e in segments)
-            remaining = target_duration - current_duration
-            if remaining <= 0:
-                break
-            if end - start > remaining:
-                end = start + remaining
+                if any(s in used_seconds for s in range(int(start), int(end))):
+                    continue
 
-            segments.append((start, end))
-            for s in range(int(start), int(end)):
-                used_seconds.add(s)
+                current_duration = sum(e - s for s, e in segments)
+                remaining = target_duration - current_duration
+                if remaining <= 0:
+                    break
+                if end - start > remaining:
+                    end = start + remaining
 
-            # Break based on duration mode
-            current_duration = sum(e - s for s, e in segments)
-            if duration_mode == "EXACT" and current_duration >= EXACT_DURATION:
-                break
-            elif duration_mode == "MAX" and current_duration >= MAX_DURATION:
-                break
+                segments.append((start, end))
+                for s in range(int(start), int(end)):
+                    used_seconds.add(s)
 
-        # Sort segments by start time
+                current_duration = sum(e - s for s, e in segments)
+                if duration_mode == "EXACT" and current_duration >= EXACT_DURATION:
+                    break
+                elif duration_mode == "MAX" and current_duration >= MAX_DURATION:
+                    break
+
+        # Sort segments by start time (both modes)
         segments.sort(key=lambda x: x[0])
 
         print("\n🔍 FINAL HIGHLIGHT BREAKDOWN:")
