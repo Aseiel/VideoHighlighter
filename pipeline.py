@@ -116,11 +116,27 @@ def check_cancellation(cancel_flag, log_fn, step_name="operation"):
         log_fn(f"⏹️ Cancelled during {step_name}")
         raise RuntimeError(f"Operation cancelled during {step_name}")
 
-
-def check_xpu_availability(log_fn=print):
-    """Check if Intel XPU is available and return (available, device_str)."""
+def check_gpu_availability(log_fn=print):
+    """Check for available GPU acceleration: CUDA > XPU > CPU."""
+    
+    # 1. Check CUDA first (NVIDIA GPUs)
     try:
-        # Try to import but don't fail if not available
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            log_fn(f"✅ CUDA available: {device_count} device(s)")
+            for i in range(device_count):
+                try:
+                    device_name = torch.cuda.get_device_name(i)
+                    vram = torch.cuda.get_device_properties(i).total_mem / (1024**3)
+                    log_fn(f"   Device {i}: {device_name} ({vram:.1f} GB VRAM)")
+                except Exception:
+                    pass
+            return True, "cuda:0"
+    except Exception as e:
+        log_fn(f"⚠️ CUDA check failed: {e}")
+
+    # 2. Check Intel XPU
+    try:
         import intel_extension_for_pytorch as ipex
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             device_count = torch.xpu.device_count()
@@ -132,22 +148,25 @@ def check_xpu_availability(log_fn=print):
                 except Exception:
                     pass
             return True, "xpu:0"
-        else:
-            log_fn("❌ Intel XPU not available")
-            return False, "cpu"
     except ImportError:
-        log_fn("❌ Intel Extension for PyTorch not installed")
-        log_fn("   Install with: pip install intel_extension_for_pytorch")
-        return False, "cpu"
+        log_fn("ℹ️ Intel Extension for PyTorch not installed")
     except Exception as e:
-        log_fn(f"❌ XPU initialization error: {e}")
-        return False, "cpu"
+        log_fn(f"⚠️ XPU initialization error: {e}")
+
+    # 3. Fallback to CPU
+    log_fn("ℹ️ No GPU acceleration found, using CPU")
+    return False, "cpu"
+
+
+# Keep old name as alias for backward compatibility
+check_xpu_availability = check_gpu_availability
 
 def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=print,
                                  progress_fn=None, frame_skip=5, cancel_flag=None,
                                  csv_output="object_log.csv", draw_boxes=False,
                                  annotated_output=None, yolo_model_size="n",
-                                 yolo_pt_path=None, openvino_model_folder=None):
+                                 yolo_pt_path=None, openvino_model_folder=None,
+                                 device="cpu"):
     """Object detection with progress tracking, cancellation support, and optional CSV export in mm:ss format"""
 
     cap = cv2.VideoCapture(video_path)
@@ -229,7 +248,7 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
                     current_second = sec
 
                     try:
-                        results = model(frame, verbose=False, imgsz=640)
+                        results = model(frame, verbose=False, imgsz=640, device=device)
                         objs = []
                         annotated_frame = frame.copy() if draw_boxes else None
                         
@@ -556,12 +575,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         progress.update_progress(0, 100, "Pipeline", "Initializing...")
         check_cancellation(cancel_flag, log, "setup")
 
-        # Device check
-        motion_device = "cpu"
-        xpu_available, yolo_device = check_xpu_availability(log_fn=log)
-        if not xpu_available:
-            log("⚠️ Falling back to CPU for YOLO inference")
-            yolo_device = "cpu"
+        # Device check — prefer CUDA > XPU > CPU
+        gpu_available, yolo_device = check_gpu_availability(log_fn=log)
+        motion_device = yolo_device if "cuda" in yolo_device else "cpu"
         log(f"🎯 YOLO device: {yolo_device}")
 
         # Get video info
@@ -1058,11 +1074,20 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             except Exception as e:
                 log(f"❌ YOLO export to OpenVINO failed: {e}")
 
-        # Load YOLO model
+        # Load YOLO model — use CUDA .pt model if GPU available, else OpenVINO
         try:
             check_cancellation(cancel_flag, log, "YOLO model loading")
-            yolo_model = YOLO(openvino_model_folder, task="detect")
-            log(f"🎯 YOLO OpenVINO model loaded successfully")
+            
+            if "cuda" in yolo_device:
+                # CUDA: load the .pt model directly (OpenVINO doesn't use CUDA)
+                log(f"🎯 Loading YOLO .pt model for CUDA: {yolo_pt_path}")
+                yolo_model = YOLO(yolo_pt_path)
+                yolo_model.to(yolo_device)
+                log(f"✅ YOLO model loaded on {yolo_device}")
+            else:
+                # CPU/XPU: use OpenVINO
+                yolo_model = YOLO(openvino_model_folder, task="detect")
+                log(f"✅ YOLO OpenVINO model loaded")
         except RuntimeError:
             return None
         except Exception as e:
@@ -1099,7 +1124,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     annotated_output=object_annotated_path,
                     yolo_model_size=yolo_model_size,
                     yolo_pt_path=yolo_pt_path,
-                    openvino_model_folder=openvino_model_folder
+                    openvino_model_folder=openvino_model_folder,
+                    device=yolo_device
                 )
 
                 log(f"✅ Object detection complete: {len(object_detections)} seconds with objects")
@@ -1185,7 +1211,25 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     action_annotated_path = os.path.join(temp_folder, f"{video_basename}_actions_annotated.mp4")
                     log(f"🎨 Action labels enabled, output: {action_annotated_path}")
                 
-                # Call action detection with include_model_type=False for backward compatibility
+                # Determine action backend from GUI config
+                action_backend = gui_config.get("action_backend", "auto")
+                r3d_model = gui_config.get("r3d_model", "r3d_18")
+
+                if action_backend == "openvino":
+                    enable_r3d = False
+                    r3d_half = False
+                elif action_backend == "r3d_cuda":
+                    enable_r3d = True
+                    r3d_half = True   # FP16 on CUDA
+                elif action_backend == "r3d_cpu":
+                    enable_r3d = True
+                    r3d_half = False  # FP32 on CPU
+                else:  # "auto"
+                    enable_r3d = True  # load_models() auto-detects CUDA
+                    r3d_half = True
+
+                log(f"🎯 Action backend: {action_backend} | R3D model: {r3d_model} | enable_r3d: {enable_r3d}")
+
                 all_action_detections = run_action_detection(
                     video_path=processed_video_path,
                     sample_rate=sample_rate,
@@ -1197,7 +1241,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     annotated_output=action_annotated_path,
                     use_person_detection=True,
                     max_people=2,
-                    include_model_type=False
+                    include_model_type=False,
+                    enable_r3d=enable_r3d,
+                    r3d_model_name=r3d_model,
+                    r3d_half=r3d_half,
                 )
 
                 check_cancellation(cancel_flag, log, "action recognition processing")
@@ -2083,14 +2130,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         seconds = int(elapsed % 60)
         log(f"⏱️ Processing time: {minutes}m {seconds}s")
 
-        # Clean up XPU memory if used
+        # Clean up GPU memory
         try:
-            if xpu_available and "xpu" in yolo_device:
-                try:
-                    torch.xpu.empty_cache()
-                    log("✅ XPU memory cleaned up")
-                except Exception:
-                    pass
+            if "cuda" in yolo_device:
+                torch.cuda.empty_cache()
+                log("✅ CUDA memory cleaned up")
+            elif "xpu" in yolo_device:
+                torch.xpu.empty_cache()
+                log("✅ XPU memory cleaned up")
         except Exception:
             pass
 
