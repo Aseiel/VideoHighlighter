@@ -1,0 +1,92 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version (e.g. 0.4.6)'
+        required: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+      - name: Build EXE
+        run: pyinstaller --name "VideoHighlighter" --windowed --add-data "config.yaml;." --add-data "yolo_objects_labels.json;." --add-data "kinetics_400_labels.json;." --add-data "assets;assets" --add-data "modules;modules" --add-data "models;models" --hidden-import PySide6 --hidden-import whisper --hidden-import ultralytics --hidden-import openvino --collect-all whisper --collect-all ultralytics main.py
+      - name: Install 7zip
+        run: choco install 7zip -y
+      - name: Create archive
+        run: 7z a -t7z -mx=9 -v1900m VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z ./dist/VideoHighlighter
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z*
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install system deps
+        run: brew install ffmpeg create-dmg
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+      - name: Build APP
+        run: |
+          pyinstaller --name "VideoHighlighter" \
+            --windowed \
+            --add-data "config.yaml:." \
+            --add-data "yolo_objects_labels.json:." \
+            --add-data "kinetics_400_labels.json:." \
+            --add-data "assets:assets" \
+            --add-data "modules:modules" \
+            --add-data "models:models" \
+            --hidden-import PySide6 \
+            --hidden-import whisper \
+            --hidden-import ultralytics \
+            --hidden-import openvino \
+            --collect-all whisper \
+            --collect-all ultralytics \
+            main.py
+      - name: Create DMG
+        run: |
+          create-dmg \
+            --volname "VideoHighlighter" \
+            --window-size 600 400 \
+            --icon "VideoHighlighter.app" 150 200 \
+            --app-drop-link 450 200 \
+            "VideoHighlighter-${{ github.event.inputs.release_version }}.dmg" \
+            "dist/VideoHighlighter.app"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-build
+          path: VideoHighlighter-${{ github.event.inputs.release_version }}.dmg
+
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.event.inputs.release_version }}
+          name: VideoHighlighter ${{ github.event.inputs.release_version }}
+          draft: true
+          artifacts: "windows-build/*,mac-build/*"
+          token: ${{ secrets.GITHUB_TOKEN }}
