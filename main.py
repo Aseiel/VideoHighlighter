@@ -789,6 +789,38 @@ class VideoHighlighterGUI(QWidget):
         misc_layout.addRow("YOLO model size:", self.yolo_model_combo)
         misc_layout.addRow("YOLO .pt path (optional):", self.yolo_pt_path)
         misc_layout.addRow("OpenVINO model folder (optional):", self.openvino_model_folder)
+        # === ACTION RECOGNITION BACKEND ===
+        self.action_backend_combo = QComboBox()
+        self.action_backend_combo.addItem("Auto (CUDA if available, else OpenVINO)", "auto")
+        self.action_backend_combo.addItem("OpenVINO Only (Intel / CPU)", "openvino")
+        self.action_backend_combo.addItem("R3D + CUDA (NVIDIA GPU)", "r3d_cuda")
+        self.action_backend_combo.addItem("R3D + CPU (PyTorch, slow)", "r3d_cpu")
+
+        current_backend = advanced_cfg.get("action_backend", "auto")
+        idx_ab = self.action_backend_combo.findData(current_backend)
+        self.action_backend_combo.setCurrentIndex(idx_ab if idx_ab >= 0 else 0)
+
+        self.r3d_model_combo = QComboBox()
+        self.r3d_model_combo.addItem("R3D-18 (fastest)", "r3d_18")
+        self.r3d_model_combo.addItem("MC3-18 (mixed convolution)", "mc3_18")
+        self.r3d_model_combo.addItem("R(2+1)D-18 (most accurate)", "r2plus1d_18")
+
+        current_r3d = advanced_cfg.get("r3d_model", "r3d_18")
+        idx_r3d = self.r3d_model_combo.findData(current_r3d)
+        self.r3d_model_combo.setCurrentIndex(idx_r3d if idx_r3d >= 0 else 0)
+
+        def on_action_backend_changed(index):
+            backend = self.action_backend_combo.currentData()
+            self.r3d_model_combo.setEnabled(backend in ("auto", "r3d_cuda", "r3d_cpu"))
+
+        self.action_backend_combo.currentIndexChanged.connect(on_action_backend_changed)
+        on_action_backend_changed(0)
+
+        misc_layout.addRow("Action recognition backend:", self.action_backend_combo)
+        misc_layout.addRow("R3D model variant:", self.r3d_model_combo)
+
+        misc_box.setLayout(misc_layout)
+
         misc_box.setLayout(misc_layout)
         advanced_layout.addWidget(misc_box)
         
@@ -1176,6 +1208,9 @@ class VideoHighlighterGUI(QWidget):
             "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
             "draw_object_boxes": self.bbox_objects_chk.isChecked(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
+            "action_backend": self.action_backend_combo.currentData(),
+            "r3d_model": self.r3d_model_combo.currentData(),
+
         }
       
         # Add time range if enabled
@@ -1706,6 +1741,8 @@ class VideoHighlighterGUI(QWidget):
                 "yolo_model_size": self.yolo_model_combo.currentData(),
                 "yolo_pt_path": self.yolo_pt_path.text().strip(),
                 "openvino_model_folder": self.openvino_model_folder.text().strip(),
+                "action_backend": self.action_backend_combo.currentData(),
+                "r3d_model": self.r3d_model_combo.currentData(),
             },
             "visualization": {
                 "draw_object_boxes": self.bbox_objects_chk.isChecked(),
@@ -2127,6 +2164,8 @@ class VideoHighlighterGUI(QWidget):
             "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
             "draw_object_boxes": self.bbox_objects_chk.isChecked(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
+            "action_backend": self.action_backend_combo.currentData(),
+            "r3d_model": self.r3d_model_combo.currentData(),
         }
 
         # --- Skip highlights logic ---

@@ -15,7 +15,26 @@ import os
 import gc
 
 # =============================
-# Load labels - support both Kinetics-400 and custom models
+# Optional PyTorch / CUDA imports
+# =============================
+TORCH_AVAILABLE = False
+CUDA_AVAILABLE = False
+try:
+    import torch
+    import torchvision.models.video as video_models
+    import torchvision.transforms as transforms
+    TORCH_AVAILABLE = True
+    CUDA_AVAILABLE = torch.cuda.is_available()
+    print(f"✓ PyTorch available (version {torch.__version__})")
+    if CUDA_AVAILABLE:
+        print(f"✓ CUDA available: {torch.cuda.get_device_name(0)}")
+    else:
+        print("⚠️ CUDA not available — R3D will run on CPU (slow)")
+except ImportError:
+    print("⚠️ PyTorch not installed — R3D/CUDA backend disabled")
+
+# =============================
+# Load labels - support Kinetics-400, custom, and R3D models
 # =============================
 BASE_DIR = Path(__file__).parent.resolve()
 
@@ -52,7 +71,7 @@ load_label_mappings()
 def get_action_name(action_id, model_type='custom'):
     if model_type == 'custom' and CUSTOM_LABELS and action_id in CUSTOM_LABELS:
         return CUSTOM_LABELS[action_id]
-    elif model_type == 'intel' and KINETICS_400_LABELS:
+    elif model_type in ('intel', 'r3d', 'cuda') and KINETICS_400_LABELS:
         return KINETICS_400_LABELS.get(str(action_id), f"action_{action_id}")
     else:
         return f"action_{action_id}"
@@ -66,6 +85,20 @@ def get_id_from_name(name):
     if KINETICS_400_LABELS:
         for k, v in KINETICS_400_LABELS.items():
             if v.lower() == name.lower():
+                return int(k), 'intel'
+    raise ValueError(f"Action '{name}' not found in any label set")
+
+
+def get_id_from_name_with_r3d(name):
+    """Extended version that also checks R3D/CUDA model (uses Kinetics-400 labels)."""
+    if CUSTOM_LABELS:
+        for idx, action_name in CUSTOM_LABELS.items():
+            if action_name.lower() == name.lower():
+                return idx, 'custom'
+    if KINETICS_400_LABELS:
+        for k, v in KINETICS_400_LABELS.items():
+            if v.lower() == name.lower():
+                # Prefer 'cuda' model type if CUDA is available, else 'intel'
                 return int(k), 'intel'
     raise ValueError(f"Action '{name}' not found in any label set")
 
@@ -313,9 +346,168 @@ ENCODER_XML = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-00
 ENCODER_BIN = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin"
 SEQUENCE_LENGTH = 16
 
+# R3D model config
+R3D_INPUT_SIZE = 112  # R3D expects 112x112
+R3D_CLIP_LENGTH = 16  # Same as SEQUENCE_LENGTH — convenient!
+R3D_IMAGENET_MEAN = [0.43216, 0.394666, 0.37645]
+R3D_IMAGENET_STD = [0.22803, 0.22145, 0.216989]
+
 
 # =============================
-# Async Inference Engine
+# R3D CUDA Model Wrapper
+# =============================
+class R3DModelWrapper:
+    """
+    Wraps a torchvision R3D model for use alongside OpenVINO models.
+
+    R3D is an end-to-end 3D CNN that takes a clip of frames (B, C, T, H, W)
+    and outputs Kinetics-400 class probabilities directly — no separate
+    encoder/decoder needed.
+
+    Supported model variants:
+      - r3d_18  (default, smallest, fastest)
+      - mc3_18  (mixed convolution variant)
+      - r2plus1d_18  (R(2+1)D — decomposed 3D convolutions, more accurate)
+    """
+
+    def __init__(self, model_name='r3d_18', device_str='cuda', half_precision=True):
+        """
+        Args:
+            model_name: One of 'r3d_18', 'mc3_18', 'r2plus1d_18'
+            device_str: 'cuda' or 'cpu'
+            half_precision: Use FP16 on CUDA for faster inference
+        """
+        self.model_name = model_name
+        self.device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
+        self.half = half_precision and self.device.type == 'cuda'
+
+        print(f"🚀 Loading {model_name} on {self.device} "
+              f"(FP16: {self.half})...")
+
+        # Load pretrained model
+        if model_name == 'r3d_18':
+            self.model = video_models.r3d_18(weights='DEFAULT')
+        elif model_name == 'mc3_18':
+            self.model = video_models.mc3_18(weights='DEFAULT')
+        elif model_name == 'r2plus1d_18':
+            self.model = video_models.r2plus1d_18(weights='DEFAULT')
+        else:
+            raise ValueError(f"Unknown R3D variant: {model_name}. "
+                             f"Use r3d_18, mc3_18, or r2plus1d_18")
+
+        self.model.eval()
+        self.model.to(self.device)
+        if self.half:
+            self.model.half()
+
+        # Pre-build normalization tensors on device for speed
+        self.mean = torch.tensor(R3D_IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1, 1)
+        self.std = torch.tensor(R3D_IMAGENET_STD, device=self.device).view(1, 3, 1, 1, 1)
+        if self.half:
+            self.mean = self.mean.half()
+            self.std = self.std.half()
+
+        # Warm-up inference to trigger CUDA kernel compilation
+        self._warmup()
+        print(f"✓ {model_name} loaded and warmed up on {self.device}")
+
+    def _warmup(self):
+        """Run a dummy forward pass to warm up CUDA kernels."""
+        dummy = torch.zeros(1, 3, R3D_CLIP_LENGTH, R3D_INPUT_SIZE, R3D_INPUT_SIZE,
+                            device=self.device)
+        if self.half:
+            dummy = dummy.half()
+        with torch.no_grad():
+            _ = self.model(dummy)
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+
+    def preprocess_clip(self, raw_frames, roi=None):
+        """
+        Preprocess a list of BGR numpy frames into a (1, 3, T, H, W) tensor.
+
+        Args:
+            raw_frames: List of numpy arrays (BGR, HWC) — exactly R3D_CLIP_LENGTH frames
+            roi: Optional (x1, y1, x2, y2) to crop before resizing
+
+        Returns:
+            torch.Tensor on self.device, shape (1, 3, T, 112, 112), normalized
+        """
+        assert len(raw_frames) == R3D_CLIP_LENGTH, \
+            f"Expected {R3D_CLIP_LENGTH} frames, got {len(raw_frames)}"
+
+        processed = []
+        for frame in raw_frames:
+            f = frame
+            if roi is not None:
+                x1, y1, x2, y2 = roi
+                f = f[y1:y2, x1:x2]
+
+            # Resize to 112x112
+            f = cv2.resize(f, (R3D_INPUT_SIZE, R3D_INPUT_SIZE),
+                           interpolation=cv2.INTER_LINEAR)
+
+            # BGR → RGB, HWC → CHW, scale to [0, 1]
+            f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+            f = f.astype(np.float32) / 255.0
+            f = np.transpose(f, (2, 0, 1))  # (3, H, W)
+            processed.append(f)
+
+        # Stack: (T, 3, H, W) → (3, T, H, W) → (1, 3, T, H, W)
+        clip = np.stack(processed, axis=0)            # (T, 3, H, W)
+        clip = np.transpose(clip, (1, 0, 2, 3))       # (3, T, H, W)
+        clip = np.expand_dims(clip, axis=0)            # (1, 3, T, H, W)
+
+        tensor = torch.from_numpy(clip).to(self.device)
+        if self.half:
+            tensor = tensor.half()
+
+        # Normalize with ImageNet stats
+        tensor = (tensor - self.mean) / self.std
+        return tensor
+
+    @torch.no_grad()
+    def predict(self, clip_tensor):
+        """
+        Run inference on a preprocessed clip tensor.
+
+        Args:
+            clip_tensor: (1, 3, T, 112, 112) tensor on device
+
+        Returns:
+            numpy array of raw logits (400,)
+        """
+        output = self.model(clip_tensor)
+        return output.cpu().float().numpy().flatten()
+
+    @torch.no_grad()
+    def predict_from_frames(self, raw_frames, roi=None):
+        """
+        Convenience: preprocess + predict in one call.
+
+        Args:
+            raw_frames: List of BGR numpy frames (length = R3D_CLIP_LENGTH)
+            roi: Optional crop region
+
+        Returns:
+            numpy array of raw logits (400,)
+        """
+        clip_tensor = self.preprocess_clip(raw_frames, roi=roi)
+        return self.predict(clip_tensor)
+
+    def cleanup(self):
+        """Free GPU memory."""
+        del self.model
+        del self.mean
+        del self.std
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        gc.collect()
+        print(f"🧹 {self.model_name} cleaned up")
+
+
+# =============================
+# Async Inference Engine (OpenVINO)
 # =============================
 class AsyncBatchedInferenceEngine:
     def __init__(self, compiled_model, input_layer, output_layer, num_requests=2):
@@ -357,9 +549,9 @@ class AsyncBatchedInferenceEngine:
 # PARALLEL YOLO DETECTOR - OPTIMIZED
 # =============================
 class ParallelYOLODetector:
-    """Parallel YOLO detection with frame skipping - optimized for throughput"""
+    """Parallel YOLO detection with frame skipping"""
 
-    def __init__(self, model_name="yolo11n.pt", num_workers=1, skip_frames=2):
+    def __init__(self, model_name="yolo11n.pt", num_workers=2, skip_frames=4):
         self.model = YOLO(model_name)
         self.skip_frames = skip_frames
         self.frame_counter = 0
@@ -370,7 +562,6 @@ class ParallelYOLODetector:
         self._shutdown = False
 
     def detect_async(self, frame):
-        """Run YOLO detection asynchronously with frame skipping"""
         if self._shutdown:
             return self.get_latest_detections()
 
@@ -379,23 +570,19 @@ class ParallelYOLODetector:
         if self.skip_frames > 1 and self.frame_counter % self.skip_frames != 0:
             return self.get_latest_detections()
 
-        # Check if previous future completed and harvest result
         if self.pending_future is not None and self.pending_future.done():
             try:
-                self.pending_future.result()  # harvest any exceptions
+                self.pending_future.result()
             except Exception:
                 pass
             self.pending_future = None
 
-        # Only submit if no pending work (avoids queue buildup)
         if self.pending_future is None or self.pending_future.done():
-            # Resize inline instead of full copy — YOLO handles BGR natively
             self.pending_future = self.executor.submit(self._detect_sync, frame.copy())
 
         return self.get_latest_detections()
 
     def _detect_sync(self, frame):
-        """Synchronous YOLO detection"""
         try:
             results = self.model.predict(frame, conf=0.40, classes=[0],
                                          verbose=False, imgsz=640)
@@ -429,13 +616,10 @@ class ParallelYOLODetector:
 # Pipelined Preprocessing Pool
 # =============================
 class PreprocessPipeline:
-    """Offloads frame preprocessing to a thread pool so it overlaps with inference"""
-
-    def __init__(self, num_workers=1):
+    def __init__(self, num_workers=2):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
 
     def submit(self, frame, input_shape, roi=None):
-        """Submit a frame for async preprocessing, returns a Future"""
         return self.executor.submit(preprocess_frame, frame, input_shape, roi)
 
     def shutdown(self):
@@ -443,14 +627,12 @@ class PreprocessPipeline:
 
 
 # =============================
-# Video Writer Thread — non-blocking writes
+# Video Writer Thread
 # =============================
 class ThreadedVideoWriter:
-    """Writes video frames from a background thread to avoid blocking the main loop"""
-
     def __init__(self, output_path, fourcc, fps, frame_size):
         self.writer = cv2.VideoWriter(output_path, fourcc, fps, frame_size)
-        self.queue = queue.Queue(maxsize=60)  # buffer up to 60 frames
+        self.queue = queue.Queue(maxsize=60)
         self._shutdown = False
         self.thread = threading.Thread(target=self._write_loop, daemon=True)
         self.thread.start()
@@ -469,7 +651,6 @@ class ThreadedVideoWriter:
             try:
                 self.queue.put_nowait(frame)
             except queue.Full:
-                # Drop frame rather than block
                 pass
 
     def release(self):
@@ -479,9 +660,17 @@ class ThreadedVideoWriter:
 
 
 # =============================
-# Load models - DUAL MODEL SUPPORT
+# Load models - TRIPLE MODEL SUPPORT (custom + intel + r3d/cuda)
 # =============================
-def load_models(device="AUTO", openvino_threads=None):
+def load_models(device="AUTO", openvino_threads=None,
+                enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True):
+    """
+    Load all available models.
+
+    Returns:
+        compiled_encoder, encoder_input, encoder_output,
+        models_info dict, selected_device string, r3d_wrapper (or None)
+    """
     ie = Core()
     available_devices = ie.available_devices
     print(f"Available OpenVINO devices: {available_devices}")
@@ -492,9 +681,8 @@ def load_models(device="AUTO", openvino_threads=None):
     else:
         selected_device = device if device in available_devices else "CPU"
 
-    print(f"Using device: {selected_device}")
+    print(f"Using OpenVINO device: {selected_device}")
 
-    # Set OpenVINO CPU threading — leave headroom for YOLO and preprocessing
     if openvino_threads and selected_device == "CPU":
         ie.set_property("CPU", {"INFERENCE_NUM_THREADS": openvino_threads})
         print(f"✓ OpenVINO CPU threads set to {openvino_threads}")
@@ -511,7 +699,7 @@ def load_models(device="AUTO", openvino_threads=None):
     intel_decoder_xml = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
     intel_decoder_bin = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 
-    models_info = {'custom': None, 'intel': None}
+    models_info = {'custom': None, 'intel': None, 'cuda': None}
 
     if custom_decoder_xml.exists() and custom_decoder_bin.exists():
         print("✓ Loading custom fine-tuned decoder model")
@@ -521,7 +709,8 @@ def load_models(device="AUTO", openvino_threads=None):
             'compiled': compiled_custom_decoder,
             'input': compiled_custom_decoder.input(0),
             'output': compiled_custom_decoder.output(0),
-            'labels': CUSTOM_LABELS
+            'labels': CUSTOM_LABELS,
+            'type': 'openvino'
         }
     else:
         print("⚠️ Custom decoder model not found")
@@ -534,28 +723,53 @@ def load_models(device="AUTO", openvino_threads=None):
             'compiled': compiled_intel_decoder,
             'input': compiled_intel_decoder.input(0),
             'output': compiled_intel_decoder.output(0),
-            'labels': KINETICS_400_LABELS
+            'labels': KINETICS_400_LABELS,
+            'type': 'openvino'
         }
     else:
         print("⚠️ Intel decoder model not found")
 
-    if models_info['custom'] is None and models_info['intel'] is None:
-        raise FileNotFoundError("❌ No decoder models found!")
+    # ---- R3D / CUDA model ----
+    r3d_wrapper = None
+    if enable_r3d and TORCH_AVAILABLE:
+        try:
+            r3d_device = 'cuda' if CUDA_AVAILABLE else 'cpu'
+            r3d_wrapper = R3DModelWrapper(
+                model_name=r3d_model_name,
+                device_str=r3d_device,
+                half_precision=r3d_half and CUDA_AVAILABLE
+            )
+            models_info['cuda'] = {
+                'wrapper': r3d_wrapper,
+                'labels': KINETICS_400_LABELS,
+                'type': 'pytorch'
+            }
+        except Exception as e:
+            print(f"⚠️ Failed to load R3D model: {e}")
+            r3d_wrapper = None
+    elif enable_r3d and not TORCH_AVAILABLE:
+        print("⚠️ R3D requested but PyTorch is not installed — skipping")
+
+    if (models_info['custom'] is None and models_info['intel'] is None
+            and models_info['cuda'] is None):
+        raise FileNotFoundError("❌ No models found! Need at least one decoder or R3D.")
 
     print("✓ Model loading complete.")
-    print(f"  - Custom model: {'✓ Available' if models_info['custom'] else '✗ Not available'}")
-    print(f"  - Intel model: {'✓ Available' if models_info['intel'] else '✗ Not available'}")
+    print(f"  - Custom model:  {'✓ Available' if models_info['custom'] else '✗ Not available'}")
+    print(f"  - Intel model:   {'✓ Available' if models_info['intel'] else '✗ Not available'}")
+    print(f"  - R3D/CUDA:      {'✓ Available' if models_info['cuda'] else '✗ Not available'}")
     print()
 
     return (
         compiled_encoder, compiled_encoder.input(0), compiled_encoder.output(0),
         models_info,
-        selected_device
+        selected_device,
+        r3d_wrapper
     )
 
 
 # =============================
-# Preprocess frame with ROI support (optimized)
+# Preprocess frame with ROI support (for OpenVINO encoder)
 # =============================
 def preprocess_frame(frame, input_shape, roi=None):
     frame_to_process = frame
@@ -663,9 +877,11 @@ def draw_action_panel(frame, detected_actions, max_labels=3):
         if len(item) == 3:
             action_name, score, model_type = item
             if model_type == 'custom':
-                text_color = (0, 255, 0)
+                text_color = (0, 255, 0)       # Green
+            elif model_type == 'cuda':
+                text_color = (0, 128, 255)      # Orange — R3D/CUDA
             else:
-                text_color = (255, 165, 0)
+                text_color = (255, 165, 0)      # Blue-ish — Intel
         else:
             action_name, score = item
             text_color = (0, 255, 255)
@@ -695,7 +911,7 @@ def softmax(x):
 
 
 # =============================
-# MAIN — Run action detection (OPTIMIZED)
+# MAIN — Run action detection (OPTIMIZED + R3D CUDA)
 # =============================
 def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="action_log.csv",
                          debug=False, top_k=50, confidence_threshold=0.01, show_video=False,
@@ -703,33 +919,34 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                          progress_callback=None, cancel_flag=None,
                          draw_bboxes=True, annotated_output=None,
                          use_person_detection=True, max_people=2,
-                         yolo_workers=1, yolo_skip_frames=2, downscale_factor=0.5,
+                         yolo_workers=2, yolo_skip_frames=4, downscale_factor=0.5,
                          warm_up_seconds=2, include_model_type=False,
-                         openvino_threads=None, preprocess_workers=2):
+                         openvino_threads=None, preprocess_workers=2,
+                         enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True):
     """
-    Run action recognition — OPTIMIZED version.
+    Run action recognition — OPTIMIZED version with R3D/CUDA support.
 
-    Key optimisations vs. original:
+    Key features:
       1. Pipelined preprocessing (overlaps with inference via thread pool)
       2. Decoder result caching (one forward pass per model, not per action)
       3. Threaded video writer (non-blocking disk I/O)
-      4. Reduced frame copies (no unnecessary .copy() or BGR→RGB)
-      5. Less aggressive GC (every 15 s instead of 2 s)
+      4. R3D end-to-end model on CUDA alongside OpenVINO encoder+decoder
+      5. Raw frame ring buffer for R3D (stores BGR frames, not encoder features)
       6. Configurable OpenVINO thread count to share cores fairly
-      7. YOLO defaults to skip=4, workers=2 for better throughput
     """
 
     # ---- CPU thread budget ----
     cpu_count = os.cpu_count() or 4
     print(f"📊 CPU cores: {cpu_count} (threads: {cpu_count})")
 
-    # Allocate threads: OpenVINO gets ~half, rest for YOLO + preprocess + IO
     if openvino_threads is None:
         openvino_threads = max(2, cpu_count // 2)
     os.environ["OMP_NUM_THREADS"] = str(openvino_threads)
     os.environ["MKL_NUM_THREADS"] = str(openvino_threads)
     print(f"✅ OpenVINO threads: {openvino_threads} | "
           f"YOLO workers: {yolo_workers} | Preprocess workers: {preprocess_workers}")
+    if enable_r3d:
+        print(f"✅ R3D model: {r3d_model_name} | FP16: {r3d_half}")
 
     # ---- Parse interesting actions ----
     action_to_model = {}
@@ -740,6 +957,10 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 action_id, model_type = get_id_from_name(action_name)
                 action_to_model[action_name.lower()] = (action_id, model_type)
                 print(f"📌 Action '{action_name}' found in {model_type} model (ID: {action_id})")
+                # If R3D is enabled and the action is from Kinetics-400, also map to cuda
+                if enable_r3d and model_type == 'intel':
+                    action_to_model[action_name.lower() + '__cuda'] = (action_id, 'cuda')
+                    print(f"   ↳ Also mapped to R3D/CUDA model (ID: {action_id})")
             except ValueError as e:
                 print(f"⚠️ {e}")
                 raise
@@ -747,8 +968,12 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
         interesting_actions_set = None
 
     # ---- Load models ----
-    compiled_encoder, encoder_input, encoder_output, models_info, actual_device = \
-        load_models(device, openvino_threads=openvino_threads)
+    (compiled_encoder, encoder_input, encoder_output,
+     models_info, actual_device, r3d_wrapper) = \
+        load_models(device, openvino_threads=openvino_threads,
+                    enable_r3d=enable_r3d, r3d_model_name=r3d_model_name,
+                    r3d_half=r3d_half)
+
     encoder_engine = AsyncBatchedInferenceEngine(
         compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
 
@@ -781,6 +1006,10 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    # ---- R3D raw frame ring buffer ----
+    # R3D needs raw BGR frames (not encoder features), so we keep a separate buffer
+    raw_frame_buffer = deque(maxlen=R3D_CLIP_LENGTH) if r3d_wrapper else None
+
     try:
         if draw_bboxes and annotated_output:
             if frame_height > 1080 and downscale_factor < 1.0:
@@ -812,6 +1041,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
         yolo_time = 0
         preprocess_time = 0
         inference_time = 0
+        r3d_time = 0
         draw_time = 0
         last_perf_print = start_time
         last_gc_time = start_time
@@ -839,7 +1069,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 else:
                     processing_frame = warm_up_frame
 
-                # YOLO accepts BGR natively — skip cvtColor
                 yolo_detector.detect_async(processing_frame)
                 raw_boxes = yolo_detector.get_latest_detections()
 
@@ -859,7 +1088,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     current_action_roi = merge_boxes(action_boxes) if action_boxes else None
                 yolo_time += time.time() - yolo_start
 
-            # Preprocess via pipeline (but wait immediately during warm-up)
+            # Preprocess for OpenVINO encoder
             preprocess_start = time.time()
             processed_frame = preprocess_frame(
                 warm_up_frame, encoder_input.shape,
@@ -872,6 +1101,10 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
             features = np.reshape(features, (-1,))
             sequence_buffer.append(features)
             inference_time += time.time() - inference_start
+
+            # Store raw frame for R3D
+            if raw_frame_buffer is not None:
+                raw_frame_buffer.append(warm_up_frame.copy())
 
             if video_writer and draw_bboxes:
                 draw_start = time.time()
@@ -905,11 +1138,13 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 last_gui_update = time.time()
 
         print(f"✅ Warm-up complete: Buffer has {len(sequence_buffer)}/{SEQUENCE_LENGTH} frames")
+        if raw_frame_buffer is not None:
+            print(f"   R3D raw buffer: {len(raw_frame_buffer)}/{R3D_CLIP_LENGTH} frames")
 
         # =============================================
         # MAIN PROCESSING LOOP
         # =============================================
-        pending_preprocess_future = None  # for pipelined preprocessing
+        pending_preprocess_future = None
 
         with open(log_file, mode="w", newline="") as f:
             writer = csv.writer(f)
@@ -927,7 +1162,11 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                 frame_id += 1
 
-                # ---- Person detection (async, no BGR→RGB needed) ----
+                # ---- Store raw frame for R3D ----
+                if raw_frame_buffer is not None:
+                    raw_frame_buffer.append(frame.copy())
+
+                # ---- Person detection ----
                 if use_person_detection and yolo_detector:
                     yolo_start = time.time()
                     h, w = frame.shape[:2]
@@ -958,7 +1197,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                         current_action_roi = merge_boxes(action_boxes) if action_boxes else None
                     yolo_time += time.time() - yolo_start
 
-                # ---- Write annotated frame (via threaded writer) ----
+                # ---- Write annotated frame ----
                 if video_writer and draw_bboxes:
                     draw_start = time.time()
                     current_timestamp_secs = frame_id / fps
@@ -1000,8 +1239,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             roi=current_action_roi if use_person_detection else None)
                         preprocess_time += time.time() - preprocess_start
 
-                    # Submit NEXT frame's preprocess now (will overlap with inference)
-                    # We'll use it on the next sampled frame
+                    # Submit NEXT frame's preprocess now
                     pending_preprocess_future = preprocess_pool.submit(
                         frame, encoder_input.shape,
                         roi=current_action_roi if use_person_detection else None)
@@ -1020,6 +1258,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             sequence_buffer.pop(0)
 
                         if len(sequence_buffer) == SEQUENCE_LENGTH:
+                            # OpenVINO decoder input
                             sequence_array = np.expand_dims(
                                 np.stack(sequence_buffer, axis=0), axis=0)
 
@@ -1029,9 +1268,27 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             use_mins, use_secs = divmod(int(use_timestamp_secs), 60)
                             use_timestamp_str = f"{use_mins:02d}:{use_secs:02d}"
 
+                            # ==============================
+                            # Run decoders (OpenVINO + R3D)
+                            # ==============================
+                            decoder_cache = {}
+
+                            # -- R3D inference (if buffer is full) --
+                            if (r3d_wrapper is not None and raw_frame_buffer is not None
+                                    and len(raw_frame_buffer) == R3D_CLIP_LENGTH):
+                                r3d_start = time.time()
+                                try:
+                                    r3d_roi = current_action_roi if use_person_detection else None
+                                    r3d_logits = r3d_wrapper.predict_from_frames(
+                                        list(raw_frame_buffer), roi=r3d_roi)
+                                    decoder_cache['cuda'] = softmax(r3d_logits)
+                                except Exception as e:
+                                    if debug:
+                                        print(f"⚠️ R3D inference error: {e}")
+                                r3d_time += time.time() - r3d_start
+
                             if interesting_actions_set:
-                                # === DECODER CACHING: run each model at most once ===
-                                decoder_cache = {}
+                                # === Run needed OpenVINO decoders ===
                                 for action_name in interesting_actions_set:
                                     action_id, model_type = action_to_model[action_name.lower()]
                                     model_data = models_info[model_type]
@@ -1039,11 +1296,15 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                         continue
 
                                     if model_type not in decoder_cache:
-                                        predictions = model_data['compiled'](
-                                            [sequence_array])[model_data['output']].flatten()
-                                        decoder_cache[model_type] = softmax(predictions)
+                                        if model_data.get('type') == 'openvino':
+                                            predictions = model_data['compiled'](
+                                                [sequence_array])[model_data['output']].flatten()
+                                            decoder_cache[model_type] = softmax(predictions)
+                                        # 'cuda' already in cache from above
 
-                                    probabilities = decoder_cache[model_type]
+                                    probabilities = decoder_cache.get(model_type)
+                                    if probabilities is None:
+                                        continue
                                     if action_id >= len(probabilities):
                                         continue
 
@@ -1064,14 +1325,55 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                         if debug:
                                             print(f"{use_timestamp_str} -> {action_name} "
                                                   f"[{model_type}] (score:{score:.3f})")
+
+                                # Also check cuda variants for interesting actions
+                                if r3d_wrapper and 'cuda' in decoder_cache:
+                                    for action_name in interesting_actions_set:
+                                        cuda_key = action_name.lower() + '__cuda'
+                                        if cuda_key in action_to_model:
+                                            action_id, _ = action_to_model[cuda_key]
+                                            probabilities = decoder_cache['cuda']
+                                            if action_id < len(probabilities):
+                                                score = float(probabilities[action_id])
+                                                if score >= confidence_threshold:
+                                                    writer.writerow([
+                                                        use_timestamp_str, use_frame_id,
+                                                        action_id, action_name, score,
+                                                        use_timestamp_secs, 'cuda'])
+                                                    if include_model_type:
+                                                        all_actions.append((
+                                                            use_timestamp_secs, use_frame_id,
+                                                            action_id, score, action_name,
+                                                            'cuda'))
+                                                    else:
+                                                        all_actions.append((
+                                                            use_timestamp_secs, use_frame_id,
+                                                            action_id, score, action_name))
+                                                    frame_detections.append(
+                                                        (action_name, score, 'cuda'))
+                                                    detection_count += 1
+                                                    if debug:
+                                                        print(f"{use_timestamp_str} -> "
+                                                              f"{action_name} [cuda] "
+                                                              f"(score:{score:.3f})")
                             else:
+                                # === Scan all models (including R3D) ===
                                 all_probabilities = {}
                                 for model_type, model_data in models_info.items():
                                     if model_data is None:
                                         continue
-                                    predictions = model_data['compiled'](
-                                        [sequence_array])[model_data['output']].flatten()
-                                    probabilities = softmax(predictions)
+
+                                    if model_type not in decoder_cache:
+                                        if model_data.get('type') == 'openvino':
+                                            predictions = model_data['compiled'](
+                                                [sequence_array])[model_data['output']].flatten()
+                                            decoder_cache[model_type] = softmax(predictions)
+                                        # 'cuda' already handled above
+
+                                    probabilities = decoder_cache.get(model_type)
+                                    if probabilities is None:
+                                        continue
+
                                     top_indices = np.argsort(probabilities)[-top_k:][::-1]
                                     for idx in top_indices:
                                         score = float(probabilities[idx])
@@ -1109,7 +1411,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     prev_frame_id = frame_id
                     processed_frames += 1
 
-                # ---- Periodic GC (every 15 seconds, not 2) ----
+                # ---- Periodic GC ----
                 current_time = time.time()
                 if current_time - last_gc_time > 15.0:
                     gc.collect()
@@ -1118,11 +1420,12 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 # ---- Performance stats ----
                 if current_time - last_perf_print > 5.0:
                     total_elapsed = current_time - start_time
+                    r3d_info = f" | R3D: {r3d_time:.1f}s" if r3d_wrapper else ""
                     print(f"\n📊 Progress: {frame_id}/{total_frames} frames "
                           f"({frame_id / total_elapsed:.1f} fps) | "
                           f"YOLO: {yolo_time:.1f}s | "
                           f"Preprocess: {preprocess_time:.1f}s | "
-                          f"Inference: {inference_time:.1f}s | "
+                          f"Inference: {inference_time:.1f}s{r3d_info} | "
                           f"Draw: {draw_time:.1f}s")
                     last_perf_print = current_time
 
@@ -1136,6 +1439,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                         f"Processing: {processing_fps:.1f} FPS | "
                         f"Inference: {engine_stats['inference_fps']:.1f} FPS | "
                         f"Device: {actual_device}")
+                    if r3d_wrapper:
+                        progress_msg += f" + {r3d_model_name}/CUDA"
                     progress_callback(processed_frames, expected_processed_frames,
                                       "Action Recognition", progress_msg)
                     last_gui_update = current_time
@@ -1158,18 +1463,34 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     use_timestamp_str = f"{use_mins:02d}:{use_secs:02d}"
 
                     frame_detections = []
+                    decoder_cache = {}
+
+                    # R3D final flush
+                    if (r3d_wrapper is not None and raw_frame_buffer is not None
+                            and len(raw_frame_buffer) == R3D_CLIP_LENGTH):
+                        try:
+                            r3d_roi = current_action_roi if use_person_detection else None
+                            r3d_logits = r3d_wrapper.predict_from_frames(
+                                list(raw_frame_buffer), roi=r3d_roi)
+                            decoder_cache['cuda'] = softmax(r3d_logits)
+                        except Exception as e:
+                            if debug:
+                                print(f"⚠️ R3D flush error: {e}")
+
                     if interesting_actions_set:
-                        decoder_cache = {}
                         for action_name in interesting_actions_set:
                             action_id, model_type = action_to_model[action_name.lower()]
                             model_data = models_info[model_type]
                             if model_data is None:
                                 continue
                             if model_type not in decoder_cache:
-                                predictions = model_data['compiled'](
-                                    [sequence_array])[model_data['output']].flatten()
-                                decoder_cache[model_type] = softmax(predictions)
-                            probabilities = decoder_cache[model_type]
+                                if model_data.get('type') == 'openvino':
+                                    predictions = model_data['compiled'](
+                                        [sequence_array])[model_data['output']].flatten()
+                                    decoder_cache[model_type] = softmax(predictions)
+                            probabilities = decoder_cache.get(model_type)
+                            if probabilities is None:
+                                continue
                             if action_id >= len(probabilities):
                                 continue
                             score = float(probabilities[action_id])
@@ -1186,17 +1507,45 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                                         action_id, score, action_name))
                                 frame_detections.append((action_name, score, model_type))
                                 detection_count += 1
-                                if debug:
-                                    print(f"{use_timestamp_str} -> {action_name} "
-                                          f"[{model_type}] (score:{score:.3f})")
+
+                        # cuda variants flush
+                        if r3d_wrapper and 'cuda' in decoder_cache:
+                            for action_name in interesting_actions_set:
+                                cuda_key = action_name.lower() + '__cuda'
+                                if cuda_key in action_to_model:
+                                    action_id, _ = action_to_model[cuda_key]
+                                    probabilities = decoder_cache['cuda']
+                                    if action_id < len(probabilities):
+                                        score = float(probabilities[action_id])
+                                        if score >= confidence_threshold:
+                                            writer.writerow([
+                                                use_timestamp_str, use_frame_id,
+                                                action_id, action_name, score,
+                                                use_timestamp_secs, 'cuda'])
+                                            if include_model_type:
+                                                all_actions.append((
+                                                    use_timestamp_secs, use_frame_id,
+                                                    action_id, score, action_name, 'cuda'))
+                                            else:
+                                                all_actions.append((
+                                                    use_timestamp_secs, use_frame_id,
+                                                    action_id, score, action_name))
+                                            frame_detections.append(
+                                                (action_name, score, 'cuda'))
+                                            detection_count += 1
                     else:
                         all_probabilities = {}
                         for model_type, model_data in models_info.items():
                             if model_data is None:
                                 continue
-                            predictions = model_data['compiled'](
-                                [sequence_array])[model_data['output']].flatten()
-                            probabilities = softmax(predictions)
+                            if model_type not in decoder_cache:
+                                if model_data.get('type') == 'openvino':
+                                    predictions = model_data['compiled'](
+                                        [sequence_array])[model_data['output']].flatten()
+                                    decoder_cache[model_type] = softmax(predictions)
+                            probabilities = decoder_cache.get(model_type)
+                            if probabilities is None:
+                                continue
                             top_indices = np.argsort(probabilities)[-top_k:][::-1]
                             for idx in top_indices:
                                 score = float(probabilities[idx])
@@ -1219,9 +1568,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                                     idx, score, action_name))
                             frame_detections.append((action_name, score, model_type))
                             detection_count += 1
-                            if debug:
-                                print(f"{use_timestamp_str} -> {action_name} "
-                                      f"[{model_type}] (score:{score:.3f})")
 
                     if frame_detections:
                         frame_detections.sort(key=lambda x: x[1], reverse=True)
@@ -1242,9 +1588,13 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
             action_detector.cleanup()
         if encoder_engine:
             encoder_engine.cleanup()
+        if r3d_wrapper:
+            r3d_wrapper.cleanup()
         preprocess_pool.shutdown()
         sequence_buffer.clear()
         recent_detections.clear()
+        if raw_frame_buffer is not None:
+            raw_frame_buffer.clear()
         gc.collect()
         print("✅ Cleanup complete")
 
@@ -1255,6 +1605,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                      f"Processed {processed_frames} frames in {total_time:.1f}s | "
                      f"Avg Processing: {processed_frames / total_time:.1f} FPS | "
                      f"Avg Inference: {engine_stats['inference_fps']:.1f} FPS")
+        if r3d_wrapper:
+            final_msg += f" | R3D time: {r3d_time:.1f}s"
         progress_callback(processed_frames, expected_processed_frames,
                           "Action Recognition Complete", final_msg)
 
@@ -1268,10 +1620,15 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     print(f"Overall FPS: {frame_id / total_time:.1f}")
     print(f"YOLO time: {yolo_time:.1f}s ({yolo_time / total_time * 100:.1f}%)")
     print(f"Preprocess time: {preprocess_time:.1f}s ({preprocess_time / total_time * 100:.1f}%)")
-    print(f"Inference time: {inference_time:.1f}s ({inference_time / total_time * 100:.1f}%)")
+    print(f"Inference time (OV): {inference_time:.1f}s ({inference_time / total_time * 100:.1f}%)")
+    if r3d_wrapper:
+        print(f"R3D/CUDA time: {r3d_time:.1f}s ({r3d_time / total_time * 100:.1f}%)")
     print(f"Draw time: {draw_time:.1f}s ({draw_time / total_time * 100:.1f}%)")
     print(f"CPU cores: {os.cpu_count()}")
     print(f"OpenVINO threads: {openvino_threads}")
+    if r3d_wrapper:
+        device_name = torch.cuda.get_device_name(0) if CUDA_AVAILABLE else "CPU"
+        print(f"R3D device: {device_name}")
     print(f"Actions detected: {detection_count}")
     print("=" * 60)
 
@@ -1352,10 +1709,9 @@ def print_action_sequences(all_actions):
 # =============================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Action Recognition — OPTIMIZED (pipelined preprocessing, "
-                    "decoder caching, threaded video writer)")
+        description="Action Recognition — OPTIMIZED with R3D/CUDA support")
     parser.add_argument("--input", type=str, required=True, help="Input video path")
-    parser.add_argument("--device", type=str, default="AUTO", help="Device (AUTO, CPU, GPU)")
+    parser.add_argument("--device", type=str, default="AUTO", help="OpenVINO device (AUTO, CPU, GPU)")
     parser.add_argument("--sample-rate", type=int, default=5, help="Frame sampling rate")
     parser.add_argument("--log-file", type=str, default="action_log.csv", help="CSV log output")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
@@ -1372,9 +1728,9 @@ if __name__ == "__main__":
                         help="Maximum number of people to track")
     parser.add_argument("--interesting-actions", type=str, nargs="+",
                         help="Specific actions to detect")
-    parser.add_argument("--yolo-workers", type=int, default=1,
+    parser.add_argument("--yolo-workers", type=int, default=2,
                         help="Number of parallel YOLO workers")
-    parser.add_argument("--yolo-skip", type=int, default=2,
+    parser.add_argument("--yolo-skip", type=int, default=4,
                         help="Skip YOLO detection every N frames")
     parser.add_argument("--downscale-factor", type=float, default=0.5,
                         help="Downscale factor for high-res videos (0.1-1.0)")
@@ -1382,14 +1738,22 @@ if __name__ == "__main__":
                         help="OpenVINO inference threads (default: half of CPU cores)")
     parser.add_argument("--preprocess-workers", type=int, default=2,
                         help="Preprocessing thread pool size")
+    # ---- R3D / CUDA options ----
+    parser.add_argument("--enable-r3d", action="store_true",
+                        help="Enable R3D model on CUDA (or CPU fallback)")
+    parser.add_argument("--r3d-model", type=str, default="r3d_18",
+                        choices=["r3d_18", "mc3_18", "r2plus1d_18"],
+                        help="R3D model variant (default: r3d_18)")
+    parser.add_argument("--r3d-no-half", action="store_true",
+                        help="Disable FP16 for R3D on CUDA (use FP32)")
 
     args = parser.parse_args()
 
     print("=" * 60)
-    print("🎯 ACTION RECOGNITION — OPTIMIZED")
+    print("🎯 ACTION RECOGNITION — OPTIMIZED + R3D/CUDA")
     print("=" * 60)
     print(f"Input: {args.input}")
-    print(f"Device: {args.device}")
+    print(f"OpenVINO device: {args.device}")
     print(f"Person detection: {'ENABLED' if args.use_person_detection else 'DISABLED'}")
     if args.use_person_detection:
         print(f"YOLO workers: {args.yolo_workers}, Skip frames: {args.yolo_skip}")
@@ -1400,6 +1764,10 @@ if __name__ == "__main__":
     if args.openvino_threads:
         print(f"OpenVINO threads: {args.openvino_threads}")
     print(f"Preprocess workers: {args.preprocess_workers}")
+    if args.enable_r3d:
+        print(f"R3D model: {args.r3d_model} | FP16: {not args.r3d_no_half}")
+    else:
+        print("R3D/CUDA: DISABLED")
     print("=" * 60)
 
     try:
@@ -1422,6 +1790,9 @@ if __name__ == "__main__":
             downscale_factor=args.downscale_factor,
             openvino_threads=args.openvino_threads,
             preprocess_workers=args.preprocess_workers,
+            enable_r3d=args.enable_r3d,
+            r3d_model_name=args.r3d_model,
+            r3d_half=not args.r3d_no_half,
         )
 
         print_top_actions(results)
@@ -1430,4 +1801,6 @@ if __name__ == "__main__":
         print(f"\n✅ Processing complete. Found {len(results)} action detections.")
     finally:
         gc.collect()
+        if CUDA_AVAILABLE:
+            torch.cuda.empty_cache()
         print("🧹 Final cleanup complete")

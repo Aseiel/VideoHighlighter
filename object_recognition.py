@@ -61,6 +61,8 @@ def detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes=False)
     
     try:
         results = model(frame, verbose=False, imgsz=640)
+        # Note: device is already set on the model via model.to(device),
+        # ultralytics will use the model's device automatically
         for result in results:
             if result.boxes is not None:
                 for box in result.boxes:
@@ -128,7 +130,8 @@ def get_video_segments(video_path, num_segments):
 
 # ---------------- Worker ----------------
 def worker_process(video_path, start_frame, end_frame, objects_of_interest, return_dict, worker_id, fps, 
-                  model_path, openvino_folder=None, progress_queue=None, draw_boxes=False, annotated_output_path=None):
+                  model_path, openvino_folder=None, progress_queue=None, draw_boxes=False, 
+                  annotated_output_path=None, device="cpu"):
     """
     Worker process for object detection
     
@@ -138,8 +141,13 @@ def worker_process(video_path, start_frame, end_frame, objects_of_interest, retu
         draw_boxes: If True, create annotated video output
         annotated_output_path: Path for annotated video (worker will append _workerN.mp4)
     """
-    # Try to load OpenVINO model first, fall back to PT model
-    if openvino_folder and os.path.exists(openvino_folder):
+    # Load model based on device
+    if "cuda" in device:
+        # CUDA: use .pt model directly (OpenVINO doesn't support CUDA)
+        model = YOLO(model_path)
+        model.to(device)
+        print(f"Worker {worker_id}: Loaded YOLO .pt model on {device}")
+    elif openvino_folder and os.path.exists(openvino_folder):
         try:
             model = YOLO(openvino_folder, task="detect")
             print(f"Worker {worker_id}: Loaded OpenVINO model from {openvino_folder}")
@@ -211,7 +219,8 @@ def worker_process(video_path, start_frame, end_frame, objects_of_interest, retu
 # ---------------- Main function for module ----------------
 def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="objects_log.csv", 
                         progress_fn=None, draw_boxes=False, annotated_output=None,
-                        yolo_model_size="n", yolo_pt_path=None, openvino_model_folder=None):
+                        yolo_model_size="n", yolo_pt_path=None, openvino_model_folder=None,
+                        device="cpu"):
     """
     Run object detection on video
     
@@ -299,7 +308,8 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
         p = Process(
             target=worker_process,
             args=(video_path, seg[0], seg[1], highlight_objects, return_dict, i, fps, 
-                  model_path, openvino_folder, progress_queue, draw_boxes, worker_annotated_path)
+                  model_path, openvino_folder, progress_queue, draw_boxes, worker_annotated_path,
+                  device)
         )
         p.start()
         processes.append(p)
