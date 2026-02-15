@@ -1,5 +1,4 @@
 # Core dependencies
-Python >=3.10
 numpy
 torch
 pyyaml
@@ -7,13 +6,7 @@ opencv-python
 tqdm
 openai-whisper
 googletrans
-openvino-dev
-intel-extension-for-pytorch
+openvino
 ultralytics  
 PySide6      
 ffmpeg
-
-
-
-
-
