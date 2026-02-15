@@ -20,8 +20,16 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: |
+          pip install numpy==2.2.6 mkl mkl-include
+          pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install openvino-dev==2024.6.0
           pip install -r requirements.txt
           pip install pyinstaller
+      - name: Verify key packages
+        run: |
+          python -c "import torch; print('Torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
+          python -c "import openvino; import os; lib_dir = os.path.join(os.path.dirname(openvino.__file__), 'libs'); files = os.listdir(lib_dir); print('OpenVINO libs:', len(files), 'files,', round(sum(os.path.getsize(os.path.join(lib_dir,f)) for f in files)/1e6), 'MB')"
+          python -c "import numpy; numpy.show_config()"
       - name: Build EXE
         run: >
           pyinstaller --name "VideoHighlighter"
@@ -54,6 +62,10 @@ jobs:
           --collect-data whisper
           --collect-data ultralytics
           main.py
+      - name: Report build size
+        run: |
+          $size = (Get-ChildItem -Recurse ./dist/VideoHighlighter | Measure-Object -Property Length -Sum).Sum / 1GB
+          Write-Host "Build size: $([math]::Round($size, 2)) GB"
       - name: Create archive
         run: 7z a -t7z -mx=9 -v1900m VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z ./dist/VideoHighlighter
       - name: Upload artifact
