@@ -72,7 +72,7 @@ PARTIAL_PERSON_MIN_AREA_RATIO = 0.0005  # Even smaller for legs-only, torsos, et
 INTERACTION_ZONE_EXPANSION = 0.3  # Expand detection zones to catch nearby partial people
 POSE_KEYPOINT_CLUSTER_DETECTION = True  # Detect people by keypoint clusters
 MIN_KEYPOINT_CLUSTER_SIZE = 2  # Minimum keypoints to count as a person
-KEYPOINT_CLUSTER_RADIUS = 120  # Pixels - how close keypoints must be
+KEYPOINT_CLUSTER_RADIUS = 70  # Pixels - how close keypoints must be
 
 # People counting adjustment
 PEOPLE_COUNT_CONFIDENCE_BOOST = True  # Use multiple detection methods
@@ -657,7 +657,7 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
                     raw_boxes.append((x1, y1, x2, y2, conf, False))  # False = not corner
 
         # Merge overlapping boxes (removes face+hand false splits)
-        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.25)
+        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.45)
         corner_boxes = [box for box, is_corner in boxes if is_corner]
         boxes = [box for box, _ in boxes]
 
@@ -1867,28 +1867,42 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
         merged_bbox = merge_overlapping_boxes(
             [(d['box'][0], d['box'][1], d['box'][2], d['box'][3], d['conf'], False) 
              for d in bbox_detections],
-            iou_threshold=0.3
+            iou_threshold=0.50
         )
         bbox_count = len(merged_bbox)
 
-        # ===== METHOD 2: POSE KEYPOINT CLUSTERING =====
+        # ===== METHOD 2: POSE SKELETON COUNTING =====
         pose_count = 0
+        raw_pose_count = 0  # Direct from model, no post-processing
         keypoint_clusters = []
         
         if pose_model and POSE_KEYPOINT_CLUSTER_DETECTION:
             try:
-                pose_result = pose_model.predict(rgb, conf=0.2, verbose=False)
+                pose_result = pose_model.predict(rgb, conf=0.12, verbose=False)
                 
                 if len(pose_result) > 0 and hasattr(pose_result[0], 'keypoints'):
                     all_keypoints = pose_result[0].keypoints.data.cpu().numpy()
                     
-                    # Cluster keypoints by proximity
+                    # METHOD 2a: RAW skeleton count (most reliable for close people)
+                    # Each entry in all_keypoints IS a separate person detection by the model
+                    for kpts in all_keypoints:
+                        visible_count = sum(1 for k in kpts if len(k) >= 3 and k[2] > 0.15)
+                        if visible_count >= MIN_KEYPOINT_CLUSTER_SIZE:
+                            raw_pose_count += 1
+                    
+                    # METHOD 2b: Cluster-based count (backup, more conservative)
                     keypoint_clusters = cluster_keypoints_by_person(
                         all_keypoints, 
                         min_keypoints=MIN_KEYPOINT_CLUSTER_SIZE,
                         radius=KEYPOINT_CLUSTER_RADIUS
                     )
-                    pose_count = len(keypoint_clusters)
+                    cluster_count = len(keypoint_clusters)
+                    
+                    # Use the HIGHER of raw vs clustered
+                    pose_count = max(raw_pose_count, cluster_count)
+                    
+                    if raw_pose_count != cluster_count:
+                        print(f"    🔬 Pose: raw_skeletons={raw_pose_count}, clustered={cluster_count} → using {pose_count}")
                     
             except Exception as e:
                 print(f"⚠️ Pose detection failed: {e}")
@@ -1897,8 +1911,12 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
         combined_count = bbox_count
         
         if COMBINE_BBOX_AND_POSE_COUNTS:
-            # Use the MAXIMUM of bbox and pose counts as baseline
-            combined_count = max(bbox_count, pose_count)
+            # For dense scenes, raw pose count is most reliable
+            # because pose skeletons are separated even when bboxes overlap
+            if raw_pose_count > bbox_count:
+                combined_count = raw_pose_count
+            else:
+                combined_count = max(bbox_count, pose_count)
             
             # If we have partial detections, check if they represent additional people
             if len(partial_detections) > 0:
