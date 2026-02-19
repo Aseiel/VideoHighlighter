@@ -520,7 +520,7 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
                         continue
                     raw_boxes.append((x1, y1, x2, y2, conf, False))  # False = not corner
 
-        # CRITICAL FIX: Merge overlapping boxes (removes face+hand false splits)
+        # Merge overlapping boxes (removes face+hand false splits)
         boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.25)
         corner_boxes = [box for box, is_corner in boxes if is_corner]
         boxes = [box for box, _ in boxes]
@@ -853,7 +853,7 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
     ACTION-AWARE cropping: Focus on where actions happen, not just people.
     Returns: (crop_count, positions_to_use, strategy_description)
     
-    FIXED: Takes people_count as input to make intelligent decisions about 2-person videos
+    Takes people_count as input to make intelligent decisions about 2-person videos
     """
     # Helper function to sort positions spatially (left to right)
     def sort_positions(positions):
@@ -1260,7 +1260,7 @@ class ROIDetector:
         return merged_box
 
     def _get_pose_based_roi(self, poses, person_boxes, frame_width, frame_height):
-        """Get ROI based on pose keypoints - FIXED VERSION"""
+        """Get ROI based on pose keypoints"""
         all_points = []
         
         for pose in poses:
@@ -1279,7 +1279,7 @@ class ROIDetector:
         width = x_max - x_min
         height = y_max - y_min
         
-        # FIXED: Use reasonable padding
+        # Use reasonable padding
         padding_x = width * 0.20
         padding_y = height * 0.25
         
@@ -1377,7 +1377,7 @@ class ROIDetector:
 def calculate_motion_expansion(current_box, history, base_margin=0.20, pose_activity=0.0):
     """
     Calculate adaptive expansion based on movement history AND pose activity.
-    FIXED VERSION: Much more conservative expansion.
+    Much more conservative expansion.
     """
     if not history or len(history) < 3:
         # Return base margin or small minimum
@@ -2233,7 +2233,7 @@ class MultiActionDetector:
                 if keep and area_ratio < 0.70:
                     boxes.append((x1, y1, x2, y2))
 
-        # 3) ROI detection — FIXED: Don't filter boxes, only use ROI as hint
+        # 3) ROI detection: Don't filter boxes, only use ROI as hint
         #    The tracker's jump resistance handles assignment correctly.
         #    ROI filtering was removing boxes from established regions.
         action_roi = None
@@ -2450,33 +2450,7 @@ def safe_crop(frame, box, action_idx=0, default_scale=0.25):
 
 def expand_box(box, frame_shape, frame_count, action_idx=0, margin=0.2, is_fallback=False):
     if box is None:
-        print(f"DEBUG: expand_box called with None for action_idx={action_idx}")
-        # Only create a new box if the input is None
-        h, w = frame_shape[:2]
-        default_size = int(min(h, w) // 2.5)
-        vertical_offset = int(h * 0.45)
-        
-        if action_idx == 0:
-            return (
-                int(w//8), 
-                vertical_offset,
-                int(w//8 + default_size), 
-                vertical_offset + default_size
-            )
-        elif action_idx == 1:
-            return (
-                int(w//2 - default_size//2), 
-                vertical_offset,
-                int(w//2 + default_size//2), 
-                vertical_offset + default_size
-            )
-        else:
-            return (
-                int(w*7//8 - default_size), 
-                vertical_offset,
-                int(w*7//8), 
-                vertical_offset + default_size
-            )
+        return None
     
     # ✅ ACTUALLY EXPAND THE GIVEN BOX
     h, w = frame_shape[:2]
@@ -2910,12 +2884,18 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
             for r in result:
                 for b in r.boxes:
                     x1, y1, x2, y2 = map(int, b.xyxy[0])
-                    box_w, box_h = x2 - x1, y2 - y1
+                    box_w, box_h = max(1, x2 - x1), max(1, y2 - y1)
                     area = box_w * box_h
                     frame_area = frame.shape[0] * frame.shape[1]
-                    aspect = box_w / box_h if box_h > 0 else 1
+                    area_ratio = area / frame_area
+                    aspect = box_w / float(box_h)
 
-                    if (0.02 < area / frame_area < 0.5 and 0.5 < aspect < 2.0):
+                    # Match the SAME filters as detect() so debug shows what tracker sees
+                    is_fullish = (area_ratio > 0.015 and 0.35 < aspect < 3.5 and box_h > frame.shape[0] * 0.20)
+                    is_legs = (area_ratio > 0.0015 and aspect < 0.45 and box_h > frame.shape[0] * 0.20)
+                    is_torso = (area_ratio > 0.0020 and aspect > 1.2 and box_w > frame.shape[1] * 0.10 and box_h > frame.shape[0] * 0.12)
+
+                    if (is_fullish or is_legs or is_torso) and area_ratio < 0.70:
                         yolo_boxes.append((x1, y1, x2, y2))
 
         # Build per-frame people_info for overlay (don’t mutate shared dict)
@@ -2933,21 +2913,21 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
         action_indices = []
         action_statuses = []  # Track status for each action
         
-        # ✅ FIXED: Determine action indices OUTSIDE the loop
+        # Determine action indices OUTSIDE the loop
         if crop_count == 3:
             action_indices = [0, 1, 2]
         elif crop_count == 2:
             # Map positions to indices: left=0, center=1, right=2
             if positions == ['left', 'right']:
                 action_indices = [0, 2]
-            elif positions == ['left', 'center']:
+            elif positions in (['left', 'center'], ['left', 'middle']):
                 action_indices = [0, 1]
-            elif positions == ['center', 'right']:
+            elif positions in (['center', 'right'], ['middle', 'right']):
                 action_indices = [1, 2]
             else:
-                action_indices = [0, 2]  # Default fallback
+                action_indices = [0, 2]
         
-        # ✅ FIXED: Main processing loop
+        # Main processing loop
         for i, action_idx in enumerate(action_indices):
             if i < len(actions) and actions[i] is not None:
                 current_box = actions[i]
@@ -2956,7 +2936,7 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
                 pose_activity = detector.pose_activities[action_idx] if action_idx < len(detector.pose_activities) else 0.0
                 history = detector.motion_histories[action_idx] if action_idx < len(detector.motion_histories) else deque(maxlen=10)
                 
-                # ✅ FIXED LOGIC: Determine status based on missing counter
+                # Determine status based on missing counter
                 if missing == 0:
                     # We have a fresh detection from YOLO!
                     status = "FRESH_DETECTION"
@@ -3000,24 +2980,27 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
             # Store status for visualization
             action_statuses.append(status)
             
-            # ──── Actually expand the box ────
-            expanded = expand_box(
-                current_box,
-                frame.shape,
-                frame_count,
-                action_idx=action_idx,
-                margin=adaptive_margin,
-                is_fallback=use_fallback_expansion
-            )
-            expanded_actions.append(expanded)
+            # ──── Actually expand the box (or None if no detection) ────
+            if current_box is not None:
+                expanded = expand_box(
+                    current_box,
+                    frame.shape,
+                    frame_count,
+                    action_idx=action_idx,
+                    margin=adaptive_margin,
+                    is_fallback=use_fallback_expansion
+                )
+                expanded_actions.append(expanded)
+            else:
+                expanded_actions.append(None)
             
-        # ✅ FIXED: This is now outside the loop, as it should be
+        # This is now outside the loop, as it should be
         h, w = frame.shape[:2]
         expanded_actions = prevent_overlap(expanded_actions, w)
         
         smoothed_actions = smoother.smooth(*expanded_actions)
                 
-        # NEW: Write debug frame with people_info
+        # Write debug frame with people_info
         if DEBUG_MODE and DEBUG_CREATE_VIDEOS and debug_writer:
             debug_info = {
                 "Crop Count": crop_count,
