@@ -3230,42 +3230,45 @@ def main():
 
                 print(f"   📊 Zone distribution: Left={left_avg:.1f}, Center={center_avg:.1f}, Right={right_avg:.1f}")
 
-                # Decision logic for 4+ people scenarios
-                if left_avg >= 2.5 and right_avg >= 1.5:
-                    print(f"   ↔️ Scenario: ~{left_avg:.0f} left, ~{right_avg:.0f} right - using left+right crops")
+                # Count zones with significant people presence
+                zones_with_people = []
+                if left_avg >= 1.0:
+                    zones_with_people.append('left')
+                if center_avg >= 1.0:
+                    zones_with_people.append('center')
+                if right_avg >= 1.0:
+                    zones_with_people.append('right')
+
+                print(f"   📍 Zones with people (avg >= 1.0): {zones_with_people}")
+
+                # Decision logic for 4+ people
+                if len(zones_with_people) >= 3:
+                    # People in all 3 zones → use all 3 crops
+                    print(f"   🎯 People in all 3 zones → 3 crops")
+                    crop_count = 3
+                    positions = ['left', 'center', 'right']
+                    strategy = "4plus-all-three-zones"
+
+                elif len(zones_with_people) == 2:
+                    # People in 2 zones → crop those 2
                     crop_count = 2
-                    positions = ['left', 'right']
-                    strategy = "4plus-left-right-split"
+                    positions = zones_with_people
+                    strategy = f"4plus-two-zones-{'-'.join(zones_with_people)}"
+                    print(f"   🎯 People in 2 zones → {positions}")
 
-                elif left_avg >= 3 and left_avg > center_avg + right_avg:
-                    print(f"   ⬅️ Left concentration ({left_avg:.1f} people) - single left crop")
+                elif len(zones_with_people) == 1:
+                    # All concentrated in one zone
                     crop_count = 1
-                    positions = ['left']
-                    strategy = "4plus-left-dominant"
-
-                elif right_avg >= 3 and right_avg > center_avg + left_avg:
-                    print(f"   ➡️ Right concentration ({right_avg:.1f} people) - single right crop")
-                    crop_count = 1
-                    positions = ['right']
-                    strategy = "4plus-right-dominant"
-
-                elif left_avg >= 2 and right_avg >= 2:
-                    print(f"   ↔️ People on both sides - left+right crops")
-                    crop_count = 2
-                    positions = ['left', 'right']
-                    strategy = "4plus-both-sides"
-
-                elif center_avg >= 3:
-                    print(f"   ⬆️ Center concentration ({center_avg:.1f} people) - center crop")
-                    crop_count = 1
-                    positions = ['center']
-                    strategy = "4plus-center-dominant"
+                    positions = zones_with_people
+                    strategy = f"4plus-concentrated-{zones_with_people[0]}"
+                    print(f"   🎯 All concentrated in {zones_with_people[0]}")
 
                 else:
-                    print(f"   ⚖️ Even distribution - default to left+right crops")
-                    crop_count = 2
-                    positions = ['left', 'right']
-                    strategy = "4plus-even-distribution"
+                    # Fallback: use all 3 to be safe
+                    print(f"   ⚖️ Can't determine distribution → 3 crops to be safe")
+                    crop_count = 3
+                    positions = ['left', 'center', 'right']
+                    strategy = "4plus-fallback-all-three"
 
             else:
                 # For 2-3 people, use the existing smart strategy
