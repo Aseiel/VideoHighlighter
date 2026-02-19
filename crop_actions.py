@@ -65,7 +65,7 @@ DEBUG_VIDEO_FOLDER = "debug_videos"  # Folder for debug videos
 DEBUG_VIDEO_SIDE_BY_SIDE = False  # Show original + debug side-by-side
 DEBUG_SHOW_METRICS = True  # Show tracking metrics overlay
 
-# ===== NEW: ENHANCED PEOPLE DETECTION =====
+# ===== ENHANCED PEOPLE DETECTION =====
 # Detect partial people and interaction zones
 USE_PARTIAL_PERSON_DETECTION = True
 PARTIAL_PERSON_MIN_AREA_RATIO = 0.0005  # Even smaller for legs-only, torsos, etc.
@@ -85,6 +85,12 @@ USE_COHERENCE_DETECTION = True
 COHERENCE_THRESHOLD_HIGH = 0.6  # Above this = same action
 COHERENCE_THRESHOLD_LOW = 0.4   # Below this = different actions
 MIN_COHERENCE_SAMPLES = 5
+
+# Jump Resistance Settings
+MAX_JUMP_RATIO = 0.18           # Max jump = 18% of frame width per frame
+JUMP_RESISTANCE_MIN_HISTORY = 4  # Enforce jump limits after 4 frames of history
+
+
 # ======================================
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -1903,6 +1909,7 @@ class MultiActionTracker:
         self.histories = [deque(maxlen=30) for _ in range(max_actions)]
         self.confidences = [0] * max_actions
         self.missing_counters = [0] * max_actions
+        self.last_centers = [None] * max_actions
 
     def update(self, boxes, frame_shape, frame_idx, crop_count=3, positions=None):
         """
@@ -1915,9 +1922,7 @@ class MultiActionTracker:
         """
         h, w = frame_shape[:2]
 
-        # ----------------------------
         # 1) Normalize positions
-        # ----------------------------
         if positions:
             positions = ["middle" if p == "center" else p for p in positions]
         else:
@@ -1926,68 +1931,103 @@ class MultiActionTracker:
         pos_to_idx = {"left": 0, "middle": 1, "right": 2}
         active_actions_indicies = [pos_to_idx[p] for p in positions if p in pos_to_idx]
 
-        # Sanity fallback
         if not active_actions_indicies:
             active_actions_indicies = [0, 1, 2] if crop_count == 3 else ([0, 2] if crop_count == 2 else [1])
             positions = ["left", "middle", "right"] if crop_count == 3 else (["left", "right"] if crop_count == 2 else ["middle"])
 
-        # ----------------------------
-        # 2) Build X targets for each output slot (order == positions)
-        # ----------------------------
+        # 2) Build zone targets
         slot_targets = []
         for p in positions:
             if p == "left":
                 slot_targets.append(w * (1/6))
             elif p == "middle":
                 slot_targets.append(w * 0.5)
-            else:  # right
+            else:
                 slot_targets.append(w * (5/6))
 
-        # ----------------------------
-        # 3) Assign detections to output slots by nearest target X
-        #    (each slot gets at most 1 box)
-        # ----------------------------
+        # 3) Classify slots: established vs new
+        max_jump_px = w * MAX_JUMP_RATIO
+        slot_established = [False] * len(positions)
+        slot_last_cx = [None] * len(positions)
+
+        for slot_i, action_idx in enumerate(active_actions_indicies):
+            has_history = len(self.histories[action_idx]) >= JUMP_RESISTANCE_MIN_HISTORY
+            if has_history and self.last_centers[action_idx] is not None:
+                slot_established[slot_i] = True
+                slot_last_cx[slot_i] = self.last_centers[action_idx]
+
+        # 4) TWO-PHASE ASSIGNMENT
         assigned_per_slot = [None] * len(positions)
+        used_boxes = set()
 
+        # Phase 1: Established slots grab only NEARBY detections
         if boxes:
-            for box in boxes:
-                cx = (box[0] + box[2]) / 2
+            for slot_i in range(len(positions)):
+                if not slot_established[slot_i]:
+                    continue
+                last_cx = slot_last_cx[slot_i]
+                best_box = None
+                best_dist = float('inf')
+                best_box_idx = -1
 
-                # find best slot
-                best_slot = min(range(len(slot_targets)), key=lambda i: abs(cx - slot_targets[i]))
+                for box_idx, box in enumerate(boxes):
+                    if box_idx in used_boxes:
+                        continue
+                    cx = (box[0] + box[2]) / 2.0
+                    dist = abs(cx - last_cx)
+                    if dist <= max_jump_px and dist < best_dist:
+                        best_dist = dist
+                        best_box = box
+                        best_box_idx = box_idx
 
-                # if slot empty, take it; else keep the one closer to target
-                if assigned_per_slot[best_slot] is None:
-                    assigned_per_slot[best_slot] = box
-                else:
-                    existing = assigned_per_slot[best_slot]
-                    ex_cx = (existing[0] + existing[2]) / 2
-                    if abs(cx - slot_targets[best_slot]) < abs(ex_cx - slot_targets[best_slot]):
-                        assigned_per_slot[best_slot] = box
+                if best_box is not None:
+                    assigned_per_slot[slot_i] = best_box
+                    used_boxes.add(best_box_idx)
 
-        # Map slot boxes into action-index boxes (0/1/2)
+        # Phase 2: Unestablished slots use zone-target matching
+        if boxes:
+            for slot_i in range(len(positions)):
+                if slot_established[slot_i]:
+                    continue
+                if assigned_per_slot[slot_i] is not None:
+                    continue
+                best_box = None
+                best_dist = float('inf')
+                best_box_idx = -1
+
+                for box_idx, box in enumerate(boxes):
+                    if box_idx in used_boxes:
+                        continue
+                    cx = (box[0] + box[2]) / 2.0
+                    dist = abs(cx - slot_targets[slot_i])
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_box = box
+                        best_box_idx = box_idx
+
+                if best_box is not None:
+                    assigned_per_slot[slot_i] = best_box
+                    used_boxes.add(best_box_idx)
+
+        # Map into action-index boxes
         action_boxes = [None] * self.max_actions
         for slot_i, action_idx in enumerate(active_actions_indicies):
             action_boxes[action_idx] = assigned_per_slot[slot_i]
 
-        # ----------------------------
-        # 4) Prevent overlap only among active boxes (in output order),
-        #    then put back into action_boxes
-        # ----------------------------
+        # 5) Prevent overlap
         active_boxes_in_output_order = [action_boxes[idx] for idx in active_actions_indicies]
         active_boxes_in_output_order = prevent_overlap(active_boxes_in_output_order, w)
         for slot_i, action_idx in enumerate(active_actions_indicies):
             action_boxes[action_idx] = active_boxes_in_output_order[slot_i]
 
-        # ----------------------------
-        # 5) Update tracking state for active actions only
-        # ----------------------------
+        # 6) Update tracking state
         for action_idx in active_actions_indicies:
             if action_boxes[action_idx] is not None:
                 box = self._fine_tune_box(action_boxes[action_idx], action_idx, (h, w))
                 self.histories[action_idx].append(box)
                 self.confidences[action_idx] = min(self.confidences[action_idx] + 1, 10)
                 self.missing_counters[action_idx] = 0
+                self.last_centers[action_idx] = (box[0] + box[2]) / 2.0
             else:
                 self.missing_counters[action_idx] += 1
 
@@ -2002,9 +2042,7 @@ class MultiActionTracker:
                 self.actions_confirmed[action_idx] = True
                 print(f"🎯 Locked Action idx={action_idx} ({positions[active_actions_indicies.index(action_idx)]})")
 
-        # ----------------------------
-        # 6) Return current regions IN OUTPUT ORDER (matches positions)
-        # ----------------------------
+        # 7) Return current regions
         regions = []
         for action_idx in active_actions_indicies:
             if self.actions_confirmed[action_idx] and self.locked_actions[action_idx]:
@@ -2016,11 +2054,9 @@ class MultiActionTracker:
 
         return prevent_overlap(regions, w)
 
-
     def _fine_tune_box(self, box, action_idx, frame_shape):
         h, w = frame_shape
         x1, y1, x2, y2 = box
-
         if action_idx == 0:
             y_center = (y1 + y2) / 2
             ideal_y_center = h * 0.5
@@ -2038,29 +2074,23 @@ class MultiActionTracker:
             ideal_y_center = h * 0.5
             y_adjust = (ideal_y_center - y_center) * 0.2
             x_adjust = 5
-
         x1 = int(max(0, x1 + x_adjust))
         y1 = int(max(0, y1 + y_adjust))
         x2 = int(min(w, x2 + x_adjust))
         y2 = int(min(h, y2 + y_adjust))
-
         return (x1, y1, x2, y2)
 
     def _get_optimal_box(self, history, action_idx, frame_shape):
         h, w = frame_shape
-
         median_box = self._get_median_box(history)
         if median_box is None:
             return None
-
         x1, y1, x2, y2 = median_box
         box_h = y2 - y1
         box_w = x2 - x1
-
         ideal_y = max(0, (h - box_h) // 2)
         y1 = int(ideal_y)
         y2 = int(y1 + box_h)
-
         if action_idx == 0:
             if x1 < w * 0.1:
                 x1 = int(w * 0.05)
@@ -2073,7 +2103,6 @@ class MultiActionTracker:
             if x2 > w * 0.9:
                 x2 = int(w * 0.95)
                 x1 = int(x2 - box_w)
-
         return (int(x1), int(y1), int(x2), int(y2))
 
     def _get_median_box(self, boxes):
@@ -2091,17 +2120,13 @@ class MultiActionTracker:
         )
 
     def _get_current_regions(self, h, w, crop_count=3, positions=None):
-        """Get current regions based on crop count"""
         regions = []
-
         if positions:
             positions = ["middle" if p == "center" else p for p in positions]
             pos_to_idx = {"left": 0, "middle": 1, "right": 2}
             indices = [pos_to_idx[p] for p in positions if p in pos_to_idx]
         else:
             indices = [0, 1, 2] if crop_count == 3 else [0, 2]
-
-
         for action_idx in indices:
             if self.actions_confirmed[action_idx] and self.locked_actions[action_idx]:
                 regions.append(self.locked_actions[action_idx])
@@ -2109,7 +2134,6 @@ class MultiActionTracker:
                 regions.append(self._get_median_box(self.histories[action_idx]))
             else:
                 regions.append(None)
-
         return prevent_overlap(regions, w)
 
 class MultiActionDetector:
@@ -2122,6 +2146,7 @@ class MultiActionDetector:
         self.motion_histories = [deque(maxlen=10) for _ in range(max_actions)]
         self.pose_activities = [0.0] * max_actions
         self.use_roi_detection = use_roi_detection
+        self.roi_detector = ROIDetector(debug=False) if use_roi_detection else None
 
         # Initialize ROI detector if enabled
         self.roi_detector = ROIDetector(debug=False) if use_roi_detection else None
@@ -2138,9 +2163,7 @@ class MultiActionDetector:
         self.frame_idx += 1
         h, w = frame.shape[:2]
 
-        # ----------------------------
-        # 1) Normalize positions / active indices
-        # ----------------------------
+        # 1) Normalize positions
         if positions:
             positions = ["middle" if p == "center" else p for p in positions]
         else:
@@ -2156,19 +2179,15 @@ class MultiActionDetector:
             active_actions_indicies = [0, 1, 2] if crop_count == 3 else ([0, 2] if crop_count == 2 else [1])
             positions = ["left", "middle", "right"] if crop_count == 3 else (["left", "right"] if crop_count == 2 else ["middle"])
 
-        # ----------------------------
         # 2) YOLO detections
-        # ----------------------------
-        # You can tune this; partials often need it lower.
-        TRACK_CONF = PERSON_DETECTION_CONF_TRACKING  # e.g. 0.06–0.12
+        TRACK_CONF = PERSON_DETECTION_CONF_TRACKING
         result = detector.predict(frame, conf=TRACK_CONF, classes=[0], verbose=False)
 
         boxes = []
         frame_area = float(h * w)
 
-        # Per-type confidence gating (prevents "conf too low -> chairs become people")
-        CONF_FULL = max(0.10, TRACK_CONF)  # full-ish should be a bit stricter
-        CONF_PARTIAL = max(0.06, TRACK_CONF)  # partials can be lower
+        CONF_FULL = max(0.10, TRACK_CONF)
+        CONF_PARTIAL = max(0.06, TRACK_CONF)
 
         def touches_border(x1, y1, x2, y2, margin=0.03):
             return (
@@ -2180,78 +2199,50 @@ class MultiActionDetector:
             for b in r.boxes:
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
                 conf = float(b.conf)
-
                 box_w = max(1, x2 - x1)
                 box_h = max(1, y2 - y1)
                 area = box_w * box_h
                 area_ratio = area / frame_area
                 aspect = box_w / float(box_h)
-
                 border = touches_border(x1, y1, x2, y2)
 
-                # ---- FULL-ish person (more normal aspect) ----
                 is_fullish = (
                     area_ratio > 0.015 and
                     0.35 < aspect < 3.5 and
                     box_h > h * 0.20
                 )
-
-                # ---- LEGS-only (tall + thin) ----
                 is_legs = (
                     area_ratio > 0.0015 and
                     aspect < 0.45 and
                     box_h > h * 0.20
                 )
-
-                # ---- TORSO-only (wide + short-ish) ----
-                # keep some minimum height so banners / tables don't dominate
                 is_torso = (
                     area_ratio > 0.0020 and
                     aspect > 1.2 and
                     box_w > w * 0.10 and
                     box_h > h * 0.12
                 )
-
-                # Optional: bias partial acceptance near borders (helps corners)
-                # If you want partials everywhere, remove `border and` from that line.
                 accept_partial = (is_legs or is_torso)
 
-                # Confidence gating:
-                # - full-ish requires CONF_FULL
-                # - partial can pass with CONF_PARTIAL (often needed for corners)
                 keep = False
                 if is_fullish and conf >= CONF_FULL:
                     keep = True
                 elif accept_partial and conf >= CONF_PARTIAL:
-                    # if you want to be stricter and ONLY keep partials near edges:
-                    # keep = border
                     keep = True
 
-                # Extra cheap anti-noise guard:
-                # reject absurdly huge "person" boxes
                 if keep and area_ratio < 0.70:
                     boxes.append((x1, y1, x2, y2))
 
-        # ----------------------------
-        # 3) ROI detection (optional)
-        # ----------------------------
+        # 3) ROI detection — FIXED: Don't filter boxes, only use ROI as hint
+        #    The tracker's jump resistance handles assignment correctly.
+        #    ROI filtering was removing boxes from established regions.
         action_roi = None
         if self.use_roi_detection and self.roi_detector and len(boxes) > 0:
             action_roi, focus_region = self.roi_detector.detect_action_roi(
                 frame, boxes, pose_model, max_people=crop_count
             )
 
-            if action_roi:
-                filtered_boxes = []
-                for box in boxes:
-                    if calculate_iou(box, action_roi) > 0.05:  # more lenient for partials
-                        filtered_boxes.append(box)
-                if filtered_boxes:
-                    boxes = filtered_boxes
-
-        # ----------------------------
-        # 4) Update tracker
-        # ----------------------------
+        # 4) Update tracker (with jump resistance built in)
         actions = self.tracker.update(
             boxes,
             (h, w),
@@ -2260,44 +2251,7 @@ class MultiActionDetector:
             positions=positions
         )
 
-        # ----------------------------
-        # 5) Constrain actions to ROI (optional)
-        # ----------------------------
-        if action_roi and len(actions) > 0:
-            adjusted_actions = []
-            roi_x1, roi_y1, roi_x2, roi_y2 = action_roi
-
-            for action in actions:
-                if action is None:
-                    adjusted_actions.append(None)
-                    continue
-
-                ax1, ay1, ax2, ay2 = action
-
-                ax1 = max(roi_x1, ax1)
-                ay1 = max(roi_y1, ay1)
-                ax2 = min(roi_x2, ax2)
-                ay2 = min(roi_y2, ay2)
-
-                if ax2 > ax1 and ay2 > ay1:
-                    adjusted_actions.append((ax1, ay1, ax2, ay2))
-                else:
-                    # fallback: ROI-centered box
-                    center_x = (roi_x1 + roi_x2) // 2
-                    center_y = (roi_y1 + roi_y2) // 2
-                    size = min(roi_x2 - roi_x1, roi_y2 - roi_y1) // 2
-                    adjusted_actions.append((
-                        max(0, center_x - size),
-                        max(0, center_y - size),
-                        min(w, center_x + size),
-                        min(h, center_y + size)
-                    ))
-
-            actions = adjusted_actions
-
-        # ----------------------------
-        # 6) Pose activity / tracking stats (unchanged)
-        # ----------------------------
+        # 5) Pose activity / tracking stats
         pose_data = {}
         if pose_model and USE_POSE_ESTIMATION:
             try:
@@ -2315,7 +2269,6 @@ class MultiActionDetector:
 
             if action is not None:
                 activity = 0.0
-
                 if pose_data:
                     best_match = None
                     best_overlap = 0.0
@@ -2324,8 +2277,7 @@ class MultiActionDetector:
                         if overlap > best_overlap:
                             best_overlap = overlap
                             best_match = keypoints
-
-                    if best_match is not None and best_overlap > 0.2:  # more lenient for partials
+                    if best_match is not None and best_overlap > 0.2:
                         activity = analyze_pose_activity(best_match, action)
 
                 self.pose_activities[action_idx] = activity
@@ -2335,9 +2287,7 @@ class MultiActionDetector:
             else:
                 self.missing_counters[action_idx] += 1
 
-        # ----------------------------
-        # 7) Fill missing actions with fallbacks
-        # ----------------------------
+        # 6) Fill missing actions with fallbacks
         final_actions = []
         for slot_i, action_idx in enumerate(active_actions_indicies):
             if slot_i < len(actions) and actions[slot_i] is not None:
@@ -2356,92 +2306,52 @@ class MultiActionDetector:
 
     def _get_fallback(self, action_idx, frame_shape, positions=None, crop_count=3):
         """
-        Improved fallback that respects the actual crop positions strategy.
-        
-        Args:
-            action_idx: Which action slot (0, 1, 2)
-            frame_shape: (h, w) tuple
-            positions: Actual positions being used (e.g., ['left', 'right'])
-            crop_count: How many crops total
+        fallback: Use last_good_actions first (keeps crop stable),
+        then fall back to position-based defaults.
         """
         h, w = frame_shape
-        
-        print(f"⚠️ FALLBACK USED for action {action_idx}! missing_counter={self.missing_counters[action_idx]}")
-        print(f"   Positions: {positions}, Crop count: {crop_count}")
 
-        # If we have positions info, use it to map action_idx to actual position
+        # FIRST: Try using last good tracked position (most stable)
+        if self.last_good_actions[action_idx] is not None:
+            return self.last_good_actions[action_idx]
+
+        # SECOND: Position-based default
         actual_position = None
         if positions:
-            # positions is in output order; map action_idx back to the corresponding position name
             if crop_count == 3:
                 idx_to_name = {0: 'left', 1: 'middle', 2: 'right'}
                 actual_position = idx_to_name.get(action_idx)
             else:
-                # For 2-crop, positions list itself defines what we are outputting.
-                # Convert to action indices and match.
                 pos_to_idx = {'left': 0, 'center': 1, 'middle': 1, 'right': 2}
                 mapped = [pos_to_idx[p] for p in positions]
                 if action_idx in mapped:
                     actual_position = positions[mapped.index(action_idx)]
 
-        
-        # Determine vertical position based on whether it's likely head/upper body
         default_size = int(min(h, w) // 2.5)
-        
-        # Head-focused crops should be higher in frame
-        if actual_position and self._is_head_focused(actual_position):
-            vertical_offset = int(h * 0.35)  # Higher for heads
-        else:
-            vertical_offset = int(h * 0.45)  # Standard
-        
-        # Map position to actual screen location
+        vertical_offset = int(h * 0.35)
+
         if actual_position == 'left':
-            return (
-                int(w//8), 
-                vertical_offset,
-                int(w//8 + default_size), 
-                vertical_offset + default_size
-            )
-        elif actual_position == 'center' or actual_position == 'middle':
-            return (
-                int(w//2 - default_size//2), 
-                vertical_offset,
-                int(w//2 + default_size//2), 
-                vertical_offset + default_size
-            )
+            return (int(w//8), vertical_offset, int(w//8 + default_size), vertical_offset + default_size)
+        elif actual_position in ('center', 'middle'):
+            return (int(w//2 - default_size//2), vertical_offset, int(w//2 + default_size//2), vertical_offset + default_size)
         elif actual_position == 'right':
-            return (
-                int(w*7//8 - default_size), 
-                vertical_offset,
-                int(w*7//8), 
-                vertical_offset + default_size
-            )
-        
-        # Fallback to old logic if no position info
-        print(f"⚠️ No position info for fallback idx={action_idx}")
+            return (int(w*7//8 - default_size), vertical_offset, int(w*7//8), vertical_offset + default_size)
+
         return self._get_legacy_fallback(action_idx, frame_shape)
 
     def _is_head_focused(self, position):
-        """Check if this crop should focus on head/upper body."""
-        # You might want to track this per position
-        # For now, assume all are head-focused
         return True
 
     def _get_legacy_fallback(self, action_idx, frame_shape):
-        """Original fallback logic for compatibility."""
         h, w = frame_shape
         default_size = int(min(h, w) // 2.5)
         vertical_offset = int(h * 0.45)
-        
         if action_idx == 0:
-            return (int(w//8), vertical_offset, int(w//8 + default_size), 
-                    vertical_offset + default_size)
+            return (int(w//8), vertical_offset, int(w//8 + default_size), vertical_offset + default_size)
         elif action_idx == 1:
-            return (int(w//2 - default_size//2), vertical_offset,
-                    int(w//2 + default_size//2), vertical_offset + default_size)
+            return (int(w//2 - default_size//2), vertical_offset, int(w//2 + default_size//2), vertical_offset + default_size)
         else:
-            return (int(w*7//8 - default_size), vertical_offset,
-                    int(w*7//8), vertical_offset + default_size)
+            return (int(w*7//8 - default_size), vertical_offset, int(w*7//8), vertical_offset + default_size)
 
 class MultiSmoother:
     def __init__(self, num_actions=3, window_size=8):
