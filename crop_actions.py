@@ -2306,38 +2306,15 @@ class MultiActionDetector:
 
     def _get_fallback(self, action_idx, frame_shape, positions=None, crop_count=3):
         """
-        fallback: Use last_good_actions first (keeps crop stable),
-        then fall back to position-based defaults.
+        fallback: Use last_good_actions if available.
+        If no history exists, return None (black frame) — don't invent positions.
         """
-        h, w = frame_shape
-
-        # FIRST: Try using last good tracked position (most stable)
+        # ONLY option: use last good tracked position
         if self.last_good_actions[action_idx] is not None:
             return self.last_good_actions[action_idx]
 
-        # SECOND: Position-based default
-        actual_position = None
-        if positions:
-            if crop_count == 3:
-                idx_to_name = {0: 'left', 1: 'middle', 2: 'right'}
-                actual_position = idx_to_name.get(action_idx)
-            else:
-                pos_to_idx = {'left': 0, 'center': 1, 'middle': 1, 'right': 2}
-                mapped = [pos_to_idx[p] for p in positions]
-                if action_idx in mapped:
-                    actual_position = positions[mapped.index(action_idx)]
-
-        default_size = int(min(h, w) // 2.5)
-        vertical_offset = int(h * 0.35)
-
-        if actual_position == 'left':
-            return (int(w//8), vertical_offset, int(w//8 + default_size), vertical_offset + default_size)
-        elif actual_position in ('center', 'middle'):
-            return (int(w//2 - default_size//2), vertical_offset, int(w//2 + default_size//2), vertical_offset + default_size)
-        elif actual_position == 'right':
-            return (int(w*7//8 - default_size), vertical_offset, int(w*7//8), vertical_offset + default_size)
-
-        return self._get_legacy_fallback(action_idx, frame_shape)
+        # No history = nothing to show. Return None → black frame until real detection.
+        return None
 
     def _is_head_focused(self, position):
         return True
