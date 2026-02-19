@@ -3572,19 +3572,119 @@ def main():
         # STEP 3: Process or copy based on strategy
         # Fully automatic - if crop_count is 0, copy; otherwise crop
         if crop_count >= MIN_PEOPLE_REQUIRED and len(positions) >= MIN_PEOPLE_REQUIRED:
-            print(f"   🎬 Processing with {crop_count}-crop: {positions}")
-            
-            # Modify process_video_with_dynamic_crops to accept people_info
+            # Process normally - debug video already created inside process_video_with_dynamic_crops
             output_files = process_video_with_dynamic_crops(
                 video_path,
                 OUTPUT_FOLDER,
                 yolo,
                 crop_count,
                 positions_override=positions,
-                people_info=people_info,   # ✅ ADD THIS
+                people_info=people_info,
             )
-
+        else:
+            reason = "strategy" if crop_count == 0 else "people count"
+            print(f"   📋 Copying {filename} as-is (reason: {reason}, strategy: {strategy})")
             
+            # Copy the video
+            copy_video_to_output(video_path, OUTPUT_FOLDER)
+            
+            # ==== CREATE DEBUG VIDEO FOR SKIPPED VIDEO (if debug mode is enabled) ====
+            if DEBUG_MODE and DEBUG_CREATE_VIDEOS:
+                print(f"   🎥 Creating debug video for skipped video...")
+                
+                # Create a dummy detector with the attributes that create_enhanced_debug_frame expects
+                class DummyDetector:
+                    def __init__(self):
+                        self.missing_counters = [0]  # For the "SKIPPED" status
+                        self.motion_histories = [deque(maxlen=10)]
+                        self.pose_activities = [0.0]
+                
+                dummy_detector = DummyDetector()
+                
+                # Create debug video
+                base_name = os.path.splitext(os.path.basename(video_path))[0]
+                debug_video_folder = os.path.join(DEBUG_VIDEO_FOLDER, "skipped")
+                os.makedirs(debug_video_folder, exist_ok=True)
+                
+                cap = cv2.VideoCapture(video_path)
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                
+                ret, first_frame = cap.read()
+                if ret:
+                    h, w = first_frame.shape[:2]
+                    debug_filename = f"{base_name}_skipped_{strategy}_debug.mp4"
+                    debug_path = os.path.join(debug_video_folder, debug_filename)
+                    
+                    fourcc = cv2.VideoWriter_fourcc(*'avc1')
+                    if DEBUG_VIDEO_SIDE_BY_SIDE:
+                        output_width = w * 2
+                        output_height = h
+                    else:
+                        output_width = w
+                        output_height = h
+                    
+                    debug_writer = cv2.VideoWriter(str(debug_path), fourcc, fps, (output_width, output_height))
+                    
+                    # Sample every 30 frames to keep file size manageable
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    frame_count = 0
+                    sample_interval = 30
+                    
+                    print(f"      Debug video: {debug_filename}")
+                    
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        
+                        if frame_count % sample_interval == 0:
+                            # Get YOLO detections
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            result = yolo.predict(rgb, conf=PERSON_DETECTION_CONF, classes=[0], verbose=False)
+                            
+                            yolo_boxes = []
+                            for r in result:
+                                for b in r.boxes:
+                                    x1, y1, x2, y2 = map(int, b.xyxy[0])
+                                    yolo_boxes.append((x1, y1, x2, y2))
+                            
+                            # Create debug info
+                            debug_info = {
+                                "Status": "SKIPPED",
+                                "Reason": f"{reason} ({strategy})",
+                                "Detections": len(yolo_boxes),
+                                "People Count": people_info.get('final_count', 'N/A')
+                            }
+                            
+                            # Use existing debug frame function with dummy detector
+                            debug_frame = create_enhanced_debug_frame(
+                                frame=frame,
+                                frame_idx=frame_count,
+                                yolo_boxes=yolo_boxes,
+                                expanded_boxes=[],
+                                smoothed_boxes=[],
+                                final_boxes=[],
+                                action_statuses=["SKIPPED"],
+                                positions=["full"],
+                                detector=dummy_detector,  # Now passing a valid detector
+                                debug_info=debug_info,
+                                people_info=people_info
+                            )
+                            
+                            if DEBUG_VIDEO_SIDE_BY_SIDE:
+                                combined_frame = create_side_by_side_frame(frame.copy(), debug_frame)
+                                debug_writer.write(combined_frame)
+                            else:
+                                debug_writer.write(debug_frame)
+                        
+                        frame_count += 1
+                    
+                    debug_writer.release()
+                    print(f"      ✅ Debug video saved")
+                
+                cap.release()
+
             # Also save people count info to debug folder
             if DEBUG_MODE:
                 debug_folder = os.path.join(DEBUG_OUTPUT_FOLDER, os.path.splitext(filename)[0])
@@ -3613,12 +3713,12 @@ def main():
                     json.dump(serializable_info, f, indent=2)
                 
                 print(f"   💾 Saved people count info to: {os.path.basename(people_info_path)}")
-        else:
-            reason = "strategy" if crop_count == 0 else "people count"
-            print(f"   📋 Copying {filename} as-is (reason: {reason}, strategy: {strategy})")
-            copy_video_to_output(video_path, OUTPUT_FOLDER)
+            else:
+                reason = "strategy" if crop_count == 0 else "people count"
+                print(f"   📋 Copying {filename} as-is (reason: {reason}, strategy: {strategy})")
+                copy_video_to_output(video_path, OUTPUT_FOLDER)
 
-        all_handled_videos.append(video_path)
+            all_handled_videos.append(video_path)
 
     print("\n" + "="*60)
     print("📊 PROCESSING SUMMARY")
