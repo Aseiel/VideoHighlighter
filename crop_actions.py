@@ -72,7 +72,7 @@ PARTIAL_PERSON_MIN_AREA_RATIO = 0.0005  # Even smaller for legs-only, torsos, et
 INTERACTION_ZONE_EXPANSION = 0.3  # Expand detection zones to catch nearby partial people
 POSE_KEYPOINT_CLUSTER_DETECTION = True  # Detect people by keypoint clusters
 MIN_KEYPOINT_CLUSTER_SIZE = 2  # Minimum keypoints to count as a person
-KEYPOINT_CLUSTER_RADIUS = 70  # Pixels - how close keypoints must be
+KEYPOINT_CLUSTER_RADIUS = 120  # Pixels - how close keypoints must be
 
 # People counting adjustment
 PEOPLE_COUNT_CONFIDENCE_BOOST = True  # Use multiple detection methods
@@ -222,6 +222,73 @@ def validate_detections_with_pose(detections, poses, conf_threshold=POSE_VALIDAT
 # ===== END NEW POSE VALIDATION HELPER =====
 
 
+def detect_single_person_split(merged_boxes, frame_poses, frame_w, frame_h):
+    """
+    Detect when 2 merged bboxes are actually parts of the SAME person
+    
+    Returns: (corrected_count, was_split_detected, split_reason)
+    """
+    if len(merged_boxes) != 2:
+        return len(merged_boxes), False, ""
+    
+    box1, _ = merged_boxes[0] if isinstance(merged_boxes[0], tuple) and len(merged_boxes[0]) == 2 else (merged_boxes[0], False)
+    box2, _ = merged_boxes[1] if isinstance(merged_boxes[1], tuple) and len(merged_boxes[1]) == 2 else (merged_boxes[1], False)
+    
+    x1_1, y1_1, x2_1, y2_1 = box1
+    x1_2, y1_2, x2_2, y2_2 = box2
+    
+    # Sort by vertical position (top box first)
+    if y1_1 > y1_2:
+        box1, box2 = box2, box1
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+    
+    cx1 = (x1_1 + x2_1) / 2
+    cx2 = (x1_2 + x2_2) / 2
+    w1 = x2_1 - x1_1
+    w2 = x2_2 - x1_2
+    h1 = y2_1 - y1_1
+    h2 = y2_2 - y1_2
+    
+    # CHECK 1: Vertically stacked boxes (torso on top, legs on bottom)
+    horizontal_overlap = abs(cx1 - cx2) < max(w1, w2) * 0.7
+    vertical_gap = y1_2 - y2_1  # Gap between bottom of top box and top of bottom box
+    vertically_adjacent = -h1 * 0.3 < vertical_gap < frame_h * 0.15  # Allow small gap or overlap
+    
+    if horizontal_overlap and vertically_adjacent:
+        # Additional check: combined height should be reasonable for one person
+        combined_h = y2_2 - y1_1
+        if combined_h < frame_h * 0.95 and combined_h > frame_h * 0.3:
+            # Check pose: should only have 1 pose skeleton
+            pose_count = len(frame_poses) if frame_poses else 0
+            if pose_count <= 1:
+                return 1, True, "vertically-stacked-single-pose"
+    
+    # CHECK 2: High IoU overlap (>0.35) - boxes mostly covering same area
+    iou = 0.0
+    ix1 = max(x1_1, x1_2)
+    iy1 = max(y1_1, y1_2)
+    ix2 = min(x2_1, x2_2)
+    iy2 = min(y2_1, y2_2)
+    if ix2 > ix1 and iy2 > iy1:
+        intersection = (ix2 - ix1) * (iy2 - iy1)
+        area1 = w1 * h1
+        area2 = w2 * h2
+        union = area1 + area2 - intersection
+        iou = intersection / union if union > 0 else 0
+    
+    if iou > 0.35:
+        return 1, True, f"high-iou-overlap-{iou:.2f}"
+    
+    # CHECK 3: One box contains the other (containment)
+    contained = (x1_1 <= x1_2 and y1_1 <= y1_2 and x2_1 >= x2_2 and y2_1 >= y2_2) or \
+                (x1_2 <= x1_1 and y1_2 <= y1_1 and x2_2 >= x2_1 and y2_2 >= y2_1)
+    if contained:
+        return 1, True, "containment"
+    
+    return 2, False, ""
+
+
 def create_debug_video_writer(video_path, output_folder, fps, frame_shape):
     """
     Create a video writer for debug visualization
@@ -366,7 +433,7 @@ def add_metrics_overlay(frame, frame_idx, action_statuses, positions, detector, 
     overlay = frame.copy()
 
     # Create semi-transparent background for metrics panel
-    panel_height = 200  # Increased height for people count info
+    panel_height = 240  # Increased height for pipeline detection info
     cv2.rectangle(overlay, (0, 0), (w, panel_height), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
@@ -413,6 +480,19 @@ def add_metrics_overlay(frame, frame_idx, action_statuses, positions, detector, 
             cv2.putText(frame, strategy_text, (20, y_pos),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             y_pos += 30
+
+        # Show per-frame pipeline info if available
+        pipeline = people_info.get('pipeline_info', None)
+        if pipeline:
+            pipe_text = f"Pipeline: Raw={pipeline.get('raw', '?')} Merged={pipeline.get('merged', '?')} Split={pipeline.get('split_corrected', '?')}"
+            cv2.putText(frame, pipe_text, (20, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 100), 1)
+            y_pos += 25
+            split_reason = pipeline.get('split_reason', '')
+            if split_reason:
+                cv2.putText(frame, f"Split fix: {split_reason}", (20, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 255, 100), 1)
+                y_pos += 25
 
     # Original debug info (now always safe)
     if debug_info:
@@ -657,7 +737,7 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
                     raw_boxes.append((x1, y1, x2, y2, conf, False))  # False = not corner
 
         # Merge overlapping boxes (removes face+hand false splits)
-        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.45)
+        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.25)
         corner_boxes = [box for box, is_corner in boxes if is_corner]
         boxes = [box for box, _ in boxes]
 
@@ -1867,42 +1947,38 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
         merged_bbox = merge_overlapping_boxes(
             [(d['box'][0], d['box'][1], d['box'][2], d['box'][3], d['conf'], False) 
              for d in bbox_detections],
-            iou_threshold=0.50
+            iou_threshold=0.3
         )
         bbox_count = len(merged_bbox)
 
-        # ===== METHOD 2: POSE SKELETON COUNTING =====
+        # ===== SPLIT DETECTION =====
+        if bbox_count == 2:
+            split_corrected_count, split_was_detected, split_reason = detect_single_person_split(
+                merged_bbox, frame_poses, w, h
+            )
+            if split_was_detected:
+                bbox_count = split_corrected_count
+                if idx % 10 == 0:
+                    print(f"  🔬 Frame {idx}: Split detected! 2→{split_corrected_count} ({split_reason})")
+
+        # ===== METHOD 2: POSE KEYPOINT CLUSTERING =====
         pose_count = 0
-        raw_pose_count = 0  # Direct from model, no post-processing
         keypoint_clusters = []
         
         if pose_model and POSE_KEYPOINT_CLUSTER_DETECTION:
             try:
-                pose_result = pose_model.predict(rgb, conf=0.12, verbose=False)
+                pose_result = pose_model.predict(rgb, conf=0.2, verbose=False)
                 
                 if len(pose_result) > 0 and hasattr(pose_result[0], 'keypoints'):
                     all_keypoints = pose_result[0].keypoints.data.cpu().numpy()
                     
-                    # METHOD 2a: RAW skeleton count (most reliable for close people)
-                    # Each entry in all_keypoints IS a separate person detection by the model
-                    for kpts in all_keypoints:
-                        visible_count = sum(1 for k in kpts if len(k) >= 3 and k[2] > 0.15)
-                        if visible_count >= MIN_KEYPOINT_CLUSTER_SIZE:
-                            raw_pose_count += 1
-                    
-                    # METHOD 2b: Cluster-based count (backup, more conservative)
+                    # Cluster keypoints by proximity
                     keypoint_clusters = cluster_keypoints_by_person(
                         all_keypoints, 
                         min_keypoints=MIN_KEYPOINT_CLUSTER_SIZE,
                         radius=KEYPOINT_CLUSTER_RADIUS
                     )
-                    cluster_count = len(keypoint_clusters)
-                    
-                    # Use the HIGHER of raw vs clustered
-                    pose_count = max(raw_pose_count, cluster_count)
-                    
-                    if raw_pose_count != cluster_count:
-                        print(f"    🔬 Pose: raw_skeletons={raw_pose_count}, clustered={cluster_count} → using {pose_count}")
+                    pose_count = len(keypoint_clusters)
                     
             except Exception as e:
                 print(f"⚠️ Pose detection failed: {e}")
@@ -1911,12 +1987,8 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
         combined_count = bbox_count
         
         if COMBINE_BBOX_AND_POSE_COUNTS:
-            # For dense scenes, raw pose count is most reliable
-            # because pose skeletons are separated even when bboxes overlap
-            if raw_pose_count > bbox_count:
-                combined_count = raw_pose_count
-            else:
-                combined_count = max(bbox_count, pose_count)
+            # Use the MAXIMUM of bbox and pose counts as baseline
+            combined_count = max(bbox_count, pose_count)
             
             # If we have partial detections, check if they represent additional people
             if len(partial_detections) > 0:
@@ -1979,27 +2051,34 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
     print(f"  Statistics: mean={mean_count:.1f}, median={median_count}, max={max_count}")
     print(f"  Most common: {most_common}")
 
-    # Decision logic: favor higher counts when evidence is strong
-    candidate_counts = []
+    # Decision logic: use MODE-FIRST approach (more robust than max)
+    # Previously used max(candidate_counts) which favored occasional split detections
     
-    # Add mean if reasonable
-    if mean_count >= 2:
-        candidate_counts.append(mean_count)
+    # Mode-first: use the most frequent count if it dominates
+    mode_count = most_common[0][0]
+    mode_freq = most_common[0][1] / len(combined_counts)
     
-    # Add median
-    candidate_counts.append(median_count)
+    print(f"  📊 Mode: {mode_count} (appears {mode_freq:.0%} of frames)")
     
-    # Add mode if it appears frequently enough
-    for count, freq in most_common:
-        if freq >= len(combined_counts) * 0.15:  # Lower threshold - 15%
-            candidate_counts.append(count)
+    if mode_freq >= 0.40:
+        # Strong mode - trust it
+        final_count = mode_count
+        print(f"  ✅ Using mode (strong): {final_count}")
+    else:
+        # No strong mode - use median (robust to outliers)
+        final_count = int(round(median_count))
+        print(f"  ✅ Using median (no strong mode): {final_count}")
     
-    # Add max if it appears in at least 20% of frames
-    max_freq = combined_counts.count(max_count) / len(combined_counts)
-    if max_freq >= 0.2:
-        candidate_counts.append(max_count)
-
-    final_count = int(round(max(candidate_counts)))
+    # Upgrade to higher count ONLY with strong multi-method agreement
+    # For upgrading 1→2: require BOTH bbox AND pose to find 2+ in ≥30% of frames
+    if final_count == 1 and max_count >= 2:
+        bbox_2plus = sum(1 for c in bbox_counts if c >= 2) / len(bbox_counts) if bbox_counts else 0
+        pose_2plus = sum(1 for c in pose_counts if c >= 2) / len(pose_counts) if pose_counts else 0
+        if bbox_2plus >= 0.30 and pose_2plus >= 0.30:
+            final_count = 2
+            print(f"  ⬆️ Upgraded 1→2: bbox_2+={bbox_2plus:.0%}, pose_2+={pose_2plus:.0%}")
+        else:
+            print(f"  ℹ️ Staying at 1: bbox_2+={bbox_2plus:.0%}, pose_2+={pose_2plus:.0%} (need both ≥30%)")
 
     # Override logic: if max_count is significantly higher and appears FREQUENTLY enough
     if max_count >= 3:
@@ -2014,12 +2093,16 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
         
         print(f"  📊 3+ frequency: bbox={bbox_3_pct:.0%} ({bbox_3plus}/{total}), pose={pose_3_pct:.0%} ({pose_3plus}/{total}), combined={combined_3_pct:.0%} ({combined_3plus}/{total})")
         
-        # Require 3+ to appear in at least 15% of frames from ANY method
-        if bbox_3_pct >= 0.15 or pose_3_pct >= 0.15 or combined_3_pct >= 0.15:
-            print(f"  ⚠️ Strong evidence of 3: sufficient frequency in samples")
+        # Require 3+ to appear in at least 20% of frames from BOTH bbox AND pose methods
+        # OR combined ≥35% (stricter than before)
+        both_agree = bbox_3_pct >= 0.20 and pose_3_pct >= 0.20
+        combined_strong = combined_3_pct >= 0.35
+        
+        if both_agree or combined_strong:
+            print(f"  ⚠️ Strong evidence of 3: bbox={bbox_3_pct:.0%}, pose={pose_3_pct:.0%}, combined={combined_3_pct:.0%}")
             final_count = max(final_count, 3)
         else:
-            print(f"  ℹ️ Max=3 but too rare ({combined_3_pct:.0%}) - not overriding")
+            print(f"  ℹ️ Max=3 but insufficient agreement: bbox={bbox_3_pct:.0%}, pose={pose_3_pct:.0%}, combined={combined_3_pct:.0%}")
 
     # Special case: if mean is 2.3+ and max is 3+, likely 3 people
     # Also require 3+ in at least 10% of frames
@@ -3590,7 +3673,9 @@ def main():
         # STEP 3: Process or copy based on strategy
         # Fully automatic - if crop_count is 0, copy; otherwise crop
         if crop_count >= MIN_PEOPLE_REQUIRED and len(positions) >= MIN_PEOPLE_REQUIRED:
-            # Process normally - debug video already created inside process_video_with_dynamic_crops
+            print(f"   🎬 Processing with {crop_count}-crop: {positions}")
+            
+            # Modify process_video_with_dynamic_crops to accept people_info
             output_files = process_video_with_dynamic_crops(
                 video_path,
                 OUTPUT_FOLDER,
@@ -3703,6 +3788,8 @@ def main():
                 
                 cap.release()
 
+
+            
             # Also save people count info to debug folder
             if DEBUG_MODE:
                 debug_folder = os.path.join(DEBUG_OUTPUT_FOLDER, os.path.splitext(filename)[0])
