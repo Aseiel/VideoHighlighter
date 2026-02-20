@@ -72,7 +72,7 @@ PARTIAL_PERSON_MIN_AREA_RATIO = 0.0005  # Even smaller for legs-only, torsos, et
 INTERACTION_ZONE_EXPANSION = 0.3  # Expand detection zones to catch nearby partial people
 POSE_KEYPOINT_CLUSTER_DETECTION = True  # Detect people by keypoint clusters
 MIN_KEYPOINT_CLUSTER_SIZE = 2  # Minimum keypoints to count as a person
-KEYPOINT_CLUSTER_RADIUS = 120  # Pixels - how close keypoints must be
+KEYPOINT_CLUSTER_RADIUS = 70  # Pixels - how close keypoints must be
 
 # People counting adjustment
 PEOPLE_COUNT_CONFIDENCE_BOOST = True  # Use multiple detection methods
@@ -594,67 +594,112 @@ def calculate_iou(box1, box2):
     
     return intersection / union if union > 0 else 0.0
 
-
-
 def analyze_pose_activity(keypoints, box):
-    """Analyze pose keypoints to determine activity level."""
+    """Analyze pose keypoints to determine activity level"""
     if keypoints is None or len(keypoints) == 0:
         return 0.0
 
     activity_score = 0.0
-
-    left_shoulder = keypoints[5] if len(keypoints) > 5 else None
-    right_shoulder = keypoints[6] if len(keypoints) > 6 else None
-    left_wrist = keypoints[9] if len(keypoints) > 9 else None
-    right_wrist = keypoints[10] if len(keypoints) > 10 else None
-
     box_x1, box_y1, box_x2, box_y2 = box
     box_width = box_x2 - box_x1
     box_height = box_y2 - box_y1
 
+    # ARM MOVEMENTS
     arms_extended = 0
+    arms_raised = 0
+    
+    # LEG MOVEMENTS
+    legs_apart = 0
+    knees_bent = 0
+    kicking = 0
 
+    # Check arms
+    left_shoulder = keypoints[5] if len(keypoints) > 5 else None
+    right_shoulder = keypoints[6] if len(keypoints) > 6 else None
+    left_wrist = keypoints[9] if len(keypoints) > 9 else None
+    right_wrist = keypoints[10] if len(keypoints) > 10 else None
+    
+    # Leg keypoints
+    left_hip = keypoints[11] if len(keypoints) > 11 else None
+    right_hip = keypoints[12] if len(keypoints) > 12 else None
+    left_knee = keypoints[13] if len(keypoints) > 13 else None
+    right_knee = keypoints[14] if len(keypoints) > 14 else None
+    left_ankle = keypoints[15] if len(keypoints) > 15 else None
+    right_ankle = keypoints[16] if len(keypoints) > 16 else None
+
+    # ===== ARM DETECTION =====
     if left_shoulder is not None and left_wrist is not None:
         left_shoulder_conf = left_shoulder[2] if len(left_shoulder) > 2 else 0
         left_wrist_conf = left_wrist[2] if len(left_wrist) > 2 else 0
-
         if left_shoulder_conf > 0.3 and left_wrist_conf > 0.3:
             arm_span = abs(left_wrist[0] - left_shoulder[0])
             if arm_span > box_width * 0.3:
                 arms_extended += 1
-
-    if right_shoulder is not None and right_wrist is not None:
-        right_shoulder_conf = right_shoulder[2] if len(right_shoulder) > 2 else 0
-        right_wrist_conf = right_wrist[2] if len(right_wrist) > 2 else 0
-
-        if right_shoulder_conf > 0.3 and right_wrist_conf > 0.3:
-            arm_span = abs(right_wrist[0] - right_shoulder[0])
-            if arm_span > box_width * 0.3:
-                arms_extended += 1
-
-    arms_raised = 0
-
-    if left_shoulder is not None and left_wrist is not None:
-        left_shoulder_conf = left_shoulder[2] if len(left_shoulder) > 2 else 0
-        left_wrist_conf = left_wrist[2] if len(left_wrist) > 2 else 0
-
-        if left_shoulder_conf > 0.3 and left_wrist_conf > 0.3:
             if left_wrist[1] < left_shoulder[1] - box_height * 0.1:
                 arms_raised += 1
 
     if right_shoulder is not None and right_wrist is not None:
         right_shoulder_conf = right_shoulder[2] if len(right_shoulder) > 2 else 0
         right_wrist_conf = right_wrist[2] if len(right_wrist) > 2 else 0
-
         if right_shoulder_conf > 0.3 and right_wrist_conf > 0.3:
+            arm_span = abs(right_wrist[0] - right_shoulder[0])
+            if arm_span > box_width * 0.3:
+                arms_extended += 1
             if right_wrist[1] < right_shoulder[1] - box_height * 0.1:
                 arms_raised += 1
 
-    activity_score = (
-        (arms_extended / 2.0) * 0.4 +
-        (arms_raised / 2.0) * 0.3 +
-        0.3
-    )
+    # ===== LEG DETECTION =====
+    # 1. Legs spread apart (standing wide, jumping, etc.)
+    if left_ankle is not None and right_ankle is not None:
+        left_ankle_conf = left_ankle[2] if len(left_ankle) > 2 else 0
+        right_ankle_conf = right_ankle[2] if len(right_ankle) > 2 else 0
+        if left_ankle_conf > 0.3 and right_ankle_conf > 0.3:
+            leg_span = abs(left_ankle[0] - right_ankle[0])
+            if leg_span > box_width * 0.4:  # Legs wider than 40% of body width
+                legs_apart += 1
+    
+    # 2. Knees bent (squatting, kicking, running)
+    if left_hip is not None and left_knee is not None and left_ankle is not None:
+        left_hip_conf = left_hip[2] if len(left_hip) > 2 else 0
+        left_knee_conf = left_knee[2] if len(left_knee) > 2 else 0
+        left_ankle_conf = left_ankle[2] if len(left_ankle) > 2 else 0
+        if left_hip_conf > 0.3 and left_knee_conf > 0.3 and left_ankle_conf > 0.3:
+            # Check if knee is bent (angle < 160 degrees)
+            # Vector from hip to knee
+            hip_knee_x = left_knee[0] - left_hip[0]
+            hip_knee_y = left_knee[1] - left_hip[1]
+            # Vector from knee to ankle
+            knee_ankle_x = left_ankle[0] - left_knee[0]
+            knee_ankle_y = left_ankle[1] - left_knee[1]
+            
+            # Dot product to check angle
+            dot = hip_knee_x * knee_ankle_x + hip_knee_y * knee_ankle_y
+            hip_knee_len = np.sqrt(hip_knee_x**2 + hip_knee_y**2)
+            knee_ankle_len = np.sqrt(knee_ankle_x**2 + knee_ankle_y**2)
+            
+            if hip_knee_len > 0 and knee_ankle_len > 0:
+                cos_angle = dot / (hip_knee_len * knee_ankle_len)
+                angle = np.arccos(np.clip(cos_angle, -1, 1)) * 180 / np.pi
+                if angle < 150:  # Bent knee
+                    knees_bent += 1
+    
+    # 3. Kicking motion (one leg forward/back)
+    if left_hip is not None and left_knee is not None and right_hip is not None and right_knee is not None:
+        left_hip_conf = left_hip[2] if len(left_hip) > 2 else 0
+        right_hip_conf = right_hip[2] if len(right_hip) > 2 else 0
+        left_knee_conf = left_knee[2] if len(left_knee) > 2 else 0
+        right_knee_conf = right_knee[2] if len(right_knee) > 2 else 0
+        
+        if left_hip_conf > 0.3 and right_hip_conf > 0.3 and left_knee_conf > 0.3 and right_knee_conf > 0.3:
+            # Check if one knee is much higher than the other
+            knee_height_diff = abs(left_knee[1] - right_knee[1])
+            if knee_height_diff > box_height * 0.15:
+                kicking += 1
+
+    # ===== COMBINED SCORE =====
+    arm_score = (arms_extended / 2.0) * 0.20 + (arms_raised / 2.0) * 0.25
+    leg_score = (legs_apart) * 0.15 + (knees_bent) * 0.15 + (kicking) * 0.15
+    activity_score = arm_score + leg_score + 0.02
 
     return min(activity_score, 1.0)
 
@@ -737,7 +782,7 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
                     raw_boxes.append((x1, y1, x2, y2, conf, False))  # False = not corner
 
         # Merge overlapping boxes (removes face+hand false splits)
-        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.25)
+        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.45)
         corner_boxes = [box for box, is_corner in boxes if is_corner]
         boxes = [box for box, _ in boxes]
 
@@ -770,11 +815,11 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
                     zone_boxes.append(box)
 
                     # Calculate activity score
-                    activity_score = 0.5
+                    activity_score = 0.0
                     for pose_box, keypoints in pose_data.items():
                         if calculate_iou(box, pose_box) > 0.2:
-                            activity_score = analyze_pose_activity(keypoints, box)
-                            break
+                            pose_activity = analyze_pose_activity(keypoints, box)
+                            activity_score = max(activity_score, pose_activity)
 
                     zone_activities.append(activity_score)
 
@@ -814,7 +859,7 @@ def is_in_corner(x1, y1, x2, y2, frame_width, frame_height, margin=0.15):
     
     return in_top_left or in_top_right or in_bottom_left or in_bottom_right
 
-def merge_overlapping_boxes(raw_boxes, iou_threshold=0.3):
+def merge_overlapping_boxes(raw_boxes, iou_threshold=0.5):
     """
         Merge overlapping bounding boxes to prevent detecting face+hand as separate people.
     Uses greedy NMS approach.
@@ -964,7 +1009,7 @@ def analyze_action_coherence(video_path, yolo_model, pose_model, sample_frames=1
                     matched_boxes.append(person_box)
             
             # If we have poses for both people
-            if len(person_poses) == 2:
+            if len(person_poses) == 2 and person_poses[0] is not None and person_poses[1] is not None:
                 # Calculate pose similarity (original)
                 similarity = calculate_pose_coherence(person_poses[0], person_poses[1])
                 similarity_scores.append(similarity)
@@ -1217,8 +1262,8 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
             # 1. Maximum activity level (peak action)
             max_activity = max(zone_activity[zone])
             
-            # 2. Percentage of frames with significant action (> 0.6)
-            high_action_frames = sum(1 for activity in zone_activity[zone] if activity > 0.6)
+            # 2. Percentage of frames with real action (> 0.15 = actual limb movement)
+            high_action_frames = sum(1 for activity in zone_activity[zone] if activity > 0.15)
             action_consistency = high_action_frames / len(zone_activity[zone])
             
             # 3. Action density (activity * people)
@@ -1232,7 +1277,7 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
                 'action_density': action_density,
                 'avg_activity': avg_activity,
                 'avg_people': avg_people,
-                'has_action': action_consistency > 0.15 or max_activity > 0.55
+                'has_action': action_consistency >= 0.15 or max_activity >= 0.25
             }
             
             print(f"      {zone.capitalize()}:")
@@ -1947,7 +1992,7 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
         merged_bbox = merge_overlapping_boxes(
             [(d['box'][0], d['box'][1], d['box'][2], d['box'][3], d['conf'], False) 
              for d in bbox_detections],
-            iou_threshold=0.3
+            iou_threshold=0.5
         )
         bbox_count = len(merged_bbox)
 
@@ -1961,25 +2006,40 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
                 if idx % 10 == 0:
                     print(f"  🔬 Frame {idx}: Split detected! 2→{split_corrected_count} ({split_reason})")
 
-        # ===== METHOD 2: POSE KEYPOINT CLUSTERING =====
+        # ===== METHOD 2: POSE SKELETON COUNTING =====
         pose_count = 0
+        raw_pose_count = 0
         keypoint_clusters = []
         
         if pose_model and POSE_KEYPOINT_CLUSTER_DETECTION:
             try:
-                pose_result = pose_model.predict(rgb, conf=0.2, verbose=False)
+                pose_result = pose_model.predict(rgb, conf=0.12, verbose=False)
                 
                 if len(pose_result) > 0 and hasattr(pose_result[0], 'keypoints'):
                     all_keypoints = pose_result[0].keypoints.data.cpu().numpy()
+
+                    # METHOD 2a: RAW skeleton count (most reliable for close people)
+                    # Each entry in all_keypoints IS a separate person detection by the model
+                    for kpts in all_keypoints:
+                        visible_count = sum(1 for k in kpts if len(k) >= 3 and k[2] > 0.15)
+                        if visible_count >= MIN_KEYPOINT_CLUSTER_SIZE:
+                            raw_pose_count += 1
                     
-                    # Cluster keypoints by proximity
+                    
+                    # METHOD 2b: Cluster-based count (backup, more conservative)
                     keypoint_clusters = cluster_keypoints_by_person(
                         all_keypoints, 
                         min_keypoints=MIN_KEYPOINT_CLUSTER_SIZE,
                         radius=KEYPOINT_CLUSTER_RADIUS
                     )
-                    pose_count = len(keypoint_clusters)
+                    cluster_count = len(keypoint_clusters)
+
+                    # Use the HIGHER of raw vs clustered
+                    pose_count = max(raw_pose_count, cluster_count)
                     
+                    if raw_pose_count != cluster_count:
+                                            print(f"    🔬 Pose: raw_skeletons={raw_pose_count}, clustered={cluster_count} → using {pose_count}")
+
             except Exception as e:
                 print(f"⚠️ Pose detection failed: {e}")
 
@@ -1987,8 +2047,12 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
         combined_count = bbox_count
         
         if COMBINE_BBOX_AND_POSE_COUNTS:
-            # Use the MAXIMUM of bbox and pose counts as baseline
-            combined_count = max(bbox_count, pose_count)
+            # For dense scenes, raw pose count is most reliable
+            # because pose skeletons are separated even when bboxes overlap
+            if raw_pose_count > bbox_count:
+                combined_count = raw_pose_count
+            else:
+                combined_count = max(bbox_count, pose_count)
             
             # If we have partial detections, check if they represent additional people
             if len(partial_detections) > 0:
