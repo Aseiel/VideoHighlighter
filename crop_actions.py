@@ -1513,6 +1513,8 @@ class ROIDetector:
         Returns (roi_box, focus_region)
         """
         h, w = frame.shape[:2]
+        self.frame_width = w
+        self.frame_height = h
 
         if not person_boxes or len(person_boxes) == 0:
             if self.debug:
@@ -1657,6 +1659,10 @@ class ROIDetector:
                     all_points.append(point)
         
         if len(all_points) == 0:
+            # If we have history, use last good ROI instead of full frame
+            if len(self.roi_history) > 0:
+                return self.roi_history[-1]
+            # Otherwise fall back to box merge
             return self._smart_merge_boxes(person_boxes, frame_width, frame_height)
         
         all_points_array = np.array(all_points)
@@ -1740,10 +1746,27 @@ class ROIDetector:
         )
 
     def _smooth_roi(self):
-        """Smooth ROI over history"""
+        """Smooth ROI over history with jump resistance"""
         if len(self.roi_history) == 0:
             return None
-
+        
+        # Calculate movement between last ROI and current
+        if len(self.roi_history) >= 2:
+            last_roi = self.roi_history[-1]
+            current_roi = self.roi_history[-2]  # Actually previous
+            
+            # If jump too big, reject it
+            last_center = ((last_roi[0] + last_roi[2])//2, (last_roi[1] + last_roi[3])//2)
+            curr_center = ((current_roi[0] + current_roi[2])//2, (current_roi[1] + current_roi[3])//2)
+            
+            jump_distance = np.sqrt((curr_center[0] - last_center[0])**2 + 
+                                (curr_center[1] - last_center[1])**2)
+            
+            if jump_distance > MAX_JUMP_RATIO * self.frame_width:
+                # Reject jump, use last good ROI
+                return last_roi
+        
+        # Normal smoothing
         x1s = [b[0] for b in self.roi_history]
         y1s = [b[1] for b in self.roi_history]
         x2s = [b[2] for b in self.roi_history]
@@ -2378,6 +2401,10 @@ class MultiActionTracker:
         self.missing_counters = [0] * max_actions
         self.last_centers = [None] * max_actions
 
+        # Initialize with reasonable default boxes for each position
+        # These will be used until first real detection
+        self.initialized = False
+
     def update(self, boxes, frame_shape, frame_idx, crop_count=3, positions=None):
         """
         Update tracker with boxes.
@@ -2388,6 +2415,40 @@ class MultiActionTracker:
         - returns regions in the SAME ORDER as `positions`
         """
         h, w = frame_shape[:2]
+
+        if not hasattr(self, 'initialized'):
+            self.initialized = False
+        
+        if not self.initialized and w > 0 and h > 0:
+            # Create default boxes for each position
+            default_width = int(w * 0.3)
+            default_height = int(h * 0.5)
+            default_y = int((h - default_height) / 2)
+            
+            for action_idx in range(self.max_actions):
+                if action_idx == 0:  # left
+                    default_x = int(w * 0.1)
+                elif action_idx == 1:  # middle
+                    default_x = int((w - default_width) / 2)
+                else:  # right
+                    default_x = int(w * 0.7)
+                    
+                default_box = (default_x, default_y, 
+                            default_x + default_width, 
+                            default_y + default_height)
+                
+                # Add to history so prediction can work immediately
+                for _ in range(3):  # Add 3 copies to build history
+                    self.histories[action_idx].append(default_box)
+                self.last_centers[action_idx] = (default_x + default_width/2)
+                
+                # Also set as last_good for fallback
+                if hasattr(self, 'last_good_actions'):
+                    self.last_good_actions[action_idx] = default_box
+            
+            self.initialized = True
+            if frame_idx < 10:  # Only print once at beginning
+                print(f"🎯 Initialized default boxes for all {self.max_actions} positions")
 
         # 1) Normalize positions
         if positions:
@@ -2475,6 +2536,44 @@ class MultiActionTracker:
                 if best_box is not None:
                     assigned_per_slot[slot_i] = best_box
                     used_boxes.add(best_box_idx)
+
+        for slot_i, action_idx in enumerate(active_actions_indicies):
+            if assigned_per_slot[slot_i] is None:
+                # This slot has no detection - predict from history
+                if len(self.histories[action_idx]) >= 3:
+                    # Predict where this person should be based on movement
+                    last_positions = list(self.histories[action_idx])[-3:]
+                    if len(last_positions) >= 2:
+                        # Get last box and previous box
+                        last_box = last_positions[-1]
+                        prev_box = last_positions[-2]
+                        
+                        # Calculate centers
+                        last_center = (last_box[0] + last_box[2]) / 2
+                        prev_center = (prev_box[0] + prev_box[2]) / 2
+                        
+                        # Calculate movement
+                        movement = last_center - prev_center
+                        
+                        # Predict next center
+                        predicted_center = last_center + movement
+                        
+                        # Use last box dimensions
+                        box_width = last_box[2] - last_box[0]
+                        box_height = last_box[3] - last_box[1]
+                        
+                        # Create predicted box (keep same y position)
+                        predicted_box = (
+                            int(max(0, predicted_center - box_width/2)),
+                            last_box[1],
+                            int(min(w, predicted_center + box_width/2)),
+                            last_box[3]
+                        )
+                        
+                        assigned_per_slot[slot_i] = predicted_box
+                        
+                        if frame_idx % 30 == 0:  # Print occasionally
+                            print(f"🔮 Predicted position for {positions[slot_i]} (no detection)")
 
         # Map into action-index boxes
         action_boxes = [None] * self.max_actions
@@ -3268,7 +3367,7 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
     if USE_ROI_DETECTION and USE_POSE_FOR_ROI:
         try:
             print("🧍 Loading pose estimation model for ROI detection...")
-            pose_model = YOLO("yolo11n-pose.pt")
+            pose_model = YOLO("yolo11s-pose.pt")
             print("✅ Pose model loaded for ROI detection")
         except Exception as e:
             print(f"⚠️ Could not load pose model: {e}")
@@ -3591,7 +3690,7 @@ def main():
         print("-" * 60)
 
     print("📦 Loading YOLO model...")
-    yolo = YOLO("yolo11n.pt")
+    yolo = YOLO("yolo11s.pt")
     print("✅ YOLO model loaded")
 
     # Load pose model for activity analysis
@@ -3599,7 +3698,7 @@ def main():
     if USE_POSE_ESTIMATION or USE_ROI_DETECTION:
         try:
             print("🧍 Loading pose estimation model...")
-            pose_model = YOLO("yolo11n-pose.pt")
+            pose_model = YOLO("yolo11s-pose.pt")
             print("✅ Pose model loaded")
         except Exception as e:
             print(f"⚠️ Could not load pose model: {e}")
