@@ -126,6 +126,10 @@ jobs:
             --collect-data whisper \
             --collect-data ultralytics \
             main.py
+      - name: Ad-hoc sign the app
+        run: |
+          codesign --force --deep --sign - "dist/VideoHighlighter.app"
+          codesign --verify --verbose "dist/VideoHighlighter.app"
       - name: Create DMG
         run: |
           create-dmg \
