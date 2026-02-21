@@ -1225,17 +1225,73 @@ def calculate_movement_synchrony(person_boxes_history, max_frames=20):
     return 0.5
 
 
-def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sample_frames=20, people_count=0):
+def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sample_frames=20, 
+                                    people_count=0, bbox_counts=None, pose_counts=None):
     """
     ACTION-AWARE cropping: Focus on where actions happen, not just people.
     Returns: (crop_count, positions_to_use, strategy_description)
     
     Takes people_count as input to make intelligent decisions about 2-person videos
+    Also uses bbox_counts and pose_counts for corner case detection
     """
+    # Initialize empty lists if not provided
+    if bbox_counts is None:
+        bbox_counts = []
+    if pose_counts is None:
+        pose_counts = []
+    
     # Helper function to sort positions spatially (left to right)
     def sort_positions(positions):
         spatial_order = {"left": 0, "center": 1, "middle": 1, "right": 2}
         return sorted(positions, key=lambda p: spatial_order.get(p, 1))
+    
+    # ===== CORNER CASE DETECTION: Dense/Packed People =====
+    # Pattern: YOLO sees 1-2, Pose sees 3-4, ALL zones have action
+    if bbox_counts and pose_counts:
+        yolo_max = max(bbox_counts) if bbox_counts else 0
+        pose_max = max(pose_counts) if pose_counts else 0
+        
+        # Only do this check if we have both types of data
+        if yolo_max <= 2 and pose_max >= 3:
+            print(f"   🚨 POTENTIAL CORNER CASE: YOLO max={yolo_max}, Pose max={pose_max}")
+            print(f"      Checking zone activity...")
+            
+            # Get zone analysis to confirm
+            zone_scores, zone_people, zone_activity = analyze_region_activity(
+                video_path, yolo_model, pose_model, sample_frames=15
+            )
+            
+            # Check if all zones have action
+            zone_action_potential = {}
+            all_zones_active = True
+            
+            for zone in ['left', 'center', 'right']:
+                if zone_activity[zone]:
+                    max_activity = max(zone_activity[zone])
+                    high_action_frames = sum(1 for activity in zone_activity[zone] if activity > 0.15)
+                    action_consistency = high_action_frames / len(zone_activity[zone])
+                    has_action = action_consistency >= 0.15 or max_activity >= 0.25
+                    
+                    zone_action_potential[zone] = {
+                        'max_activity': max_activity,
+                        'action_consistency': action_consistency,
+                        'has_action': has_action
+                    }
+                    
+                    if not has_action:
+                        all_zones_active = False
+                        print(f"      {zone.capitalize()} has no action")
+                else:
+                    all_zones_active = False
+            
+            if all_zones_active:
+                print(f"   🚨 CORNER CASE CONFIRMED: Dense crowd with activity in all zones")
+                print(f"      YOLO max: {yolo_max}, Pose max: {pose_max}")
+                print(f"      All zones have action - people packed together")
+                print(f"   ➡️ Using 3 crops to capture all activity")
+                return 3, ['left', 'center', 'right'], "corner-case-dense-crowd"
+            else:
+                print(f"   ℹ️ Not a corner case - zones lack consistent action")
     
     # ===== HANDLE SINGLE PERSON EXPLICITLY =====
     if people_count == 1:
@@ -1432,26 +1488,37 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
     
     # Case 4: Three action zones
     else:  # all 3 zones have action
-        action_zones = sort_positions(action_zones)  # ✅ SORT!
+        action_zones = sort_positions(action_zones)
         print(f"   🎯 Three action zones detected")
         
-        # Check if center is the main action hub
+        # Calculate densities
         center_density = zone_action_potential['center']['action_density']
         left_density = zone_action_potential['left']['action_density']
         right_density = zone_action_potential['right']['action_density']
         
-        # If center has significantly more action than sides
-        if center_density > (left_density + right_density) * 0.8:
-            print(f"   🎯 Center is action hub - cropping center only")
-            return 1, ['center'], "center-action-hub"
+        # More nuanced decision logic
+        if center_density > (left_density + right_density) * 1.2:
+            # Center is truly dominant (20% more than both sides combined)
+            print(f"   🎯 Center strongly dominant - cropping center only")
+            return 1, ['center'], "center-strongly-dominant"
         
-        # If sides have more action than center
+        elif center_density > right_density * 1.3 and right_density > left_density:
+            # Center and right are the main action zones
+            print(f"   🎯 Center + right primary action zones")
+            return 2, ['center', 'right'], "center-right-primary"
+        
+        elif center_density > left_density * 1.3 and left_density > right_density:
+            # Center and left are the main action zones
+            print(f"   🎯 Center + left primary action zones")
+            return 2, ['left', 'center'], "center-left-primary"
+        
         elif (left_density + right_density) > center_density * 1.5:
+            # Sides have more action than center
             print(f"   🎯 Sides have more action - cropping left+right")
             return 2, ['left', 'right'], "side-actions-dominant"
         
-        # Otherwise, crop all three
         else:
+            # Balanced across all three
             print(f"   🎯 Balanced action across zones - cropping all three")
             return 3, ['left', 'center', 'right'], "balanced-three-zone-actions"
                 
@@ -3752,6 +3819,48 @@ def main():
         if 'total_pose_filtered' in people_info and people_info['total_pose_filtered'] > 0:
             print(f"      🔬 Pose validation filtered {people_info['total_pose_filtered']} false positives")
 
+        # ===== CORNER CASE OVERRIDE - MODIFIED CONDITION =====
+        bbox_counts = people_info.get('bbox_counts', [])
+        pose_counts = people_info.get('pose_counts', [])
+
+        if bbox_counts and pose_counts:
+            low_yolo_frames = sum(1 for c in bbox_counts if c <= 1) / len(bbox_counts) if bbox_counts else 0
+            pose_max = max(pose_counts) if pose_counts else 0
+            
+            print(f"   📊 Corner check: Low YOLO frames={low_yolo_frames:.0%}, Pose max={pose_max}")
+            
+        if low_yolo_frames >= 0.7 and pose_max >= 3 and people_count <= 2:
+            print(f"   🚨 CORNER CASE DETECTED: YOLO sees 0-1, Pose sees up to {pose_max}")
+            
+            # SIMPLIFIED ZONE CHECK - just check if pose exists at all
+            if pose_max >= 3:  # If pose detected 3+ skeletons, that's enough evidence
+                print(f"   ✅ Pose detected {pose_max} skeletons - Overriding without zone check!")
+                
+                # Use pose count to determine crop count
+                crop_count = min(pose_max, 3)  # 3 crops max
+                positions = ['left', 'center', 'right'][:crop_count]
+                strategy = f"corner-case-pose-{pose_max}"
+                
+                people_info['crop_strategy'] = strategy
+                people_info['crop_count'] = crop_count
+                people_info['positions'] = positions
+                
+                print(f"   🎬 Processing with {crop_count}-crop (pose-based override)")
+                output_files = process_video_with_dynamic_crops(
+                    video_path,
+                    OUTPUT_FOLDER,
+                    yolo,
+                    crop_count,
+                    positions_override=positions,
+                    people_info=people_info,
+                )
+                
+                all_handled_videos.append(video_path)
+                continue
+            else:
+                print(f"   ℹ️ Pose only detected {pose_max} skeletons, not enough for override")
+                    # ===== END CORNER CASE OVERRIDE =====
+
         # STEP 2: Determine crop strategy
         crop_count = 0
         positions = []
@@ -3817,7 +3926,11 @@ def main():
                 # For 2-3 people, use the existing smart strategy
                 # PASS people_count to enable smart 2-person logic
                 crop_count, positions, strategy = determine_smart_crop_strategy_v2(
-                    video_path, yolo, pose_model, sample_frames=20, people_count=people_count
+                    video_path, yolo, pose_model, 
+                    sample_frames=20, 
+                    people_count=people_count,
+                    bbox_counts=people_info.get('bbox_counts', []),
+                    pose_counts=people_info.get('pose_counts', [])
                 )
                 print(f"   ✅ Strategy: {crop_count}-crop ({strategy})")
                 print(f"      Positions: {positions}")
