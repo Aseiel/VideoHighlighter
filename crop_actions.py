@@ -3082,61 +3082,70 @@ def safe_crop(frame, box, action_idx=0, default_scale=0.25):
     return frame[y1:y2, x1:x2]
 
 def expand_box(box, frame_shape, frame_count, action_idx=0, margin=0.2, is_fallback=False):
+    """
+    EXPAND BOX EVENLY in all directions with corner awareness.
+    Ensures action stays centered even when near frame edges.
+    """
     if box is None:
         return None
     
-    # ✅ ACTUALLY EXPAND THE GIVEN BOX
     h, w = frame_shape[:2]
     x1, y1, x2, y2 = map(int, box)
     
-    # ✅ Use FALLBACK_BOX_EXPANSION if is_fallback is True
+    # Use FALLBACK_BOX_EXPANSION if is_fallback is True
     if is_fallback:
         margin = FALLBACK_BOX_EXPANSION
-    
-    # DEBUG
-    if frame_count % 30 == 0 and is_fallback:
-        print(f"DEBUG expand_box: Frame {frame_count}, idx={action_idx}, margin={margin:.2f}")
-        print(f"  Original: ({x1}, {y1}, {x2}, {y2}) size: {x2-x1}x{y2-y1}")
     
     # Calculate expansion amounts
     bw, bh = x2 - x1, y2 - y1
     ew = int(bw * margin)
     eh = int(bh * margin)
     
-    # DEBUG - Show raw expansion before clipping
-    if frame_count % 30 == 0 and is_fallback:
-        print(f"  Raw expansion: {ew} horizontal, {eh} vertical")
+    # ----- HORIZONTAL EXPANSION: BALANCED for all positions -----
+    # Calculate ideal expansion
+    left_exp_ideal = ew
+    right_exp_ideal = ew
     
-    # Cap expansion to ensure box stays within frame
-    max_left_expansion = x1  # Can't go more left than 0
-    max_right_expansion = w - x2  # Can't go more right than w
+    # Check available space
+    max_left = x1  # Can't go left beyond 0
+    max_right = w - x2  # Can't go right beyond frame edge
     
-    # For boxes near edges, distribute expansion more evenly
-    if action_idx == 0:  # Left crop
-        # Left box: more expansion on right side, less on left
-        left_exp = min(ew // 3, max_left_expansion)
-        right_exp = min(ew, max_right_expansion)
-        if frame_count % 30 == 0 and is_fallback:
-            print(f"  Left crop: left_exp={left_exp}, right_exp={right_exp}")
-    elif action_idx == 2:  # Right crop
-        # Right box: more expansion on left side, less on right
-        left_exp = min(ew, max_left_expansion)
-        right_exp = min(ew // 3, max_right_expansion)
-        if frame_count % 30 == 0 and is_fallback:
-            print(f"  Right crop: left_exp={left_exp}, right_exp={right_exp}")
-            print(f"  Distance to right edge: {w - x2}px, max_right_expansion={max_right_expansion}")
-    else:  # Middle crop
-        # Middle box: equal expansion both sides
-        left_exp = min(ew // 2, max_left_expansion)
-        right_exp = min(ew // 2, max_right_expansion)
-        if frame_count % 30 == 0 and is_fallback:
-            print(f"  Middle crop: left_exp={left_exp}, right_exp={right_exp}")
+    # If near left edge, shift expansion to the right
+    if max_left < left_exp_ideal:
+        deficit = left_exp_ideal - max_left
+        left_exp = max_left
+        right_exp = min(right_exp_ideal + deficit, max_right)
+    # If near right edge, shift expansion to the left
+    elif max_right < right_exp_ideal:
+        deficit = right_exp_ideal - max_right
+        right_exp = max_right
+        left_exp = min(left_exp_ideal + deficit, max_left)
+    else:
+        # Plenty of space both sides - expand evenly
+        left_exp = left_exp_ideal
+        right_exp = right_exp_ideal
     
-    # Same for vertical expansion
-    max_top_expansion = y1
-    max_bottom_expansion = h - y2
-    top_exp = min(eh // 2, max_top_expansion)
-    bottom_exp = min(eh // 2, max_bottom_expansion)
+    # ----- VERTICAL EXPANSION: ALWAYS BALANCED -----
+    top_exp_ideal = eh
+    bottom_exp_ideal = eh
+    
+    max_top = y1
+    max_bottom = h - y2
+    
+    # If near top edge, shift expansion downward
+    if max_top < top_exp_ideal:
+        deficit = top_exp_ideal - max_top
+        top_exp = max_top
+        bottom_exp = min(bottom_exp_ideal + deficit, max_bottom)
+    # If near bottom edge, shift expansion upward
+    elif max_bottom < bottom_exp_ideal:
+        deficit = bottom_exp_ideal - max_bottom
+        bottom_exp = max_bottom
+        top_exp = min(top_exp_ideal + deficit, max_top)
+    else:
+        # Plenty of space both sides - expand evenly
+        top_exp = top_exp_ideal
+        bottom_exp = bottom_exp_ideal
     
     # Apply the expansion
     x1_new = int(max(0, x1 - left_exp))
@@ -3144,27 +3153,29 @@ def expand_box(box, frame_shape, frame_count, action_idx=0, margin=0.2, is_fallb
     y1_new = int(max(0, y1 - top_exp))
     y2_new = int(min(h, y2 + bottom_exp))
     
-    # DEBUG - Show after expansion
+    # Debug output for fallback boxes
     if frame_count % 30 == 0 and is_fallback:
+        print(f"DEBUG expand_box: Frame {frame_count}, idx={action_idx}, margin={margin:.2f}")
+        print(f"  Original: ({x1}, {y1}, {x2}, {y2}) size: {bw}x{bh}")
+        print(f"  Left expansion: {left_exp}px (ideal {left_exp_ideal}, space {max_left})")
+        print(f"  Right expansion: {right_exp}px (ideal {right_exp_ideal}, space {max_right})")
+        print(f"  Top expansion: {top_exp}px (ideal {top_exp_ideal}, space {max_top})")
+        print(f"  Bottom expansion: {bottom_exp}px (ideal {bottom_exp_ideal}, space {max_bottom})")
         print(f"  After expansion: ({x1_new}, {y1_new}, {x2_new}, {y2_new}) size: {x2_new-x1_new}x{y2_new-y1_new}")
     
     # Ensure minimum size for all boxes
-    min_width = int(w * 0.3)
-    min_height = int(h * 0.3)
+    min_width = int(w * MIN_BOX_WIDTH_RATIO)
+    min_height = int(h * MIN_BOX_HEIGHT_RATIO)
     
     if (x2_new - x1_new) < min_width:
         center_x = (x1_new + x2_new) // 2
         x1_new = max(0, center_x - min_width // 2)
         x2_new = min(w, center_x + min_width // 2)
-        if frame_count % 30 == 0 and is_fallback:
-            print(f"  Adjusted width to minimum: {min_width}")
     
     if (y2_new - y1_new) < min_height:
         center_y = (y1_new + y2_new) // 2
         y1_new = max(0, center_y - min_height // 2)
         y2_new = min(h, center_y + min_height // 2)
-        if frame_count % 30 == 0 and is_fallback:
-            print(f"  Adjusted height to minimum: {min_height}")
     
     return (x1_new, y1_new, x2_new, y2_new)
     
@@ -3567,7 +3578,7 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
                     # Use small expansion for fresh detections
                     adaptive_margin = calculate_motion_expansion(
                         current_box, history, 
-                        base_margin=BOX_EXPANSION,  # 0.20
+                        base_margin=BOX_EXPANSION,
                         pose_activity=pose_activity
                     )
                     
@@ -3575,7 +3586,7 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
                     # TRACKED with good history
                     status = "TRACKED-good"
                     use_fallback_expansion = False
-                    adaptive_margin = BOX_EXPANSION  # 0.20
+                    adaptive_margin = BOX_EXPANSION
                     
                 else:
                     # POOR tracking or stale (missing > 8 or low history)
