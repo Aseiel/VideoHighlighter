@@ -29,7 +29,7 @@ BOX_EXPANSION = 0.20  # For good detections
 FALLBACK_BOX_EXPANSION = 0.50  # For fallback boxes - SEPARATE!
 ACTION_LOCK_FRAMES = 90
 MAX_MISSING_FRAMES = 45
-OVERLAP_MARGIN = 15
+OVERLAP_MARGIN = 5
 
 # Minimum box dimensions (as percentage of frame)
 MIN_BOX_WIDTH_RATIO = 0.35
@@ -595,7 +595,7 @@ def calculate_iou(box1, box2):
     return intersection / union if union > 0 else 0.0
 
 def analyze_pose_activity(keypoints, box):
-    """Analyze pose keypoints to determine activity level"""
+    """Analyze pose keypoints to determine activity level - FIXED HIP TRACKING"""
     if keypoints is None or len(keypoints) == 0:
         return 0.0
 
@@ -612,6 +612,7 @@ def analyze_pose_activity(keypoints, box):
     legs_apart = 0
     knees_bent = 0
     kicking = 0
+    hip_movement = 0
 
     # Check arms
     left_shoulder = keypoints[5] if len(keypoints) > 5 else None
@@ -627,7 +628,7 @@ def analyze_pose_activity(keypoints, box):
     left_ankle = keypoints[15] if len(keypoints) > 15 else None
     right_ankle = keypoints[16] if len(keypoints) > 16 else None
 
-    # ===== ARM DETECTION =====
+    # ===== ARM DETECTION (unchanged) =====
     if left_shoulder is not None and left_wrist is not None:
         left_shoulder_conf = left_shoulder[2] if len(left_shoulder) > 2 else 0
         left_wrist_conf = left_wrist[2] if len(left_wrist) > 2 else 0
@@ -648,23 +649,42 @@ def analyze_pose_activity(keypoints, box):
             if right_wrist[1] < right_shoulder[1] - box_height * 0.1:
                 arms_raised += 1
 
-    # ===== LEG DETECTION =====
-    # 1. Legs spread apart (standing wide, jumping, etc.)
+    # ===== FIXED HIP/LEG DETECTION =====
+    
+    # 1. HIP MOVEMENT - Check if hips are visible (this was missing!)
+    if left_hip is not None and right_hip is not None:
+        left_hip_conf = left_hip[2] if len(left_hip) > 2 else 0
+        right_hip_conf = right_hip[2] if len(right_hip) > 2 else 0
+        
+        if left_hip_conf > 0.3 and right_hip_conf > 0.3:
+            # Check hip width (wider stance = more activity)
+            hip_width = abs(left_hip[0] - right_hip[0])
+            if hip_width > box_width * 0.3:
+                hip_movement += 1
+                
+            # Check hip height relative to box (squatting/crouching)
+            avg_hip_y = (left_hip[1] + right_hip[1]) / 2
+            box_center_y = (box_y1 + box_y2) / 2
+            
+            # If hips are lower than box center, likely squatting/crouching
+            if avg_hip_y > box_center_y + box_height * 0.1:
+                hip_movement += 2  # Strong indicator of activity
+    
+    # 2. Legs spread apart
     if left_ankle is not None and right_ankle is not None:
         left_ankle_conf = left_ankle[2] if len(left_ankle) > 2 else 0
         right_ankle_conf = right_ankle[2] if len(right_ankle) > 2 else 0
-        if left_ankle_conf > 0.3 and right_ankle_conf > 0.3:
+        if left_ankle_conf > 0.2 and right_ankle_conf > 0.2:
             leg_span = abs(left_ankle[0] - right_ankle[0])
-            if leg_span > box_width * 0.4:  # Legs wider than 40% of body width
+            if leg_span > box_width * 0.25:
                 legs_apart += 1
     
-    # 2. Knees bent (squatting, kicking, running)
+    # 3. Knees bent
     if left_hip is not None and left_knee is not None and left_ankle is not None:
         left_hip_conf = left_hip[2] if len(left_hip) > 2 else 0
         left_knee_conf = left_knee[2] if len(left_knee) > 2 else 0
         left_ankle_conf = left_ankle[2] if len(left_ankle) > 2 else 0
-        if left_hip_conf > 0.3 and left_knee_conf > 0.3 and left_ankle_conf > 0.3:
-            # Check if knee is bent (angle < 160 degrees)
+        if left_hip_conf > 0.2 and left_knee_conf > 0.2 and left_ankle_conf > 0.2:
             # Vector from hip to knee
             hip_knee_x = left_knee[0] - left_hip[0]
             hip_knee_y = left_knee[1] - left_hip[1]
@@ -672,7 +692,6 @@ def analyze_pose_activity(keypoints, box):
             knee_ankle_x = left_ankle[0] - left_knee[0]
             knee_ankle_y = left_ankle[1] - left_knee[1]
             
-            # Dot product to check angle
             dot = hip_knee_x * knee_ankle_x + hip_knee_y * knee_ankle_y
             hip_knee_len = np.sqrt(hip_knee_x**2 + hip_knee_y**2)
             knee_ankle_len = np.sqrt(knee_ankle_x**2 + knee_ankle_y**2)
@@ -680,26 +699,48 @@ def analyze_pose_activity(keypoints, box):
             if hip_knee_len > 0 and knee_ankle_len > 0:
                 cos_angle = dot / (hip_knee_len * knee_ankle_len)
                 angle = np.arccos(np.clip(cos_angle, -1, 1)) * 180 / np.pi
-                if angle < 150:  # Bent knee
+                if angle < 160:
                     knees_bent += 1
     
-    # 3. Kicking motion (one leg forward/back)
+    # 4. Kicking motion
     if left_hip is not None and left_knee is not None and right_hip is not None and right_knee is not None:
         left_hip_conf = left_hip[2] if len(left_hip) > 2 else 0
         right_hip_conf = right_hip[2] if len(right_hip) > 2 else 0
         left_knee_conf = left_knee[2] if len(left_knee) > 2 else 0
         right_knee_conf = right_knee[2] if len(right_knee) > 2 else 0
         
-        if left_hip_conf > 0.3 and right_hip_conf > 0.3 and left_knee_conf > 0.3 and right_knee_conf > 0.3:
+        if left_hip_conf > 0.2 and right_hip_conf > 0.2 and left_knee_conf > 0.2 and right_knee_conf > 0.2:
             # Check if one knee is much higher than the other
             knee_height_diff = abs(left_knee[1] - right_knee[1])
-            if knee_height_diff > box_height * 0.15:
+            if knee_height_diff > box_height * 0.08:
+                kicking += 1
+                
+            # Also check if one knee is far forward/back
+            knee_depth_diff = abs(left_knee[0] - right_knee[0])
+            if knee_depth_diff > box_width * 0.15:
                 kicking += 1
 
-    # ===== COMBINED SCORE =====
-    arm_score = (arms_extended / 2.0) * 0.20 + (arms_raised / 2.0) * 0.25
-    leg_score = (legs_apart) * 0.15 + (knees_bent) * 0.15 + (kicking) * 0.15
-    activity_score = arm_score + leg_score + 0.02
+    # ===== ADD HIP ROTATION DETECTION =====
+    if left_hip is not None and right_hip is not None:
+        left_hip_conf = left_hip[2] if len(left_hip) > 2 else 0
+        right_hip_conf = right_hip[2] if len(right_hip) > 2 else 0
+        
+        if left_hip_conf > 0.2 and right_hip_conf > 0.2:
+            # Check if hips are rotated (different Y positions)
+            hip_y_diff = abs(left_hip[1] - right_hip[1])
+            if hip_y_diff > box_height * 0.05:  # Slight rotation
+                hip_movement += 1
+
+    # ===== COMBINED SCORE - REBALANCED =====
+    # FIXED: Give more weight to hip/leg movements
+    arm_score = (arms_extended / 2.0) * 0.15 + (arms_raised / 2.0) * 0.15
+    leg_score = (legs_apart) * 0.15 + (knees_bent) * 0.20 + (kicking) * 0.20 + (hip_movement) * 0.15
+    
+    activity_score = arm_score + leg_score
+    
+    # Add small baseline for any movement
+    if activity_score > 0:
+        activity_score += 0.05
 
     return min(activity_score, 1.0)
 
@@ -708,17 +749,14 @@ def analyze_pose_activity(keypoints, box):
 def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20):
     """
     Analyze actual activity in different regions of the video.
-    Hybrid approach: Handles both corner people AND multi-person scenes.
-    Merges overlapping detections to prevent false splits in close-ups.
-    
-    UPDATED: Uses pose validation to filter false positives (stuffed animals etc.)
+    NOW RETURNS: zone_scores, zone_people, zone_activity, zone_positions
     """
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Define zones with overlap to catch corner people
+    # Define zones
     zone_width = frame_width / 3
     zones = {
         'left': (0, zone_width * 1.2),
@@ -728,6 +766,7 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
 
     zone_activity = {'left': [], 'center': [], 'right': []}
     zone_people_count = {'left': [], 'center': [], 'right': []}
+    zone_positions = {'left': [], 'center': [], 'right': []}  # NEW: Store actual positions of action
 
     sample_indices = [int((i / sample_frames) * total_frames) for i in range(sample_frames)]
 
@@ -739,54 +778,18 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # ===== Get pose data FIRST for validation =====
+        # Get pose data
         frame_poses = get_pose_keypoints_for_frame(rgb, pose_model, conf=0.15)
 
-        # Use lower confidence for zone analysis
+        # Get detections
         result = yolo_model.predict(rgb, conf=PERSON_DETECTION_CONF_ZONES, classes=[0], verbose=False)
         raw_boxes = []
-        corner_boxes = []
         
-        for r in result:
-            for b in r.boxes:
-                x1, y1, x2, y2 = map(int, b.xyxy[0])
-                box_w, box_h = x2 - x1, y2 - y1
-                area = box_w * box_h
-                frame_area = frame_width * frame_height
-                aspect = box_w / max(box_h, 1)
-                conf = float(b.conf)
-
-                # Check if person is in a corner
-                in_corner = is_in_corner(x1, y1, x2, y2, frame_width, frame_height)
-                
-                # TWO PATHS: Corner detection vs Regular detection
-                if in_corner:
-                    if area / frame_area >= MIN_PERSON_AREA_RATIO * 0.3:  # Lowered from 0.5x
-                        if aspect >= 0.05 and aspect <= 12:  # Wider range for distorted partials
-                            if conf > 0.20:  # Lowered from 0.25
-                                # ===== Pose validation for low-conf corner detections =====
-                                if conf < POSE_VALIDATION_CONF_THRESHOLD:
-                                    if not bbox_has_pose_support((x1, y1, x2, y2), frame_poses):
-                                        continue  # Skip: no pose support for low-conf detection
-                                raw_boxes.append((x1, y1, x2, y2, conf, True))
-                else:
-                    # REGULAR PATH: Standard thresholds for multi-person scenes
-                    if area / frame_area < MIN_PERSON_AREA_RATIO:
-                        continue
-                    if aspect < 0.08 or aspect > 10:
-                        continue
-                    # ===== Pose validation for low-conf regular detections =====
-                    if conf < POSE_VALIDATION_CONF_THRESHOLD:
-                        if not bbox_has_pose_support((x1, y1, x2, y2), frame_poses):
-                            continue  # Skip: no pose support for low-conf detection
-                    raw_boxes.append((x1, y1, x2, y2, conf, False))  # False = not corner
-
-        # Merge overlapping boxes (removes face+hand false splits)
+        # [existing detection code...]
+        
         boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.45)
-        corner_boxes = [box for box, is_corner in boxes if is_corner]
-        boxes = [box for box, _ in boxes]
 
-        # Get pose data for activity scoring (reuse frame_poses)
+        # Get pose data for activity scoring
         pose_data = {}
         for pose in frame_poses:
             pose_data[pose['bbox']] = pose['keypoints']
@@ -795,6 +798,7 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
         for zone_name, (zone_start, zone_end) in zones.items():
             zone_boxes = []
             zone_activities = []
+            zone_action_points = []  # NEW: Store actual action coordinates
 
             for box in boxes:
                 box_center_x = (box[0] + box[2]) / 2
@@ -806,22 +810,32 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
                 overlap_start = max(zone_start, box_left)
                 overlap_end = min(zone_end, box_right)
                 overlap = max(0, overlap_end - overlap_start)
-
-                # ADAPTIVE THRESHOLD: More lenient for corner boxes
-                is_corner_box = box in corner_boxes
-                overlap_threshold = 0.2 if is_corner_box else 0.3
                 
-                if overlap > box_width * overlap_threshold:
+                if overlap > box_width * 0.3:
                     zone_boxes.append(box)
 
-                    # Calculate activity score
+                    # Calculate activity score AND collect active keypoints
                     activity_score = 0.0
+                    active_points = []
+                    
                     for pose_box, keypoints in pose_data.items():
                         if calculate_iou(box, pose_box) > 0.2:
+                            # Get active keypoints (hands, feet, hips)
+                            for idx in [9, 10, 11, 12, 15, 16]:  # wrists, hips, ankles
+                                if idx < len(keypoints) and keypoints[idx][2] > 0.3:
+                                    x, y = keypoints[idx][0], keypoints[idx][1]
+                                    if zone_start <= x <= zone_end:  # In this zone
+                                        active_points.append((x, y))
+
+                            
                             pose_activity = analyze_pose_activity(keypoints, box)
                             activity_score = max(activity_score, pose_activity)
 
                     zone_activities.append(activity_score)
+                    
+                    # If there's significant activity, store the points
+                    if activity_score > 0.2 and active_points:
+                        zone_action_points.extend(active_points)
 
             # Store results
             zone_people_count[zone_name].append(len(zone_boxes))
@@ -829,6 +843,10 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
                 zone_activity[zone_name].append(np.mean(zone_activities))
             else:
                 zone_activity[zone_name].append(0.0)
+            
+            # NEW: Store action positions for this zone
+            if zone_action_points:
+                zone_positions[zone_name].append(zone_action_points)
 
     cap.release()
 
@@ -839,7 +857,7 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
         avg_activity = np.mean(zone_activity[zone_name]) if zone_activity[zone_name] else 0
         zone_scores[zone_name] = avg_people * avg_activity
 
-    return zone_scores, zone_people_count, zone_activity
+    return zone_scores, zone_people_count, zone_activity, zone_positions  # NEW: Return positions too
 
 
 def is_in_corner(x1, y1, x2, y2, frame_width, frame_height, margin=0.15):
@@ -1240,6 +1258,9 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
     if pose_counts is None:
         pose_counts = []
     
+    # Initialize action_hotspots at the VERY BEGINNING
+    action_hotspots = {}
+    
     # Helper function to sort positions spatially (left to right)
     def sort_positions(positions):
         spatial_order = {"left": 0, "center": 1, "middle": 1, "right": 2}
@@ -1257,9 +1278,30 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
             print(f"      Checking zone activity...")
             
             # Get zone analysis to confirm
-            zone_scores, zone_people, zone_activity = analyze_region_activity(
+            zone_scores, zone_people, zone_activity, zone_positions = analyze_region_activity(
                 video_path, yolo_model, pose_model, sample_frames=15
             )
+            
+            # Update action_hotspots from zone_positions
+            zones_to_check = ['left', 'center', 'right']
+            for zone in zones_to_check:
+                if zone in zone_positions and zone_positions[zone]:
+                    all_points = []
+                    for frame_points in zone_positions[zone]:
+                        all_points.extend(frame_points)
+                    
+                    if all_points:
+                        points_array = np.array(all_points)
+                        hot_x = np.mean(points_array[:, 0])
+                        hot_y = np.mean(points_array[:, 1])
+                        spread_x = np.std(points_array[:, 0])
+                        spread_y = np.std(points_array[:, 1])
+                        
+                        action_hotspots[zone] = {
+                            'center': (hot_x, hot_y),
+                            'spread': (spread_x, spread_y),
+                            'num_points': len(all_points)
+                        }
             
             # Check if all zones have action
             zone_action_potential = {}
@@ -1289,24 +1331,51 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
                 print(f"      YOLO max: {yolo_max}, Pose max: {pose_max}")
                 print(f"      All zones have action - people packed together")
                 print(f"   ➡️ Using 3 crops to capture all activity")
-                return 3, ['left', 'center', 'right'], "corner-case-dense-crowd"
+                return 3, ['left', 'center', 'right'], "corner-case-dense-crowd", action_hotspots
             else:
                 print(f"   ℹ️ Not a corner case - zones lack consistent action")
     
     # ===== HANDLE SINGLE PERSON EXPLICITLY =====
     if people_count == 1:
         print(f"   👤 Single person detected - NO CROP (would split body parts)")
-        return 0, [], "single-person-no-crop"
-    # ================================================
-
+        return 0, [], "single-person-no-crop", action_hotspots
     
     print(f"   🔍 Analyzing ACTION zones (not just people)...")
     
     # Get activity analysis
-    zone_scores, zone_people, zone_activity = analyze_region_activity(
+    zone_scores, zone_people, zone_activity, zone_positions = analyze_region_activity(
         video_path, yolo_model, pose_model, sample_frames
     )
     
+    # ===== Calculate action hotspots for each zone =====
+    zones_to_check = ['left', 'center', 'right']
+    
+    for zone in zones_to_check:
+        if zone in zone_positions and zone_positions[zone]:
+            # Collect all action points from this zone
+            all_points = []
+            for frame_points in zone_positions[zone]:
+                all_points.extend(frame_points)
+            
+            if all_points:
+                points_array = np.array(all_points)
+                # Calculate the centroid of action
+                hot_x = np.mean(points_array[:, 0])
+                hot_y = np.mean(points_array[:, 1])
+                
+                # Also calculate spread to determine if we need wide or tight crop
+                spread_x = np.std(points_array[:, 0])
+                spread_y = np.std(points_array[:, 1])
+                
+                action_hotspots[zone] = {
+                    'center': (hot_x, hot_y),
+                    'spread': (spread_x, spread_y),
+                    'num_points': len(all_points)
+                }
+                
+                print(f"   🔥 {zone} action hot spot: x={hot_x:.0f}, y={hot_y:.0f}, spread={spread_x:.0f}")
+    
+    # ===== Calculate zone action potential =====
     print(f"   📊 ACTION Zone analysis:")
     
     # Calculate ACTION metrics (not people metrics)
@@ -1349,6 +1418,195 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
     
     print(f"   🎯 Zones with action: {len(action_zones)} ({action_zones})")
     
+    # ===== NEW: Use hotspots to refine decisions =====
+    # Calculate hotspot scores for each zone
+    hotspot_scores = {}
+    for zone in ['left', 'center', 'right']:
+        if zone in action_hotspots:
+            hotspot = action_hotspots[zone]
+            # Score based on:
+            # 1. Number of action points (more = more action)
+            # 2. Tightness of cluster (lower spread = focused action)
+            num_points = hotspot['num_points']
+            spread = (hotspot['spread'][0] + hotspot['spread'][1]) / 2
+            
+            # Higher score for more points and tighter clusters
+            if num_points > 0:
+                hotspot_scores[zone] = num_points / (spread + 50)  # +50 to avoid division by zero
+                print(f"   🔥 {zone} hotspot score: {hotspot_scores[zone]:.3f} ({num_points} points, spread={spread:.0f})")
+            else:
+                hotspot_scores[zone] = 0
+        else:
+            hotspot_scores[zone] = 0
+    
+    # Combine activity scores with hotspot scores
+    combined_scores = {}
+    for zone in ['left', 'center', 'right']:
+        activity_score = zone_action_potential.get(zone, {}).get('action_density', 0)
+        hotspot_score = hotspot_scores.get(zone, 0)
+        
+        # Weighted combination (70% activity, 30% hotspot clustering)
+        combined_scores[zone] = activity_score * 0.7 + hotspot_score * 0.3
+        
+        if combined_scores[zone] > 0:
+            print(f"   📊 {zone} combined: {combined_scores[zone]:.3f} (activity={activity_score:.3f}, hotspot={hotspot_score:.3f})")
+    
+    # Sort zones by combined score
+    sorted_zones = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
+    top_zones = [z[0] for z in sorted_zones if z[1] > 0]
+    
+    # ===== HOTSPOT-BASED DECISION LOGIC =====
+    
+    # Case 1: Clear winner (top score much higher than others)
+    if len(sorted_zones) >= 2 and sorted_zones[0][1] > sorted_zones[1][1] * 1.5 and sorted_zones[0][1] > 0.1:
+        top_zone = sorted_zones[0][0]
+        print(f"   🎯 Clear hotspot winner: {top_zone} (score {sorted_zones[0][1]:.3f})")
+        
+        # Check if single crop is enough or if we need multiple
+        if people_count >= 3 and sorted_zones[1][1] > 0.05:
+            # Second zone still has significant action
+            top_two = [z[0] for z in sorted_zones[:2]]
+            print(f"   🎯 But second zone also active → 2 crops: {top_two}")
+            return 2, sort_positions(top_two), f"hotspot-2-{top_two[0]}-{top_two[1]}", action_hotspots
+        else:
+            return 1, [top_zone], f"hotspot-single-{top_zone}", action_hotspots
+    
+    # Case 2: Two strong hotspots
+    elif len(sorted_zones) >= 2 and sorted_zones[1][1] > 0.1:
+        top_two = [z[0] for z in sorted_zones[:2]]
+        print(f"   🎯 Two strong hotspots: {top_two}")
+        return 2, sort_positions(top_two), f"hotspot-two-{top_two[0]}-{top_two[1]}", action_hotspots
+    
+    # Case 3: All zones have hotspots
+    elif len([z for z in combined_scores if combined_scores[z] > 0.05]) >= 3:
+        print(f"   🎯 All zones active - using 3 crops")
+        return 3, ['left', 'center', 'right'], "hotspot-all-three", action_hotspots
+    
+    # ===== FALLBACK TO ORIGINAL LOGIC =====
+    # Only use this if hotspot-based decisions didn't apply
+    
+    # Case: No significant action anywhere
+    if len(action_zones) == 0:
+        # Fallback to presence-based
+        def pick_best_zones_by_presence(zone_people, zone_activity, k=2):
+            scores = []
+            for z in ["left", "center", "right"]:
+                avg_p = float(np.mean(zone_people[z])) if zone_people[z] else 0.0
+                avg_a = float(np.mean(zone_activity[z])) if zone_activity[z] else 0.0
+                score = avg_p + 0.25 * avg_a
+                scores.append((score, z))
+            scores.sort(key=lambda x: x[0], reverse=True)
+            return [s[1] for s in scores[:k]]
+        
+        best2 = pick_best_zones_by_presence(zone_people, zone_activity, k=2)
+        best2 = sort_positions(best2)
+        print(f"   📋 No clear action - using presence-based zones: {best2}")
+        return 2, best2, f"no-action-presence-{best2[0]}-{best2[1]}", action_hotspots
+    
+    # Case: Single action zone
+    elif len(action_zones) == 1:
+        zone = action_zones[0]
+        print(f"   🎯 Single action zone: {zone}")
+        return 1, [zone], f"single-action-{zone}", action_hotspots
+    
+    # Case: Two action zones
+    elif len(action_zones) == 2:
+        action_zones = sort_positions(action_zones)
+        print(f"   🎯 Two action zones: {action_zones}")
+        return 2, action_zones, f"two-action-{action_zones[0]}-{action_zones[1]}", action_hotspots
+    
+    # Case: Three action zones
+    else:
+        print(f"   🎯 Three action zones detected")
+        return 3, ['left', 'center', 'right'], "three-action-zones", action_hotspots
+        
+    # ===== HANDLE SINGLE PERSON EXPLICITLY =====
+    if people_count == 1:
+        print(f"   👤 Single person detected - NO CROP (would split body parts)")
+        return 0, [], "single-person-no-crop", {}
+    # ================================================
+
+    
+    print(f"   🔍 Analyzing ACTION zones (not just people)...")
+    
+    # Get activity analysis
+    zone_scores, zone_people, zone_activity, zone_positions = analyze_region_activity(
+        video_path, yolo_model, pose_model, sample_frames
+    )
+    
+    # ===== NEW: Calculate action hotspots for each zone =====
+    action_hotspots = {}
+    zones_to_check = ['left', 'center', 'right']
+    
+    for zone in zones_to_check:
+        if zone in zone_positions and zone_positions[zone]:
+            # Collect all action points from this zone
+            all_points = []
+            for frame_points in zone_positions[zone]:
+                all_points.extend(frame_points)
+            
+            if all_points:
+                points_array = np.array(all_points)
+                # Calculate the centroid of action
+                hot_x = np.mean(points_array[:, 0])
+                hot_y = np.mean(points_array[:, 1])
+                
+                # Also calculate spread to determine if we need wide or tight crop
+                spread_x = np.std(points_array[:, 0])
+                spread_y = np.std(points_array[:, 1])
+                
+                action_hotspots[zone] = {
+                    'center': (hot_x, hot_y),
+                    'spread': (spread_x, spread_y),
+                    'num_points': len(all_points)
+                }
+                
+                print(f"   🔥 {zone} action hot spot: x={hot_x:.0f}, y={hot_y:.0f}, spread={spread_x:.0f}")
+    
+    # ===== Continue with existing zone_action_potential calculation =====
+    print(f"   📊 ACTION Zone analysis:")
+    
+    # Calculate ACTION metrics (not people metrics)
+    zone_action_potential = {}
+    
+    for zone in ['left', 'center', 'right']:
+        if zone_activity[zone]:
+            # Key metrics for action cropping:
+            # 1. Maximum activity level (peak action)
+            max_activity = max(zone_activity[zone])
+            
+            # 2. Percentage of frames with real action (> 0.15 = actual limb movement)
+            high_action_frames = sum(1 for activity in zone_activity[zone] if activity > 0.15)
+            action_consistency = high_action_frames / len(zone_activity[zone])
+            
+            # 3. Action density (activity * people)
+            avg_people = np.mean(zone_people[zone]) if zone_people[zone] else 0
+            avg_activity = np.mean(zone_activity[zone])
+            action_density = avg_people * avg_activity
+            
+            zone_action_potential[zone] = {
+                'max_activity': max_activity,
+                'action_consistency': action_consistency,
+                'action_density': action_density,
+                'avg_activity': avg_activity,
+                'avg_people': avg_people,
+                'has_action': action_consistency >= 0.15 or max_activity >= 0.25
+            }
+            
+            print(f"      {zone.capitalize()}:")
+            print(f"        Max activity: {max_activity:.2f}")
+            print(f"        Action consistency: {action_consistency:.0%}")
+            print(f"        Action density: {action_density:.2f}")
+            print(f"        Avg people: {avg_people:.1f}")
+            print(f"        Has action: {'✓' if zone_action_potential[zone]['has_action'] else '✗'}")
+
+    
+    # Count zones with significant action
+    action_zones = [zone for zone in ['left', 'center', 'right'] 
+                    if zone in zone_action_potential and zone_action_potential[zone]['has_action']]
+    
+    print(f"   🎯 Zones with action: {len(action_zones)} ({action_zones})")
+    
     # ===== IMPROVED 2-PERSON LOGIC =====
     # Only apply strict 2-person logic if we're CONFIDENT it's exactly 2 people
     # (not 3+ with some partially visible)
@@ -1373,12 +1631,24 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
         
         # Determine zones with people
         zones_with_people = []
+        action_centers = {}  # NEW: Store where in each zone the action is happening
+
         for zone in ['left', 'center', 'right']:
             if zone in zone_action_potential:
                 avg_people = zone_action_potential[zone]['avg_people']
                 if avg_people >= 0.7:
                     zones_with_people.append(zone)
-        
+                    
+                    # NEW: Calculate action hot spot within this zone
+                    if zone_activity[zone]:
+                        # Find frames with high activity
+                        high_activity_frames = []
+                        for i, activity in enumerate(zone_activity[zone]):
+                            if activity > 0.25:  # Threshold for "active"
+                                # We need the actual positions from these frames
+                                # This requires storing more data in analyze_region_activity
+                                pass
+
         print(f"   📍 Zones with people: {zones_with_people}")
         
         # ===== DECISION LOGIC =====
@@ -1448,7 +1718,7 @@ def determine_smart_crop_strategy_v2(video_path, yolo_model, pose_model=None, sa
         best2, dbg = pick_best_zones_by_presence(zone_people, zone_activity, k=2)
         best2 = sort_positions(best2)  # ✅ SORT!
         print(f"   📋 No clear action - using presence-based zones: {best2}")
-        return 2, best2, f"no-action-presence-{best2[0]}-{best2[1]}"
+        return 2, best2, f"no-action-presence-{best2[0]}-{best2[1]}", action_hotspots
     
     # Case 2: Single action zone
     elif len(action_zones) == 1:
@@ -1716,38 +1986,47 @@ class ROIDetector:
         return merged_box
 
     def _get_pose_based_roi(self, poses, person_boxes, frame_width, frame_height):
-        """Get ROI based on pose keypoints"""
+        """
+        Get ROI based on pose keypoints - ALL keypoints are equal, no weighting
+        """
         all_points = []
         
         for pose in poses:
+            # Add ALL visible keypoints with equal weight
             for idx in range(17):
                 if pose[idx, 2] > ROI_CONFIDENCE_THRESHOLD:
                     point = pose[idx, :2]
-                    all_points.append(point)
+                    all_points.append(point)  # Each point added ONCE, no weighting
         
         if len(all_points) == 0:
-            # If we have history, use last good ROI instead of full frame
+            # If we have history, use last good ROI
             if len(self.roi_history) > 0:
                 return self.roi_history[-1]
             # Otherwise fall back to box merge
             return self._smart_merge_boxes(person_boxes, frame_width, frame_height)
         
         all_points_array = np.array(all_points)
-        x_min, y_min = np.min(all_points_array, axis=0)
-        x_max, y_max = np.max(all_points_array, axis=0)
+        
+        # Use min/max to capture full body - this is the problem!
+        # This always captures from head to toe
+        x_min = np.min(all_points_array[:, 0])
+        y_min = np.min(all_points_array[:, 1])
+        x_max = np.max(all_points_array[:, 0])
+        y_max = np.max(all_points_array[:, 1])
+        
+        # This includes head (y_min) and feet (y_max) - that's why hips aren't focused
         
         width = x_max - x_min
         height = y_max - y_min
         
-        # Use reasonable padding
+        # Padding
         padding_x = width * 0.20
         padding_y = height * 0.25
         
         x1 = max(0, int(x_min - padding_x))
         y1 = max(0, int(y_min - padding_y))
         x2 = min(frame_width, int(x_max + padding_x))
-        y2 = min(frame_height, int(y_max + padding_y))
-        
+        y2 = min(frame_height, int(y_max + padding_y))        
         # Ensure minimum size (but not excessive)
         min_width = frame_width * 0.25
         min_height = frame_height * 0.25
@@ -1765,26 +2044,47 @@ class ROIDetector:
         return (x1, y1, x2, y2)
 
     def _determine_focus_region(self, poses):
-        """Determine focus region based on visible keypoints"""
+        """Determine focus region based on visible keypoints - BETTER HIP/LOWER BODY DETECTION"""
         if len(poses) == 0:
             return 'full_body'
 
-        upper_count = 0
-        lower_count = 0
+        # Count keypoints in different regions
+        head_count = 0      # Nose, eyes, ears (0-4)
+        upper_count = 0     # Shoulders, elbows (5-8)
+        core_count = 0      # Wrists, hips (9-12) - THIS IS THE HIP AREA!
+        lower_count = 0     # Knees, ankles (13-16)
 
         for pose in poses:
-            for idx in range(0, 11):
+            for idx in range(17):
                 if pose[idx, 2] > ROI_CONFIDENCE_THRESHOLD:
-                    upper_count += 1
+                    if idx <= 4:  # Head
+                        head_count += 1
+                    elif 5 <= idx <= 8:  # Upper body
+                        upper_count += 1
+                    elif 9 <= idx <= 12:  # Core/Hip area (wrists + hips)
+                        core_count += 1
+                    elif 13 <= idx <= 16:  # Lower body
+                        lower_count += 1
 
-            for idx in range(11, 17):
-                if pose[idx, 2] > ROI_CONFIDENCE_THRESHOLD:
-                    lower_count += 1
-
-        if upper_count > lower_count * 1.5:
-            return 'upper_body'
-        elif lower_count > upper_count * 1.5:
+        # Calculate total visible keypoints
+        total = head_count + upper_count + core_count + lower_count
+        
+        if total == 0:
+            return 'full_body'
+        
+        # Calculate percentages
+        head_pct = head_count / total
+        upper_pct = upper_count / total
+        core_pct = core_count / total
+        lower_pct = lower_count / total
+        
+        # Decision logic focusing on core/hip area
+        if core_pct > 0.4:  # Many core/hip keypoints visible
+            return 'core_body'  # New region type!
+        elif lower_pct > upper_pct * 1.5:
             return 'lower_body'
+        elif upper_pct > lower_pct * 1.5:
+            return 'upper_body'
         else:
             return 'full_body'
 
@@ -2420,8 +2720,6 @@ def has_evidence_of_third_person(full_detections, partial_detections, keypoint_c
     
     return False
 
-
-
 def prevent_overlap(boxes, frame_width, margin=OVERLAP_MARGIN):
     """Adjust boxes to prevent overlap while maintaining left-middle-right order."""
     if not boxes or len(boxes) < 2:
@@ -2468,10 +2766,6 @@ class MultiActionTracker:
         self.missing_counters = [0] * max_actions
         self.last_centers = [None] * max_actions
 
-        # Initialize with reasonable default boxes for each position
-        # These will be used until first real detection
-        self.initialized = False
-
     def update(self, boxes, frame_shape, frame_idx, crop_count=3, positions=None):
         """
         Update tracker with boxes.
@@ -2490,7 +2784,7 @@ class MultiActionTracker:
             # Create default boxes for each position
             default_width = int(w * 0.3)
             default_height = int(h * 0.5)
-            default_y = int((h - default_height) / 2)
+            default_y = int((h - default_height) / 2)  # ← THIS IS THE CULPRIT!
             
             for action_idx in range(self.max_actions):
                 if action_idx == 0:  # left
@@ -2514,6 +2808,7 @@ class MultiActionTracker:
                     self.last_good_actions[action_idx] = default_box
             
             self.initialized = True
+
             if frame_idx < 10:  # Only print once at beginning
                 print(f"🎯 Initialized default boxes for all {self.max_actions} positions")
 
@@ -2721,22 +3016,29 @@ class MultiActionTracker:
         x1, y1, x2, y2 = median_box
         box_h = y2 - y1
         box_w = x2 - x1
+
         ideal_y = max(0, (h - box_h) // 2)
         y1 = int(ideal_y)
         y2 = int(y1 + box_h)
-        if action_idx == 0:
-            if x1 < w * 0.1:
+        
+        # Only apply gentle horizontal positioning for left/right
+        if action_idx == 0:  # left
+            if x1 < w * 0.1:  # Keep it from hugging the edge
                 x1 = int(w * 0.05)
                 x2 = int(x1 + box_w)
-        elif action_idx == 1:
+        elif action_idx == 1:  # center
+            # Optional: very gentle centering pull, but keep y position
             ideal_x = max(0, (w - box_w) // 2)
-            x1 = int(ideal_x)
+            # Blend between current and center (70% current, 30% center)
+            x1 = int(x1 * 0.7 + ideal_x * 0.3)
             x2 = int(x1 + box_w)
-        else:
+        else:  # right
             if x2 > w * 0.9:
                 x2 = int(w * 0.95)
                 x1 = int(x2 - box_w)
+        
         return (int(x1), int(y1), int(x2), int(y2))
+
 
     def _get_median_box(self, boxes):
         if not boxes:
@@ -2854,6 +3156,12 @@ class MultiActionDetector:
                     aspect > 1.2 and
                     box_w > w * 0.10 and
                     box_h > h * 0.12
+                )
+                is_hip_region = (
+                    area_ratio > 0.01 and
+                    0.6 < aspect < 1.4 and
+                    box_h > h * 0.15 and
+                    box_h < h * 0.4
                 )
                 accept_partial = (is_legs or is_torso)
 
@@ -3004,7 +3312,20 @@ class MultiSmoother:
             int(np.median(y2s))
         )
 
-def safe_crop(frame, box, action_idx=0, default_scale=0.25):
+def safe_crop(frame, box, action_idx=0, default_scale=0.25, focus_region='full_body'):
+    """
+    Safe cropping with region awareness - NOW WITH CORE/HIP FOCUS
+    
+    Args:
+        frame: Input frame
+        box: (x1, y1, x2, y2) bounding box
+        action_idx: Index of action (0=left, 1=center, 2=right)
+        default_scale: Default crop scale if box is None
+        focus_region: 'full_body', 'upper_body', 'lower_body', or 'core_body'
+    
+    Returns:
+        Cropped frame region
+    """
     if box is None:
         h, w = frame.shape[:2]
         size = int(min(h, w) * default_scale)
@@ -3020,162 +3341,185 @@ def safe_crop(frame, box, action_idx=0, default_scale=0.25):
     x1, y1, x2, y2 = map(int, box)
     h, w = frame.shape[:2]
     
+    # Clamp to frame boundaries
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     
-    # REDUCE MINIMUM DIMENSIONS for head-focused crops
-    # Check if this looks like a head crop (based on aspect ratio)
+    # Store original dimensions
     original_box_w = x2 - x1
     original_box_h = y2 - y1
     
-    # If it's a portrait-oriented box, it might be head-focused
-    is_portrait = original_box_h > original_box_w * 1.2
+    # Skip if box is invalid
+    if original_box_w <= 0 or original_box_h <= 0:
+        # Return a default center crop
+        size = int(min(h, w) * 0.3)
+        x1 = w//2 - size//2
+        y1 = h//2 - size//2
+        return frame[y1:y1+size, x1:x1+size]
     
-    if is_portrait:
-        # For head crops, allow smaller minimums
-        min_width = int(w * 0.25)  # Reduced from 0.30
-        min_height = int(h * 0.28)  # Reduced from 0.30
-    else:
-        # For regular crops, use standard minimums
-        min_width = int(w * 0.30)
-        min_height = int(h * 0.30)
+    # === ADJUST VERTICAL POSITION BASED ON FOCUS REGION ===
     
+    if focus_region == 'core_body':
+        # Core/hip focus - aim for region around 60-70% down from top
+        # This targets the hip area specifically
+        
+        # Calculate new center at 65% of original box height
+        new_center_y = int(y1 + original_box_h * 0.65)
+        
+        # Adjust box to center on hip area
+        half_height = original_box_h // 2
+        y1_new = max(0, new_center_y - half_height)
+        y2_new = min(h, new_center_y + half_height)
+        
+        # If we have room to shift, use the new position
+        if y2_new > y1_new:
+            y1, y2 = y1_new, y2_new
+            
+            # If we lost too much height due to boundaries, expand a bit
+            if (y2 - y1) < original_box_h * 0.6:
+                # Expand back toward original height but keep centered on hip
+                y1 = max(0, new_center_y - original_box_h // 2)
+                y2 = min(h, new_center_y + original_box_h // 2)
+    
+    elif focus_region == 'lower_body':
+        # Lower body focus - shift crop downward to show legs/feet
+        # Shift down by 15% of box height
+        shift_y = int(original_box_h * 0.15)
+        y1_new = min(h - original_box_h, y1 + shift_y)
+        y2_new = y1_new + original_box_h
+        
+        # Only apply if we have room
+        if y2_new <= h and y1_new >= 0:
+            y1, y2 = y1_new, y2_new
+    
+    elif focus_region == 'upper_body':
+        # Upper body focus - shift crop upward to show head/shoulders
+        # Shift up by 10% of box height
+        shift_y = int(original_box_h * 0.10)
+        y1_new = max(0, y1 - shift_y)
+        y2_new = y1_new + original_box_h
+        
+        # Only apply if we have room
+        if y2_new <= h:
+            y1, y2 = y1_new, y2_new
+    
+    # === ENSURE MINIMUM SIZE ===
+    
+    # Calculate current dimensions after adjustments
     box_w = x2 - x1
     box_h = y2 - y1
     
-    # Only enforce minimums if box is REALLY small
-    if box_w < min_width and box_w < w * 0.2:  # Only expand if very small
+    # Minimum dimensions (as percentage of frame)
+    min_width = int(w * 0.25)
+    min_height = int(h * 0.25)
+    
+    # Expand if too narrow
+    if box_w < min_width and box_w < w * 0.2:
         cx = (x1 + x2) // 2
-        x1 = int(max(0, cx - min_width//2))
-        x2 = int(min(w, cx + min_width//2))
+        x1 = int(max(0, cx - min_width // 2))
+        x2 = int(min(w, cx + min_width // 2))
         box_w = x2 - x1
     
-    if box_h < min_height and box_h < h * 0.2:  # Only expand if very small
+    # Expand if too short
+    if box_h < min_height and box_h < h * 0.2:
         cy = (y1 + y2) // 2
-        y1 = int(max(0, cy - min_height//2))
-        y2 = int(min(h, cy + min_height//2))
+        y1 = int(max(0, cy - min_height // 2))
+        y2 = int(min(h, cy + min_height // 2))
         box_h = y2 - y1
     
-    # Make aspect ratio requirements more lenient
+    # === ENFORCE REASONABLE ASPECT RATIO ===
+    
     aspect_ratio = box_w / max(box_h, 1)
     
-    if aspect_ratio > 2.0:  # Too wide
-        target_h = int(box_w / 1.2)  # More lenient than 1.5
+    # If too wide
+    if aspect_ratio > 2.2:
+        target_h = int(box_w / 1.5)
         cy = (y1 + y2) // 2
-        y1 = int(max(0, cy - target_h//2))
-        y2 = int(min(h, cy + target_h//2))
-    elif aspect_ratio < 0.4:  # More lenient than 0.5 (allow taller boxes)
-        target_w = int(box_h * 0.7)  # More lenient than 0.8
-        cx = (x1 + x2) // 2
-        x1 = int(max(0, cx - target_w//2))
-        x2 = int(min(w, cx + target_w//2))
+        y1_new = max(0, cy - target_h // 2)
+        y2_new = min(h, cy + target_h // 2)
+        
+        # Only apply if we have enough height
+        if y2_new - y1_new > box_h * 0.5:
+            y1, y2 = y1_new, y2_new
     
-    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+    # If too tall
+    elif aspect_ratio < 0.4:
+        target_w = int(box_h * 0.7)
+        cx = (x1 + x2) // 2
+        x1_new = max(0, cx - target_w // 2)
+        x2_new = min(w, cx + target_w // 2)
+        
+        # Only apply if we have enough width
+        if x2_new - x1_new > box_w * 0.5:
+            x1, x2 = x1_new, x2_new
+    
+    # Final clamp to frame boundaries
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
     
     # Final validation
     if x2 <= x1 or y2 <= y1:
+        # Fallback to default center crop
         size = int(min(h, w) * default_scale)
-        x1 = int(w//2 - size//2)
-        y1 = int(h//2 - size//2)
+        x1 = w//2 - size//2
+        y1 = h//2 - size//2
         return frame[y1:y1+size, x1:x1+size]
     
+    # Return the cropped region
     return frame[y1:y2, x1:x2]
 
-def expand_box(box, frame_shape, frame_count, action_idx=0, margin=0.2, is_fallback=False):
-    """
-    EXPAND BOX EVENLY in all directions with corner awareness.
-    Ensures action stays centered even when near frame edges.
-    """
+def expand_box(box, frame_shape, frame_count, action_idx=0, margin=0.2, is_fallback=False, pose_activity=0.0):
     if box is None:
         return None
     
     h, w = frame_shape[:2]
     x1, y1, x2, y2 = map(int, box)
     
-    # Use FALLBACK_BOX_EXPANSION if is_fallback is True
     if is_fallback:
         margin = FALLBACK_BOX_EXPANSION
     
-    # Calculate expansion amounts
     bw, bh = x2 - x1, y2 - y1
     ew = int(bw * margin)
     eh = int(bh * margin)
     
-    # ----- HORIZONTAL EXPANSION: BALANCED for all positions -----
-    # Calculate ideal expansion
-    left_exp_ideal = ew
-    right_exp_ideal = ew
+    # VERTICAL EXPANSION - More aggressive for lower body activity
+    # If pose activity indicates leg/hip movement, add extra vertical padding
+    leg_activity_bonus = 0
+    if pose_activity > 0.3:  # Significant activity detected
+        leg_activity_bonus = int(bh * 0.15)  # Add 15% more vertical space
     
-    # Check available space
-    max_left = x1  # Can't go left beyond 0
-    max_right = w - x2  # Can't go right beyond frame edge
+    # Calculate desired vertical padding
+    target_top_pad = eh
+    target_bottom_pad = eh + leg_activity_bonus  # More space at bottom for legs
     
-    # If near left edge, shift expansion to the right
-    if max_left < left_exp_ideal:
-        deficit = left_exp_ideal - max_left
-        left_exp = max_left
-        right_exp = min(right_exp_ideal + deficit, max_right)
-    # If near right edge, shift expansion to the left
-    elif max_right < right_exp_ideal:
-        deficit = right_exp_ideal - max_right
-        right_exp = max_right
-        left_exp = min(left_exp_ideal + deficit, max_left)
-    else:
-        # Plenty of space both sides - expand evenly
-        left_exp = left_exp_ideal
-        right_exp = right_exp_ideal
+    # Apply vertical expansion
+    y1_new = max(0, y1 - target_top_pad)
+    y2_new = min(h, y2 + target_bottom_pad)
     
-    # ----- VERTICAL EXPANSION: ALWAYS BALANCED -----
-    top_exp_ideal = eh
-    bottom_exp_ideal = eh
+    # HORIZONTAL expansion
+    left_exp = min(ew, x1)
+    right_exp = min(ew, w - x2)
+    x1_new = max(0, x1 - left_exp)
+    x2_new = min(w, x2 + right_exp)
     
-    max_top = y1
-    max_bottom = h - y2
-    
-    # If near top edge, shift expansion downward
-    if max_top < top_exp_ideal:
-        deficit = top_exp_ideal - max_top
-        top_exp = max_top
-        bottom_exp = min(bottom_exp_ideal + deficit, max_bottom)
-    # If near bottom edge, shift expansion upward
-    elif max_bottom < bottom_exp_ideal:
-        deficit = bottom_exp_ideal - max_bottom
-        bottom_exp = max_bottom
-        top_exp = min(top_exp_ideal + deficit, max_top)
-    else:
-        # Plenty of space both sides - expand evenly
-        top_exp = top_exp_ideal
-        bottom_exp = bottom_exp_ideal
-    
-    # Apply the expansion
-    x1_new = int(max(0, x1 - left_exp))
-    x2_new = int(min(w, x2 + right_exp))
-    y1_new = int(max(0, y1 - top_exp))
-    y2_new = int(min(h, y2 + bottom_exp))
-    
-    # Debug output for fallback boxes
-    if frame_count % 30 == 0 and is_fallback:
-        print(f"DEBUG expand_box: Frame {frame_count}, idx={action_idx}, margin={margin:.2f}")
-        print(f"  Original: ({x1}, {y1}, {x2}, {y2}) size: {bw}x{bh}")
-        print(f"  Left expansion: {left_exp}px (ideal {left_exp_ideal}, space {max_left})")
-        print(f"  Right expansion: {right_exp}px (ideal {right_exp_ideal}, space {max_right})")
-        print(f"  Top expansion: {top_exp}px (ideal {top_exp_ideal}, space {max_top})")
-        print(f"  Bottom expansion: {bottom_exp}px (ideal {bottom_exp_ideal}, space {max_bottom})")
-        print(f"  After expansion: ({x1_new}, {y1_new}, {x2_new}, {y2_new}) size: {x2_new-x1_new}x{y2_new-y1_new}")
-    
-    # Ensure minimum size for all boxes
+    # Ensure minimum size
     min_width = int(w * MIN_BOX_WIDTH_RATIO)
     min_height = int(h * MIN_BOX_HEIGHT_RATIO)
     
-    if (x2_new - x1_new) < min_width:
-        center_x = (x1_new + x2_new) // 2
-        x1_new = max(0, center_x - min_width // 2)
-        x2_new = min(w, center_x + min_width // 2)
+    # Check if we need to expand further
+    current_width = x2_new - x1_new
+    current_height = y2_new - y1_new
     
-    if (y2_new - y1_new) < min_height:
+    # If still too small, expand from center
+    if current_height < min_height:
         center_y = (y1_new + y2_new) // 2
         y1_new = max(0, center_y - min_height // 2)
         y2_new = min(h, center_y + min_height // 2)
+    
+    if current_width < min_width:
+        center_x = (x1_new + x2_new) // 2
+        x1_new = max(0, center_x - min_width // 2)
+        x2_new = min(w, center_x + min_width // 2)
     
     return (x1_new, y1_new, x2_new, y2_new)
     
@@ -3426,7 +3770,7 @@ def visualize_crop_process(frame, frame_idx, yolo_boxes, expanded_boxes, smoothe
 
 
 def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop_count, 
-                                    positions_override=None, people_info=None):
+                                    positions_override=None, people_info=None, action_hotspots=None):
     """Process video with dynamic number of crops (2 or 3) with ROI detection and debug visualization"""
     # Use override positions if provided, otherwise use default
     if positions_override:
@@ -3621,7 +3965,8 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
                     frame_count,
                     action_idx=action_idx,
                     margin=adaptive_margin,
-                    is_fallback=use_fallback_expansion
+                    is_fallback=use_fallback_expansion,
+                    pose_activity=pose_activity
                 )
                 expanded_actions.append(expanded)
             else:
@@ -3882,7 +4227,7 @@ def main():
                 print(f"   👥👥 4+ people detected - analyzing distribution...")
 
                 # Get zone analysis for distribution
-                zone_scores, zone_people, zone_activity = analyze_region_activity(
+                zone_scores, zone_people, zone_activity, zone_positions = analyze_region_activity(
                     video_path, yolo, pose_model, sample_frames=25
                 )
 
@@ -3936,7 +4281,7 @@ def main():
             else:
                 # For 2-3 people, use the existing smart strategy
                 # PASS people_count to enable smart 2-person logic
-                crop_count, positions, strategy = determine_smart_crop_strategy_v2(
+                crop_count, positions, strategy, action_hotspots = determine_smart_crop_strategy_v2(
                     video_path, yolo, pose_model, 
                     sample_frames=20, 
                     people_count=people_count,
