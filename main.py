@@ -1,18 +1,21 @@
-import sys
+import cv2
+import json
 import os
+import re
 import subprocess
+import sys
 import threading
 import time
 import yaml
-import cv2
-import re
+
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QApplication, QCompleter, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QLineEdit, QSpinBox,
     QGroupBox, QTextEdit, QFormLayout, QProgressBar, QCheckBox,
-    QComboBox, QTabWidget, QListWidget, QSlider, 
+    QComboBox, QTabWidget, QListWidget, QSlider,
+    QDialog, QDialogButtonBox, QAbstractItemView, 
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from pipeline import run_highlighter
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 
@@ -20,6 +23,146 @@ from downloader import download_videos_with_immediate_processing, extract_video_
 reset_duration_method_cache()
 
 CONFIG_FILE = "config.yaml"
+
+YOLO_OBJECTS_LABELS_FILE = "yolo_objects_labels.json"
+KINETICS_400_LABELS_FILE = "kinetics_400_labels.json"
+INTEL_CUSTOM_LABELS_FILE = "intel_finetuned_classifier_3d_mapping.json"
+
+class LabelSelectorDialog(QDialog):
+    """Dialog with search/filter and multi-select for labels."""
+
+    def __init__(self, title, labels, current_selection=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(480, 520)
+        self.all_labels = sorted(labels)
+        self.current_selection = set(current_selection or [])
+
+        layout = QVBoxLayout()
+
+        search_layout = QHBoxLayout()
+        search_layout.addWidget(QLabel("Filter:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Type to filter labels...")
+        self.search_input.textChanged.connect(self._filter_labels)
+        search_layout.addWidget(self.search_input)
+        layout.addLayout(search_layout)
+
+        self.info_label = QLabel(f"{len(self.all_labels)} labels available")
+        self.info_label.setStyleSheet("color: #666; font-size: 9pt;")
+        layout.addWidget(self.info_label)
+
+        self.label_list = QListWidget()
+        self.label_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        self._populate_list(self.all_labels)
+        layout.addWidget(self.label_list)
+
+        quick_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All Visible")
+        select_all_btn.clicked.connect(self._select_all_visible)
+        deselect_all_btn = QPushButton("Deselect All")
+        deselect_all_btn.clicked.connect(self._deselect_all)
+        quick_layout.addWidget(select_all_btn)
+        quick_layout.addWidget(deselect_all_btn)
+        quick_layout.addStretch()
+        layout.addLayout(quick_layout)
+
+        self.selection_label = QLabel("0 selected")
+        self.selection_label.setStyleSheet("font-weight: bold; color: #2196F3;")
+        layout.addWidget(self.selection_label)
+        self.label_list.itemSelectionChanged.connect(self._update_selection_count)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self.setLayout(layout)
+        self._preselect_current()
+
+    def _populate_list(self, labels):
+        self.label_list.clear()
+        for label in labels:
+            self.label_list.addItem(label)
+
+    def _preselect_current(self):
+        for i in range(self.label_list.count()):
+            item = self.label_list.item(i)
+            if item.text() in self.current_selection:
+                item.setSelected(True)
+        self._update_selection_count()
+
+    def _filter_labels(self, text):
+        text = text.strip().lower()
+        filtered = [l for l in self.all_labels if text in l.lower()] if text else self.all_labels
+        self._populate_list(filtered)
+        self.info_label.setText(f"{len(filtered)} of {len(self.all_labels)} labels shown")
+        self._preselect_current()
+
+    def _select_all_visible(self):
+        for i in range(self.label_list.count()):
+            self.label_list.item(i).setSelected(True)
+        self._update_selection_count()
+
+    def _deselect_all(self):
+        self.label_list.clearSelection()
+        self._update_selection_count()
+
+    def _update_selection_count(self):
+        self.selection_label.setText(f"{len(self.label_list.selectedItems())} selected")
+
+    def get_selected_labels(self):
+        return [item.text() for item in self.label_list.selectedItems()]
+
+class MultiCompleter(QCompleter):
+    """QCompleter that works on comma-separated fields, completing only the current token.
+    Matches labels where any word starts with the typed text."""
+
+    def __init__(self, labels=None, parent=None):
+        super().__init__(parent)
+        self._all_labels = labels or []
+        self._source_model = QStringListModel(self._all_labels)
+        self.setModel(self._source_model)
+        self.setCaseSensitivity(Qt.CaseInsensitive)
+        self.setFilterMode(Qt.MatchContains)
+
+    def setLabels(self, labels):
+        """Update the full label list."""
+        self._all_labels = labels
+        self._source_model.setStringList(labels)
+
+    def pathFromIndex(self, index):
+        completion = super().pathFromIndex(index)
+        widget = self.widget()
+        if not widget:
+            return completion
+        text = widget.text()
+        cursor = widget.cursorPosition()
+        before = text[:cursor]
+        last_comma = before.rfind(",")
+        prefix = text[:last_comma + 1] + " " if last_comma >= 0 else ""
+        after_cursor = text[cursor:]
+        next_comma = after_cursor.find(",")
+        suffix = after_cursor[next_comma:] if next_comma >= 0 else ""
+        return prefix + completion + suffix
+
+    def splitPath(self, path):
+        widget = self.widget()
+        if not widget:
+            return [path.strip()]
+        cursor = widget.cursorPosition()
+        before = path[:cursor]
+        last_comma = before.rfind(",")
+        current_token = before[last_comma + 1:].strip().lower()
+
+        # Filter: any word in label starts with typed text
+        if current_token:
+            filtered = [l for l in self._all_labels
+                        if any(w.startswith(current_token) for w in l.lower().split())]
+        else:
+            filtered = self._all_labels
+        self._source_model.setStringList(filtered)
+        return [current_token]
 
 class DownloadWorker(QThread):
     """
@@ -533,7 +676,6 @@ class VideoHighlighterGUI(QWidget):
         # Connect checkbox to enable/disable spinner
         self.immediate_processing_chk.toggled.connect(self.concurrent_spinbox.setEnabled)
 
-
         # Download button
         download_btn_layout = QHBoxLayout()
         self.download_btn = QPushButton("🌐 Download Videos")
@@ -668,6 +810,10 @@ class VideoHighlighterGUI(QWidget):
         self.objects_input.setPlaceholderText("person,glass,wine glass,sports ball")
         obj_layout.addWidget(QLabel("Object detection:"))
         obj_layout.addWidget(self.objects_input)
+        self.load_objects_btn = QPushButton("Load Labels")
+        self.load_objects_btn.setToolTip("Load labels from yolo_objects_labels.json")
+        self.load_objects_btn.clicked.connect(self.open_object_label_selector)
+        obj_layout.addWidget(self.load_objects_btn)
         basic_layout.addLayout(obj_layout)
 
         # Action keywords
@@ -676,6 +822,10 @@ class VideoHighlighterGUI(QWidget):
         self.actions_input.setPlaceholderText("high jump, high kick, archery")
         action_kw_layout.addWidget(QLabel("Action keywords:"))
         action_kw_layout.addWidget(self.actions_input)
+        self.load_actions_btn = QPushButton("Load Labels")
+        self.load_actions_btn.setToolTip("Load labels from kinetics_400_labels.json (or custom Intel model)")
+        self.load_actions_btn.clicked.connect(self.open_action_label_selector)
+        action_kw_layout.addWidget(self.load_actions_btn)
         basic_layout.addLayout(action_kw_layout)
 
         # Conditional action scoring checkbox
@@ -790,15 +940,26 @@ class VideoHighlighterGUI(QWidget):
         misc_layout.addRow("YOLO .pt path (optional):", self.yolo_pt_path)
         misc_layout.addRow("OpenVINO model folder (optional):", self.openvino_model_folder)
         # === ACTION RECOGNITION BACKEND ===
+        # === ACTION RECOGNITION BACKEND ===
         self.action_backend_combo = QComboBox()
-        self.action_backend_combo.addItem("Auto (CUDA if available, else OpenVINO)", "auto")
-        self.action_backend_combo.addItem("OpenVINO Only (Intel / CPU)", "openvino")
+        self.action_backend_combo.addItem("Auto (CUDA / OpenVINO / CPU)", "auto")
+        self.action_backend_combo.addItem("OpenVINO (Intel GPU / CPU)", "openvino")
         self.action_backend_combo.addItem("R3D + CUDA (NVIDIA GPU)", "r3d_cuda")
         self.action_backend_combo.addItem("R3D + CPU (PyTorch, slow)", "r3d_cpu")
 
         current_backend = advanced_cfg.get("action_backend", "auto")
         idx_ab = self.action_backend_combo.findData(current_backend)
         self.action_backend_combo.setCurrentIndex(idx_ab if idx_ab >= 0 else 0)
+
+        # === ACTION MODELS (which decoders to load) ===
+        self.action_models_combo = QComboBox()
+        self.action_models_combo.addItem("Intel Kinetics-400 only (400 classes)", "intel_only")
+        self.action_models_combo.addItem("Custom fine-tuned only (37 classes)", "custom_only")
+        self.action_models_combo.addItem("Mixed — Intel + Custom (both loaded)", "mixed")
+
+        current_action_models = advanced_cfg.get("action_models", "mixed")
+        idx_am = self.action_models_combo.findData(current_action_models)
+        self.action_models_combo.setCurrentIndex(idx_am if idx_am >= 0 else 0)
 
         self.r3d_model_combo = QComboBox()
         self.r3d_model_combo.addItem("R3D-18 (fastest)", "r3d_18")
@@ -811,12 +972,23 @@ class VideoHighlighterGUI(QWidget):
 
         def on_action_backend_changed(index):
             backend = self.action_backend_combo.currentData()
+            is_r3d_only = backend in ("r3d_cuda", "r3d_cpu")
             self.r3d_model_combo.setEnabled(backend in ("auto", "r3d_cuda", "r3d_cpu"))
+            # R3D-only uses Kinetics-400, no decoder choice needed
+            self.action_models_combo.setEnabled(not is_r3d_only)
+            if is_r3d_only:
+                self.action_models_combo.setCurrentIndex(
+                    self.action_models_combo.findData("intel_only"))
+            # Update autocomplete when backend changes
+            self.update_actions_completer()
 
         self.action_backend_combo.currentIndexChanged.connect(on_action_backend_changed)
+        self.action_models_combo.currentIndexChanged.connect(
+            lambda: self.update_actions_completer())
         on_action_backend_changed(0)
 
         misc_layout.addRow("Action recognition backend:", self.action_backend_combo)
+        misc_layout.addRow("Action models (decoders):", self.action_models_combo)
         misc_layout.addRow("R3D model variant:", self.r3d_model_combo)
 
         misc_box.setLayout(misc_layout)
@@ -891,7 +1063,7 @@ class VideoHighlighterGUI(QWidget):
         download_cfg = self.config_data.get("download", {})
         self.use_same_time_range_chk.setChecked(download_cfg.get("use_same_time_range", False))
 
-
+        self.setup_label_completers()
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.check_worker_status)
 
@@ -903,6 +1075,9 @@ class VideoHighlighterGUI(QWidget):
 
         # Initialize the UI state
         self.on_download_full_toggle(self.download_full_chk.isChecked())
+
+        # Setup auto-complete for label inputs
+        self.setup_label_completers()
 
     # --- Downloader methods ---
     def browse_save_directory(self):
@@ -1210,7 +1385,7 @@ class VideoHighlighterGUI(QWidget):
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
             "action_backend": self.action_backend_combo.currentData(),
             "r3d_model": self.r3d_model_combo.currentData(),
-
+            "action_models": self.action_models_combo.currentData(),
         }
       
         # Add time range if enabled
@@ -1743,6 +1918,7 @@ class VideoHighlighterGUI(QWidget):
                 "openvino_model_folder": self.openvino_model_folder.text().strip(),
                 "action_backend": self.action_backend_combo.currentData(),
                 "r3d_model": self.r3d_model_combo.currentData(),
+                "action_models": self.action_models_combo.currentData(),
             },
             "visualization": {
                 "draw_object_boxes": self.bbox_objects_chk.isChecked(),
@@ -1782,6 +1958,191 @@ class VideoHighlighterGUI(QWidget):
         self.subtitle_source_lang.setEnabled(final_state)
         self.subtitle_target_lang.setEnabled(final_state)
 
+    # --- Labels ---
+    def load_labels_from_json(self, filepath):
+            """Load label list from a JSON file. Handles list, dict, and nested dict formats."""
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return [str(item) for item in data]
+                elif isinstance(data, dict):
+                    # Intel custom: has "label_to_idx" key
+                    if "label_to_idx" in data:
+                        return list(data["label_to_idx"].keys())
+                    # Intel custom alt: has "idx_to_label" key
+                    if "idx_to_label" in data:
+                        return list(data["idx_to_label"].values())
+                    # YOLO: has "class" key with {index: label}
+                    if "class" in data:
+                        return list(data["class"].values())
+                    # Flat dict: {index: label} or {label: index}
+                    values = list(data.values())
+                    if values and isinstance(values[0], str):
+                        return list(data.values())
+                    else:
+                        return list(data.keys())
+                else:
+                    self.append_log(f"⚠️ Unexpected JSON format in {filepath}")
+                    return []
+            except Exception as e:
+                self.append_log(f"❌ Failed to load labels from {filepath}: {e}")
+                return []
+
+    def open_object_label_selector(self):
+        """Open label selector populated from yolo_objects_labels.json."""
+        if not os.path.exists(YOLO_OBJECTS_LABELS_FILE):
+            self.append_log(f"⚠️ Label file not found: {YOLO_OBJECTS_LABELS_FILE}")
+            return
+
+        labels = self.load_labels_from_json(YOLO_OBJECTS_LABELS_FILE)
+        if not labels:
+            self.append_log("⚠️ No labels found in YOLO labels file")
+            return
+
+        current = [s.strip() for s in self.objects_input.text().split(",") if s.strip()]
+        dlg = LabelSelectorDialog("Select Object Labels (YOLO)", labels, current, self)
+        if dlg.exec() == QDialog.Accepted:
+            selected = dlg.get_selected_labels()
+            self.objects_input.setText(", ".join(selected))
+            self.append_log(f"✅ Loaded {len(selected)} object labels")
+
+    def open_action_label_selector(self):
+        """Open label selector based on current backend and action models settings."""
+        backend = self.action_backend_combo.currentData()
+        action_models = self.action_models_combo.currentData()
+
+        # R3D-only always uses Kinetics-400
+        if backend in ("r3d_cuda", "r3d_cpu"):
+            action_models = "intel_only"
+
+        if action_models == "custom_only":
+            label_file = INTEL_CUSTOM_LABELS_FILE
+            title = "Select Action Labels (Custom Fine-tuned — 37 classes)"
+        elif action_models == "intel_only":
+            label_file = KINETICS_400_LABELS_FILE
+            title = "Select Action Labels (Intel Kinetics-400 — 400 classes)"
+        elif action_models == "mixed":
+            # Show labels tagged with source model
+            custom_labels = []
+            intel_labels = []
+            if os.path.exists(INTEL_CUSTOM_LABELS_FILE):
+                custom_labels = self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)
+            if os.path.exists(KINETICS_400_LABELS_FILE):
+                intel_labels = self.load_labels_from_json(KINETICS_400_LABELS_FILE)
+
+            tagged = []
+            custom_set = set(l.lower() for l in custom_labels)
+            intel_set = set(l.lower() for l in intel_labels)
+            # Labels in both → show tagged versions
+            overlap = custom_set & intel_set
+            for label in sorted(custom_labels):
+                if label.lower() in overlap:
+                    tagged.append(f"{label} [custom]")
+                else:
+                    tagged.append(label)
+            for label in sorted(intel_labels):
+                if label.lower() in overlap:
+                    tagged.append(f"{label} [intel]")
+                else:
+                    if label.lower() not in custom_set:  # avoid duplicates for non-overlap
+                        tagged.append(label)
+            tagged.sort()
+
+            if not tagged:
+                self.append_log("⚠️ No label files found")
+                return
+            current = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
+            overlap_count = len(overlap)
+            dlg = LabelSelectorDialog(
+                f"Select Action Labels (Mixed — {len(tagged)} labels, {overlap_count} shared)",
+                tagged, current, self)
+            if dlg.exec() == QDialog.Accepted:
+                selected = dlg.get_selected_labels()
+                self.actions_input.setText(", ".join(selected))
+                self.append_log(f"✅ Loaded {len(selected)} action labels (mixed)")
+            return
+        else:
+            label_file = KINETICS_400_LABELS_FILE
+            title = "Select Action Labels"
+
+        if not os.path.exists(label_file):
+            self.append_log(f"⚠️ Label file not found: {label_file}")
+            return
+
+        labels = self.load_labels_from_json(label_file)
+        if not labels:
+            self.append_log(f"⚠️ No labels found in {label_file}")
+            return
+
+        current = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
+        dlg = LabelSelectorDialog(title, labels, current, self)
+        if dlg.exec() == QDialog.Accepted:
+            selected = dlg.get_selected_labels()
+            self.actions_input.setText(", ".join(selected))
+            self.append_log(f"✅ Loaded {len(selected)} action labels from {os.path.basename(label_file)}")
+
+    def setup_label_completers(self):
+        if os.path.exists(YOLO_OBJECTS_LABELS_FILE):
+            obj_labels = self.load_labels_from_json(YOLO_OBJECTS_LABELS_FILE)
+            if obj_labels:
+                completer = MultiCompleter(obj_labels, self)
+                completer.setMaxVisibleItems(10)
+                self.objects_input.setCompleter(completer)
+
+        self.update_actions_completer()
+        self.action_backend_combo.currentIndexChanged.connect(self.update_actions_completer)
+
+    def update_actions_completer(self):
+        """Update actions auto-complete labels based on selected backend and action models."""
+        self.actions_input.setCompleter(None)
+
+        backend = self.action_backend_combo.currentData()
+        action_models = self.action_models_combo.currentData()
+
+        # R3D-only always uses Kinetics-400
+        if backend in ("r3d_cuda", "r3d_cpu"):
+            action_models = "intel_only"
+
+        action_labels = []
+        source = None
+
+        if action_models == "custom_only":
+            if os.path.exists(INTEL_CUSTOM_LABELS_FILE):
+                action_labels = self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)
+                source = "Custom fine-tuned (37 classes)"
+        elif action_models == "intel_only":
+            if os.path.exists(KINETICS_400_LABELS_FILE):
+                action_labels = self.load_labels_from_json(KINETICS_400_LABELS_FILE)
+                source = "Intel Kinetics-400 (400 classes)"
+        elif action_models == "mixed":
+            custom_labels = []
+            intel_labels = []
+            if os.path.exists(INTEL_CUSTOM_LABELS_FILE):
+                custom_labels = self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)
+            if os.path.exists(KINETICS_400_LABELS_FILE):
+                intel_labels = self.load_labels_from_json(KINETICS_400_LABELS_FILE)
+            # Build tagged list for overlapping labels
+            custom_set = set(l.lower() for l in custom_labels)
+            intel_set = set(l.lower() for l in intel_labels)
+            overlap = custom_set & intel_set
+            tagged = []
+            for label in custom_labels:
+                tagged.append(f"{label} [custom]" if label.lower() in overlap else label)
+            for label in intel_labels:
+                if label.lower() in overlap:
+                    tagged.append(f"{label} [intel]")
+                elif label.lower() not in custom_set:
+                    tagged.append(label)
+            action_labels = sorted(set(tagged))
+            source = f"Mixed ({len(custom_labels)} custom + {len(intel_labels)} Kinetics-400, {len(overlap)} shared, {len(action_labels)} total)"
+
+        if action_labels:
+            completer = MultiCompleter(action_labels, self)
+            completer.setMaxVisibleItems(10)
+            self.actions_input.setCompleter(completer)
+            if hasattr(self, 'log_output'):
+                self.append_log(f"🔤 Actions auto-complete: {source}")
 
     @Slot(str)
     def append_log(self, text: str):
