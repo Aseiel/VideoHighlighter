@@ -2744,8 +2744,39 @@ if __name__ == "__main__":
                 acc = final_per_class_acc[label_idx]
                 status = "⚠️" if acc == 0.0 else "✓"
                 print(f"    {status} {class_name}: {acc:.4f}")
+        
+        # =====================================================================
+        # FILTER ZERO-ACCURACY CLASSES FROM BASE MODEL
+        # Classes with 0% val accuracy are undetectable — keeping them in the
+        # model just adds noise and hurts predictions for other classes.
+        # =====================================================================
+        zero_acc_classes = [idx for idx, acc in final_per_class_acc.items() if acc == 0.0]
+        
+        if zero_acc_classes:
+            zero_names = [idx_to_label[idx] for idx in zero_acc_classes]
+            print(f"\n🗑️  Removing {len(zero_acc_classes)} zero-accuracy classes from BASE model:")
+            for name in zero_names:
+                print(f"      • {name} (0% validation accuracy — undetectable)")
+            
+            # Filter via create_production_model with a tiny threshold
+            # This keeps anything with >0% accuracy, removing only truly dead classes
+            action_model = create_production_model(
+                encoder, action_model, train_loader, val_loader, device,
+                min_val_accuracy=0.001  # Effectively removes only 0% classes
+            )
+            
+            # Overwrite the base model save with filtered version
+            action_model.save(CONFIG['model_save_path'])
+            
+            # Update label mappings so production model step uses filtered set
+            label_to_idx = action_model.label_to_idx
+            idx_to_label = action_model.idx_to_label
+            
+            print(f"   ✅ Base model updated: {len(label_to_idx)} classes remaining")
+        else:
+            print(f"\n   ✅ All classes have >0% accuracy — no filtering needed for base model")
 
-    # 🔧 CREATE PRODUCTION MODEL (filtered)
+    # 🔧 CREATE PRODUCTION MODEL (stricter filtering on top of base)
     production_model = create_production_model(
         encoder, 
         action_model, 
@@ -2760,9 +2791,12 @@ if __name__ == "__main__":
     production_model.save(production_path)
    
     print(f"\n✅ Training completed! Model and labels saved.")
-    print(f"✓ Model path: {CONFIG['model_save_path']}")
+    print(f"✓ Base model: {CONFIG['model_save_path']} ({len(action_model.label_to_idx)} classes)")
+    print(f"✓ Production model: {production_path} ({len(production_model.label_to_idx)} classes)")
     print(f"\n💡 Summary:")
     print(f"  - Trained on {len(valid_actions)} actions")
     print(f"  - Used {len(train_dataset.samples)} training videos")
     print(f"  - Used {len(val_dataset.samples)} validation videos")
     print(f"  - Auto-split was applied where validation was insufficient")
+    print(f"  - Base model: removed classes with 0% val accuracy")
+    print(f"  - Production model: removed classes below {CONFIG.get('min_production_accuracy', 0.3):.0%} val accuracy")
