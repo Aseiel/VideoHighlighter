@@ -1,4 +1,3 @@
-
 """
 Complete Signal Timeline Viewer with Filters and Edit Timeline
 - Signal visualization with filtering
@@ -2315,7 +2314,42 @@ class SignalTimelineView(QGraphicsView):
         # Track mouse state for manual panning
         self.panning = False
         self.last_pan_point = QPoint()
-    
+
+        # Auto-follow playhead during playback
+        self.follow_playhead = True
+        self.follow_anchor = 0.35       # keep playhead ~35% from left
+        self.follow_margin_left = 0.10  # scroll when playhead < 10% from left
+        self.follow_margin_right = 0.85 # scroll when playhead > 85% from left
+
+    def ensure_time_visible(self, time_seconds):
+        """Auto-scroll so the playhead stays visible during playback."""
+        if not self.follow_playhead:
+            return
+        scene = self.scene()
+        if not scene:
+            return
+
+        pps = getattr(scene, 'pixels_per_second', 50)
+        playhead_x = time_seconds * pps
+
+        vp = self.viewport().rect()
+        left = self.mapToScene(vp.topLeft()).x()
+        right = self.mapToScene(vp.topRight()).x()
+        width = right - left
+        if width <= 0:
+            return
+
+        rel = (playhead_x - left) / width
+
+        # Inside comfort zone → do nothing
+        if self.follow_margin_left <= rel <= self.follow_margin_right:
+            return
+
+        # Use Qt's centerOn — keep vertical position, shift horizontal
+        center_y = self.mapToScene(vp.center()).y()
+        # Offset so playhead lands at 35% from left (center = 50%, so shift by +15%)
+        self.centerOn(playhead_x + width * 0.15, center_y)
+
     def wheelEvent(self, event):
         """Zoom with mouse wheel"""
         zoom_factor = 1.15
@@ -2355,6 +2389,8 @@ class SignalTimelineView(QGraphicsView):
         # If right-click or middle-click, use scroll hand drag
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self._follow_was_on = self.follow_playhead
+            self.follow_playhead = False
             super().mousePressEvent(event)
             return
         
@@ -2396,9 +2432,11 @@ class SignalTimelineView(QGraphicsView):
         # Reset drag mode if it was set
         if self.dragMode() == QGraphicsView.DragMode.ScrollHandDrag:
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            if hasattr(self, '_follow_was_on'):
+                self.follow_playhead = self._follow_was_on
+                del self._follow_was_on
         
         super().mouseReleaseEvent(event)
-
 
 class FilterDialog(QDialog):
     """Dialog for filtering actions and objects"""
@@ -2896,6 +2934,8 @@ class SignalTimelineWindow(QMainWindow):
             if self.video_player.playbackState() == QMediaPlayer.PlayingState:
                 self.current_time = position / 1000.0
                 self.signal_scene.set_current_time(self.current_time)
+                if hasattr(self, 'signal_view'):
+                    self.signal_view.ensure_time_visible(self.current_time)
 
     def update_time_display(self, position):
         """Update the time display label"""
@@ -3745,9 +3785,17 @@ class SignalTimelineWindow(QMainWindow):
         """)
         playback_layout.addWidget(play_btn)
         
-        playback_group.setLayout(playback_layout)
-        layout.addWidget(playback_group)
+        self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
+        self.follow_playhead_checkbox.setChecked(True)
+        self.follow_playhead_checkbox.setToolTip(
+            "Auto-scroll the timeline to keep the playhead visible during playback"
+        )
+        self.follow_playhead_checkbox.stateChanged.connect(self.toggle_follow_playhead)
+        playback_layout.addWidget(self.follow_playhead_checkbox)
         
+        playback_group.setLayout(playback_layout)
+
+        layout.addWidget(playback_group)     
         layout.addStretch()
         
         dock.setWidget(controls_widget)
@@ -3839,6 +3887,14 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ Error extracting highlights from signal data: {e}")
         
         return highlights
+
+    @Slot(int)
+    def toggle_follow_playhead(self, state):
+        """Toggle whether the timeline auto-scrolls to follow the playhead"""
+        follow = (state == Qt.Checked)
+        if hasattr(self, 'signal_view'):
+            self.signal_view.follow_playhead = follow
+        self.statusBar().showMessage(f"Follow playhead: {'ON' if follow else 'OFF'}", 2000)
 
     @Slot(int)
     def toggle_waveform(self, state):
@@ -3952,7 +4008,9 @@ class SignalTimelineWindow(QMainWindow):
         # Update signal scene
         self.signal_scene.current_time_seconds = self.current_time
         self.signal_scene.set_current_time(self.current_time)
-        
+        if hasattr(self, 'signal_view'):
+            self.signal_view.ensure_time_visible(self.current_time)
+           
         # Seek video player to this time
         if hasattr(self, 'video_player'):
             milliseconds = int(self.current_time * 1000)
