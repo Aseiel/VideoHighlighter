@@ -510,7 +510,7 @@ class EditClipItem(QGraphicsRectItem):
             self.setPen(QPen(self.color.darker(150), 1))
     
     def mousePressEvent(self, event):
-        """Handle mouse press for dragging"""
+        """Handle mouse press for dragging + seeking"""
         if event.button() == Qt.LeftButton:
             # Clear other selections if shift/ctrl not pressed
             if not (event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier)):
@@ -524,6 +524,16 @@ class EditClipItem(QGraphicsRectItem):
             self.setSelected(True)
             self.original_pos = self.pos()
             self.setCursor(QCursor(Qt.ClosedHandCursor))
+            
+            # Calculate source time from click position within clip
+            local_x = event.pos().x()
+            width = self.rect().width()
+            if width > 0:
+                progress = max(0.0, min(1.0, local_x / width))
+                source_time = self.start_time + progress * (self.end_time - self.start_time)
+                scene = self.scene()
+                if scene and hasattr(scene, 'time_clicked'):
+                    scene.time_clicked.emit(source_time)
         
         super().mousePressEvent(event)
     
@@ -582,6 +592,7 @@ class EditTimelineScene(QGraphicsScene):
     clip_double_clicked = Signal(float, float)  # start, end
     clip_added = Signal(float, float)  # start, end
     clip_removed = Signal(int)  # index
+    time_clicked = Signal(float)  # source video time
     
     def __init__(self, video_path, video_duration, parent=None, cache=None):  # ADD cache parameter
         super().__init__(parent)
@@ -603,8 +614,25 @@ class EditTimelineScene(QGraphicsScene):
         # Load initial highlights if available
         self.load_initial_clips()
         
+        self.active_clip_index = -1  # Currently playing clip (-1 = none)
+        self.active_progress = 0.0   # 0.0 to 1.0 within active clip
+        self._active_overlay = None
+        self._progress_line = None
         self.setSceneRect(0, 0, 1000, self.clip_height + 40)
         self.build_timeline()
+
+    def mousePressEvent(self, event):
+        """Handle mouse clicks - emit time signal"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.scenePos()
+            time = pos.x() / self.pixels_per_second
+            self.time_clicked.emit(time)
+            
+            # If Ctrl is pressed, also request to add to edit timeline
+            if event.modifiers() & Qt.ControlModifier:
+                self.add_to_edit_requested.emit(time)
+        
+        super().mousePressEvent(event)
 
     def contextMenuEvent(self, event):
         """Show context menu for loading different highlight versions"""
@@ -859,6 +887,12 @@ class EditTimelineScene(QGraphicsScene):
         count_text = self.addText(f"{len(self.clips)} clips", QFont("Arial", 10))
         count_text.setDefaultTextColor(QColor(200, 200, 200))
         count_text.setPos(total_width - 100, 5)
+
+        # Restore active clip overlay if playing
+        if self.active_clip_index >= 0 and self.active_clip_index < len(self.clip_items):
+            self._active_overlay = None
+            self._progress_line = None
+            self._update_active_overlay()
     
     def draw_time_ruler(self):
         """Draw a time ruler above the clips"""
@@ -1098,7 +1132,99 @@ class EditTimelineScene(QGraphicsScene):
                 QTimer.singleShot(300, lambda: item.setPen(original_pen))
             
             QTimer.singleShot(100, flash)
-    
+
+    def set_active_clip(self, index):
+        """Highlight the currently playing clip"""
+        self.active_clip_index = index
+        self.active_progress = 0.0
+        self._update_active_overlay()
+
+    def set_active_progress(self, progress):
+        """Update progress within the active clip (0.0 to 1.0)"""
+        self.active_progress = max(0.0, min(1.0, progress))
+        self._move_progress_line()
+
+    def clear_active_clip(self):
+        """Remove active clip highlight"""
+        self.active_clip_index = -1
+        self.active_progress = 0.0
+        self._remove_active_overlay()
+
+    def set_active_clip(self, index):
+        """Highlight the currently playing clip"""
+        old_index = self.active_clip_index
+        self.active_clip_index = index
+        self.active_progress = 0.0
+
+        if old_index != index:
+            # Only recreate overlay when clip changes
+            self._remove_active_overlay()
+            self._create_active_overlay()
+        
+        self._move_progress_line()
+
+    def _create_active_overlay(self):
+        """Create glow overlay and progress line (once per clip)"""
+        if self.active_clip_index < 0 or self.active_clip_index >= len(self.clip_items):
+            return
+
+        item = self.clip_items[self.active_clip_index]
+        rect = item.rect()
+        pos = item.pos()
+
+        # Glow overlay
+        self._active_overlay = self.addRect(
+            pos.x() - 3, pos.y() - 3,
+            rect.width() + 6, rect.height() + 6,
+            QPen(QColor(80, 180, 255, 200), 3),
+            QBrush(QColor(80, 180, 255, 40))
+        )
+        self._active_overlay.setZValue(10)
+
+        # Progress line — create once, then just move it
+        x = pos.x()
+        self._progress_line = self.addLine(
+            x, pos.y(), x, pos.y() + rect.height(),
+            QPen(QColor(255, 255, 255, 220), 2)
+        )
+        self._progress_line.setZValue(11)
+
+    def _move_progress_line(self):
+        """Move the progress line without removing/recreating it"""
+        if self.active_clip_index < 0 or self.active_clip_index >= len(self.clip_items):
+            return
+
+        # Recreate if missing (e.g. after build_timeline cleared everything)
+        if not self._progress_line or self._progress_line not in self.items():
+            self._progress_line = None
+            self._active_overlay = None
+            self._create_active_overlay()
+            return
+
+        item = self.clip_items[self.active_clip_index]
+        rect = item.rect()
+        pos = item.pos()
+        x = pos.x() + rect.width() * self.active_progress
+
+        # Just update the line coordinates — no remove/add
+        self._progress_line.setLine(x, pos.y(), x, pos.y() + rect.height())
+
+    def _remove_active_overlay(self):
+        """Remove overlay and progress line"""
+        try:
+            if self._active_overlay and self._active_overlay in self.items():
+                self.removeItem(self._active_overlay)
+        except RuntimeError:
+            pass
+        self._active_overlay = None
+
+        try:
+            if self._progress_line and self._progress_line in self.items():
+                self.removeItem(self._progress_line)
+        except RuntimeError:
+            pass
+        self._progress_line = None
+
     def reorder_clip(self, clip_index, new_x_pos):
         """Reorder a clip based on drag position"""
         if 0 <= clip_index < len(self.clips):
@@ -1966,40 +2092,29 @@ class SignalTimelineScene(QGraphicsScene):
                 text = self.addText(time_label, QFont("Consolas", 9))
                 text.setPos(x + 5, self.sceneRect().height() - 25)
                 text.setDefaultTextColor(QColor(200, 200, 200))
-    
-    def mousePressEvent(self, event):
-        """Handle mouse clicks - emit time signal"""
-        if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.scenePos()
-            time = pos.x() / self.pixels_per_second
-            self.time_clicked.emit(time)
-            
-            # If Ctrl is pressed, also request to add to edit timeline
-            if event.modifiers() & Qt.ControlModifier:
-                self.add_to_edit_requested.emit(time)
-        
-        super().mousePressEvent(event)
-    
+      
     def set_zoom(self, zoom_level):
         """Change zoom level (pixels per second)"""
         self.pixels_per_second = zoom_level
         self.build_timeline()
     
     def set_current_time(self, seconds):
-        """Set current time indicator"""
-        # Store the current time
+        """Set current time indicator — moves existing line instead of recreating"""
         self.current_time_seconds = seconds
         
-        # Remove old time line if it exists
-        if hasattr(self, 'current_time_line') and self.current_time_line in self.items():
-            self.removeItem(self.current_time_line)
-        
         x = seconds * self.pixels_per_second
-        # Make sure x is within scene bounds
         x = max(0, min(x, self.sceneRect().width() - 1))
+        h = self.sceneRect().height()
         
-        self.current_time_line = self.addLine(x, 0, x, self.sceneRect().height(),
-                                            QPen(QColor(255, 60, 60), 2, Qt.PenStyle.DashLine))
+        # Move existing line or create if missing
+        if hasattr(self, 'current_time_line') and self.current_time_line in self.items():
+            self.current_time_line.setLine(x, 0, x, h)
+        else:
+            self.current_time_line = self.addLine(
+                x, 0, x, h,
+                QPen(QColor(255, 60, 60), 2, Qt.PenStyle.DashLine)
+            )
+            self.current_time_line.setZValue(100)
         
     def set_confidence_filter(self, min_confidence, max_confidence=None):
         """Set confidence filter range (0.0 to 1.0)"""
@@ -2381,12 +2496,11 @@ class SignalTimelineView(QGraphicsView):
         item = self.itemAt(event.pos())
         
         if item and isinstance(item, DraggableTimelineBar):
-            # Let the item handle the mouse press
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
             super().mousePressEvent(event)
             return
         
-        # If right-click or middle-click, use scroll hand drag
+        # Right/middle-click — scroll hand drag
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
             self._follow_was_on = self.follow_playhead
@@ -2394,23 +2508,32 @@ class SignalTimelineView(QGraphicsView):
             super().mousePressEvent(event)
             return
         
-        # Left-click on background - manual panning
+        # Left-click on background — emit time signal directly
         if event.button() == Qt.LeftButton:
-            self.panning = True
+            self.panning = False
+            self._left_press_pos = event.pos()
             self.last_pan_point = event.pos()
-            self.setCursor(QCursor(Qt.ClosedHandCursor))
-            event.accept()
+            
+            # Emit time_clicked from the view — don't rely on scene receiving it
+            scene = self.scene()
+            if scene and hasattr(scene, 'pixels_per_second'):
+                scene_pos = self.mapToScene(event.pos())
+                time = scene_pos.x() / scene.pixels_per_second
+                scene.time_clicked.emit(time)
+                if event.modifiers() & Qt.ControlModifier and hasattr(scene, 'add_to_edit_requested'):
+                    scene.add_to_edit_requested.emit(time)
+            
+            super().mousePressEvent(event)
             return
         
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event):
-        """Handle mouse movement for panning"""
+        """Handle mouse movement — start panning only after drag threshold"""
         if self.panning:
             delta = event.pos() - self.last_pan_point
             self.last_pan_point = event.pos()
             
-            # Scroll the view
             hbar = self.horizontalScrollBar()
             vbar = self.verticalScrollBar()
             hbar.setValue(hbar.value() - delta.x())
@@ -2419,13 +2542,25 @@ class SignalTimelineView(QGraphicsView):
             event.accept()
             return
         
+        # Left button held — check if we should start panning
+        if event.buttons() & Qt.LeftButton and hasattr(self, '_left_press_pos'):
+            if (event.pos() - self._left_press_pos).manhattanLength() > QApplication.startDragDistance():
+                self.panning = True
+                self.setCursor(QCursor(Qt.ClosedHandCursor))
+                event.accept()
+                return
+        
         super().mouseMoveEvent(event)
     
     def mouseReleaseEvent(self, event):
         """Handle mouse release"""
-        if event.button() == Qt.LeftButton and self.panning:
-            self.panning = False
-            self.setCursor(QCursor(Qt.ArrowCursor))
+        if event.button() == Qt.LeftButton:
+            if self.panning:
+                self.panning = False
+                self.setCursor(QCursor(Qt.ArrowCursor))
+            # Clean up press tracking
+            if hasattr(self, '_left_press_pos'):
+                del self._left_press_pos
             event.accept()
             return
         
@@ -3522,6 +3657,7 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_scene.clip_double_clicked.connect(self.on_clip_double_clicked)
         self.edit_scene.clip_added.connect(self.on_clip_added)
         self.edit_scene.clip_removed.connect(self.on_clip_removed)
+        self.edit_scene.time_clicked.connect(self.on_edit_time_clicked)
         
         edit_layout.addWidget(QLabel("Edit Timeline (Select clips and press Delete)"))
         edit_layout.addWidget(self.edit_view)
@@ -3562,8 +3698,11 @@ class SignalTimelineWindow(QMainWindow):
         self.installEventFilter(self)
 
     def eventFilter(self, obj, event):
-        """Global event filter for handling delete key"""
+        """Global event filter for handling delete and spacebar"""
         if event.type() == event.Type.KeyPress:
+            if event.key() == Qt.Key_Space:
+                self.toggle_edit_playback()
+                return True
             if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
                 # Check if edit view has focus or if delete is pressed globally
                 if (obj == self or 
@@ -3686,6 +3825,31 @@ class SignalTimelineWindow(QMainWindow):
         controls = QWidget()
         layout = QHBoxLayout(controls)
         
+        # Play Edited clip
+        self.play_edit_btn = QPushButton("▶ Play Edit")
+        self.play_edit_btn.clicked.connect(self.toggle_edit_playback)
+        self.play_edit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2a6fcd;
+                font-weight: bold;
+                padding: 8px;
+                min-width: 100px;
+            }
+        """)
+        self.play_edit_btn.setToolTip("Play all clips in the edit timeline sequentially")
+        layout.addWidget(self.play_edit_btn)
+        
+        self.stop_edit_btn = QPushButton("⏹ Stop")
+        self.stop_edit_btn.clicked.connect(self.stop_edit_playback)
+        self.stop_edit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #8a2a2a;
+                font-weight: bold;
+                padding: 8px;
+            }
+        """)
+        layout.addWidget(self.stop_edit_btn)
+
         # Add clip button
         self.add_clip_btn = QPushButton("➕ Add Clip at Current Time")
         self.add_clip_btn.clicked.connect(self.on_add_clip_clicked)
@@ -4082,6 +4246,46 @@ class SignalTimelineWindow(QMainWindow):
         
         self.statusBar().showMessage(f"Added clip: {start:.1f}s to {end:.1f}s", 2000)
     
+    @Slot(float)
+    def on_edit_time_clicked(self, time):
+        """Handle click on edit timeline — seek to source time"""
+        self.current_time = max(0, min(self.video_duration, time))
+        
+        # Update signal timeline playhead
+        self.signal_scene.current_time_seconds = self.current_time
+        self.signal_scene.set_current_time(self.current_time)
+        if hasattr(self, 'signal_view'):
+            self.signal_view.ensure_time_visible(self.current_time)
+        
+        # Seek video player
+        if hasattr(self, 'video_player'):
+            self.video_player.setPosition(int(self.current_time * 1000))
+        
+        # If playing — update which clip we're in and let timer handle progress
+        is_playing = (hasattr(self, '_edit_paused') and not self._edit_paused 
+                      and hasattr(self, '_edit_playlist') and self._edit_playlist)
+        
+        for i, (start, end) in enumerate(self.edit_scene.clips):
+            if start <= self.current_time <= end:
+                if is_playing:
+                    # During playback: update playlist index, let timer do progress
+                    self._edit_playlist_index = i + 1
+                    self.edit_scene.set_active_clip(i)
+                else:
+                    # When paused: set both clip and progress from click
+                    self.edit_scene.set_active_clip(i)
+                    progress = (self.current_time - start) / (end - start) if end > start else 0
+                    self.edit_scene.set_active_progress(progress)
+                break
+        else:
+            self.edit_scene.clear_active_clip()
+        
+        # Update time label
+        minutes = int(self.current_time // 60)
+        seconds = int(self.current_time % 60)
+        milliseconds = int((self.current_time % 1) * 1000)
+        self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}")
+
     @Slot(float, float)
     def on_clip_double_clicked(self, start_time, end_time):
         """Handle double-click on edit clip - play it"""
@@ -4362,25 +4566,168 @@ class SignalTimelineWindow(QMainWindow):
     
     @Slot()
     def play_video_at_current_time(self):
-        """Play video at current time IN PREVIEW WINDOW"""
+        """Play video — if edit timeline has clips, play those sequentially"""
+        # If edit timeline has clips, play the edit
+        clips = self.edit_scene.get_clip_times()
+        if clips:
+            self.play_edit_timeline()
+            return
+
         if not hasattr(self, 'current_time') or self.current_time < 0:
             self.statusBar().showMessage("⚠️ Click timeline to select a timestamp first", 2000)
             return
         
-        # Play in the preview window
-        self.play_video_time(self.current_time)
-
-        
-        # Seek to current time
         milliseconds = int(self.current_time * 1000)
         self.video_player.setPosition(milliseconds)
-        
-        # Play the video
         self.video_player.play()
         self.play_btn.setText("⏸ Pause")
         
         self.statusBar().showMessage(f"▶ Playing at {self.current_time:.1f}s", 2000)
 
+    def play_edit_timeline(self):
+        """Play all clips in the edit timeline sequentially"""
+        clips = self.edit_scene.get_clip_times()
+        if not clips:
+            self.statusBar().showMessage("⚠️ No clips in edit timeline", 2000)
+            return
+
+        self._edit_paused = False
+        self._edit_playlist = list(clips)
+        self._edit_playlist_index = 0
+        self.play_edit_btn.setText("⏸ Pause")
+        self.statusBar().showMessage(f"▶ Playing edit timeline: {len(clips)} clips", 3000)
+        self._play_next_edit_clip()
+
+    def toggle_edit_playback(self):
+        """Toggle play/pause for edit timeline"""
+        if not hasattr(self, '_edit_playlist') or not self._edit_playlist:
+            # Nothing playing — start fresh
+            self.play_edit_timeline()
+            return
+
+        if hasattr(self, '_edit_paused') and self._edit_paused:
+            # Resume
+            self._edit_paused = False
+            self.play_edit_btn.setText("⏸ Pause")
+            self.video_player.play()
+            
+            # Restart progress timer
+            if hasattr(self, '_edit_progress_timer'):
+                self._edit_progress_timer.start(33)
+            
+            # Restart clip end timer with remaining time
+            if hasattr(self, '_edit_remaining_ms') and self._edit_remaining_ms > 0:
+                if hasattr(self, '_edit_clip_timer'):
+                    self._edit_clip_timer.start(self._edit_remaining_ms)
+            
+            self.statusBar().showMessage("▶ Resumed", 2000)
+        else:
+            # Pause
+            self._edit_paused = True
+            self.play_edit_btn.setText("▶ Play Edit")
+            self.video_player.pause()
+            
+            # Stop timers but remember remaining time
+            if hasattr(self, '_edit_clip_timer') and self._edit_clip_timer.isActive():
+                self._edit_remaining_ms = self._edit_clip_timer.remainingTime()
+                self._edit_clip_timer.stop()
+            
+            if hasattr(self, '_edit_progress_timer'):
+                self._edit_progress_timer.stop()
+            
+            self.statusBar().showMessage("⏸ Paused", 2000)
+
+    def _play_next_edit_clip(self):
+        """Play the next clip in the edit playlist"""
+        if not hasattr(self, '_edit_playlist') or self._edit_playlist_index >= len(self._edit_playlist):
+            self.statusBar().showMessage("✅ Edit timeline playback complete", 3000)
+            self.video_player.pause()
+            self.edit_scene.clear_active_clip()
+            self._edit_playlist = []
+            self._edit_paused = False
+            self.play_edit_btn.setText("▶ Play Edit")
+            if hasattr(self, '_edit_progress_timer'):
+                self._edit_progress_timer.stop()
+            return
+
+        start, end = self._edit_playlist[self._edit_playlist_index]
+        duration = end - start
+        self._edit_playlist_index += 1
+
+        clip_num = self._edit_playlist_index
+        total = len(self._edit_playlist)
+        self.statusBar().showMessage(f"▶ Clip {clip_num}/{total}: {start:.1f}s - {end:.1f}s", int(duration * 1000))
+
+        # Seek and play
+        self.current_time = start
+        self.signal_scene.set_current_time(start)
+        if hasattr(self, 'signal_view'):
+            self.signal_view.ensure_time_visible(start)
+
+        self.video_player.setPosition(int(start * 1000))
+        self.video_player.play()
+
+        # Highlight active clip in edit timeline
+        self.edit_scene.set_active_clip(self._edit_playlist_index - 1)
+
+        # Progress update timer (~30fps)
+        if hasattr(self, '_edit_progress_timer'):
+            self._edit_progress_timer.stop()
+            self._edit_progress_timer.deleteLater()
+        self._edit_progress_timer = QTimer()
+        self._edit_progress_timer.timeout.connect(self._update_edit_progress)
+        self._edit_progress_timer.start(33)
+
+        # Timer to stop at clip end and play next
+        if hasattr(self, '_edit_clip_timer'):
+            self._edit_clip_timer.stop()
+        self._edit_clip_timer = QTimer()
+        self._edit_clip_timer.setSingleShot(True)
+        self._edit_clip_timer.timeout.connect(self._play_next_edit_clip)
+        self._edit_clip_timer.start(int(duration * 1000))
+
+    def _update_edit_progress(self):
+        """Update progress line in active edit clip"""
+        if not hasattr(self, '_edit_playlist') or self._edit_playlist_index <= 0:
+            return
+        idx = self._edit_playlist_index - 1
+        if idx >= len(self._edit_playlist):
+            return
+        start, end = self._edit_playlist[idx]
+        duration = end - start
+        if duration <= 0:
+            return
+        current = self.video_player.position() / 1000.0
+        
+        # Ignore updates until player has actually seeked to the clip
+        if current < start - 0.5 or current > end + 0.5:
+            return
+        
+        progress = max(0.0, min(1.0, (current - start) / duration))
+        self.edit_scene.set_active_progress(progress)
+
+    def stop_edit_playback(self):
+        """Stop edit timeline playback"""
+        if hasattr(self, '_edit_clip_timer'):
+            self._edit_clip_timer.stop()
+        if hasattr(self, '_edit_progress_timer'):
+            self._edit_progress_timer.stop()
+        self.edit_scene.clear_active_clip()
+        self._edit_playlist = []
+        self._edit_playlist_index = 0
+        self._edit_paused = False
+        self.play_edit_btn.setText("▶ Play Edit")
+        self.video_player.pause()
+        
+        # Reset to beginning
+        self.current_time = 0
+        self.video_player.setPosition(0)
+        self.signal_scene.set_current_time(0)
+        if hasattr(self, 'signal_view'):
+            self.signal_view.ensure_time_visible(0)
+        self.time_label.setText("00:00.000")
+        
+        self.statusBar().showMessage("⏹ Edit playback stopped", 2000)
 
     def play_video_clip(self, start_time, end_time):
         """Play a specific clip in the preview"""
