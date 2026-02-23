@@ -2647,6 +2647,7 @@ class FilterDialog(QDialog):
 class SignalTimelineWindow(QMainWindow):
     """Main window for signal timeline viewer with edit timeline and filters"""
     waveform_ready = Signal(object)
+    render_finished = Signal(bool, str)
     
     def __init__(self, video_path, cache_data=None):
         # Add this IMMEDIATELY at the start of __init__
@@ -3532,6 +3533,8 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ Could not create preview dock: {e}")
             # Continue without preview
 
+        # Connect render signal
+        self.render_finished.connect(self.on_render_finished)
 
         # Apply dark theme
         self.apply_dark_theme()
@@ -3677,7 +3680,7 @@ class SignalTimelineWindow(QMainWindow):
         
         # Save to cache button - ADD THIS
         self.save_cache_btn = QPushButton("💾 Save to Cache")
-        self.save_cache_btn.clicked.connect(self.on_save_cache_clicked)  # CONNECT IT!
+        self.save_cache_btn.clicked.connect(self.on_save_cache_clicked)
         self.save_cache_btn.setToolTip("Save current edit timeline to cache for future use")
         
         # Export button
@@ -3690,9 +3693,23 @@ class SignalTimelineWindow(QMainWindow):
         
         layout.addWidget(self.add_clip_btn)
         layout.addWidget(self.remove_clips_btn)
-        layout.addWidget(self.save_cache_btn)  # ADD TO LAYOUT
+        layout.addWidget(self.save_cache_btn)
         layout.addWidget(self.export_btn)
+        
+        self.render_highlight_btn = QPushButton("🎬 Render Highlight Video")
+        self.render_highlight_btn.clicked.connect(self.on_render_highlight_clicked)
+        self.render_highlight_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2a7a2a;
+                font-weight: bold;
+                padding: 8px;
+            }
+        """)
+        self.render_highlight_btn.setToolTip("Render edit timeline clips into a single highlight video file")
+        layout.addWidget(self.render_highlight_btn)
+        
         layout.addStretch()
+
         layout.addWidget(self.edit_duration_label)
         
         return controls
@@ -4377,7 +4394,89 @@ class SignalTimelineWindow(QMainWindow):
         self.current_time = time
         self.play_video_at_current_time()
 
-    
+    @Slot()
+    def on_render_highlight_clicked(self):
+        """Render edit timeline clips into a single highlight video"""
+        clips = self.edit_scene.get_clip_times()
+        if not clips:
+            QMessageBox.warning(self, "No Clips", "Add some clips to the edit timeline first!")
+            return
+
+        from PySide6.QtWidgets import QFileDialog
+
+        default_name = os.path.splitext(os.path.basename(self.video_path))[0] + "_highlight.mp4"
+        default_path = os.path.join(os.path.dirname(self.video_path), default_name)
+
+        output_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Highlight Video", default_path, "MP4 files (*.mp4);;All files (*.*)"
+        )
+        if not output_path:
+            return
+
+        self.statusBar().showMessage("🎬 Rendering highlight video...")
+        self.render_highlight_btn.setEnabled(False)
+        self.render_highlight_btn.setText("⏳ Rendering...")
+
+        # Store for the callback
+        self._render_output_path = output_path
+        self._render_clips = clips
+
+        import threading
+
+        def render():
+            try:
+                filter_parts = []
+                inputs = []
+
+                for i, (start, end) in enumerate(clips):
+                    duration = end - start
+                    inputs.extend(["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", self.video_path])
+                    filter_parts.append(f"[{i}:v][{i}:a]")
+
+                n = len(clips)
+                filter_str = "".join(filter_parts) + f"concat=n={n}:v=1:a=1[outv][outa]"
+
+                cmd = ["ffmpeg", "-y"] + inputs + [
+                    "-filter_complex", filter_str,
+                    "-map", "[outv]", "-map", "[outa]",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-c:a", "aac", "-b:a", "192k",
+                    output_path
+                ]
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+                if result.returncode == 0 and os.path.exists(output_path):
+                    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                    total_dur = sum(e - s for s, e in clips)
+                    msg = (f"✅ Highlight video rendered!\n\n"
+                           f"File: {os.path.basename(output_path)}\n"
+                           f"Clips: {len(clips)}\n"
+                           f"Duration: {total_dur:.1f}s\n"
+                           f"Size: {size_mb:.1f} MB")
+                    self.render_finished.emit(True, msg)
+                else:
+                    err = result.stderr[-500:] if result.stderr else "Unknown error"
+                    self.render_finished.emit(False, f"FFmpeg error:\n{err}")
+
+            except Exception as e:
+                self.render_finished.emit(False, str(e))
+
+        threading.Thread(target=render, daemon=True).start()
+
+    @Slot(bool, str)
+    def on_render_finished(self, success, message):
+        """Handle render completion on the main thread"""
+        self.render_highlight_btn.setEnabled(True)
+        self.render_highlight_btn.setText("🎬 Render Highlight Video")
+
+        if success:
+            self.statusBar().showMessage("✅ Highlight rendered!", 5000)
+            QMessageBox.information(self, "Render Complete", message)
+        else:
+            self.statusBar().showMessage("❌ Render failed", 5000)
+            QMessageBox.critical(self, "Render Failed", message)
+
     def apply_dark_theme(self):
         """Apply modern dark theme"""
         self.setStyleSheet("""
