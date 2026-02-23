@@ -18,6 +18,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from pipeline import run_highlighter
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
+from llm.llm_chat_widget import LLMChatWidget
+from modules.video_cache import VideoAnalysisCache
+from pipeline import build_analysis_cache_params
+from pipeline import run_highlighter
 
 # At app startup
 reset_duration_method_cache()
@@ -901,7 +905,7 @@ class VideoHighlighterGUI(QWidget):
         transcript_tab.setLayout(transcript_layout)
         tabs.addTab(transcript_tab, "Transcript & Subtitles")
 
-        # --- Tab3: Advanced Tab ---
+        # --- Tab 3: Advanced Tab ---
         advanced_cfg = self.config_data.get("advanced", {})
         visualization_cfg = self.config_data.get("visualization", {})
 
@@ -1021,6 +1025,14 @@ class VideoHighlighterGUI(QWidget):
         tabs.addTab(advanced_tab, "Advanced")
 
         layout.addWidget(tabs)
+
+        # --- Tab 4: LLM Chat ---
+        llm_tab = QWidget()
+        llm_layout = QVBoxLayout()
+        self.llm_chat = LLMChatWidget(parent=self)
+        llm_layout.addWidget(self.llm_chat)
+        llm_tab.setLayout(llm_layout)
+        tabs.addTab(llm_tab, "🤖 LLM Chat")
 
         # --- Run / Cancel Controls ---
         ctrl_layout = QHBoxLayout()
@@ -2721,6 +2733,52 @@ class VideoHighlighterGUI(QWidget):
             self.task_label.setText("❌ Failed")
             self.task_label.setStyleSheet("color: #f44336; font-weight: bold;")
         
+        # Feed analysis data to LLM chat
+        if hasattr(self, 'llm_chat'):
+            try:
+                from modules.video_cache import VideoAnalysisCache
+                cache = VideoAnalysisCache()
+                video_path = self.get_file_list()[0] if self.get_file_list() else ""
+                
+                # Try loading from cache
+                config = self.build_pipeline_config()
+                cache_data = cache.load(video_path, params=None)  # load latest
+                
+                if cache_data:
+                    self.llm_chat.set_analysis_data(cache_data, video_path)
+                    self.append_log("🤖 LLM chat context updated with analysis data")
+            except Exception as e:
+                self.append_log(f"⚠️ Could not update LLM context: {e}")
+
+        # feed cache to bot after finished pipeline
+        if hasattr(self, 'llm_chat') and output_file:
+            try:
+                video_paths = self.get_file_list()
+                video_path = video_paths[0] if video_paths else ""
+                if video_path and os.path.exists(video_path):
+                    config = self.build_pipeline_config()
+                    cap = cv2.VideoCapture(video_path)
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                    video_duration = total_frames / fps if fps else 0
+                    cap.release()
+                    cfg_data = {}
+                    if os.path.exists("config.yaml"):
+                        with open("config.yaml", "r") as _f:
+                            cfg_data = yaml.safe_load(_f) or {}
+                    analysis_params = build_analysis_cache_params(
+                        gui_config=config, config=cfg_data,
+                        sample_rate=int(self.sample_rate_spin.value()),
+                        video_duration=video_duration,
+                    )
+                    cache = VideoAnalysisCache(cache_dir=config.get("cache_dir", "./cache"))
+                    cache_data = cache.load(video_path, params=analysis_params)
+                    if cache_data:
+                        self.llm_chat.set_analysis_data(cache_data, video_path)
+                        self.append_log("🤖 LLM chat context updated with analysis data")
+            except Exception as e:
+                self.append_log(f"⚠️ Could not update LLM context: {e}")
+
         self.pipeline_cleanup()
 
     def pipeline_cancelled(self):

@@ -3455,7 +3455,7 @@ class SignalTimelineWindow(QMainWindow):
         signal_widget = QWidget()
         signal_layout = QVBoxLayout(signal_widget)
         
-        # IMPORTANT: Always pass current waveform data (might be None initially)
+        # Always pass current waveform data (might be None initially)
         print(f"🎵 init_ui: Creating scene with waveform data ({len(self.waveform) if self.waveform else 0} points)")
         
         # Create scene with current waveform data (may be empty initially)
@@ -3478,7 +3478,6 @@ class SignalTimelineWindow(QMainWindow):
         signal_layout.addWidget(self.signal_view)
         
         splitter.addWidget(signal_widget)
-
        
         # Create edit timeline view (bottom)
         edit_widget = QWidget()
@@ -3499,6 +3498,23 @@ class SignalTimelineWindow(QMainWindow):
             }
         """)
         
+        # --- LLM Chat Panel (in timeline) ---
+        try:
+            from llm.llm_chat_widget import LLMChatWidget
+            self.llm_chat = LLMChatWidget(parent=self, compact=True, cache_dir="./cache")
+            self.llm_chat.set_timeline_window(self)  # <-- THIS connects it!
+            
+            # If we have cache_data, feed it
+            if self.cache_data:
+                self.llm_chat.set_analysis_data(self.cache_data, self.video_path)
+            
+            # Add as a dock widget on the bottom
+            llm_dock = QDockWidget("LLM Assistant", self)
+            llm_dock.setWidget(self.llm_chat)
+            self.addDockWidget(Qt.BottomDockWidgetArea, llm_dock)
+        except ImportError:
+            pass  # LLM modules not installed
+
         # Set focus policy to receive key events
         self.edit_view.setFocusPolicy(Qt.StrongFocus)
         
