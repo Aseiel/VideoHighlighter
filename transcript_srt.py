@@ -287,9 +287,111 @@ def create_enhanced_transcript(segments: List[Dict], pause_threshold=2.0) -> str
         last_end = seg['end']
     return "".join(transcript_parts).strip()
 
+# --------------------------
+# TRANSLATION (LLM + FALLBACK)
+# --------------------------
+
+def get_llm_translator():
+    """Try to detect local LLM availability, return backend name or None"""
+    try:
+        import subprocess
+        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5,
+                        encoding='utf-8', errors='replace')
+        if result.returncode == 0:
+            return "ollama"
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+def translate_with_llm(text, source_lang="en", target_lang="pl", model="llama3"):
+    """Translate a single text using local LLM via ollama"""
+    import subprocess
+
+    prompt = (
+        f"Translate the following text from {source_lang} to {target_lang}. "
+        f"Return ONLY the translated text, nothing else. "
+        f"Keep the same tone and style. Do not add quotes or explanations.\n\n"
+        f"{text}"
+    )
+
+    try:
+        result = subprocess.run(
+            ["ollama", "run", model, prompt],
+            capture_output=True, text=True, timeout=60,
+            encoding='utf-8', errors='replace'
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            translated = result.stdout.strip()
+            # Remove common LLM artifacts
+            translated = re.sub(r'^["\'](.*)["\']$', r'\1', translated)
+            translated = re.sub(
+                r'^(Here is the translation:|Translation:|Translated text:)\s*',
+                '', translated, flags=re.IGNORECASE
+            )
+            return translated.strip()
+    except Exception as e:
+        print(f"⚠️ LLM translation failed: {e}")
+
+    return None
+
+def translate_batch_with_llm(texts, source_lang="en", target_lang="pl",
+                             model="llama3", batch_size=10):
+    """Translate multiple texts in batches for efficiency"""
+    import subprocess
+
+    results = []
+    total = len(texts)
+
+    for i in range(0, total, batch_size):
+        batch = texts[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (total + batch_size - 1) // batch_size
+        print(f"  🦙 Batch {batch_num}/{total_batches} ({len(batch)} segments)...")
+
+        numbered = "\n".join(f"{j+1}. {t}" for j, t in enumerate(batch))
+        prompt = (
+            f"Translate each numbered line from {source_lang} to {target_lang}. "
+            f"Return ONLY the translations, one per line, keeping the same numbering. "
+            f"Do not add explanations or extra text.\n\n{numbered}"
+        )
+
+        try:
+            result = subprocess.run(
+                ["ollama", "run", model, prompt],
+                capture_output=True, text=True, timeout=120,
+                encoding='utf-8', errors='replace'
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.strip().split("\n")
+                parsed = []
+                for line in lines:
+                    cleaned = re.sub(r'^\d+[\.\)]\s*', '', line.strip())
+                    if cleaned:
+                        parsed.append(cleaned)
+
+                # If we got the right count, use batch result
+                if len(parsed) == len(batch):
+                    results.extend(parsed)
+                    continue
+                else:
+                    print(f"  ⚠️ Batch returned {len(parsed)} lines, expected {len(batch)}, falling back to individual")
+        except Exception as e:
+            print(f"  ⚠️ Batch LLM translation failed: {e}")
+
+        # Fallback: translate individually for this batch
+        for j, text in enumerate(batch):
+            translated = translate_with_llm(text, source_lang, target_lang, model)
+            if translated:
+                results.append(translated)
+            else:
+                print(f"  ⚠️ LLM failed for segment {i+j+1}, keeping original")
+                results.append(text)
+
+    return results
+
 def safe_translate(translator, text, src, dest, retries=3, delay=1.0):
     """
-    Try translating with retries and exponential backoff.
+    Try translating with googletrans with retries and exponential backoff.
     Falls back to original text if all retries fail.
     """
     for attempt in range(retries):
@@ -305,6 +407,11 @@ def safe_translate(translator, text, src, dest, retries=3, delay=1.0):
                 return text  # fallback
 
 def translate_segments(segments, source_lang="en", target_lang="pl"):
+    """
+    Translate subtitle segments.
+    Strategy: try local LLM (llama via ollama) first for better quality,
+    fall back to googletrans if LLM is unavailable.
+    """
     if not segments:
         print("No segments to translate")
         return []
@@ -313,10 +420,38 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
         print("No translation needed (same language)")
         return segments
 
-    translator = Translator()
-    translated_segments = []
     print(f"⏳ Translating {len(segments)} segments from {source_lang} to {target_lang}...")
 
+    # --- Try LLM first ---
+    llm_backend = get_llm_translator()
+    if llm_backend:
+        print(f"🦙 Using local LLM ({llm_backend}) for translation (better quality)")
+        texts = [seg["text"] for seg in segments]
+        translated_texts = translate_batch_with_llm(texts, source_lang, target_lang)
+
+        if len(translated_texts) == len(segments):
+            translated_segments = []
+            for seg, translated_text in zip(segments, translated_texts):
+                translated_segments.append({
+                    'start': seg['start'],
+                    'end': seg['end'],
+                    'text': translated_text
+                })
+            print(f"✅ Translated {len(translated_segments)} segments via LLM")
+            return translated_segments
+        else:
+            print(f"⚠️ LLM returned {len(translated_texts)} translations for {len(segments)} segments, falling back")
+
+    # --- Fallback: googletrans ---
+    try:
+        translator = Translator()
+        print("🌐 Using googletrans for translation (LLM not available)")
+    except Exception as e:
+        print(f"❌ No translation backend available: {e}")
+        print("   Install ollama + llama3 for better translations, or pip install googletrans==4.0.0-rc1")
+        return segments
+
+    translated_segments = []
     for i, seg in enumerate(segments):
         translated_text = safe_translate(translator, seg["text"], src=source_lang, dest=target_lang)
         translated_segments.append({
@@ -324,16 +459,20 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
             'end': seg['end'],
             'text': translated_text
         })
-        print(f"Translated {i+1}/{len(segments)}", end='\r')
+        print(f"  Translated {i+1}/{len(segments)}", end='\r')
 
-    print(f"\n✅ Translated {len(translated_segments)} segments")
+    print(f"\n✅ Translated {len(translated_segments)} segments via googletrans")
     return translated_segments
+
+# --------------------------
+# FILE GENERATION
+# --------------------------
 
 def create_srt_file(segments, output_path, source_lang="en", target_lang=None):
     """Create SRT subtitle file from transcript segments with optional translation"""
     if target_lang and target_lang != source_lang:
         print(f"Translating subtitles from {source_lang} to {target_lang}...")
-        segments = translate_segments(segments, source_lang, target_lang, log_fn=print)
+        segments = translate_segments(segments, source_lang, target_lang)
 
     srt_content = create_srt_content(segments)
 
@@ -344,6 +483,7 @@ def create_srt_file(segments, output_path, source_lang="en", target_lang=None):
 
 def create_highlight_subtitles(original_segments: List[Dict], highlight_segments: List[tuple], 
                                output_path: str, source_lang="en", target_lang=None):
+    """Create SRT subtitles for highlight video from original transcript segments"""
     highlight_subtitle_segments = []
     current_time_offset = 0.0
     for h_start, h_end in highlight_segments:
@@ -359,9 +499,12 @@ def create_highlight_subtitles(original_segments: List[Dict], highlight_segments
                     overlapping_segments.append({'start': new_start, 'end': new_end, 'text': seg['text']})
         highlight_subtitle_segments.extend(overlapping_segments)
         current_time_offset += (h_end - h_start)
-    if target_lang and Translator:
+    if target_lang:
         highlight_subtitle_segments = translate_segments(highlight_subtitle_segments, source_lang, target_lang)
     if highlight_subtitle_segments:
         srt_content = create_srt_content(highlight_subtitle_segments)
         with open(output_path, "w", encoding="utf-8-sig") as f:
             f.write(srt_content)
+        print(f"✅ Highlight subtitles saved: {output_path}")
+    else:
+        print("⚠️ No subtitle segments overlap with highlights")
