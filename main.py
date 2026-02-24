@@ -22,8 +22,11 @@ from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache
 from pipeline import build_analysis_cache_params
 from pipeline import run_highlighter
+import multiprocessing
+
 
 # At app startup
+multiprocessing.freeze_support()
 reset_duration_method_cache()
 
 CONFIG_FILE = "config.yaml"
@@ -2908,6 +2911,7 @@ class VideoHighlighterGUI(QWidget):
             self.append_log(traceback.format_exc())
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     app = QApplication(sys.argv)
     gui = VideoHighlighterGUI()
     gui.show()
