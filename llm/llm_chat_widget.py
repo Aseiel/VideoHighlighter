@@ -49,13 +49,15 @@ class _LLMWorker(QThread):
     def __init__(self, llm: LLMModule, message: str,
                  analysis_data: dict | None = None,
                  video_path: str = "",
-                 timeline_context: str = ""):
+                 timeline_context: str = "",
+                 frame_base64: str | None = None):
         super().__init__()
         self.llm = llm
         self.message = message
         self.analysis_data = analysis_data
         self.video_path = video_path
         self.timeline_context = timeline_context
+        self.frame_base64 = frame_base64
 
     def run(self):
         try:
@@ -64,12 +66,12 @@ class _LLMWorker(QThread):
                 analysis_data=self.analysis_data,
                 video_path=self.video_path,
                 timeline_context=self.timeline_context,
+                frame_base64=self.frame_base64,
                 stream_callback=lambda token: self.token_received.emit(token),
             )
             self.finished.emit(full_response)
         except Exception as e:
             self.error.emit(str(e))
-
 
 # ---------------------------------------------------------------------------
 # Chat widget
@@ -574,12 +576,26 @@ class LLMChatWidget(QWidget):
                 self._timeline_bridge.get_available_commands_text()
             )
 
+        # Capture current frame for vision models
+        frame_b64 = None
+        if self._timeline_bridge and self._timeline_bridge._window:
+            window = self._timeline_bridge._window
+            if hasattr(window, 'capture_current_frame_base64'):
+                frame_b64 = window.capture_current_frame_base64()
+                if frame_b64:
+                    self._append_system(f"📷 Frame captured at {window.current_time:.1f}s ({len(frame_b64)//1024}KB)")
+                else:
+                    self._append_system("⚠️ Frame capture failed")
+            else:
+                self._append_system("⚠️ capture_current_frame_base64 method not found on timeline window")
+
         self._worker = _LLMWorker(
             llm=self._llm,
             message=text,
             analysis_data=self._analysis_data,
             video_path=self._video_path,
             timeline_context=timeline_ctx,
+            frame_base64=frame_b64,
         )
         self._worker.token_received.connect(self._on_token)
         self._worker.finished.connect(self._on_response_done)

@@ -892,7 +892,7 @@ class EditTimelineScene(QGraphicsScene):
         if self.active_clip_index >= 0 and self.active_clip_index < len(self.clip_items):
             self._active_overlay = None
             self._progress_line = None
-            self._update_active_overlay()
+            self._create_active_overlay()
     
     def draw_time_ruler(self):
         """Draw a time ruler above the clips"""
@@ -1137,7 +1137,7 @@ class EditTimelineScene(QGraphicsScene):
         """Highlight the currently playing clip"""
         self.active_clip_index = index
         self.active_progress = 0.0
-        self._update_active_overlay()
+        self._create_active_overlay()
 
     def set_active_progress(self, progress):
         """Update progress within the active clip (0.0 to 1.0)"""
@@ -3696,6 +3696,30 @@ class SignalTimelineWindow(QMainWindow):
         
         # Install event filter to handle global key events
         self.installEventFilter(self)
+
+    def capture_current_frame_base64(self) -> str | None:
+        """Grab the current frame as base64 for LLM vision."""
+        import cv2
+        import base64
+        
+        try:
+            cap = cv2.VideoCapture(self.video_path)
+            cap.set(cv2.CAP_PROP_POS_MSEC, self.current_time * 1000)
+            ret, frame = cap.read()
+            cap.release()
+            
+            if not ret:
+                print(f"❌ Could not read frame at {self.current_time:.1f}s")
+                return None
+            
+            frame = cv2.resize(frame, (512, 512))
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            b64 = base64.b64encode(buffer).decode('utf-8')
+            print(f"📷 Captured frame at {self.current_time:.1f}s ({len(b64)//1024}KB)")
+            return b64
+        except Exception as e:
+            print(f"❌ Frame capture failed: {e}")
+            return None
 
     def eventFilter(self, obj, event):
         """Global event filter for handling delete and spacebar"""
