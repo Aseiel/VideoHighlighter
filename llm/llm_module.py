@@ -36,7 +36,8 @@ class _LLMBackend:
         raise NotImplementedError
 
     def generate(self, prompt: str, system: str = "", max_tokens: int = 1024,
-                 temperature: float = 0.7, stream_callback: Optional[Callable] = None) -> str:
+                 temperature: float = 0.7, stream_callback: Optional[Callable] = None,
+                 images: list[str] | None = None) -> str:
         raise NotImplementedError
 
     def is_loaded(self) -> bool:
@@ -96,13 +97,23 @@ class _OllamaBackend(_LLMBackend):
         return self._loaded
 
     def generate(self, prompt: str, system: str = "", max_tokens: int = 1024,
-                 temperature: float = 0.7, stream_callback: Optional[Callable] = None) -> str:
+                temperature: float = 0.7, stream_callback: Optional[Callable] = None,
+                images: list[str] | None = None) -> str:
         import requests
+
+        # For vision models: DON'T embed system in prompt — it drowns out the image
+        if images:
+            formatted_prompt = prompt
+        else:
+            # Text-only: embed system in prompt for models that ignore system field
+            formatted_prompt = (
+                f"[SYSTEM INSTRUCTIONS]\n{system}\n[END INSTRUCTIONS]\n\n{prompt}"
+                if system else prompt
+            )
 
         payload = {
             "model": self.model,
-            # Include system both ways — some models only read one
-            "prompt": f"[SYSTEM INSTRUCTIONS]\n{system}\n[END INSTRUCTIONS]\n\n{prompt}" if system else prompt,
+            "prompt": formatted_prompt,
             "system": system,
             "stream": stream_callback is not None,
             "options": {
@@ -111,11 +122,13 @@ class _OllamaBackend(_LLMBackend):
             },
         }
 
+        if images:
+            payload["images"] = images
+
         if stream_callback:
-            # Streaming mode
             full_text = []
             with requests.post(f"{self.base_url}/api/generate", json=payload,
-                               stream=True, timeout=120) as resp:
+                            stream=True, timeout=120) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
                     if not line:
@@ -172,7 +185,8 @@ class _LlamaCppBackend(_LLMBackend):
         return self._model is not None
 
     def generate(self, prompt: str, system: str = "", max_tokens: int = 1024,
-                 temperature: float = 0.7, stream_callback: Optional[Callable] = None) -> str:
+                temperature: float = 0.7, stream_callback: Optional[Callable] = None,
+                images: list[str] | None = None) -> str:
         if not self._model:
             raise RuntimeError("Model not loaded. Call load() first.")
 
@@ -180,6 +194,11 @@ class _LlamaCppBackend(_LLMBackend):
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
+
+        # Note: llama-cpp-python doesn't support images natively
+        # Vision requires Ollama backend
+        if images:
+            messages[-1]["content"] = "[Image attached but not supported by llama-cpp backend. Use Ollama with a vision model.]\n\n" + prompt
 
         if stream_callback:
             full_text = []
@@ -442,6 +461,15 @@ class LLMModule:
         "7. NEVER repeat the '## Current Timeline State' section in your response.\n"
     )
 
+    SYSTEM_PROMPT_VISION = (
+        "You have VISION. An image is attached to this message.\n"
+        "IGNORE all text data. ONLY describe what you SEE in the image.\n"
+        "Describe: people (count, poses, clothing, actions), objects, background, colors.\n"
+        "If you cannot see the image, say 'I cannot see the image'.\n"
+        "Do NOT mention timestamps, detections, or analysis data.\n"
+        "Do NOT make up actions from text — ONLY describe the visual content.\n"
+    )
+
     def __init__(
         self,
         backend: str = "ollama",
@@ -487,6 +515,7 @@ class LLMModule:
         video_path: str = "",
         system_prompt: str | None = None,
         timeline_context: str = "",
+        frame_base64: str | None = None,
         max_tokens: int = 1024,
         temperature: float = 0.3,
         stream_callback: Optional[Callable[[str], None]] = None,
@@ -500,6 +529,7 @@ class LLMModule:
             video_path:      Video filename (for context)
             system_prompt:   Override the default system prompt
             timeline_context: Extra context about timeline state + available commands
+            frame_base64:    Base64-encoded image of current video frame (for vision models)
             max_tokens:      Max response length
             temperature:     Sampling temperature
             stream_callback: Called with each token for streaming UI updates
@@ -509,10 +539,18 @@ class LLMModule:
         """
         if not self._backend.is_loaded():
             raise RuntimeError("LLM not loaded. Call load() first.")
+        
+        # DEBUG: trace vision path
+        print(f"🔍 query() called:")
+        print(f"   frame_base64: {'YES ' + str(len(frame_base64)) + ' chars' if frame_base64 else 'NONE'}")
+        print(f"   timeline_context: {'YES' if timeline_context else 'NONE'}")
+        print(f"   analysis_data: {'YES' if analysis_data else 'NONE'}")
 
-        # Pick system prompt: timeline-aware if we have timeline context
+        # Pick system prompt based on context
         if system_prompt:
             system = system_prompt
+        elif frame_base64:
+            system = self.SYSTEM_PROMPT_VISION
         elif timeline_context:
             system = self.SYSTEM_PROMPT_TIMELINE
         else:
@@ -520,6 +558,22 @@ class LLMModule:
 
         # Build the full prompt with context
         prompt_parts = []
+
+        if frame_base64:
+            # ===== VISION MODE: image is primary, minimal text =====
+            prompt_parts.append(user_message)
+            full_prompt = "\n".join(prompt_parts)
+
+            return self._backend.generate(
+                prompt=full_prompt,
+                system=self.SYSTEM_PROMPT_VISION,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream_callback=stream_callback,
+                images=[frame_base64],
+            )
+
+        # ===== TEXT MODE: full analysis context =====
         if analysis_data:
             context = VideoContextBuilder.build(analysis_data, video_path)
             prompt_parts.append(
@@ -531,7 +585,6 @@ class LLMModule:
                 "=== END DATA ===\n\n"
             )
 
-        # Add timeline context if connected
         if timeline_context:
             prompt_parts.append(
                 "=== TIMELINE CONTROL ===\n"
