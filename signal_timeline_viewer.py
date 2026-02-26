@@ -3712,8 +3712,14 @@ class SignalTimelineWindow(QMainWindow):
                 print(f"❌ Could not read frame at {self.current_time:.1f}s")
                 return None
             
-            frame = cv2.resize(frame, (512, 512))
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            # Resize keeping aspect ratio, max dimension 1024
+            h, w = frame.shape[:2]
+            max_dim = 1024
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
             b64 = base64.b64encode(buffer).decode('utf-8')
             print(f"📷 Captured frame at {self.current_time:.1f}s ({len(b64)//1024}KB)")
             return b64
