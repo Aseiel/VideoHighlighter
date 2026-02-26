@@ -58,20 +58,43 @@ class _LLMWorker(QThread):
         self.video_path = video_path
         self.timeline_context = timeline_context
         self.frame_base64 = frame_base64
+        self._cancel = False
+
+    def cancel(self):
+        """Request cancellation of the current generation."""
+        self._cancel = True
 
     def run(self):
         try:
+            def _stream_callback(token: str):
+                if self._cancel:
+                    raise _GenerationCancelled()
+                self.token_received.emit(token)
+
             full_response = self.llm.query(
                 user_message=self.message,
                 analysis_data=self.analysis_data,
                 video_path=self.video_path,
                 timeline_context=self.timeline_context,
                 frame_base64=self.frame_base64,
-                stream_callback=lambda token: self.token_received.emit(token),
+                stream_callback=_stream_callback,
             )
-            self.finished.emit(full_response)
+            if self._cancel:
+                self.finished.emit(full_response + "\n[stopped]")
+            else:
+                self.finished.emit(full_response)
+        except _GenerationCancelled:
+            self.finished.emit("[stopped by user]")
         except Exception as e:
-            self.error.emit(str(e))
+            if self._cancel:
+                self.finished.emit("[stopped by user]")
+            else:
+                self.error.emit(str(e))
+
+
+class _GenerationCancelled(Exception):
+    """Raised inside stream callback to abort generation."""
+    pass
 
 # ---------------------------------------------------------------------------
 # Chat widget
@@ -214,6 +237,16 @@ class LLMChatWidget(QWidget):
         self.send_btn.clicked.connect(self._send_message)
         self.send_btn.setEnabled(False)
         input_layout.addWidget(self.send_btn)
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setStyleSheet(
+            "QPushButton{background:#c62828;color:white;font-weight:bold;"
+            "padding:8px 16px;border-radius:4px;}"
+            "QPushButton:disabled{background:#555;}"
+        )
+        self.stop_btn.clicked.connect(self._stop_generation)
+        self.stop_btn.setEnabled(False)
+        input_layout.addWidget(self.stop_btn)
 
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self._clear_chat)
@@ -563,6 +596,7 @@ class LLMChatWidget(QWidget):
         self.input_field.setEnabled(False)
         self.send_btn.setEnabled(False)
         self.send_btn.setText("...")
+        self.stop_btn.setEnabled(True)
 
         self._append_html(
             '<div style="color:#8BC34A;margin-top:8px;"><b>Assistant:</b></div>'
@@ -601,6 +635,13 @@ class LLMChatWidget(QWidget):
         self._worker.finished.connect(self._on_response_done)
         self._worker.error.connect(self._on_response_error)
         self._worker.start()
+
+    def _stop_generation(self):
+        """Stop the current LLM generation."""
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self.stop_btn.setEnabled(False)
+            self._append_system("⏹ Stopping generation...")
 
     @Slot(str)
     def _on_token(self, token: str):
@@ -644,8 +685,8 @@ class LLMChatWidget(QWidget):
         self.input_field.setEnabled(True)
         self.send_btn.setEnabled(True)
         self.send_btn.setText("Send")
+        self.stop_btn.setEnabled(False)
         self.input_field.setFocus()
-        self.llm_replied.emit(full_text)
 
     @Slot(str)
     def _on_response_error(self, error_msg: str):
@@ -655,6 +696,7 @@ class LLMChatWidget(QWidget):
         self.input_field.setEnabled(True)
         self.send_btn.setEnabled(True)
         self.send_btn.setText("Send")
+        self.stop_btn.setEnabled(False)
 
     def _clear_chat(self):
         self.chat_display.clear()
