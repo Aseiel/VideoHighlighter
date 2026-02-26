@@ -550,7 +550,8 @@ class LLMModule:
         # Pick system prompt based on context
         if system_prompt:
             system = system_prompt
-        elif frame_base64:
+        elif frame_base64 and not timeline_context:
+            # Pure vision mode: only when there's NO timeline context
             system = self.SYSTEM_PROMPT_VISION
         elif timeline_context:
             system = self.SYSTEM_PROMPT_TIMELINE
@@ -560,8 +561,11 @@ class LLMModule:
         # Build the full prompt with context
         prompt_parts = []
 
-        if frame_base64:
-            # ===== VISION MODE: image is primary, minimal text =====
+        # ---- Only enter pure vision mode when there's no timeline context ----
+        # Previously, frame_base64 alone triggered an early return that skipped
+        # all analysis data and timeline commands.
+        if frame_base64 and not timeline_context:
+            # ===== PURE VISION MODE: image is primary, minimal text =====
             prompt_parts.append(user_message)
             full_prompt = "\n".join(prompt_parts)
 
@@ -573,6 +577,12 @@ class LLMModule:
                 stream_callback=stream_callback,
                 images=[frame_base64],
             )
+
+        # If we have BOTH a frame AND timeline context, drop the frame and use
+        # text mode so that analysis data + timeline commands are preserved.
+        if frame_base64 and timeline_context:
+            print("⚠️ frame_base64 present but timeline_context active — using text mode")
+            frame_base64 = None  # Don't send image; use full text context instead
 
         # ===== TEXT MODE: full analysis context =====
         if analysis_data:

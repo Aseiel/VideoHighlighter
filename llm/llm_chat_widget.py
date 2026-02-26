@@ -99,6 +99,16 @@ class _GenerationCancelled(Exception):
 # ---------------------------------------------------------------------------
 # Chat widget
 # ---------------------------------------------------------------------------
+
+# Keywords that indicate the user wants visual/frame analysis
+_VISION_KEYWORDS = (
+    "see", "look", "show me", "what is this", "describe frame",
+    "describe image", "what's in the frame", "what do you see",
+    "visual", "screenshot", "current frame", "this frame",
+    "what's happening here", "what is happening here",
+)
+
+
 class LLMChatWidget(QWidget):
     """
     Self-contained chat panel. Auto-loads latest cache from disk on startup.
@@ -610,18 +620,24 @@ class LLMChatWidget(QWidget):
                 self._timeline_bridge.get_available_commands_text()
             )
 
-        # Capture current frame for vision models
+        # ---- Only capture frame when user asks about visual content ----
+        # Previously this captured on EVERY message, causing all queries to
+        # enter vision-only mode (which skips analysis data & timeline commands).
         frame_b64 = None
-        if self._timeline_bridge and self._timeline_bridge._window:
+        _text_lower = text.lower()
+        _wants_vision = any(kw in _text_lower for kw in _VISION_KEYWORDS)
+
+        if _wants_vision and self._timeline_bridge and self._timeline_bridge._window:
             window = self._timeline_bridge._window
             if hasattr(window, 'capture_current_frame_base64'):
                 frame_b64 = window.capture_current_frame_base64()
                 if frame_b64:
-                    self._append_system(f"📷 Frame captured at {window.current_time:.1f}s ({len(frame_b64)//1024}KB)")
+                    self._append_system(
+                        f"📷 Frame captured at {window.current_time:.1f}s "
+                        f"({len(frame_b64)//1024}KB)"
+                    )
                 else:
                     self._append_system("⚠️ Frame capture failed")
-            else:
-                self._append_system("⚠️ capture_current_frame_base64 method not found on timeline window")
 
         self._worker = _LLMWorker(
             llm=self._llm,
