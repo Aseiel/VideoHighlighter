@@ -4,10 +4,29 @@ R3D Training Script
 
 End-to-end 3D CNN fine-tuning (r3d_18 / mc3_18 / r2plus1d_18).
 
-Usage:
+Usage (run from project root, e.g. D:\\movie_highlighter):
+
     python -m model_training.r3d.train
-    python model_training/r3d/train.py
-    python train.py                        (from inside r3d/)
+    python -m model_training.r3d.train --model r2plus1d_18 --epochs 40
+    python -m model_training.r3d.train --freeze-backbone --lr 3e-4
+    python -m model_training.r3d.train --rebuild-cache
+    python -m model_training.r3d.train --no-cache --num-workers 0
+
+Options:
+    --model             r3d_18 | mc3_18 | r2plus1d_18 (default: r3d_18)
+    --data-path         Path to dataset folder (default: dataset/)
+    --epochs            Number of training epochs (default: 30)
+    --batch-size        Batch size (default: 4)
+    --lr                Learning rate (default: 1e-4)
+    --resume            Resume from checkpoint path
+    --freeze-backbone   Only train the FC head, freeze 3D-CNN layers
+    --no-amp            Disable mixed precision (use FP32)
+    --no-onnx           Skip ONNX export after training
+    --no-cache          Disable ROI cache (slow — runs YOLO every epoch)
+    --rebuild-cache     Force rebuild ROI cache even if one exists
+    --num-workers       DataLoader workers (default: 4, 0 = single-process)
+    --no-viz            Skip sample visualizations before training
+    --viz               Create sample visualizations before training
 """
 
 import os
@@ -309,6 +328,10 @@ def main():
                         help="DataLoader workers (default: 4)")
     parser.add_argument("--rebuild-cache", action="store_true",
                         help="Force rebuild ROI cache even if one exists")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="Skip sample visualizations before training")
+    parser.add_argument("--viz", action="store_true",
+                        help="Create sample visualizations before training")
     args = parser.parse_args()
 
     # Override config
@@ -332,6 +355,10 @@ def main():
         CONFIG["export_onnx"] = False
     if args.num_workers is not None:
         CONFIG["num_workers"] = args.num_workers
+    if args.no_viz:
+        CONFIG["create_visualizations"] = False
+    if args.viz:
+        CONFIG["create_visualizations"] = True
 
     set_seed(42)
     print("=" * 60)
@@ -361,16 +388,15 @@ def main():
     # PRE-COMPUTE ROI CACHE (one-time cost, massive speedup per epoch)
     # ==============================
     roi_cache = None
+    pose_ext = None
 
-    if not args.no_cache:
-        pose_ext = None
-        if CONFIG.get("use_adaptive_cropping") and CONFIG.get("use_pose_guided_crop"):
-            pose_ext = PoseExtractor(
-                CONFIG.get("pose_model", "yolo11n-pose.pt"),
-                CONFIG.get("pose_conf_threshold", 0.3),
-            )
+    if CONFIG.get("use_adaptive_cropping") and CONFIG.get("use_pose_guided_crop"):
+        pose_ext = PoseExtractor(
+            CONFIG.get("pose_model", "yolo11n-pose.pt"),
+            CONFIG.get("pose_conf_threshold", 0.3),
+        )
 
-        # Build a combined sample list for caching
+    if not args.no_cache:        # Build a combined sample list for caching
         all_samples_ds = R3DVideoDataset.__new__(R3DVideoDataset)
         all_samples_ds.samples = train_ds.samples + val_ds.samples
         all_samples_ds.config = CONFIG
@@ -422,6 +448,17 @@ def main():
         num_workers=nw, pin_memory=pin,
         prefetch_factor=pf, persistent_workers=pw,
     )
+
+    # ==============================
+    # Sample Visualizations
+    # ==============================
+    if CONFIG.get("create_visualizations") and pose_ext:
+        create_sample_visualizations(
+            train_ds, pose_ext,
+            num_samples=CONFIG.get("num_visualization_samples", 2),
+            sample_rate=CONFIG.get("visualization_sample_rate", 5),
+            visualize_skeletons=CONFIG.get("visualize_skeletons", False),
+        )
 
     # Train
     print(f"\n🚀 Training...\n")

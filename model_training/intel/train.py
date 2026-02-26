@@ -4,10 +4,24 @@ Intel Training Script
 
 Frozen OpenVINO encoder → trainable LSTM decoder.
 
-Usage:
+Usage (run from project root, e.g. D:\\movie_highlighter):
+
     python -m model_training.intel.train
-    python model_training/intel/train.py
-    python train.py                        (from inside intel/)
+    python -m model_training.intel.train --data-path /path/to/dataset
+    python -m model_training.intel.train --resume checkpoints_intel/checkpoint_latest.pth
+    python -m model_training.intel.train --epochs 30 --batch-size 4
+
+Options:
+    --data-path         Path to dataset folder (default: dataset/)
+    --epochs            Number of training epochs (default: 25)
+    --batch-size        Batch size (default: 2)
+    --lr                Learning rate (default: 1e-4)
+    --resume            Resume from checkpoint path
+    --no-viz            Skip sample visualizations before training
+    --viz               Create sample visualizations before training
+    --no-cache          Disable ROI cache (slow — runs YOLO every epoch)
+    --rebuild-cache     Force rebuild ROI cache even if one exists
+    --num-workers       DataLoader workers (default: 4, 0 = single-process)
 """
 
 import os
@@ -229,12 +243,22 @@ def train_classifier(encoder, train_loader, val_loader, num_classes,
 # =============================
 def main():
     parser = argparse.ArgumentParser(description="Intel OpenVINO encoder → LSTM training")
+    # --- shared with R3D ---
     parser.add_argument("--data-path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--no-viz", action="store_true")
+    parser.add_argument("--no-viz", action="store_true",
+                        help="Skip sample visualizations before training")
+    parser.add_argument("--viz", action="store_true",
+                        help="Create sample visualizations before training")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Disable ROI cache (slow — runs YOLO every epoch)")
+    parser.add_argument("--rebuild-cache", action="store_true",
+                        help="Force rebuild ROI cache even if one exists")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader workers (default: 4, 0 = single-process)")
     args = parser.parse_args()
 
     # Override config from CLI
@@ -250,6 +274,10 @@ def main():
         CONFIG["base_learning_rate"] = args.lr
     if args.no_viz:
         CONFIG["create_visualizations"] = False
+    if args.viz:
+        CONFIG["create_visualizations"] = True
+    if args.num_workers is not None:
+        CONFIG["num_workers"] = args.num_workers
 
     set_seed(42)
     print("=" * 60)
@@ -283,20 +311,43 @@ def main():
     # ==============================
     # PRE-COMPUTE ROI CACHE
     # ==============================
+    roi_cache = None
     pose_ext = None
+
     if CONFIG.get("use_adaptive_cropping") and CONFIG.get("use_pose_guided_crop"):
         pose_ext = PoseExtractor(CONFIG.get("pose_model", "yolo11n-pose.pt"),
                                   CONFIG.get("pose_conf_threshold", 0.3))
 
-    all_ds = VideoDataset.__new__(VideoDataset)
-    all_ds.samples = train_ds.samples + val_ds.samples
-    all_ds.config = CONFIG
+    if not args.no_cache:
+        all_ds = VideoDataset.__new__(VideoDataset)
+        all_ds.samples = train_ds.samples + val_ds.samples
+        all_ds.config = CONFIG
 
-    roi_cache = precompute_roi_cache(all_ds, CONFIG, pose_extractor=pose_ext)
-    train_ds.roi_cache = roi_cache
-    val_ds.roi_cache = roi_cache
+        if args.rebuild_cache:
+            import hashlib as _h
+            h = _h.md5()
+            h.update(str(CONFIG.get("sequence_length", 16)).encode())
+            h.update(str(CONFIG.get("default_stride", 4)).encode())
+            h.update(str(CONFIG.get("crop_size", (224, 224))).encode())
+            h.update(str(len(all_ds.samples)).encode())
+            cache_file = os.path.join(
+                CONFIG.get("checkpoint_dir", "."),
+                f"roi_cache_{h.hexdigest()[:8]}.pkl",
+            )
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+                print(f"🗑️  Deleted old cache: {cache_file}")
 
-    nw = CONFIG.get("num_workers", 4)
+        roi_cache = precompute_roi_cache(all_ds, CONFIG, pose_extractor=pose_ext)
+        train_ds.roi_cache = roi_cache
+        val_ds.roi_cache = roi_cache
+    else:
+        print("\n⚠️  ROI cache DISABLED — training will be slow (YOLO runs every epoch)")
+
+    # ==============================
+    # DataLoaders
+    # ==============================
+    nw = CONFIG.get("num_workers", 4) if roi_cache is not None else 0
     pin = CONFIG["device"] == "cuda"
     pf = CONFIG.get("prefetch_factor", 2) if nw > 0 else None
     pw = CONFIG.get("persistent_workers", True) and nw > 0
@@ -313,14 +364,15 @@ def main():
     # Encoder
     encoder = IntelFeatureExtractor(CONFIG["encoder_xml"], CONFIG["encoder_bin"])
 
-    # Pose + visualizations
-    pose = None
-    if CONFIG.get("create_visualizations"):
-        pose = PoseExtractor(CONFIG.get("pose_model", "yolo11n-pose.pt"),
-                             CONFIG.get("pose_conf_threshold", 0.3))
-        create_sample_visualizations(train_ds, pose,
-                                      num_samples=CONFIG.get("num_visualization_samples", 2),
-                                      sample_rate=CONFIG.get("visualization_sample_rate", 5))
+    # ==============================
+    # Sample Visualizations
+    # ==============================
+    if CONFIG.get("create_visualizations") and pose_ext:
+        create_sample_visualizations(
+            train_ds, pose_ext,
+            num_samples=CONFIG.get("num_visualization_samples", 2),
+            sample_rate=CONFIG.get("visualization_sample_rate", 5),
+        )
 
     # Train
     print(f"\n🚀 Training...\n")

@@ -13,6 +13,7 @@ from ultralytics import YOLO
 import concurrent.futures
 import os
 import gc
+import re
 
 # =============================
 # Optional PyTorch / CUDA imports
@@ -40,20 +41,25 @@ BASE_DIR = Path(__file__).parent.resolve()
 
 CUSTOM_MAPPING_PATH = BASE_DIR / "intel_finetuned_classifier_3d_mapping.json"
 KINETICS_LABELS_PATH = BASE_DIR / "kinetics_400_labels.json"
+R3D_CUSTOM_MAPPING_PATH = BASE_DIR / "r3d_finetuned_mapping.json"
+R3D_CUSTOM_WEIGHTS_PATH = BASE_DIR / "r3d_finetuned.pth"
+
 
 CUSTOM_LABELS = None
 KINETICS_400_LABELS = None
+R3D_CUSTOM_LABELS = None
+R3D_CUSTOM_META = None
 
 
 def load_label_mappings():
-    global CUSTOM_LABELS, KINETICS_400_LABELS
+    global CUSTOM_LABELS, KINETICS_400_LABELS, R3D_CUSTOM_LABELS, R3D_CUSTOM_META
 
     if CUSTOM_MAPPING_PATH.exists():
         with open(CUSTOM_MAPPING_PATH, "r") as f:
             custom_data = json.load(f)
             CUSTOM_LABELS = custom_data.get('idx_to_label', {})
             CUSTOM_LABELS = {int(k): v for k, v in CUSTOM_LABELS.items()}
-        print(f"✓ Loaded custom model labels: {len(CUSTOM_LABELS)} classes")
+        print(f"✓ Loaded custom OpenVINO model labels: {len(CUSTOM_LABELS)} classes")
     else:
         CUSTOM_LABELS = None
 
@@ -64,13 +70,36 @@ def load_label_mappings():
     else:
         print("⚠️ Kinetics-400 labels not found")
 
+    if R3D_CUSTOM_MAPPING_PATH.exists():
+        with open(R3D_CUSTOM_MAPPING_PATH, "r") as f:
+            r3d_data = json.load(f)
+            R3D_CUSTOM_LABELS = r3d_data.get('idx_to_label', {})
+            R3D_CUSTOM_LABELS = {int(k): v for k, v in R3D_CUSTOM_LABELS.items()}
+            # Extract metadata (model_variant, num_classes, crop_size, etc.)
+            R3D_CUSTOM_META = r3d_data.get('metadata', {})
+            if not R3D_CUSTOM_META:
+                # Fallback: build from top-level keys if metadata block is missing
+                R3D_CUSTOM_META = {
+                    'model_variant': r3d_data.get('model_variant'),
+                    'num_classes': len(R3D_CUSTOM_LABELS),
+                }
+        print(f"✓ Loaded R3D custom labels: {len(R3D_CUSTOM_LABELS)} classes")
+        variant = (R3D_CUSTOM_META or {}).get('model_variant', 'unknown')
+        print(f"  Model variant: {variant}")
+    else:
+        R3D_CUSTOM_LABELS = None
+        R3D_CUSTOM_META = None
+
 
 load_label_mappings()
+
 
 
 def get_action_name(action_id, model_type='custom'):
     if model_type == 'custom' and CUSTOM_LABELS and action_id in CUSTOM_LABELS:
         return CUSTOM_LABELS[action_id]
+    elif model_type == 'r3d_custom' and R3D_CUSTOM_LABELS and action_id in R3D_CUSTOM_LABELS:
+        return R3D_CUSTOM_LABELS[action_id]
     elif model_type in ('intel', 'r3d', 'cuda') and KINETICS_400_LABELS:
         return KINETICS_400_LABELS.get(str(action_id), f"action_{action_id}")
     else:
@@ -88,6 +117,39 @@ def get_id_from_name(name):
                 return int(k), 'intel'
     raise ValueError(f"Action '{name}' not found in any label set")
 
+def get_all_ids_from_name(name):
+    """Return ALL model matches for a given action name (for mixed mode).
+    
+    Supports tagged format: 'laughing [custom]' → only custom model
+                           'laughing [intel]'  → only intel model  
+                           'laughing'          → all matching models
+    """
+    import re
+    # Parse optional [model] tag
+    tag_match = re.match(r'^(.+?)\s*\[(custom|intel|cuda)\]\s*$', name.strip())
+    if tag_match:
+        clean_name = tag_match.group(1).strip()
+        forced_model = tag_match.group(2)
+    else:
+        clean_name = name.strip()
+        forced_model = None
+
+    results = []
+    if CUSTOM_LABELS and (forced_model is None or forced_model == 'custom'):
+        for idx, action_name in CUSTOM_LABELS.items():
+            if action_name.lower() == clean_name.lower():
+                results.append((idx, 'custom'))
+    if R3D_CUSTOM_LABELS and (forced_model is None or forced_model == 'r3d_custom'):
+        for idx, action_name in R3D_CUSTOM_LABELS.items():
+            if action_name.lower() == clean_name.lower():
+                results.append((idx, 'r3d_custom'))
+    if KINETICS_400_LABELS and (forced_model is None or forced_model == 'intel'):
+        for k, v in KINETICS_400_LABELS.items():
+            if v.lower() == clean_name.lower():
+                results.append((int(k), 'intel'))
+    if not results:
+        raise ValueError(f"Action '{name}' not found in any label set")
+    return results
 
 def get_id_from_name_with_r3d(name):
     """Extended version that also checks R3D/CUDA model (uses Kinetics-400 labels)."""
@@ -370,19 +432,23 @@ class R3DModelWrapper:
       - r2plus1d_18  (R(2+1)D — decomposed 3D convolutions, more accurate)
     """
 
-    def __init__(self, model_name='r3d_18', device_str='cuda', half_precision=True):
+    def __init__(self, model_name='r3d_18', device_str='cuda', half_precision=True,
+                 custom_weights=None, custom_num_classes=None):
         """
         Args:
             model_name: One of 'r3d_18', 'mc3_18', 'r2plus1d_18'
             device_str: 'cuda' or 'cpu'
             half_precision: Use FP16 on CUDA for faster inference
+            custom_weights: Path to .pth file with fine-tuned weights (optional)
+            custom_num_classes: Number of classes in custom model (required if custom_weights)
         """
         self.model_name = model_name
         self.device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
         self.half = half_precision and self.device.type == 'cuda'
+        self.num_classes = custom_num_classes or 400  # default Kinetics-400
 
-        print(f"🚀 Loading {model_name} on {self.device} "
-              f"(FP16: {self.half})...")
+        tag = " (custom)" if custom_weights else ""
+        print(f"🚀 Loading {model_name}{tag} on {self.device} (FP16: {self.half})...")
 
         # Load pretrained model
         if model_name == 'r3d_18':
@@ -392,13 +458,27 @@ class R3DModelWrapper:
         elif model_name == 'r2plus1d_18':
             self.model = video_models.r2plus1d_18(weights='DEFAULT')
         else:
-            raise ValueError(f"Unknown R3D variant: {model_name}. "
-                             f"Use r3d_18, mc3_18, or r2plus1d_18")
+            raise ValueError(f"Unknown R3D variant: {model_name}")
+
+        if custom_weights and custom_num_classes:
+            in_features = self.model.fc.in_features
+            self.model.fc = torch.nn.Sequential(
+                torch.nn.Dropout(0.4),
+                torch.nn.Linear(in_features, custom_num_classes),
+            )
+            state = torch.load(custom_weights, map_location='cpu', weights_only=True)
+            # Handle ActionRecognitionModel wrapper format
+            if 'model_state_dict' in state:
+                self.model.load_state_dict(state['model_state_dict'])
+            else:
+                self.model.load_state_dict(state)
+            print(f"   ✓ Loaded custom weights: {custom_num_classes} classes")
 
         self.model.eval()
         self.model.to(self.device)
         if self.half:
             self.model.half()
+
 
         # Pre-build normalization tensors on device for speed
         self.mean = torch.tensor(R3D_IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1, 1)
@@ -729,7 +809,7 @@ def load_models(device="AUTO", openvino_threads=None,
     else:
         print("⚠️ Intel decoder model not found")
 
-    # ---- R3D / CUDA model ----
+    # ---- R3D / CUDA model (pretrained Kinetics-400) ----
     r3d_wrapper = None
     if enable_r3d and TORCH_AVAILABLE:
         try:
@@ -750,14 +830,41 @@ def load_models(device="AUTO", openvino_threads=None,
     elif enable_r3d and not TORCH_AVAILABLE:
         print("⚠️ R3D requested but PyTorch is not installed — skipping")
 
+    # ---- R3D Custom fine-tuned model ----
+    if (enable_r3d and TORCH_AVAILABLE
+            and R3D_CUSTOM_LABELS and R3D_CUSTOM_WEIGHTS_PATH.exists()):
+        try:
+            r3d_custom_device = 'cuda' if CUDA_AVAILABLE else 'cpu'
+            # Use variant from mapping metadata, fall back to CLI r3d_model_name
+            custom_variant = (R3D_CUSTOM_META or {}).get('model_variant') or r3d_model_name
+            num_classes = len(R3D_CUSTOM_LABELS)
+
+            r3d_custom_wrapper = R3DModelWrapper(
+                model_name=custom_variant,
+                device_str=r3d_custom_device,
+                half_precision=r3d_half and CUDA_AVAILABLE,
+                custom_weights=str(R3D_CUSTOM_WEIGHTS_PATH),
+                custom_num_classes=num_classes,
+            )
+            models_info['r3d_custom'] = {
+                'wrapper': r3d_custom_wrapper,
+                'labels': R3D_CUSTOM_LABELS,
+                'type': 'pytorch',
+            }
+        except Exception as e:
+            print(f"⚠️ Failed to load R3D custom model: {e}")
+    elif enable_r3d and R3D_CUSTOM_LABELS and not R3D_CUSTOM_WEIGHTS_PATH.exists():
+        print(f"⚠️ R3D custom mapping found but weights missing: {R3D_CUSTOM_WEIGHTS_PATH}")
+
     if (models_info['custom'] is None and models_info['intel'] is None
-            and models_info['cuda'] is None):
+            and models_info['cuda'] is None and models_info.get('r3d_custom') is None):
         raise FileNotFoundError("❌ No models found! Need at least one decoder or R3D.")
 
     print("✓ Model loading complete.")
     print(f"  - Custom model:  {'✓ Available' if models_info['custom'] else '✗ Not available'}")
     print(f"  - Intel model:   {'✓ Available' if models_info['intel'] else '✗ Not available'}")
     print(f"  - R3D/CUDA:      {'✓ Available' if models_info['cuda'] else '✗ Not available'}")
+    print(f"  - R3D Custom:    {'✓ Available (' + str(len(R3D_CUSTOM_LABELS)) + ' classes)' if models_info.get('r3d_custom') else '✗ Not available'}")
     print()
 
     return (
@@ -954,13 +1061,18 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
         interesting_actions_set = set([s.lower() for s in interesting_actions])
         for action_name in interesting_actions:
             try:
-                action_id, model_type = get_id_from_name(action_name)
-                action_to_model[action_name.lower()] = (action_id, model_type)
-                print(f"📌 Action '{action_name}' found in {model_type} model (ID: {action_id})")
-                # If R3D is enabled and the action is from Kinetics-400, also map to cuda
-                if enable_r3d and model_type == 'intel':
-                    action_to_model[action_name.lower() + '__cuda'] = (action_id, 'cuda')
-                    print(f"   ↳ Also mapped to R3D/CUDA model (ID: {action_id})")
+                all_matches = get_all_ids_from_name(action_name)
+                # Use clean name (without tag) for the key
+                clean_name = re.sub(r'\s*\[(custom|intel|cuda)\]\s*$', '', action_name).strip()
+                for action_id, model_type in all_matches:
+                    key = f"{clean_name.lower()}__{model_type}"
+                    action_to_model[key] = (action_id, model_type)
+                    print(f"📌 Action '{action_name}' found in {model_type} model (ID: {action_id})")
+                    # If R3D is enabled and the action is from Kinetics-400, also map to cuda
+                    if enable_r3d and model_type == 'intel':
+                        cuda_key = f"{action_name.lower()}__cuda"
+                        action_to_model[cuda_key] = (action_id, 'cuda')
+                        print(f"   ↳ Also mapped to R3D/CUDA model (ID: {action_id})")
             except ValueError as e:
                 print(f"⚠️ {e}")
                 raise
@@ -1008,7 +1120,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     # ---- R3D raw frame ring buffer ----
     # R3D needs raw BGR frames (not encoder features), so we keep a separate buffer
-    raw_frame_buffer = deque(maxlen=R3D_CLIP_LENGTH) if r3d_wrapper else None
+    has_any_r3d = r3d_wrapper is not None or models_info.get('r3d_custom') is not None
+    raw_frame_buffer = deque(maxlen=R3D_CLIP_LENGTH) if has_any_r3d else None
 
     try:
         if draw_bboxes and annotated_output:
@@ -1272,26 +1385,41 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             # Run decoders (OpenVINO + R3D)
                             # ==============================
                             decoder_cache = {}
-
-                            # -- R3D inference (if buffer is full) --
-                            if (r3d_wrapper is not None and raw_frame_buffer is not None
+                            # -- R3D inference (pretrained + custom, if buffer is full) --
+                            if (raw_frame_buffer is not None
                                     and len(raw_frame_buffer) == R3D_CLIP_LENGTH):
                                 r3d_start = time.time()
-                                try:
-                                    r3d_roi = current_action_roi if use_person_detection else None
-                                    r3d_logits = r3d_wrapper.predict_from_frames(
-                                        list(raw_frame_buffer), roi=r3d_roi)
-                                    decoder_cache['cuda'] = softmax(r3d_logits)
-                                except Exception as e:
-                                    if debug:
-                                        print(f"⚠️ R3D inference error: {e}")
+                                r3d_roi = current_action_roi if use_person_detection else None
+                                frames_list = list(raw_frame_buffer)
+
+                                # Pretrained R3D (Kinetics-400)
+                                if r3d_wrapper is not None:
+                                    try:
+                                        r3d_logits = r3d_wrapper.predict_from_frames(
+                                            frames_list, roi=r3d_roi)
+                                        decoder_cache['cuda'] = softmax(r3d_logits)
+                                    except Exception as e:
+                                        if debug:
+                                            print(f"⚠️ R3D inference error: {e}")
+
+                                # Custom R3D (fine-tuned)
+                                r3d_custom_info = models_info.get('r3d_custom')
+                                if r3d_custom_info is not None:
+                                    try:
+                                        r3d_custom_logits = r3d_custom_info['wrapper'].predict_from_frames(
+                                            frames_list, roi=r3d_roi)
+                                        decoder_cache['r3d_custom'] = softmax(r3d_custom_logits)
+                                    except Exception as e:
+                                        if debug:
+                                            print(f"⚠️ R3D custom inference error: {e}")
+
                                 r3d_time += time.time() - r3d_start
 
                             if interesting_actions_set:
-                                # === Run needed OpenVINO decoders ===
-                                for action_name in interesting_actions_set:
-                                    action_id, model_type = action_to_model[action_name.lower()]
-                                    model_data = models_info[model_type]
+                                # === Run needed decoders for all model mappings ===
+                                for key, (action_id, model_type) in action_to_model.items():
+                                    action_name = key.split("__")[0]
+                                    model_data = models_info.get(model_type)
                                     if model_data is None:
                                         continue
 
@@ -1300,7 +1428,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                             predictions = model_data['compiled'](
                                                 [sequence_array])[model_data['output']].flatten()
                                             decoder_cache[model_type] = softmax(predictions)
-                                        # 'cuda' already in cache from above
 
                                     probabilities = decoder_cache.get(model_type)
                                     if probabilities is None:
@@ -1325,37 +1452,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                         if debug:
                                             print(f"{use_timestamp_str} -> {action_name} "
                                                   f"[{model_type}] (score:{score:.3f})")
-
-                                # Also check cuda variants for interesting actions
-                                if r3d_wrapper and 'cuda' in decoder_cache:
-                                    for action_name in interesting_actions_set:
-                                        cuda_key = action_name.lower() + '__cuda'
-                                        if cuda_key in action_to_model:
-                                            action_id, _ = action_to_model[cuda_key]
-                                            probabilities = decoder_cache['cuda']
-                                            if action_id < len(probabilities):
-                                                score = float(probabilities[action_id])
-                                                if score >= confidence_threshold:
-                                                    writer.writerow([
-                                                        use_timestamp_str, use_frame_id,
-                                                        action_id, action_name, score,
-                                                        use_timestamp_secs, 'cuda'])
-                                                    if include_model_type:
-                                                        all_actions.append((
-                                                            use_timestamp_secs, use_frame_id,
-                                                            action_id, score, action_name,
-                                                            'cuda'))
-                                                    else:
-                                                        all_actions.append((
-                                                            use_timestamp_secs, use_frame_id,
-                                                            action_id, score, action_name))
-                                                    frame_detections.append(
-                                                        (action_name, score, 'cuda'))
-                                                    detection_count += 1
-                                                    if debug:
-                                                        print(f"{use_timestamp_str} -> "
-                                                              f"{action_name} [cuda] "
-                                                              f"(score:{score:.3f})")
                             else:
                                 # === Scan all models (including R3D) ===
                                 all_probabilities = {}
@@ -1478,21 +1574,25 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                 print(f"⚠️ R3D flush error: {e}")
 
                     if interesting_actions_set:
-                        for action_name in interesting_actions_set:
-                            action_id, model_type = action_to_model[action_name.lower()]
-                            model_data = models_info[model_type]
+                        # === Run needed decoders for all model mappings ===
+                        for key, (action_id, model_type) in action_to_model.items():
+                            action_name = key.split("__")[0]
+                            model_data = models_info.get(model_type)
                             if model_data is None:
                                 continue
+
                             if model_type not in decoder_cache:
                                 if model_data.get('type') == 'openvino':
                                     predictions = model_data['compiled'](
                                         [sequence_array])[model_data['output']].flatten()
                                     decoder_cache[model_type] = softmax(predictions)
+
                             probabilities = decoder_cache.get(model_type)
                             if probabilities is None:
                                 continue
                             if action_id >= len(probabilities):
                                 continue
+
                             score = float(probabilities[action_id])
                             if score >= confidence_threshold:
                                 writer.writerow([use_timestamp_str, use_frame_id, action_id,
@@ -1507,32 +1607,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                                         action_id, score, action_name))
                                 frame_detections.append((action_name, score, model_type))
                                 detection_count += 1
-
-                        # cuda variants flush
-                        if r3d_wrapper and 'cuda' in decoder_cache:
-                            for action_name in interesting_actions_set:
-                                cuda_key = action_name.lower() + '__cuda'
-                                if cuda_key in action_to_model:
-                                    action_id, _ = action_to_model[cuda_key]
-                                    probabilities = decoder_cache['cuda']
-                                    if action_id < len(probabilities):
-                                        score = float(probabilities[action_id])
-                                        if score >= confidence_threshold:
-                                            writer.writerow([
-                                                use_timestamp_str, use_frame_id,
-                                                action_id, action_name, score,
-                                                use_timestamp_secs, 'cuda'])
-                                            if include_model_type:
-                                                all_actions.append((
-                                                    use_timestamp_secs, use_frame_id,
-                                                    action_id, score, action_name, 'cuda'))
-                                            else:
-                                                all_actions.append((
-                                                    use_timestamp_secs, use_frame_id,
-                                                    action_id, score, action_name))
-                                            frame_detections.append(
-                                                (action_name, score, 'cuda'))
-                                            detection_count += 1
                     else:
                         all_probabilities = {}
                         for model_type, model_data in models_info.items():
@@ -1590,6 +1664,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
             encoder_engine.cleanup()
         if r3d_wrapper:
             r3d_wrapper.cleanup()
+        r3d_custom_info = models_info.get('r3d_custom')
+        if r3d_custom_info and r3d_custom_info.get('wrapper'):
+            r3d_custom_info['wrapper'].cleanup()
         preprocess_pool.shutdown()
         sequence_buffer.clear()
         recent_detections.clear()
