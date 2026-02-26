@@ -29,11 +29,13 @@ import multiprocessing
 multiprocessing.freeze_support()
 reset_duration_method_cache()
 
+
 CONFIG_FILE = "config.yaml"
 
 YOLO_OBJECTS_LABELS_FILE = "yolo_objects_labels.json"
 KINETICS_400_LABELS_FILE = "kinetics_400_labels.json"
 INTEL_CUSTOM_LABELS_FILE = "intel_finetuned_classifier_3d_mapping.json"
+R3D_CUSTOM_LABELS_FILE = "r3d_finetuned_mapping.json"
 
 class LabelSelectorDialog(QDialog):
     """Dialog with search/filter and multi-select for labels."""
@@ -960,9 +962,9 @@ class VideoHighlighterGUI(QWidget):
 
         # === ACTION MODELS (which decoders to load) ===
         self.action_models_combo = QComboBox()
-        self.action_models_combo.addItem("Intel Kinetics-400 only (400 classes)", "intel_only")
-        self.action_models_combo.addItem("Custom fine-tuned only (37 classes)", "custom_only")
-        self.action_models_combo.addItem("Mixed — Intel + Custom (both loaded)", "mixed")
+        self._intel_count = len(self.load_labels_from_json(KINETICS_400_LABELS_FILE)) if os.path.exists(KINETICS_400_LABELS_FILE) else 0
+        self._custom_ov_count = len(self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)) if os.path.exists(INTEL_CUSTOM_LABELS_FILE) else 0
+        self._r3d_custom_count = len(self.load_labels_from_json(R3D_CUSTOM_LABELS_FILE)) if os.path.exists(R3D_CUSTOM_LABELS_FILE) else 0
 
         current_action_models = advanced_cfg.get("action_models", "mixed")
         idx_am = self.action_models_combo.findData(current_action_models)
@@ -979,14 +981,54 @@ class VideoHighlighterGUI(QWidget):
 
         def on_action_backend_changed(index):
             backend = self.action_backend_combo.currentData()
-            is_r3d_only = backend in ("r3d_cuda", "r3d_cpu")
             self.r3d_model_combo.setEnabled(backend in ("auto", "r3d_cuda", "r3d_cpu"))
-            # R3D-only uses Kinetics-400, no decoder choice needed
-            self.action_models_combo.setEnabled(not is_r3d_only)
-            if is_r3d_only:
-                self.action_models_combo.setCurrentIndex(
-                    self.action_models_combo.findData("intel_only"))
-            # Update autocomplete when backend changes
+
+            # Remember current selection to restore if still valid
+            prev_data = self.action_models_combo.currentData()
+
+            # Rebuild combo with only compatible models
+            self.action_models_combo.blockSignals(True)
+            self.action_models_combo.clear()
+
+            if backend in ("openvino",):
+                # OpenVINO decoders only
+                if self._intel_count:
+                    self.action_models_combo.addItem(f"Intel Kinetics-400 ({self._intel_count} classes)", "intel_only")
+                if self._custom_ov_count:
+                    self.action_models_combo.addItem(f"Custom OpenVINO ({self._custom_ov_count} classes)", "custom_only")
+                if self._intel_count and self._custom_ov_count:
+                    total = self._intel_count + self._custom_ov_count
+                    self.action_models_combo.addItem(f"Mixed — both decoders ({total} classes)", "mixed")
+
+            elif backend in ("r3d_cuda", "r3d_cpu"):
+                # R3D models only
+                if self._intel_count:
+                    self.action_models_combo.addItem(f"R3D Kinetics-400 pretrained ({self._intel_count} classes)", "intel_only")
+                if self._r3d_custom_count:
+                    self.action_models_combo.addItem(f"R3D fine-tuned ({self._r3d_custom_count} classes)", "r3d_custom_only")
+                if self._intel_count and self._r3d_custom_count:
+                    total = self._intel_count + self._r3d_custom_count
+                    self.action_models_combo.addItem(f"Mixed — both R3D ({total} classes)", "mixed")
+
+            else:
+                # Auto — show everything available
+                if self._intel_count:
+                    self.action_models_combo.addItem(f"Intel Kinetics-400 ({self._intel_count} classes)", "intel_only")
+                if self._custom_ov_count:
+                    self.action_models_combo.addItem(f"Custom OpenVINO ({self._custom_ov_count} classes)", "custom_only")
+                if self._r3d_custom_count:
+                    self.action_models_combo.addItem(f"R3D fine-tuned ({self._r3d_custom_count} classes)", "r3d_custom_only")
+                available = sum(1 for c in [self._intel_count, self._custom_ov_count, self._r3d_custom_count] if c > 0)
+                if available >= 2:
+                    total = self._intel_count + self._custom_ov_count + self._r3d_custom_count
+                    self.action_models_combo.addItem(f"Mixed — all models ({total} classes)", "mixed")
+
+            # Restore previous selection if still valid
+            restore_idx = self.action_models_combo.findData(prev_data)
+            if restore_idx >= 0:
+                self.action_models_combo.setCurrentIndex(restore_idx)
+
+            self.action_models_combo.blockSignals(False)
             self.update_actions_completer()
 
         self.action_backend_combo.currentIndexChanged.connect(on_action_backend_changed)
@@ -995,7 +1037,7 @@ class VideoHighlighterGUI(QWidget):
         on_action_backend_changed(0)
 
         misc_layout.addRow("Action recognition backend:", self.action_backend_combo)
-        misc_layout.addRow("Action models (decoders):", self.action_models_combo)
+        misc_layout.addRow("Action models:", self.action_models_combo)
         misc_layout.addRow("R3D model variant:", self.r3d_model_combo)
 
         misc_box.setLayout(misc_layout)
@@ -2037,6 +2079,9 @@ class VideoHighlighterGUI(QWidget):
         elif action_models == "intel_only":
             label_file = KINETICS_400_LABELS_FILE
             title = "Select Action Labels (Intel Kinetics-400 — 400 classes)"
+        elif action_models == "r3d_custom_only":
+            label_file = R3D_CUSTOM_LABELS_FILE
+            title = "Select Action Labels (R3D Fine-tuned)"
         elif action_models == "mixed":
             # Show labels tagged with source model
             custom_labels = []
@@ -2130,6 +2175,10 @@ class VideoHighlighterGUI(QWidget):
             if os.path.exists(KINETICS_400_LABELS_FILE):
                 action_labels = self.load_labels_from_json(KINETICS_400_LABELS_FILE)
                 source = "Intel Kinetics-400 (400 classes)"
+        elif action_models == "r3d_custom_only":
+            if os.path.exists(R3D_CUSTOM_LABELS_FILE):
+                action_labels = self.load_labels_from_json(R3D_CUSTOM_LABELS_FILE)
+                source = f"R3D fine-tuned ({len(action_labels)} classes)"
         elif action_models == "mixed":
             custom_labels = []
             intel_labels = []
