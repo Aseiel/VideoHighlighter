@@ -504,13 +504,22 @@ def validate_and_split_dataset(train_dataset, val_dataset, config):
             print(f"  ❌ '{action}': {t_cnt} train (need {min_train}) — SKIPPED")
             continue
 
-        if v_cnt < min_val:
+        # Enforce minimum val ratio (default 20%)
+        min_val_ratio = config.get("min_val_ratio", 0.2)
+        current_val_ratio = v_cnt / total if total > 0 else 0.0
+        needs_resplit = v_cnt < min_val or current_val_ratio < min_val_ratio
+
+        if needs_resplit:
             if total < min_train + min_val:
                 print(f"  ⚠️  '{action}': {total} total (need {min_train + min_val}) — SKIPPED")
                 continue
-            print(f"  🔄 '{action}': {t_cnt} train, {v_cnt} val → AUTO-SPLITTING")
+            reason = (
+                f"{v_cnt} val" if v_cnt < min_val
+                else f"{current_val_ratio:.0%} val ratio < {min_val_ratio:.0%}"
+            )
+            print(f"  🔄 '{action}': {t_cnt} train, {v_cnt} val → AUTO-SPLITTING ({reason})")
             all_vids = t_vids + v_vids
-            val_ratio = max(min_val / total, 0.2)
+            val_ratio = max(min_val / total, min_val_ratio)
             val_ratio = min(val_ratio, 0.3)
             split_train, split_val = train_test_split(
                 all_vids, test_size=val_ratio, random_state=42

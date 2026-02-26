@@ -480,70 +480,50 @@ def main():
     use_amp = CONFIG.get("use_amp", True) and device.type == "cuda"
 
     def _val_fn():
-        _, _, pc, preds = validate(raw_model, val_loader, device, criterion, use_amp)
+        raw_model.to(device).float()  # ensure FP32 on correct device
+        _, _, pc, preds = validate(raw_model, val_loader, device, criterion, use_amp=False)
         return pc, preds
 
-    keep, remove, _ = create_production_model(
+    keep, remove, per_class_acc = create_production_model(
         wrapped, _val_fn, min_val_accuracy=CONFIG.get("min_production_accuracy", 0.3)
     )
 
-    if remove:
-        new_l2i, new_i2l, old2new = build_filtered_label_maps(keep, wrapped.idx_to_label)
-        prod_model = build_r3d_model(len(keep), CONFIG).to(device)
-        _copy_r3d_weights(raw_model, prod_model, keep, old2new)
+    # --- Base mapping: remove only 0% accuracy classes ---
+    base_keep = [idx for idx in sorted(wrapped.idx_to_label.keys())
+                 if per_class_acc.get(idx, 0.0) > 0.0]
+    base_remove = [idx for idx in sorted(wrapped.idx_to_label.keys())
+                   if per_class_acc.get(idx, 0.0) == 0.0]
 
-        prod_wrapped = ActionRecognitionModel(
-            prod_model, new_l2i, new_i2l, 0, CONFIG["sequence_length"],
-            model_type=f"R3D_{CONFIG['model_variant']}",
-            extra_meta={
-                "model_variant": CONFIG["model_variant"],
-                "crop_size": list(CONFIG["crop_size"]),
-                "mean": CONFIG["mean"],
-                "std": CONFIG["std"],
-            },
+    if base_remove:
+        # Overwrite the default mapping with 0%-filtered version
+        wrapped.save_filtered_mapping(
+            CONFIG["model_save_path"], base_keep,
+            per_class_acc=per_class_acc, suffix="",
         )
-        prod_path = CONFIG["model_save_path"].replace(".pth", "_production.pth")
-        prod_wrapped.save(prod_path)
+        print(f"\n  Base mapping: removed {len(base_remove)} classes with 0% accuracy:")
+        for ri in base_remove:
+            print(f"    ❌ {wrapped.idx_to_label.get(ri, f'class_{ri}')}")
 
-        if CONFIG.get("export_onnx"):
-            export_onnx(prod_model, len(keep), CONFIG,
-                        prod_path.replace(".pth", ".onnx"))
-    else:
-        prod_path = CONFIG["model_save_path"].replace(".pth", "_production.pth")
-        wrapped.save(prod_path)
+    # --- Production mapping: remove classes below threshold ---
+    if remove:
+        wrapped.save_filtered_mapping(
+            CONFIG["model_save_path"], keep,
+            per_class_acc=per_class_acc, suffix="_production",
+        )
+
+    prod_path = CONFIG["model_save_path"].replace(".pth", "_production_mapping.json")
 
     print(f"\n✅ Done!")
-    print(f"  Base model:       {CONFIG['model_save_path']} ({len(wrapped.label_to_idx)} classes)")
-    print(f"  Production model: {prod_path}")
+    print(f"  Weights:             {CONFIG['model_save_path']} ({len(wrapped.label_to_idx)} classes total)")
+    print(f"  Base mapping:        {CONFIG['model_save_path'].replace('.pth', '_mapping.json')} "
+          f"({len(base_keep)} classes, 0% removed)")
+    print(f"  Production mapping:  {prod_path} "
+          f"({len(keep)} classes, <{CONFIG.get('min_production_accuracy', 0.3):.0%} removed)")
 
     # Cleanup
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-
-def _copy_r3d_weights(old_model, new_model, classes_to_keep, old2new):
-    """Copy backbone weights and remap FC head for kept classes."""
-    old_s = old_model.state_dict()
-    new_s = new_model.state_dict()
-
-    # Copy everything except fc layer
-    for k in old_s:
-        if k in new_s and old_s[k].shape == new_s[k].shape:
-            new_s[k] = old_s[k]
-
-    # Remap fc.1.weight / fc.1.bias (fc is Sequential: Dropout → Linear)
-    for suffix in ("weight", "bias"):
-        key = f"fc.1.{suffix}"
-        if key in old_s and key in new_s:
-            old_t = old_s[key]
-            new_t = torch.zeros_like(new_s[key])
-            for old_idx in classes_to_keep:
-                new_idx = old2new[old_idx]
-                new_t[new_idx] = old_t[old_idx]
-            new_s[key] = new_t
-
-    new_model.load_state_dict(new_s)
 
 
 if __name__ == "__main__":

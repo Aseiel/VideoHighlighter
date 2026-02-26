@@ -186,12 +186,55 @@ class ActionRecognitionModel:
             "feature_dim": self.feature_dim,
             "sequence_length": self.sequence_length,
             "model_type": self.model_type,
+            "num_classes_total": len(self.label_to_idx),
         }
         data.update(self.extra_meta)
         with open(mapping_path, "w") as f:
             json.dump(data, f, indent=2)
         print(f"✅ Model saved: {path}")
         print(f"✅ Mapping saved: {mapping_path}")
+
+    def save_filtered_mapping(self, path, classes_to_keep, per_class_acc=None, suffix=""):
+        """
+        Save a mapping JSON that only includes specified classes.
+        Weights file is NOT re-saved — same .pth works with any mapping.
+        
+        Args:
+            path: Base .pth path (used to derive mapping filename)
+            classes_to_keep: List of class indices to include
+            per_class_acc: Optional per-class accuracy dict
+            suffix: Mapping filename suffix (e.g. '_production')
+        """
+        keep_set = set(classes_to_keep)
+        filtered_l2i = {name: idx for name, idx in self.label_to_idx.items()
+                        if idx in keep_set}
+        filtered_i2l = {str(k): v for k, v in self.idx_to_label.items()
+                        if k in keep_set}
+        removed = [self.idx_to_label[i] for i in sorted(
+            set(self.idx_to_label.keys()) - keep_set)]
+
+        mapping_path = path.replace(".pth", f"{suffix}_mapping.json")
+        data = {
+            "label_to_idx": filtered_l2i,
+            "idx_to_label": filtered_i2l,
+            "feature_dim": self.feature_dim,
+            "sequence_length": self.sequence_length,
+            "model_type": self.model_type,
+            "num_classes_total": len(self.label_to_idx),
+            "num_classes_active": len(filtered_l2i),
+            "removed_classes": removed,
+        }
+        if per_class_acc:
+            data["per_class_accuracy"] = {
+                self.idx_to_label.get(k, str(k)): round(v, 4)
+                for k, v in per_class_acc.items()
+            }
+        data.update(self.extra_meta)
+
+        with open(mapping_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"✅ Mapping saved: {mapping_path} "
+              f"({len(filtered_l2i)} active / {len(self.label_to_idx)} total)")
 
     @staticmethod
     def load_mapping(path):

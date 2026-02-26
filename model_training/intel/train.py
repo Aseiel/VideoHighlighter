@@ -53,7 +53,6 @@ from model_training.shared.training_utils import (
     save_checkpoint,
     load_checkpoint,
     create_production_model,
-    build_filtered_label_maps,
     ActionRecognitionModel,
 )
 from model_training.shared.detection import PoseExtractor
@@ -227,6 +226,7 @@ def train_classifier(encoder, train_loader, val_loader, num_classes,
         model.load_state_dict(best_state)
         print(f"\n✅ Best model loaded (loss={best_loss:.4f}, acc={best_acc:.4f})")
 
+    # Save full model (all classes — retrainable)
     wrapped = ActionRecognitionModel(
         model=model, label_to_idx=label_to_idx, idx_to_label=idx_to_label,
         feature_dim=feature_dim, sequence_length=CONFIG["sequence_length"],
@@ -376,97 +376,75 @@ def main():
 
     # Train
     print(f"\n🚀 Training...\n")
-    model = train_classifier(encoder, train_loader, val_loader,
-                              num_classes=len(valid_actions),
-                              label_to_idx=label_to_idx,
-                              idx_to_label=idx_to_label)
+    wrapped = train_classifier(encoder, train_loader, val_loader,
+                               num_classes=len(valid_actions),
+                               label_to_idx=label_to_idx,
+                               idx_to_label=idx_to_label)
 
-    # Final validation + production model
+    # ==============================================================
+    # POST-TRAINING: Create filtered mappings
+    # ==============================================================
+    # Same .pth weights file, two mapping JSONs:
+    #   _mapping.json            = base (0% classes removed)
+    #   _production_mapping.json = production (<30% classes removed)
+    # ==============================================================
+
     device = torch.device(CONFIG["device"])
-    if CONFIG.get("use_class_weights"):
-        w = compute_class_weights(train_ds).to(device)
-        criterion = nn.CrossEntropyLoss(weight=w, label_smoothing=0.1)
-    else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    prod_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     def _val_fn():
-        _, _, pc, preds = validate(encoder, model.model, val_loader, device, criterion)
+        _, _, pc, preds = validate(encoder, wrapped.model, val_loader, device, prod_criterion)
         return pc, preds
 
-    # Remove zero-accuracy classes
-    keep, remove, _ = create_production_model(model, _val_fn, min_val_accuracy=0.001)
-    if remove:
-        new_l2i, new_i2l, old2new = build_filtered_label_maps(keep, model.idx_to_label)
-        new_m = EncoderLSTM(
-            feature_dim=model.feature_dim,
-            hidden_dim=CONFIG.get("hidden_dim", 256),
-            num_classes=len(keep),
-            num_layers=CONFIG.get("num_layers", 2),
-        ).to(device)
-        _copy_lstm_weights(model.model, new_m, keep, old2new)
-        model = ActionRecognitionModel(
-            new_m, new_l2i, new_i2l, model.feature_dim, model.sequence_length,
-            model_type="EncoderLSTM",
-            extra_meta={"hidden_dim": CONFIG.get("hidden_dim", 256),
-                        "num_layers": CONFIG.get("num_layers", 2)},
-        )
-        model.save(CONFIG["model_save_path"])
-
-    # Stricter production filter
-    keep2, remove2, _ = create_production_model(
-        model, _val_fn, min_val_accuracy=CONFIG.get("min_production_accuracy", 0.3)
+    # --- Base filtering: remove 0% accuracy classes ---
+    print("\n" + "=" * 70)
+    print("📋 BASE MODEL FILTERING (remove 0% accuracy)")
+    print("=" * 70)
+    base_keep, base_remove, per_class_acc = create_production_model(
+        wrapped, _val_fn, min_val_accuracy=0.001,
     )
-    if remove2:
-        new_l2i, new_i2l, old2new = build_filtered_label_maps(keep2, model.idx_to_label)
-        new_m = EncoderLSTM(
-            feature_dim=model.feature_dim,
-            hidden_dim=CONFIG.get("hidden_dim", 256),
-            num_classes=len(keep2),
-            num_layers=CONFIG.get("num_layers", 2),
-        ).to(device)
-        _copy_lstm_weights(model.model, new_m, keep2, old2new)
-        prod_model = ActionRecognitionModel(
-            new_m, new_l2i, new_i2l, model.feature_dim, model.sequence_length,
-            model_type="EncoderLSTM",
-            extra_meta={"hidden_dim": CONFIG.get("hidden_dim", 256),
-                        "num_layers": CONFIG.get("num_layers", 2)},
+
+    if base_remove:
+        # Overwrite the default mapping with 0%-filtered version
+        wrapped.save_filtered_mapping(
+            CONFIG["model_save_path"], base_keep,
+            per_class_acc=per_class_acc, suffix="",
         )
-        prod_path = CONFIG["model_save_path"].replace(".pth", "_production.pth")
-        prod_model.save(prod_path)
-    else:
-        prod_path = CONFIG["model_save_path"].replace(".pth", "_production.pth")
-        model.save(prod_path)
+
+    # --- Production filtering: remove <30% accuracy classes ---
+    min_prod_acc = CONFIG.get("min_production_accuracy", 0.3)
+    prod_keep = [idx for idx in sorted(wrapped.idx_to_label.keys())
+                 if per_class_acc.get(idx, 0.0) >= min_prod_acc]
+    prod_remove = [idx for idx in sorted(wrapped.idx_to_label.keys())
+                   if per_class_acc.get(idx, 0.0) < min_prod_acc]
+
+    print(f"\n📋 PRODUCTION FILTERING (remove <{min_prod_acc:.0%} accuracy)")
+    print(f"   Keep: {len(prod_keep)} | Remove: {len(prod_remove)}")
+
+    wrapped.save_filtered_mapping(
+        CONFIG["model_save_path"], prod_keep,
+        per_class_acc=per_class_acc, suffix="_production",
+    )
+
+    # --- Summary ---
+    base_mapping = CONFIG["model_save_path"].replace(".pth", "_mapping.json")
+    prod_mapping = CONFIG["model_save_path"].replace(".pth", "_production_mapping.json")
 
     print(f"\n✅ Done!")
-    print(f"  Base model:       {CONFIG['model_save_path']} ({len(model.label_to_idx)} classes)")
-    print(f"  Production model: {prod_path}")
-
-
-def _copy_lstm_weights(old_model, new_model, classes_to_keep, old2new):
-    """Copy shared LSTM weights and remap classifier for kept classes."""
-    old_s = old_model.state_dict()
-    new_s = new_model.state_dict()
-
-    # Copy everything except final classifier layer
-    for k in old_s:
-        if k in new_s and old_s[k].shape == new_s[k].shape:
-            new_s[k] = old_s[k]
-
-    # Remap final classifier (classifier.3.weight / .bias)
-    for suffix in ("weight", "bias"):
-        key = f"classifier.3.{suffix}"
-        if key in old_s and key in new_s:
-            old_t = old_s[key]
-            new_t = torch.zeros_like(new_s[key])
-            for old_idx in classes_to_keep:
-                new_idx = old2new[old_idx]
-                if suffix == "weight":
-                    new_t[new_idx] = old_t[old_idx]
-                else:
-                    new_t[new_idx] = old_t[old_idx]
-            new_s[key] = new_t
-
-    new_model.load_state_dict(new_s)
+    print(f"  Weights:             {CONFIG['model_save_path']}")
+    print(f"  Base mapping:        {base_mapping} ({len(base_keep)} classes)")
+    print(f"  Production mapping:  {prod_mapping} ({len(prod_keep)} classes)")
+    if base_remove:
+        print(f"\n  Removed from base (0% accuracy):")
+        for ri in base_remove:
+            print(f"    ❌ {wrapped.idx_to_label.get(ri, f'class_{ri}')}")
+    if len(prod_remove) > len(base_remove):
+        extra_removed = [ri for ri in prod_remove if ri not in base_remove]
+        if extra_removed:
+            print(f"\n  Additionally removed for production (<{min_prod_acc:.0%}):")
+            for ri in extra_removed:
+                acc = per_class_acc.get(ri, 0.0)
+                print(f"    ❌ {wrapped.idx_to_label.get(ri, f'class_{ri}')} ({acc:.1%})")
 
 
 if __name__ == "__main__":
