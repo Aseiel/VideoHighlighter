@@ -118,6 +118,7 @@ class _OllamaBackend(_LLMBackend):
             "stream": stream_callback is not None,
             "options": {
                 "num_predict": max_tokens,
+                "num_ctx": 2048,
                 "temperature": temperature,
             },
         }
