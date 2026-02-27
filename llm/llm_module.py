@@ -9,21 +9,33 @@ The module builds rich context from your video analysis cache so the LLM
 can reason about detected objects, actions, transcript, scores, etc.
 
 Usage:
-    from llm_module import LLMModule
+    from llm_module import LLMModule, VideoSeekAnalyzer
 
     llm = LLMModule(backend="ollama", model="llama3.2")
     llm.load()
-    reply = llm.query("What actions are happening in the video?",
-                       analysis_data=my_cache_dict)
+    
+    # Analyze video every 1 second
+    analyzer = VideoSeekAnalyzer("video.mp4", llm)
+    results = analyzer.analyze_every_1_second()
 """
 
 from __future__ import annotations
 
+import base64
+import math
 import json
 import os
 import time
 import threading
 from typing import Optional, Callable
+
+# Try to import OpenCV for video analysis (optional)
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+    print("⚠️ OpenCV not installed. VideoSeekAnalyzer will not work. Install with: pip install opencv-python")
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +469,7 @@ class LLMModule:
         "2. SEARCH the data and quote findings with MM:SS timestamps.\n"
         "3. NEVER say you 'don't have access' or 'can't see the video'.\n"
         "4. You can CONTROL THE TIMELINE with [CMD:...] commands.\n"
+        "   - seek time MUST be a number of seconds (float or int), NOT mm:ss.\n"
         "5. BE CONCISE. Say what you're doing in 1-2 sentences, then the command.\n"
         "6. NEVER list all clips or echo the timeline state back. The user can see it.\n"
         "7. NEVER repeat the '## Current Timeline State' section in your response.\n"
@@ -732,3 +745,469 @@ def get_ollama_models(base_url: str = "http://localhost:11434") -> list[str]:
         return [m["name"] for m in resp.json().get("models", [])]
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------------------
+# Video Seek Analyzer - NEW: Analyze video frames every 1 seconds
+# ---------------------------------------------------------------------------
+class VideoSeekAnalyzer:
+    """
+    Analyzes video frames at regular intervals using LLM vision.
+    
+    This class provides functionality to:
+    - Seek to specific timestamps in a video
+    - Capture frames and convert to base64 for LLM vision
+    - Analyze frames every N seconds (default 1)
+    - Save analysis results to JSON
+    
+    Requires OpenCV: pip install opencv-python
+    
+    Example:
+        llm = LLMModule(backend="ollama", model="llava")
+        llm.load()
+        
+        analyzer = VideoSeekAnalyzer("video.mp4", llm)
+        results = analyzer.analyze_every_1_second()
+        
+        for r in results:
+            print(f"[{r['timestamp_str']}] {r['analysis'][:100]}...")
+        
+        analyzer.close()
+    """
+    
+    def __init__(self, video_path: str, llm: LLMModule, verbose: bool = False):
+        """
+        Initialize the video analyzer.
+        
+        Args:
+            video_path: Path to the video file
+            llm: Initialized LLMModule instance (must support vision)
+        
+        Raises:
+            ImportError: If OpenCV is not installed
+            FileNotFoundError: If video file doesn't exist
+        """
+        self.verbose = verbose
+
+        if not HAS_CV2:
+            raise ImportError(
+                "OpenCV (cv2) is required for VideoSeekAnalyzer. "
+                "Install with: pip install opencv-python"
+            )
+        
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        
+        self.video_path = video_path
+        self.llm = llm
+        self.cap = cv2.VideoCapture(video_path)
+        
+        # Get video properties
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.duration = self.total_frames / self.fps
+        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # State for interactive mode
+        self.current_time = 0
+        self.lock = threading.Lock()
+        self.running = False
+        self.analysis_cache = []
+        
+        print(f"📹 Video loaded: {os.path.basename(video_path)}")
+        print(f"   Duration: {int(self.duration)//60}m{int(self.duration)%60:02d}s")
+        print(f"   Resolution: {self.width}x{self.height}")
+        print(f"   FPS: {self.fps:.2f}")
+    
+    def seek_to_time(self, timestamp_seconds: float):
+        """
+        Seek to a specific timestamp in the video.
+        
+        Args:
+            timestamp_seconds: Time in seconds to seek to
+        
+        Returns:
+            Frame as numpy array or None if failed
+        """
+        # Ensure timestamp is within bounds
+        timestamp_seconds = max(0, min(timestamp_seconds, self.duration))
+        
+        # Calculate frame number and seek
+        frame_number = int(timestamp_seconds * self.fps)
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        
+        # Read the frame
+        ret, frame = self.cap.read()
+        return frame if ret else None
+    
+    def frame_to_base64(self, frame, quality: int = 85) -> str:
+        """
+        Convert OpenCV frame to base64 string for LLM vision.
+        
+        Args:
+            frame: OpenCV frame (numpy array)
+            quality: JPEG quality (0-100)
+        
+        Returns:
+            Base64 encoded JPEG image
+        """
+        # Encode frame as JPEG
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+        _, buffer = cv2.imencode('.jpg', frame, encode_params)
+        
+        # Convert to base64
+        return base64.b64encode(buffer).decode('utf-8')
+    
+    def analyze_current_frame(
+        self, 
+        user_query: str = "What do you see in this frame? Describe the scene, people, objects, and actions.",
+        custom_prompt: str = None
+    ) -> dict:
+        """
+        Analyze the current frame using LLM vision.
+        
+        Args:
+            user_query: Question to ask about the frame
+            custom_prompt: Override the default system prompt
+        
+        Returns:
+            Dictionary with analysis results
+        """
+        # Seek to current time and get frame
+        frame = self.seek_to_time(self.current_time)
+        if frame is None:
+            return {
+                "error": "Could not read frame",
+                "timestamp": self.current_time,
+                "timestamp_str": f"{int(self.current_time)//60}:{int(self.current_time)%60:02d}"
+            }
+        
+        # Convert frame to base64
+        frame_b64 = self.frame_to_base64(frame)
+        
+        # Use custom prompt if provided
+        system = custom_prompt if custom_prompt else None
+        
+        # Query LLM with vision
+        try:
+            response = self.llm.query(
+                user_message=user_query,
+                frame_base64=frame_b64,
+                system_prompt=system,
+                temperature=0.3,
+                max_tokens=500
+            )
+            
+            return {
+                "timestamp": self.current_time,
+                "timestamp_str": f"{int(self.current_time)//60}:{int(self.current_time)%60:02d}",
+                "analysis": response,
+                "frame_info": {
+                    "width": self.width,
+                    "height": self.height
+                }
+            }
+        except Exception as e:
+            return {
+                "error": str(e),
+                "timestamp": self.current_time,
+                "timestamp_str": f"{int(self.current_time)//60}:{int(self.current_time)%60:02d}"
+            }
+    
+    def analyze_every_1_second(
+        self, 
+        interval: int = 1,
+        callback: Optional[Callable[[dict], None]] = None,
+        save_to_file: Optional[str] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None
+    ) -> list:
+        """
+        Analyze video frames at regular intervals.
+        
+        Args:
+            interval: Seconds between analyses (default: 1)
+            callback: Called with each result dictionary
+            save_to_file: Optional JSON file path to save results
+            progress_callback: Called with (current, total) for progress tracking
+        
+        Returns:
+            List of analysis results
+        """
+        results = []
+        total_steps = int(self.duration / interval) + 1
+        
+        print(f"\n📊 Analyzing video every {interval} seconds...")
+        print(f"   Total frames to analyze: {total_steps}")
+        
+        total_steps = math.ceil(self.duration / interval)
+
+        for step in range(total_steps):
+            timestamp = step * interval
+            if timestamp > self.duration:
+                break
+            self.current_time = timestamp
+            
+            # Show progress
+            if progress_callback:
+                progress_callback(step + 1, total_steps)
+            else:
+                print(f"   ⏱️  [{step+1}/{total_steps}] Analyzing at {timestamp//60}:{timestamp%60:02d}")
+            
+            # Analyze frame
+            result = self.analyze_current_frame()
+            
+            if "error" not in result:
+                results.append(result)
+                self.analysis_cache.append(result)
+                
+                if callback:
+                    callback(result)
+            
+            # Small delay to avoid overwhelming the LLM
+            time.sleep(0.2)
+        
+        # Save to JSON if requested
+        if save_to_file:
+            self.save_results(results, save_to_file)
+        
+        print(f"\n✅ Analysis complete! {len(results)} frames analyzed")
+        return results
+    
+    def save_results(self, results: list, filepath: str):
+        """
+        Save analysis results to JSON file.
+        
+        Args:
+            results: List of analysis dictionaries
+            filepath: Path to save JSON file
+        """
+        output = {
+            "video_path": self.video_path,
+            "video_info": {
+                "duration": self.duration,
+                "fps": self.fps,
+                "width": self.width,
+                "height": self.height,
+                "total_frames": self.total_frames
+            },
+            "analysis_interval": 1,  # Default interval
+            "total_analyses": len(results),
+            "analyses": results
+        }
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(output, f, indent=1, ensure_ascii=False)
+        
+        print(f"💾 Results saved to: {filepath}")
+    
+    def search_analyses(self, query: str, results: list = None) -> list:
+        """
+        Search through analysis results for specific content.
+        
+        Args:
+            query: Text to search for in analyses
+            results: List to search (uses cache if None)
+        
+        Returns:
+            List of matching results with timestamps
+        """
+        search_results = []
+        analyses = results if results is not None else self.analysis_cache
+        
+        query_lower = query.lower()
+        
+        for r in analyses:
+            if "analysis" in r and query_lower in r["analysis"].lower():
+                search_results.append({
+                    "timestamp": r["timestamp"],
+                    "timestamp_str": r["timestamp_str"],
+                    "context": r["analysis"][:200] + "..." if len(r["analysis"]) > 200 else r["analysis"]
+                })
+        
+        return search_results
+    
+    def interactive_mode(self, interval: int = 1):
+        """
+        Interactive mode with real-time analysis and seeking commands.
+        
+        Commands:
+            s <seconds> or s <mm:ss> - Seek to timestamp
+            p - Show current position
+            f <sec> - Move forward N seconds
+            b <sec> - Move backward N seconds
+            q - Quit
+            h - Show help
+        
+        Args:
+            interval: Seconds between automatic analyses
+        """
+        self.running = True
+        
+        def analysis_loop():
+            """Background thread for continuous analysis"""
+            consecutive_errors = 0
+            
+            while self.running:
+                try:
+                    with self.lock:
+                        current_pos = self.current_time
+                    
+                    # Analyze current frame
+                    result = self.analyze_current_frame()
+                    
+                    if "error" in result:
+                        consecutive_errors += 1
+                        if consecutive_errors > 3:
+                            print("\n❌ Too many errors, stopping analysis")
+                            break
+                    else:
+                        consecutive_errors = 0
+                        self.analysis_cache.append(result)
+                        
+                        # Show result
+                        print(f"\n{'='*60}")
+                        print(f"📹 [{result['timestamp_str']}] Analysis:")
+                        print(f"{'='*60}")
+                        # Truncate long responses for display
+                        analysis = result['analysis']
+                        if len(analysis) > 300:
+                            print(analysis[:300] + "...")
+                        else:
+                            print(analysis)
+                    
+                    time.sleep(interval)
+                    
+                except Exception as e:
+                    print(f"\n⚠️ Analysis error: {e}")
+                    time.sleep(interval)
+        
+        # Start analysis thread
+        thread = threading.Thread(target=analysis_loop, daemon=True)
+        thread.start()
+        
+        # Help text
+        self._show_help()
+        
+        # Command loop
+        while self.running:
+            try:
+                cmd = input("\n🎮 Command: ").strip().lower()
+                
+                if not cmd:
+                    continue
+                
+                parts = cmd.split()
+                
+                if parts[0] == 's' and len(parts) > 1:
+                    self._handle_seek_command(parts[1])
+                
+                elif parts[0] == 'p':
+                    print(f"📌 Current position: {int(self.current_time)//60}:{int(self.current_time)%60:02d}")
+                
+                elif parts[0] == 'f' and len(parts) > 1:
+                    self._handle_forward_command(parts[1])
+                
+                elif parts[0] == 'b' and len(parts) > 1:
+                    self._handle_backward_command(parts[1])
+                
+                elif parts[0] == 'h':
+                    self._show_help()
+                
+                elif parts[0] == 'q':
+                    print("\n👋 Stopping analysis...")
+                    self.running = False
+                    break
+                
+                else:
+                    print("❌ Unknown command. Type 'h' for help.")
+                    
+            except KeyboardInterrupt:
+                print("\n\n👋 Interrupted, stopping...")
+                self.running = False
+                break
+            except Exception as e:
+                print(f"❌ Command error: {e}")
+    
+    def _show_help(self):
+        """Show interactive mode help"""
+        print("\n" + "="*50)
+        print("🎬 Interactive Video Analysis Mode")
+        print("="*50)
+        print("Commands:")
+        print("  s <seconds>   - Seek to timestamp (e.g., 's 30')")
+        print("  s <mm:ss>     - Seek to timestamp (e.g., 's 1:30')")
+        print("  p             - Show current position")
+        print("  f <sec>       - Move forward N seconds")
+        print("  b <sec>       - Move backward N seconds")
+        print("  h             - Show this help")
+        print("  q             - Quit")
+        print("="*50)
+    
+    def _handle_seek_command(self, arg: str):
+        """Handle seek command with various formats"""
+        try:
+            # Parse mm:ss format
+            if ':' in arg:
+                minutes, seconds = map(int, arg.split(':'))
+                seek_to = minutes * 60 + seconds
+            else:
+                # Parse seconds
+                seek_to = int(arg)
+            
+            # Validate and seek
+            seek_to = max(0, min(seek_to, int(self.duration)))
+            
+            with self.lock:
+                self.current_time = seek_to
+            
+            if self.verbose:
+                print(f"⏩ Seeking to {self.current_time//60}:{self.current_time%60:02d}")
+            
+        except ValueError:
+            print("❌ Invalid time format. Use seconds or mm:ss")
+    
+    def _handle_forward_command(self, arg: str):
+        """Handle forward command"""
+        try:
+            forward = int(arg)
+            with self.lock:
+                self.current_time = min(self.current_time + forward, self.duration)
+            print(f"⏩ Forward {forward}s to {int(self.current_time)//60}:{int(self.current_time)%60:02d}")
+        except ValueError:
+            print("❌ Invalid forward value")
+    
+    def _handle_backward_command(self, arg: str):
+        """Handle backward command"""
+        try:
+            backward = int(arg)
+            with self.lock:
+                self.current_time = max(self.current_time - backward, 0)
+            print(f"⏪ Back {backward}s to {int(self.current_time)//60}:{int(self.current_time)%60:02d}")
+        except ValueError:
+            print("❌ Invalid backward value")
+    
+    def close(self):
+        """Release video capture resources"""
+        self.running = False
+        if hasattr(self, 'cap') and self.cap:
+            self.cap.release()
+        print("📹 Video capture released")
+
+
+# ---------------------------------------------------------------------------
+# Example usage when run directly
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("🔍 LLM Module with Video Seek Analyzer")
+    print("=" * 50)
+    print("This module provides:")
+    print("  - LLMModule: Interface to local LLMs")
+    print("  - VideoSeekAnalyzer: Analyze video frames every 1 second")
+    print("\nExample usage:")
+    print("  from llm_module import LLMModule, VideoSeekAnalyzer")
+    print("  llm = LLMModule(backend='ollama', model='llava')")
+    print("  llm.load()")
+    print("  analyzer = VideoSeekAnalyzer('video.mp4', llm)")
+    print("  results = analyzer.analyze_every_1_second()")
+    print("  analyzer.close()")
