@@ -862,13 +862,22 @@ class LLMChatWidget(QWidget):
             self._append_system("Still generating... please wait.")
             return
 
-        # Check if this is a seek command that we can handle directly
-        if self._handle_seek_command(text):
-            self.input_field.clear()
-            return
+        # Check for mode commands
+        force_visual = False
+        force_text = False
+        actual_message = text
+        
+        if text.startswith('!visual'):
+            force_visual = True
+            actual_message = text[7:].strip()  # Remove !visual prefix
+            self._append_system("🎯 Forcing VISUAL mode - will capture and analyze current frame")
+        elif text.startswith('!text'):
+            force_text = True
+            actual_message = text[5:].strip()  # Remove !text prefix
+            self._append_system("📝 Forcing TEXT mode - will ignore vision keywords and use only analysis data")
 
-        # Check if this is a visual search request
-        if self._handle_visual_search_request(text):
+        # Handle seek commands (still useful)
+        if self._handle_seek_command(actual_message):
             self.input_field.clear()
             return
 
@@ -878,9 +887,9 @@ class LLMChatWidget(QWidget):
                 "Use 'Load Cache' to load a cache file first."
             )
 
-        self._append_user(text)
+        self._append_user(actual_message)
         self.input_field.clear()
-        self._chat_history.append({"role": "user", "content": text})
+        self._chat_history.append({"role": "user", "content": actual_message})
 
         self.input_field.setEnabled(False)
         self.send_btn.setEnabled(False)
@@ -900,37 +909,68 @@ class LLMChatWidget(QWidget):
                 self._timeline_bridge.get_available_commands_text()
             )
 
-        # Capture frame ONLY when user asks about visual content
+        # Capture frame based on mode
         frame_b64 = None
-        _text_lower = text.lower()
-        _wants_vision = any(kw in _text_lower for kw in _VISION_KEYWORDS)
+        _text_lower = actual_message.lower()
         
-        # Check if this is asking about the current frame specifically
-        _asks_about_current = any(phrase in _text_lower for phrase in 
-                                ["current frame", "this frame", "what do you see", 
-                                "what's happening now", "describe this frame"])
-
-        if (_wants_vision or _asks_about_current) and self._timeline_bridge and self._timeline_bridge._window:
-            window = self._timeline_bridge._window
-            if hasattr(window, 'capture_current_frame_base64'):
-                frame_b64 = window.capture_current_frame_base64()
-                if frame_b64:
-                    self._append_system(
-                        f"📷 Frame captured at {window.current_time:.1f}s "
-                        f"({len(frame_b64)//1024}KB)"
-                    )
-                    
-                    # If timeline is active, let user know we're combining both
-                    if has_timeline:
+        if force_visual:
+            # Visual mode: ALWAYS capture frame regardless of keywords
+            if self._timeline_bridge and self._timeline_bridge._window:
+                window = self._timeline_bridge._window
+                if hasattr(window, 'capture_current_frame_base64'):
+                    frame_b64 = window.capture_current_frame_base64()
+                    if frame_b64:
                         self._append_system(
-                            "ℹ️ Combining frame analysis with timeline context..."
+                            f"📷 Frame captured at {window.current_time:.1f}s "
+                            f"({len(frame_b64)//1024}KB)"
                         )
-                else:
-                    self._append_system("⚠️ Frame capture failed")
+                        
+                        # If timeline is active, let user know we're combining both
+                        if has_timeline:
+                            self._append_system(
+                                "ℹ️ Combining frame analysis with timeline context..."
+                            )
+                    else:
+                        self._append_system("⚠️ Frame capture failed")
+            else:
+                self._append_system("⚠️ Cannot capture frame: No timeline window connected")
+        
+        elif force_text:
+            # Text mode: NEVER capture frame, even if vision keywords present
+            frame_b64 = None
+            self._append_system("ℹ️ Text mode active: using analysis data only, ignoring vision")
+        
+        else:
+            # Auto mode: use keyword detection (existing behavior)
+            _wants_vision = any(kw in _text_lower for kw in _VISION_KEYWORDS)
+            
+            # Check if this is asking about the current frame specifically
+            _asks_about_current = any(phrase in _text_lower for phrase in 
+                                    ["current frame", "this frame", "what do you see", 
+                                    "what's happening now", "describe this frame"])
+            
+            if (_wants_vision or _asks_about_current) and self._timeline_bridge and self._timeline_bridge._window:
+                window = self._timeline_bridge._window
+                if hasattr(window, 'capture_current_frame_base64'):
+                    frame_b64 = window.capture_current_frame_base64()
+                    if frame_b64:
+                        self._append_system(
+                            f"📷 Frame captured at {window.current_time:.1f}s "
+                            f"({len(frame_b64)//1024}KB)"
+                        )
+                        
+                        # If timeline is active, let user know we're combining both
+                        if has_timeline:
+                            self._append_system(
+                                "ℹ️ Combining frame analysis with timeline context..."
+                            )
+                    else:
+                        self._append_system("⚠️ Frame capture failed")
 
+        # Create and start worker thread
         self._worker = _LLMWorker(
             llm=self._llm,
-            message=text,
+            message=actual_message,
             analysis_data=self._analysis_data,
             video_path=self._video_path,
             timeline_context=timeline_ctx,
