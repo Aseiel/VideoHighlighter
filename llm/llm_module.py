@@ -834,10 +834,8 @@ class VideoSeekAnalyzer:
         timestamp_seconds = max(0, min(timestamp_seconds, self.duration))
         
         # Calculate frame number and seek
-        frame_number = int(timestamp_seconds * self.fps)
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
-        
-        # Read the frame
+        self.cap.set(cv2.CAP_PROP_POS_MSEC, timestamp_seconds * 1000)
+        self.cap.read()  # flush
         ret, frame = self.cap.read()
         return frame if ret else None
     
@@ -915,65 +913,166 @@ class VideoSeekAnalyzer:
                 "timestamp_str": f"{int(self.current_time)//60}:{int(self.current_time)%60:02d}"
             }
     
-    def analyze_every_1_second(
-        self, 
-        interval: int = 1,
-        callback: Optional[Callable[[dict], None]] = None,
-        save_to_file: Optional[str] = None,
-        progress_callback: Optional[Callable[[int, int], None]] = None
-    ) -> list:
+    def analyze_every_n_seconds(self, interval: float = 1.0, callback=None, save_to_file=None):
         """
-        Analyze video frames at regular intervals.
+        Properly seek to each timestamp instead of sequential reading.
         
         Args:
-            interval: Seconds between analyses (default: 1)
-            callback: Called with each result dictionary
-            save_to_file: Optional JSON file path to save results
-            progress_callback: Called with (current, total) for progress tracking
+            interval: Seconds between analyses (e.g., 1.0 for every second)
+            callback: Optional function to call with each result
+            save_to_file: Optional path to save results JSON
         
         Returns:
             List of analysis results
         """
         results = []
-        total_steps = int(self.duration / interval) + 1
         
-        print(f"\n📊 Analyzing video every {interval} seconds...")
-        print(f"   Total frames to analyze: {total_steps}")
+        # Calculate all timestamps to analyze
+        num_analyses = int(self.duration / interval) + 1
+        timestamps = [i * interval for i in range(num_analyses)]
         
-        total_steps = math.ceil(self.duration / interval)
-
-        for step in range(total_steps):
-            timestamp = step * interval
-            if timestamp > self.duration:
-                break
+        print(f"\n📊 Seeking analysis every {interval}s ({len(timestamps)} frames)")
+        print(f"   Video duration: {int(self.duration)//60}m{int(self.duration)%60:02d}s")
+        
+        for i, timestamp in enumerate(timestamps):
+            # Update current time
             self.current_time = timestamp
             
-            # Show progress
-            if progress_callback:
-                progress_callback(step + 1, total_steps)
-            else:
-                print(f"   ⏱️  [{step+1}/{total_steps}] Analyzing at {timestamp//60}:{timestamp%60:02d}")
+            # Seek to exact timestamp
+            frame = self.seek_to_time(timestamp)
+            
+            if frame is None:
+                print(f"⚠️ Could not read frame at {timestamp:.1f}s")
+                continue
+            
+            # Convert frame to base64
+            frame_b64 = self.frame_to_base64(frame)
             
             # Analyze frame
-            result = self.analyze_current_frame()
-            
-            if "error" not in result:
+            try:
+                response = self.llm.query(
+                    user_message="What do you see in this frame? Describe the scene, people, objects, and actions.",
+                    frame_base64=frame_b64,
+                    temperature=0.3,
+                    max_tokens=500,
+                )
+                
+                result = {
+                    "timestamp": timestamp,
+                    "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
+                    "analysis": response,
+                    "frame_number": i
+                }
+                
                 results.append(result)
                 self.analysis_cache.append(result)
                 
                 if callback:
                     callback(result)
-            
-            # Small delay to avoid overwhelming the LLM
-            time.sleep(0.2)
+                
+                # Show progress with timestamp
+                if (i + 1) % 5 == 0 or i == 0 or i == len(timestamps) - 1:
+                    print(f"  [{i+1}/{len(timestamps)}] {timestamp:.1f}s: Analyzed")
+                    
+                # Optional: Show first few words of analysis
+                if self.verbose and len(response) > 0:
+                    preview = response[:50] + "..." if len(response) > 50 else response
+                    print(f"     ↪ {preview}")
+                
+            except Exception as e:
+                print(f"❌ Error at {timestamp:.1f}s: {e}")
+                # Add error result to maintain timeline
+                results.append({
+                    "timestamp": timestamp,
+                    "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
+                    "error": str(e),
+                    "frame_number": i
+                })
         
-        # Save to JSON if requested
+        print(f"\n✅ Done. {len(results)}/{len(timestamps)} frames analyzed successfully")
+        
         if save_to_file:
             self.save_results(results, save_to_file)
         
-        print(f"\n✅ Analysis complete! {len(results)} frames analyzed")
         return results
-    
+
+    def analyze_with_seeking(self, interval: float = 1.0, target_description: str = "explosion", max_seeks: int = 100):
+        """
+        Properly seek through video at specified intervals and analyze each frame.
+        
+        Args:
+            interval: Seconds between seeks (1.0 or 2.0)
+            target_description: What to look for (e.g., "explosion")
+            max_seeks: Maximum number of seeks to perform
+        
+        Returns:
+            List of analysis results
+        """
+        results = []
+        
+        # Start from beginning or current position
+        start_time = 0.0
+        current_time = start_time
+        
+        print(f"\n🔍 Seeking every {interval}s looking for: {target_description}")
+        print("=" * 60)
+        
+        for seek_num in range(max_seeks):
+            # Calculate next timestamp
+            timestamp = current_time + (seek_num * interval)
+            
+            # Stop if we've reached the end of the video
+            if timestamp >= self.duration:
+                print(f"\n🏁 Reached end of video at {timestamp:.1f}s")
+                break
+            
+            # SEEK to the exact timestamp
+            print(f"\n⏩ Seeking to {timestamp:.1f}s ({int(timestamp)//60}:{int(timestamp)%60:02d})")
+            frame = self.seek_to_time(timestamp)
+            
+            if frame is None:
+                print(f"⚠️ Could not read frame at {timestamp:.1f}s")
+                continue
+            
+            # Convert frame to base64
+            frame_b64 = self.frame_to_base64(frame)
+            
+            # Analyze the frame for the target
+            try:
+                response = self.llm.query(
+                    user_message=f"Does this frame contain a {target_description}? Answer with YES or NO, and briefly explain what you see.",
+                    frame_base64=frame_b64,
+                    temperature=0.1,  # Low temperature for consistent answers
+                    max_tokens=150,
+                )
+                
+                result = {
+                    "timestamp": timestamp,
+                    "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
+                    "analysis": response,
+                    "contains_target": "yes" in response.lower() or "explosion" in response.lower()
+                }
+                
+                results.append(result)
+                
+                # Display result
+                print(f"📝 Analysis: {response[:100]}...")
+                
+                # Check if we found the target
+                if result["contains_target"]:
+                    print(f"\n🎯 FOUND {target_description.upper()} at {timestamp:.1f}s!")
+                    print(f"Full analysis: {response}")
+                    break
+                
+            except Exception as e:
+                print(f"❌ Error at {timestamp:.1f}s: {e}")
+            
+            # Small pause to simulate real seeking
+            time.sleep(0.5)
+        
+        print(f"\n✅ Seeking complete. Analyzed {len(results)} frames")
+        return results
+
     def save_results(self, results: list, filepath: str):
         """
         Save analysis results to JSON file.
