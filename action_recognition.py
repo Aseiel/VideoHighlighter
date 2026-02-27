@@ -742,11 +742,38 @@ class ThreadedVideoWriter:
 # =============================
 # Load models - TRIPLE MODEL SUPPORT (custom + intel + r3d/cuda)
 # =============================
+def compile_with_fallback(ie, model, preferred_device, model_name="model"):
+    """Try preferred device, fallback to CPU on LSTM/dynamic shape errors"""
+    
+    # First try the preferred device
+    try:
+        print(f"🔄 Attempting to compile {model_name} on {preferred_device}...")
+        compiled = ie.compile_model(model=model, device_name=preferred_device)
+        print(f"✅ Successfully compiled {model_name} on {preferred_device}")
+        return compiled, preferred_device
+    except Exception as e:
+        # Check if it's the LSTM/dynamic shape error
+        error_str = str(e)
+        if ("LSTMSequence" in error_str or "dynamic shape" in error_str) and preferred_device != "CPU":
+            print(f"⚠️ Compilation on {preferred_device} failed with LSTM/dynamic shape error")
+            print(f"🔄 Falling back {model_name} to CPU...")
+            try:
+                compiled = ie.compile_model(model=model, device_name="CPU")
+                print(f"✅ Successfully compiled {model_name} on CPU")
+                return compiled, "CPU"
+            except Exception as cpu_e:
+                print(f"❌ CPU compilation also failed: {cpu_e}")
+                raise
+        else:
+            # Re-raise if it's a different error or already on CPU
+            raise
+
+
 def load_models(device="AUTO", openvino_threads=None,
                 enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True):
     """
-    Load all available models.
-
+    Load all available models with smart fallback for device mismatches.
+    
     Returns:
         compiled_encoder, encoder_input, encoder_output,
         models_info dict, selected_device string, r3d_wrapper (or None)
@@ -761,7 +788,7 @@ def load_models(device="AUTO", openvino_threads=None,
     else:
         selected_device = device if device in available_devices else "CPU"
 
-    print(f"Using OpenVINO device: {selected_device}")
+    print(f"Requested OpenVINO device: {selected_device}")
 
     if openvino_threads and selected_device == "CPU":
         ie.set_property("CPU", {"INFERENCE_NUM_THREADS": openvino_threads})
@@ -771,41 +798,68 @@ def load_models(device="AUTO", openvino_threads=None,
         raise FileNotFoundError(f"❌ Encoder model not found at {ENCODER_XML}")
     print("✓ Encoder model found")
 
+    # Read encoder model
     encoder_model = ie.read_model(model=ENCODER_XML, weights=ENCODER_BIN)
-    compiled_encoder = ie.compile_model(model=encoder_model, device_name=selected_device)
+    
+    # COMPILE ENCODER WITH FALLBACK
+    compiled_encoder, encoder_device = compile_with_fallback(
+        ie, encoder_model, selected_device, model_name="encoder"
+    )
+    
+    # Update selected_device if fallback changed it (for consistency)
+    actual_device = encoder_device
+    if encoder_device != selected_device:
+        print(f"📌 Note: Encoder running on {encoder_device} (different from requested {selected_device})")
+        actual_device = encoder_device
 
     custom_decoder_xml = BASE_DIR / "action_classifier_3d.xml"
     custom_decoder_bin = BASE_DIR / "action_classifier_3d.bin"
     intel_decoder_xml = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
     intel_decoder_bin = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 
-    models_info = {'custom': None, 'intel': None, 'cuda': None}
+    models_info = {'custom': None, 'intel': None, 'cuda': None, 'r3d_custom': None}
 
+    # ---- Custom fine-tuned decoder (OpenVINO) ----
     if custom_decoder_xml.exists() and custom_decoder_bin.exists():
         print("✓ Loading custom fine-tuned decoder model")
         custom_decoder_model = ie.read_model(model=custom_decoder_xml, weights=custom_decoder_bin)
-        compiled_custom_decoder = ie.compile_model(model=custom_decoder_model, device_name=selected_device)
+        
+        # COMPILE CUSTOM DECODER WITH FALLBACK - THIS IS THE KEY FIX!
+        compiled_custom_decoder, custom_device = compile_with_fallback(
+            ie, custom_decoder_model, actual_device, model_name="custom decoder"
+        )
+        
         models_info['custom'] = {
             'compiled': compiled_custom_decoder,
             'input': compiled_custom_decoder.input(0),
             'output': compiled_custom_decoder.output(0),
             'labels': CUSTOM_LABELS,
-            'type': 'openvino'
+            'type': 'openvino',
+            'device': custom_device
         }
+        print(f"  ✅ Custom decoder ready on {custom_device}")
     else:
         print("⚠️ Custom decoder model not found")
 
+    # ---- Intel Kinetics-400 decoder (OpenVINO) ----
     if intel_decoder_xml.exists() and intel_decoder_bin.exists():
         print("✓ Loading Intel Kinetics-400 decoder model")
         intel_decoder_model = ie.read_model(model=intel_decoder_xml, weights=intel_decoder_bin)
-        compiled_intel_decoder = ie.compile_model(model=intel_decoder_model, device_name=selected_device)
+        
+        # COMPILE INTEL DECODER WITH FALLBACK
+        compiled_intel_decoder, intel_device = compile_with_fallback(
+            ie, intel_decoder_model, actual_device, model_name="Intel decoder"
+        )
+        
         models_info['intel'] = {
             'compiled': compiled_intel_decoder,
             'input': compiled_intel_decoder.input(0),
             'output': compiled_intel_decoder.output(0),
             'labels': KINETICS_400_LABELS,
-            'type': 'openvino'
+            'type': 'openvino',
+            'device': intel_device
         }
+        print(f"  ✅ Intel decoder ready on {intel_device}")
     else:
         print("⚠️ Intel decoder model not found")
 
@@ -814,6 +868,7 @@ def load_models(device="AUTO", openvino_threads=None,
     if enable_r3d and TORCH_AVAILABLE:
         try:
             r3d_device = 'cuda' if CUDA_AVAILABLE else 'cpu'
+            print(f"🔄 Initializing R3D model on {r3d_device}...")
             r3d_wrapper = R3DModelWrapper(
                 model_name=r3d_model_name,
                 device_str=r3d_device,
@@ -822,8 +877,10 @@ def load_models(device="AUTO", openvino_threads=None,
             models_info['cuda'] = {
                 'wrapper': r3d_wrapper,
                 'labels': KINETICS_400_LABELS,
-                'type': 'pytorch'
+                'type': 'pytorch',
+                'device': r3d_device
             }
+            print(f"✅ R3D model loaded on {r3d_device}")
         except Exception as e:
             print(f"⚠️ Failed to load R3D model: {e}")
             r3d_wrapper = None
@@ -838,6 +895,8 @@ def load_models(device="AUTO", openvino_threads=None,
             # Use variant from mapping metadata, fall back to CLI r3d_model_name
             custom_variant = (R3D_CUSTOM_META or {}).get('model_variant') or r3d_model_name
             num_classes = len(R3D_CUSTOM_LABELS)
+            
+            print(f"🔄 Initializing R3D custom model ({num_classes} classes) on {r3d_custom_device}...")
 
             r3d_custom_wrapper = R3DModelWrapper(
                 model_name=custom_variant,
@@ -850,27 +909,38 @@ def load_models(device="AUTO", openvino_threads=None,
                 'wrapper': r3d_custom_wrapper,
                 'labels': R3D_CUSTOM_LABELS,
                 'type': 'pytorch',
+                'device': r3d_custom_device
             }
+            print(f"✅ R3D custom model loaded on {r3d_custom_device}")
         except Exception as e:
             print(f"⚠️ Failed to load R3D custom model: {e}")
     elif enable_r3d and R3D_CUSTOM_LABELS and not R3D_CUSTOM_WEIGHTS_PATH.exists():
         print(f"⚠️ R3D custom mapping found but weights missing: {R3D_CUSTOM_WEIGHTS_PATH}")
 
+    # Check if at least one model loaded
     if (models_info['custom'] is None and models_info['intel'] is None
             and models_info['cuda'] is None and models_info.get('r3d_custom') is None):
         raise FileNotFoundError("❌ No models found! Need at least one decoder or R3D.")
 
-    print("✓ Model loading complete.")
-    print(f"  - Custom model:  {'✓ Available' if models_info['custom'] else '✗ Not available'}")
-    print(f"  - Intel model:   {'✓ Available' if models_info['intel'] else '✗ Not available'}")
-    print(f"  - R3D/CUDA:      {'✓ Available' if models_info['cuda'] else '✗ Not available'}")
-    print(f"  - R3D Custom:    {'✓ Available (' + str(len(R3D_CUSTOM_LABELS)) + ' classes)' if models_info.get('r3d_custom') else '✗ Not available'}")
-    print()
+    # Print summary with device info
+    print("\n" + "="*60)
+    print("📊 MODEL LOADING SUMMARY")
+    print("="*60)
+    print(f"  - Encoder:        ✓ Loaded (on {encoder_device})")
+    print(f"  - Custom model:   {'✓ Available' if models_info['custom'] else '✗ Not available'} "
+          f"{f'(on {models_info["custom"]["device"]})' if models_info['custom'] else ''}")
+    print(f"  - Intel model:    {'✓ Available' if models_info['intel'] else '✗ Not available'} "
+          f"{f'(on {models_info["intel"]["device"]})' if models_info['intel'] else ''}")
+    print(f"  - R3D/CUDA:       {'✓ Available' if models_info['cuda'] else '✗ Not available'} "
+          f"{f'(on {models_info["cuda"]["device"]})' if models_info['cuda'] else ''}")
+    print(f"  - R3D Custom:     {'✓ Available (' + str(len(R3D_CUSTOM_LABELS)) + ' classes)' if models_info.get('r3d_custom') else '✗ Not available'} "
+          f"{f'(on {models_info["r3d_custom"]["device"]})' if models_info.get('r3d_custom') else ''}")
+    print("="*60 + "\n")
 
     return (
         compiled_encoder, compiled_encoder.input(0), compiled_encoder.output(0),
         models_info,
-        selected_device,
+        actual_device,  # Return the actual device used (after fallbacks)
         r3d_wrapper
     )
 
