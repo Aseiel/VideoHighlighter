@@ -4,6 +4,8 @@ llm_chat_widget.py - Embeddable Qt chat panel for VideoHighlighter.
 Key feature: AUTO-LOADS the most recent cache file from ./cache/ on startup,
 so the LLM always has video context even after restarting the app.
 
+Now with VideoSeekAnalyzer integration for visual search and seeking capabilities.
+
 Usage:
     chat = LLMChatWidget(parent=self, cache_dir="./cache")
     layout.addWidget(chat)
@@ -21,12 +23,12 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QLineEdit, QComboBox,
     QGroupBox, QFileDialog, QApplication,
-    QDialog, QDialogButtonBox,
+    QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox,
 )
-from PySide6.QtCore import Qt, Signal, Slot, QThread
+from PySide6.QtCore import Qt, Signal, Slot, QThread, QTimer
 from PySide6.QtGui import QTextCursor
 
-from .llm_module import LLMModule, VideoContextBuilder, get_available_backends, get_ollama_models
+from .llm_module import LLMModule, VideoContextBuilder, get_available_backends, get_ollama_models, VideoSeekAnalyzer
 
 # timeline bridge (only available when timeline viewer is present)
 try:
@@ -96,9 +98,84 @@ class _GenerationCancelled(Exception):
     """Raised inside stream callback to abort generation."""
     pass
 
+
 # ---------------------------------------------------------------------------
-# Chat widget
+# Worker thread for visual search
 # ---------------------------------------------------------------------------
+class _VisualSearchWorker(QThread):
+    """Runs VideoSeekAnalyzer visual search in background."""
+
+    progress = Signal(int, int, float, str)  # current, total, timestamp, preview
+    found = Signal(float, str, str)  # timestamp, timestamp_str, analysis
+    finished = Signal(list)  # all results
+    error = Signal(str)
+
+    def __init__(self, analyzer: VideoSeekAnalyzer, target: str, interval: float = 1.0, max_seeks: int = 100):
+        super().__init__()
+        self.analyzer = analyzer
+        self.target = target
+        self.interval = interval
+        self.max_seeks = max_seeks
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            results = []
+            
+            # Calculate timestamps
+            num_analyses = min(int(self.analyzer.duration / self.interval) + 1, self.max_seeks)
+            timestamps = [i * self.interval for i in range(num_analyses)]
+            
+            for i, timestamp in enumerate(timestamps):
+                if self._cancel:
+                    break
+                    
+                if timestamp > self.analyzer.duration + 0.1:
+                    break
+                
+                # Update progress
+                self.progress.emit(i + 1, len(timestamps), timestamp, f"Analyzing {timestamp:.1f}s")
+                
+                # Seek and analyze
+                self.analyzer.current_time = timestamp
+                frame = self.analyzer.seek_to_time(timestamp)
+                
+                if frame is None:
+                    continue
+                
+                frame_b64 = self.analyzer.frame_to_base64(frame)
+                
+                try:
+                    response = self.analyzer.llm.query(
+                        user_message=f"Does this frame contain a {self.target}? Answer with YES or NO, and briefly explain what you see.",
+                        frame_base64=frame_b64,
+                        temperature=0.1,
+                        max_tokens=150,
+                    )
+                    
+                    result = {
+                        "timestamp": timestamp,
+                        "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
+                        "analysis": response,
+                        "contains_target": "yes" in response.lower() or self.target.lower() in response.lower()
+                    }
+                    
+                    results.append(result)
+                    
+                    if result["contains_target"]:
+                        self.found.emit(timestamp, result["timestamp_str"], response)
+                        
+                except Exception as e:
+                    print(f"Error at {timestamp:.1f}s: {e}")
+            
+            self.finished.emit(results)
+            
+        except Exception as e:
+            self.error.emit(str(e))
+
 
 # Keywords that indicate the user wants visual/frame analysis
 _VISION_KEYWORDS = (
@@ -108,22 +185,32 @@ _VISION_KEYWORDS = (
     "what's happening here", "what is happening here",
 )
 
+# Keywords that indicate the user wants visual search
+_VISUAL_SEARCH_KEYWORDS = (
+    "search for", "find", "look for", "scan for", "seek for",
+    "visual search", "find me", "show me where", "locate",
+    "explosion", "fire", "person", "car", "object", "action",
+)
+
 
 class LLMChatWidget(QWidget):
     """
     Self-contained chat panel. Auto-loads latest cache from disk on startup.
+    Now with VideoSeekAnalyzer integration for visual search and seeking.
     """
 
     llm_replied = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None, compact: bool = False,
-                 cache_dir: str = "./cache"):
+                 cache_dir: str = "./cache", video_path: str = ""):
         super().__init__(parent)
         self._llm: Optional[LLMModule] = None
+        self._analyzer: Optional[VideoSeekAnalyzer] = None
         self._analysis_data: Optional[dict] = None
-        self._video_path: str = ""
+        self._video_path: str = video_path
         self._chat_history: list[dict] = []
         self._worker: Optional[_LLMWorker] = None
+        self._search_worker: Optional[_VisualSearchWorker] = None
         self._compact = compact
         self._cache_dir = cache_dir
         self._timeline_bridge: Optional['TimelineBridge'] = None
@@ -132,6 +219,10 @@ class LLMChatWidget(QWidget):
 
         self._build_ui()
         self._auto_load_latest_cache()
+        
+        # Initialize analyzer if video path provided
+        if self._video_path and os.path.exists(self._video_path):
+            self._init_analyzer()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -211,9 +302,49 @@ class LLMChatWidget(QWidget):
         row4.addWidget(self.show_context_btn)
 
         settings_layout.addLayout(row4)
+        
+        # Row 5: Visual search controls
+        search_group = QGroupBox("Visual Search")
+        search_layout = QHBoxLayout()
+        
+        search_layout.addWidget(QLabel("Search for:"))
+        self.search_target = QLineEdit()
+        self.search_target.setPlaceholderText("explosion, person, car, etc.")
+        search_layout.addWidget(self.search_target)
+        
+        search_layout.addWidget(QLabel("Interval (s):"))
+        self.search_interval = QDoubleSpinBox()
+        self.search_interval.setRange(0.5, 10.0)
+        self.search_interval.setValue(1.0)
+        self.search_interval.setSingleStep(0.5)
+        search_layout.addWidget(self.search_interval)
+        
+        self.search_btn = QPushButton("🔍 Search")
+        self.search_btn.setStyleSheet(
+            "QPushButton{background:#FF9800;color:white;font-weight:bold;padding:6px 12px;border-radius:4px;}"
+        )
+        self.search_btn.clicked.connect(self._start_visual_search)
+        search_layout.addWidget(self.search_btn)
+        
+        self.stop_search_btn = QPushButton("⏹ Stop")
+        self.stop_search_btn.setStyleSheet(
+            "QPushButton{background:#c62828;color:white;font-weight:bold;padding:6px 12px;border-radius:4px;}"
+        )
+        self.stop_search_btn.clicked.connect(self._stop_visual_search)
+        self.stop_search_btn.setEnabled(False)
+        search_layout.addWidget(self.stop_search_btn)
+        
+        search_group.setLayout(search_layout)
+        settings_layout.addWidget(search_group)
+        
+        # Search progress
+        self.search_progress = QLabel("")
+        self.search_progress.setStyleSheet("color:#2196F3;font-style:italic;font-size:9pt;")
+        settings_layout.addWidget(self.search_progress)
+        
         settings_group.setLayout(settings_layout)
         if self._compact:
-            settings_group.setMaximumHeight(180)
+            settings_group.setMaximumHeight(250)
         root.addWidget(settings_group)
 
         # --- Chat display ---
@@ -230,7 +361,7 @@ class LLMChatWidget(QWidget):
         # --- Input bar ---
         input_layout = QHBoxLayout()
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Ask about the video analysis...")
+        self.input_field.setPlaceholderText("Ask about the video analysis or search visually...")
         self.input_field.setStyleSheet(
             "QLineEdit{padding:8px;font-size:10pt;border:1px solid #555;border-radius:4px;}"
         )
@@ -273,6 +404,10 @@ class LLMChatWidget(QWidget):
         self._analysis_data = data
         self._video_path = video_path
         self._update_context_label()
+        
+        # Initialize analyzer if we have video path
+        if video_path and os.path.exists(video_path):
+            self._init_analyzer()
 
     def set_timeline_window(self, window):
         """Connect to a SignalTimelineWindow for timeline control.
@@ -293,6 +428,9 @@ class LLMChatWidget(QWidget):
     def get_llm_module(self) -> Optional[LLMModule]:
         return self._llm
 
+    def get_analyzer(self) -> Optional[VideoSeekAnalyzer]:
+        return self._analyzer
+
     def load_cache_for_video(self, video_path: str) -> bool:
         """Try to find and load a cache file for a specific video."""
         if not video_path or not os.path.exists(video_path):
@@ -310,7 +448,10 @@ class LLMChatWidget(QWidget):
         )
         for cf in all_caches:
             if video_stem in cf.stem.lower():
-                return self._load_cache_file(str(cf), video_path)
+                success = self._load_cache_file(str(cf), video_path)
+                if success:
+                    self._init_analyzer(video_path)
+                return success
 
         # Fallback: try via VideoAnalysisCache hash lookup
         try:
@@ -323,11 +464,132 @@ class LLMChatWidget(QWidget):
                 reverse=True,
             )
             if matching:
-                return self._load_cache_file(str(matching[0]), video_path)
+                success = self._load_cache_file(str(matching[0]), video_path)
+                if success:
+                    self._init_analyzer(video_path)
+                return success
         except Exception:
             pass
 
         return False
+
+    def set_video_path(self, video_path: str):
+        """Set the video path and initialize analyzer."""
+        self._video_path = video_path
+        if video_path and os.path.exists(video_path):
+            self._init_analyzer(video_path)
+
+    # ------------------------------------------------ Analyzer initialization
+
+    def _init_analyzer(self, video_path: str = None):
+        """Initialize VideoSeekAnalyzer for visual operations."""
+        path = video_path or self._video_path
+        if not path or not os.path.exists(path):
+            return False
+        
+        if not self._llm or not self._llm.is_loaded():
+            self._append_system("⚠️ LLM not connected. Visual search requires a connected vision model.")
+            return False
+        
+        try:
+            if self._analyzer:
+                self._analyzer.close()
+            
+            self._analyzer = VideoSeekAnalyzer(path, self._llm, verbose=False)
+            self._append_system(f"✅ Video analyzer ready: {os.path.basename(path)}")
+            return True
+        except Exception as e:
+            self._append_system(f"❌ Failed to initialize analyzer: {e}")
+            return False
+
+    # ------------------------------------------------ Visual search
+
+    def _start_visual_search(self):
+        """Start visual search for target in video."""
+        target = self.search_target.text().strip()
+        if not target:
+            self._append_system("❌ Please enter something to search for")
+            return
+        
+        if not self._analyzer:
+            if not self._init_analyzer():
+                self._append_system("❌ Cannot start search: No video loaded or analyzer not ready")
+                return
+        
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.cancel()
+        
+        interval = self.search_interval.value()
+        max_seeks = int(self._analyzer.duration / interval) + 1
+        
+        self._append_system(f"🔍 Starting visual search for '{target}' every {interval}s...")
+        self.search_progress.setText(f"Searching for '{target}'...")
+        self.search_btn.setEnabled(False)
+        self.stop_search_btn.setEnabled(True)
+        
+        self._search_worker = _VisualSearchWorker(
+            analyzer=self._analyzer,
+            target=target,
+            interval=interval,
+            max_seeks=max_seeks
+        )
+        self._search_worker.progress.connect(self._on_search_progress)
+        self._search_worker.found.connect(self._on_search_found)
+        self._search_worker.finished.connect(self._on_search_finished)
+        self._search_worker.error.connect(self._on_search_error)
+        self._search_worker.start()
+
+    def _stop_visual_search(self):
+        """Stop ongoing visual search."""
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.cancel()
+            self._append_system("⏹ Visual search stopped by user")
+            self.search_progress.setText("Search stopped")
+            self.search_btn.setEnabled(True)
+            self.stop_search_btn.setEnabled(False)
+
+    @Slot(int, int, float, str)
+    def _on_search_progress(self, current: int, total: int, timestamp: float, preview: str):
+        """Update search progress."""
+        percent = (current / total) * 100
+        self.search_progress.setText(
+            f"Searching: {current}/{total} ({percent:.1f}%) - {timestamp:.1f}s"
+        )
+
+    @Slot(float, str, str)
+    def _on_search_found(self, timestamp: float, timestamp_str: str, analysis: str):
+        """Handle found target."""
+        self._append_system(
+            f"🎯 FOUND at {timestamp_str}!\n"
+            f"   {analysis[:150]}..."
+        )
+
+    @Slot(list)
+    def _on_search_finished(self, results: list):
+        """Handle search completion."""
+        found_count = sum(1 for r in results if r.get("contains_target", False))
+        
+        if found_count > 0:
+            self._append_system(
+                f"✅ Search complete. Found '{self.search_target.text()}' at {found_count} timestamps.\n"
+                f"   Use 'seek to <timestamp>' to jump to any found location."
+            )
+        else:
+            self._append_system(
+                f"❌ Search complete. No '{self.search_target.text()}' found in video."
+            )
+        
+        self.search_progress.setText("")
+        self.search_btn.setEnabled(True)
+        self.stop_search_btn.setEnabled(False)
+
+    @Slot(str)
+    def _on_search_error(self, error: str):
+        """Handle search error."""
+        self._append_system(f"❌ Search error: {error}")
+        self.search_progress.setText("Search failed")
+        self.search_btn.setEnabled(True)
+        self.stop_search_btn.setEnabled(False)
 
     # ------------------------------------------------ Cache loading
 
@@ -487,6 +749,9 @@ class LLMChatWidget(QWidget):
 
         vname = os.path.basename(self._video_path) if self._video_path else "loaded"
 
+        # Analyzer status
+        analyzer_status = " | Analyzer: ready" if self._analyzer else ""
+
         # Timeline status
         tl_status = ""
         if self._timeline_bridge and self._timeline_bridge.is_connected:
@@ -494,7 +759,7 @@ class LLMChatWidget(QWidget):
 
         self.context_label.setText(
             f"Context: {vname} | {int(dur)}s | "
-            f"{n_obj} obj | {n_act} act | {n_trans} transcript{tl_status}"
+            f"{n_obj} obj | {n_act} act | {n_trans} transcript{tl_status}{analyzer_status}"
         )
         self.context_label.setStyleSheet("color:#4CAF50;font-size:9pt;font-weight:bold;")
 
@@ -519,9 +784,9 @@ class LLMChatWidget(QWidget):
                 self.status_label.setText(f"Found {len(models)} Ollama models")
                 self.status_label.setStyleSheet("color:#4CAF50;font-style:italic;")
             else:
-                for m in ["llama3.2", "llama3.1", "mistral", "phi3", "gemma2"]:
+                for m in ["llama3.2", "llama3.2-vision", "llava", "bakllava", "llava-llama3"]:
                     self.model_combo.addItem(m)
-                self.status_label.setText("Ollama not running - showing defaults")
+                self.status_label.setText("Ollama not running - showing defaults (vision models recommended)")
                 self.status_label.setStyleSheet("color:#ff9800;font-style:italic;")
         else:
             self.model_combo.addItem("(select GGUF file below)")
@@ -561,6 +826,10 @@ class LLMChatWidget(QWidget):
             self.input_field.setEnabled(True)
             self.send_btn.setEnabled(True)
 
+            # Initialize analyzer if we have video path
+            if self._video_path and os.path.exists(self._video_path):
+                self._init_analyzer()
+
             if self._analysis_data:
                 n_obj = len(self._analysis_data.get("objects", []))
                 n_act = len(self._analysis_data.get("actions", []))
@@ -593,6 +862,16 @@ class LLMChatWidget(QWidget):
             self._append_system("Still generating... please wait.")
             return
 
+        # Check if this is a seek command that we can handle directly
+        if self._handle_seek_command(text):
+            self.input_field.clear()
+            return
+
+        # Check if this is a visual search request
+        if self._handle_visual_search_request(text):
+            self.input_field.clear()
+            return
+
         if not self._analysis_data:
             self._append_system(
                 "WARNING: No analysis data loaded! LLM will hallucinate.\n"
@@ -621,8 +900,6 @@ class LLMChatWidget(QWidget):
             )
 
         # ---- Only capture frame when user asks about visual content ----
-        # Previously this captured on EVERY message, causing all queries to
-        # enter vision-only mode (which skips analysis data & timeline commands).
         frame_b64 = None
         _text_lower = text.lower()
         _wants_vision = any(kw in _text_lower for kw in _VISION_KEYWORDS)
@@ -651,6 +928,65 @@ class LLMChatWidget(QWidget):
         self._worker.finished.connect(self._on_response_done)
         self._worker.error.connect(self._on_response_error)
         self._worker.start()
+
+    def _handle_seek_command(self, text: str) -> bool:
+        """Handle direct seek commands without going through LLM."""
+        text_lower = text.lower()
+        
+        # Check for seek commands
+        if text_lower.startswith(('seek ', 'go to ', 'jump to ')):
+            parts = text.split()
+            if len(parts) >= 2:
+                time_str = parts[-1]
+                try:
+                    # Parse mm:ss or seconds
+                    if ':' in time_str:
+                        minutes, seconds = map(int, time_str.split(':'))
+                        seconds = minutes * 60 + seconds
+                    else:
+                        seconds = float(time_str)
+                    
+                    if self._timeline_bridge and self._timeline_bridge._window:
+                        window = self._timeline_bridge._window
+                        if hasattr(window, 'seek_to_time'):
+                            window.seek_to_time(seconds)
+                            self._append_system(f"⏩ Seeking to {int(seconds)//60}:{int(seconds)%60:02d}")
+                            return True
+                except ValueError:
+                    pass
+        
+        return False
+
+    def _handle_visual_search_request(self, text: str) -> bool:
+        """Handle visual search requests directly."""
+        text_lower = text.lower()
+        
+        # Check for visual search keywords
+        is_search = any(kw in text_lower for kw in _VISUAL_SEARCH_KEYWORDS)
+        
+        if is_search and ('explosion' in text_lower or 'fire' in text_lower or 
+                          'person' in text_lower or 'car' in text_lower or
+                          'object' in text_lower or 'action' in text_lower):
+            
+            # Extract what to search for
+            words = text_lower.split()
+            search_target = None
+            
+            # Look for common patterns
+            for i, word in enumerate(words):
+                if word in ['explosion', 'fire', 'person', 'car', 'object']:
+                    search_target = word
+                    break
+                if word in ['search', 'find', 'look'] and i + 1 < len(words):
+                    search_target = words[i + 1]
+                    break
+            
+            if search_target:
+                self.search_target.setText(search_target)
+                self._start_visual_search()
+                return True
+        
+        return False
 
     def _stop_generation(self):
         """Stop the current LLM generation."""
@@ -747,24 +1083,41 @@ class LLMChatWidget(QWidget):
     def _log(self, msg: str):
         self.status_label.setText(msg)
 
+    def closeEvent(self, event):
+        """Clean up resources on close."""
+        if self._analyzer:
+            self._analyzer.close()
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.cancel()
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+        super().closeEvent(event)
+
 
 # ---------------------------------------------------------------------------
 # Standalone window for testing
 # ---------------------------------------------------------------------------
 class LLMChatWindow(QWidget):
-    def __init__(self, cache_dir: str = "./cache"):
+    def __init__(self, cache_dir: str = "./cache", video_path: str = ""):
         super().__init__()
-        self.setWindowTitle("VideoHighlighter - LLM Chat")
-        self.setMinimumSize(600, 500)
+        self.setWindowTitle("VideoHighlighter - LLM Chat with Visual Search")
+        self.setMinimumSize(700, 600)
         layout = QVBoxLayout()
-        self.chat = LLMChatWidget(parent=self, cache_dir=cache_dir)
+        self.chat = LLMChatWidget(parent=self, cache_dir=cache_dir, video_path=video_path)
         layout.addWidget(self.chat)
         self.setLayout(layout)
 
 
 if __name__ == "__main__":
     import sys
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="LLM Chat with Visual Search")
+    parser.add_argument("--video", type=str, help="Path to video file")
+    parser.add_argument("--cache-dir", type=str, default="./cache", help="Cache directory")
+    args = parser.parse_args()
+    
     app = QApplication(sys.argv)
-    win = LLMChatWindow()
+    win = LLMChatWindow(cache_dir=args.cache_dir, video_path=args.video or "")
     win.show()
     sys.exit(app.exec())

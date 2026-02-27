@@ -189,15 +189,25 @@ Example:
             (clean_text, list_of_result_messages)
         """
         commands = parse_commands(response_text)
+        
+        # Limit to first 5 commands to prevent abuse
+        MAX_COMMANDS = 5
+        if len(commands) > MAX_COMMANDS:
+            commands = commands[:MAX_COMMANDS]
+            self._command_log.append(f"⚠️ Too many commands, only executing first {MAX_COMMANDS}")
+        
         clean_text = strip_commands(response_text)
         results = []
 
         for cmd_name, params in commands:
             result = self._execute_command(cmd_name, params)
-            results.append(result)
+            # Only add non-empty results to the list
+            if result and result.strip():
+                results.append(result)
             self._command_log.append(f"{cmd_name}: {result}")
 
         return clean_text, results
+
 
     def _execute_command(self, cmd: str, params: dict) -> str:
         """Execute a single command. Returns result message."""

@@ -934,7 +934,14 @@ class VideoSeekAnalyzer:
         print(f"\n📊 Seeking analysis every {interval}s ({len(timestamps)} frames)")
         print(f"   Video duration: {int(self.duration)//60}m{int(self.duration)%60:02d}s")
         
+        # ONLY print progress every 10 frames to reduce spam
+        progress_interval = max(1, len(timestamps) // 10)  # Show ~10 updates total
+        
         for i, timestamp in enumerate(timestamps):
+            # Skip if beyond video duration (with small epsilon for floating point)
+            if timestamp > self.duration + 0.1:
+                break
+                
             # Update current time
             self.current_time = timestamp
             
@@ -942,7 +949,9 @@ class VideoSeekAnalyzer:
             frame = self.seek_to_time(timestamp)
             
             if frame is None:
-                print(f"⚠️ Could not read frame at {timestamp:.1f}s")
+                # Only print errors occasionally
+                if i % progress_interval == 0:
+                    print(f"⚠️ Could not read frame at {timestamp:.1f}s")
                 continue
             
             # Convert frame to base64
@@ -970,17 +979,19 @@ class VideoSeekAnalyzer:
                 if callback:
                     callback(result)
                 
-                # Show progress with timestamp
-                if (i + 1) % 5 == 0 or i == 0 or i == len(timestamps) - 1:
+                # ONLY print progress at interval, not every frame
+                if i % progress_interval == 0 or i == len(timestamps) - 1:
                     print(f"  [{i+1}/{len(timestamps)}] {timestamp:.1f}s: Analyzed")
                     
-                # Optional: Show first few words of analysis
-                if self.verbose and len(response) > 0:
+                # Optional verbose mode - but limited
+                if self.verbose and len(response) > 0 and i % progress_interval == 0:
                     preview = response[:50] + "..." if len(response) > 50 else response
                     print(f"     ↪ {preview}")
                 
             except Exception as e:
-                print(f"❌ Error at {timestamp:.1f}s: {e}")
+                # Only print errors occasionally
+                if i % progress_interval == 0:
+                    print(f"❌ Error at {timestamp:.1f}s: {e}")
                 # Add error result to maintain timeline
                 results.append({
                     "timestamp": timestamp,
@@ -989,7 +1000,7 @@ class VideoSeekAnalyzer:
                     "frame_number": i
                 })
         
-        print(f"\n✅ Done. {len(results)}/{len(timestamps)} frames analyzed successfully")
+        print(f"\n✅ Done. {len(results)} frames analyzed successfully")
         
         if save_to_file:
             self.save_results(results, save_to_file)
