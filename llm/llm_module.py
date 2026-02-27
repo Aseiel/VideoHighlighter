@@ -560,44 +560,47 @@ class LLMModule:
         print(f"   timeline_context: {'YES' if timeline_context else 'NONE'}")
         print(f"   analysis_data: {'YES' if analysis_data else 'NONE'}")
 
-        # Pick system prompt based on context
-        if system_prompt:
-            system = system_prompt
-        elif frame_base64 and not timeline_context:
-            # Pure vision mode: only when there's NO timeline context
-            system = self.SYSTEM_PROMPT_VISION
-        elif timeline_context:
-            system = self.SYSTEM_PROMPT_TIMELINE
-        else:
-            system = self.SYSTEM_PROMPT
-
-        # Build the full prompt with context
-        prompt_parts = []
-
-        # ---- Only enter pure vision mode when there's no timeline context ----
-        # Previously, frame_base64 alone triggered an early return that skipped
-        # all analysis data and timeline commands.
-        if frame_base64 and not timeline_context:
-            # ===== PURE VISION MODE: image is primary, minimal text =====
-            prompt_parts.append(user_message)
-            full_prompt = "\n".join(prompt_parts)
-
+        # Check if this is a vision-focused query (user asking about current frame)
+        _vision_keywords = ("see", "look", "frame", "current", "what's happening", 
+                        "describe this", "what is this", "what do you see")
+        _is_vision_query = any(kw in user_message.lower() for kw in _vision_keywords)
+        
+        # ===== VISION MODE: When user explicitly asks about current frame =====
+        if frame_base64 and _is_vision_query:
+            # Even with timeline context, prioritize vision for frame-specific questions
+            if timeline_context:
+                # Include timeline commands but focus on the image
+                system = self.SYSTEM_PROMPT_VISION + "\n\n" + (
+                    "IMPORTANT: The user has also provided timeline context below. "
+                    "FIRST describe what you see in the image, THEN if relevant, "
+                    "you can include timeline commands."
+                )
+                
+                prompt_parts = [
+                    "=== TIMELINE CONTEXT (for reference) ===\n",
+                    timeline_context,
+                    "\n=== END TIMELINE ===\n\n",
+                    "Now, based on the image attached to this message, describe what you see.\n",
+                    user_message
+                ]
+                full_prompt = "\n".join(prompt_parts)
+            else:
+                # Pure vision mode
+                system = self.SYSTEM_PROMPT_VISION
+                full_prompt = user_message
+            
             return self._backend.generate(
                 prompt=full_prompt,
-                system=self.SYSTEM_PROMPT_VISION,
+                system=system,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream_callback=stream_callback,
                 images=[frame_base64],
             )
-
-        # If we have BOTH a frame AND timeline context, drop the frame and use
-        # text mode so that analysis data + timeline commands are preserved.
-        if frame_base64 and timeline_context:
-            print("⚠️ frame_base64 present but timeline_context active — using text mode")
-            frame_base64 = None  # Don't send image; use full text context instead
-
-        # ===== TEXT MODE: full analysis context =====
+        
+        # ===== TEXT MODE: No frame or not a vision query =====
+        prompt_parts = []
+        
         if analysis_data:
             context = VideoContextBuilder.build(analysis_data, video_path)
             prompt_parts.append(
@@ -608,21 +611,30 @@ class LLMModule:
                 f"{context}\n"
                 "=== END DATA ===\n\n"
             )
-
-        if timeline_context:
+        
+        if timeline_context and not _is_vision_query:
+            # Only include timeline context if not asking about current frame
             prompt_parts.append(
                 "=== TIMELINE CONTROL ===\n"
                 f"{timeline_context}\n"
                 "=== END TIMELINE ===\n\n"
             )
-
+        
         prompt_parts.append(
             "Based on the data above, answer the following. "
             "If the user asks you to modify the timeline, include the appropriate [CMD:...] commands.\n\n"
         )
         prompt_parts.append(user_message)
         full_prompt = "\n".join(prompt_parts)
-
+        
+        # Choose appropriate system prompt
+        if system_prompt:
+            system = system_prompt
+        elif timeline_context and not _is_vision_query:
+            system = self.SYSTEM_PROMPT_TIMELINE
+        else:
+            system = self.SYSTEM_PROMPT
+        
         return self._backend.generate(
             prompt=full_prompt,
             system=system,

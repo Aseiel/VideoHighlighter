@@ -893,18 +893,24 @@ class LLMChatWidget(QWidget):
 
         # Build timeline context if connected
         timeline_ctx = ""
-        if self._timeline_bridge and self._timeline_bridge.is_connected:
+        has_timeline = self._timeline_bridge and self._timeline_bridge.is_connected
+        if has_timeline:
             timeline_ctx = (
                 self._timeline_bridge.get_timeline_state() + "\n" +
                 self._timeline_bridge.get_available_commands_text()
             )
 
-        # ---- Only capture frame when user asks about visual content ----
+        # Capture frame ONLY when user asks about visual content
         frame_b64 = None
         _text_lower = text.lower()
         _wants_vision = any(kw in _text_lower for kw in _VISION_KEYWORDS)
+        
+        # Check if this is asking about the current frame specifically
+        _asks_about_current = any(phrase in _text_lower for phrase in 
+                                ["current frame", "this frame", "what do you see", 
+                                "what's happening now", "describe this frame"])
 
-        if _wants_vision and self._timeline_bridge and self._timeline_bridge._window:
+        if (_wants_vision or _asks_about_current) and self._timeline_bridge and self._timeline_bridge._window:
             window = self._timeline_bridge._window
             if hasattr(window, 'capture_current_frame_base64'):
                 frame_b64 = window.capture_current_frame_base64()
@@ -913,6 +919,12 @@ class LLMChatWidget(QWidget):
                         f"📷 Frame captured at {window.current_time:.1f}s "
                         f"({len(frame_b64)//1024}KB)"
                     )
+                    
+                    # If timeline is active, let user know we're combining both
+                    if has_timeline:
+                        self._append_system(
+                            "ℹ️ Combining frame analysis with timeline context..."
+                        )
                 else:
                     self._append_system("⚠️ Frame capture failed")
 
