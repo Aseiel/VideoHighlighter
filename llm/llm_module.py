@@ -164,16 +164,18 @@ class _OllamaBackend(_LLMBackend):
 
 
 # ---------------------------------------------------------------------------
-# llama-cpp-python backend
+# llama-cpp-python backend with vision support
 # ---------------------------------------------------------------------------
 class _LlamaCppBackend(_LLMBackend):
     """Uses llama-cpp-python to run a GGUF model directly (no server)."""
 
-    def __init__(self, model_path: str, n_ctx: int = 4096, n_gpu_layers: int = -1):
+    def __init__(self, model_path: str, mmproj_path: str = None, n_ctx: int = 4096, n_gpu_layers: int = -1):
         self.model_path = model_path
+        self.mmproj_path = mmproj_path  # Store mmproj path for vision models
         self.n_ctx = n_ctx
         self.n_gpu_layers = n_gpu_layers
         self._model = None
+        self._chat_handler = None  # Store the chat handler
 
     @staticmethod
     def available() -> bool:
@@ -186,13 +188,53 @@ class _LlamaCppBackend(_LLMBackend):
     def load(self, **kwargs):
         if not os.path.isfile(self.model_path):
             raise FileNotFoundError(f"GGUF model not found: {self.model_path}")
+        
         from llama_cpp import Llama
-        self._model = Llama(
-            model_path=self.model_path,
-            n_ctx=self.n_ctx,
-            n_gpu_layers=self.n_gpu_layers,
-            verbose=False,
-        )
+        
+        # Check if this is a vision model (has mmproj)
+        if self.mmproj_path and os.path.exists(self.mmproj_path):
+            print(f"📷 Loading vision model with mmproj: {self.mmproj_path}")
+            
+            # Try to import the chat handler
+            try:
+                from llama_cpp.llama_chat_format import Llava15ChatHandler
+                
+                # Create the chat handler for vision models
+                self._chat_handler = Llava15ChatHandler(
+                    clip_model_path=self.mmproj_path,
+                    verbose=False
+                )
+                
+                print(f"✅ Created Llava15ChatHandler for vision support")
+                
+                self._model = Llama(
+                    model_path=self.model_path,
+                    chat_handler=self._chat_handler,  # This is the key fix!
+                    n_ctx=self.n_ctx,
+                    n_gpu_layers=self.n_gpu_layers,
+                    verbose=False,
+                    n_threads=None,  # Auto-detect
+                )
+            except ImportError:
+                print("⚠️ Llava15ChatHandler not available, falling back to basic vision")
+                # Fallback to older method without chat handler
+                self._model = Llama(
+                    model_path=self.model_path,
+                    clip_model_path=self.mmproj_path,  # This enables vision in older versions
+                    n_ctx=self.n_ctx,
+                    n_gpu_layers=self.n_gpu_layers,
+                    verbose=False,
+                    n_threads=None,
+                )
+        else:
+            # Text-only model
+            self._model = Llama(
+                model_path=self.model_path,
+                n_ctx=self.n_ctx,
+                n_gpu_layers=self.n_gpu_layers,
+                verbose=False,
+                n_threads=None,
+            )
 
     def is_loaded(self) -> bool:
         return self._model is not None
@@ -203,15 +245,23 @@ class _LlamaCppBackend(_LLMBackend):
         if not self._model:
             raise RuntimeError("Model not loaded. Call load() first.")
 
+        # Handle vision inputs
+        if images and self.mmproj_path:
+            # This is a vision query with mmproj
+            return self._generate_vision(prompt, system, images, max_tokens, 
+                                        temperature, stream_callback)
+        else:
+            # Text-only query
+            return self._generate_text(prompt, system, max_tokens, 
+                                      temperature, stream_callback)
+
+    def _generate_text(self, prompt: str, system: str = "", max_tokens: int = 1024,
+                      temperature: float = 0.7, stream_callback: Optional[Callable] = None) -> str:
+        """Handle text-only generation."""
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-
-        # Note: llama-cpp-python doesn't support images natively
-        # Vision requires Ollama backend
-        if images:
-            messages[-1]["content"] = "[Image attached but not supported by llama-cpp backend. Use Ollama with a vision model.]\n\n" + prompt
 
         if stream_callback:
             full_text = []
@@ -235,9 +285,156 @@ class _LlamaCppBackend(_LLMBackend):
             )
             return result["choices"][0]["message"]["content"]
 
+    def _generate_vision(self, prompt: str, system: str = "", images: list[str] = None,
+                        max_tokens: int = 1024, temperature: float = 0.7,
+                        stream_callback: Optional[Callable] = None) -> str:
+        """Handle vision generation with proper chat handler."""
+        try:
+            # Convert base64 images to data URLs
+            image_urls = []
+            for img_b64 in images:
+                # Clean base64 string if it has data URL prefix
+                if ',' in img_b64:
+                    img_b64 = img_b64.split(',', 1)[1]
+                image_urls.append(f"data:image/jpeg;base64,{img_b64}")
+            
+            # Build messages with proper multimodal format
+            messages = []
+            
+            # Add system message if provided
+            if system:
+                messages.append({"role": "system", "content": system})
+            
+            # Build user message with proper multimodal content
+            user_content = []
+            
+            # Add text prompt
+            user_content.append({
+                "type": "text", 
+                "text": prompt
+            })
+            
+            # Add images as image_urls
+            for img_url in image_urls:
+                user_content.append({
+                    "type": "image_url", 
+                    "image_url": {
+                        "url": img_url
+                    }
+                })
+            
+            # Add the complete user message
+            messages.append({
+                "role": "user", 
+                "content": user_content  # This is a list, which the chat handler can process
+            })
+            
+            print(f"📤 Sending vision request with {len(images)} images")
+            print(f"   Using chat handler: {self._chat_handler is not None}")
+            
+            if stream_callback:
+                full_text = []
+                for chunk in self._model.create_chat_completion(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stream=True,
+                ):
+                    if "choices" in chunk and len(chunk["choices"]) > 0:
+                        delta = chunk["choices"][0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            full_text.append(token)
+                            stream_callback(token)
+                result = "".join(full_text)
+                print(f"✅ Vision generation complete: {len(result)} chars")
+                return result
+            else:
+                result = self._model.create_chat_completion(
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                if "choices" in result and len(result["choices"]) > 0:
+                    result_text = result["choices"][0]["message"]["content"]
+                    print(f"✅ Vision generation complete: {len(result_text)} chars")
+                    return result_text
+                else:
+                    print("⚠️ No choices in result")
+                    return "No response generated"
+                    
+        except Exception as e:
+            print(f"❌ Vision generation error: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # FALLBACK: Try the quick workaround (Option 1 from your solutions)
+            print("⚠️ Falling back to raw prompt format...")
+            return self._generate_vision_fallback(prompt, system, images, max_tokens, 
+                                                  temperature, stream_callback)
+
+    def _generate_vision_fallback(self, prompt: str, system: str = "", images: list[str] = None,
+                                 max_tokens: int = 1024, temperature: float = 0.7,
+                                 stream_callback: Optional[Callable] = None) -> str:
+        """Fallback method using raw prompt formatting (LLaVA style)."""
+        try:
+            # Build LLaVA-style prompt with image tokens
+            prompt_parts = []
+            
+            # Add system message if provided
+            if system:
+                prompt_parts.append(f"System: {system}")
+            
+            # Add image tokens (one per image)
+            for _ in images:
+                prompt_parts.append("<image>")
+            
+            # Add the user prompt
+            prompt_parts.append(f"User: {prompt}")
+            prompt_parts.append("Assistant:")
+            
+            full_prompt = "\n".join(prompt_parts)
+            
+            print(f"📤 Using fallback prompt format with {len(images)} images")
+            
+            # Decode images to bytes for the model
+            image_bytes = []
+            for img_b64 in images:
+                if ',' in img_b64:
+                    img_b64 = img_b64.split(',', 1)[1]
+                image_bytes.append(base64.b64decode(img_b64))
+            
+            # Use completion API instead of chat completion
+            if stream_callback:
+                full_text = []
+                for chunk in self._model.create_completion(
+                    prompt=full_prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    image_data=image_bytes,  # Pass raw image bytes
+                    stream=True,
+                ):
+                    token = chunk["choices"][0].get("text", "")
+                    if token:
+                        full_text.append(token)
+                        stream_callback(token)
+                return "".join(full_text)
+            else:
+                result = self._model.create_completion(
+                    prompt=full_prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    image_data=image_bytes,  # Pass raw image bytes
+                )
+                return result["choices"][0]["text"]
+                
+        except Exception as e:
+            print(f"❌ Fallback also failed: {e}")
+            return f"Error processing image: {e}"
+
     def unload(self):
         self._model = None
-
+        self._chat_handler = None
 
 # ---------------------------------------------------------------------------
 # Context builder — turns analysis cache into LLM-readable text
@@ -476,12 +673,12 @@ class LLMModule:
     )
 
     SYSTEM_PROMPT_VISION = (
-        "You have VISION. An image is attached to this message.\n"
-        "IGNORE all text data. ONLY describe what you SEE in the image.\n"
-        "Describe: people (count, poses, clothing, actions), objects, background, colors.\n"
-        "If you cannot see the image, say 'I cannot see the image'.\n"
-        "Do NOT mention timestamps, detections, or analysis data.\n"
-        "Do NOT make up actions from text — ONLY describe the visual content.\n"
+        "You are an AI with vision capabilities. An image is attached to this message.\n"
+        "DESCRIBE WHAT YOU SEE IN THE IMAGE.\n"
+        "Focus on: people (count, poses, clothing, actions), objects, scene, colors, lighting.\n"
+        "If there is video analysis data or timeline context provided, use it as ADDITIONAL context,\n"
+        "but your primary focus is describing what's visible in the image.\n"
+        "Be specific and detailed in your description.\n"
     )
 
     def __init__(
@@ -489,6 +686,7 @@ class LLMModule:
         backend: str = "ollama",
         model: str = "llama3.2",
         model_path: str = "",
+        mmproj_path: str = None,
         base_url: str = "http://localhost:11434",
         n_ctx: int = 4096,
         n_gpu_layers: int = -1,
@@ -502,7 +700,10 @@ class LLMModule:
             self._backend = _OllamaBackend(model=model, base_url=base_url)
         elif backend == "llama-cpp":
             self._backend = _LlamaCppBackend(
-                model_path=model_path, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers
+                model_path=model_path,
+                mmproj_path=mmproj_path,
+                n_ctx=n_ctx,
+                n_gpu_layers=n_gpu_layers
             )
         else:
             raise ValueError(f"Unknown backend: {backend}. Use 'ollama' or 'llama-cpp'.")
@@ -556,38 +757,40 @@ class LLMModule:
         
         # DEBUG: trace vision path
         print(f"🔍 query() called:")
-        print(f"   frame_base64: {'YES ' + str(len(frame_base64)) + ' chars' if frame_base64 else 'NONE'}")
+        print(f"   frame_base64: {'YES (' + str(len(frame_base64)) + ' chars)' if frame_base64 else 'NONE'}")
         print(f"   timeline_context: {'YES' if timeline_context else 'NONE'}")
         print(f"   analysis_data: {'YES' if analysis_data else 'NONE'}")
 
-        # Check if this is a vision-focused query (user asking about current frame)
-        _vision_keywords = ("see", "look", "frame", "current", "what's happening", 
-                        "describe this", "what is this", "what do you see")
-        _is_vision_query = any(kw in user_message.lower() for kw in _vision_keywords)
-        
-        # ===== VISION MODE: When user explicitly asks about current frame =====
-        if frame_base64 and _is_vision_query:
-            # Even with timeline context, prioritize vision for frame-specific questions
+        # ===== VISION MODE: When frame is provided, use it! =====
+        if frame_base64:
+            # We have a frame, so this is a vision query
+            # Even if not explicitly asking, the frame is provided for a reason
+            
+            prompt_parts = []
+            
+            # Add timeline context if available (for reference)
             if timeline_context:
-                # Include timeline commands but focus on the image
-                system = self.SYSTEM_PROMPT_VISION + "\n\n" + (
-                    "IMPORTANT: The user has also provided timeline context below. "
-                    "FIRST describe what you see in the image, THEN if relevant, "
-                    "you can include timeline commands."
+                prompt_parts.append(
+                    "=== TIMELINE CONTEXT (for reference) ===\n"
+                    f"{timeline_context}\n"
+                    "=== END TIMELINE ===\n\n"
                 )
-                
-                prompt_parts = [
-                    "=== TIMELINE CONTEXT (for reference) ===\n",
-                    timeline_context,
-                    "\n=== END TIMELINE ===\n\n",
-                    "Now, based on the image attached to this message, describe what you see.\n",
-                    user_message
-                ]
-                full_prompt = "\n".join(prompt_parts)
-            else:
-                # Pure vision mode
-                system = self.SYSTEM_PROMPT_VISION
-                full_prompt = user_message
+            
+            # Add analysis data if available (for reference)
+            if analysis_data:
+                context = VideoContextBuilder.build(analysis_data, video_path)
+                prompt_parts.append(
+                    "=== VIDEO ANALYSIS DATA (for reference) ===\n"
+                    f"{context}\n"
+                    "=== END DATA ===\n\n"
+                )
+            
+            # Add the user's question
+            prompt_parts.append(user_message)
+            full_prompt = "\n".join(prompt_parts)
+            
+            # Use vision system prompt
+            system = system_prompt or self.SYSTEM_PROMPT_VISION
             
             return self._backend.generate(
                 prompt=full_prompt,
@@ -595,10 +798,10 @@ class LLMModule:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream_callback=stream_callback,
-                images=[frame_base64],
+                images=[frame_base64],  # Pass the image to the backend
             )
         
-        # ===== TEXT MODE: No frame or not a vision query =====
+        # ===== TEXT MODE: No frame =====
         prompt_parts = []
         
         if analysis_data:
@@ -612,25 +815,20 @@ class LLMModule:
                 "=== END DATA ===\n\n"
             )
         
-        if timeline_context and not _is_vision_query:
-            # Only include timeline context if not asking about current frame
+        if timeline_context:
             prompt_parts.append(
                 "=== TIMELINE CONTROL ===\n"
                 f"{timeline_context}\n"
                 "=== END TIMELINE ===\n\n"
             )
         
-        prompt_parts.append(
-            "Based on the data above, answer the following. "
-            "If the user asks you to modify the timeline, include the appropriate [CMD:...] commands.\n\n"
-        )
         prompt_parts.append(user_message)
         full_prompt = "\n".join(prompt_parts)
         
         # Choose appropriate system prompt
         if system_prompt:
             system = system_prompt
-        elif timeline_context and not _is_vision_query:
+        elif timeline_context:
             system = self.SYSTEM_PROMPT_TIMELINE
         else:
             system = self.SYSTEM_PROMPT

@@ -272,6 +272,21 @@ class LLMChatWidget(QWidget):
         self.gguf_row_widget.setVisible(False)
         settings_layout.addWidget(self.gguf_row_widget)
 
+        # Row 3: mmproj path (for vision models, hidden by default)
+        self.mmproj_row_widget = QWidget()
+        mmproj_inner = QHBoxLayout()
+        mmproj_inner.setContentsMargins(0, 0, 0, 0)
+        mmproj_inner.addWidget(QLabel("mmproj path:"))
+        self.mmproj_path_input = QLineEdit()
+        self.mmproj_path_input.setPlaceholderText("/path/to/mmproj-model.gguf (optional, for vision)")
+        mmproj_inner.addWidget(self.mmproj_path_input)
+        self.mmproj_browse_btn = QPushButton("Browse...")
+        self.mmproj_browse_btn.clicked.connect(self._browse_mmproj)
+        mmproj_inner.addWidget(self.mmproj_browse_btn)
+        self.mmproj_row_widget.setLayout(mmproj_inner)
+        self.mmproj_row_widget.setVisible(False)
+        settings_layout.addWidget(self.mmproj_row_widget)
+
         # Row 3: connect + status
         row3 = QHBoxLayout()
         self.connect_btn = QPushButton("Connect")
@@ -877,13 +892,26 @@ class LLMChatWidget(QWidget):
         backend = self.backend_combo.currentData()
         is_gguf = backend == "llama-cpp"
         self.gguf_row_widget.setVisible(is_gguf)
+        self.mmproj_row_widget.setVisible(is_gguf)
         self.refresh_btn.setVisible(not is_gguf)
-        if not is_gguf:
+        
+        # Disable model dropdown for llama-cpp since we use file path instead
+        self.model_combo.setEnabled(not is_gguf)
+        if is_gguf:
+            self.model_combo.clear()
+            self.model_combo.addItem("(using GGUF file)")
+        else:
             self._refresh_models()
 
     def _refresh_models(self):
         self.model_combo.clear()
         backend = self.backend_combo.currentData()
+        
+        if backend == "llama-cpp":
+            # For llama-cpp, we don't need to fetch models
+            self.model_combo.addItem("(select GGUF file below)")
+            return
+            
         if backend == "ollama":
             models = get_ollama_models()
             if models:
@@ -896,8 +924,6 @@ class LLMChatWidget(QWidget):
                     self.model_combo.addItem(m)
                 self.status_label.setText("Ollama not running - showing defaults (vision models recommended)")
                 self.status_label.setStyleSheet("color:#ff9800;font-style:italic;")
-        else:
-            self.model_combo.addItem("(select GGUF file below)")
 
     def _browse_gguf(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -905,6 +931,14 @@ class LLMChatWidget(QWidget):
         )
         if path:
             self.gguf_path_input.setText(path)
+
+    def _browse_mmproj(self):
+        """Browse for mmproj file (for vision models)."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select mmproj File", "", "GGUF Models (*.gguf);;All Files (*)"
+        )
+        if path:
+            self.mmproj_path_input.setText(path)
 
     def _connect_llm(self):
         backend = self.backend_combo.currentData()
@@ -922,13 +956,36 @@ class LLMChatWidget(QWidget):
                 gguf_path = self.gguf_path_input.text().strip()
                 if not gguf_path:
                     raise ValueError("Select a GGUF model file first")
-                self._llm = LLMModule(backend="llama-cpp", model_path=gguf_path, log_fn=self._log)
+                
+                # Get mmproj path if provided
+                mmproj_path = self.mmproj_path_input.text().strip() or None
+                
+                # IMPORTANT: For llama-cpp, we use model_path, NOT the dropdown model name!
+                self._llm = LLMModule(
+                    backend="llama-cpp", 
+                    model_path=gguf_path,  # Use the GGUF file path
+                    mmproj_path=mmproj_path,  # Pass mmproj path
+                    log_fn=self._log
+                )
+                
+                # Optionally, you might want to show which model is being used
+                model_name = os.path.basename(gguf_path)
+                self.status_label.setText(f"Loading {model_name}...")
+                QApplication.processEvents()
             else:
                 raise ValueError(f"Unknown backend: {backend}")
 
             self._llm.load()
 
-            self.status_label.setText(f"Connected: {model}")
+            # Show appropriate success message
+            if backend == "llama-cpp":
+                model_name = os.path.basename(gguf_path)
+                if mmproj_path:
+                    model_name += " (with vision)"
+                self.status_label.setText(f"Connected: {model_name}")
+            else:
+                self.status_label.setText(f"Connected: {model}")
+                
             self.status_label.setStyleSheet("color:#4CAF50;font-weight:bold;")
             self.connect_btn.setText("Reconnect")
             self.input_field.setEnabled(True)
@@ -953,17 +1010,16 @@ class LLMChatWidget(QWidget):
                 except Exception as e:
                     self._append_system(f"⚠️ Could not initialize reasoning: {e}")
 
-
             if self._analysis_data:
                 n_obj = len(self._analysis_data.get("objects", []))
                 n_act = len(self._analysis_data.get("actions", []))
                 self._append_system(
-                    f"Connected to {model}. "
+                    f"Connected to {model if backend=='ollama' else os.path.basename(gguf_path)}. "
                     f"Context ready: {n_obj} object entries, {n_act} actions."
                 )
             else:
                 self._append_system(
-                    f"Connected to {model}. "
+                    f"Connected to {model if backend=='ollama' else os.path.basename(gguf_path)}. "
                     f"WARNING: No video context! Use 'Load Cache' first."
                 )
 
