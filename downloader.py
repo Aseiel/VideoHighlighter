@@ -1896,7 +1896,41 @@ def download_video(
                     log_fn(f"   ({int(start_pct)}% to {int(end_pct)}% = {end_seconds - start_seconds:.1f}s)")
                     time_range = (start_seconds, end_seconds)
                     use_percentages = False
-              
+        
+        # 4. Yandex preview special extraction
+        extracted_source = extract_yandex_preview_source(url, log_fn)
+        if extracted_source:
+            t0 = time.time()
+            success, filename = download_from_extracted_source(extracted_source, output_template, log_fn)
+            metadata["download_time"] = time.time() - t0
+            if success:
+                if filename and os.path.exists(filename):
+                    size_mb = os.path.getsize(filename) / (1024 * 1024)
+                    metadata["file_size"] = size_mb
+                    apply_ffprobe_duration(filename)
+                    log_fn(f"✅ Downloaded from Yandex source: {os.path.basename(filename)}")
+                    log_fn(f"📊 File size: {size_mb:.2f} MB")
+                    log_fn(f"⏱️ Download time: {metadata['download_time']:.1f} seconds")
+                    if size_mb < 0.1:
+                        log_fn("⚠️ Warning: File is very small, might be corrupted")
+                    if process_callback:
+                        log_fn("🔄 Processing video immediately...")
+                        try:
+                            process_result = process_callback(filename, metadata)
+                            if process_result:
+                                log_fn("✅ Video processed successfully")
+                                metadata["processed"] = True
+                                metadata["process_result"] = process_result
+                            else:
+                                log_fn("⚠️ Processing returned no result")
+                                metadata["processed"] = False
+                        except Exception as e:
+                            log_fn(f"❌ Processing failed: {e}")
+                            metadata["processed"] = False
+                            metadata["process_error"] = str(e)
+                    return True, filename, metadata
+            log_fn("⚠️ Yandex direct download failed, falling back to standard yt-dlp...")
+        
         # 5. Build yt-dlp download command
         cmd = [
             "yt-dlp",
@@ -2203,6 +2237,566 @@ def test_downloader():
         print(f"Metadata: {metadata}")
     else:
         print("Usage: python video_downloader.py <video_url>")
+
+# -----------------------------
+# Yandex preview extraction
+# -----------------------------
+def extract_yandex_video_url(url: str, log_fn: Callable = print) -> Optional[str]:
+    """
+    Extract the actual video URL from a Yandex preview page.
+    Fixed to ignore preview thumbnails and get the real video.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        
+        with sync_playwright() as p:
+            # Use persistent context to maintain session
+            browser = p.chromium.launch_persistent_context(
+                user_data_dir="./yandex_profile",
+                headless=False,  # MUST be visible to avoid detection
+                args=["--disable-blink-features=AutomationControlled"]
+            )
+            
+            page = browser.new_page()
+            log_fn("  • Loading page...")
+            page.goto(url, wait_until="networkidle", timeout=60000)
+            
+            # CRITICAL: Wait for and click the actual play button
+            log_fn("  • Looking for play button to click...")
+            
+            # Try multiple selectors for the play button
+            play_selectors = [
+                ".video-preview__play",
+                ".player-controls__play",
+                "[aria-label='Play']",
+                "[aria-label='Воспроизвести']",
+                ".thumb__play",
+                ".videoplayer__play",
+                "button:has-text('Play')",
+                "button:has-text('Воспроизвести')"
+            ]
+            
+            play_clicked = False
+            for selector in play_selectors:
+                try:
+                    play_button = page.wait_for_selector(selector, timeout=5000)
+                    if play_button and play_button.is_visible():
+                        play_button.click()
+                        log_fn(f"  ✓ Clicked play button: {selector}")
+                        play_clicked = True
+                        break
+                except:
+                    continue
+            
+            if not play_clicked:
+                log_fn("  ⚠ No play button found, trying to force video load...")
+                page.evaluate("""
+                    document.querySelectorAll('video').forEach(v => {
+                        v.play().catch(() => {});
+                    });
+                """)
+            
+            # Wait for video to start loading
+            page.wait_for_timeout(5000)
+            
+            # Now look for the iframe (it should be loaded)
+            log_fn("  • Looking for video player iframe...")
+            
+            # Wait specifically for the video-player iframe
+            iframe_element = page.wait_for_selector(
+                "iframe[src*='video-player'], iframe[src*='yastatic.net']", 
+                timeout=15000
+            )
+            
+            # Get the iframe
+            iframe = page.frame_locator("iframe[src*='video-player'], iframe[src*='yastatic.net']")
+            
+            # Wait for video element inside iframe
+            log_fn("  • Waiting for video in iframe...")
+            iframe.locator("video").first.wait_for(timeout=10000)
+            
+            # Get video duration to verify it's the real video
+            duration = iframe.locator("video").first.evaluate("el => el.duration")
+            
+            if duration and duration > 60:  # Real videos are longer than 60s
+                log_fn(f"  ✓ Found video with duration: {duration:.1f}s")
+                
+                # Get video source
+                video_url = iframe.locator("video").first.evaluate("""
+                    el => {
+                        // Try multiple sources
+                        return el.currentSrc || 
+                               el.src || 
+                               (el.querySelector('source')?.src) ||
+                               el.getAttribute('src');
+                    }
+                """)
+                
+                if video_url and not any(x in video_url.lower() for x in ['preview', 'thumbnail']):
+                    log_fn(f"  ✓ Found real video URL: {video_url[:100]}...")
+                    return video_url
+            
+            # If iframe approach fails, try network capture after play click
+            log_fn("  • Trying network capture after play...")
+            
+            # Clear existing requests and capture new ones
+            video_urls = set()
+            
+            def handle_request(request):
+                url = request.url
+                if any(x in url.lower() for x in ['.mp4', '.m3u8', 'videoplayback']) and \
+                   not any(x in url.lower() for x in ['preview', 'thumbnail', 'gfxdn.pics']):
+                    video_urls.add(url)
+            
+            page.on("request", handle_request)
+            
+            # Wait for video requests
+            page.wait_for_timeout(10000)
+            
+            # Filter out preview URLs
+            real_videos = [url for url in video_urls 
+                          if 'video-preview.s3' not in url 
+                          and 'gfxdn.pics' not in url]
+            
+            if real_videos:
+                log_fn(f"  ✓ Found real video via network: {real_videos[0][:100]}...")
+                return real_videos[0]
+            
+    except Exception as e:
+        log_fn(f"  ✗ Extraction failed: {e}")
+    
+    return None
+
+def extract_yandex_preview_source(url: str, log_fn: Callable = print) -> Optional[str]:
+    """
+    Extract the actual video source URL from a Yandex preview page.
+    Enhanced to handle Yandex's current page structure.
+    """
+    if "/video/preview/" not in url and "/video/touch/preview/" not in url:
+        return None
+    
+    log_fn("🔍 Detected Yandex preview link → trying enhanced Playwright extraction...")
+    
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        
+        with sync_playwright() as p:
+            # Launch browser with more realistic settings
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    "--autoplay-policy=no-user-gesture-required",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process"
+                ]
+            )
+            
+            # Try different user agents
+            user_agents = [
+                # Mobile (Yandex touch site)
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1",
+                # Desktop
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                # Yandex Browser
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 YaBrowser/24.1.0.0 Safari/537.36"
+            ]
+            
+            video_urls = set()
+            
+            for ua in user_agents:
+                context = browser.new_context(
+                    user_agent=ua,
+                    viewport={"width": 1280, "height": 720},
+                    ignore_https_errors=True,
+                    java_script_enabled=True,
+                    extra_http_headers={
+                        "Accept": "*/*",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Referer": "https://yandex.com/",
+                        "Origin": "https://yandex.com",
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-site"
+                    }
+                )
+                
+                page = context.new_page()
+                
+                # Track video-related requests
+                def handle_request(request):
+                    req_url = request.url.lower()
+                    
+                    # Look for actual video content, not previews
+                    video_indicators = [
+                        '.mp4', '.m3u8', '.ts', 'videoplayback',
+                        'mycdn.me', 'cloudfront.net', 'akamaihd.net',
+                        'blob:', 'videocdn', 'video.cdn',
+                        'master.m3u8', 'playlist.m3u8',
+                        'getvideo', 'streaming'
+                    ]
+                    
+                    # Skip obvious thumbnails and previews
+                    skip_indicators = [
+                        '.jpg', '.jpeg', '.png', '.gif', '.webp',
+                        'preview', 'thumbnail', 'poster', 'cover',
+                        'avatar', 'favicon', 'sprite'
+                    ]
+                    
+                    if any(x in req_url for x in skip_indicators):
+                        return
+                        
+                    if any(x in req_url for x in video_indicators):
+                        # Additional check: if it has both video and image patterns, skip it
+                        if '.mp4' in req_url and any(x in req_url for x in ['.jpg', '.jpeg', '.png']):
+                            return
+                        video_urls.add(request.url)
+                        log_fn(f"      📡 Captured: {request.url[:120]}...")
+                
+                page.on("request", handle_request)
+                
+                log_fn(f"  • Loading Yandex preview with UA: {ua[:50]}...")
+                
+                try:
+                    # Navigate and wait for content
+                    response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    
+                    if response and response.status >= 400:
+                        log_fn(f"  ⚠ Bad response: {response.status}")
+                        context.close()
+                        continue
+                    
+                    # Wait for page to settle
+                    page.wait_for_timeout(5000)
+                    
+                    # Try to find and interact with the video player
+                    log_fn("  • Looking for video player...")
+                    
+                    # Execute JavaScript to find and trigger the actual video
+                    page.evaluate("""
+                        () => {
+                            // Scroll to find lazy-loaded content
+                            window.scrollTo(0, document.body.scrollHeight / 2);
+                            
+                            // Look for and click any play button
+                            const playSelectors = [
+                                '.video-preview__play',
+                                '.player-controls__play',
+                                '[aria-label="Play"]',
+                                '[aria-label="Воспроизвести"]',
+                                '.thumb__play',
+                                '.videoplayer__play',
+                                '.play-button',
+                                '.jwplayer__playbutton',
+                                '.vjs-big-play-button',
+                                '[data-testid="play"]',
+                                '.VideoPlayer__play'
+                            ];
+                            
+                            for (const selector of playSelectors) {
+                                const btn = document.querySelector(selector);
+                                if (btn) {
+                                    btn.click();
+                                    console.log('Clicked play button:', selector);
+                                    break;
+                                }
+                            }
+                            
+                            // Try to load video directly
+                            const videos = document.querySelectorAll('video');
+                            videos.forEach(v => {
+                                v.preload = 'auto';
+                                v.load();
+                                v.muted = true;
+                                v.play().catch(() => {});
+                            });
+                            
+                            // Look for video in shadow DOM
+                            const findInShadow = (root) => {
+                                if (root.shadowRoot) {
+                                    root.shadowRoot.querySelectorAll('video').forEach(v => {
+                                        v.preload = 'auto';
+                                        v.load();
+                                        v.muted = true;
+                                        v.play().catch(() => {});
+                                    });
+                                    root.shadowRoot.querySelectorAll('*').forEach(findInShadow);
+                                }
+                            };
+                            document.querySelectorAll('*').forEach(findInShadow);
+                        }
+                    """)
+                    
+                    # Wait for network activity
+                    page.wait_for_timeout(8000)
+                    
+                    # Check for direct video element with real source
+                    log_fn("  • Checking for video element...")
+                    
+                    video_info = page.evaluate("""
+                        () => {
+                            const videos = [];
+                            
+                            // Regular video elements
+                            document.querySelectorAll('video').forEach((v, i) => {
+                                const src = v.currentSrc || v.src || '';
+                                if (src && src.length > 0) {
+                                    videos.push({
+                                        type: 'video',
+                                        index: i,
+                                        src: src,
+                                        duration: v.duration || 0,
+                                        readyState: v.readyState,
+                                        networkState: v.networkState
+                                    });
+                                }
+                                
+                                // Check source tags
+                                v.querySelectorAll('source').forEach((s, j) => {
+                                    if (s.src) {
+                                        videos.push({
+                                            type: 'source',
+                                            index: j,
+                                            src: s.src,
+                                            duration: v.duration || 0
+                                        });
+                                    }
+                                });
+                            });
+                            
+                            // Check shadow DOM
+                            const checkShadow = (root) => {
+                                if (root.shadowRoot) {
+                                    root.shadowRoot.querySelectorAll('video').forEach((v, i) => {
+                                        const src = v.currentSrc || v.src || '';
+                                        if (src) {
+                                            videos.push({
+                                                type: 'shadow-video',
+                                                src: src,
+                                                duration: v.duration || 0
+                                            });
+                                        }
+                                    });
+                                    root.shadowRoot.querySelectorAll('*').forEach(checkShadow);
+                                }
+                            };
+                            document.querySelectorAll('*').forEach(checkShadow);
+                            
+                            return videos;
+                        }
+                    """)
+                    
+                    if video_info and len(video_info) > 0:
+                        log_fn(f"  ✓ Found {len(video_info)} video source(s)")
+                        
+                        # Filter out preview sources (short duration)
+                        valid_sources = []
+                        for v in video_info:
+                            src = v.get('src', '')
+                            duration = v.get('duration', 0)
+                            
+                            # Skip preview sources (duration < 30s or suspicious URLs)
+                            if duration > 0 and duration < 30:
+                                log_fn(f"  ⚠ Skipping preview source (duration: {duration:.1f}s): {src[:80]}...")
+                                continue
+                                
+                            if any(x in src.lower() for x in ['.mp4', '.m3u8', 'videoplayback', 'mycdn.me']):
+                                if not any(x in src.lower() for x in ['.jpg', '.jpeg', '.png', 'preview']):
+                                    valid_sources.append(src)
+                                    log_fn(f"  ✓ Valid source found: {src[:100]}...")
+                        
+                        if valid_sources:
+                            # Prefer .mp4 over .m3u8 for direct download
+                            mp4_sources = [s for s in valid_sources if '.mp4' in s.lower()]
+                            if mp4_sources:
+                                best = mp4_sources[0]
+                                log_fn(f"  ✓ Selected MP4 source: {best[:120]}...")
+                                return best
+                            
+                            # Otherwise use the first valid source
+                            best = valid_sources[0]
+                            log_fn(f"  ✓ Selected source: {best[:120]}...")
+                            return best
+                    
+                    # Check captured network requests
+                    if video_urls:
+                        log_fn(f"  • Found {len(video_urls)} video URLs from network")
+                        
+                        # Filter out preview URLs
+                        filtered_urls = []
+                        for vu in video_urls:
+                            vu_lower = vu.lower()
+                            
+                            # Skip obvious previews
+                            if any(x in vu_lower for x in ['preview', 'thumbnail', 'poster']):
+                                continue
+                                
+                            # Skip image files
+                            if any(vu_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+                                continue
+                                
+                            # Check for video patterns
+                            if any(x in vu_lower for x in ['.mp4', '.m3u8', 'videoplayback', 'mycdn.me']):
+                                filtered_urls.append(vu)
+                        
+                        log_fn(f"  • After filtering: {len(filtered_urls)} actual video URLs")
+                        
+                        if filtered_urls:
+                            # Sort by preference: .mp4 first, then .m3u8
+                            filtered_urls.sort(key=lambda x: (
+                                0 if '.mp4' in x.lower() else 
+                                1 if '.m3u8' in x.lower() else 2
+                            ))
+                            
+                            best_url = filtered_urls[0]
+                            log_fn(f"  ✓ Best video URL from network: {best_url[:120]}...")
+                            return best_url
+                    
+                    # Check iframes
+                    log_fn("  • Checking iframes...")
+                    frames = page.frames
+                    for i, frame in enumerate(frames[1:], 1):  # Skip main frame
+                        try:
+                            if 'video' in frame.url.lower() or 'player' in frame.url.lower():
+                                log_fn(f"    • Checking iframe {i}: {frame.url[:80]}...")
+                                
+                                # Look for video in iframe
+                                iframe_src = frame.evaluate("""
+                                    () => {
+                                        const v = document.querySelector('video');
+                                        if (v) {
+                                            const src = v.currentSrc || v.src || '';
+                                            if (src) return src;
+                                        }
+                                        const source = document.querySelector('video source');
+                                        return source ? source.src : null;
+                                    }
+                                """)
+                                
+                                if iframe_src:
+                                    log_fn(f"    ✓ Found video in iframe: {iframe_src[:120]}...")
+                                    return iframe_src
+                        except:
+                            continue
+                    
+                except Exception as e:
+                    log_fn(f"  ⚠ Error with UA {ua[:30]}: {str(e)[:100]}")
+                
+                finally:
+                    context.close()
+            
+            log_fn("  ✗ No video source found with any user agent")
+            return None
+            
+    except ImportError:
+        log_fn("  ⚠ Playwright not installed. Run: pip install playwright && playwright install")
+        return None
+    except Exception as e:
+        log_fn(f"  ✗ Playwright extraction failed: {str(e)[:120]}")
+        return None
+
+def _try_extract_video_src(driver, log_fn, context):
+    try:
+        WebDriverWait(driver, 10).until(lambda d: d.execute_script("return !!document.querySelector('video')"))
+        log_fn(f"    ✓ <video> in {context}")
+        
+        driver.execute_script("""
+            let v = document.querySelector('video');
+            if (v) {
+                v.preload = 'auto';
+                v.muted = true;
+                v.play().catch(()=>{});
+            }
+        """)
+        time.sleep(3.5)
+        
+        src = driver.execute_script("return document.querySelector('video')?.currentSrc || '';")
+        if src and any(x in src.lower() for x in [".mp4", ".m3u8", ".ts"]):
+            log_fn(f"    ✓ Source from {context}: {src[:120]}...")
+            return src
+        
+        sources = driver.find_elements(By.CSS_SELECTOR, "video source")
+        for s in sources:
+            src = s.get_attribute("src") or ""
+            if src and any(x in src.lower() for x in [".mp4", ".m3u8"]):
+                log_fn(f"    ✓ <source> from {context}: {src[:120]}...")
+                return src
+    except Exception as e:
+        log_fn(f"    ⚠ Extraction in {context} failed: {str(e)[:100]}")
+    return None
+
+def _capture_yandex_network_media(driver, log_fn):
+    time.sleep(2)
+    driver.execute_script("document.querySelector('video')?.play().catch(()=>{});")
+    time.sleep(8)
+    
+    media = set()
+    try:
+        logs = driver.get_log("performance")
+        for entry in logs:
+            try:
+                msg = json.loads(entry["message"])["message"]
+                if msg["method"] == "Network.requestWillBeSent":
+                    u = msg["params"]["request"]["url"].lower()
+                    if any(x in u for x in [".mp4", ".m3u8", ".ts", "master.m3u8", "videoplayback", "mycdn.me"]):
+                        full_u = msg["params"]["request"]["url"]
+                        log_fn(f"    • Captured: {full_u[:140]}...")
+                        media.add(full_u)
+            except:
+                continue
+    except Exception as e:
+        log_fn(f"    ⚠ Network capture failed: {e}")
+    
+    if not media:
+        return None
+    
+    candidates = sorted(media, key=lambda x: ("master.m3u8" in x.lower(), ".m3u8" in x.lower(), len(x)), reverse=True)
+    best = candidates[0]
+    log_fn(f"    ✓ Best media URL: {best[:140]}...")
+    return best
+
+def download_from_extracted_source(source_url: str, output_template: str, log_fn: Callable = print) -> Tuple[bool, Optional[str]]:
+    log_fn(f"📥 Downloading extracted Yandex source: {source_url[:100]}...")
+    
+    cmd = [
+        "yt-dlp",
+        "-o", output_template,
+        "--no-playlist",
+        "--no-warnings",
+        "--force-ipv4",
+        "--socket-timeout", "90",
+        "--retries", "6",
+        source_url
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=400, check=True)
+        filename = None
+        for line in result.stdout.splitlines():
+            if "Destination:" in line:
+                filename = line.split("Destination:")[1].strip()
+                break
+        if filename and os.path.exists(filename):
+            log_fn(f"✅ Direct download success: {filename}")
+            return True, filename
+    except Exception as e:
+        log_fn(f"⚠ yt-dlp direct failed: {e}")
+    
+    if ".m3u8" in source_url.lower():
+        final_path = output_template.replace(".%(ext)s", ".mp4") if ".%(ext)s" in output_template else output_template + ".mp4"
+        cmd = ["ffmpeg", "-i", source_url, "-c", "copy", final_path]
+        try:
+            subprocess.run(cmd, check=True, timeout=400)
+            if os.path.exists(final_path):
+                log_fn(f"✅ ffmpeg success: {final_path}")
+                return True, final_path
+        except Exception as e:
+            log_fn(f"⚠ ffmpeg failed: {e}")
+    
+    return False, None
 
 if __name__ == "__main__":
     test_downloader()
