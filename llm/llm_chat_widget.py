@@ -22,13 +22,14 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QLineEdit, QComboBox,
-    QGroupBox, QFileDialog, QApplication,
+    QGroupBox, QFileDialog, QApplication, QCheckBox,
     QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QThread, QTimer
 from PySide6.QtGui import QTextCursor
 
 from .llm_module import LLMModule, VideoContextBuilder, get_available_backends, get_ollama_models, VideoSeekAnalyzer
+from .llm_reasoning import ReasoningLLMIntegration
 
 # timeline bridge (only available when timeline viewer is present)
 try:
@@ -214,6 +215,8 @@ class LLMChatWidget(QWidget):
         self._compact = compact
         self._cache_dir = cache_dir
         self._timeline_bridge: Optional['TimelineBridge'] = None
+        self.reasoning_engine = None
+        self.reasoning_enabled = True
         if HAS_TIMELINE_BRIDGE:
             self._timeline_bridge = TimelineBridge()
 
@@ -342,6 +345,34 @@ class LLMChatWidget(QWidget):
         self.search_progress.setStyleSheet("color:#2196F3;font-style:italic;font-size:9pt;")
         settings_layout.addWidget(self.search_progress)
         
+        # ===== Reasoning controls =====
+        reasoning_group = QGroupBox("Reasoning Engine")
+        reasoning_layout = QHBoxLayout()
+        
+        self.reasoning_checkbox = QCheckBox("Enable reasoning")
+        self.reasoning_checkbox.setChecked(True)
+        self.reasoning_checkbox.setToolTip(
+            "When enabled, the LLM will infer relationships between detected objects and actions\n"
+            "Examples: 'Person is punching person', 'Person drinking from cup', 'Multiple people talking'"
+        )
+        reasoning_layout.addWidget(self.reasoning_checkbox)
+        
+        self.reasoning_stats_btn = QPushButton("📊 Stats")
+        self.reasoning_stats_btn.setFixedWidth(60)
+        self.reasoning_stats_btn.setToolTip("Show reasoning statistics")
+        self.reasoning_stats_btn.clicked.connect(self._show_reasoning_stats)
+        reasoning_layout.addWidget(self.reasoning_stats_btn)
+        
+        self.reasoning_save_btn = QPushButton("💾 Save")
+        self.reasoning_save_btn.setFixedWidth(60)
+        self.reasoning_save_btn.setToolTip("Save inferred facts to cache")
+        self.reasoning_save_btn.clicked.connect(self._save_reasoning_facts)
+        reasoning_layout.addWidget(self.reasoning_save_btn)
+        
+        reasoning_layout.addStretch()
+        reasoning_group.setLayout(reasoning_layout)
+        settings_layout.addWidget(reasoning_group)
+
         settings_group.setLayout(settings_layout)
         if self._compact:
             settings_group.setMaximumHeight(250)
@@ -408,6 +439,29 @@ class LLMChatWidget(QWidget):
         # Initialize analyzer if we have video path
         if video_path and os.path.exists(video_path):
             self._init_analyzer()
+        
+        # Initialize reasoning engine if enabled
+        if hasattr(self, 'reasoning_checkbox') and self.reasoning_checkbox.isChecked():
+            try:
+                from .llm_reasoning import ReasoningLLMIntegration
+                if self._llm and self._llm.is_loaded():
+                    self.reasoning_engine = ReasoningLLMIntegration(
+                        self._llm, data, video_path
+                    )
+                    # Use get_action_statistics() instead of get_statistics()
+                    stats = self.reasoning_engine.reasoning_engine.get_action_statistics()
+                    self._append_system(
+                        f"🧠 Reasoning engine initialized with {stats['total_actions']} actions analyzed"
+                    )
+                else:
+                    self._append_system(
+                        "⚠️ LLM not connected yet. Reasoning engine will initialize when you connect."
+                    )
+                    # Store data for later initialization
+                    self._pending_reasoning_data = data
+            except Exception as e:
+                self._append_system(f"⚠️ Could not initialize reasoning: {e}")
+                self.reasoning_engine = None
 
     def set_timeline_window(self, window):
         """Connect to a SignalTimelineWindow for timeline control.
@@ -763,6 +817,60 @@ class LLMChatWidget(QWidget):
         )
         self.context_label.setStyleSheet("color:#4CAF50;font-size:9pt;font-weight:bold;")
 
+    def _show_reasoning_stats(self):
+        """Show reasoning engine statistics."""
+        if not hasattr(self, 'reasoning_engine') or not self.reasoning_engine:
+            self._append_system("⚠️ Reasoning engine not initialized. Load a cache file first.")
+            return
+        
+        try:
+            # Try to get action summary first
+            summary = self.reasoning_engine.get_action_summary()
+            self._append_system(summary)
+        except AttributeError:
+            # Fallback to older method
+            try:
+                stats = self.reasoning_engine.reasoning_engine.get_action_statistics()
+                lines = [
+                    "📊 **Action Statistics**",
+                    f"• Total actions: {stats['total_actions']}",
+                    f"• Unique action types: {stats['unique_actions']}",
+                    f"• Timestamps with actions: {stats['timestamps_with_actions']}",
+                    f"• Action clusters: {stats['action_clusters']}",
+                    "\nMost common actions:"
+                ]
+                for action, count in stats['most_common'][:5]:
+                    lines.append(f"  • {action}: {count} times")
+                self._append_system("\n".join(lines))
+            except:
+                self._append_system("⚠️ Could not retrieve statistics")
+
+        
+        # Show action sequences if any
+        if self.reasoning_engine.reasoning_engine.action_sequences:
+            lines.append("\n🎬 **Detected Action Sequences:**")
+            for seq in self.reasoning_engine.reasoning_engine.action_sequences[:3]:
+                lines.append(
+                    f"  • {seq.description} "
+                    f"({int(seq.start_time)//60}:{int(seq.start_time)%60:02d} - "
+                    f"{int(seq.end_time)//60}:{int(seq.end_time)%60:02d})"
+                )
+        
+        self._append_system("\n".join(lines))
+
+    def _save_reasoning_facts(self):
+        """Save inferred facts to cache."""
+        if not hasattr(self, 'reasoning_engine') or not self.reasoning_engine:
+            self._append_system("⚠️ No reasoning engine to save.")
+            return
+        
+        try:
+            saved_path = self.reasoning_engine.save_analysis(self._cache_dir)
+            self._append_system(f"💾 Reasoning facts saved to: {os.path.basename(saved_path)}")
+        except Exception as e:
+            self._append_system(f"❌ Failed to save: {e}")
+
+
     # ------------------------------------------------ Handlers
 
     def _on_backend_changed(self, _index):
@@ -830,6 +938,22 @@ class LLMChatWidget(QWidget):
             if self._video_path and os.path.exists(self._video_path):
                 self._init_analyzer()
 
+            # Initialize reasoning engine if we have pending data
+            if hasattr(self, '_pending_reasoning_data') and self._pending_reasoning_data:
+                try:
+                    from .llm_reasoning import ReasoningLLMIntegration
+                    self.reasoning_engine = ReasoningLLMIntegration(
+                        self._llm, self._pending_reasoning_data, self._video_path
+                    )
+                    stats = self.reasoning_engine.reasoning_engine.get_action_statistics()
+                    self._append_system(
+                        f"🧠 Reasoning engine initialized with {stats['total_actions']} actions analyzed"
+                    )
+                    delattr(self, '_pending_reasoning_data')
+                except Exception as e:
+                    self._append_system(f"⚠️ Could not initialize reasoning: {e}")
+
+
             if self._analysis_data:
                 n_obj = len(self._analysis_data.get("objects", []))
                 n_act = len(self._analysis_data.get("actions", []))
@@ -861,6 +985,30 @@ class LLMChatWidget(QWidget):
         if self._worker and self._worker.isRunning():
             self._append_system("Still generating... please wait.")
             return
+        
+        # Special handling for reasoning questions
+        if (hasattr(self, 'reasoning_engine') and self.reasoning_engine and 
+            text.lower().startswith(('why ', 'how do you know', 'explain '))):
+            
+            current_time = 0
+            if self._timeline_bridge and self._timeline_bridge._window:
+                current_time = getattr(self._timeline_bridge._window, 'current_time', 0)
+            
+            answer = self.reasoning_engine.answer_why_question(text, current_time)
+            if answer:
+                # Show user message first
+                self._append_user(text)
+                # Then show reasoning answer with special styling
+                self._append_html(
+                    f'<div style="color:#FFD700;margin:8px 0;padding:8px;'
+                    f'background:#2a2a2a;border-left:4px solid #FFD700;'
+                    f'font-family:monospace;">'
+                    f'🔍 {answer}</div>'
+                )
+                self.input_field.clear()
+                self._chat_history.append({"role": "user", "content": text})
+                self._chat_history.append({"role": "assistant", "content": answer})
+                return
 
         # Check for mode commands
         force_visual = False

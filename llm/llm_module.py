@@ -851,7 +851,7 @@ class VideoSeekAnalyzer:
         ret, frame = self.cap.read()
         return frame if ret else None
     
-    def frame_to_base64(self, frame, quality: int = 85) -> str:
+    def frame_to_base64(self, frame, quality: int = 100) -> str:
         """
         Convert OpenCV frame to base64 string for LLM vision.
         
