@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QFileDialog, QApplication, QCheckBox,
     QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox,
 )
-from PySide6.QtCore import Qt, Signal, Slot, QThread, QTimer
+from PySide6.QtCore import Qt, Signal, Slot, QThread, QTimer, QSettings
 from PySide6.QtGui import QTextCursor
 
 from .llm_module import (
@@ -235,6 +235,8 @@ class LLMChatWidget(QWidget):
     Self-contained chat panel. Auto-loads latest cache from disk on startup.
     Now with VideoSeekAnalyzer integration for visual search and seeking.
     """
+    MAX_RECENT_GGUF = 5
+    SETTINGS_KEY = "VideoHighlighter/LLMChat"
 
     llm_replied = Signal(str)
 
@@ -322,6 +324,11 @@ class LLMChatWidget(QWidget):
         self.mmproj_row_widget.setLayout(mmproj_inner)
         self.mmproj_row_widget.setVisible(False)
         settings_layout.addWidget(self.mmproj_row_widget)
+        # Restore last-used GGUF paths
+        settings = QSettings(self.SETTINGS_KEY, "LLMChat")
+        self.gguf_path_input.setText(settings.value("last_gguf_path", ""))
+        self.mmproj_path_input.setText(settings.value("last_mmproj_path", ""))
+
 
         # Row 3: connect + status
         row3 = QHBoxLayout()
@@ -993,13 +1000,39 @@ class LLMChatWidget(QWidget):
         self.gguf_row_widget.setVisible(is_gguf)
         self.mmproj_row_widget.setVisible(is_gguf)
         self.refresh_btn.setVisible(not is_gguf)
-        
         self.model_combo.setEnabled(not is_gguf)
+
         if is_gguf:
-            self.model_combo.clear()
-            self.model_combo.addItem("(using GGUF file)")
+            self._populate_recent_gguf()
         else:
             self._refresh_models()
+
+    def _populate_recent_gguf(self):
+        """Fill model combo with recently used GGUF files."""
+        self.model_combo.clear()
+        settings = QSettings(self.SETTINGS_KEY, "LLMChat")
+        recent = settings.value("recent_gguf_paths", [])
+        # QSettings may return a string instead of list if only 1 item
+        if isinstance(recent, str):
+            recent = [recent] if recent else []
+
+        if recent:
+            for path in recent:
+                # Show just filename in dropdown, store full path as data
+                self.model_combo.addItem(os.path.basename(path), path)
+            # Auto-fill the path input when user picks from dropdown
+            self.model_combo.currentIndexChanged.connect(self._on_recent_gguf_selected)
+            # Select the most recent one
+            self.model_combo.setCurrentIndex(0)
+            self._on_recent_gguf_selected(0)
+        else:
+            self.model_combo.addItem("(no recent models — use Browse)")
+
+    def _on_recent_gguf_selected(self, index):
+        """When user picks a recent GGUF from dropdown, fill the path input."""
+        path = self.model_combo.currentData()
+        if path and os.path.exists(path):
+            self.gguf_path_input.setText(path)
 
     def _refresh_models(self):
         self.model_combo.clear()
@@ -1040,6 +1073,9 @@ class LLMChatWidget(QWidget):
     def _connect_llm(self):
         backend = self.backend_combo.currentData()
         model = self.model_combo.currentText().strip()
+        gguf_path = ""
+        mmproj_path = None
+
 
         self.status_label.setText("Connecting...")
         self.status_label.setStyleSheet("color:#2196F3;font-style:italic;")
@@ -1070,6 +1106,12 @@ class LLMChatWidget(QWidget):
                 raise ValueError(f"Unknown backend: {backend}")
 
             self._llm.load()
+
+            self._save_gguf_to_recent(gguf_path)
+            settings = QSettings(self.SETTINGS_KEY, "LLMChat")
+            settings.setValue("last_gguf_path", gguf_path)
+            if mmproj_path:
+                settings.setValue("last_mmproj_path", mmproj_path)
 
             if backend == "llama-cpp":
                 model_name = os.path.basename(gguf_path)
@@ -1121,6 +1163,26 @@ class LLMChatWidget(QWidget):
             self.send_btn.setEnabled(False)
         finally:
             self.connect_btn.setEnabled(True)
+
+    def _save_gguf_to_recent(self, path: str):
+        """Add a GGUF path to the recent list (most recent first, no duplicates)."""
+        settings = QSettings(self.SETTINGS_KEY, "LLMChat")
+        recent = settings.value("recent_gguf_paths", [])
+        if isinstance(recent, str):
+            recent = [recent] if recent else []
+
+        # Remove if already present, then prepend
+        if path in recent:
+            recent.remove(path)
+        recent.insert(0, path)
+
+        # Cap the list
+        recent = recent[:self.MAX_RECENT_GGUF]
+        settings.setValue("recent_gguf_paths", recent)
+
+        # Refresh dropdown if currently showing GGUF mode
+        if self.backend_combo.currentData() == "llama-cpp":
+            self._populate_recent_gguf()
 
     def _send_message(self):
         text = self.input_field.text().strip()
