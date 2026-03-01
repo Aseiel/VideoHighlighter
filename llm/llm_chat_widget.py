@@ -485,8 +485,11 @@ class LLMChatWidget(QWidget):
             self.llm_chat = LLMChatWidget(parent=self, compact=True)
             self.llm_chat.set_timeline_window(self)
         """
+    def set_timeline_window(self, window):
         if self._timeline_bridge:
             self._timeline_bridge.set_timeline_window(window)
+            # Wire up visual_scan command to use the search panel
+            self._timeline_bridge.set_scan_callback(self._trigger_visual_scan)
             self._update_context_label()
             self._append_system(
                 "Timeline connected! You can now ask me to edit the timeline.\n"
@@ -616,6 +619,12 @@ class LLMChatWidget(QWidget):
             self.search_progress.setText("Search stopped")
             self.search_btn.setEnabled(True)
             self.stop_search_btn.setEnabled(False)
+
+    def _trigger_visual_scan(self, target: str, interval: float):
+        """Called by TimelineBridge when LLM generates [CMD:visual_scan]."""
+        self.search_target.setText(target)
+        self.search_interval.setValue(interval)
+        self._start_visual_search()
 
     @Slot(int, int, float, str)
     def _on_search_progress(self, current: int, total: int, timestamp: float, preview: str):
