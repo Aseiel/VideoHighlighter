@@ -40,6 +40,30 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Cancellation token — allows external code to abort generation mid-stream
+# ---------------------------------------------------------------------------
+class CancellationToken:
+    """Thread-safe cancellation flag that backends check during generation."""
+    def __init__(self):
+        self._cancelled = threading.Event()
+
+    def cancel(self):
+        self._cancelled.set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def reset(self):
+        self._cancelled.clear()
+
+
+class GenerationCancelled(Exception):
+    """Raised when generation is cancelled via CancellationToken."""
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Response sanitizer — strips leaked role tokens and self-conversation
 # ---------------------------------------------------------------------------
 # Patterns that indicate the model started role-playing a conversation
@@ -103,7 +127,8 @@ class _LLMBackend:
 
     def generate(self, prompt: str, system: str = "", max_tokens: int = 1024,
                  temperature: float = 0.7, stream_callback: Optional[Callable] = None,
-                 images: list[str] | None = None) -> str:
+                 images: list[str] | None = None,
+                 cancellation_token: Optional[CancellationToken] = None) -> str:
         raise NotImplementedError
 
     def is_loaded(self) -> bool:
@@ -115,6 +140,15 @@ class _LLMBackend:
     @staticmethod
     def available() -> bool:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Helper: check cancellation inside any streaming loop
+# ---------------------------------------------------------------------------
+def _check_cancel(cancel_token: Optional[CancellationToken]):
+    """Raise GenerationCancelled if the token is set."""
+    if cancel_token and cancel_token.is_cancelled:
+        raise GenerationCancelled("Generation cancelled by user")
 
 
 # ---------------------------------------------------------------------------
@@ -163,12 +197,10 @@ class _OllamaBackend(_LLMBackend):
 
     def generate(self, prompt: str, system: str = "", max_tokens: int = 1024,
                 temperature: float = 0.7, stream_callback: Optional[Callable] = None,
-                images: list[str] | None = None) -> str:
+                images: list[str] | None = None,
+                cancellation_token: Optional[CancellationToken] = None) -> str:
         import requests
 
-        # FIX #1: Don't embed system prompt inside user prompt — this causes
-        # small models to echo it back or get confused about boundaries.
-        # Instead, rely on the separate "system" field which Ollama handles natively.
         formatted_prompt = prompt
 
         payload = {
@@ -180,10 +212,8 @@ class _OllamaBackend(_LLMBackend):
                 "num_predict": max_tokens,
                 "num_ctx": 2048,
                 "temperature": temperature,
-                # FIX #2: Add repetition penalty to prevent looping
                 "repeat_penalty": 1.3,
                 "repeat_last_n": 128,
-                # FIX #3: Add stop sequences to prevent self-conversation
                 "stop": STOP_SEQUENCES,
             },
         }
@@ -199,14 +229,14 @@ class _OllamaBackend(_LLMBackend):
                 for line in resp.iter_lines():
                     if not line:
                         continue
+                    # Check cancellation on every token
+                    _check_cancel(cancellation_token)
                     chunk = json.loads(line)
                     token = chunk.get("response", "")
                     if token:
                         full_text.append(token)
-                        # FIX #4: Check for self-talk during streaming
                         current_text = "".join(full_text)
                         if _SELF_TALK_PATTERNS.search(current_text):
-                            # Stop immediately — model started self-talking
                             break
                         stream_callback(token)
                     if chunk.get("done", False):
@@ -214,9 +244,26 @@ class _OllamaBackend(_LLMBackend):
             raw = "".join(full_text)
             return sanitize_response(raw)
         else:
-            resp = requests.post(f"{self.base_url}/api/generate", json=payload, timeout=120)
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
+            # Non-streaming: use streaming internally so we can cancel
+            full_text = []
+            payload["stream"] = True
+            with requests.post(f"{self.base_url}/api/generate", json=payload,
+                            stream=True, timeout=120) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    _check_cancel(cancellation_token)
+                    chunk = json.loads(line)
+                    token = chunk.get("response", "")
+                    if token:
+                        full_text.append(token)
+                        current_text = "".join(full_text)
+                        if _SELF_TALK_PATTERNS.search(current_text):
+                            break
+                    if chunk.get("done", False):
+                        break
+            raw = "".join(full_text)
             return sanitize_response(raw)
 
     def unload(self):
@@ -296,26 +343,29 @@ class _LlamaCppBackend(_LLMBackend):
 
     def generate(self, prompt: str, system: str = "", max_tokens: int = 1024,
                 temperature: float = 0.7, stream_callback: Optional[Callable] = None,
-                images: list[str] | None = None) -> str:
+                images: list[str] | None = None,
+                cancellation_token: Optional[CancellationToken] = None) -> str:
         if not self._model:
             raise RuntimeError("Model not loaded. Call load() first.")
 
         if images and self.mmproj_path:
             return self._generate_vision(prompt, system, images, max_tokens, 
-                                        temperature, stream_callback)
+                                        temperature, stream_callback,
+                                        cancellation_token)
         else:
             return self._generate_text(prompt, system, max_tokens, 
-                                      temperature, stream_callback)
+                                      temperature, stream_callback,
+                                      cancellation_token)
 
     def _generate_text(self, prompt: str, system: str = "", max_tokens: int = 1024,
-                      temperature: float = 0.7, stream_callback: Optional[Callable] = None) -> str:
+                      temperature: float = 0.7, stream_callback: Optional[Callable] = None,
+                      cancellation_token: Optional[CancellationToken] = None) -> str:
         """Handle text-only generation with anti-hallucination measures."""
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        # FIX #5: Common generation kwargs with stop sequences and repetition penalty
         gen_kwargs = {
             "messages": messages,
             "max_tokens": max_tokens,
@@ -324,29 +374,31 @@ class _LlamaCppBackend(_LLMBackend):
             "stop": STOP_SEQUENCES,
         }
 
-        if stream_callback:
-            full_text = []
-            for chunk in self._model.create_chat_completion(**gen_kwargs, stream=True):
-                delta = chunk["choices"][0].get("delta", {})
-                token = delta.get("content", "")
-                if token:
-                    full_text.append(token)
-                    # FIX #6: Check for self-talk mid-stream
-                    joined = "".join(full_text)
-                    if _SELF_TALK_PATTERNS.search(joined):
-                        break
+        # ALWAYS use streaming for llama-cpp so we can check cancellation
+        full_text = []
+        for chunk in self._model.create_chat_completion(**gen_kwargs, stream=True):
+            _check_cancel(cancellation_token)
+            delta = chunk["choices"][0].get("delta", {})
+            token = delta.get("content", "")
+            if token:
+                full_text.append(token)
+                joined = "".join(full_text)
+                if _SELF_TALK_PATTERNS.search(joined):
+                    break
+                if stream_callback:
                     stream_callback(token)
-            raw = "".join(full_text)
-            return sanitize_response(raw)
-        else:
-            result = self._model.create_chat_completion(**gen_kwargs)
-            raw = result["choices"][0]["message"]["content"]
-            return sanitize_response(raw)
+        raw = "".join(full_text)
+        return sanitize_response(raw)
 
     def _generate_vision(self, prompt: str, system: str = "", images: list[str] = None,
                         max_tokens: int = 1024, temperature: float = 0.7,
-                        stream_callback: Optional[Callable] = None) -> str:
-        """Handle vision generation with proper chat handler."""
+                        stream_callback: Optional[Callable] = None,
+                        cancellation_token: Optional[CancellationToken] = None) -> str:
+        """Handle vision generation with proper chat handler.
+        
+        Always streams internally so cancellation_token can interrupt
+        even when no stream_callback is provided.
+        """
         try:
             image_urls = []
             for img_b64 in images:
@@ -371,7 +423,6 @@ class _LlamaCppBackend(_LLMBackend):
             
             print(f"📤 Sending vision request with {len(images)} images")
 
-            # FIX #7: Add stop sequences + repetition penalty to vision too
             gen_kwargs = {
                 "messages": messages,
                 "max_tokens": max_tokens,
@@ -380,33 +431,31 @@ class _LlamaCppBackend(_LLMBackend):
                 "stop": STOP_SEQUENCES,
             }
 
-            if stream_callback:
-                full_text = []
-                for chunk in self._model.create_chat_completion(**gen_kwargs, stream=True):
-                    if "choices" in chunk and len(chunk["choices"]) > 0:
-                        delta = chunk["choices"][0].get("delta", {})
-                        token = delta.get("content", "")
-                        if token:
-                            full_text.append(token)
-                            joined = "".join(full_text)
-                            if _SELF_TALK_PATTERNS.search(joined):
-                                break
+            # ALWAYS stream internally so we can check cancellation_token
+            # between tokens. Previously the non-streaming path was a single
+            # blocking C call with no way to interrupt.
+            full_text = []
+            for chunk in self._model.create_chat_completion(**gen_kwargs, stream=True):
+                _check_cancel(cancellation_token)
+                if "choices" in chunk and len(chunk["choices"]) > 0:
+                    delta = chunk["choices"][0].get("delta", {})
+                    token = delta.get("content", "")
+                    if token:
+                        full_text.append(token)
+                        joined = "".join(full_text)
+                        if _SELF_TALK_PATTERNS.search(joined):
+                            break
+                        if stream_callback:
                             stream_callback(token)
-                raw = "".join(full_text)
-                result = sanitize_response(raw)
-                print(f"✅ Vision generation complete: {len(result)} chars")
-                return result
-            else:
-                result = self._model.create_chat_completion(**gen_kwargs)
-                if "choices" in result and len(result["choices"]) > 0:
-                    raw = result["choices"][0]["message"]["content"]
-                    result_text = sanitize_response(raw)
-                    print(f"✅ Vision generation complete: {len(result_text)} chars")
-                    return result_text
-                else:
-                    print("⚠️ No choices in result")
-                    return "No response generated"
+            raw = "".join(full_text)
+            result = sanitize_response(raw)
+            print(f"✅ Vision generation complete: {len(result)} chars")
+            return result
                     
+        except GenerationCancelled:
+            # Re-raise so callers see the cancellation
+            raw = "".join(full_text) if 'full_text' in dir() else ""
+            return sanitize_response(raw)
         except Exception as e:
             print(f"❌ Vision generation error: {e}")
             import traceback
@@ -414,29 +463,25 @@ class _LlamaCppBackend(_LLMBackend):
             
             print("⚠️ Falling back to raw prompt format...")
             return self._generate_vision_fallback(prompt, system, images, max_tokens, 
-                                                  temperature, stream_callback)
+                                                  temperature, stream_callback,
+                                                  cancellation_token)
 
     def _generate_vision_fallback(self, prompt: str, system: str = "", images: list[str] = None,
                                  max_tokens: int = 1024, temperature: float = 0.7,
-                                 stream_callback: Optional[Callable] = None) -> str:
+                                 stream_callback: Optional[Callable] = None,
+                                 cancellation_token: Optional[CancellationToken] = None) -> str:
         """Fallback method using raw prompt formatting (LLaVA style)."""
         try:
-            # FIX #8: Don't use "User:" / "Assistant:" markers in the raw prompt!
-            # These teach the model to role-play both sides of a conversation.
-            # Use a clean format instead.
             prompt_parts = []
             
             if system:
                 prompt_parts.append(system)
                 prompt_parts.append("")
             
-            # Image tokens (one per image)
             for _ in images:
                 prompt_parts.append("<image>")
             
             prompt_parts.append("")
-            # FIX: Use "Question:" / "Answer:" instead of "User:" / "Assistant:"
-            # This is less likely to trigger multi-turn generation
             prompt_parts.append(f"Question: {prompt}")
             prompt_parts.append("Answer:")
             
@@ -450,7 +495,6 @@ class _LlamaCppBackend(_LLMBackend):
                     img_b64 = img_b64.split(',', 1)[1]
                 image_bytes.append(base64.b64decode(img_b64))
             
-            # FIX #9: Add stop + repeat_penalty to fallback too
             gen_kwargs = {
                 "prompt": full_prompt,
                 "max_tokens": max_tokens,
@@ -460,23 +504,24 @@ class _LlamaCppBackend(_LLMBackend):
                 "stop": STOP_SEQUENCES + ["\nQuestion:", "\nQ:"],
             }
 
-            if stream_callback:
-                full_text = []
-                for chunk in self._model.create_completion(**gen_kwargs, stream=True):
-                    token = chunk["choices"][0].get("text", "")
-                    if token:
-                        full_text.append(token)
-                        joined = "".join(full_text)
-                        if _SELF_TALK_PATTERNS.search(joined):
-                            break
+            # Always stream for cancellation support
+            full_text = []
+            for chunk in self._model.create_completion(**gen_kwargs, stream=True):
+                _check_cancel(cancellation_token)
+                token = chunk["choices"][0].get("text", "")
+                if token:
+                    full_text.append(token)
+                    joined = "".join(full_text)
+                    if _SELF_TALK_PATTERNS.search(joined):
+                        break
+                    if stream_callback:
                         stream_callback(token)
-                raw = "".join(full_text)
-                return sanitize_response(raw)
-            else:
-                result = self._model.create_completion(**gen_kwargs)
-                raw = result["choices"][0]["text"]
-                return sanitize_response(raw)
+            raw = "".join(full_text)
+            return sanitize_response(raw)
                 
+        except GenerationCancelled:
+            raw = "".join(full_text) if 'full_text' in dir() else ""
+            return sanitize_response(raw)
         except Exception as e:
             print(f"❌ Fallback also failed: {e}")
             return f"Error processing image: {e}"
@@ -683,8 +728,6 @@ class LLMModule:
         llm.load()
     """
 
-    # FIX #10: Tighter system prompts — explicitly tell model NOT to generate
-    # fake conversation turns or repeat the data back.
     SYSTEM_PROMPT = (
         "You are a video analysis assistant. You have access to structured analysis data below.\n"
         "RULES:\n"
@@ -724,6 +767,16 @@ class LLMModule:
         "If analysis data is provided, use it as additional context.\n"
         "Be specific and detailed. Give ONE description and STOP.\n"
         "Do NOT generate follow-up questions or fake conversation."
+    )
+
+    SYSTEM_PROMPT_VISUAL_SEARCH = (
+        "You are a visual search assistant. The user will ask if a specific thing "
+        "is present in the image.\n"
+        "RULES:\n"
+        "1. Start your answer with YES or NO.\n"
+        "2. Then give a ONE sentence explanation of what you see.\n"
+        "3. STOP after that. Do NOT describe the full scene.\n"
+        "4. Do NOT generate follow-up questions or fake conversation."
     )
 
     def __init__(
@@ -779,9 +832,14 @@ class LLMModule:
         max_tokens: int = 1024,
         temperature: float = 0.3,
         stream_callback: Optional[Callable[[str], None]] = None,
+        cancellation_token: Optional[CancellationToken] = None,
     ) -> str:
         """
         Send a query to the LLM with optional video analysis context.
+        
+        Args:
+            cancellation_token: Optional CancellationToken that, when cancelled,
+                will interrupt generation even mid-token for GGUF vision models.
         """
         if not self._backend.is_loaded():
             raise RuntimeError("LLM not loaded. Call load() first.")
@@ -822,6 +880,7 @@ class LLMModule:
                 temperature=temperature,
                 stream_callback=stream_callback,
                 images=[frame_base64],
+                cancellation_token=cancellation_token,
             )
         
         # ===== TEXT MODE =====
@@ -858,6 +917,7 @@ class LLMModule:
             max_tokens=max_tokens,
             temperature=temperature,
             stream_callback=stream_callback,
+            cancellation_token=cancellation_token,
         )
 
     def verify_action_clip(
@@ -1024,7 +1084,8 @@ class VideoSeekAnalyzer:
     def analyze_current_frame(
         self, 
         user_query: str = "What do you see in this frame? Describe the scene, people, objects, and actions.",
-        custom_prompt: str = None
+        custom_prompt: str = None,
+        cancellation_token: Optional[CancellationToken] = None,
     ) -> dict:
         frame = self.seek_to_time(self.current_time)
         if frame is None:
@@ -1043,7 +1104,8 @@ class VideoSeekAnalyzer:
                 frame_base64=frame_b64,
                 system_prompt=system,
                 temperature=0.3,
-                max_tokens=500
+                max_tokens=500,
+                cancellation_token=cancellation_token,
             )
             
             return {
@@ -1055,6 +1117,12 @@ class VideoSeekAnalyzer:
                     "height": self.height
                 }
             }
+        except GenerationCancelled:
+            return {
+                "cancelled": True,
+                "timestamp": self.current_time,
+                "timestamp_str": f"{int(self.current_time)//60}:{int(self.current_time)%60:02d}"
+            }
         except Exception as e:
             return {
                 "error": str(e),
@@ -1062,7 +1130,8 @@ class VideoSeekAnalyzer:
                 "timestamp_str": f"{int(self.current_time)//60}:{int(self.current_time)%60:02d}"
             }
     
-    def analyze_every_n_seconds(self, interval: float = 1.0, callback=None, save_to_file=None):
+    def analyze_every_n_seconds(self, interval: float = 1.0, callback=None, save_to_file=None,
+                                cancellation_token: Optional[CancellationToken] = None):
         results = []
         num_analyses = int(self.duration / interval) + 1
         timestamps = [i * interval for i in range(num_analyses)]
@@ -1073,6 +1142,11 @@ class VideoSeekAnalyzer:
         progress_interval = max(1, len(timestamps) // 10)
         
         for i, timestamp in enumerate(timestamps):
+            # Check cancellation between frames
+            if cancellation_token and cancellation_token.is_cancelled:
+                print(f"\n⏹ Analysis cancelled at {timestamp:.1f}s")
+                break
+
             if timestamp > self.duration + 0.1:
                 break
                 
@@ -1092,6 +1166,7 @@ class VideoSeekAnalyzer:
                     frame_base64=frame_b64,
                     temperature=0.3,
                     max_tokens=500,
+                    cancellation_token=cancellation_token,
                 )
                 
                 result = {
@@ -1114,6 +1189,9 @@ class VideoSeekAnalyzer:
                     preview = response[:50] + "..." if len(response) > 50 else response
                     print(f"     ↪ {preview}")
                 
+            except GenerationCancelled:
+                print(f"\n⏹ Generation cancelled at {timestamp:.1f}s")
+                break
             except Exception as e:
                 if i % progress_interval == 0:
                     print(f"❌ Error at {timestamp:.1f}s: {e}")
@@ -1131,7 +1209,9 @@ class VideoSeekAnalyzer:
         
         return results
 
-    def analyze_with_seeking(self, interval: float = 1.0, target_description: str = "explosion", max_seeks: int = 100):
+    def analyze_with_seeking(self, interval: float = 1.0, target_description: str = "explosion",
+                            max_seeks: int = 100,
+                            cancellation_token: Optional[CancellationToken] = None):
         results = []
         start_time = 0.0
         current_time = start_time
@@ -1140,6 +1220,10 @@ class VideoSeekAnalyzer:
         print("=" * 60)
         
         for seek_num in range(max_seeks):
+            if cancellation_token and cancellation_token.is_cancelled:
+                print(f"\n⏹ Search cancelled at seek #{seek_num}")
+                break
+
             timestamp = current_time + (seek_num * interval)
             
             if timestamp >= self.duration:
@@ -1159,8 +1243,10 @@ class VideoSeekAnalyzer:
                 response = self.llm.query(
                     user_message=f"Does this frame contain a {target_description}? Answer with YES or NO, and briefly explain what you see.",
                     frame_base64=frame_b64,
+                    system_prompt=LLMModule.SYSTEM_PROMPT_VISUAL_SEARCH,
                     temperature=0.1,
                     max_tokens=150,
+                    cancellation_token=cancellation_token,
                 )
                 
                 result = {
@@ -1178,6 +1264,9 @@ class VideoSeekAnalyzer:
                     print(f"Full analysis: {response}")
                     break
                 
+            except GenerationCancelled:
+                print(f"\n⏹ Search cancelled at {timestamp:.1f}s")
+                break
             except Exception as e:
                 print(f"❌ Error at {timestamp:.1f}s: {e}")
             
