@@ -691,16 +691,24 @@ class LLMChatWidget(QWidget):
 
     @Slot(float, str, str, bool)
     def _on_frame_analyzed(self, timestamp: float, timestamp_str: str, response: str, contains_target: bool):
-        """Show each frame's YES/NO result in chat and update preview."""
+        """Show each frame's YES/NO result in chat and update preview for ALL frames."""
         icon = "✅" if contains_target else "❌"
         short = response[:120] + "..." if len(response) > 120 else response
         self._append_system(f"  {icon} [{timestamp_str}] {short}")
         
-        # Update preview window to show this frame (for debugging)
+        # ALWAYS update preview window to show this frame
         if hasattr(self, '_preview_window') and self._preview_window:
             self._preview_window.seek_to_time(timestamp)
             self._preview_window.force_frame_update()
+            
+            # Show visual feedback in preview
+            if hasattr(self._preview_window, 'show_frame_analysis_status'):
+                self._preview_window.show_frame_analysis_status(timestamp, contains_target)
+            
             QApplication.processEvents()
+        
+        # Update progress
+        self.search_progress.setText(f"Analyzing frame at {timestamp_str}...")
 
     @Slot(float, str, str)
     def _on_search_found(self, timestamp: float, timestamp_str: str, analysis: str):
