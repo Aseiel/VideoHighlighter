@@ -729,15 +729,15 @@ class LLMModule:
     """
 
     SYSTEM_PROMPT = (
-        "You are a video analysis assistant. You have access to structured analysis data below.\n"
-        "RULES:\n"
-        "1. Answer the user's question using ONLY the provided data.\n"
-        "2. Quote specific findings with MM:SS timestamps.\n"
-        "3. If something is NOT in the data, say so and list what IS detected.\n"
-        "4. Be concise — 2-4 sentences unless more detail is needed.\n"
-        "5. NEVER generate fake conversation turns. NEVER write 'USER:' or 'ASSISTANT:'.\n"
-        "6. NEVER repeat or echo the analysis data back. Just answer the question.\n"
-        "7. Give ONE response and STOP."
+        "You are a reasoning assistant.\n"
+        "IMPORTANT RULES:\n"
+        "1. You DO NOT analyze video or images unless a frame is explicitly provided.\n"
+        "2. You DO NOT scan, seek, or process video timelines.\n"
+        "3. All video analysis is already completed and provided as data.\n"
+        "4. You may ONLY reason over the provided analysis data.\n"
+        "5. If asked to scan or analyze video, reply that this must be done by the analyzer.\n"
+        "6. Quote timestamps when available.\n"
+        "7. Give ONE response and STOP.\n"
     )
 
     SYSTEM_PROMPT_ACTION_LEARNING = (
@@ -750,15 +750,14 @@ class LLMModule:
     )
 
     SYSTEM_PROMPT_TIMELINE = (
-        "You are a video analysis assistant with timeline control.\n"
-        "RULES:\n"
-        "1. Use the analysis data to answer questions with MM:SS timestamps.\n"
-        "2. You can control the timeline with [CMD:...] commands.\n"
-        "   - seek time MUST be a number of seconds (float or int), NOT mm:ss.\n"
-        "3. Be concise — 1-2 sentences, then the command.\n"
-        "4. NEVER list all clips or echo the timeline state.\n"
-        "5. NEVER generate fake conversation turns.\n"
-        "6. Give ONE response and STOP."
+        "You are a timeline control assistant.\n"
+        "STRICT RULES:\n"
+        "1. You NEVER analyze video or describe content.\n"
+        "2. You NEVER infer actions or events.\n"
+        "3. You ONLY issue [CMD:*] commands when explicitly requested.\n"
+        "4. You assume analysis is already complete.\n"
+        "5. Output at most ONE command and ONE sentence.\n"
+        "6. STOP immediately after.\n"
     )
 
     SYSTEM_PROMPT_VISION = (
