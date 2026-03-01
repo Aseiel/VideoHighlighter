@@ -253,6 +253,7 @@ class LLMChatWidget(QWidget):
         self._compact = compact
         self._cache_dir = cache_dir
         self._timeline_bridge: Optional['TimelineBridge'] = None
+        self._preview_window = None
         self.reasoning_engine = None
         self.reasoning_enabled = True
         if HAS_TIMELINE_BRIDGE:
@@ -528,6 +529,10 @@ class LLMChatWidget(QWidget):
                 self._append_system(f"⚠️ Could not initialize reasoning: {e}")
                 self.reasoning_engine = None
 
+    def set_preview_window(self, preview):
+        """Connect to a VideoPreviewWindow for seek sync."""
+        self._preview_window = preview
+
     def set_timeline_window(self, window):
         """Connect to a SignalTimelineWindow for timeline control."""
         if self._timeline_bridge:
@@ -677,7 +682,6 @@ class LLMChatWidget(QWidget):
         self._start_visual_search()
 
     @Slot(int, int, float, str)
-    @Slot(int, int, float, str)
     def _on_search_progress(self, current: int, total: int, timestamp: float, preview: str):
         """Update search progress."""
         percent = (current / total) * 100
@@ -687,22 +691,34 @@ class LLMChatWidget(QWidget):
 
     @Slot(float, str, str, bool)
     def _on_frame_analyzed(self, timestamp: float, timestamp_str: str, response: str, contains_target: bool):
-        """Show each frame's YES/NO result in chat so user sees live feedback."""
+        """Show each frame's YES/NO result in chat and update preview."""
         icon = "✅" if contains_target else "❌"
-        # Truncate long responses
         short = response[:120] + "..." if len(response) > 120 else response
         self._append_system(f"  {icon} [{timestamp_str}] {short}")
+        
+        # Update preview window to show this frame (for debugging)
+        if hasattr(self, '_preview_window') and self._preview_window:
+            self._preview_window.seek_to_time(timestamp)
+            self._preview_window.force_frame_update()
+            QApplication.processEvents()
 
     @Slot(float, str, str)
     def _on_search_found(self, timestamp: float, timestamp_str: str, analysis: str):
-        """Handle found target — auto-seek to the found timestamp."""
+        """Handle found target — auto-seek to the found timestamp and display it."""
         self._append_system(
             f"🎯 FOUND at {timestamp_str}!\n"
             f"   {analysis[:150]}..."
         )
         
-        # Auto-seek to the found timestamp
+        # Auto-seek to the found timestamp AND update preview
         self._seek_to_timestamp(timestamp)
+        
+        # Force the analyzer to capture this frame
+        if self._analyzer:
+            frame = self._analyzer.seek_to_time(timestamp)
+            if frame is not None and hasattr(self, '_preview_window') and self._preview_window:
+                # Update preview again to ensure it's showing the right frame
+                self._preview_window.seek_to_time(timestamp)
 
     @Slot(list)
     def _on_search_finished(self, results: list):
@@ -711,12 +727,13 @@ class LLMChatWidget(QWidget):
         found_count = len(found_results)
         
         if found_count > 0:
-            # Build a summary of all found timestamps
             ts_list = ", ".join(r["timestamp_str"] for r in found_results)
             self._append_system(
-                f"✅ Search complete. Found '{self.search_target.text()}' at {found_count} timestamp(s): {ts_list}\n"
-                f"   Use 'seek to <timestamp>' to jump to any found location."
+                f"✅ Search complete. Found '{self.search_target.text()}' at {found_count} timestamp(s): {ts_list}"
             )
+            
+            # Always seek to the first match
+            self._seek_to_timestamp(found_results[0]["timestamp"])
             
             # If we found results and stop_on_match is enabled,
             # we already seeked in _on_search_found. If stop_on_match
@@ -746,23 +763,44 @@ class LLMChatWidget(QWidget):
             self.stop_btn.setEnabled(False)
 
     def _seek_to_timestamp(self, seconds: float):
-        """Seek the timeline to a specific timestamp (shared helper)."""
-        if self._timeline_bridge and self._timeline_bridge._window:
-            window = self._timeline_bridge._window
-            if hasattr(window, 'seek_to_time'):
-                window.seek_to_time(seconds)
-                ts_str = f"{int(seconds)//60}:{int(seconds)%60:02d}"
-                self._append_system(f"⏩ Seeked to {ts_str}")
-                return True
+        """Seek the timeline AND preview to a specific timestamp and ensure frame is displayed."""
+        ts_str = f"{int(seconds)//60}:{int(seconds)%60:02d}"
         
-        # Fallback: at least update the analyzer position
+        # Update analyzer position
         if self._analyzer:
             self._analyzer.current_time = seconds
-            ts_str = f"{int(seconds)//60}:{int(seconds)%60:02d}"
-            self._append_system(f"⏩ Analyzer position set to {ts_str} (no timeline connected)")
-            return True
+            # Actually seek and read a frame to ensure it's loaded
+            frame = self._analyzer.seek_to_time(seconds)
+            if frame is not None:
+                # Optionally cache the frame for later use
+                if hasattr(self, '_current_frame'):
+                    self._current_frame = frame
         
-        return False
+        # Update the preview window with forced frame update
+        if hasattr(self, '_preview_window') and self._preview_window:
+            # First seek to the time
+            self._preview_window.seek_to_time(seconds)
+            
+            # Then force a frame update
+            self._preview_window.force_frame_update()
+            
+            # Process events to ensure UI updates
+            QApplication.processEvents()
+            
+            # For debugging: check if frame was captured
+            if hasattr(self._preview_window, 'capture_current_frame'):
+                frame_image = self._preview_window.capture_current_frame()
+                if frame_image:
+                    self._append_system(f"📸 Frame captured at {ts_str}")
+                else:
+                    self._append_system(f"⚠️ Could not capture frame at {ts_str}")
+        
+        # Also use timeline bridge if available
+        if self._timeline_bridge and self._timeline_bridge.is_connected:
+            result = self._timeline_bridge._cmd_seek({'time': str(seconds)})
+            self._append_system(result)
+        
+        return True
 
     # ------------------------------------------------ Cache loading
 
@@ -1477,6 +1515,33 @@ class LLMChatWidget(QWidget):
                 self.search_target.setText(search_target)
                 self._start_visual_search()
                 return True
+        
+        return False
+    
+    def capture_and_show_frame(self, timestamp: float):
+        """Manually capture and display a frame from the video"""
+        if not self._analyzer:
+            self._append_system("⚠️ No analyzer available")
+            return False
+        
+        # Seek and capture
+        frame = self._analyzer.seek_to_time(timestamp)
+        if frame is None:
+            self._append_system(f"⚠️ Could not read frame at {timestamp:.1f}s")
+            return False
+        
+        # Update preview
+        if hasattr(self, '_preview_window') and self._preview_window:
+            self._preview_window.seek_to_time(timestamp)
+            self._preview_window.force_frame_update()
+            
+            # Convert frame to base64 for potential LLM use
+            frame_b64 = self._analyzer.frame_to_base64(frame)
+            
+            ts_str = f"{int(timestamp)//60}:{int(timestamp)%60:02d}"
+            self._append_system(f"📸 Frame captured at {ts_str}")
+            
+            return frame_b64
         
         return False
 

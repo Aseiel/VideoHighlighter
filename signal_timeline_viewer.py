@@ -2901,7 +2901,8 @@ class SignalTimelineWindow(QMainWindow):
 
     def launch_preview(self):
         """Launch video preview window"""
-        self.preview_window = TimelineWithPreview.launch_preview(self)
+        chat = getattr(self, 'llm_chat', None)
+        self.preview_window = TimelineWithPreview.launch_preview(self, chat_widget=chat)
 
     def closeEvent(self, event):
         """Close preview when timeline closes"""
@@ -4242,6 +4243,9 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self, 'video_player'):
             milliseconds = int(self.current_time * 1000)
             self.video_player.setPosition(milliseconds)
+            if self.video_player.playbackState() != QMediaPlayer.PlayingState:
+                self.video_player.play()
+                QTimer.singleShot(50, self.video_player.pause)
         
         # Update label
         minutes = int(self.current_time // 60)

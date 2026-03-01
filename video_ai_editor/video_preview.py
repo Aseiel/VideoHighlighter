@@ -256,17 +256,36 @@ class VideoPreviewWindow(QMainWindow):
         
     # Public API methods for timeline to call
     def seek_to_time(self, seconds):
-        """Seek to specific time (called from timeline)"""
+        """Seek to specific time (called from timeline or LLM) and ensure frame is displayed"""
         if self.player.duration() > 0:
             milliseconds = int(seconds * 1000)
+            
+            # Store current playback state
+            was_playing = self.player.playbackState() == QMediaPlayer.PlayingState
+            
+            # Set position
             self.player.setPosition(milliseconds)
+            
+            # Force frame to be rendered
+            if not was_playing:
+                # If was paused, we need to briefly play to force frame update
+                self.player.play()
+                
+                # Create a single-shot timer to pause after frame is rendered
+                # Use a longer delay to ensure frame is actually rendered
+                QTimer.singleShot(100, lambda: self._pause_if_not_playing(was_playing))
             
             # Update UI
             self.time_slider.blockSignals(True)
             self.time_slider.setValue(milliseconds)
             self.time_slider.blockSignals(False)
             self.update_time_label(milliseconds)
-            
+
+    def _pause_if_not_playing(self, was_playing):
+        """Helper to pause if we were originally paused"""
+        if not was_playing and self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+
     def play_from_time(self, seconds):
         """Play from specific time"""
         self.seek_to_time(seconds)
@@ -275,7 +294,34 @@ class VideoPreviewWindow(QMainWindow):
     def set_sync_enabled(self, enabled):
         """Enable/disable sync with timeline"""
         self.sync_checkbox.setChecked(enabled)
-        
+
+    def capture_current_frame(self):
+        """Capture the current frame as QImage (for AI analysis or display)"""
+        if hasattr(self.video_widget, 'grab'):
+            # This grabs the current video widget content
+            pixmap = self.video_widget.grab()
+            return pixmap.toImage()
+        return None
+
+    def force_frame_update(self):
+        """Force the video widget to update its displayed frame"""
+        if self.player.playbackState() != QMediaPlayer.PlayingState:
+            # Briefly play to force frame update
+            self.player.play()
+            
+            # Create a timer to pause after a very short time
+            # This ensures the frame is rendered
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self._safe_pause(timer))
+            timer.start(50)  # 50ms should be enough for one frame
+
+    def _safe_pause(self, timer):
+        """Safely pause the player"""
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+        timer.deleteLater()
+
     def apply_dark_theme(self):
         """Apply dark theme styling"""
         self.setStyleSheet("""
@@ -330,7 +376,7 @@ class TimelineWithPreview:
     """Helper to connect timeline with preview window"""
     
     @staticmethod
-    def launch_preview(timeline_window):
+    def launch_preview(timeline_window, chat_widget=None):
         """Launch preview window from timeline"""
         # Get paths from timeline
         video_path = timeline_window.video_path
@@ -350,6 +396,10 @@ class TimelineWithPreview:
         
         # Show both windows
         preview.show()
+        if chat_widget:
+            chat_widget.set_preview_window(preview)
+
+
         return preview
         
     @staticmethod
