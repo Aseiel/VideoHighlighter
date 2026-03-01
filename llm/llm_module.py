@@ -1253,7 +1253,7 @@ class VideoSeekAnalyzer:
                     "timestamp": timestamp,
                     "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
                     "analysis": response,
-                    "contains_target": "yes" in response.lower() or target_description.lower() in response.lower()
+                    "contains_target": response.strip().lower().startswith("yes")
                 }
                 
                 results.append(result)
