@@ -161,6 +161,11 @@ class _VisualSearchWorker(QThread):
                 
                 frame_b64 = self.analyzer.frame_to_base64(frame)
                 
+                # Check cancellation again right before the expensive LLM call
+                # (image encode/decode in llama-cpp is ~20s and NOT interruptible)
+                if self._cancel_token.is_cancelled:
+                    break
+                
                 try:
                     response = self.analyzer.llm.query(
                         user_message=f"Does this frame contain a {self.target}? Answer with YES or NO, and briefly explain what you see.",
@@ -623,6 +628,7 @@ class LLMChatWidget(QWidget):
         self.search_progress.setText(f"Searching for '{target}'...")
         self.search_btn.setEnabled(False)
         self.stop_search_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)  # Also enable main Stop button
         
         self._search_worker = _VisualSearchWorker(
             analyzer=self._analyzer,
@@ -708,6 +714,9 @@ class LLMChatWidget(QWidget):
         self.search_progress.setText("")
         self.search_btn.setEnabled(True)
         self.stop_search_btn.setEnabled(False)
+        # Disable main stop button too (unless a chat query is still running)
+        if not (self._worker and self._worker.isRunning()):
+            self.stop_btn.setEnabled(False)
 
     @Slot(str)
     def _on_search_error(self, error: str):
@@ -716,6 +725,8 @@ class LLMChatWidget(QWidget):
         self.search_progress.setText("Search failed")
         self.search_btn.setEnabled(True)
         self.stop_search_btn.setEnabled(False)
+        if not (self._worker and self._worker.isRunning()):
+            self.stop_btn.setEnabled(False)
 
     def _seek_to_timestamp(self, seconds: float):
         """Seek the timeline to a specific timestamp (shared helper)."""
@@ -1353,15 +1364,28 @@ class LLMChatWidget(QWidget):
         return False
 
     def _stop_generation(self):
-        """Stop the current LLM generation.
+        """Stop the current LLM generation or visual search.
         
-        Uses CancellationToken which interrupts even blocking
-        GGUF vision generation, not just stream callbacks.
+        Note: For GGUF vision models, the image encoding/decoding step is a
+        single blocking C call (~20s) that cannot be interrupted from Python.
+        Stop takes effect after the current frame finishes processing.
         """
+        stopped_something = False
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
+            stopped_something = True
+        if self._search_worker and self._search_worker.isRunning():
+            self._search_worker.cancel()
+            self.search_btn.setEnabled(True)
+            self.stop_search_btn.setEnabled(False)
+            self.search_progress.setText("Stopping after current frame...")
+            stopped_something = True
+        if stopped_something:
             self.stop_btn.setEnabled(False)
-            self._append_system("⏹ Stopping generation...")
+            self._append_system(
+                "⏹ Stop requested — will stop after current frame finishes processing.\n"
+                "   (GGUF image decoding is ~20s and cannot be interrupted mid-frame)"
+            )
 
     @Slot(str)
     def _on_token(self, token: str):
