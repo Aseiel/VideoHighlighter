@@ -25,6 +25,7 @@ import base64
 import math
 import json
 import os
+import re
 import time
 import threading
 from typing import Optional, Callable
@@ -36,6 +37,59 @@ try:
 except ImportError:
     HAS_CV2 = False
     print("⚠️ OpenCV not installed. VideoSeekAnalyzer will not work. Install with: pip install opencv-python")
+
+
+# ---------------------------------------------------------------------------
+# Response sanitizer — strips leaked role tokens and self-conversation
+# ---------------------------------------------------------------------------
+# Patterns that indicate the model started role-playing a conversation
+_SELF_TALK_PATTERNS = re.compile(
+    r'(?:\n|^)\s*(?:'
+    r'(?:USER|User|user|HUMAN|Human|human)\s*:\s*'   # "USER:" turn markers
+    r'|(?:ASSISTANT|Assistant|assistant)\s*:\s*'       # "ASSISTANT:" markers
+    r'|⏹\s*Stopping generation'                       # leaked stop tokens
+    r'|\[SYSTEM INSTRUCTIONS\]'                        # leaked system wrapping
+    r'|\[END INSTRUCTIONS\]'
+    r'|=== VIDEO ANALYSIS DATA ==='                    # leaked context markers
+    r'|=== END DATA ==='
+    r'|=== TIMELINE'
+    r')',
+    re.IGNORECASE
+)
+
+# Stop sequences to prevent generation past the assistant's turn
+STOP_SEQUENCES = [
+    "\nUSER:", "\nUser:", "\nuser:",
+    "\nHUMAN:", "\nHuman:", "\nhuman:",
+    "\nASSISTANT:", "\nAssistant:",
+    "\n## ", "\n===",  # Don't regenerate context markers
+    "⏹",
+]
+
+def sanitize_response(text: str) -> str:
+    """
+    Clean up LLM output: strip self-conversation, leaked markers, and 
+    truncate at the first sign of role-playing.
+    """
+    if not text:
+        return text
+    
+    # Find the first occurrence of a self-talk pattern
+    match = _SELF_TALK_PATTERNS.search(text)
+    if match:
+        # Truncate everything from the first leaked marker onward
+        text = text[:match.start()].rstrip()
+    
+    # Also strip any trailing partial role markers that didn't fully match
+    # e.g. the model outputting "USER" right at the end
+    for marker in ["USER", "User", "ASSISTANT", "Assistant", "HUMAN", "Human"]:
+        if text.rstrip().endswith(marker):
+            text = text[:text.rfind(marker)].rstrip()
+    
+    # Strip trailing whitespace and dangling punctuation
+    text = text.rstrip()
+    
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +143,6 @@ class _OllamaBackend(_LLMBackend):
             resp = requests.get(f"{self.base_url}/api/tags", timeout=5)
             resp.raise_for_status()
             models = [m["name"] for m in resp.json().get("models", [])]
-            # Match with or without tag suffix
             matched = any(self.model in m for m in models)
             if not matched:
                 raise RuntimeError(
@@ -113,15 +166,10 @@ class _OllamaBackend(_LLMBackend):
                 images: list[str] | None = None) -> str:
         import requests
 
-        # For vision models: DON'T embed system in prompt — it drowns out the image
-        if images:
-            formatted_prompt = prompt
-        else:
-            # Text-only: embed system in prompt for models that ignore system field
-            formatted_prompt = (
-                f"[SYSTEM INSTRUCTIONS]\n{system}\n[END INSTRUCTIONS]\n\n{prompt}"
-                if system else prompt
-            )
+        # FIX #1: Don't embed system prompt inside user prompt — this causes
+        # small models to echo it back or get confused about boundaries.
+        # Instead, rely on the separate "system" field which Ollama handles natively.
+        formatted_prompt = prompt
 
         payload = {
             "model": self.model,
@@ -132,6 +180,11 @@ class _OllamaBackend(_LLMBackend):
                 "num_predict": max_tokens,
                 "num_ctx": 2048,
                 "temperature": temperature,
+                # FIX #2: Add repetition penalty to prevent looping
+                "repeat_penalty": 1.3,
+                "repeat_last_n": 128,
+                # FIX #3: Add stop sequences to prevent self-conversation
+                "stop": STOP_SEQUENCES,
             },
         }
 
@@ -150,14 +203,21 @@ class _OllamaBackend(_LLMBackend):
                     token = chunk.get("response", "")
                     if token:
                         full_text.append(token)
+                        # FIX #4: Check for self-talk during streaming
+                        current_text = "".join(full_text)
+                        if _SELF_TALK_PATTERNS.search(current_text):
+                            # Stop immediately — model started self-talking
+                            break
                         stream_callback(token)
                     if chunk.get("done", False):
                         break
-            return "".join(full_text)
+            raw = "".join(full_text)
+            return sanitize_response(raw)
         else:
             resp = requests.post(f"{self.base_url}/api/generate", json=payload, timeout=120)
             resp.raise_for_status()
-            return resp.json().get("response", "")
+            raw = resp.json().get("response", "")
+            return sanitize_response(raw)
 
     def unload(self):
         self._loaded = False
@@ -171,11 +231,11 @@ class _LlamaCppBackend(_LLMBackend):
 
     def __init__(self, model_path: str, mmproj_path: str = None, n_ctx: int = 4096, n_gpu_layers: int = -1):
         self.model_path = model_path
-        self.mmproj_path = mmproj_path  # Store mmproj path for vision models
+        self.mmproj_path = mmproj_path
         self.n_ctx = n_ctx
         self.n_gpu_layers = n_gpu_layers
         self._model = None
-        self._chat_handler = None  # Store the chat handler
+        self._chat_handler = None
 
     @staticmethod
     def available() -> bool:
@@ -191,15 +251,12 @@ class _LlamaCppBackend(_LLMBackend):
         
         from llama_cpp import Llama
         
-        # Check if this is a vision model (has mmproj)
         if self.mmproj_path and os.path.exists(self.mmproj_path):
             print(f"📷 Loading vision model with mmproj: {self.mmproj_path}")
             
-            # Try to import the chat handler
             try:
                 from llama_cpp.llama_chat_format import Llava15ChatHandler
                 
-                # Create the chat handler for vision models
                 self._chat_handler = Llava15ChatHandler(
                     clip_model_path=self.mmproj_path,
                     verbose=False
@@ -209,25 +266,23 @@ class _LlamaCppBackend(_LLMBackend):
                 
                 self._model = Llama(
                     model_path=self.model_path,
-                    chat_handler=self._chat_handler,  # This is the key fix!
+                    chat_handler=self._chat_handler,
                     n_ctx=self.n_ctx,
                     n_gpu_layers=self.n_gpu_layers,
                     verbose=False,
-                    n_threads=None,  # Auto-detect
+                    n_threads=None,
                 )
             except ImportError:
                 print("⚠️ Llava15ChatHandler not available, falling back to basic vision")
-                # Fallback to older method without chat handler
                 self._model = Llama(
                     model_path=self.model_path,
-                    clip_model_path=self.mmproj_path,  # This enables vision in older versions
+                    clip_model_path=self.mmproj_path,
                     n_ctx=self.n_ctx,
                     n_gpu_layers=self.n_gpu_layers,
                     verbose=False,
                     n_threads=None,
                 )
         else:
-            # Text-only model
             self._model = Llama(
                 model_path=self.model_path,
                 n_ctx=self.n_ctx,
@@ -245,118 +300,107 @@ class _LlamaCppBackend(_LLMBackend):
         if not self._model:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        # Handle vision inputs
         if images and self.mmproj_path:
-            # This is a vision query with mmproj
             return self._generate_vision(prompt, system, images, max_tokens, 
                                         temperature, stream_callback)
         else:
-            # Text-only query
             return self._generate_text(prompt, system, max_tokens, 
                                       temperature, stream_callback)
 
     def _generate_text(self, prompt: str, system: str = "", max_tokens: int = 1024,
                       temperature: float = 0.7, stream_callback: Optional[Callable] = None) -> str:
-        """Handle text-only generation."""
+        """Handle text-only generation with anti-hallucination measures."""
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        # FIX #5: Common generation kwargs with stop sequences and repetition penalty
+        gen_kwargs = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "repeat_penalty": 1.3,
+            "stop": STOP_SEQUENCES,
+        }
+
         if stream_callback:
             full_text = []
-            for chunk in self._model.create_chat_completion(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stream=True,
-            ):
+            for chunk in self._model.create_chat_completion(**gen_kwargs, stream=True):
                 delta = chunk["choices"][0].get("delta", {})
                 token = delta.get("content", "")
                 if token:
                     full_text.append(token)
+                    # FIX #6: Check for self-talk mid-stream
+                    joined = "".join(full_text)
+                    if _SELF_TALK_PATTERNS.search(joined):
+                        break
                     stream_callback(token)
-            return "".join(full_text)
+            raw = "".join(full_text)
+            return sanitize_response(raw)
         else:
-            result = self._model.create_chat_completion(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-            return result["choices"][0]["message"]["content"]
+            result = self._model.create_chat_completion(**gen_kwargs)
+            raw = result["choices"][0]["message"]["content"]
+            return sanitize_response(raw)
 
     def _generate_vision(self, prompt: str, system: str = "", images: list[str] = None,
                         max_tokens: int = 1024, temperature: float = 0.7,
                         stream_callback: Optional[Callable] = None) -> str:
         """Handle vision generation with proper chat handler."""
         try:
-            # Convert base64 images to data URLs
             image_urls = []
             for img_b64 in images:
-                # Clean base64 string if it has data URL prefix
                 if ',' in img_b64:
                     img_b64 = img_b64.split(',', 1)[1]
                 image_urls.append(f"data:image/jpeg;base64,{img_b64}")
             
-            # Build messages with proper multimodal format
             messages = []
-            
-            # Add system message if provided
             if system:
                 messages.append({"role": "system", "content": system})
             
-            # Build user message with proper multimodal content
             user_content = []
+            user_content.append({"type": "text", "text": prompt})
             
-            # Add text prompt
-            user_content.append({
-                "type": "text", 
-                "text": prompt
-            })
-            
-            # Add images as image_urls
             for img_url in image_urls:
                 user_content.append({
                     "type": "image_url", 
-                    "image_url": {
-                        "url": img_url
-                    }
+                    "image_url": {"url": img_url}
                 })
             
-            # Add the complete user message
-            messages.append({
-                "role": "user", 
-                "content": user_content  # This is a list, which the chat handler can process
-            })
+            messages.append({"role": "user", "content": user_content})
             
             print(f"📤 Sending vision request with {len(images)} images")
-            print(f"   Using chat handler: {self._chat_handler is not None}")
-            
+
+            # FIX #7: Add stop sequences + repetition penalty to vision too
+            gen_kwargs = {
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "repeat_penalty": 1.3,
+                "stop": STOP_SEQUENCES,
+            }
+
             if stream_callback:
                 full_text = []
-                for chunk in self._model.create_chat_completion(
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    stream=True,
-                ):
+                for chunk in self._model.create_chat_completion(**gen_kwargs, stream=True):
                     if "choices" in chunk and len(chunk["choices"]) > 0:
                         delta = chunk["choices"][0].get("delta", {})
                         token = delta.get("content", "")
                         if token:
                             full_text.append(token)
+                            joined = "".join(full_text)
+                            if _SELF_TALK_PATTERNS.search(joined):
+                                break
                             stream_callback(token)
-                result = "".join(full_text)
+                raw = "".join(full_text)
+                result = sanitize_response(raw)
                 print(f"✅ Vision generation complete: {len(result)} chars")
                 return result
             else:
-                result = self._model.create_chat_completion(
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
+                result = self._model.create_chat_completion(**gen_kwargs)
                 if "choices" in result and len(result["choices"]) > 0:
-                    result_text = result["choices"][0]["message"]["content"]
+                    raw = result["choices"][0]["message"]["content"]
+                    result_text = sanitize_response(raw)
                     print(f"✅ Vision generation complete: {len(result_text)} chars")
                     return result_text
                 else:
@@ -368,7 +412,6 @@ class _LlamaCppBackend(_LLMBackend):
             import traceback
             traceback.print_exc()
             
-            # FALLBACK: Try the quick workaround (Option 1 from your solutions)
             print("⚠️ Falling back to raw prompt format...")
             return self._generate_vision_fallback(prompt, system, images, max_tokens, 
                                                   temperature, stream_callback)
@@ -378,55 +421,61 @@ class _LlamaCppBackend(_LLMBackend):
                                  stream_callback: Optional[Callable] = None) -> str:
         """Fallback method using raw prompt formatting (LLaVA style)."""
         try:
-            # Build LLaVA-style prompt with image tokens
+            # FIX #8: Don't use "User:" / "Assistant:" markers in the raw prompt!
+            # These teach the model to role-play both sides of a conversation.
+            # Use a clean format instead.
             prompt_parts = []
             
-            # Add system message if provided
             if system:
-                prompt_parts.append(f"System: {system}")
+                prompt_parts.append(system)
+                prompt_parts.append("")
             
-            # Add image tokens (one per image)
+            # Image tokens (one per image)
             for _ in images:
                 prompt_parts.append("<image>")
             
-            # Add the user prompt
-            prompt_parts.append(f"User: {prompt}")
-            prompt_parts.append("Assistant:")
+            prompt_parts.append("")
+            # FIX: Use "Question:" / "Answer:" instead of "User:" / "Assistant:"
+            # This is less likely to trigger multi-turn generation
+            prompt_parts.append(f"Question: {prompt}")
+            prompt_parts.append("Answer:")
             
             full_prompt = "\n".join(prompt_parts)
             
             print(f"📤 Using fallback prompt format with {len(images)} images")
             
-            # Decode images to bytes for the model
             image_bytes = []
             for img_b64 in images:
                 if ',' in img_b64:
                     img_b64 = img_b64.split(',', 1)[1]
                 image_bytes.append(base64.b64decode(img_b64))
             
-            # Use completion API instead of chat completion
+            # FIX #9: Add stop + repeat_penalty to fallback too
+            gen_kwargs = {
+                "prompt": full_prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "image_data": image_bytes,
+                "repeat_penalty": 1.3,
+                "stop": STOP_SEQUENCES + ["\nQuestion:", "\nQ:"],
+            }
+
             if stream_callback:
                 full_text = []
-                for chunk in self._model.create_completion(
-                    prompt=full_prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    image_data=image_bytes,  # Pass raw image bytes
-                    stream=True,
-                ):
+                for chunk in self._model.create_completion(**gen_kwargs, stream=True):
                     token = chunk["choices"][0].get("text", "")
                     if token:
                         full_text.append(token)
+                        joined = "".join(full_text)
+                        if _SELF_TALK_PATTERNS.search(joined):
+                            break
                         stream_callback(token)
-                return "".join(full_text)
+                raw = "".join(full_text)
+                return sanitize_response(raw)
             else:
-                result = self._model.create_completion(
-                    prompt=full_prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    image_data=image_bytes,  # Pass raw image bytes
-                )
-                return result["choices"][0]["text"]
+                result = self._model.create_completion(**gen_kwargs)
+                raw = result["choices"][0]["text"]
+                return sanitize_response(raw)
                 
         except Exception as e:
             print(f"❌ Fallback also failed: {e}")
@@ -472,7 +521,6 @@ class VideoContextBuilder:
         # --- Detected objects ---
         objects_raw = analysis_data.get("objects", [])
         if objects_raw:
-            # Aggregate object counts
             obj_counts: dict[str, int] = {}
             obj_timestamps: dict[str, list] = {}
             for entry in objects_raw:
@@ -494,7 +542,6 @@ class VideoContextBuilder:
         # --- Detected actions ---
         actions_raw = analysis_data.get("actions", [])
         if actions_raw:
-            # Group by action name
             action_groups: dict[str, list] = {}
             for act in actions_raw:
                 name = act.get("action_name", "unknown")
@@ -552,7 +599,6 @@ class VideoContextBuilder:
         lang = transcript.get("language", "unknown")
         if segments:
             parts.append(f"## Transcript ({len(segments)} segments, language: {lang})")
-            # Show first and last few segments
             show_count = min(max_items, len(segments))
             for seg in segments[:show_count]:
                 start = seg.get("start", 0)
@@ -586,8 +632,6 @@ class VideoContextBuilder:
     ) -> str:
         """
         Build context specifically for the auto-learn pipeline (Step 5).
-
-        Used when verifying whether a clip matches the target action.
         """
         parts = [
             f"## Action Learning Task",
@@ -639,16 +683,18 @@ class LLMModule:
         llm.load()
     """
 
+    # FIX #10: Tighter system prompts — explicitly tell model NOT to generate
+    # fake conversation turns or repeat the data back.
     SYSTEM_PROMPT = (
-        "You are an AI video analysis assistant integrated into VideoHighlighter.\n"
-        "CRITICAL RULES:\n"
-        "1. You ALWAYS have access to video analysis data provided below the separator '=== VIDEO ANALYSIS DATA ==='.\n"
-        "2. When the user asks about objects, actions, or events in the video, you MUST search the provided data and quote specific findings with timestamps.\n"
-        "3. NEVER say you 'don't have access' or 'can't see the video' — you have the full analysis results.\n"
-        "4. If an action or object is NOT in the data, say 'This was not detected in the analysis' and list what WAS detected instead.\n"
-        "5. Use MM:SS timestamps. Be concise and specific.\n"
-        "6. When asked about a specific action, search the '## Detected Actions' section and report matches, confidence scores, and timestamps.\n"
-        "7. When asked about objects, search '## Detected Objects' and report what was found and when."
+        "You are a video analysis assistant. You have access to structured analysis data below.\n"
+        "RULES:\n"
+        "1. Answer the user's question using ONLY the provided data.\n"
+        "2. Quote specific findings with MM:SS timestamps.\n"
+        "3. If something is NOT in the data, say so and list what IS detected.\n"
+        "4. Be concise — 2-4 sentences unless more detail is needed.\n"
+        "5. NEVER generate fake conversation turns. NEVER write 'USER:' or 'ASSISTANT:'.\n"
+        "6. NEVER repeat or echo the analysis data back. Just answer the question.\n"
+        "7. Give ONE response and STOP."
     )
 
     SYSTEM_PROMPT_ACTION_LEARNING = (
@@ -656,29 +702,28 @@ class LLMModule:
         "Given detected objects, motion features, and existing action classifications, "
         "determine whether a video clip likely contains the target action. "
         "Respond with a confidence score (0.0 to 1.0) and brief reasoning. "
-        "Format: SCORE: 0.XX\nREASON: ..."
+        "Format: SCORE: 0.XX\nREASON: ...\n"
+        "Give ONE response and STOP. Do not generate any follow-up."
     )
 
     SYSTEM_PROMPT_TIMELINE = (
-        "You are an AI video analysis assistant integrated into VideoHighlighter.\n"
-        "CRITICAL RULES:\n"
-        "1. You have video analysis data below '=== VIDEO ANALYSIS DATA ==='.\n"
-        "2. SEARCH the data and quote findings with MM:SS timestamps.\n"
-        "3. NEVER say you 'don't have access' or 'can't see the video'.\n"
-        "4. You can CONTROL THE TIMELINE with [CMD:...] commands.\n"
+        "You are a video analysis assistant with timeline control.\n"
+        "RULES:\n"
+        "1. Use the analysis data to answer questions with MM:SS timestamps.\n"
+        "2. You can control the timeline with [CMD:...] commands.\n"
         "   - seek time MUST be a number of seconds (float or int), NOT mm:ss.\n"
-        "5. BE CONCISE. Say what you're doing in 1-2 sentences, then the command.\n"
-        "6. NEVER list all clips or echo the timeline state back. The user can see it.\n"
-        "7. NEVER repeat the '## Current Timeline State' section in your response.\n"
+        "3. Be concise — 1-2 sentences, then the command.\n"
+        "4. NEVER list all clips or echo the timeline state.\n"
+        "5. NEVER generate fake conversation turns.\n"
+        "6. Give ONE response and STOP."
     )
 
     SYSTEM_PROMPT_VISION = (
-        "You are an AI with vision capabilities. An image is attached to this message.\n"
-        "DESCRIBE WHAT YOU SEE IN THE IMAGE.\n"
+        "Describe what you see in the attached image.\n"
         "Focus on: people (count, poses, clothing, actions), objects, scene, colors, lighting.\n"
-        "If there is video analysis data or timeline context provided, use it as ADDITIONAL context,\n"
-        "but your primary focus is describing what's visible in the image.\n"
-        "Be specific and detailed in your description.\n"
+        "If analysis data is provided, use it as additional context.\n"
+        "Be specific and detailed. Give ONE description and STOP.\n"
+        "Do NOT generate follow-up questions or fake conversation."
     )
 
     def __init__(
@@ -737,59 +782,37 @@ class LLMModule:
     ) -> str:
         """
         Send a query to the LLM with optional video analysis context.
-
-        Args:
-            user_message:    The user's question or instruction
-            analysis_data:   Cache dict from VideoHighlighter pipeline
-            video_path:      Video filename (for context)
-            system_prompt:   Override the default system prompt
-            timeline_context: Extra context about timeline state + available commands
-            frame_base64:    Base64-encoded image of current video frame (for vision models)
-            max_tokens:      Max response length
-            temperature:     Sampling temperature
-            stream_callback: Called with each token for streaming UI updates
-
-        Returns:
-            The LLM's response text
         """
         if not self._backend.is_loaded():
             raise RuntimeError("LLM not loaded. Call load() first.")
         
-        # DEBUG: trace vision path
         print(f"🔍 query() called:")
         print(f"   frame_base64: {'YES (' + str(len(frame_base64)) + ' chars)' if frame_base64 else 'NONE'}")
         print(f"   timeline_context: {'YES' if timeline_context else 'NONE'}")
         print(f"   analysis_data: {'YES' if analysis_data else 'NONE'}")
 
-        # ===== VISION MODE: When frame is provided, use it! =====
+        # ===== VISION MODE =====
         if frame_base64:
-            # We have a frame, so this is a vision query
-            # Even if not explicitly asking, the frame is provided for a reason
-            
             prompt_parts = []
             
-            # Add timeline context if available (for reference)
             if timeline_context:
                 prompt_parts.append(
-                    "=== TIMELINE CONTEXT (for reference) ===\n"
+                    "--- TIMELINE CONTEXT ---\n"
                     f"{timeline_context}\n"
-                    "=== END TIMELINE ===\n\n"
+                    "--- END ---\n"
                 )
             
-            # Add analysis data if available (for reference)
             if analysis_data:
                 context = VideoContextBuilder.build(analysis_data, video_path)
                 prompt_parts.append(
-                    "=== VIDEO ANALYSIS DATA (for reference) ===\n"
+                    "--- VIDEO ANALYSIS DATA ---\n"
                     f"{context}\n"
-                    "=== END DATA ===\n\n"
+                    "--- END ---\n"
                 )
             
-            # Add the user's question
             prompt_parts.append(user_message)
             full_prompt = "\n".join(prompt_parts)
             
-            # Use vision system prompt
             system = system_prompt or self.SYSTEM_PROMPT_VISION
             
             return self._backend.generate(
@@ -798,34 +821,30 @@ class LLMModule:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream_callback=stream_callback,
-                images=[frame_base64],  # Pass the image to the backend
+                images=[frame_base64],
             )
         
-        # ===== TEXT MODE: No frame =====
+        # ===== TEXT MODE =====
         prompt_parts = []
         
         if analysis_data:
             context = VideoContextBuilder.build(analysis_data, video_path)
             prompt_parts.append(
-                "=== VIDEO ANALYSIS DATA ===\n"
-                "This is the ACTUAL analysis output from processing the video. "
-                "Use this data to answer the user's question. "
-                "All timestamps, objects, actions, and transcript text below are REAL detections.\n\n"
+                "--- VIDEO ANALYSIS DATA ---\n"
                 f"{context}\n"
-                "=== END DATA ===\n\n"
+                "--- END ---\n"
             )
         
         if timeline_context:
             prompt_parts.append(
-                "=== TIMELINE CONTROL ===\n"
+                "--- TIMELINE CONTROL ---\n"
                 f"{timeline_context}\n"
-                "=== END TIMELINE ===\n\n"
+                "--- END ---\n"
             )
         
         prompt_parts.append(user_message)
         full_prompt = "\n".join(prompt_parts)
         
-        # Choose appropriate system prompt
         if system_prompt:
             system = system_prompt
         elif timeline_context:
@@ -850,15 +869,6 @@ class LLMModule:
     ) -> tuple[float, str]:
         """
         Step 5 of auto-learn pipeline: ask LLM whether a clip contains the target action.
-
-        Args:
-            action_name:     e.g. "pick up cup"
-            object_name:     e.g. "cup"
-            clip_analysis:   List of per-clip dicts with keys: objects, actions, motion_level
-            existing_labels: Current known action labels
-
-        Returns:
-            (confidence_score, reasoning)
         """
         context = VideoContextBuilder.build_action_learning_context(
             action_name=action_name,
@@ -883,7 +893,6 @@ class LLMModule:
             temperature=0.3,
         )
 
-        # Parse response
         score = 0.5
         reason = response.strip()
         for line in response.strip().split("\n"):
@@ -906,18 +915,7 @@ class LLMModule:
         error_callback: Optional[Callable[[str], None]] = None,
         **kwargs,
     ) -> threading.Thread:
-        """
-        Non-blocking query — runs in a background thread.
-
-        Args:
-            user_message:   The question
-            callback:       Called with final response text
-            error_callback: Called with error message on failure
-            **kwargs:       Passed to query()
-
-        Returns:
-            The background Thread object
-        """
+        """Non-blocking query — runs in a background thread."""
         def _run():
             try:
                 result = self.query(user_message, **kwargs)
@@ -958,17 +956,11 @@ def get_ollama_models(base_url: str = "http://localhost:11434") -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Video Seek Analyzer - NEW: Analyze video frames every 1 seconds
+# Video Seek Analyzer
 # ---------------------------------------------------------------------------
 class VideoSeekAnalyzer:
     """
     Analyzes video frames at regular intervals using LLM vision.
-    
-    This class provides functionality to:
-    - Seek to specific timestamps in a video
-    - Capture frames and convert to base64 for LLM vision
-    - Analyze frames every N seconds (default 1)
-    - Save analysis results to JSON
     
     Requires OpenCV: pip install opencv-python
     
@@ -986,17 +978,6 @@ class VideoSeekAnalyzer:
     """
     
     def __init__(self, video_path: str, llm: LLMModule, verbose: bool = False):
-        """
-        Initialize the video analyzer.
-        
-        Args:
-            video_path: Path to the video file
-            llm: Initialized LLMModule instance (must support vision)
-        
-        Raises:
-            ImportError: If OpenCV is not installed
-            FileNotFoundError: If video file doesn't exist
-        """
         self.verbose = verbose
 
         if not HAS_CV2:
@@ -1012,14 +993,12 @@ class VideoSeekAnalyzer:
         self.llm = llm
         self.cap = cv2.VideoCapture(video_path)
         
-        # Get video properties
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.duration = self.total_frames / self.fps
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        # State for interactive mode
         self.current_time = 0
         self.lock = threading.Lock()
         self.running = False
@@ -1031,40 +1010,15 @@ class VideoSeekAnalyzer:
         print(f"   FPS: {self.fps:.2f}")
     
     def seek_to_time(self, timestamp_seconds: float):
-        """
-        Seek to a specific timestamp in the video.
-        
-        Args:
-            timestamp_seconds: Time in seconds to seek to
-        
-        Returns:
-            Frame as numpy array or None if failed
-        """
-        # Ensure timestamp is within bounds
         timestamp_seconds = max(0, min(timestamp_seconds, self.duration))
-        
-        # Calculate frame number and seek
         self.cap.set(cv2.CAP_PROP_POS_MSEC, timestamp_seconds * 1000)
         self.cap.read()  # flush
         ret, frame = self.cap.read()
         return frame if ret else None
     
     def frame_to_base64(self, frame, quality: int = 100) -> str:
-        """
-        Convert OpenCV frame to base64 string for LLM vision.
-        
-        Args:
-            frame: OpenCV frame (numpy array)
-            quality: JPEG quality (0-100)
-        
-        Returns:
-            Base64 encoded JPEG image
-        """
-        # Encode frame as JPEG
         encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
         _, buffer = cv2.imencode('.jpg', frame, encode_params)
-        
-        # Convert to base64
         return base64.b64encode(buffer).decode('utf-8')
     
     def analyze_current_frame(
@@ -1072,17 +1026,6 @@ class VideoSeekAnalyzer:
         user_query: str = "What do you see in this frame? Describe the scene, people, objects, and actions.",
         custom_prompt: str = None
     ) -> dict:
-        """
-        Analyze the current frame using LLM vision.
-        
-        Args:
-            user_query: Question to ask about the frame
-            custom_prompt: Override the default system prompt
-        
-        Returns:
-            Dictionary with analysis results
-        """
-        # Seek to current time and get frame
         frame = self.seek_to_time(self.current_time)
         if frame is None:
             return {
@@ -1091,13 +1034,9 @@ class VideoSeekAnalyzer:
                 "timestamp_str": f"{int(self.current_time)//60}:{int(self.current_time)%60:02d}"
             }
         
-        # Convert frame to base64
         frame_b64 = self.frame_to_base64(frame)
-        
-        # Use custom prompt if provided
         system = custom_prompt if custom_prompt else None
         
-        # Query LLM with vision
         try:
             response = self.llm.query(
                 user_message=user_query,
@@ -1124,50 +1063,29 @@ class VideoSeekAnalyzer:
             }
     
     def analyze_every_n_seconds(self, interval: float = 1.0, callback=None, save_to_file=None):
-        """
-        Properly seek to each timestamp instead of sequential reading.
-        
-        Args:
-            interval: Seconds between analyses (e.g., 1.0 for every second)
-            callback: Optional function to call with each result
-            save_to_file: Optional path to save results JSON
-        
-        Returns:
-            List of analysis results
-        """
         results = []
-        
-        # Calculate all timestamps to analyze
         num_analyses = int(self.duration / interval) + 1
         timestamps = [i * interval for i in range(num_analyses)]
         
         print(f"\n📊 Seeking analysis every {interval}s ({len(timestamps)} frames)")
         print(f"   Video duration: {int(self.duration)//60}m{int(self.duration)%60:02d}s")
         
-        # ONLY print progress every 10 frames to reduce spam
-        progress_interval = max(1, len(timestamps) // 10)  # Show ~10 updates total
+        progress_interval = max(1, len(timestamps) // 10)
         
         for i, timestamp in enumerate(timestamps):
-            # Skip if beyond video duration (with small epsilon for floating point)
             if timestamp > self.duration + 0.1:
                 break
                 
-            # Update current time
             self.current_time = timestamp
-            
-            # Seek to exact timestamp
             frame = self.seek_to_time(timestamp)
             
             if frame is None:
-                # Only print errors occasionally
                 if i % progress_interval == 0:
                     print(f"⚠️ Could not read frame at {timestamp:.1f}s")
                 continue
             
-            # Convert frame to base64
             frame_b64 = self.frame_to_base64(frame)
             
-            # Analyze frame
             try:
                 response = self.llm.query(
                     user_message="What do you see in this frame? Describe the scene, people, objects, and actions.",
@@ -1189,20 +1107,16 @@ class VideoSeekAnalyzer:
                 if callback:
                     callback(result)
                 
-                # ONLY print progress at interval, not every frame
                 if i % progress_interval == 0 or i == len(timestamps) - 1:
                     print(f"  [{i+1}/{len(timestamps)}] {timestamp:.1f}s: Analyzed")
                     
-                # Optional verbose mode - but limited
                 if self.verbose and len(response) > 0 and i % progress_interval == 0:
                     preview = response[:50] + "..." if len(response) > 50 else response
                     print(f"     ↪ {preview}")
                 
             except Exception as e:
-                # Only print errors occasionally
                 if i % progress_interval == 0:
                     print(f"❌ Error at {timestamp:.1f}s: {e}")
-                # Add error result to maintain timeline
                 results.append({
                     "timestamp": timestamp,
                     "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
@@ -1218,20 +1132,7 @@ class VideoSeekAnalyzer:
         return results
 
     def analyze_with_seeking(self, interval: float = 1.0, target_description: str = "explosion", max_seeks: int = 100):
-        """
-        Properly seek through video at specified intervals and analyze each frame.
-        
-        Args:
-            interval: Seconds between seeks (1.0 or 2.0)
-            target_description: What to look for (e.g., "explosion")
-            max_seeks: Maximum number of seeks to perform
-        
-        Returns:
-            List of analysis results
-        """
         results = []
-        
-        # Start from beginning or current position
         start_time = 0.0
         current_time = start_time
         
@@ -1239,15 +1140,12 @@ class VideoSeekAnalyzer:
         print("=" * 60)
         
         for seek_num in range(max_seeks):
-            # Calculate next timestamp
             timestamp = current_time + (seek_num * interval)
             
-            # Stop if we've reached the end of the video
             if timestamp >= self.duration:
                 print(f"\n🏁 Reached end of video at {timestamp:.1f}s")
                 break
             
-            # SEEK to the exact timestamp
             print(f"\n⏩ Seeking to {timestamp:.1f}s ({int(timestamp)//60}:{int(timestamp)%60:02d})")
             frame = self.seek_to_time(timestamp)
             
@@ -1255,15 +1153,13 @@ class VideoSeekAnalyzer:
                 print(f"⚠️ Could not read frame at {timestamp:.1f}s")
                 continue
             
-            # Convert frame to base64
             frame_b64 = self.frame_to_base64(frame)
             
-            # Analyze the frame for the target
             try:
                 response = self.llm.query(
                     user_message=f"Does this frame contain a {target_description}? Answer with YES or NO, and briefly explain what you see.",
                     frame_base64=frame_b64,
-                    temperature=0.1,  # Low temperature for consistent answers
+                    temperature=0.1,
                     max_tokens=150,
                 )
                 
@@ -1271,15 +1167,12 @@ class VideoSeekAnalyzer:
                     "timestamp": timestamp,
                     "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
                     "analysis": response,
-                    "contains_target": "yes" in response.lower() or "explosion" in response.lower()
+                    "contains_target": "yes" in response.lower() or target_description.lower() in response.lower()
                 }
                 
                 results.append(result)
-                
-                # Display result
                 print(f"📝 Analysis: {response[:100]}...")
                 
-                # Check if we found the target
                 if result["contains_target"]:
                     print(f"\n🎯 FOUND {target_description.upper()} at {timestamp:.1f}s!")
                     print(f"Full analysis: {response}")
@@ -1288,20 +1181,12 @@ class VideoSeekAnalyzer:
             except Exception as e:
                 print(f"❌ Error at {timestamp:.1f}s: {e}")
             
-            # Small pause to simulate real seeking
             time.sleep(0.5)
         
         print(f"\n✅ Seeking complete. Analyzed {len(results)} frames")
         return results
 
     def save_results(self, results: list, filepath: str):
-        """
-        Save analysis results to JSON file.
-        
-        Args:
-            results: List of analysis dictionaries
-            filepath: Path to save JSON file
-        """
         output = {
             "video_path": self.video_path,
             "video_info": {
@@ -1311,7 +1196,7 @@ class VideoSeekAnalyzer:
                 "height": self.height,
                 "total_frames": self.total_frames
             },
-            "analysis_interval": 1,  # Default interval
+            "analysis_interval": 1,
             "total_analyses": len(results),
             "analyses": results
         }
@@ -1322,19 +1207,8 @@ class VideoSeekAnalyzer:
         print(f"💾 Results saved to: {filepath}")
     
     def search_analyses(self, query: str, results: list = None) -> list:
-        """
-        Search through analysis results for specific content.
-        
-        Args:
-            query: Text to search for in analyses
-            results: List to search (uses cache if None)
-        
-        Returns:
-            List of matching results with timestamps
-        """
         search_results = []
         analyses = results if results is not None else self.analysis_cache
-        
         query_lower = query.lower()
         
         for r in analyses:
@@ -1348,32 +1222,15 @@ class VideoSeekAnalyzer:
         return search_results
     
     def interactive_mode(self, interval: int = 1):
-        """
-        Interactive mode with real-time analysis and seeking commands.
-        
-        Commands:
-            s <seconds> or s <mm:ss> - Seek to timestamp
-            p - Show current position
-            f <sec> - Move forward N seconds
-            b <sec> - Move backward N seconds
-            q - Quit
-            h - Show help
-        
-        Args:
-            interval: Seconds between automatic analyses
-        """
         self.running = True
         
         def analysis_loop():
-            """Background thread for continuous analysis"""
             consecutive_errors = 0
-            
             while self.running:
                 try:
                     with self.lock:
                         current_pos = self.current_time
                     
-                    # Analyze current frame
                     result = self.analyze_current_frame()
                     
                     if "error" in result:
@@ -1385,11 +1242,9 @@ class VideoSeekAnalyzer:
                         consecutive_errors = 0
                         self.analysis_cache.append(result)
                         
-                        # Show result
                         print(f"\n{'='*60}")
                         print(f"📹 [{result['timestamp_str']}] Analysis:")
                         print(f"{'='*60}")
-                        # Truncate long responses for display
                         analysis = result['analysis']
                         if len(analysis) > 300:
                             print(analysis[:300] + "...")
@@ -1402,18 +1257,13 @@ class VideoSeekAnalyzer:
                     print(f"\n⚠️ Analysis error: {e}")
                     time.sleep(interval)
         
-        # Start analysis thread
         thread = threading.Thread(target=analysis_loop, daemon=True)
         thread.start()
-        
-        # Help text
         self._show_help()
         
-        # Command loop
         while self.running:
             try:
                 cmd = input("\n🎮 Command: ").strip().lower()
-                
                 if not cmd:
                     continue
                 
@@ -1421,24 +1271,18 @@ class VideoSeekAnalyzer:
                 
                 if parts[0] == 's' and len(parts) > 1:
                     self._handle_seek_command(parts[1])
-                
                 elif parts[0] == 'p':
                     print(f"📌 Current position: {int(self.current_time)//60}:{int(self.current_time)%60:02d}")
-                
                 elif parts[0] == 'f' and len(parts) > 1:
                     self._handle_forward_command(parts[1])
-                
                 elif parts[0] == 'b' and len(parts) > 1:
                     self._handle_backward_command(parts[1])
-                
                 elif parts[0] == 'h':
                     self._show_help()
-                
                 elif parts[0] == 'q':
                     print("\n👋 Stopping analysis...")
                     self.running = False
                     break
-                
                 else:
                     print("❌ Unknown command. Type 'h' for help.")
                     
@@ -1450,7 +1294,6 @@ class VideoSeekAnalyzer:
                 print(f"❌ Command error: {e}")
     
     def _show_help(self):
-        """Show interactive mode help"""
         print("\n" + "="*50)
         print("🎬 Interactive Video Analysis Mode")
         print("="*50)
@@ -1465,30 +1308,23 @@ class VideoSeekAnalyzer:
         print("="*50)
     
     def _handle_seek_command(self, arg: str):
-        """Handle seek command with various formats"""
         try:
-            # Parse mm:ss format
             if ':' in arg:
                 minutes, seconds = map(int, arg.split(':'))
                 seek_to = minutes * 60 + seconds
             else:
-                # Parse seconds
                 seek_to = int(arg)
             
-            # Validate and seek
             seek_to = max(0, min(seek_to, int(self.duration)))
-            
             with self.lock:
                 self.current_time = seek_to
             
             if self.verbose:
                 print(f"⏩ Seeking to {self.current_time//60}:{self.current_time%60:02d}")
-            
         except ValueError:
             print("❌ Invalid time format. Use seconds or mm:ss")
     
     def _handle_forward_command(self, arg: str):
-        """Handle forward command"""
         try:
             forward = int(arg)
             with self.lock:
@@ -1498,7 +1334,6 @@ class VideoSeekAnalyzer:
             print("❌ Invalid forward value")
     
     def _handle_backward_command(self, arg: str):
-        """Handle backward command"""
         try:
             backward = int(arg)
             with self.lock:
@@ -1508,7 +1343,6 @@ class VideoSeekAnalyzer:
             print("❌ Invalid backward value")
     
     def close(self):
-        """Release video capture resources"""
         self.running = False
         if hasattr(self, 'cap') and self.cap:
             self.cap.release()
