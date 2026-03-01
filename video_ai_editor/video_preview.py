@@ -157,7 +157,22 @@ class VideoPreviewWindow(QMainWindow):
             self.status_bar.showMessage(f"Loaded: {os.path.basename(path)}", 3000)
         else:
             self.status_bar.showMessage(f"File not found: {path}", 5000)
-            
+
+    def show_frame_analysis_status(self, timestamp: float, contains_target: bool):
+        """Show a temporary overlay indicating frame analysis result"""
+        # Update status bar
+        status = f"Frame at {int(timestamp)//60}:{int(timestamp)%60:02d} - {'✅ TARGET FOUND' if contains_target else '❌ No target'}"
+        self.status_bar.showMessage(status, 1000)  # Show for 1 second
+        
+        # Optional: Change border color briefly to indicate analysis
+        original_style = self.video_widget.styleSheet()
+        color = "#4CAF50" if contains_target else "#f44336"
+        self.video_widget.setStyleSheet(f"border: 3px solid {color};")
+        
+        # Reset border after a short delay
+        QTimer.singleShot(500, lambda: self.video_widget.setStyleSheet(original_style))
+
+
     @Slot()
     def toggle_playback(self):
         """Toggle play/pause"""
