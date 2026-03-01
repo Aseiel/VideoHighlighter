@@ -48,7 +48,7 @@ except ImportError:
 class _LLMWorker(QThread):
     """Runs LLM.query() off the GUI thread with token-by-token streaming.
     
-    Uses CancellationToken so GGUF vision models can be interrupted
+    Now uses CancellationToken so GGUF vision models can be interrupted
     mid-generation, not just between tokens in the stream callback.
     """
 
@@ -176,11 +176,17 @@ class _VisualSearchWorker(QThread):
                         cancellation_token=self._cancel_token,
                     )
                     
+                    # Only check if the response starts with YES.
+                    # Do NOT substring-match the target word — the model
+                    # will mention it even when saying "NO, there is no X".
+                    response_stripped = response.strip().lower()
+                    starts_with_yes = response_stripped.startswith("yes")
+                    
                     result = {
                         "timestamp": timestamp,
                         "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
                         "analysis": response,
-                        "contains_target": "yes" in response.lower() or self.target.lower() in response.lower()
+                        "contains_target": starts_with_yes,
                     }
                     
                     results.append(result)
@@ -648,10 +654,14 @@ class LLMChatWidget(QWidget):
         """Stop ongoing visual search."""
         if self._search_worker and self._search_worker.isRunning():
             self._search_worker.cancel()
-            self._append_system("⏹ Visual search stopped by user")
-            self.search_progress.setText("Search stopped")
+            self._append_system(
+                "⏹ Stop requested — will stop after current frame finishes.\n"
+                "   (GGUF image decoding cannot be interrupted mid-frame)"
+            )
+            self.search_progress.setText("Stopping after current frame...")
             self.search_btn.setEnabled(True)
             self.stop_search_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
 
     def _trigger_visual_scan(self, target: str, interval: float):
         """Called by TimelineBridge when LLM generates [CMD:visual_scan]."""
@@ -1147,6 +1157,7 @@ class LLMChatWidget(QWidget):
 
         # Parse search requests from chat (e.g. "search for explosion every 60s")
         if self._try_parse_chat_search(text):
+            self._append_user(text)
             self.input_field.clear()
             return
 
@@ -1263,56 +1274,100 @@ class LLMChatWidget(QWidget):
     def _try_parse_chat_search(self, text: str) -> bool:
         """Parse visual search requests typed in the chat input.
         
-            Handles messages like:
+        Handles natural language like:
             "search for explosion every 60s"
-            "find person every 30s"  
-            "scan for fire every 5s"
-            "search for car"  (uses current interval setting)
+            "seek through video every 60s until you find anal penetration"
+            "please seek every 60s until you will find X"
+            "go through video every 30s looking for X"
+            "scan every 10s for fire"
+            "find person every 30s"
+            "search for car" (uses current interval)
         
         Returns True if the message was handled as a search command.
         """
         import re
         text_lower = text.lower().strip()
         
-        # Match patterns like "search for <target> [every <N>s]"
-        patterns = [
-            r'(?:search|find|scan|look)\s+for\s+(.+?)\s+every\s+(\d+(?:\.\d+)?)\s*s',
-            r'(?:search|find|scan|look)\s+for\s+(.+?)\s+(?:at|with)\s+(\d+(?:\.\d+)?)\s*s?\s+intervals?',
-        ]
+        # Quick check: does this look like a search/seek request at all?
+        # Must contain at least one action keyword AND either "every" or "search/find for"
+        action_words = ('seek', 'search', 'scan', 'find', 'look for', 'looking for',
+                        'go through', 'scrub through')
+        has_action = any(w in text_lower for w in action_words)
+        if not has_action:
+            return False
         
-        for pattern in patterns:
-            match = re.match(pattern, text_lower)
-            if match:
-                target = match.group(1).strip()
-                interval = float(match.group(2))
-                self.search_target.setText(target)
-                self.search_interval.setValue(interval)
-                self._append_system(f"🔍 Parsed search request: '{target}' every {interval}s")
-                self._start_visual_search()
-                return True
+        # --- Extract interval (if present) ---
+        interval = None
+        interval_match = re.search(r'every\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?', text_lower)
+        if interval_match:
+            interval = float(interval_match.group(1))
         
-        # Match simpler "search for <target>" (no interval specified)
-        simple_patterns = [
-            r'(?:search|scan)\s+for\s+(.+)',
-            r'(?:visual\s+search)\s+(.+)',
-        ]
+        # --- Extract target ---
+        target = None
         
-        for pattern in simple_patterns:
-            match = re.match(pattern, text_lower)
-            if match:
-                target = match.group(1).strip()
-                # Remove trailing punctuation
-                target = target.rstrip('.,!?')
-                if target:
-                    self.search_target.setText(target)
-                    self._append_system(
-                        f"🔍 Parsed search request: '{target}' "
-                        f"(using current interval: {self.search_interval.value()}s)"
-                    )
-                    self._start_visual_search()
-                    return True
+        # Pattern group 1: "until you [will] find <target>"  /  "until <target> is found"
+        # Covers: "seek every 60s until you find X", "seek until you will find X"
+        m = re.search(r'until\s+(?:you\s+)?(?:will\s+)?(?:find|see|spot|locate)\s+(.+)', text_lower)
+        if m:
+            target = m.group(1).strip()
         
-        return False
+        # Pattern group 2: "looking for <target>"  /  "for <target>" at end
+        if not target:
+            m = re.search(r'(?:looking|searching|scanning)\s+for\s+(.+)', text_lower)
+            if m:
+                target = m.group(1).strip()
+        
+        # Pattern group 3: "search/scan/find for <target> [every Ns]"
+        if not target:
+            m = re.search(r'(?:search|scan|find|look)\s+(?:for|the)\s+(.+?)(?:\s+every\s+|$)', text_lower)
+            if m:
+                target = m.group(1).strip()
+        
+        # Pattern group 3b: "find <target> every Ns" (no "for")
+        if not target:
+            m = re.search(r'(?:find|seek)\s+(.+?)\s+every\s+', text_lower)
+            if m:
+                target = m.group(1).strip()
+                # Don't match filler like "find through video every"
+                filler = {'through', 'the', 'video', 'in', 'a', 'an', 'this', 'my'}
+                if target in filler or all(w in filler for w in target.split()):
+                    target = None
+        
+        # Pattern group 4: "every Ns for <target>"  (interval before target)
+        if not target:
+            m = re.search(r'every\s+\d+(?:\.\d+)?\s*s(?:ec(?:ond)?s?)?\s+(?:for|to find|looking for)\s+(.+)', text_lower)
+            if m:
+                target = m.group(1).strip()
+        
+        if not target:
+            return False
+        
+        # --- Clean up target ---
+        # Remove common trailing filler words and punctuation
+        target = re.sub(
+            r'\s+(?:in\s+(?:the\s+)?(?:video|frame|frames|clip)|every\s+\d+.*|please|thanks?)\.?$',
+            '', target
+        ).strip()
+        target = target.rstrip('.,!?')
+        
+        # If we still have "every Ns" embedded in the target, remove it
+        target = re.sub(r'\s*every\s+\d+(?:\.\d+)?\s*s(?:ec(?:ond)?s?)?\s*', ' ', target).strip()
+        
+        if not target or len(target) < 2:
+            return False
+        
+        # --- Apply ---
+        self.search_target.setText(target)
+        if interval is not None:
+            self.search_interval.setValue(interval)
+            self._append_system(f"🔍 Parsed search: '{target}' every {interval}s")
+        else:
+            self._append_system(
+                f"🔍 Parsed search: '{target}' "
+                f"(using current interval: {self.search_interval.value()}s)"
+            )
+        self._start_visual_search()
+        return True
 
     def _handle_seek_command(self, text: str) -> bool:
         """Handle direct seek commands without going through LLM."""
