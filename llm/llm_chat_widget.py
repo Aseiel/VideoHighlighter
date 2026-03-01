@@ -171,7 +171,7 @@ class _VisualSearchWorker(QThread):
                         user_message=f"Does this frame contain a {self.target}? Answer with YES or NO, and briefly explain what you see.",
                         frame_base64=frame_b64,
                         system_prompt=LLMModule.SYSTEM_PROMPT_VISUAL_SEARCH,
-                        temperature=0.1,
+                        temperature=0.0,
                         max_tokens=150,
                         cancellation_token=self._cancel_token,
                     )
@@ -696,41 +696,45 @@ class LLMChatWidget(QWidget):
         short = response[:120] + "..." if len(response) > 120 else response
         self._append_system(f"  {icon} [{timestamp_str}] {short}")
         
-        # ALWAYS update preview window to show this frame
+        # Update preview window directly (QMediaPlayer has its own decoder,
+        # so this is safe). Do NOT call _seek_to_timestamp() here — that
+        # would re-seek the analyzer's cv2.VideoCapture from the GUI thread
+        # while the worker thread is still using it, causing the FFmpeg
+        # assertion: "!dst->progress failed at libavcodec/utils.c:954"
         if hasattr(self, '_preview_window') and self._preview_window:
             self._preview_window.seek_to_time(timestamp)
             self._preview_window.force_frame_update()
             
-            # Show visual feedback in preview
             if hasattr(self._preview_window, 'show_frame_analysis_status'):
                 self._preview_window.show_frame_analysis_status(timestamp, contains_target)
             
             QApplication.processEvents()
         
-        # Update progress
+        # Update timeline playhead (no decoder involved, just UI)
+        if self._timeline_bridge and self._timeline_bridge.is_connected:
+            self._timeline_bridge._cmd_seek({'time': str(timestamp)})
+        
         self.search_progress.setText(f"Analyzing frame at {timestamp_str}...")
 
     @Slot(float, str, str)
     def _on_search_found(self, timestamp: float, timestamp_str: str, analysis: str):
-        """Handle found target — auto-seek to the found timestamp and display it."""
+        """Handle found target — auto-seek preview and timeline to the found timestamp."""
         self._append_system(
             f"🎯 FOUND at {timestamp_str}!\n"
             f"   {analysis[:150]}..."
         )
         
-        # Auto-seek to the found timestamp AND update preview
-        self._seek_to_timestamp(timestamp)
+        # Only update preview + timeline, NOT the analyzer (worker may still be running)
+        if hasattr(self, '_preview_window') and self._preview_window:
+            self._preview_window.seek_to_time(timestamp)
+            self._preview_window.force_frame_update()
         
-        # Force the analyzer to capture this frame
-        if self._analyzer:
-            frame = self._analyzer.seek_to_time(timestamp)
-            if frame is not None and hasattr(self, '_preview_window') and self._preview_window:
-                # Update preview again to ensure it's showing the right frame
-                self._preview_window.seek_to_time(timestamp)
+        if self._timeline_bridge and self._timeline_bridge.is_connected:
+            self._timeline_bridge._cmd_seek({'time': str(timestamp)})
 
     @Slot(list)
     def _on_search_finished(self, results: list):
-        """Handle search completion."""
+        """Handle search completion — worker is done, safe to seek analyzer."""
         found_results = [r for r in results if r.get("contains_target", False)]
         found_count = len(found_results)
         
@@ -740,14 +744,9 @@ class LLMChatWidget(QWidget):
                 f"✅ Search complete. Found '{self.search_target.text()}' at {found_count} timestamp(s): {ts_list}"
             )
             
-            # Always seek to the first match
+            # Worker is finished so _seek_to_timestamp (which touches the
+            # analyzer's cv2.VideoCapture) is safe now — no race condition.
             self._seek_to_timestamp(found_results[0]["timestamp"])
-            
-            # If we found results and stop_on_match is enabled,
-            # we already seeked in _on_search_found. If stop_on_match
-            # is disabled, seek to the first match now.
-            if not self.stop_on_match_cb.isChecked() and found_results:
-                self._seek_to_timestamp(found_results[0]["timestamp"])
         else:
             self._append_system(
                 f"❌ Search complete. No '{self.search_target.text()}' found in video."
@@ -1261,6 +1260,11 @@ class LLMChatWidget(QWidget):
                 self.input_field.clear()
                 self._chat_history.append({"role": "user", "content": text})
                 self._chat_history.append({"role": "assistant", "content": answer})
+
+                MAX_HISTORY_PAIRS = 6
+                if len(self._chat_history) > MAX_HISTORY_PAIRS * 2:
+                    self._chat_history = self._chat_history[-(MAX_HISTORY_PAIRS * 2):]
+
                 return
 
         # Parse search requests from chat (e.g. "search for explosion every 60s")
@@ -1315,6 +1319,14 @@ class LLMChatWidget(QWidget):
                 self._timeline_bridge.get_timeline_state() + "\n" +
                 self._timeline_bridge.get_available_commands_text()
             )
+
+        if has_timeline:
+            timeline_ctx = self._timeline_bridge.get_timeline_state()
+            # Truncate clip list for small models
+            lines = timeline_ctx.split('\n')
+            if len(lines) > 15:
+                timeline_ctx = '\n'.join(lines[:15]) + f'\n... ({len(lines)-15} more lines)'
+            timeline_ctx += '\n' + self._timeline_bridge.get_available_commands_text()
 
         # Capture frame based on mode
         frame_b64 = None
@@ -1419,6 +1431,11 @@ class LLMChatWidget(QWidget):
         if m:
             target = m.group(1).strip()
         
+        if not target:
+            m = re.search(r'until\s+(.+?)\s+is\s+(?:found|seen|spotted|located|detected)', text_lower)
+            if m:
+                target = m.group(1).strip()
+
         # Pattern group 2: "looking for <target>"  /  "for <target>" at end
         if not target:
             m = re.search(r'(?:looking|searching|scanning)\s+for\s+(.+)', text_lower)

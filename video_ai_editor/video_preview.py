@@ -8,6 +8,7 @@ Video Preview Player with AI Overlay Toggle
 
 import sys
 import os
+from typing import Optional
 from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -281,14 +282,9 @@ class VideoPreviewWindow(QMainWindow):
             # Set position
             self.player.setPosition(milliseconds)
             
-            # Force frame to be rendered
+            # Force the frame to be rendered if we were paused
             if not was_playing:
-                # If was paused, we need to briefly play to force frame update
-                self.player.play()
-                
-                # Create a single-shot timer to pause after frame is rendered
-                # Use a longer delay to ensure frame is actually rendered
-                QTimer.singleShot(100, lambda: self._pause_if_not_playing(was_playing))
+                self.force_frame_update()
             
             # Update UI
             self.time_slider.blockSignals(True)
@@ -321,15 +317,62 @@ class VideoPreviewWindow(QMainWindow):
     def force_frame_update(self):
         """Force the video widget to update its displayed frame"""
         if self.player.playbackState() != QMediaPlayer.PlayingState:
-            # Briefly play to force frame update
-            self.player.play()
+            # Store current position
+            current_pos = self.player.position()
             
-            # Create a timer to pause after a very short time
-            # This ensures the frame is rendered
-            timer = QTimer()
-            timer.setSingleShot(True)
-            timer.timeout.connect(lambda: self._safe_pause(timer))
-            timer.start(50)  # 50ms should be enough for one frame
+            # Method 1: Seek to current position + 1ms then back (forces frame update)
+            if current_pos + 1 < self.player.duration():
+                self.player.setPosition(current_pos + 1)
+                
+                # Use a single-shot timer to seek back after a very short delay
+                QTimer.singleShot(10, lambda: self._restore_position(current_pos))
+            else:
+                # Near the end, seek slightly backward then forward
+                self.player.setPosition(current_pos - 100)  # 100ms back
+                QTimer.singleShot(10, lambda: self._restore_position(current_pos))
+
+    def capture_current_frame_base64(self) -> Optional[str]:
+        """Capture current frame and return as base64 string"""
+        import base64
+        from io import BytesIO
+        
+        # Ensure we're at the right position and frame is rendered
+        self.force_frame_update()
+        
+        # Give a tiny moment for the frame to render
+        from PySide6.QtCore import QCoreApplication
+        QCoreApplication.processEvents()
+        
+        # Try multiple methods to capture the frame
+        pixmap = None
+        
+        # Method 1: Try grabbing from video widget
+        if hasattr(self.video_widget, 'grab'):
+            pixmap = self.video_widget.grab()
+        
+        # Method 2: If that failed, try grabbing from the player's video output
+        if (pixmap is None or pixmap.isNull()) and hasattr(self.player, 'videoSink'):
+            video_sink = self.player.videoSink()
+            if video_sink and hasattr(video_sink, 'videoFrame'):
+                frame = video_sink.videoFrame()
+                if frame and not frame.isNull():
+                    # Convert QVideoFrame to QImage to QPixmap
+                    image = frame.toImage()
+                    if not image.isNull():
+                        from PySide6.QtGui import QPixmap
+                        pixmap = QPixmap.fromImage(image)
+        
+        if pixmap and not pixmap.isNull():
+            # Convert to base64
+            buffer = BytesIO()
+            pixmap.save(buffer, 'JPEG', quality=85)
+            return base64.b64encode(buffer.getvalue()).decode('utf-8')
+        
+        return None
+
+    def _restore_position(self, target_position):
+        """Restore to target position after forcing frame update"""
+        self.player.setPosition(target_position)
 
     def _safe_pause(self, timer):
         """Safely pause the player"""
