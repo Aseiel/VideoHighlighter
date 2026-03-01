@@ -19,6 +19,7 @@ Command format (embedded in LLM response text):
     [CMD:clear_clips]
     [CMD:save]
     [CMD:export format=edl]
+    [CMD:visual_scan interval=60 target=some_description]
 
 Usage:
     bridge = TimelineBridge(timeline_window)
@@ -40,7 +41,49 @@ KNOWN_COMMANDS = {
     'add_clip', 'remove_clip', 'clear_clips', 'seek', 'play', 'pause',
     'resume', 'filter_action', 'filter_object', 'show_all_filters',
     'confidence', 'zoom', 'list_clips', 'save', 'export',
+    'visual_scan',  # NEW: iterative frame-by-frame scanning
 }
+
+# ---------------------------------------------------------------------------
+# Robust numeric parsing — handles "60s", "1.5s", "10sec", "30.0 seconds" etc.
+# ---------------------------------------------------------------------------
+_NUMERIC_SUFFIX = re.compile(r'^([+-]?\d+\.?\d*)\s*(?:s|sec|seconds|ms|px|%)?$', re.IGNORECASE)
+
+def _parse_float(value: str, default: float = 0.0) -> float:
+    """
+    Parse a float from a string, stripping common unit suffixes.
+    Handles: "60", "60s", "60.0s", "1.5sec", "30seconds", etc.
+    """
+    value = value.strip()
+    
+    # Try direct conversion first (fast path)
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    
+    # Try stripping unit suffixes
+    match = _NUMERIC_SUFFIX.match(value)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            pass
+    
+    # Last resort: strip all non-numeric chars except . and -
+    cleaned = re.sub(r'[^0-9.\-]', '', value)
+    if cleaned:
+        try:
+            return float(cleaned)
+        except ValueError:
+            pass
+    
+    return default
+
+
+def _parse_int(value: str, default: int = 0) -> int:
+    """Parse an int from a string, stripping common unit suffixes."""
+    return int(_parse_float(value, float(default)))
 
 
 def parse_commands(text: str) -> list[tuple[str, dict[str, str]]]:
@@ -84,10 +127,15 @@ class TimelineBridge:
     def __init__(self, timeline_window=None):
         self._window = timeline_window  # SignalTimelineWindow instance
         self._command_log: list[str] = []
+        self._scan_callback = None  # Callback for visual_scan results
 
     def set_timeline_window(self, window):
         """Connect to a timeline window."""
         self._window = window
+
+    def set_scan_callback(self, callback):
+        """Set callback for visual_scan command (called from chat widget)."""
+        self._scan_callback = callback
 
     @property
     def is_connected(self) -> bool:
@@ -145,6 +193,10 @@ class TimelineBridge:
 You can control the timeline by including commands in your response.
 Commands use this format: [CMD:command_name param1=value param2=value]
 
+IMPORTANT: All time values must be plain numbers (seconds). Do NOT add "s" suffix.
+  CORRECT: [CMD:seek time=60]
+  WRONG:   [CMD:seek time=60s]
+
 Available commands:
   [CMD:add_clip start=SECONDS end=SECONDS]     — Add a clip to the edit timeline
   [CMD:remove_clip index=NUMBER]                — Remove clip by number (1-based), or index=all to clear
@@ -161,24 +213,34 @@ Available commands:
   [CMD:list_clips]                              — List current edit timeline clips
   [CMD:save]                                    — Save edit timeline to cache
   [CMD:export format=edl]                       — Export timeline (edl or xml)
+  [CMD:visual_scan interval=SECONDS target=DESCRIPTION] — Scan video frames looking for something
 
 RULES for commands:
+- All numeric parameters are plain numbers: 60, 10.5, 0.3 (NO units like "s" or "sec")
 - Place commands AFTER your text explanation
 - Use real timestamps from the analysis data
 - For action/object names, use Title Case exactly as shown in the data
 - You can include multiple commands in one response
-- KEEP RESPONSES SHORT. Just say what you're doing + the command. Do NOT list all clips or echo back the timeline state.
+- KEEP RESPONSES SHORT. Just say what you're doing + the command.
 - To play video, use [CMD:play] (from current pos) or [CMD:play start=X end=Y] (specific clip)
 - [CMD:seek] only moves the playhead, it does NOT start playback
-- BAD example (too verbose): "Here are your clips: Clip 1: 0-5s, Clip 2: 10-15s... I'll remove clip 2 [CMD:remove_clip index=2]"
-- GOOD example (concise): "Removing clip 2. [CMD:remove_clip index=2]"
+
+IMPORTANT — SCANNING FOR CONTENT:
+- You CANNOT seek through a video frame-by-frame yourself in a single response.
+- If the user asks you to "seek through video every N seconds looking for X":
+  Use [CMD:visual_scan interval=N target=X] — this triggers an actual frame-by-frame 
+  visual analysis that captures and analyzes each frame with the vision model.
+- Do NOT generate multiple [CMD:seek] commands pretending to analyze frames.
+  You can only see frames when the system explicitly captures one for you.
+- Do NOT hallucinate finding content — if you haven't actually seen a frame, say so.
 
 Example:
-  "I see the action 'Drinking' at 0:10. I'll add it as a clip and play it.
+  "I'll scan the video every 60 seconds looking for that.
+  [CMD:visual_scan interval=60 target=punching_person]"
+
+  "I see the action 'Drinking' at 0:10 in the analysis data. Adding it as a clip.
   [CMD:add_clip start=8.0 end=13.0]
   [CMD:play start=8.0 end=13.0]"
-
-  "Sure, playing the video now. [CMD:play]"
 """
 
     def process_response(self, response_text: str) -> tuple[str, list[str]]:
@@ -224,12 +286,12 @@ Example:
             return f"❌ Error executing {cmd}: {e}"
 
     # ----------------------------------------------------------------
-    # Command handlers
+    # Command handlers — all use _parse_float/_parse_int for robustness
     # ----------------------------------------------------------------
 
     def _cmd_add_clip(self, p: dict) -> str:
-        start = float(p.get('start', 0))
-        end = float(p.get('end', start + 5))
+        start = _parse_float(p.get('start', '0'))
+        end = _parse_float(p.get('end', str(start + 5)))
         if end <= start:
             end = start + 3
         self._window.edit_scene.add_clip(start, end)
@@ -244,8 +306,8 @@ Example:
             return self._cmd_clear_clips(p)
 
         try:
-            idx = int(idx_str) - 1  # Convert 1-based to 0-based
-        except ValueError:
+            idx = _parse_int(idx_str) - 1  # Convert 1-based to 0-based
+        except (ValueError, TypeError):
             return f"⚠️ Invalid clip index: '{idx_str}'"
 
         clips = self._window.edit_scene.clips
@@ -266,7 +328,7 @@ Example:
         return f"✅ Cleared all {count} clips"
 
     def _cmd_seek(self, p: dict) -> str:
-        t = float(p.get('time', 0))
+        t = _parse_float(p.get('time', '0'))
         t = max(0, min(t, self._window.video_duration))
         self._window.on_time_clicked(t)
         return f"✅ Seeked to {t:.1f}s"
@@ -286,8 +348,8 @@ Example:
                 return f"✅ Playing from {current:.1f}s"
             return "⚠️ No video player available"
 
-        start = float(start)
-        end = float(end) if end else start + 5
+        start = _parse_float(start)
+        end = _parse_float(end, start + 5)
         self._window.play_video_clip(start, end)
         return f"✅ Playing {start:.1f}s - {end:.1f}s"
 
@@ -331,13 +393,13 @@ Example:
         return "✅ All filters reset — showing everything"
 
     def _cmd_confidence(self, p: dict) -> str:
-        min_c = float(p.get('min', 0.0))
-        max_c = float(p.get('max', 1.0))
+        min_c = _parse_float(p.get('min', '0.0'))
+        max_c = _parse_float(p.get('max', '1.0'))
         self._window.signal_scene.set_confidence_filter(min_c, max_c)
         return f"✅ Confidence filter set: {min_c:.2f} - {max_c:.2f}"
 
     def _cmd_zoom(self, p: dict) -> str:
-        level = int(p.get('level', 50))
+        level = _parse_int(p.get('level', '50'))
         level = max(10, min(200, level))
         self._window.signal_scene.set_zoom(level)
         return f"✅ Zoom set to {level}"
@@ -365,7 +427,6 @@ Example:
         if not clips:
             return "⚠️ No clips to export"
         try:
-            # Use the window's exporter
             from signal_timeline_viewer import TimelineExporter
             if fmt in ('edl',):
                 result = TimelineExporter.to_edl(clips, self._window.video_path)
@@ -377,3 +438,31 @@ Example:
                 return f"⚠️ Unknown format: {fmt}. Use 'edl' or 'xml'"
         except Exception as e:
             return f"❌ Export failed: {e}"
+
+    def _cmd_visual_scan(self, p: dict) -> str:
+        """
+        Trigger actual frame-by-frame visual scanning using VideoSeekAnalyzer.
+        This is the correct way to search through video — NOT multiple seek commands.
+        """
+        interval = _parse_float(p.get('interval', '60'))
+        target = p.get('target', '').replace('_', ' ').strip()
+        
+        if not target:
+            return "⚠️ Missing target description. Usage: [CMD:visual_scan interval=60 target=description]"
+        
+        if interval < 0.5:
+            interval = 0.5
+        if interval > 300:
+            interval = 300
+        
+        # Delegate to the scan callback (set by LLMChatWidget)
+        if self._scan_callback:
+            self._scan_callback(target, interval)
+            return f"🔍 Starting visual scan every {interval:.0f}s looking for: {target}"
+        else:
+            return (
+                f"⚠️ Visual scan not available. Use the Visual Search panel instead:\n"
+                f"  1. Enter '{target}' in the 'Search for' field\n"
+                f"  2. Set interval to {interval:.0f}s\n"
+                f"  3. Click 🔍 Search"
+            )
