@@ -2950,7 +2950,11 @@ class VideoHighlighterGUI(QWidget):
             # Create and show the timeline window
             self.timeline_window = SignalTimelineWindow(video_path, cache_data)
             self.timeline_window.show()
-            
+            # Connect LLM chat to timeline and video
+            self.llm_chat.set_timeline_window(self.timeline_window)
+            self.llm_chat.set_video_path(video_path)
+            self.llm_chat.load_cache_for_video(video_path)
+
         except ImportError as e:
             self.append_log(f"❌ Failed to import timeline viewer: {e}")
             self.append_log("   Make sure signal_timeline_viewer.py is in the same directory.")
