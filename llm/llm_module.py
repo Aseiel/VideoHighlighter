@@ -77,6 +77,9 @@ _SELF_TALK_PATTERNS = re.compile(
     r'|=== VIDEO ANALYSIS DATA ==='                    # leaked context markers
     r'|=== END DATA ==='
     r'|=== TIMELINE'
+    r'|```python'
+    r'|\[CMD:\w+\].*\[CMD:\w+\]'          # multiple CMDs on same line
+    r'|(?:Clip\s*#\d+.*\n){3,}'           # hallucinated clip lists
     r')',
     re.IGNORECASE
 )
