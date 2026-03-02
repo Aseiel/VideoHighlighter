@@ -23,13 +23,23 @@ except ImportError:
     pass
 
 
-def get_yolo_people_model(model_name="yolo11n.pt"):
+def get_yolo_people_model(model_name="yolo11n.pt", device=None):
     """Lazy-load YOLO people detection model (singleton)."""
     global _yolo_people_model
     if _yolo_people_model is None:
         if not YOLO_AVAILABLE:
             raise ImportError("ultralytics not installed — run: pip install ultralytics")
+        if device is None:
+            import torch
+            if hasattr(torch, 'xpu') and torch.xpu.is_available():
+                device = 'xpu'
+            elif torch.cuda.is_available():
+                device = 'cuda'
+            else:
+                device = 'cpu'
         _yolo_people_model = YOLO(model_name)
+        _yolo_people_model.to(device)
+        print(f"🧍 People model loaded on {device}")
     return _yolo_people_model
 
 
@@ -159,7 +169,7 @@ class SmartActionDetector:
     and relative motion patterns.
     """
 
-    def __init__(self, sticky_frames=15, sticky_weight=0.5, debug=False):
+    def __init__(self, sticky_frames=15, sticky_weight=0.5, debug=False, device=None):
         self.prev_frame_data = None
         self.frame_count = 0
         self.selection_history = deque(maxlen=sticky_frames)
@@ -168,6 +178,17 @@ class SmartActionDetector:
         self.lock_strength = 0
         self.locked_track_ids = set()
         self.debug = debug
+
+        if device is None:
+            import torch
+            if hasattr(torch, 'xpu') and torch.xpu.is_available():
+                device = 'xpu'
+            elif torch.cuda.is_available():
+                device = 'cuda'
+            else:
+                device = 'cpu'
+        self.device = device
+
 
     # ----- core detection -----
     def detect(self, frame, detector, max_people=2, allow_dynamic_group=True):
@@ -663,21 +684,108 @@ class SmoothedROIDetector:
 
 
 # =============================
-# Pose Extractor
+# Pose Extractor with GPU Support
 # =============================
 class PoseExtractor:
     """YOLO11 pose estimation for spatial cropping guidance."""
 
-    def __init__(self, model_name="yolo11n-pose.pt", conf_threshold=0.3):
+    def __init__(self, model_name="yolo11n-pose.pt", conf_threshold=0.3, device=None):
         if not YOLO_AVAILABLE:
             raise ImportError("ultralytics not installed")
-        print(f"🦴 Loading pose estimation model: {model_name}")
+        
+        # Auto-detect best available device if none specified
+        if device is None:
+            import torch
+            if torch.cuda.is_available():
+                device = 'cuda'
+                print(f"  📷 Auto-detected CUDA GPU for YOLO")
+            elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+                device = 'xpu'
+                print(f"  📷 Auto-detected Intel GPU for YOLO")
+            else:
+                device = 'cpu'
+                print(f"  📷 No GPU detected, using CPU for YOLO (this will be slow)")
+        
+        print(f"🦴 Loading pose estimation model on {device}: {model_name}")
         self.model = YOLO(model_name)
+        
+        # Move model to specified device
+        if device != 'cpu':
+            self.model.to(device)
+            print(f"  ✅ YOLO model moved to {device}")
+        
         self.conf_threshold = conf_threshold
+        self.device = device
 
     def get_all_keypoints_for_visualization(self, frame):
+        # Ensure frame is on correct device
+        if hasattr(frame, 'device'):
+            # If frame is a tensor, move it to the model's device
+            if str(frame.device) != self.device:
+                frame = frame.to(self.device)
+        
         results = self.model.predict(frame, conf=self.conf_threshold, verbose=False)
+        
         if len(results) == 0 or results[0].keypoints is None:
             return []
+        
+        # Keypoints are returned on the device they were processed on
         all_kpts = results[0].keypoints.data.cpu().numpy()
         return [k for k in all_kpts if np.sum(k[:, 2] > 0.3) >= 5]
+    
+    # Add batch processing for efficiency
+    def predict_batch(self, frames, batch_size=16):
+        """
+        Process multiple frames in a batch for maximum GPU utilization.
+        
+        Args:
+            frames: List of frames (numpy arrays)
+            batch_size: Number of frames to process at once
+        
+        Returns:
+            List of keypoint results for each frame
+        """
+        all_results = []
+        
+        for i in range(0, len(frames), batch_size):
+            batch = frames[i:i+batch_size]
+            
+            # Convert batch to tensor if needed and move to device
+            if isinstance(batch[0], np.ndarray):
+                # Convert numpy batch to tensor on correct device
+                import torch
+                batch_tensor = torch.from_numpy(np.stack(batch)).to(self.device)
+                # Ensure correct format (B, H, W, C) -> (B, C, H, W) if needed
+                if batch_tensor.shape[-1] == 3:  # If channels last
+                    batch_tensor = batch_tensor.permute(0, 3, 1, 2)
+            else:
+                batch_tensor = batch
+            
+            # Run inference on batch
+            results = self.model.predict(batch_tensor, conf=self.conf_threshold, verbose=False)
+            all_results.extend(results)
+            
+            # Optional: print progress
+            if i % (batch_size * 10) == 0:
+                print(f"    Processed {i+len(batch)}/{len(frames)} frames...")
+        
+        return all_results
+    
+    def extract_poses_batch(self, frames):
+        """
+        Extract poses from multiple frames and return keypoints.
+        More convenient wrapper around predict_batch.
+        """
+        results = self.predict_batch(frames)
+        
+        batch_keypoints = []
+        for result in results:
+            if result.keypoints is not None:
+                kpts = result.keypoints.data.cpu().numpy()
+                # Filter by confidence
+                valid_kpts = [k for k in kpts if np.sum(k[:, 2] > self.conf_threshold) >= 3]
+                batch_keypoints.append(valid_kpts)
+            else:
+                batch_keypoints.append([])
+        
+        return batch_keypoints
