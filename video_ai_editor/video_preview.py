@@ -15,11 +15,175 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QSlider, QCheckBox, QGroupBox,
     QFileDialog, QMessageBox, QSplitter
 )
-from PySide6.QtCore import Qt, QUrl, Signal, Slot, QTimer
+from PySide6.QtCore import Qt, QUrl, Signal, Slot, QTimer, QRect, QEvent
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPixmap
 
+class AnalysisOverlayWidget(QWidget):
+    """Floating transparent overlay that draws labels on top of video.
+    
+    QVideoWidget uses native rendering that covers child widgets,
+    so this is a top-level frameless window that tracks the video widget position.
+    """
+    
+    def __init__(self, video_widget, parent=None):
+        # Top-level frameless transparent window
+        super().__init__(None, 
+                         Qt.FramelessWindowHint | 
+                         Qt.WindowStaysOnTopHint |
+                         Qt.Tool)  # Tool = no taskbar entry
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        
+        self.video_widget = video_widget
+        self.cache_data = None
+        self.current_time = 0.0
+        self.time_window = 1.0
+        self._visible = False
+        
+        # Track video widget movement/resize
+        self.video_widget.installEventFilter(self)
+        
+        # Poll position as backup (some window managers miss move events)
+        self._pos_timer = QTimer()
+        self._pos_timer.timeout.connect(self._sync_geometry)
+        self._pos_timer.start(100)  # 10fps position sync
+        
+    def set_cache_data(self, cache_data):
+        self.cache_data = cache_data
+        
+    def set_time(self, seconds):
+        self.current_time = seconds
+        if self._visible:
+            self.update()
+    
+    def set_overlay_visible(self, visible):
+        self._visible = visible
+        if visible:
+            self._sync_geometry()
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
+        self.update()
+    
+    def eventFilter(self, obj, event):
+        """Track video widget moves and resizes"""
+        if obj == self.video_widget:
+            if event.type() in (QEvent.Resize, QEvent.Move, QEvent.Show):
+                self._sync_geometry()
+        return False
+    
+    def _sync_geometry(self):
+        """Match overlay geometry to video widget's screen position"""
+        if not self.video_widget.isVisible():
+            return
+        try:
+            global_pos = self.video_widget.mapToGlobal(self.video_widget.rect().topLeft())
+            self.setGeometry(
+                global_pos.x(), global_pos.y(),
+                self.video_widget.width(), self.video_widget.height()
+            )
+        except RuntimeError:
+            pass  # widget deleted
+    
+    def paintEvent(self, event):
+        if not self._visible or not self.cache_data:
+            return
+            
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        w, h = self.width(), self.height()
+        if w < 10 or h < 10:
+            painter.end()
+            return
+        
+        # ── Actions (top-left) ──
+        actions = []
+        for act in self.cache_data.get('actions', []):
+            ts = act.get('timestamp', -999)
+            if abs(ts - self.current_time) > self.time_window:
+                continue
+            name = act.get('action_name') or act.get('action', '?')
+            conf = act.get('confidence', 0)
+            model = act.get('model_type', '')
+            actions.append((name, conf, model))
+        
+        actions.sort(key=lambda x: x[1], reverse=True)
+        
+        for i, (name, conf, model) in enumerate(actions[:5]):
+            y = 28 + i * 34
+            tag = f" [{model}]" if model else ""
+            text = f"{name}{tag} {conf:.0%}"
+            
+            if 'custom' in model:
+                color = QColor(0, 255, 0, 220)
+            elif 'cuda' in model or 'r3d' in model:
+                color = QColor(0, 128, 255, 220)
+            else:
+                color = QColor(0, 165, 255, 220)
+            
+            # Confidence bar
+            bar_w = int(min(w - 20, 320) * conf)
+            painter.fillRect(10, y - 18, bar_w, 28, 
+                           QColor(color.red(), color.green(), color.blue(), 70))
+            
+            # Text with outline for readability
+            font = QFont("Arial", 11, QFont.Bold)
+            painter.setFont(font)
+            
+            # Black outline
+            painter.setPen(QPen(QColor(0, 0, 0, 200), 3))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx or dy:
+                        painter.drawText(14 + dx, y + 2 + dy, text)
+            
+            # Colored text
+            painter.setPen(color)
+            painter.drawText(14, y + 2, text)
+        
+        # ── Objects (bottom-left) ──
+        objects = []
+        for obj_entry in self.cache_data.get('objects', []):
+            ts = obj_entry.get('timestamp', -999)
+            if abs(ts - self.current_time) > self.time_window:
+                continue
+            for obj_name in obj_entry.get('objects', []):
+                if isinstance(obj_name, str) and obj_name not in objects:
+                    objects.append(obj_name)
+        
+        if objects:
+            text = "Objects: " + ", ".join(objects[:6])
+            painter.fillRect(8, h - 38, len(text) * 9 + 16, 30, QColor(0, 0, 0, 150))
+            painter.setFont(QFont("Arial", 10, QFont.Bold))
+            painter.setPen(QColor(0, 255, 0, 220))
+            painter.drawText(14, h - 16, text)
+        
+        # ── No data indicator ──
+        if not actions and not objects:
+            painter.setFont(QFont("Arial", 9))
+            painter.setPen(QColor(255, 255, 100, 150))
+            painter.drawText(10, h - 10, f"No detections at {self.current_time:.1f}s")
+        
+        # ── Timestamp (top-right) ──
+        mins, secs = divmod(int(self.current_time), 60)
+        ts_text = f"{mins:02d}:{secs:02d}"
+        painter.setFont(QFont("Consolas", 13, QFont.Bold))
+        painter.setPen(QColor(0, 0, 0, 200))
+        painter.drawText(w - 78, 27, ts_text)
+        painter.setPen(QColor(0, 255, 255, 230))
+        painter.drawText(w - 80, 25, ts_text)
+        
+        painter.end()
+    
+    def cleanup(self):
+        """Stop timers and hide"""
+        self._pos_timer.stop()
+        self.hide()
 
 class VideoPreviewWindow(QMainWindow):
     """Standalone video preview window with AI overlay toggle"""
@@ -29,11 +193,12 @@ class VideoPreviewWindow(QMainWindow):
     play_state_changed = Signal(bool)  # Play/pause state
     overlay_toggled = Signal(bool)  # AI overlay on/off
     
-    def __init__(self, video_path, annotated_video_path=None, parent=None):
+    def __init__(self, video_path, annotated_video_path=None, parent=None, cache_data=None):
         super().__init__(parent)
         self.video_path = video_path
         self.annotated_video_path = annotated_video_path
-        self.current_source = 'original'  # 'original' or 'annotated'
+        self.cache_data = cache_data
+        self.current_source = 'original'
         
         self.setWindowTitle(f"Video Preview - {os.path.basename(video_path)}")
         self.setGeometry(200, 200, 800, 600)
@@ -47,21 +212,26 @@ class VideoPreviewWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         
-        # Video display area
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumSize(640, 360)
         layout.addWidget(self.video_widget, 1)
         
-        # Controls panel
+        # ── ADD: Floating overlay for analysis labels ──
+        self.analysis_overlay = AnalysisOverlayWidget(self.video_widget)
+        if self.cache_data:
+            self.analysis_overlay.set_cache_data(self.cache_data)
+        
         controls = self.create_controls()
         layout.addWidget(controls)
         
-        # Status bar
         self.status_bar = self.statusBar()
-        
-        # Apply dark theme
         self.apply_dark_theme()
-        
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'analysis_overlay'):
+            self.analysis_overlay.setGeometry(self.video_widget.geometry())
+
     def create_controls(self):
         """Create video controls"""
         controls = QWidget()
@@ -95,8 +265,8 @@ class VideoPreviewWindow(QMainWindow):
         feature_layout = QHBoxLayout()
         
         # AI overlay toggle
-        self.overlay_checkbox = QCheckBox("Show AI Bounding Boxes")
-        self.overlay_checkbox.setEnabled(self.annotated_video_path is not None)
+        self.overlay_checkbox = QCheckBox("Show AI Labels Overlay")
+        self.overlay_checkbox.setEnabled(True)  # Always enabled — reads from cache
         self.overlay_checkbox.stateChanged.connect(self.toggle_overlay)
         
         # Sync with timeline checkbox
@@ -218,14 +388,9 @@ class VideoPreviewWindow(QMainWindow):
         
     @Slot(int)
     def toggle_overlay(self, state):
-        """Toggle between original and AI-annotated video"""
-        if state == Qt.Checked and self.annotated_video_path:
-            self.load_video(self.annotated_video_path)
-            self.current_source = 'annotated'
-        else:
-            self.load_video(self.video_path)
-            self.current_source = 'original'
-            
+        """Toggle analysis labels overlay"""
+        if hasattr(self, 'analysis_overlay'):
+            self.analysis_overlay.set_overlay_visible(state == Qt.Checked)
         self.overlay_toggled.emit(state == Qt.Checked)
         
     @Slot(int)
@@ -239,17 +404,16 @@ class VideoPreviewWindow(QMainWindow):
             
     @Slot(int)
     def update_position(self, position):
-        """Update position display"""
         if self.player.duration() > 0:
-            # Update slider
             self.time_slider.blockSignals(True)
             self.time_slider.setValue(position)
             self.time_slider.blockSignals(False)
-            
-            # Update label
             self.update_time_label(position)
             
-            # Emit time change if syncing
+            # ── Update overlay time ──
+            if hasattr(self, 'analysis_overlay'):
+                self.analysis_overlay.set_time(position / 1000.0)
+            
             if (self.sync_checkbox.isChecked() and 
                 self.player.playbackState() == QMediaPlayer.PlayingState):
                 self.time_changed.emit(position / 1000.0)
@@ -272,25 +436,22 @@ class VideoPreviewWindow(QMainWindow):
         
     # Public API methods for timeline to call
     def seek_to_time(self, seconds):
-        """Seek to specific time (called from timeline or LLM) and ensure frame is displayed"""
         if self.player.duration() > 0:
             milliseconds = int(seconds * 1000)
-            
-            # Store current playback state
             was_playing = self.player.playbackState() == QMediaPlayer.PlayingState
-            
-            # Set position
             self.player.setPosition(milliseconds)
             
-            # Force the frame to be rendered if we were paused
+            # ── Update overlay ──
+            if hasattr(self, 'analysis_overlay'):
+                self.analysis_overlay.set_time(seconds)
+            
             if not was_playing:
                 self.force_frame_update()
-            
-            # Update UI
             self.time_slider.blockSignals(True)
             self.time_slider.setValue(milliseconds)
             self.time_slider.blockSignals(False)
             self.update_time_label(milliseconds)
+
 
     def _pause_if_not_playing(self, was_playing):
         """Helper to pause if we were originally paused"""
@@ -435,15 +596,12 @@ class TimelineWithPreview:
     
     @staticmethod
     def launch_preview(timeline_window, chat_widget=None):
-        """Launch preview window from timeline"""
-        # Get paths from timeline
         video_path = timeline_window.video_path
-        
-        # Find annotated video (you need to implement this based on your cache)
         annotated_path = TimelineWithPreview.find_annotated_video(video_path, timeline_window.cache_data)
         
-        # Create preview window
-        preview = VideoPreviewWindow(video_path, annotated_path)
+        # Pass cache_data to preview
+        preview = VideoPreviewWindow(video_path, annotated_path, 
+                                    cache_data=timeline_window.cache_data)
         
         # Connect signals
         timeline_window.signal_scene.time_clicked.connect(preview.seek_to_time)
@@ -452,14 +610,12 @@ class TimelineWithPreview:
         )
         preview.time_changed.connect(timeline_window.signal_scene.set_current_time)
         
-        # Show both windows
         preview.show()
         if chat_widget:
             chat_widget.set_preview_window(preview)
-
-
-        return preview
         
+        return preview
+
     @staticmethod
     def find_annotated_video(video_path, cache_data):
         """Find annotated video path from cache"""
@@ -482,5 +638,10 @@ class TimelineWithPreview:
         for path in possible_paths:
             if os.path.exists(path):
                 return path
-                
+
+    def closeEvent(self, event):
+        if hasattr(self, 'analysis_overlay'):
+            self.analysis_overlay.cleanup()
+        super().closeEvent(event)
+
         return None

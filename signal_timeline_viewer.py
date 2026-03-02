@@ -2911,97 +2911,92 @@ class SignalTimelineWindow(QMainWindow):
         super().closeEvent(event)
 
     def create_video_preview_dock(self):
-        """Create dock with video preview player using Qt's built-in player"""
         from PySide6.QtCore import Qt, QUrl
         from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
         from PySide6.QtMultimediaWidgets import QVideoWidget
         
-        # Create the dock widget
         dock = QDockWidget("Video Preview", self)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         
-        # Create the main widget for the dock
         preview_widget = QWidget()
         layout = QVBoxLayout(preview_widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
         
-        # Preview label
-        preview_label = QLabel("🎬 Video Preview")
-        preview_label.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        preview_label.setStyleSheet("color: #a0c0ff; padding: 4px;")
-        layout.addWidget(preview_label)
+        # ── Video + Info side-by-side ──
+        video_splitter = QSplitter(Qt.Orientation.Horizontal)
         
-        # Create video widget
+        # Left: Video
         self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumSize(400, 300)
-        self.video_widget.setStyleSheet("""
-            QVideoWidget {
-                background-color: black;
-                border: 2px solid #3a3a5a;
-                border-radius: 6px;
+        self.video_widget.setMinimumSize(320, 240)
+        self.video_widget.setStyleSheet("background-color: black; border: 2px solid #3a3a5a;")
+        video_splitter.addWidget(self.video_widget)
+        
+        # Right: Detection info panel
+        self.detection_panel = QLabel("No detections")
+        self.detection_panel.setWordWrap(True)
+        self.detection_panel.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.detection_panel.setMinimumWidth(180)
+        self.detection_panel.setMaximumWidth(280)
+        self.detection_panel.setStyleSheet("""
+            QLabel {
+                background-color: #0a0a18;
+                color: #d0d8ff;
+                border: 1px solid #3a3a5a;
+                border-radius: 4px;
+                padding: 8px;
+                font-family: 'Consolas', monospace;
+                font-size: 11px;
             }
         """)
-        layout.addWidget(self.video_widget)
+        video_splitter.addWidget(self.detection_panel)
+        video_splitter.setSizes([500, 200])
         
-        # Create media player
+        layout.addWidget(video_splitter, 1)
+        
+        # ── Media player ──
         self.video_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.video_player.setAudioOutput(self.audio_output)
         self.video_player.setVideoOutput(self.video_widget)
+        self.video_player.setSource(QUrl.fromLocalFile(self.video_path))
         
-        # Load the video
-        video_url = QUrl.fromLocalFile(self.video_path)
-        self.video_player.setSource(video_url)
-        
-        # Create controls widget
+        # ── Controls ──
         controls_widget = QWidget()
         controls_layout = QHBoxLayout(controls_widget)
-        controls_layout.setContentsMargins(0, 8, 0, 0)
+        controls_layout.setContentsMargins(0, 4, 0, 0)
         
-        # Play/Pause button
         self.play_btn = QPushButton("▶ Play")
         self.play_btn.clicked.connect(self.toggle_video_playback)
         self.play_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #3a5fcd;
-                color: white;
-                font-weight: bold;
-                padding: 8px 16px;
-                border-radius: 4px;
-                min-width: 80px;
-            }
-            QPushButton:hover {
-                background-color: #4a6fdd;
-            }
+            QPushButton { background-color: #3a5fcd; color: white; font-weight: bold;
+                        padding: 8px 16px; border-radius: 4px; min-width: 80px; }
+            QPushButton:hover { background-color: #4a6fdd; }
         """)
+
         controls_layout.addWidget(self.play_btn)
         
-        # Time slider
         self.time_slider = QSlider(Qt.Horizontal)
         self.time_slider.setRange(0, 100)
         self.time_slider.sliderMoved.connect(self.seek_video)
         controls_layout.addWidget(self.time_slider)
         
-        # Time label
-        self.time_label = QLabel("00:00 / 00:00")
+        self.preview_time_label = QLabel("00:00 / 00:00")
         self.time_label.setStyleSheet("""
-            QLabel {
-                color: #a0ffa0;
-                font-family: 'Consolas', monospace;
-                font-weight: bold;
-                padding: 8px;
-                background-color: #1a1a2a;
-                border-radius: 4px;
-                min-width: 120px;
-                qproperty-alignment: AlignCenter;
-            }
+            QLabel { color: #a0ffa0; font-family: 'Consolas', monospace;
+                    font-weight: bold; padding: 8px; background-color: #1a1a2a;
+                    border-radius: 4px; min-width: 120px; qproperty-alignment: AlignCenter; }
         """)
-        controls_layout.addWidget(self.time_label)
+        controls_layout.addWidget(self.preview_time_label)
+        
+        # Show overlay checkbox
+        self.show_detections_checkbox = QCheckBox("Show Detections")
+        self.show_detections_checkbox.setChecked(True)
+        self.show_detections_checkbox.stateChanged.connect(self._toggle_detection_panel)
+        controls_layout.addWidget(self.show_detections_checkbox)
         
         controls_layout.addStretch()
         
-        # Volume slider
         volume_layout = QHBoxLayout()
         volume_layout.addWidget(QLabel("🔊"))
         self.volume_slider = QSlider(Qt.Horizontal)
@@ -3012,19 +3007,92 @@ class SignalTimelineWindow(QMainWindow):
         volume_layout.addWidget(self.volume_slider)
         controls_layout.addLayout(volume_layout)
         
-        # Add controls to main layout
         layout.addWidget(controls_widget)
         
-        # Connect video player signals
+        # Connect signals
         self.video_player.durationChanged.connect(self.update_video_duration)
         self.video_player.positionChanged.connect(self.update_video_position)
         self.video_player.playbackStateChanged.connect(self.update_play_button)
-        
-        # Set initial volume
         self.audio_output.setVolume(0.8)
         
         dock.setWidget(preview_widget)
         return dock
+
+    def _toggle_detection_panel(self, state):
+        """Show/hide detection panel"""
+        if hasattr(self, 'detection_panel'):
+            self.detection_panel.setVisible(state == Qt.Checked)
+
+    def _update_detection_panel(self, time_seconds):
+        """Update detection info panel with actions/objects at current time"""
+        if not hasattr(self, 'detection_panel') or not self.detection_panel.isVisible():
+            return
+        if not self.cache_data:
+            return
+        
+        time_window = 1.0
+        lines = []
+        
+        # ── Actions ──
+        actions = []
+        for act in self.cache_data.get('actions', []):
+            ts = act.get('timestamp', -999)
+            if abs(ts - time_seconds) > time_window:
+                continue
+            name = act.get('action_name') or act.get('action', '?')
+            conf = act.get('confidence', 0)
+            model = act.get('model_type', '')
+            actions.append((name, conf, model))
+        
+        actions.sort(key=lambda x: x[1], reverse=True)
+        
+        if actions:
+            lines.append('<b style="color: #80b0ff;">━━ ACTIONS ━━</b>')
+            for name, conf, model in actions[:5]:
+                # Confidence bar using block chars
+                bar_len = int(conf * 12)
+                bar = '█' * bar_len + '░' * (12 - bar_len)
+                
+                if 'custom' in model:
+                    color = '#00ff00'
+                elif 'cuda' in model or 'r3d' in model:
+                    color = '#0080ff'
+                else:
+                    color = '#00a5ff'
+                
+                tag = f' <span style="color:#888;">[{model}]</span>' if model else ''
+                lines.append(
+                    f'<span style="color:{color};">{bar} {conf:.0%}</span><br>'
+                    f'  <b>{name}</b>{tag}'
+                )
+            lines.append('')
+        
+        # ── Objects ──
+        objects = []
+        for obj_entry in self.cache_data.get('objects', []):
+            ts = obj_entry.get('timestamp', -999)
+            if abs(ts - time_seconds) > time_window:
+                continue
+            for obj_name in obj_entry.get('objects', []):
+                if isinstance(obj_name, str) and obj_name not in objects:
+                    objects.append(obj_name)
+        
+        if objects:
+            lines.append('<b style="color: #80ff80;">━━ OBJECTS ━━</b>')
+            for obj in objects[:8]:
+                lines.append(f'  • {obj}')
+            lines.append('')
+        
+        # ── Timestamp ──
+        mins, secs = divmod(int(time_seconds), 60)
+        ms = int((time_seconds % 1) * 100)
+        lines.insert(0, f'<b style="color: #00ffff; font-size: 13px;">{mins:02d}:{secs:02d}.{ms:02d}</b>')
+        
+        if not actions and not objects:
+            lines.append('<span style="color: #666;">No detections</span>')
+        
+        self.detection_panel.setText('<br>'.join(lines))
+
 
     def toggle_video_playback(self):
         """Toggle video playback in the preview"""
@@ -3056,35 +3124,34 @@ class SignalTimelineWindow(QMainWindow):
             self.update_time_display(self.video_player.position())
 
     def update_video_position(self, position):
-        """Update video position display"""
         if self.video_player.duration() > 0:
-            # Update slider
             percent = (position / self.video_player.duration()) * 100
             self.time_slider.blockSignals(True)
             self.time_slider.setValue(int(percent))
             self.time_slider.blockSignals(False)
             
-            # Update time label
             self.update_time_display(position)
             
-            # Sync with timeline if playing
+            # ── Update detection panel ──
+            time_seconds = position / 1000.0
+            self._update_detection_panel(time_seconds)
+            
             if self.video_player.playbackState() == QMediaPlayer.PlayingState:
-                self.current_time = position / 1000.0
+                self.current_time = time_seconds
                 self.signal_scene.set_current_time(self.current_time)
                 if hasattr(self, 'signal_view'):
                     self.signal_view.ensure_time_visible(self.current_time)
 
     def update_time_display(self, position):
-        """Update the time display label"""
         current_seconds = position // 1000
         mins = current_seconds // 60
         secs = current_seconds % 60
         current_time_str = f"{mins:02d}:{secs:02d}"
         
         if hasattr(self, 'total_duration_str'):
-            self.time_label.setText(f"{current_time_str} / {self.total_duration_str}")
+            self.preview_time_label.setText(f"{current_time_str} / {self.total_duration_str}")
         else:
-            self.time_label.setText(f"{current_time_str}")
+            self.preview_time_label.setText(f"{current_time_str}")
 
     def update_play_button(self, state):
         """Update play button based on playback state"""
@@ -3699,21 +3766,25 @@ class SignalTimelineWindow(QMainWindow):
         self.installEventFilter(self)
 
     def capture_current_frame_base64(self) -> str | None:
-        """Grab the current frame as base64 for LLM vision."""
+        """Grab current frame as base64, optionally annotated for LLM."""
         import cv2
         import base64
-        
+
         try:
             cap = cv2.VideoCapture(self.video_path)
             cap.set(cv2.CAP_PROP_POS_MSEC, self.current_time * 1000)
             ret, frame = cap.read()
             cap.release()
-            
+
             if not ret:
                 print(f"❌ Could not read frame at {self.current_time:.1f}s")
                 return None
-            
-            # Resize keeping aspect ratio, max dimension 1024
+
+            # Annotate if checkbox is on
+            if hasattr(self, 'annotate_llm_frames') and self.annotate_llm_frames.isChecked():
+                frame = self._annotate_frame_for_llm(frame, self.current_time)
+
+            # Resize
             h, w = frame.shape[:2]
             max_dim = 1024
             if max(h, w) > max_dim:
@@ -3722,11 +3793,155 @@ class SignalTimelineWindow(QMainWindow):
 
             _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
             b64 = base64.b64encode(buffer).decode('utf-8')
-            print(f"📷 Captured frame at {self.current_time:.1f}s ({len(b64)//1024}KB)")
+            tag = " [annotated]" if hasattr(self, 'annotate_llm_frames') and self.annotate_llm_frames.isChecked() else ""
+            print(f"📷 Captured frame at {self.current_time:.1f}s ({len(b64)//1024}KB){tag}")
             return b64
         except Exception as e:
             print(f"❌ Frame capture failed: {e}")
             return None
+
+    def _annotate_frame_for_llm(self, frame, timestamp, time_window=1.0):
+        """Draw action/object labels onto frame before sending to LLM."""
+        import cv2
+
+        if not self.cache_data:
+            return frame
+
+        annotated = frame.copy()
+        h, w = annotated.shape[:2]
+
+        # ── Actions (top-left) ──
+        actions = []
+        for act in self.cache_data.get('actions', []):
+            ts = act.get('timestamp', -999)
+            if abs(ts - timestamp) > time_window:
+                continue
+            name = act.get('action_name') or act.get('action', '?')
+            conf = act.get('confidence', 0)
+            model = act.get('model_type', '')
+            actions.append((name, conf, model))
+
+        actions.sort(key=lambda x: x[1], reverse=True)
+
+        for i, (name, conf, model) in enumerate(actions[:5]):
+            y = 30 + i * 35
+            tag = f" [{model}]" if model else ""
+            text = f"{name}{tag} {conf:.0%}"
+
+            if 'custom' in model:
+                color = (0, 255, 0)
+            elif 'cuda' in model or 'r3d' in model:
+                color = (0, 128, 255)
+            else:
+                color = (0, 165, 255)
+
+            # Semi-transparent confidence bar
+            bar_w = int(min(w - 20, 350) * conf)
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (10, y - 18), (10 + bar_w, y + 10), color, -1)
+            cv2.addWeighted(overlay, 0.35, annotated, 0.65, 0, annotated)
+
+            # Text
+            cv2.putText(annotated, text, (14, y + 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)  # outline
+            cv2.putText(annotated, text, (14, y + 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # ── Objects (bottom-left) ──
+        objects = []
+        for obj_entry in self.cache_data.get('objects', []):
+            ts = obj_entry.get('timestamp', -999)
+            if abs(ts - timestamp) > time_window:
+                continue
+            for obj_name in obj_entry.get('objects', []):
+                if isinstance(obj_name, str) and obj_name not in objects:
+                    objects.append(obj_name)
+
+        if objects:
+            text = "Objects: " + ", ".join(objects[:6])
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (8, h - 40), (len(text) * 11 + 20, h - 8), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
+            cv2.putText(annotated, text, (12, h - 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+
+        # ── Timestamp (top-right) ──
+        mins, secs = divmod(int(timestamp), 60)
+        cv2.putText(annotated, f"{mins:02d}:{secs:02d}", (w - 100, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
+        cv2.putText(annotated, f"{mins:02d}:{secs:02d}", (w - 100, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+        return annotated
+
+    def _annotate_frame_from_cache(self, frame, timestamp, time_window=1.0):
+        """Draw action/object labels from cached analysis data onto frame."""
+        import cv2
+
+        if not self.cache_data:
+            return frame
+
+        annotated = frame.copy()
+        h, w = annotated.shape[:2]
+
+        # ── 1. Action labels (top-left) ──
+        actions_at_time = []
+        for act in self.cache_data.get('actions', []):
+            act_ts = act.get('timestamp', -999)
+            if abs(act_ts - timestamp) > time_window:
+                continue
+            name = act.get('action_name') or act.get('action', '?')
+            conf = act.get('confidence', 0)
+            model = act.get('model_type', '')
+            actions_at_time.append((name, conf, model))
+
+        actions_at_time.sort(key=lambda x: x[1], reverse=True)
+        for i, (name, conf, model) in enumerate(actions_at_time[:5]):
+            y_pos = 30 + i * 35
+            tag = f" [{model}]" if model else ""
+            text = f"{name}{tag} {conf:.0%}"
+
+            # Color by model
+            if 'custom' in model:
+                color = (0, 255, 0)
+            elif 'cuda' in model or 'r3d' in model:
+                color = (0, 128, 255)
+            else:
+                color = (0, 165, 255)
+
+            # Confidence bar background
+            bar_width = int(min(w - 20, 350) * conf)
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (10, y_pos - 18), (10 + bar_width, y_pos + 8), color, -1)
+            cv2.addWeighted(overlay, 0.35, annotated, 0.65, 0, annotated)
+
+            cv2.putText(annotated, text, (14, y_pos + 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # ── 2. Object names (bottom-left) ──
+        objects_at_time = []
+        for obj_entry in self.cache_data.get('objects', []):
+            obj_ts = obj_entry.get('timestamp', -999)
+            if abs(obj_ts - timestamp) > time_window:
+                continue
+            for obj_name in obj_entry.get('objects', []):
+                if isinstance(obj_name, str) and obj_name not in objects_at_time:
+                    objects_at_time.append(obj_name)
+
+        if objects_at_time:
+            text = "Objects: " + ", ".join(objects_at_time[:6])
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (8, h - 38), (len(text) * 11 + 16, h - 8), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
+            cv2.putText(annotated, text, (12, h - 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
+
+        # ── 3. Timestamp ──
+        mins, secs = divmod(int(timestamp), 60)
+        cv2.putText(annotated, f"{mins:02d}:{secs:02d}", (w - 90, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        return annotated
 
     def eventFilter(self, obj, event):
         """Global event filter for handling delete and spacebar"""
@@ -4012,7 +4227,12 @@ class SignalTimelineWindow(QMainWindow):
             }
         """)
         playback_layout.addWidget(play_btn)
-        
+
+        self.annotate_llm_frames = QCheckBox("Annotate LLM frames (labels + confidence)")
+        self.annotate_llm_frames.setChecked(False)
+        self.annotate_llm_frames.setToolTip("Draw action/object labels on frames before sending to LLM vision")
+        playback_layout.addWidget(self.annotate_llm_frames)
+
         self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
         self.follow_playhead_checkbox.setChecked(True)
         self.follow_playhead_checkbox.setToolTip(
