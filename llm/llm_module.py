@@ -74,11 +74,14 @@ _SELF_TALK_PATTERNS = re.compile(
     r'|⏹\s*Stopping generation'                       # leaked stop tokens
     r'|\[SYSTEM INSTRUCTIONS\]'                        # leaked system wrapping
     r'|\[END INSTRUCTIONS\]'
-    r'|=== VIDEO ANALYSIS DATA ==='                    # leaked context markers
-    r'|=== END DATA ==='
-    r'|=== TIMELINE'
+    r'|--- VIDEO ANALYSIS DATA ---'                    # new context markers
+    r'|--- TIMELINE CONTROL ---'
+    r'|--- END ---'
     r'|```python'
-    r'|\[CMD:\w+\].*\[CMD:\w+\]'          # multiple CMDs on same line
+    r'|\[CMD:\w+[^\]]*\]'                              # ANY [CMD:...] block
+    r'|#{1,3}\s+Additional\s+analysis'                 # self-generated headers
+    r'|#{1,3}\s+Further\s+'
+    r'|#{1,3}\s+Next\s+steps'
     r'|(?:Clip\s*#\d+.*\n){3,}'           # hallucinated clip lists
     r')',
     re.IGNORECASE
@@ -90,6 +93,9 @@ STOP_SEQUENCES = [
     "\nHUMAN:", "\nHuman:", "\nhuman:",
     "\nASSISTANT:", "\nAssistant:",
     "\n## ", "\n===",  # Don't regenerate context markers
+    "\n---",           # Don't regenerate context separators
+    "[CMD:",           # Don't generate commands
+    "```",             # Don't generate code blocks
     "⏹",
 ]
 
@@ -732,15 +738,16 @@ class LLMModule:
     """
 
     SYSTEM_PROMPT = (
-        "You are a reasoning assistant.\n"
-        "IMPORTANT RULES:\n"
-        "1. You DO NOT analyze video or images unless a frame is explicitly provided.\n"
-        "2. You DO NOT scan, seek, or process video timelines.\n"
-        "3. All video analysis is already completed and provided as data.\n"
-        "4. You may ONLY reason over the provided analysis data.\n"
-        "5. If asked to scan or analyze video, reply that this must be done by the analyzer.\n"
-        "6. Quote timestamps when available.\n"
-        "7. Give ONE response and STOP.\n"
+        "You are a video analysis assistant. You answer questions about video content "
+        "using ONLY the analysis data provided below.\n\n"
+        "RULES:\n"
+        "1. Use ONLY the provided analysis data to answer. Do not guess or invent details.\n"
+        "2. Quote specific timestamps from the data when relevant (e.g. 'at 1:23').\n"
+        "3. If the data does not contain enough information, say so clearly.\n"
+        "4. Give ONE concise answer. Do not repeat yourself.\n"
+        "5. NEVER output commands, code, system messages, or status lines.\n"
+        "6. NEVER pretend to scan, seek, or process the video yourself.\n"
+        "7. STOP after answering. Do not add follow-up questions or next steps.\n"
     )
 
     SYSTEM_PROMPT_ACTION_LEARNING = (
@@ -753,32 +760,39 @@ class LLMModule:
     )
 
     SYSTEM_PROMPT_TIMELINE = (
-        "You are a timeline control assistant.\n"
-        "STRICT RULES:\n"
-        "1. You NEVER analyze video or describe content.\n"
-        "2. You NEVER infer actions or events.\n"
-        "3. You ONLY issue [CMD:*] commands when explicitly requested.\n"
-        "4. You assume analysis is already complete.\n"
-        "5. Output at most ONE command and ONE sentence.\n"
-        "6. STOP immediately after.\n"
+        "You are a timeline assistant. You help the user understand what is on their "
+        "edit timeline using the provided data.\n\n"
+        "RULES:\n"
+        "1. Answer questions about the timeline using ONLY the provided data.\n"
+        "2. Reference specific timestamps and clip numbers from the data.\n"
+        "3. Give ONE concise answer.\n"
+        "4. NEVER output commands, code blocks, or system messages.\n"
+        "5. NEVER pretend to scan or analyze video.\n"
+        "6. STOP after answering.\n"
     )
 
     SYSTEM_PROMPT_VISION = (
-        "Describe what you see in the attached image.\n"
-        "Focus on: people (count, poses, clothing, actions), objects, scene, colors, lighting.\n"
-        "If analysis data is provided, use it as additional context.\n"
-        "Be specific and detailed. Give ONE description and STOP.\n"
-        "Do NOT generate follow-up questions or fake conversation."
+        "Describe what you see in the image.\n"
+        "Focus on: people (count, poses, clothing, actions), objects, scene setting, "
+        "colors, and lighting.\n"
+        "If additional analysis data is provided, use it as context.\n"
+        "Be specific and detailed in your description.\n\n"
+        "RULES:\n"
+        "1. Give ONE description and STOP.\n"
+        "2. NEVER generate commands, code blocks, or system messages.\n"
+        "3. NEVER generate follow-up questions or fake conversation.\n"
+        "4. NEVER pretend to run searches, scans, or tools.\n"
+        "5. STOP after your description. Do not add anything else.\n"
     )
 
     SYSTEM_PROMPT_VISUAL_SEARCH = (
-        "You are a visual search assistant. The user will ask if a specific thing "
-        "is present in the image.\n"
+        "The user will ask if something specific is present in the image.\n\n"
         "RULES:\n"
-        "1. Start your answer with YES or NO.\n"
-        "2. Then give a ONE sentence explanation of what you see.\n"
-        "3. STOP after that. Do NOT describe the full scene.\n"
-        "4. Do NOT generate follow-up questions or fake conversation."
+        "1. Start with YES or NO.\n"
+        "2. Follow with ONE sentence explaining what you see.\n"
+        "3. STOP after that single sentence.\n"
+        "4. NEVER describe the full scene.\n"
+        "5. NEVER generate commands, code, follow-up questions, or fake conversation.\n"
     )
 
     def __init__(

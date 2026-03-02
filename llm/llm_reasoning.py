@@ -360,7 +360,8 @@ class VideoReasoningEngine:
         # Check against known patterns
         for pattern in self.ACTION_PATTERNS:
             # Check if pattern actions are present
-            matches = sum(1 for pa in pattern["pattern"] if pa in action_names)
+            matches = sum(1 for pa in pattern["pattern"] 
+              if any(pa in an or an in pa for an in action_names))
             match_ratio = matches / len(pattern["pattern"])
             
             if match_ratio >= 0.6:  # At least 60% match
@@ -634,14 +635,14 @@ class ReasoningLLMIntegration:
         if not facts:
             return ""
         
-        lines = ["\n## INFERRED RELATIONSHIPS (from action patterns)"]
-        
+        lines = ["\nInferred relationships:"]
+
         for fact in facts[:3]:
-            lines.append(f"  - {fact.description} (confidence: {fact.confidence:.2f})")
+            lines.append(f"  {fact.description} (confidence: {fact.confidence:.2f})")
             
             if fact.confidence > 0.7:
                 for step in fact.reasoning_chain[:1]:
-                    lines.append(f"      • {step}")
+                    lines.append(f"    Reasoning: {step}")
         
         # Add cluster info if relevant
         current_cluster = None
@@ -651,53 +652,95 @@ class ReasoningLLMIntegration:
                 break
         
         if current_cluster:
-            lines.append(f"\n  Current activity: {current_cluster.description}")
+            lines.append(f"  Current activity: {current_cluster.description}")
         
         lines.append("")
         return "\n".join(lines)
     
     def answer_why_question(self, question: str, current_time: float) -> str:
         """
-        Answer "why" questions by showing the reasoning chain.
+        Answer "why" questions by gathering reasoning context and
+        letting the LLM reason over it.
         """
+        # Gather facts around this timestamp
         facts = self.reasoning_engine.reason_about_timestamp(current_time)
         
-        # Extract key terms from question
-        question_lower = question.lower()
-        key_terms = [word for word in question_lower.split() 
-                    if len(word) > 3 and word not in 
-                    ['why', 'how', 'what', 'where', 'when', 'does', 'this', 'that']]
+        # Build context from facts
+        context_parts = []
+        if facts:
+            context_parts.append("Inferred facts near this timestamp:")
+            for fact in facts[:5]:
+                context_parts.append(f"  {fact.description} (confidence: {fact.confidence:.2f})")
+                for step in fact.reasoning_chain:
+                    context_parts.append(f"    {step}")
         
-        # Find relevant facts
-        relevant = []
-        for fact in facts:
-            if any(term in fact.description.lower() for term in key_terms):
-                relevant.append(fact)
-            elif any(term in ' '.join(fact.entities).lower() for term in key_terms):
-                relevant.append(fact)
+        # Add cluster info
+        current_cluster = None
+        for cluster in self.reasoning_engine.action_clusters:
+            if cluster.start_time <= current_time <= cluster.end_time:
+                current_cluster = cluster
+                break
         
-        if not relevant and facts:
-            relevant = facts[:2]
-        
-        if not relevant:
-            # Show action summary instead
-            stats = self.reasoning_engine.get_action_statistics()
-            return (
-                f"At {int(current_time)//60}:{int(current_time)%60:02d}, "
-                f"I detect {stats['timestamps_with_actions']} action timestamps. "
-                f"The most common actions in the video are: "
-                f"{', '.join(a for a, _ in stats['most_common'][:3])}."
+        if current_cluster:
+            context_parts.append(
+                f"Current activity cluster: {current_cluster.description} "
+                f"({len(current_cluster.actions)} action types, "
+                f"density: {current_cluster.density:.1f}/s)"
             )
         
-        explanation = ["🔍 **Based on the action patterns:**\n"]
-        for fact in relevant:
-            explanation.append(f"• {fact.description}")
+        # Add action stats
+        stats = self.reasoning_engine.get_action_statistics()
+        if stats['most_common']:
+            top_actions = ', '.join(f"{a} ({c}x)" for a, c in stats['most_common'][:5])
+            context_parts.append(f"Most common actions in video: {top_actions}")
+        
+        reasoning_context = "\n".join(context_parts) if context_parts else ""
+        
+        # If LLM is available, let it reason over the facts
+        if self.llm and self.llm.is_loaded():
+            try:
+                return self.llm.query(
+                    user_message=question,
+                    timeline_context=reasoning_context,
+                    temperature=0.3,
+                    max_tokens=512,
+                )
+            except Exception as e:
+                pass  # Fall through to local answer
+        
+        # Fallback: local answer without LLM
+        if not facts:
+            return (
+                f"At {int(current_time)//60}:{int(current_time)%60:02d}, "
+                f"the analysis data shows {stats['timestamps_with_actions']} timestamps with actions. "
+                f"The most common actions are: "
+                f"{', '.join(a for a, _ in stats['most_common'][:3])}. "
+                f"For more detail, try asking about a specific action or timestamp."
+            )
+        
+        explanation = []
+        for fact in facts[:3]:
+            explanation.append(f"{fact.description}")
             if fact.reasoning_chain:
-                explanation.append(f"  → {fact.reasoning_chain[0]}")
-            explanation.append("")
+                explanation.append(f"  Reasoning: {fact.reasoning_chain[0]}")
         
         return "\n".join(explanation)
     
+    def _categorize_action(self, action_name: str) -> str:
+        """Categorize an action, with fuzzy matching for partial names."""
+        action_lower = action_name.lower()
+        
+        # Exact match first
+        if action_lower in self.ACTION_CATEGORIES:
+            return self.ACTION_CATEGORIES[action_lower]
+        
+        # Partial match — check if any known action is contained in the name
+        for known_action, category in self.ACTION_CATEGORIES.items():
+            if known_action in action_lower or action_lower in known_action:
+                return category
+        
+        return "other"
+
     def get_action_summary(self) -> str:
         """Get a summary of all actions in the video."""
         return self.reasoning_engine.get_action_timeline_summary()
