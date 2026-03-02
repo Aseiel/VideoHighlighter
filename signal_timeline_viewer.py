@@ -3947,21 +3947,22 @@ class SignalTimelineWindow(QMainWindow):
         """Global event filter for handling delete and spacebar"""
         if event.type() == event.Type.KeyPress:
             if event.key() == Qt.Key_Space:
-                self.toggle_edit_playback()
+                # If edit timeline is actively playing, toggle that
+                if hasattr(self, '_edit_playlist') and self._edit_playlist:
+                    self.toggle_edit_playback()
+                else:
+                    # Otherwise toggle normal video playback
+                    self.toggle_video_playback()
                 return True
             if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
-                # Check if edit view has focus or if delete is pressed globally
                 if (obj == self or 
                     (hasattr(self, 'edit_view') and self.edit_view.hasFocus()) or
                     (hasattr(self, 'edit_scene') and len(self.edit_scene.selectedItems()) > 0)):
-                    
-                    # Remove selected clips
                     if hasattr(self, 'edit_scene'):
                         self.edit_scene.remove_selected_clips()
                         return True
         
         return super().eventFilter(obj, event)
-
     
     def create_info_bar(self):
         """Create information bar with video stats"""
@@ -4451,6 +4452,10 @@ class SignalTimelineWindow(QMainWindow):
     @Slot(float)
     def on_time_clicked(self, time):
         """Handle timeline click"""
+        # Stop edit playback if running
+        if hasattr(self, '_edit_playlist') and self._edit_playlist:
+            self.stop_edit_playback()
+        
         self.current_time = max(0, min(self.video_duration, time))
         
         # Update signal scene
@@ -4818,15 +4823,8 @@ class SignalTimelineWindow(QMainWindow):
         """Handle filter changes from the scene"""
         self.update_filter_summary()
     
-    @Slot()
     def play_video_at_current_time(self):
-        """Play video — if edit timeline has clips, play those sequentially"""
-        # If edit timeline has clips, play the edit
-        clips = self.edit_scene.get_clip_times()
-        if clips:
-            self.play_edit_timeline()
-            return
-
+        """Play video at current time position"""
         if not hasattr(self, 'current_time') or self.current_time < 0:
             self.statusBar().showMessage("⚠️ Click timeline to select a timestamp first", 2000)
             return
