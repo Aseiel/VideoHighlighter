@@ -8,6 +8,7 @@ Complete Signal Timeline Viewer with Filters and Edit Timeline
 
 import sys
 import os
+import threading
 from pathlib import Path
 import json
 import numpy as np
@@ -38,6 +39,7 @@ from datetime import datetime, timedelta
 
 # modules
 from video_ai_editor.video_preview import TimelineWithPreview
+from video_ai_editor.bbox_overlay import AnnotatedVideoManager
 
 class TimelineExporter:
     """Export edit timeline to various formats"""
@@ -2326,6 +2328,8 @@ class ConfidenceFilterDialog(QDialog):
             }
         """)
 
+
+
     def on_slider_changed(self):
         """Update labels when sliders change"""
         min_val = self.min_slider.value() / 100.0
@@ -2888,6 +2892,9 @@ class SignalTimelineWindow(QMainWindow):
         debug_log(f"\n  🎨 Initializing UI...")
         self.init_ui()
         
+        # bbox_manager is created inside create_video_preview_dock()
+        # — no need to create it again here
+
         # Start background extraction if we don't have cached waveform
         if not self.waveform or len(self.waveform) == 0:
             debug_log(f"  ⚠️ No cached waveform or empty waveform, starting extraction...")
@@ -2909,6 +2916,16 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self, 'preview_window') and self.preview_window:
             self.preview_window.close()
         super().closeEvent(event)
+
+    def _on_bbox_toggled(self, label: str):
+        """Visual feedback when overlay is toggled."""
+        is_original = (label == "🎥 Original")
+        state = "Original" if is_original else f"Overlay: {label}"
+        self.statusBar().showMessage(f"Video source: {state}", 3000)
+
+        # Hide detection panel when viewing annotated video (avoids double info)
+        if hasattr(self, 'detection_panel'):
+            self.detection_panel.setVisible(is_original)
 
     def create_video_preview_dock(self):
         from PySide6.QtCore import Qt, QUrl
@@ -2982,7 +2999,7 @@ class SignalTimelineWindow(QMainWindow):
         controls_layout.addWidget(self.time_slider)
         
         self.preview_time_label = QLabel("00:00 / 00:00")
-        self.time_label.setStyleSheet("""
+        self.preview_time_label.setStyleSheet("""
             QLabel { color: #a0ffa0; font-family: 'Consolas', monospace;
                     font-weight: bold; padding: 8px; background-color: #1a1a2a;
                     border-radius: 4px; min-width: 120px; qproperty-alignment: AlignCenter; }
@@ -3006,7 +3023,7 @@ class SignalTimelineWindow(QMainWindow):
         self.volume_slider.setFixedWidth(80)
         volume_layout.addWidget(self.volume_slider)
         controls_layout.addLayout(volume_layout)
-        
+      
         layout.addWidget(controls_widget)
         
         # Connect signals
@@ -3014,7 +3031,31 @@ class SignalTimelineWindow(QMainWindow):
         self.video_player.positionChanged.connect(self.update_video_position)
         self.video_player.playbackStateChanged.connect(self.update_play_button)
         self.audio_output.setVolume(0.8)
-        
+
+        # ── BBox overlay manager ──
+        try:
+            from video_ai_editor.bbox_overlay import AnnotatedVideoManager
+            print(f"✅ bbox_overlay imported OK")
+            self.bbox_manager = AnnotatedVideoManager(
+                video_path=self.video_path,
+                cache_data=self.cache_data,
+                player=self.video_player,
+                parent=self,
+            )
+            bbox_widget = self.bbox_manager.create_toggle_widget()
+            layout.addWidget(bbox_widget)
+
+            # Connect signals (generate buttons are self-contained in bbox_manager)
+            self.bbox_manager.source_changed.connect(self._on_bbox_toggled)
+
+            print(f"✅ bbox widget added to layout")
+        except ImportError as e:
+            print(f"❌ IMPORT FAILED: {e}")
+        except Exception as e:
+            import traceback
+            print(f"❌ BBOX INIT FAILED: {e}")
+            traceback.print_exc()
+
         dock.setWidget(preview_widget)
         return dock
 
@@ -3092,7 +3133,6 @@ class SignalTimelineWindow(QMainWindow):
             lines.append('<span style="color: #666;">No detections</span>')
         
         self.detection_panel.setText('<br>'.join(lines))
-
 
     def toggle_video_playback(self):
         """Toggle video playback in the preview"""
