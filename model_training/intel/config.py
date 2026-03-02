@@ -36,7 +36,7 @@ CONFIG = {
     "min_delta": 0.001,
     "use_class_weights": True,
     "augmentation_prob": 0.3,
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "device": "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu",
 
     # --- LSTM architecture ---
     "hidden_dim": 256,
