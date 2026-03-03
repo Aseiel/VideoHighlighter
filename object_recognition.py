@@ -57,6 +57,7 @@ def detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes=False)
         tuple: (list of detected object names, annotated frame if draw_boxes=True else None)
     """
     objs = []
+    bbox_data = []  # collect [x1, y1, x2, y2, confidence] per detection
     annotated_frame = frame.copy() if draw_boxes else None
     
     try:
@@ -72,6 +73,9 @@ def detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes=False)
                     
                     if conf > 0.5 and cls_name in objects_of_interest:
                         objs.append(cls_name)
+                        # Store raw pixel coords for cache
+                        x1p, y1p, x2p, y2p = box.xyxy[0].cpu().numpy().astype(int)
+                        bbox_data.append((int(x1p), int(y1p), int(x2p), int(y2p), float(conf)))
                         
                         if draw_boxes:
                             # Get bounding box coordinates
@@ -113,7 +117,7 @@ def detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes=False)
     except Exception as e:
         print(f"⚠️ Error in detection: {e}")
     
-    return objs, annotated_frame
+    return objs, annotated_frame, bbox_data
 
 def get_video_segments(video_path, num_segments):
     cap = cv2.VideoCapture(video_path)
@@ -177,6 +181,7 @@ def worker_process(video_path, start_frame, end_frame, objects_of_interest, retu
         return_dict[f'worker_{worker_id}_video'] = worker_output
 
     sec_objects = {}
+    sec_bboxes = {}  # {sec: [(cls_name, x1, y1, x2, y2, conf), ...]}
     frame_idx = start_frame
     processed_frames = 0
 
@@ -189,12 +194,23 @@ def worker_process(video_path, start_frame, end_frame, objects_of_interest, retu
         
         if should_detect:
             # Detect objects (and optionally get annotated frame)
-            objs, annotated_frame = detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes)
+            objs, annotated_frame, bbox_data = detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes)
             
             if objs:
                 sec = int(frame_idx / fps)
                 sec_objects.setdefault(sec, []).extend(objs)
-            
+                # Store bboxes with class names for cache
+                frame_h, frame_w = frame.shape[:2]
+                for i, name in enumerate(objs):
+                    if i < len(bbox_data):
+                        x1, y1, x2, y2, conf = bbox_data[i]
+                        sec_bboxes.setdefault(sec, []).append({
+                            'class': name,
+                            'bbox': [x1 / frame_w, y1 / frame_h,
+                                    (x2 - x1) / frame_w, (y2 - y1) / frame_h],  # normalised xywh
+                            'confidence': conf,
+                        })
+
             # Write annotated frame if enabled
             if draw_boxes and video_writer and annotated_frame is not None:
                 video_writer.write(annotated_frame)
@@ -215,6 +231,7 @@ def worker_process(video_path, start_frame, end_frame, objects_of_interest, retu
         video_writer.release()
     
     return_dict[worker_id] = sec_objects
+    return_dict[f'bboxes_{worker_id}'] = dict(sec_bboxes)
 
 # ---------------- Main function for module ----------------
 def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="objects_log.csv", 
@@ -331,11 +348,16 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
     all_frame_objects = []
     final_objects = {}
     worker_videos = []
-    
+    all_bboxes = {}  # {sec: [bbox_entries]}
+
     for key, value in return_dict.items():
         if isinstance(key, str) and key.startswith('worker_') and key.endswith('_video'):
             # This is a worker video path
             worker_videos.append(value)
+        elif isinstance(key, str) and key.startswith('bboxes_'):
+            # This is bbox data from a worker
+            for sec, entries in value.items():
+                all_bboxes.setdefault(sec, []).extend(entries)
         else:
             # This is detection data
             for sec, objs in value.items():
@@ -343,6 +365,17 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
                 timestamp_str = f"{sec//60:02d}:{sec%60:02d}"
                 for obj_name in objs:
                     all_frame_objects.append([timestamp_str, None, obj_name, None, sec])
+
+    # Build cache-ready bbox list
+    object_bboxes_cache = []
+    for sec in sorted(all_bboxes.keys()):
+        entries = all_bboxes[sec]
+        object_bboxes_cache.append({
+            'timestamp': float(sec),
+            'objects': [e['class'] for e in entries],
+            'bboxes': [e['bbox'] for e in entries],
+            'confidences': [e['confidence'] for e in entries],
+        })
 
     # Merge worker videos if bounding boxes were drawn
     if draw_boxes and worker_videos and annotated_output:
@@ -366,7 +399,7 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
     if progress_fn:
         progress_fn(1.0, f"Completed: {total_detections} detections found")
 
-    return final_objects
+    return final_objects, object_bboxes_cache
 
 def merge_worker_videos(worker_videos, output_path, fps):
     """Merge multiple worker video segments into single annotated video"""

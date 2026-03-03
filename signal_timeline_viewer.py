@@ -2928,28 +2928,96 @@ class SignalTimelineWindow(QMainWindow):
             self.detection_panel.setVisible(is_original)
 
     def create_video_preview_dock(self):
+        """
+        Create video preview dock with dual overlay modes:
+          - Off:     Plain video (QVideoWidget)
+          - Live:    Real-time bbox overlay from cache (QGraphicsVideoItem + scene)
+          - Precomp: Pre-rendered annotated video swap (bbox_overlay.py)
+        """
         from PySide6.QtCore import Qt, QUrl
         from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
         from PySide6.QtMultimediaWidgets import QVideoWidget
-        
+        from PySide6.QtWidgets import QStackedWidget
+
         dock = QDockWidget("Video Preview", self)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        
+
         preview_widget = QWidget()
         layout = QVBoxLayout(preview_widget)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
-        
-        # ── Video + Info side-by-side ──
-        video_splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # Left: Video
+
+        # ──────────────────────────────────────────────────────────
+        # Mode selector row
+        # ──────────────────────────────────────────────────────────
+        mode_row = QHBoxLayout()
+
+        mode_label = QLabel("Overlay:")
+        mode_label.setStyleSheet("color: #a0c0ff; font-weight: bold;")
+        mode_row.addWidget(mode_label)
+
+        self.overlay_mode_combo = QComboBox()
+        self.overlay_mode_combo.addItems([
+            "Off",
+            "Live (real-time)",
+            "Precomp (swap video)",
+        ])
+        self.overlay_mode_combo.setToolTip(
+            "Off — plain video, no overlays\n"
+            "Live — real-time bboxes from cache (needs bbox data)\n"
+            "Precomp — swap to pre-rendered annotated video"
+        )
+        self.overlay_mode_combo.setStyleSheet("""
+            QComboBox {
+                background-color: #1a1a2a; color: #ddd;
+                border: 1px solid #3a3a5a; border-radius: 4px;
+                padding: 4px 8px; min-width: 160px;
+            }
+            QComboBox:hover { border-color: #5a5a8a; }
+            QComboBox::drop-down { border: none; }
+            QComboBox QAbstractItemView {
+                background-color: #1a1a2a; color: #ddd;
+                selection-background-color: #3a5fcd;
+            }
+        """)
+        mode_row.addWidget(self.overlay_mode_combo)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
+        # ──────────────────────────────────────────────────────────
+        # Stacked video area: page 0 = QVideoWidget, page 1 = Live overlay
+        # ──────────────────────────────────────────────────────────
+        video_and_info = QSplitter(Qt.Orientation.Horizontal)
+
+        # -- Left: stacked video widget --
+        self.preview_stack = QStackedWidget()
+
+        # Page 0: Plain QVideoWidget (Off + Precomp modes)
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumSize(320, 240)
         self.video_widget.setStyleSheet("background-color: black; border: 2px solid #3a3a5a;")
-        video_splitter.addWidget(self.video_widget)
-        
-        # Right: Detection info panel
+        self.preview_stack.addWidget(self.video_widget)  # index 0
+
+        # Page 1: Live real-time overlay
+        self.realtime_preview = None
+        try:
+            from video_ai_editor.realtime_overlay import RealtimeOverlayPreview
+            self.realtime_preview = RealtimeOverlayPreview(
+                video_path=self.video_path,
+                cache_data=self.cache_data,
+            )
+            self.preview_stack.addWidget(self.realtime_preview)  # index 1
+            print(f"✅ Live overlay loaded ({self.realtime_preview.get_detection_count()} detections)")
+        except ImportError as e:
+            print(f"⚠️ realtime_overlay not available: {e}")
+        except Exception as e:
+            print(f"⚠️ realtime_overlay init failed: {e}")
+            import traceback; traceback.print_exc()
+
+        self.preview_stack.setCurrentIndex(0)
+        video_and_info.addWidget(self.preview_stack)
+
+        # -- Right: Detection info panel --
         self.detection_panel = QLabel("No detections")
         self.detection_panel.setWordWrap(True)
         self.detection_panel.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -2966,54 +3034,70 @@ class SignalTimelineWindow(QMainWindow):
                 font-size: 11px;
             }
         """)
-        video_splitter.addWidget(self.detection_panel)
-        video_splitter.setSizes([500, 200])
-        
-        layout.addWidget(video_splitter, 1)
-        
-        # ── Media player ──
+        video_and_info.addWidget(self.detection_panel)
+        video_and_info.setSizes([500, 200])
+
+        layout.addWidget(video_and_info, 1)
+
+        # ──────────────────────────────────────────────────────────
+        # Media player (shared — used in Off + Precomp modes)
+        # ──────────────────────────────────────────────────────────
         self.video_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.video_player.setAudioOutput(self.audio_output)
         self.video_player.setVideoOutput(self.video_widget)
         self.video_player.setSource(QUrl.fromLocalFile(self.video_path))
-        
-        # ── Controls ──
+        self.audio_output.setVolume(0.8)
+
+        # Active player pointer — switches between shared and live
+        self._active_player = self.video_player
+
+        # ──────────────────────────────────────────────────────────
+        # Transport controls
+        # ──────────────────────────────────────────────────────────
         controls_widget = QWidget()
         controls_layout = QHBoxLayout(controls_widget)
         controls_layout.setContentsMargins(0, 4, 0, 0)
-        
+
+        # Play button
         self.play_btn = QPushButton("▶ Play")
         self.play_btn.clicked.connect(self.toggle_video_playback)
         self.play_btn.setStyleSheet("""
-            QPushButton { background-color: #3a5fcd; color: white; font-weight: bold;
-                        padding: 8px 16px; border-radius: 4px; min-width: 80px; }
+            QPushButton {
+                background-color: #3a5fcd; color: white; font-weight: bold;
+                padding: 8px 16px; border-radius: 4px; min-width: 80px;
+            }
             QPushButton:hover { background-color: #4a6fdd; }
         """)
-
         controls_layout.addWidget(self.play_btn)
-        
+
+        # Time slider
         self.time_slider = QSlider(Qt.Horizontal)
         self.time_slider.setRange(0, 100)
         self.time_slider.sliderMoved.connect(self.seek_video)
         controls_layout.addWidget(self.time_slider)
-        
+
+        # Time label
         self.preview_time_label = QLabel("00:00 / 00:00")
         self.preview_time_label.setStyleSheet("""
-            QLabel { color: #a0ffa0; font-family: 'Consolas', monospace;
-                    font-weight: bold; padding: 8px; background-color: #1a1a2a;
-                    border-radius: 4px; min-width: 120px; qproperty-alignment: AlignCenter; }
+            QLabel {
+                color: #a0ffa0; font-family: 'Consolas', monospace;
+                font-weight: bold; padding: 8px; background-color: #1a1a2a;
+                border-radius: 4px; min-width: 120px;
+                qproperty-alignment: AlignCenter;
+            }
         """)
         controls_layout.addWidget(self.preview_time_label)
-        
-        # Show overlay checkbox
+
+        # Show detections checkbox
         self.show_detections_checkbox = QCheckBox("Show Detections")
         self.show_detections_checkbox.setChecked(True)
         self.show_detections_checkbox.stateChanged.connect(self._toggle_detection_panel)
         controls_layout.addWidget(self.show_detections_checkbox)
-        
+
         controls_layout.addStretch()
-        
+
+        # Volume
         volume_layout = QHBoxLayout()
         volume_layout.addWidget(QLabel("🔊"))
         self.volume_slider = QSlider(Qt.Horizontal)
@@ -3023,41 +3107,191 @@ class SignalTimelineWindow(QMainWindow):
         self.volume_slider.setFixedWidth(80)
         volume_layout.addWidget(self.volume_slider)
         controls_layout.addLayout(volume_layout)
-      
-        layout.addWidget(controls_widget)
-        
-        # Connect signals
-        self.video_player.durationChanged.connect(self.update_video_duration)
-        self.video_player.positionChanged.connect(self.update_video_position)
-        self.video_player.playbackStateChanged.connect(self.update_play_button)
-        self.audio_output.setVolume(0.8)
 
-        # ── BBox overlay manager ──
+        layout.addWidget(controls_widget)
+
+        # ──────────────────────────────────────────────────────────
+        # Precomp overlay controls (bbox_overlay.py)
+        # ──────────────────────────────────────────────────────────
+        self.bbox_manager = None
         try:
             from video_ai_editor.bbox_overlay import AnnotatedVideoManager
-            print(f"✅ bbox_overlay imported OK")
             self.bbox_manager = AnnotatedVideoManager(
                 video_path=self.video_path,
                 cache_data=self.cache_data,
                 player=self.video_player,
                 parent=self,
             )
-            bbox_widget = self.bbox_manager.create_toggle_widget()
-            layout.addWidget(bbox_widget)
 
-            # Connect signals (generate buttons are self-contained in bbox_manager)
+            # Create widget but start hidden (only shown in Precomp mode)
+            self._precomp_widget = self.bbox_manager.create_toggle_widget()
+            self._precomp_widget.setVisible(False)
+            layout.addWidget(self._precomp_widget)
+
+            # Connect source change signal
             self.bbox_manager.source_changed.connect(self._on_bbox_toggled)
 
-            print(f"✅ bbox widget added to layout")
+            print(f"✅ Precomp overlay manager ready")
         except ImportError as e:
-            print(f"❌ IMPORT FAILED: {e}")
+            print(f"⚠️ bbox_overlay not available: {e}")
+            self._precomp_widget = None
         except Exception as e:
-            import traceback
-            print(f"❌ BBOX INIT FAILED: {e}")
-            traceback.print_exc()
+            print(f"⚠️ bbox_overlay init failed: {e}")
+            import traceback; traceback.print_exc()
+            self._precomp_widget = None
+
+        # ──────────────────────────────────────────────────────────
+        # Connect shared player signals
+        # ──────────────────────────────────────────────────────────
+        self.video_player.durationChanged.connect(self.update_video_duration)
+        self.video_player.positionChanged.connect(self._on_shared_player_position)
+        self.video_player.playbackStateChanged.connect(self.update_play_button)
+
+        # Connect live player signals (if available)
+        if self.realtime_preview is not None:
+            live_player = self.realtime_preview.player
+            live_player.durationChanged.connect(self.update_video_duration)
+            live_player.positionChanged.connect(self._on_live_player_position)
+            live_player.playbackStateChanged.connect(self.update_play_button)
+
+        # ──────────────────────────────────────────────────────────
+        # Connect mode selector (after everything is built)
+        # ──────────────────────────────────────────────────────────
+        self.overlay_mode_combo.currentTextChanged.connect(self._on_overlay_mode_changed)
 
         dock.setWidget(preview_widget)
         return dock
+
+    def _on_overlay_mode_changed(self, text):
+        """Switch between Off / Live / Precomp overlay modes."""
+
+        # Capture current position from whichever player is active
+        current_pos = self._active_player.position()
+        was_playing = (
+            self._active_player.playbackState() == QMediaPlayer.PlayingState
+        )
+
+        # Pause the outgoing player
+        self._active_player.pause()
+
+        if "Live" in text:
+            # ── Switch to Live real-time overlay ──
+            if self.realtime_preview is None:
+                self.statusBar().showMessage(
+                    "⚠️ Live overlay not available — module not loaded", 3000
+                )
+                self.overlay_mode_combo.blockSignals(True)
+                self.overlay_mode_combo.setCurrentText("Off")
+                self.overlay_mode_combo.blockSignals(False)
+                return
+
+            self.preview_stack.setCurrentIndex(1)
+            self._active_player = self.realtime_preview.player
+
+            # Hide precomp controls
+            if self._precomp_widget:
+                self._precomp_widget.setVisible(False)
+
+            # Sync position — play briefly to force frame render, then restore state
+            self._active_player.setPosition(current_pos)
+            if was_playing:
+                self._active_player.play()
+            else:
+                # Must play+pause to force QGraphicsVideoItem to render a frame
+                self._active_player.play()
+                QTimer.singleShot(100, self._active_player.pause)
+
+            # Refit view after video dimensions are known
+            QTimer.singleShot(200, self.realtime_preview._view._fit_video)
+
+            count = self.realtime_preview.get_detection_count()
+            self.statusBar().showMessage(
+                f"🎯 Live overlay mode — {count} detections from cache", 3000
+            )
+            
+        elif "Precomp" in text:
+            # ── Switch to Precomp (annotated video swap) ──
+            self.preview_stack.setCurrentIndex(0)
+            self._active_player = self.video_player
+
+            # Ensure shared player outputs to QVideoWidget
+            self.video_player.setVideoOutput(self.video_widget)
+
+            # Show precomp controls
+            if self._precomp_widget:
+                self._precomp_widget.setVisible(True)
+
+            # Sync position
+            self._active_player.setPosition(current_pos)
+            if was_playing:
+                self._active_player.play()
+
+            self.statusBar().showMessage(
+                "🎬 Precomp mode — select annotated video from dropdown", 3000
+            )
+
+        else:
+            # ── Off mode ──
+            self.preview_stack.setCurrentIndex(0)
+            self._active_player = self.video_player
+
+            # Ensure shared player outputs to QVideoWidget
+            self.video_player.setVideoOutput(self.video_widget)
+
+            # Reset to original video if bbox_manager swapped it
+            if self.bbox_manager and self.bbox_manager._current_source != "🎥 Original":
+                self.bbox_manager._switch_to("🎥 Original")
+
+            # Hide precomp controls
+            if self._precomp_widget:
+                self._precomp_widget.setVisible(False)
+
+            # Sync position
+            self._active_player.setPosition(current_pos)
+            if was_playing:
+                self._active_player.play()
+
+            self.statusBar().showMessage("Video overlay off", 3000)
+
+    def _on_shared_player_position(self, position):
+        """Position updates from shared player (Off + Precomp modes)."""
+        if self._active_player is not self.video_player:
+            return  # Ignore if live mode is active
+        self._handle_position_update(position)
+
+    def _on_live_player_position(self, position):
+        """Position updates from live overlay player."""
+        if self.realtime_preview is None:
+            return
+        if self._active_player is not self.realtime_preview.player:
+            return  # Ignore if not in live mode
+        self._handle_position_update(position)
+
+    def _handle_position_update(self, position):
+        """Shared logic for any player position update."""
+        duration = self._active_player.duration()
+        if duration <= 0:
+            return
+
+        # Update slider
+        percent = (position / duration) * 100
+        self.time_slider.blockSignals(True)
+        self.time_slider.setValue(int(percent))
+        self.time_slider.blockSignals(False)
+
+        # Update time display
+        self.update_time_display(position)
+
+        # Update detection panel
+        time_seconds = position / 1000.0
+        self._update_detection_panel(time_seconds)
+
+        # Update signal timeline playhead during playback
+        if self._active_player.playbackState() == QMediaPlayer.PlayingState:
+            self.current_time = time_seconds
+            self.signal_scene.set_current_time(self.current_time)
+            if hasattr(self, 'signal_view'):
+                self.signal_view.ensure_time_visible(self.current_time)
 
     def _toggle_detection_panel(self, state):
         """Show/hide detection panel"""
@@ -3135,12 +3369,11 @@ class SignalTimelineWindow(QMainWindow):
         self.detection_panel.setText('<br>'.join(lines))
 
     def toggle_video_playback(self):
-        """Toggle video playback in the preview"""
-        if self.video_player.playbackState() == QMediaPlayer.PlayingState:
-            self.video_player.pause()
+        if self._active_player.playbackState() == QMediaPlayer.PlayingState:
+            self._active_player.pause()
             self.play_btn.setText("▶ Play")
         else:
-            self.video_player.play()
+            self._active_player.play()
             self.play_btn.setText("⏸ Pause")
 
     def seek_video(self, position):
@@ -3806,12 +4039,37 @@ class SignalTimelineWindow(QMainWindow):
         self.installEventFilter(self)
 
     def capture_current_frame_base64(self) -> str | None:
-        """Grab current frame as base64, optionally annotated for LLM."""
+        """
+        Capture current frame for LLM.
+        
+        Live mode:  scene.render() → video + bboxes = one image
+        Other modes: cv2 grab from current source file + optional annotation
+        """
+        # ── Live mode: composited scene capture ──
+        if (self.realtime_preview is not None
+                and self.preview_stack.currentIndex() == 1):
+            b64 = self.realtime_preview.capture_frame_base64()
+            if b64:
+                tag = " [live overlay]" if self.realtime_preview._overlay_enabled else ""
+                print(f"📷 Captured frame at {self.current_time:.1f}s "
+                      f"({len(b64) // 1024}KB){tag}")
+                return b64
+
+        # ── Precomp / Off mode: cv2 capture ──
         import cv2
         import base64
 
         try:
-            cap = cv2.VideoCapture(self.video_path)
+            # Determine which video file to read from
+            source_path = self.video_path
+            if (self.bbox_manager is not None
+                    and hasattr(self.bbox_manager, '_sources')
+                    and hasattr(self.bbox_manager, '_current_source')):
+                source_path = self.bbox_manager._sources.get(
+                    self.bbox_manager._current_source, self.video_path
+                )
+
+            cap = cv2.VideoCapture(source_path)
             cap.set(cv2.CAP_PROP_POS_MSEC, self.current_time * 1000)
             ret, frame = cap.read()
             cap.release()
@@ -3820,8 +4078,9 @@ class SignalTimelineWindow(QMainWindow):
                 print(f"❌ Could not read frame at {self.current_time:.1f}s")
                 return None
 
-            # Annotate if checkbox is on
-            if hasattr(self, 'annotate_llm_frames') and self.annotate_llm_frames.isChecked():
+            # Optionally annotate with cached action/object labels
+            if (hasattr(self, 'annotate_llm_frames')
+                    and self.annotate_llm_frames.isChecked()):
                 frame = self._annotate_frame_for_llm(frame, self.current_time)
 
             # Resize
@@ -3831,11 +4090,22 @@ class SignalTimelineWindow(QMainWindow):
                 scale = max_dim / max(h, w)
                 frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
 
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            _, buffer = cv2.imencode(
+                '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90]
+            )
             b64 = base64.b64encode(buffer).decode('utf-8')
-            tag = " [annotated]" if hasattr(self, 'annotate_llm_frames') and self.annotate_llm_frames.isChecked() else ""
-            print(f"📷 Captured frame at {self.current_time:.1f}s ({len(b64)//1024}KB){tag}")
+
+            tag = ""
+            if source_path != self.video_path:
+                tag = " [precomp annotated]"
+            elif (hasattr(self, 'annotate_llm_frames')
+                  and self.annotate_llm_frames.isChecked()):
+                tag = " [cv2 annotated]"
+
+            print(f"📷 Captured frame at {self.current_time:.1f}s "
+                  f"({len(b64) // 1024}KB){tag}")
             return b64
+
         except Exception as e:
             print(f"❌ Frame capture failed: {e}")
             return None
@@ -4507,10 +4777,10 @@ class SignalTimelineWindow(QMainWindow):
         # Seek video player to this time
         if hasattr(self, 'video_player'):
             milliseconds = int(self.current_time * 1000)
-            self.video_player.setPosition(milliseconds)
+            self._active_player.setPosition(milliseconds)
             if self.video_player.playbackState() != QMediaPlayer.PlayingState:
-                self.video_player.play()
-                QTimer.singleShot(50, self.video_player.pause)
+                self._active_player.play()
+                QTimer.singleShot(50, self._active_player.pause)
         
         # Update label
         minutes = int(self.current_time // 60)
@@ -5009,11 +5279,11 @@ class SignalTimelineWindow(QMainWindow):
         self._edit_playlist_index = 0
         self._edit_paused = False
         self.play_edit_btn.setText("▶ Play Edit")
-        self.video_player.pause()
+        self._active_player.pause()
         
         # Reset to beginning
         self.current_time = 0
-        self.video_player.setPosition(0)
+        self._active_player.setPosition(0)
         self.signal_scene.set_current_time(0)
         if hasattr(self, 'signal_view'):
             self.signal_view.ensure_time_visible(0)

@@ -353,7 +353,7 @@ class AnnotatedVideoManager(QObject):
                 if actions_list:
                     print(f"   Tracking actions: {actions_list}")
 
-                run_action_detection(
+                all_actions, action_bboxes = run_action_detection(
                     video_path=self.video_path,
                     device="AUTO",
                     sample_rate=5,
@@ -370,6 +370,12 @@ class AnnotatedVideoManager(QObject):
                     enable_r3d=True,
                     progress_callback=self._action_progress_callback,
                 )
+
+                # Save bbox data to cache for real-time overlay
+                if action_bboxes:
+                    self.cache_data['action_bboxes'] = action_bboxes
+                    self._save_cache_to_disk()
+                    print(f"💾 Saved {len(action_bboxes)} action bboxes to cache")
 
                 print(f"✅ Action bbox video saved: {output}")
                 QTimer.singleShot(0, lambda: self._on_generate_done(True, output, "actions"))
@@ -417,7 +423,7 @@ class AnnotatedVideoManager(QObject):
                 print(f"📦 Starting object detection → {os.path.basename(output)}")
                 print(f"   Looking for: {highlight_objects[:5]}...")
 
-                run_object_detection(
+                final_objects, object_bboxes = run_object_detection(
                     video_path=self.video_path,
                     highlight_objects=highlight_objects,
                     frame_skip=5,
@@ -426,6 +432,12 @@ class AnnotatedVideoManager(QObject):
                     annotated_output=output,
                     progress_fn=None,
                 )
+
+                # Save bbox data to cache for real-time overlay
+                if object_bboxes:
+                    self.cache_data['object_bboxes'] = object_bboxes
+                    self._save_cache_to_disk()
+                    print(f"💾 Saved {len(object_bboxes)} object bbox entries to cache")
 
                 print(f"✅ Object bbox video saved: {output}")
                 QTimer.singleShot(0, lambda: self._on_generate_done(True, output, "objects"))
@@ -493,3 +505,53 @@ class AnnotatedVideoManager(QObject):
         if self._gen_objects_btn and not self._generating_objects:
             self._gen_objects_btn.setText(
                 "📦 Regenerate Objects" if has_objects else "📦 Generate Objects")
+    
+    def _save_cache_to_disk(self):
+        """Write updated cache_data back to the existing cache JSON file."""
+        import json
+        from pathlib import Path
+        
+        try:
+            from modules.video_cache import VideoAnalysisCache
+            
+            cache = VideoAnalysisCache()
+            video_hash = cache._get_video_hash(self.video_path)
+            cache_dir = Path(cache.cache_dir)  # typically ./cache/
+            
+            # Find existing cache file(s) for this video
+            matching_files = list(cache_dir.glob(f"{video_hash}*.cache.json"))
+            
+            if not matching_files:
+                print(f"⚠️ No cache file found for {video_hash} — creating new one")
+                cache_path = cache_dir / f"{video_hash}_bbox.cache.json"
+            else:
+                # Use the most recent one
+                cache_path = max(matching_files, key=lambda p: p.stat().st_mtime)
+                
+                # Load existing data and merge (don't overwrite other fields)
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+                
+                # Only update bbox keys, keep everything else
+                if 'object_bboxes' in self.cache_data:
+                    existing['object_bboxes'] = self.cache_data['object_bboxes']
+                if 'action_bboxes' in self.cache_data:
+                    existing['action_bboxes'] = self.cache_data['action_bboxes']
+                
+                self.cache_data = existing  # sync back so in-memory is complete too
+            
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(self.cache_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"💾 Cache written to: {cache_path.name}")
+            
+        except ImportError:
+            print("⚠️ VideoAnalysisCache not available — saving to fallback path")
+            cache_path = Path(self.video_path).with_suffix('.bbox_cache.json')
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(self.cache_data, f, indent=2, ensure_ascii=False)
+            print(f"💾 Cache written to: {cache_path.name}")
+        except Exception as e:
+            print(f"⚠️ Failed to write cache: {e}")
+            import traceback; traceback.print_exc()
+

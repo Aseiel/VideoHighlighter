@@ -928,14 +928,16 @@ def load_models(device="AUTO", openvino_threads=None,
     print("="*60)
     print(f"  - Encoder:        ✓ Loaded (on {encoder_device})")
     print(f"  - Custom model:   {'✓ Available' if models_info['custom'] else '✗ Not available'} "
-          f"{f'(on {models_info["custom"]["device"]})' if models_info['custom'] else ''}")
+        f"{'(on ' + models_info['custom']['device'] + ')' if models_info['custom'] else ''}")
+
     print(f"  - Intel model:    {'✓ Available' if models_info['intel'] else '✗ Not available'} "
-          f"{f'(on {models_info["intel"]["device"]})' if models_info['intel'] else ''}")
+        f"{'(on ' + models_info['intel']['device'] + ')' if models_info['intel'] else ''}")
+
     print(f"  - R3D/CUDA:       {'✓ Available' if models_info['cuda'] else '✗ Not available'} "
-          f"{f'(on {models_info["cuda"]["device"]})' if models_info['cuda'] else ''}")
+        f"{'(on ' + models_info['cuda']['device'] + ')' if models_info['cuda'] else ''}")
+
     print(f"  - R3D Custom:     {'✓ Available (' + str(len(R3D_CUSTOM_LABELS)) + ' classes)' if models_info.get('r3d_custom') else '✗ Not available'} "
-          f"{f'(on {models_info["r3d_custom"]["device"]})' if models_info.get('r3d_custom') else ''}")
-    print("="*60 + "\n")
+        f"{'(on ' + models_info['r3d_custom']['device'] + ')' if models_info.get('r3d_custom') else ''}")
 
     return (
         compiled_encoder, compiled_encoder.input(0), compiled_encoder.output(0),
@@ -1212,6 +1214,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
         frame_id = 0
         processed_frames = 0
         detection_count = 0
+        action_bboxes_cache = []  # collect bbox data for real-time overlay cache
 
         recent_detections = deque(maxlen=SEQUENCE_LENGTH)
         current_tracked_people = []
@@ -1571,6 +1574,22 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                 frame_detections.sort(key=lambda x: x[1], reverse=True)
                                 recent_detections.clear()
                                 recent_detections.extend(frame_detections[:3])
+                                
+                                # Save bbox data for cache (use person ROI as action bbox)
+                                if current_action_roi is not None and frame_width > 0 and frame_height > 0:
+                                    ax1, ay1, ax2, ay2 = current_action_roi
+                                    norm_bbox = [
+                                        ax1 / frame_width, ay1 / frame_height,
+                                        (ax2 - ax1) / frame_width, (ay2 - ay1) / frame_height,
+                                    ]
+                                    for det_name, det_score, det_model in frame_detections[:3]:
+                                        action_bboxes_cache.append({
+                                            'timestamp': float(use_timestamp_secs),
+                                            'action_name': det_name,
+                                            'confidence': float(det_score),
+                                            'bbox': norm_bbox,
+                                            'model_type': det_model,
+                                        })
 
                     prev_req = req
                     prev_timestamp_secs = timestamp_secs
@@ -1779,8 +1798,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     print(f"Actions detected: {detection_count}")
     print("=" * 60)
 
-    return all_actions
-
+    return all_actions, action_bboxes_cache
 
 # =============================
 # Debug / Analysis Functions
