@@ -1232,6 +1232,8 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.edit_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.edit_view.setFixedHeight(120)
+        self.edit_view.setAcceptDrops(True)
+        self.edit_view.viewport().setAcceptDrops(True)
         self.edit_view.setStyleSheet("""
             QGraphicsView {
                 background-color: rgba(30, 30, 40, 200);
@@ -1576,7 +1578,11 @@ class SignalTimelineWindow(QMainWindow):
         layout.addStretch()
         
         # Drag and delete instructions
-        instructions = QLabel("🖱️ Drag bars to edit timeline • Select clips and press Delete to remove")
+        instructions = QLabel(
+            "🖱️ Drag signal bars → edit timeline  "
+            "•  Left-drag background → highlight range, then drag range → edit timeline  "
+            "•  Select clip + Delete to remove"
+        )
         instructions.setStyleSheet("color: #a0ffa0; font-style: italic; font-size: 11px; padding: 4px; background: rgba(0, 100, 0, 40); border-radius: 4px;")
         layout.addWidget(instructions)
         layout.addStretch()
@@ -2188,10 +2194,28 @@ class SignalTimelineWindow(QMainWindow):
         self.play_video_clip(start_time, end_time)
 
     @Slot(float, float)
-    def on_clip_added(self, start_time, end_time):
+    def on_clip_added(self, start_time: float, end_time: float):
         """Handle when a clip is added to edit timeline"""
         self.update_edit_duration()
-        self.statusBar().showMessage(f"Added clip: {start_time:.1f}s to {end_time:.1f}s", 2000)
+        self.statusBar().showMessage(
+            f"✅  Added clip  {start_time:.2f}s → {end_time:.2f}s  "
+            f"({end_time - start_time:.2f}s)",
+            3000
+        )
+        # Flash the newly added clip
+        items = self.edit_scene.clip_items
+        if items:
+            last = items[-1]
+            original_pen = last.pen()
+            last.setPen(QPen(QColor(100, 230, 255), 3))
+            QTimer.singleShot(400, lambda: self._safe_restore_pen(last, original_pen))
+
+    def _safe_restore_pen(self, item, pen):
+        """Restore a clip item's pen safely (item may have been deleted)."""
+        try:
+            item.setPen(pen)
+        except RuntimeError:
+            pass
     
     @Slot(int)
     def on_clip_removed(self, index):
