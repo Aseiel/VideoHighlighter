@@ -770,9 +770,16 @@ def compile_with_fallback(ie, model, preferred_device, model_name="model"):
 
 
 def load_models(device="AUTO", openvino_threads=None,
-                enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True):
+                enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True,
+                action_models='mixed'):
     """
-    Load all available models with smart fallback for device mismatches.
+    Load models based on action_models selection.
+
+    action_models values:
+      'mixed'          → load everything available
+      'custom_only'    → OpenVINO custom fine-tuned decoder only
+      'intel_only'     → OpenVINO Intel Kinetics-400 decoder + R3D pretrained
+      'r3d_custom_only'→ R3D fine-tuned only
     
     Returns:
         compiled_encoder, encoder_input, encoder_output,
@@ -798,154 +805,157 @@ def load_models(device="AUTO", openvino_threads=None,
         raise FileNotFoundError(f"❌ Encoder model not found at {ENCODER_XML}")
     print("✓ Encoder model found")
 
-    # Read encoder model
+    # ---- Encoder (always required) ----
     encoder_model = ie.read_model(model=ENCODER_XML, weights=ENCODER_BIN)
-    
-    # COMPILE ENCODER WITH FALLBACK
     compiled_encoder, encoder_device = compile_with_fallback(
         ie, encoder_model, selected_device, model_name="encoder"
     )
-    
-    # Update selected_device if fallback changed it (for consistency)
     actual_device = encoder_device
     if encoder_device != selected_device:
         print(f"📌 Note: Encoder running on {encoder_device} (different from requested {selected_device})")
-        actual_device = encoder_device
 
     custom_decoder_xml = BASE_DIR / "action_classifier_3d.xml"
     custom_decoder_bin = BASE_DIR / "action_classifier_3d.bin"
-    intel_decoder_xml = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
-    intel_decoder_bin = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
+    intel_decoder_xml  = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
+    intel_decoder_bin  = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 
     models_info = {'custom': None, 'intel': None, 'cuda': None, 'r3d_custom': None}
 
+    # Determine which model groups to load
+    load_custom     = action_models in ('custom_only', 'mixed')
+    load_intel      = action_models in ('intel_only',  'mixed')
+    load_r3d_pre    = action_models in ('intel_only',  'mixed')   # pretrained R3D uses Kinetics-400
+    load_r3d_custom = action_models in ('r3d_custom_only', 'mixed')
+
+    print(f"\n📋 Action models selection: '{action_models}'")
+    print(f"   Load custom OpenVINO:  {load_custom}")
+    print(f"   Load Intel Kinetics:   {load_intel}")
+    print(f"   Load R3D pretrained:   {load_r3d_pre}")
+    print(f"   Load R3D custom:       {load_r3d_custom}")
+
     # ---- Custom fine-tuned decoder (OpenVINO) ----
-    if custom_decoder_xml.exists() and custom_decoder_bin.exists():
+    if load_custom and custom_decoder_xml.exists() and custom_decoder_bin.exists():
         print("✓ Loading custom fine-tuned decoder model")
         custom_decoder_model = ie.read_model(model=custom_decoder_xml, weights=custom_decoder_bin)
-        
-        # COMPILE CUSTOM DECODER WITH FALLBACK - THIS IS THE KEY FIX!
         compiled_custom_decoder, custom_device = compile_with_fallback(
             ie, custom_decoder_model, actual_device, model_name="custom decoder"
         )
-        
         models_info['custom'] = {
             'compiled': compiled_custom_decoder,
-            'input': compiled_custom_decoder.input(0),
-            'output': compiled_custom_decoder.output(0),
-            'labels': CUSTOM_LABELS,
-            'type': 'openvino',
-            'device': custom_device
+            'input':    compiled_custom_decoder.input(0),
+            'output':   compiled_custom_decoder.output(0),
+            'labels':   CUSTOM_LABELS,
+            'type':     'openvino',
+            'device':   custom_device,
         }
         print(f"  ✅ Custom decoder ready on {custom_device}")
-    else:
-        print("⚠️ Custom decoder model not found")
+    elif load_custom:
+        print("⚠️ Custom decoder requested but model files not found — skipping")
 
     # ---- Intel Kinetics-400 decoder (OpenVINO) ----
-    if intel_decoder_xml.exists() and intel_decoder_bin.exists():
+    if load_intel and intel_decoder_xml.exists() and intel_decoder_bin.exists():
         print("✓ Loading Intel Kinetics-400 decoder model")
         intel_decoder_model = ie.read_model(model=intel_decoder_xml, weights=intel_decoder_bin)
-        
-        # COMPILE INTEL DECODER WITH FALLBACK
         compiled_intel_decoder, intel_device = compile_with_fallback(
             ie, intel_decoder_model, actual_device, model_name="Intel decoder"
         )
-        
         models_info['intel'] = {
             'compiled': compiled_intel_decoder,
-            'input': compiled_intel_decoder.input(0),
-            'output': compiled_intel_decoder.output(0),
-            'labels': KINETICS_400_LABELS,
-            'type': 'openvino',
-            'device': intel_device
+            'input':    compiled_intel_decoder.input(0),
+            'output':   compiled_intel_decoder.output(0),
+            'labels':   KINETICS_400_LABELS,
+            'type':     'openvino',
+            'device':   intel_device,
         }
         print(f"  ✅ Intel decoder ready on {intel_device}")
-    else:
-        print("⚠️ Intel decoder model not found")
+    elif load_intel:
+        print("⚠️ Intel decoder requested but model files not found — skipping")
 
-    # ---- R3D / CUDA model (pretrained Kinetics-400) ----
+    # ---- R3D pretrained — Kinetics-400 (PyTorch) ----
     r3d_wrapper = None
-    if enable_r3d and TORCH_AVAILABLE:
+    if load_r3d_pre and enable_r3d and TORCH_AVAILABLE:
         try:
             r3d_device = 'cuda' if CUDA_AVAILABLE else 'cpu'
-            print(f"🔄 Initializing R3D model on {r3d_device}...")
+            print(f"🔄 Initializing R3D pretrained model on {r3d_device}...")
             r3d_wrapper = R3DModelWrapper(
                 model_name=r3d_model_name,
                 device_str=r3d_device,
-                half_precision=r3d_half and CUDA_AVAILABLE
+                half_precision=r3d_half and CUDA_AVAILABLE,
             )
             models_info['cuda'] = {
                 'wrapper': r3d_wrapper,
-                'labels': KINETICS_400_LABELS,
-                'type': 'pytorch',
-                'device': r3d_device
+                'labels':  KINETICS_400_LABELS,
+                'type':    'pytorch',
+                'device':  r3d_device,
             }
-            print(f"✅ R3D model loaded on {r3d_device}")
+            print(f"✅ R3D pretrained loaded on {r3d_device}")
         except Exception as e:
-            print(f"⚠️ Failed to load R3D model: {e}")
+            print(f"⚠️ Failed to load R3D pretrained model: {e}")
             r3d_wrapper = None
-    elif enable_r3d and not TORCH_AVAILABLE:
-        print("⚠️ R3D requested but PyTorch is not installed — skipping")
+    elif load_r3d_pre and enable_r3d and not TORCH_AVAILABLE:
+        print("⚠️ R3D pretrained requested but PyTorch is not installed — skipping")
 
-    # ---- R3D Custom fine-tuned model ----
-    if (enable_r3d and TORCH_AVAILABLE
-            and R3D_CUSTOM_LABELS and R3D_CUSTOM_WEIGHTS_PATH.exists()):
-        try:
-            r3d_custom_device = 'cuda' if CUDA_AVAILABLE else 'cpu'
-            # Use variant from mapping metadata, fall back to CLI r3d_model_name
-            custom_variant = (R3D_CUSTOM_META or {}).get('model_variant') or r3d_model_name
-            num_classes = len(R3D_CUSTOM_LABELS)
-            
-            print(f"🔄 Initializing R3D custom model ({num_classes} classes) on {r3d_custom_device}...")
+    # ---- R3D custom fine-tuned (PyTorch) ----
+    if load_r3d_custom and enable_r3d and TORCH_AVAILABLE:
+        if R3D_CUSTOM_LABELS and R3D_CUSTOM_WEIGHTS_PATH.exists():
+            try:
+                r3d_custom_device = 'cuda' if CUDA_AVAILABLE else 'cpu'
+                custom_variant = (R3D_CUSTOM_META or {}).get('model_variant') or r3d_model_name
+                num_classes = len(R3D_CUSTOM_LABELS)
+                print(f"🔄 Initializing R3D custom model ({num_classes} classes, "
+                      f"variant: {custom_variant}) on {r3d_custom_device}...")
+                r3d_custom_wrapper = R3DModelWrapper(
+                    model_name=custom_variant,
+                    device_str=r3d_custom_device,
+                    half_precision=r3d_half and CUDA_AVAILABLE,
+                    custom_weights=str(R3D_CUSTOM_WEIGHTS_PATH),
+                    custom_num_classes=num_classes,
+                )
+                models_info['r3d_custom'] = {
+                    'wrapper': r3d_custom_wrapper,
+                    'labels':  R3D_CUSTOM_LABELS,
+                    'type':    'pytorch',
+                    'device':  r3d_custom_device,
+                }
+                print(f"✅ R3D custom model loaded on {r3d_custom_device}")
+            except Exception as e:
+                print(f"⚠️ Failed to load R3D custom model: {e}")
+        elif R3D_CUSTOM_LABELS and not R3D_CUSTOM_WEIGHTS_PATH.exists():
+            print(f"⚠️ R3D custom mapping found but weights missing: {R3D_CUSTOM_WEIGHTS_PATH}")
+        else:
+            print("⚠️ R3D custom requested but mapping file not found — skipping")
+    elif load_r3d_custom and enable_r3d and not TORCH_AVAILABLE:
+        print("⚠️ R3D custom requested but PyTorch is not installed — skipping")
 
-            r3d_custom_wrapper = R3DModelWrapper(
-                model_name=custom_variant,
-                device_str=r3d_custom_device,
-                half_precision=r3d_half and CUDA_AVAILABLE,
-                custom_weights=str(R3D_CUSTOM_WEIGHTS_PATH),
-                custom_num_classes=num_classes,
-            )
-            models_info['r3d_custom'] = {
-                'wrapper': r3d_custom_wrapper,
-                'labels': R3D_CUSTOM_LABELS,
-                'type': 'pytorch',
-                'device': r3d_custom_device
-            }
-            print(f"✅ R3D custom model loaded on {r3d_custom_device}")
-        except Exception as e:
-            print(f"⚠️ Failed to load R3D custom model: {e}")
-    elif enable_r3d and R3D_CUSTOM_LABELS and not R3D_CUSTOM_WEIGHTS_PATH.exists():
-        print(f"⚠️ R3D custom mapping found but weights missing: {R3D_CUSTOM_WEIGHTS_PATH}")
+    # ---- Sanity check ----
+    loaded = [k for k, v in models_info.items() if v is not None]
+    if not loaded:
+        raise FileNotFoundError(
+            f"❌ No models loaded for action_models='{action_models}'! "
+            f"Check that the required model files exist."
+        )
 
-    # Check if at least one model loaded
-    if (models_info['custom'] is None and models_info['intel'] is None
-            and models_info['cuda'] is None and models_info.get('r3d_custom') is None):
-        raise FileNotFoundError("❌ No models found! Need at least one decoder or R3D.")
-
-    # Print summary with device info
-    print("\n" + "="*60)
+    # ---- Summary ----
+    print("\n" + "=" * 60)
     print("📊 MODEL LOADING SUMMARY")
-    print("="*60)
+    print("=" * 60)
     print(f"  - Encoder:        ✓ Loaded (on {encoder_device})")
-    print(f"  - Custom model:   {'✓ Available' if models_info['custom'] else '✗ Not available'} "
-        f"{'(on ' + models_info['custom']['device'] + ')' if models_info['custom'] else ''}")
-
-    print(f"  - Intel model:    {'✓ Available' if models_info['intel'] else '✗ Not available'} "
-        f"{'(on ' + models_info['intel']['device'] + ')' if models_info['intel'] else ''}")
-
-    print(f"  - R3D/CUDA:       {'✓ Available' if models_info['cuda'] else '✗ Not available'} "
-        f"{'(on ' + models_info['cuda']['device'] + ')' if models_info['cuda'] else ''}")
-
-    print(f"  - R3D Custom:     {'✓ Available (' + str(len(R3D_CUSTOM_LABELS)) + ' classes)' if models_info.get('r3d_custom') else '✗ Not available'} "
-        f"{'(on ' + models_info['r3d_custom']['device'] + ')' if models_info.get('r3d_custom') else ''}")
+    print(f"  - Custom model:   "
+          f"{'✓ Available (on ' + models_info['custom']['device'] + ')' if models_info['custom'] else '✗ Not loaded'}")
+    print(f"  - Intel model:    "
+          f"{'✓ Available (on ' + models_info['intel']['device'] + ')' if models_info['intel'] else '✗ Not loaded'}")
+    print(f"  - R3D/CUDA:       "
+          f"{'✓ Available (on ' + models_info['cuda']['device'] + ')' if models_info['cuda'] else '✗ Not loaded'}")
+    print(f"  - R3D Custom:     "
+          f"{'✓ Available (' + str(len(R3D_CUSTOM_LABELS)) + ' classes, on ' + models_info['r3d_custom']['device'] + ')' if models_info.get('r3d_custom') else '✗ Not loaded'}")
+    print("=" * 60)
 
     return (
         compiled_encoder, compiled_encoder.input(0), compiled_encoder.output(0),
         models_info,
-        actual_device,  # Return the actual device used (after fallbacks)
-        r3d_wrapper
+        actual_device,
+        r3d_wrapper,
     )
-
 
 # =============================
 # Preprocess frame with ROI support (for OpenVINO encoder)
@@ -1101,7 +1111,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                          yolo_workers=2, yolo_skip_frames=4, downscale_factor=0.5,
                          warm_up_seconds=2, include_model_type=False,
                          openvino_threads=None, preprocess_workers=2,
-                         enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True):
+                         enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True,
+                         action_models='mixed'):  # ← NEW PARAMETER
     """
     Run action recognition — OPTIMIZED version with R3D/CUDA support.
 
@@ -1112,6 +1123,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
       4. R3D end-to-end model on CUDA alongside OpenVINO encoder+decoder
       5. Raw frame ring buffer for R3D (stores BGR frames, not encoder features)
       6. Configurable OpenVINO thread count to share cores fairly
+      7. action_models gates which decoders are loaded and used
     """
 
     # ---- CPU thread budget ----
@@ -1126,6 +1138,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
           f"YOLO workers: {yolo_workers} | Preprocess workers: {preprocess_workers}")
     if enable_r3d:
         print(f"✅ R3D model: {r3d_model_name} | FP16: {r3d_half}")
+    print(f"✅ Action models: {action_models}")
 
     # ---- Parse interesting actions ----
     action_to_model = {}
@@ -1135,28 +1148,43 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
             try:
                 all_matches = get_all_ids_from_name(action_name)
                 # Use clean name (without tag) for the key
-                clean_name = re.sub(r'\s*\[(custom|intel|cuda)\]\s*$', '', action_name).strip()
+                clean_name = re.sub(r'\s*\[(custom|intel|cuda|r3d_custom)\]\s*$', '', action_name).strip()
                 for action_id, model_type in all_matches:
+                    # ---- Filter to only models that will actually be loaded ----
+                    if action_models == 'custom_only' and model_type not in ('custom',):
+                        continue
+                    if action_models == 'intel_only' and model_type not in ('intel', 'cuda'):
+                        continue
+                    if action_models == 'r3d_custom_only' and model_type not in ('r3d_custom',):
+                        continue
+                    # 'mixed' passes all through
+
                     key = f"{clean_name.lower()}__{model_type}"
                     action_to_model[key] = (action_id, model_type)
-                    print(f"📌 Action '{action_name}' found in {model_type} model (ID: {action_id})")
-                    # If R3D is enabled and the action is from Kinetics-400, also map to cuda
-                    if enable_r3d and model_type == 'intel':
-                        cuda_key = f"{action_name.lower()}__cuda"
+                    # Use get_action_name to get the proper display name (preserves casing)
+                    display_name = get_action_name(action_id, model_type)
+                    print(f"📌 Action '{display_name}' → {model_type} model (ID: {action_id})")
+
+                    # If R3D is enabled and the action is from Kinetics-400 (intel),
+                    # also map to cuda when action_models allows it
+                    if (enable_r3d and model_type == 'intel'
+                            and action_models in ('intel_only', 'mixed')):
+                        cuda_key = f"{clean_name.lower()}__cuda"
                         action_to_model[cuda_key] = (action_id, 'cuda')
                         print(f"   ↳ Also mapped to R3D/CUDA model (ID: {action_id})")
+
             except ValueError as e:
                 print(f"⚠️ {e}")
                 raise
     else:
         interesting_actions_set = None
 
-    # ---- Load models ----
+    # ---- Load models (respects action_models selection) ----
     (compiled_encoder, encoder_input, encoder_output,
      models_info, actual_device, r3d_wrapper) = \
         load_models(device, openvino_threads=openvino_threads,
                     enable_r3d=enable_r3d, r3d_model_name=r3d_model_name,
-                    r3d_half=r3d_half)
+                    r3d_half=r3d_half, action_models=action_models)  # ← passed through
 
     encoder_engine = AsyncBatchedInferenceEngine(
         compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
@@ -1191,7 +1219,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     # ---- R3D raw frame ring buffer ----
-    # R3D needs raw BGR frames (not encoder features), so we keep a separate buffer
     has_any_r3d = r3d_wrapper is not None or models_info.get('r3d_custom') is not None
     raw_frame_buffer = deque(maxlen=R3D_CLIP_LENGTH) if has_any_r3d else None
 
@@ -1214,7 +1241,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
         frame_id = 0
         processed_frames = 0
         detection_count = 0
-        action_bboxes_cache = []  # collect bbox data for real-time overlay cache
+        action_bboxes_cache = []
 
         recent_detections = deque(maxlen=SEQUENCE_LENGTH)
         current_tracked_people = []
@@ -1274,7 +1301,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     current_action_roi = merge_boxes(action_boxes) if action_boxes else None
                 yolo_time += time.time() - yolo_start
 
-            # Preprocess for OpenVINO encoder
             preprocess_start = time.time()
             processed_frame = preprocess_frame(
                 warm_up_frame, encoder_input.shape,
@@ -1288,7 +1314,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
             sequence_buffer.append(features)
             inference_time += time.time() - inference_start
 
-            # Store raw frame for R3D
             if raw_frame_buffer is not None:
                 raw_frame_buffer.append(warm_up_frame.copy())
 
@@ -1348,7 +1373,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                 frame_id += 1
 
-                # ---- Store raw frame for R3D ----
                 if raw_frame_buffer is not None:
                     raw_frame_buffer.append(frame.copy())
 
@@ -1425,7 +1449,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             roi=current_action_roi if use_person_detection else None)
                         preprocess_time += time.time() - preprocess_start
 
-                    # Submit NEXT frame's preprocess now
+                    # Submit NEXT frame's preprocess now (overlapped)
                     pending_preprocess_future = preprocess_pool.submit(
                         frame, encoder_input.shape,
                         roi=current_action_roi if use_person_detection else None)
@@ -1444,7 +1468,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             sequence_buffer.pop(0)
 
                         if len(sequence_buffer) == SEQUENCE_LENGTH:
-                            # OpenVINO decoder input
                             sequence_array = np.expand_dims(
                                 np.stack(sequence_buffer, axis=0), axis=0)
 
@@ -1458,7 +1481,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             # Run decoders (OpenVINO + R3D)
                             # ==============================
                             decoder_cache = {}
-                            # -- R3D inference (pretrained + custom, if buffer is full) --
+
+                            # -- R3D inference (runs first so results are cached) --
                             if (raw_frame_buffer is not None
                                     and len(raw_frame_buffer) == R3D_CLIP_LENGTH):
                                 r3d_start = time.time()
@@ -1489,9 +1513,10 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                 r3d_time += time.time() - r3d_start
 
                             if interesting_actions_set:
-                                # === Run needed decoders for all model mappings ===
+                                # === Targeted: only run decoders needed for mapped actions ===
                                 for key, (action_id, model_type) in action_to_model.items():
-                                    action_name = key.split("__")[0]
+                                    # Use get_action_name for proper casing in display/log
+                                    action_name = get_action_name(action_id, model_type)
                                     model_data = models_info.get(model_type)
                                     if model_data is None:
                                         continue
@@ -1526,7 +1551,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                             print(f"{use_timestamp_str} -> {action_name} "
                                                   f"[{model_type}] (score:{score:.3f})")
                             else:
-                                # === Scan all models (including R3D) ===
+                                # === Scan all loaded models ===
                                 all_probabilities = {}
                                 for model_type, model_data in models_info.items():
                                     if model_data is None:
@@ -1537,7 +1562,6 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                             predictions = model_data['compiled'](
                                                 [sequence_array])[model_data['output']].flatten()
                                             decoder_cache[model_type] = softmax(predictions)
-                                        # 'cuda' already handled above
 
                                     probabilities = decoder_cache.get(model_type)
                                     if probabilities is None:
@@ -1548,9 +1572,10 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                         score = float(probabilities[idx])
                                         if score >= confidence_threshold:
                                             action_name = get_action_name(idx, model_type)
-                                            key = (action_name, model_type)
-                                            all_probabilities[key] = (idx, score, action_name,
-                                                                      model_type)
+                                            dedup_key = (action_name, model_type)
+                                            all_probabilities[dedup_key] = (idx, score,
+                                                                            action_name,
+                                                                            model_type)
 
                                 sorted_results = sorted(all_probabilities.values(),
                                                         key=lambda x: x[1], reverse=True)
@@ -1574,8 +1599,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                 frame_detections.sort(key=lambda x: x[1], reverse=True)
                                 recent_detections.clear()
                                 recent_detections.extend(frame_detections[:3])
-                                
-                                # Save bbox data for cache (use person ROI as action bbox)
+
                                 if current_action_roi is not None and frame_width > 0 and frame_height > 0:
                                     ax1, ay1, ax2, ay2 = current_action_roi
                                     norm_bbox = [
@@ -1584,11 +1608,11 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                     ]
                                     for det_name, det_score, det_model in frame_detections[:3]:
                                         action_bboxes_cache.append({
-                                            'timestamp': float(use_timestamp_secs),
+                                            'timestamp':   float(use_timestamp_secs),
                                             'action_name': det_name,
-                                            'confidence': float(det_score),
-                                            'bbox': norm_bbox,
-                                            'model_type': det_model,
+                                            'confidence':  float(det_score),
+                                            'bbox':        norm_bbox,
+                                            'model_type':  det_model,
                                         })
 
                     prev_req = req
@@ -1618,19 +1642,31 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     elapsed = current_time - start_time
                     processing_fps = processed_frames / elapsed if elapsed > 0 else 0
                     engine_stats = encoder_engine.get_stats()
+                    _dev_parts = [f"encoder:{actual_device}"]
+                    if models_info.get('custom'):
+                        _dev_parts.append(f"custom:{models_info['custom']['device']}")
+                    if models_info.get('intel'):
+                        _dev_parts.append(f"intel:{models_info['intel']['device']}")
+                    if models_info.get('cuda'):
+                        _dev_parts.append(f"r3d:{models_info['cuda']['device']}")
+                    if models_info.get('r3d_custom'):
+                        _dev_parts.append(f"r3d_custom:{models_info['r3d_custom']['device']}")
                     progress_msg = (
                         f"Frame {processed_frames}/{expected_processed_frames} | "
                         f"Detections: {detection_count} | "
                         f"Processing: {processing_fps:.1f} FPS | "
                         f"Inference: {engine_stats['inference_fps']:.1f} FPS | "
-                        f"Device: {actual_device}")
+                        f"Devices: {', '.join(_dev_parts)} | "
+                        f"Models: {action_models}")
                     if r3d_wrapper:
                         progress_msg += f" + {r3d_model_name}/CUDA"
                     progress_callback(processed_frames, expected_processed_frames,
                                       "Action Recognition", progress_msg)
                     last_gui_update = current_time
 
-            # ---- Flush last frame ----
+            # =============================================
+            # FLUSH LAST FRAME
+            # =============================================
             if prev_req is not None:
                 features = encoder_engine.wait_and_get(prev_req)[0]
                 features = np.reshape(features, (-1,))
@@ -1651,21 +1687,33 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     decoder_cache = {}
 
                     # R3D final flush
-                    if (r3d_wrapper is not None and raw_frame_buffer is not None
+                    if (raw_frame_buffer is not None
                             and len(raw_frame_buffer) == R3D_CLIP_LENGTH):
-                        try:
-                            r3d_roi = current_action_roi if use_person_detection else None
-                            r3d_logits = r3d_wrapper.predict_from_frames(
-                                list(raw_frame_buffer), roi=r3d_roi)
-                            decoder_cache['cuda'] = softmax(r3d_logits)
-                        except Exception as e:
-                            if debug:
-                                print(f"⚠️ R3D flush error: {e}")
+                        r3d_roi = current_action_roi if use_person_detection else None
+                        frames_list = list(raw_frame_buffer)
+
+                        if r3d_wrapper is not None:
+                            try:
+                                r3d_logits = r3d_wrapper.predict_from_frames(
+                                    frames_list, roi=r3d_roi)
+                                decoder_cache['cuda'] = softmax(r3d_logits)
+                            except Exception as e:
+                                if debug:
+                                    print(f"⚠️ R3D flush error: {e}")
+
+                        r3d_custom_info = models_info.get('r3d_custom')
+                        if r3d_custom_info is not None:
+                            try:
+                                r3d_custom_logits = r3d_custom_info['wrapper'].predict_from_frames(
+                                    frames_list, roi=r3d_roi)
+                                decoder_cache['r3d_custom'] = softmax(r3d_custom_logits)
+                            except Exception as e:
+                                if debug:
+                                    print(f"⚠️ R3D custom flush error: {e}")
 
                     if interesting_actions_set:
-                        # === Run needed decoders for all model mappings ===
                         for key, (action_id, model_type) in action_to_model.items():
-                            action_name = key.split("__")[0]
+                            action_name = get_action_name(action_id, model_type)
                             model_data = models_info.get(model_type)
                             if model_data is None:
                                 continue
@@ -1714,9 +1762,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                 score = float(probabilities[idx])
                                 if score >= confidence_threshold:
                                     action_name = get_action_name(idx, model_type)
-                                    key = (action_name, model_type)
-                                    all_probabilities[key] = (idx, score, action_name,
-                                                              model_type)
+                                    dedup_key = (action_name, model_type)
+                                    all_probabilities[dedup_key] = (idx, score,
+                                                                    action_name, model_type)
                         sorted_results = sorted(all_probabilities.values(),
                                                 key=lambda x: x[1], reverse=True)
                         for idx, score, action_name, model_type in sorted_results[:top_k]:
@@ -1781,21 +1829,22 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     print("🏁 PERFORMANCE SUMMARY")
     print("=" * 60)
     total_time = time.time() - start_time
-    print(f"Total time: {total_time:.1f}s")
-    print(f"Total frames: {frame_id}")
-    print(f"Overall FPS: {frame_id / total_time:.1f}")
-    print(f"YOLO time: {yolo_time:.1f}s ({yolo_time / total_time * 100:.1f}%)")
-    print(f"Preprocess time: {preprocess_time:.1f}s ({preprocess_time / total_time * 100:.1f}%)")
-    print(f"Inference time (OV): {inference_time:.1f}s ({inference_time / total_time * 100:.1f}%)")
+    print(f"Total time:           {total_time:.1f}s")
+    print(f"Total frames:         {frame_id}")
+    print(f"Overall FPS:          {frame_id / total_time:.1f}")
+    print(f"Action models:        {action_models}")
+    print(f"YOLO time:            {yolo_time:.1f}s ({yolo_time / total_time * 100:.1f}%)")
+    print(f"Preprocess time:      {preprocess_time:.1f}s ({preprocess_time / total_time * 100:.1f}%)")
+    print(f"Inference time (OV):  {inference_time:.1f}s ({inference_time / total_time * 100:.1f}%)")
     if r3d_wrapper:
-        print(f"R3D/CUDA time: {r3d_time:.1f}s ({r3d_time / total_time * 100:.1f}%)")
-    print(f"Draw time: {draw_time:.1f}s ({draw_time / total_time * 100:.1f}%)")
-    print(f"CPU cores: {os.cpu_count()}")
-    print(f"OpenVINO threads: {openvino_threads}")
+        print(f"R3D/CUDA time:        {r3d_time:.1f}s ({r3d_time / total_time * 100:.1f}%)")
+    print(f"Draw time:            {draw_time:.1f}s ({draw_time / total_time * 100:.1f}%)")
+    print(f"CPU cores:            {os.cpu_count()}")
+    print(f"OpenVINO threads:     {openvino_threads}")
     if r3d_wrapper:
         device_name = torch.cuda.get_device_name(0) if CUDA_AVAILABLE else "CPU"
-        print(f"R3D device: {device_name}")
-    print(f"Actions detected: {detection_count}")
+        print(f"R3D device:           {device_name}")
+    print(f"Actions detected:     {detection_count}")
     print("=" * 60)
 
     return all_actions, action_bboxes_cache
@@ -1936,7 +1985,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     try:
-        results = run_action_detection(
+        results, bboxes_cache = run_action_detection(
             video_path=args.input,
             device=args.device,
             sample_rate=args.sample_rate,
