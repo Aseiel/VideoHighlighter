@@ -4,10 +4,10 @@ from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
     QGraphicsLineItem, QApplication, QMenu
 )
-from PySide6.QtCore import Qt, Signal, QPoint, QTimer
+from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QFont, QLinearGradient,
-    QFontMetrics, QCursor, QPainter
+    QFontMetrics, QCursor, QPainter, QDrag, QPixmap
 )
 
 class SignalTimelineScene(QGraphicsScene):
@@ -100,9 +100,15 @@ class SignalTimelineScene(QGraphicsScene):
         self.object_colors = self._color_palette(len(self.object_classes), start_hue=340)
         
         self.bars = []
+
+        # Range selection state
+        self._selection_rect_item = None   # QGraphicsRectItem — the blue highlight
+        self._selection_label_item = None  # QGraphicsTextItem — time label
+        self._selection_start_time = None  # float seconds
+        self._selection_end_time = None    # float seconds
+        self._selection_active = False     # True = selection exists and can be dragged
+
         self.build_timeline()
-
-
     
     def generate_waveform_colors(self):
         """Generate color gradient for waveform based on amplitude"""
@@ -279,6 +285,11 @@ class SignalTimelineScene(QGraphicsScene):
         print(f"   - Waveform data: {self.waveform is not None}, length: {len(self.waveform)}")
         print(f"   - Waveform visible: {self.waveform_visible}")
         
+        # Clear selection state — items are about to be wiped by self.clear()
+        self._selection_rect_item  = None
+        self._selection_label_item = None
+        self._selection_active     = False
+
         # If we have a view connected, store its current transform
         views = self.views()
         old_transform = None
@@ -880,7 +891,112 @@ class SignalTimelineScene(QGraphicsScene):
                 QPen(QColor(255, 60, 60), 2, Qt.PenStyle.DashLine)
             )
             self.current_time_line.setZValue(100)
-        
+
+    def update_selection_rect(self, start_time: float, end_time: float):
+        """
+        Draw or update the blue selection highlight while the user is dragging.
+        Called on every mouse-move during a range drag.
+        """
+        t0 = min(start_time, end_time)
+        t1 = max(start_time, end_time)
+
+        self._selection_start_time = t0
+        self._selection_end_time   = t1
+
+        x0     = t0 * self.pixels_per_second
+        width  = max(2.0, (t1 - t0) * self.pixels_per_second)
+        height = self.sceneRect().height()
+
+        if (self._selection_rect_item is not None
+                and self._selection_rect_item in self.items()):
+            self._selection_rect_item.setRect(x0, 0, width, height)
+        else:
+            pen   = QPen(QColor(100, 200, 255, 200), 1.5)
+            brush = QBrush(QColor(80, 160, 255, 40))
+            self._selection_rect_item = self.addRect(x0, 0, width, height, pen, brush)
+            self._selection_rect_item.setZValue(90)
+
+        self._update_selection_label(t0, t1, x0)
+
+    def _update_selection_label(self, t0: float, t1: float, x0: float):
+        """Update the time-range label that floats above the selection rect."""
+        def fmt(t):
+            m, s = divmod(t, 60)
+            return f"{int(m):02d}:{s:05.2f}"
+
+        duration = t1 - t0
+        text = f"{fmt(t0)} → {fmt(t1)}  ({duration:.2f}s)  — drag to add"
+
+        font = QFont("Consolas", 9, QFont.Weight.Bold)
+
+        if (self._selection_label_item is not None
+                and self._selection_label_item in self.items()):
+            self._selection_label_item.setPlainText(text)
+            self._selection_label_item.setPos(x0 + 4, 2)
+        else:
+            self._selection_label_item = self.addText(text, font)
+            self._selection_label_item.setDefaultTextColor(QColor(120, 220, 255))
+            self._selection_label_item.setPos(x0 + 4, 2)
+            self._selection_label_item.setZValue(91)
+
+    def finalise_selection(self):
+        """
+        Called on mouse-release after a range drag.
+        Keeps the selection rect visible and marks it as ready to drag.
+        Returns (start, end) if the selection is valid, else None.
+        """
+        t0 = self._selection_start_time
+        t1 = self._selection_end_time
+
+        if t0 is None or t1 is None or abs(t1 - t0) < 0.3:
+            # Too short — discard silently
+            self.clear_selection()
+            return None
+
+        # Make the rect visually distinct ("ready to drag")
+        if (self._selection_rect_item is not None
+                and self._selection_rect_item in self.items()):
+            # Brighter border, slightly more opaque fill
+            self._selection_rect_item.setPen(QPen(QColor(100, 220, 255, 255), 2))
+            self._selection_rect_item.setBrush(QBrush(QColor(80, 180, 255, 60)))
+
+        # Update label to show drag hint
+        x0 = min(t0, t1) * self.pixels_per_second
+        self._update_selection_label(min(t0, t1), max(t0, t1), x0)
+
+        self._selection_active = True
+        return (min(t0, t1), max(t0, t1))
+
+    def clear_selection(self):
+        """Remove the selection overlay entirely."""
+        for attr in ('_selection_rect_item', '_selection_label_item'):
+            item = getattr(self, attr, None)
+            if item is not None and item in self.items():
+                try:
+                    self.removeItem(item)
+                except RuntimeError:
+                    pass
+            setattr(self, attr, None)
+
+        self._selection_start_time = None
+        self._selection_end_time   = None
+        self._selection_active     = False
+
+    def selection_rect_contains(self, scene_pos) -> bool:
+        """
+        Returns True if scene_pos is inside the current selection rect.
+        Used by SignalTimelineView to decide whether a press starts a DnD
+        or clears the selection.
+        """
+        if not self._selection_active:
+            return False
+        if (self._selection_rect_item is None
+                or self._selection_rect_item not in self.items()):
+            return False
+        return self._selection_rect_item.contains(
+            self._selection_rect_item.mapFromScene(scene_pos)
+        )
+       
     def set_confidence_filter(self, min_confidence, max_confidence=None):
         """Set confidence filter range (0.0 to 1.0)"""
         self.min_confidence = max(0.0, min(min_confidence, 1.0))
@@ -975,6 +1091,11 @@ class SignalTimelineView(QGraphicsView):
         # Track mouse state for manual panning
         self.panning = False
         self.last_pan_point = QPoint()
+        self._range_selecting = False   # True while left-drag on background
+        self._range_dragging  = False   # True while dragging the selection rect
+        self._range_start_time = None   # seconds — where the drag started
+        self._drag_press_pos   = None
+        self._dnd_started      = False
 
         # Auto-follow playhead during playback
         self.follow_playhead = True
@@ -1036,85 +1157,274 @@ class SignalTimelineView(QGraphicsView):
         
         event.accept()
     
+    def _item_is_bar(self, pos) -> bool:
+        """True if a DraggableTimelineBar is under pos (walks parent chain)."""
+        item = self.itemAt(pos)
+        while item is not None:
+            if isinstance(item, DraggableTimelineBar):
+                return True
+            item = item.parentItem()
+        return False
+
+    def _pos_in_selection(self, pos) -> bool:
+        """True if view pos is inside the active selection rect."""
+        scene = self.scene()
+        if scene is None:
+            return False
+        scene_pos = self.mapToScene(pos)
+        return scene.selection_rect_contains(scene_pos)
+
+    # ── mouse events ───────────────────────────────────────────────────
+
     def mousePressEvent(self, event):
-        """Handle mouse press in the view"""
-        # Check if we're clicking on a draggable item
-        item = self.itemAt(event.pos())
-        
-        if item and isinstance(item, DraggableTimelineBar):
+        """
+        Priority:
+          1. Left on active selection rect  → start DnD
+          2. Left on a signal bar           → pass to item (existing bar DnD)
+          3. Right / middle                 → pan
+          4. Left on background             → start range selection
+                                              (clears any existing selection)
+        """
+        scene = self.scene()
+
+        # ── 1. Press inside the active selection rect ─────────────────
+        # We record the press position; the actual QDrag is started
+        # in mouseMoveEvent once the drag threshold is exceeded.
+        if event.button() == Qt.LeftButton and self._pos_in_selection(event.pos()):
+            self._range_dragging   = True   # "intent to drag" flag
+            self._range_selecting  = False
+            self._drag_press_pos   = event.pos()   # ← record where press happened
+            self._dnd_started      = False          # ← DnD not yet fired
+            self.setCursor(QCursor(Qt.ClosedHandCursor))
+            event.accept()
+            return
+
+        # ── 2. Signal bar ─────────────────────────────────────────────
+        if event.button() == Qt.LeftButton and self._item_is_bar(event.pos()):
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self._range_selecting = False
+            self._range_dragging  = False
+            if scene:
+                scene.clear_selection()
             super().mousePressEvent(event)
             return
-        
-        # Right/middle-click — scroll hand drag
+
+        # ── 3. Pan ────────────────────────────────────────────────────
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            self._follow_was_on = self.follow_playhead
-            self.follow_playhead = False
+            self._follow_was_on   = self.follow_playhead
+            self.follow_playhead  = False
+            self._range_selecting = False
+            self._range_dragging  = False
             super().mousePressEvent(event)
             return
-        
-        # Left-click on background — emit time signal directly
+
+        # ── 4. Background — start range selection ─────────────────────
         if event.button() == Qt.LeftButton:
-            self.panning = False
-            self._left_press_pos = event.pos()
-            self.last_pan_point = event.pos()
-            
-            # Emit time_clicked from the view — don't rely on scene receiving it
-            scene = self.scene()
+            # Clear any existing selection first
+            if scene:
+                scene.clear_selection()
+
+            self._range_selecting = True
+            self._range_dragging  = False
+            self._left_press_pos  = event.pos()
+            self.last_pan_point   = event.pos()
+
             if scene and hasattr(scene, 'pixels_per_second'):
                 scene_pos = self.mapToScene(event.pos())
-                time = scene_pos.x() / scene.pixels_per_second
-                scene.time_clicked.emit(time)
-                if event.modifiers() & Qt.ControlModifier and hasattr(scene, 'add_to_edit_requested'):
-                    scene.add_to_edit_requested.emit(time)
-            
-            super().mousePressEvent(event)
+                t = scene_pos.x() / scene.pixels_per_second
+                self._range_start_time = t
+                # Also seek the video to the click point
+                scene.time_clicked.emit(t)
+
+            event.accept()
             return
-        
+
         super().mousePressEvent(event)
-    
+
     def mouseMoveEvent(self, event):
-        """Handle mouse movement — start panning only after drag threshold"""
+        scene = self.scene()
+
+        # ── Intent to drag the selection rect ────────────────────────
+        if self._range_dragging and not getattr(self, '_dnd_started', False):
+            # Wait until the cursor has moved past the drag threshold
+            press_pos = getattr(self, '_drag_press_pos', event.pos())
+            dist = (event.pos() - press_pos).manhattanLength()
+
+            if dist < QApplication.startDragDistance():
+                # Not moved enough yet — just update cursor
+                event.accept()
+                return
+
+            # ── Threshold crossed: fire the real QDrag ────────────────
+            # Mark as started so we don't fire twice
+            self._dnd_started = True
+
+            t0 = scene._selection_start_time if scene else None
+            t1 = scene._selection_end_time   if scene else None
+
+            if t0 is not None and t1 is not None:
+                self._start_range_dnd(min(t0, t1), max(t0, t1), event)
+                # drag.exec() is blocking — returns here when drop completes
+                # or is cancelled.  Clean up regardless of outcome.
+
+            self._range_dragging = False
+            self._dnd_started    = False
+            self.setCursor(QCursor(Qt.ArrowCursor))
+            if scene:
+                scene.clear_selection()
+
+            event.accept()
+            return
+
+        # ── Drawing the range selection rect ──────────────────────────
+        if self._range_selecting:
+            if scene and hasattr(self, '_range_start_time'):
+                scene_pos = self.mapToScene(event.pos())
+                current_t = scene_pos.x() / scene.pixels_per_second
+                scene.update_selection_rect(self._range_start_time, current_t)
+            event.accept()
+            return
+
+        # ── Panning ───────────────────────────────────────────────────
         if self.panning:
             delta = event.pos() - self.last_pan_point
             self.last_pan_point = event.pos()
-            
-            hbar = self.horizontalScrollBar()
-            vbar = self.verticalScrollBar()
-            hbar.setValue(hbar.value() - delta.x())
-            vbar.setValue(vbar.value() - delta.y())
-            
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y())
             event.accept()
             return
-        
-        # Left button held — check if we should start panning
+
+        # Threshold check: switch to pan if left held and moved far enough
         if event.buttons() & Qt.LeftButton and hasattr(self, '_left_press_pos'):
             if (event.pos() - self._left_press_pos).manhattanLength() > QApplication.startDragDistance():
-                self.panning = True
-                self.setCursor(QCursor(Qt.ClosedHandCursor))
+                if not self._range_selecting:
+                    self.panning = True
+                    self.setCursor(QCursor(Qt.ClosedHandCursor))
+                    event.accept()
+                    return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        scene = self.scene()
+
+        if event.button() == Qt.LeftButton:
+
+            # ── Release while in drag-intent state ────────────────────
+            # If the user pressed inside the selection but released
+            # without moving far enough to trigger DnD, just clear flags.
+            if self._range_dragging:
+                self._range_dragging = False
+                self._dnd_started    = False
+                self.setCursor(QCursor(Qt.ArrowCursor))
+                # Leave the selection rect visible — user can try again
                 event.accept()
                 return
-        
-        super().mouseMoveEvent(event)
-    
-    def mouseReleaseEvent(self, event):
-        """Handle mouse release"""
-        if event.button() == Qt.LeftButton:
+
+            # ── Release after drawing the range ───────────────────────
+            if self._range_selecting:
+                self._range_selecting = False
+                self.setCursor(QCursor(Qt.ArrowCursor))
+
+                if scene:
+                    result = scene.finalise_selection()
+                    if result:
+                        # Selection is now active — show hint in status bar
+                        # via the parent window
+                        t0, t1 = result
+                        duration = t1 - t0
+                        # Find parent SignalTimelineWindow and update status
+                        parent = self.parent()
+                        while parent and not hasattr(parent, 'statusBar'):
+                            parent = parent.parent()
+                        if parent and hasattr(parent, 'statusBar'):
+                            parent.statusBar().showMessage(
+                                f"Selected {duration:.2f}s  "
+                                f"({t0:.2f}s → {t1:.2f}s)  "
+                                "— drag selection into edit timeline to add",
+                                0
+                            )
+
+                if hasattr(self, '_left_press_pos'):
+                    del self._left_press_pos
+                event.accept()
+                return
+
+            # ── Normal left release ────────────────────────────────────
             if self.panning:
                 self.panning = False
                 self.setCursor(QCursor(Qt.ArrowCursor))
-            # Clean up press tracking
+
             if hasattr(self, '_left_press_pos'):
                 del self._left_press_pos
+
             event.accept()
             return
-        
-        # Reset drag mode if it was set
+
+        # Right / middle — reset scroll-hand drag
         if self.dragMode() == QGraphicsView.DragMode.ScrollHandDrag:
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
             if hasattr(self, '_follow_was_on'):
                 self.follow_playhead = self._follow_was_on
                 del self._follow_was_on
-        
+
         super().mouseReleaseEvent(event)
+
+    def _start_range_dnd(self, start_time: float, end_time: float, event):
+        """
+        Fire a QDrag with the same MIME format that DraggableTimelineBar uses,
+        so the existing EditTimelineScene.dropEvent handles it transparently.
+        """
+        import json
+
+        mime_data = QMimeData()
+        bar_data = {
+            'type':       'timeline_bar',
+            'start_time': start_time,
+            'end_time':   end_time,
+            'duration':   end_time - start_time,
+            'label':      f"Range {start_time:.2f}s–{end_time:.2f}s",
+            'metadata':   {'source': 'range_selection'}
+        }
+        mime_data.setText(json.dumps(bar_data))
+
+        drag = QDrag(self.viewport())
+        drag.setMimeData(mime_data)
+
+        # Build a small pixmap that looks like a clip chip
+        pps = self.scene().pixels_per_second if self.scene() else 50
+        chip_w = min(200, max(60, int((end_time - start_time) * pps)))
+        chip_h = 30
+
+        pixmap = QPixmap(chip_w, chip_h)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Gradient fill — same blue as the selection rect
+        grad = QLinearGradient(0, 0, 0, chip_h)
+        grad.setColorAt(0, QColor(120, 200, 255, 220))
+        grad.setColorAt(1, QColor(60,  140, 220, 220))
+        painter.setBrush(QBrush(grad))
+        painter.setPen(QPen(QColor(100, 220, 255), 1.5))
+        painter.drawRoundedRect(1, 1, chip_w - 2, chip_h - 2, 4, 4)
+
+        # Duration label
+        painter.setPen(QPen(Qt.white))
+        painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        painter.drawText(
+            pixmap.rect(),
+            Qt.AlignCenter,
+            f"{end_time - start_time:.2f}s"
+        )
+        painter.end()
+
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(QPoint(chip_w // 2, chip_h // 2))
+
+        # exec_ is blocking — returns when drop completes or is cancelled
+        drag.exec(Qt.CopyAction)
