@@ -1265,6 +1265,9 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_scene.clip_added.connect(self.on_clip_added)
         self.edit_scene.clip_removed.connect(self.on_clip_removed)
         self.edit_scene.time_clicked.connect(self.on_edit_time_clicked)
+        self.edit_scene.clip_cut.connect(self.on_clip_cut)
+        self.edit_scene.clip_trimmed.connect(self.on_clip_trimmed)
+
         
         edit_layout.addWidget(QLabel("Edit Timeline (Select clips and press Delete)"))
         edit_layout.addWidget(self.edit_view)
@@ -1520,24 +1523,30 @@ class SignalTimelineWindow(QMainWindow):
         return annotated
 
     def eventFilter(self, obj, event):
-        """Global event filter for handling delete and spacebar"""
+        """Global event filter for handling delete, spacebar, and cut mode exit"""
         if event.type() == event.Type.KeyPress:
+
+            # Escape: exit cut mode
+            if event.key() == Qt.Key_Escape:
+                if hasattr(self, 'cut_mode_btn') and self.cut_mode_btn.isChecked():
+                    self.cut_mode_btn.setChecked(False)  # triggers toggle_cut_mode(False)
+                    return True
+
             if event.key() == Qt.Key_Space:
-                # If edit timeline is actively playing, toggle that
                 if hasattr(self, '_edit_playlist') and self._edit_playlist:
                     self.toggle_edit_playback()
                 else:
-                    # Otherwise toggle normal video playback
                     self.toggle_video_playback()
                 return True
+
             if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
-                if (obj == self or 
+                if (obj == self or
                     (hasattr(self, 'edit_view') and self.edit_view.hasFocus()) or
                     (hasattr(self, 'edit_scene') and len(self.edit_scene.selectedItems()) > 0)):
                     if hasattr(self, 'edit_scene'):
                         self.edit_scene.remove_selected_clips()
                         return True
-        
+
         return super().eventFilter(obj, event)
     
     def create_info_bar(self):
@@ -1681,6 +1690,47 @@ class SignalTimelineWindow(QMainWindow):
         self.remove_clips_btn = QPushButton("🗑️ Delete Selected Clips")
         self.remove_clips_btn.clicked.connect(self.on_remove_clips_clicked)
         
+        # Add clip button
+        self.add_clip_btn = QPushButton("➕ Add Clip at Current Time")
+        self.add_clip_btn.clicked.connect(self.on_add_clip_clicked)
+
+        # Remove selected clips button
+        self.remove_clips_btn = QPushButton("🗑️ Delete Selected Clips")
+        self.remove_clips_btn.clicked.connect(self.on_remove_clips_clicked)
+
+        # Cut Mode toggle
+        self.cut_mode_btn = QPushButton("✂️  Cut Mode")
+        self.cut_mode_btn.setCheckable(True)
+        self.cut_mode_btn.setToolTip(
+            "Cut Mode ON:\n"
+            "  • Left-click on a clip to cut it at that point\n"
+            "  • Right-click for trim / cut menu\n"
+            "  • Press C while hovering to cut at cursor\n\n"
+            "Cut Mode OFF: normal drag/select behaviour"
+        )
+        self.cut_mode_btn.toggled.connect(self.toggle_cut_mode)
+        self.cut_mode_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2a2a44;
+                color: #d0d8ff;
+                font-weight: bold;
+                padding: 8px 12px;
+                border: 1px solid #4a4a6a;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #3a3a5c;
+            }
+            QPushButton:checked {
+                background-color: #7a2a1a;
+                border: 2px solid #ff6040;
+                color: #ffccaa;
+            }
+            QPushButton:checked:hover {
+                background-color: #8a3a2a;
+            }
+        """)
+
         # Save to cache button - ADD THIS
         self.save_cache_btn = QPushButton("💾 Save to Cache")
         self.save_cache_btn.clicked.connect(self.on_save_cache_clicked)
@@ -1696,6 +1746,7 @@ class SignalTimelineWindow(QMainWindow):
         
         layout.addWidget(self.add_clip_btn)
         layout.addWidget(self.remove_clips_btn)
+        layout.addWidget(self.cut_mode_btn)
         layout.addWidget(self.save_cache_btn)
         layout.addWidget(self.export_btn)
         
@@ -2150,6 +2201,67 @@ class SignalTimelineWindow(QMainWindow):
         
         # Start or restart the timer
         self.removal_timer.start(100)  # 100ms delay
+
+    def toggle_cut_mode(self, active: bool):
+        """
+        Enable or disable cut mode on the edit timeline.
+
+        While cut mode is active:
+          - The edit view shows a CrossCursor
+          - Left-clicking a clip cuts it at the click position
+          - A red dashed line follows the mouse on clips
+          - The C key cuts at the current hover position
+        """
+        if not hasattr(self, 'edit_scene'):
+            return
+
+        self.edit_scene.cut_mode = active
+
+        if active:
+            self.edit_view.setCursor(QCursor(Qt.CrossCursor))
+            self.statusBar().showMessage(
+                "✂️  Cut Mode ON — left-click a clip to cut it  |  C key = cut at cursor  |  right-click for trim menu",
+                0  # 0 = stays until next message
+            )
+        else:
+            self.edit_view.setCursor(QCursor(Qt.ArrowCursor))
+            # Make sure no stale indicator line remains
+            self.edit_scene._hide_cut_indicator()
+            self.statusBar().showMessage("Cut Mode OFF", 3000)
+
+    @Slot(float)
+    def on_clip_cut(self, cut_time: float):
+        """
+        Called after a successful cut.  Updates duration display and
+        shows a status bar message with the cut timestamp.
+        """
+        self.update_edit_duration()
+
+        minutes = int(cut_time // 60)
+        seconds = cut_time % 60
+        self.statusBar().showMessage(
+            f"✂️  Cut at {minutes:02d}:{seconds:05.2f}  —  "
+            f"{len(self.edit_scene.clips)} clips in timeline",
+            4000
+        )
+
+    @Slot(int)
+    def on_clip_trimmed(self, clip_index: int):
+        """
+        Called after a trim operation.  Updates duration display and
+        shows a brief status bar message.
+        """
+        self.update_edit_duration()
+
+        if 0 <= clip_index < len(self.edit_scene.clips):
+            start, end = self.edit_scene.clips[clip_index]
+            duration = end - start
+            self.statusBar().showMessage(
+                f"Trimmed clip {clip_index + 1}  →  {start:.2f}s – {end:.2f}s  ({duration:.1f}s)",
+                3000
+            )
+        else:
+            self.statusBar().showMessage("Clip trimmed", 2000)
 
     def process_pending_removals(self):
         """Process multiple clip removals at once"""

@@ -63,31 +63,43 @@ class EditClipItem(QGraphicsRectItem):
             self.setPen(QPen(self.color.darker(150), 1))
     
     def mousePressEvent(self, event):
-        """Handle mouse press for dragging + seeking"""
+        """Handle mouse press — cut mode takes priority over drag/seek."""
+        scene = self.scene()
+
+        # 1. Cut mode: left-click cuts immediately
+        if (event.button() == Qt.LeftButton
+                and scene is not None
+                and getattr(scene, 'cut_mode', False)):
+            local_x = event.pos().x()
+            width = self.rect().width()
+            progress = max(0.0, min(1.0, local_x / width)) if width > 0 else 0.5
+            cut_time = self.start_time + progress * (self.end_time - self.start_time)
+            scene.cut_clip_at(cut_time)
+            event.accept()
+            return
+
+        # 2. Normal left-click: select + seek
         if event.button() == Qt.LeftButton:
             # Clear other selections if shift/ctrl not pressed
             if not (event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier)):
-                scene = self.scene()
                 if scene:
                     for item in scene.selectedItems():
                         if item != self:
                             item.setSelected(False)
-            
-            # Set this item as selected
+
             self.setSelected(True)
             self.original_pos = self.pos()
             self.setCursor(QCursor(Qt.ClosedHandCursor))
-            
-            # Calculate source time from click position within clip
+
+            # Seek to the source time at the click position
             local_x = event.pos().x()
             width = self.rect().width()
             if width > 0:
                 progress = max(0.0, min(1.0, local_x / width))
                 source_time = self.start_time + progress * (self.end_time - self.start_time)
-                scene = self.scene()
                 if scene and hasattr(scene, 'time_clicked'):
                     scene.time_clicked.emit(source_time)
-        
+
         super().mousePressEvent(event)
     
     def mouseReleaseEvent(self, event):
@@ -139,6 +151,152 @@ class EditClipItem(QGraphicsRectItem):
         self.setToolTip(f"Clip {self.index}\n{self.start_time:.1f}s - {self.end_time:.1f}s\nDuration: {duration:.1f}s\nDrag to reorder\nDouble-click to play")
         super().hoverEnterEvent(event)
 
+        def contextMenuEvent(self, event):
+            """
+            Right-click context menu for a clip.
+            Provides:
+            - Cut here        (at the exact pixel the user right-clicked)
+            - Trim start      (move in-point to click position)
+            - Trim end        (move out-point to click position)
+            - Delete clip
+            """
+            scene = self.scene()
+            if not scene:
+                return
+
+            # ── Calculate source time at click position ────────────────────
+            local_x = event.pos().x()
+            width = self.rect().width()
+            progress = max(0.0, min(1.0, local_x / width)) if width > 0 else 0.5
+            click_time = self.start_time + progress * (self.end_time - self.start_time)
+            duration = self.end_time - self.start_time
+
+            # ── Build menu ─────────────────────────────────────────────────
+            menu = QMenu()
+            menu.setStyleSheet("""
+                QMenu {
+                    background-color: #1a1a2a;
+                    color: #d0d8ff;
+                    border: 1px solid #3a3a5a;
+                    border-radius: 4px;
+                    padding: 4px 0;
+                }
+                QMenu::item { padding: 6px 20px; border-radius: 3px; }
+                QMenu::item:selected { background-color: #3a5fcd; }
+                QMenu::item:disabled { color: #555577; }
+                QMenu::separator { height: 1px; background: #3a3a5a; margin: 4px 8px; }
+            """)
+
+            # Non-clickable header showing clip info
+            header = menu.addAction(
+                f"Clip {self.index}   {self.start_time:.2f}s → {self.end_time:.2f}s  ({duration:.1f}s)"
+            )
+            header.setEnabled(False)
+            menu.addSeparator()
+
+            # ── Cut action ─────────────────────────────────────────────────
+            cut_action = menu.addAction(f"✂️   Cut here  ({click_time:.2f}s)")
+
+            # Disable if click is within 0.2 s of either edge
+            too_close = (
+                click_time - self.start_time < 0.2
+                or self.end_time - click_time < 0.2
+            )
+            cut_action.setEnabled(not too_close)
+            if too_close:
+                cut_action.setToolTip("Click closer to the centre of the clip")
+
+            # ── Trim actions ───────────────────────────────────────────────
+            trim_start_action = menu.addAction(
+                f"⬅️   Trim start  →  {click_time:.2f}s"
+            )
+            trim_end_action = menu.addAction(
+                f"➡️   Trim end  ←  {click_time:.2f}s"
+            )
+
+            # Disable trim-start if click is already past or at current start
+            trim_start_action.setEnabled(click_time > self.start_time + 0.2)
+            # Disable trim-end if click is already before or at current end
+            trim_end_action.setEnabled(click_time < self.end_time - 0.2)
+
+            menu.addSeparator()
+
+            # ── Delete action ──────────────────────────────────────────────
+            delete_action = menu.addAction("🗑️   Delete clip")
+
+            # ── Execute menu ───────────────────────────────────────────────
+            chosen = menu.exec(event.screenPos())
+
+            if chosen == cut_action:
+                scene.cut_clip_at(click_time)
+
+            elif chosen == trim_start_action:
+                # Find this clip's index in the scene
+                if self in scene.clip_items:
+                    idx = scene.clip_items.index(self)
+                    scene.trim_clip_start(idx, click_time)
+
+            elif chosen == trim_end_action:
+                if self in scene.clip_items:
+                    idx = scene.clip_items.index(self)
+                    scene.trim_clip_end(idx, click_time)
+
+            elif chosen == delete_action:
+                if self in scene.clip_items:
+                    idx = scene.clip_items.index(self)
+                    scene.clips.pop(idx)
+                    scene.clip_items.pop(idx)
+                    scene.removeItem(self)
+                    scene.build_timeline()
+                    scene.clip_removed.emit(idx)
+
+    def hoverMoveEvent(self, event):
+        """
+        Track the source-time under the cursor for the C key shortcut,
+        and update the cut indicator line when in cut mode.
+        """
+        scene = self.scene()
+        if scene is not None:
+            local_x = event.pos().x()
+            width = self.rect().width()
+            progress = max(0.0, min(1.0, local_x / width)) if width > 0 else 0.5
+            source_time = self.start_time + progress * (self.end_time - self.start_time)
+
+            # Always keep scene informed of hover time (used by C key)
+            scene._hover_source_time = source_time
+
+            # Show cut indicator only while in cut mode
+            if getattr(scene, 'cut_mode', False):
+                item_pos = self.pos()
+                scene._update_cut_indicator(
+                    item_pos.x() + local_x,   # scene x
+                    item_pos.y(),              # scene y (top of clip)
+                    self.rect().height()       # clip height
+                )
+
+                # Change cursor to scissors-style cross
+                self.setCursor(QCursor(Qt.CrossCursor))
+            else:
+                self.setCursor(QCursor(Qt.OpenHandCursor))
+
+        super().hoverMoveEvent(event)
+
+    def hoverLeaveEvent(self, event):
+        """
+        Hide the cut indicator when the mouse leaves this clip.
+        Also restores tooltip text set by the original hoverEnterEvent.
+        """
+        scene = self.scene()
+        if scene is not None:
+            scene._hide_cut_indicator()
+            scene._hover_source_time = None
+
+        # Restore normal cursor
+        self.setCursor(QCursor(Qt.OpenHandCursor))
+
+        super().hoverLeaveEvent(event)
+
+
 class EditTimelineScene(QGraphicsScene):
     """Simple timeline showing clips as colored rectangles"""
     
@@ -146,6 +304,8 @@ class EditTimelineScene(QGraphicsScene):
     clip_added = Signal(float, float)  # start, end
     clip_removed = Signal(int)  # index
     time_clicked = Signal(float)  # source video time
+    clip_cut = Signal(float)      # emits the cut time after a successful cut
+    clip_trimmed = Signal(int)    # emits clip index after a trim
     
     def __init__(self, video_path, video_duration, parent=None, cache=None):  # ADD cache parameter
         super().__init__(parent)
@@ -167,10 +327,16 @@ class EditTimelineScene(QGraphicsScene):
         # Load initial highlights if available
         self.load_initial_clips()
         
-        self.active_clip_index = -1  # Currently playing clip (-1 = none)
-        self.active_progress = 0.0   # 0.0 to 1.0 within active clip
+        self.active_clip_index = -1
+        self.active_progress = 0.0
         self._active_overlay = None
         self._progress_line = None
+
+        # Cut mode state
+        self.cut_mode = False           # when True, left-click cuts a clip
+        self._cut_line = None           # the red dashed indicator line
+        self._hover_source_time = None  # updated by EditClipItem.hoverMoveEvent
+
         self.setSceneRect(0, 0, 1000, self.clip_height + 40)
         self.build_timeline()
 
@@ -303,10 +469,20 @@ class EditTimelineScene(QGraphicsScene):
             return False
 
     def keyPressEvent(self, event):
-        """Handle key presses for deleting clips"""
+        """Handle key presses for deleting and cutting clips"""
         if event.key() == Qt.Key_Delete or event.key() == Qt.Key_Backspace:
             self.remove_selected_clips()
             event.accept()
+
+        elif event.key() == Qt.Key_C:
+            # Cut at the last known hover position
+            if self._hover_source_time is not None:
+                success = self.cut_clip_at(self._hover_source_time)
+                if not success:
+                    # Optionally surface this to the parent window status bar
+                    pass
+            event.accept()
+
         else:
             super().keyPressEvent(event)
     
@@ -796,3 +972,93 @@ class EditTimelineScene(QGraphicsScene):
             
             # Rebuild timeline
             self.build_timeline()
+
+        # ──────────────────────────────────────────────────────────────────────
+    # CUT / TRIM OPERATIONS
+    # ──────────────────────────────────────────────────────────────────────
+
+    def cut_clip_at(self, source_time):
+        """
+        Split whichever clip contains source_time into two clips.
+
+        Rules:
+        - source_time must be at least 0.2 s from both edges to avoid
+          creating clips that are too small to be useful.
+        - Returns True if a cut was made, False otherwise.
+        """
+        MIN_SIDE = 0.2  # minimum seconds on each side of the cut
+
+        for i, (start, end) in enumerate(self.clips):
+            if start + MIN_SIDE < source_time < end - MIN_SIDE:
+                # Replace the original clip with two halves
+                self.clips[i] = (start, source_time)
+                self.clips.insert(i + 1, (source_time, end))
+                self.build_timeline()
+                self.clip_cut.emit(source_time)
+                return True
+
+        return False  # source_time is not inside any clip
+
+    def trim_clip_start(self, clip_index, new_start):
+        """
+        Move the in-point (left edge) of a clip to new_start.
+
+        new_start is clamped so the clip keeps a minimum duration of 0.5 s.
+        """
+        MIN_DURATION = 0.5
+
+        if not (0 <= clip_index < len(self.clips)):
+            return
+
+        start, end = self.clips[clip_index]
+        # Clamp: can't go further right than (end - MIN_DURATION)
+        new_start = max(start, min(new_start, end - MIN_DURATION))
+        self.clips[clip_index] = (new_start, end)
+        self.build_timeline()
+        self.clip_trimmed.emit(clip_index)
+
+    def trim_clip_end(self, clip_index, new_end):
+        """
+        Move the out-point (right edge) of a clip to new_end.
+
+        new_end is clamped so the clip keeps a minimum duration of 0.5 s.
+        """
+        MIN_DURATION = 0.5
+
+        if not (0 <= clip_index < len(self.clips)):
+            return
+
+        start, end = self.clips[clip_index]
+        # Clamp: can't go further left than (start + MIN_DURATION)
+        new_end = min(end, max(new_end, start + MIN_DURATION))
+        self.clips[clip_index] = (start, new_end)
+        self.build_timeline()
+        self.clip_trimmed.emit(clip_index)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # CUT INDICATOR (the red dashed line that follows the mouse in cut mode)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _update_cut_indicator(self, x, y, height):
+        """
+        Draw or reposition the dashed red vertical line that previews
+        where the cut will happen.  Called by EditClipItem.hoverMoveEvent.
+        """
+        if self._cut_line is not None and self._cut_line in self.items():
+            # Just move the existing line — no remove/add overhead
+            self._cut_line.setLine(x, y, x, y + height)
+        else:
+            self._cut_line = self.addLine(
+                x, y, x, y + height,
+                QPen(QColor(255, 80, 80, 220), 2, Qt.DashLine)
+            )
+            self._cut_line.setZValue(50)  # above clips but below active overlay
+
+    def _hide_cut_indicator(self):
+        """Remove the cut indicator line.  Called when mouse leaves a clip."""
+        if self._cut_line is not None and self._cut_line in self.items():
+            try:
+                self.removeItem(self._cut_line)
+            except RuntimeError:
+                pass  # item already removed (e.g. after build_timeline)
+        self._cut_line = None
