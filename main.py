@@ -2959,9 +2959,13 @@ class VideoHighlighterGUI(QWidget):
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    multiprocessing.set_start_method("spawn", force=True)  # Explicit on Mac
-    reset_duration_method_cache()             # Only runs in the real main process
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass
+    reset_duration_method_cache()
     app = QApplication(sys.argv)
     gui = VideoHighlighterGUI()
     gui.show()
     sys.exit(app.exec())
+
