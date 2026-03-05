@@ -3,7 +3,8 @@ Intel Model Components
 =======================
 
 - IntelFeatureExtractor: OpenVINO encoder wrapper
-- EncoderLSTM: 2-layer bidirectional LSTM with attention
+- EncoderMLP:  Feedforward decoder — static shapes → compiles on OpenVINO GPU ✓  (default)
+- EncoderLSTM: Bidirectional LSTM with attention — dynamic shapes → CPU-only at inference ✗ (legacy)
 """
 
 import numpy as np
@@ -76,18 +77,88 @@ class IntelFeatureExtractor:
 
 
 # =============================
-# Encoder LSTM
+# EncoderMLP  ← DEFAULT DECODER
+# =============================
+class EncoderMLP(nn.Module):
+    """
+    Feedforward classifier over a flattened feature sequence.
+
+    Input:  (B, T, feat_dim)
+    Output: logits (B, num_classes),  attn=None  (same return signature as EncoderLSTM)
+
+    Why this instead of LSTM
+    ------------------------
+    LSTM → LSTMSequence ops with dynamic shapes in OpenVINO IR
+         → GPU plugin rejects it → falls back to CPU at inference
+
+    MLP  → only Linear + BatchNorm + ReLU + Dropout → fully static shapes
+         → compiles on OpenVINO GPU with no issues
+    """
+
+    def __init__(self, feature_dim=512, hidden_dim=256, num_classes=31,
+                 sequence_length=16, dropout=0.3, **kwargs):
+        super().__init__()
+        self.feature_dim     = feature_dim
+        self.hidden_dim      = hidden_dim
+        self.num_classes     = num_classes
+        self.sequence_length = sequence_length
+
+        flat_dim = sequence_length * feature_dim
+
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flat_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout / 2),
+            nn.Linear(hidden_dim // 2, num_classes),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.fill_(0.01)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, feat_dim)
+        Returns:
+            logits: (B, num_classes)
+            None:   placeholder — keeps the same return signature as EncoderLSTM
+        """
+        return self.net(x), None
+
+
+# =============================
+# EncoderLSTM  ← LEGACY (CPU-only at inference)
 # =============================
 class EncoderLSTM(nn.Module):
     """
     2-layer bidirectional LSTM with attention for action classification.
+
+    ⚠️  OpenVINO GPU plugin does NOT support LSTMSequence ops with dynamic
+        shapes. Models trained with this decoder will silently fall back to
+        CPU at inference time. Use EncoderMLP instead for GPU inference.
+
+    Kept here for:
+      - loading old checkpoints
+      - CPU-only deployments where LSTM accuracy matters
 
     Architecture:
         encoder features → BiLSTM(2) → LayerNorm → Attention → Classifier
     """
 
     def __init__(self, feature_dim=512, hidden_dim=256, num_classes=31,
-                 num_layers=2, dropout=0.3):
+                 num_layers=2, dropout=0.3, **kwargs):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -123,7 +194,6 @@ class EncoderLSTM(nn.Module):
 
         self._init_weights()
 
-    # ------------------------------------------------------------------
     def _init_weights(self):
         for name, param in self.lstm.named_parameters():
             if "weight_ih" in name:
@@ -142,7 +212,6 @@ class EncoderLSTM(nn.Module):
                     if m.bias is not None:
                         m.bias.data.fill_(0.01)
 
-    # ------------------------------------------------------------------
     def forward(self, x):
         """
         Args:
@@ -162,3 +231,42 @@ class EncoderLSTM(nn.Module):
 
         logits = self.classifier(context)
         return logits, attn_w.squeeze(-1)
+
+
+# =============================
+# Factory
+# =============================
+def build_decoder(decoder_type, feature_dim, hidden_dim, num_classes,
+                  sequence_length=16, num_layers=2, dropout=0.3):
+    """
+    Build a decoder by name.
+
+    Args:
+        decoder_type: "mlp" (default, GPU-compatible) or "lstm" (CPU-only at inference)
+    """
+    decoder_type = decoder_type.lower()
+
+    if decoder_type == "mlp":
+        model = EncoderMLP(
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            sequence_length=sequence_length,
+            dropout=dropout,
+        )
+        print(f"✅ Decoder: EncoderMLP (GPU-compatible at inference)")
+    elif decoder_type == "lstm":
+        model = EncoderLSTM(
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            num_classes=num_classes,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        print(f"⚠️  Decoder: EncoderLSTM (will fall back to CPU at inference — consider 'mlp')")
+    else:
+        raise ValueError(f"Unknown decoder_type '{decoder_type}'. Use 'mlp' or 'lstm'.")
+
+    total = sum(p.numel() for p in model.parameters())
+    print(f"   Parameters: {total:,}")
+    return model

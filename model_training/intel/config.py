@@ -2,8 +2,12 @@
 Intel Training Configuration
 ==============================
 
-Frozen OpenVINO encoder → trainable LSTM decoder.
+Frozen OpenVINO encoder → trainable decoder.
 Input: 224×224, ImageNet normalization.
+
+decoder_type options:
+    "mlp"  → EncoderMLP   (default) — static shapes, compiles on OpenVINO GPU ✓
+    "lstm" → EncoderLSTM  (legacy)  — dynamic shapes, CPU-only at inference  ✗
 """
 
 import os
@@ -26,6 +30,14 @@ CONFIG = {
     "mean": [0.485, 0.456, 0.406],      # ImageNet
     "std": [0.229, 0.224, 0.225],
 
+    # --- decoder architecture ---
+    # "mlp"  → GPU-compatible at inference (recommended)
+    # "lstm" → CPU-only at inference (legacy)
+    "decoder_type": "mlp",
+    "hidden_dim": 256,
+    "num_layers": 2,       # only used by lstm
+    "dropout": 0.3,
+
     # --- training ---
     "batch_size": 2,
     "base_epochs": 25,
@@ -37,11 +49,6 @@ CONFIG = {
     "use_class_weights": True,
     "augmentation_prob": 0.3,
     "device": "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu",
-
-    # --- LSTM architecture ---
-    "hidden_dim": 256,
-    "num_layers": 2,
-    "dropout": 0.3,
 
     # --- checkpointing ---
     "save_checkpoint_every": 5,
