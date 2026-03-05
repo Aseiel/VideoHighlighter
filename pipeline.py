@@ -568,6 +568,15 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         duration_mode = "EXACT" if EXACT_DURATION else "MAX"
         log(f"🎯 Mode: {duration_mode} duration of {target_duration} seconds ({target_duration/60:.1f} minutes)")
 
+        # ── Hard gate: actions require objects but no objects configured ─────────────
+        actions_require_objects = gui_config.get("actions_require_objects", False)
+        highlight_objects_check = gui_config.get("highlight_objects", config.get("highlight_objects", []))
+        if actions_require_objects and not highlight_objects_check:
+            log("❌ 'Score actions only if objects detected' is enabled, but no objects are configured. "
+                "Please add objects to detect, or uncheck that option.")
+            return None
+        # ────────────────────────────────────────────────────────────────────────────
+
         if not os.path.isfile(video_path):
             raise FileNotFoundError(f"Input video not found at path: {video_path}")
 
@@ -1445,7 +1454,41 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 for sec in range(start_sec, end_sec + 1):
                     keyword_set.add(sec)
 
-        
+        # Get the require_objects flag (needed for sanity warnings below)
+        actions_require_objects = gui_config.get("actions_require_objects", False)
+        OBJECT_TOLERANCE = 10
+        BASE_ACTION_POINTS = ACTION_POINTS
+
+        # ── Scoring sanity warnings ──────────────────────────────────────────────────
+        if OBJECT_POINTS > 0 and highlight_objects and not object_detections:
+            log("⚠️ WARNING: object_points > 0 and objects were configured, "
+                "but no objects were detected in the video. Object scoring will contribute nothing.")
+
+        if ACTION_POINTS > 0 and not interesting_actions:
+            log("⚠️ WARNING: action_points > 0 but no interesting actions are configured. "
+                "Action scoring will contribute nothing — set action_points to 0 or add actions to detect.")
+
+        if KEYWORD_POINTS > 0 and not SEARCH_KEYWORDS:
+            log("⚠️ WARNING: keyword_points > 0 but no search keywords are configured. "
+                "Keyword scoring will contribute nothing.")
+
+        if KEYWORD_POINTS > 0 and SEARCH_KEYWORDS and not keyword_matches:
+            log("⚠️ WARNING: keyword_points > 0 and keywords were configured, "
+                "but no keyword matches were found in the transcript.")
+
+        if actions_require_objects and not highlight_objects:
+            log("⚠️ WARNING: 'Score actions only if objects detected' is enabled, "
+                "but no objects are configured to detect. Actions will NEVER be scored. "
+                "Either add objects to detect, or uncheck 'Score actions only if objects detected'.")
+
+        # Check if total possible score is zero (highlight will be empty in MAX mode)
+        total_possible = (SCENE_POINTS + MOTION_PEAK_POINTS + MOTION_EVENT_POINTS +
+                        AUDIO_PEAK_POINTS + KEYWORD_POINTS + BEGINNING_POINTS +
+                        ENDING_POINTS + OBJECT_POINTS + ACTION_POINTS)
+        if total_possible == 0:
+            log("⚠️ WARNING: All scoring signals are set to 0. No moments will be scored and "
+                "no highlight will be generated in MAX mode. Enable at least one scoring signal.")
+
         # Fill scores using the detected signals
         for start, end in scenes:
             idx = int(round(start))
@@ -1486,11 +1529,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             sec = int(timestamp_secs)
             detections_by_sec[sec].append((action_name, sc))
 
-        # Get the require_objects flag
-        actions_require_objects = gui_config.get("actions_require_objects", False)
-        OBJECT_TOLERANCE = 10
-        BASE_ACTION_POINTS = ACTION_POINTS
-
         # Calculate confidence percentiles PER ACTION TYPE
         action_type_confidences = defaultdict(list)
         for sec, actions in detections_by_sec.items():
@@ -1508,30 +1546,33 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log(f"📊 {action_name} confidence stats: 50th={action_type_percentiles[action_name]['50th']:.2f}, 90th={action_type_percentiles[action_name]['90th']:.2f}")
 
         # Now score each second with action-type-specific percentiles
-        for sec, actions in detections_by_sec.items():
-            if sec < len(action_score):
-                if not actions_require_objects or any(abs(obj_sec - sec) <= OBJECT_TOLERANCE for obj_sec in object_detections):
-                    # Find the HIGHEST confidence action in this second
-                    max_confidence = 0
-                    best_action_name = None
-                    
-                    for action_name, confidence in actions:
-                        if confidence > max_confidence:
-                            max_confidence = confidence
-                            best_action_name = action_name
-                    
-                    # Score ONLY ONCE per second using the best action
-                    if best_action_name and max_confidence > 0:
-                        percentiles = action_type_percentiles.get(best_action_name, {})
-                        confidence_90th = percentiles.get('90th', 0)
-                        confidence_50th = percentiles.get('50th', 0)
+        if actions_require_objects and not highlight_objects:
+            log("⚠️ Skipping action scoring — 'require objects' is ON but no objects configured.")
+        else:
+            for sec, actions in detections_by_sec.items():
+                if sec < len(action_score):
+                    if not actions_require_objects or any(abs(obj_sec - sec) <= OBJECT_TOLERANCE for obj_sec in object_detections):
+                        # Find the HIGHEST confidence action in this second
+                        max_confidence = 0
+                        best_action_name = None
                         
-                        if max_confidence >= confidence_90th:
-                            action_score[sec] += ACTION_POINTS * 1.5
-                        elif max_confidence >= confidence_50th:
-                            action_score[sec] += ACTION_POINTS
-                        else:
-                            action_score[sec] += ACTION_POINTS * 0.5
+                        for action_name, confidence in actions:
+                            if confidence > max_confidence:
+                                max_confidence = confidence
+                                best_action_name = action_name
+                        
+                        # Score ONLY ONCE per second using the best action
+                        if best_action_name and max_confidence > 0:
+                            percentiles = action_type_percentiles.get(best_action_name, {})
+                            confidence_90th = percentiles.get('90th', 0)
+                            confidence_50th = percentiles.get('50th', 0)
+                            
+                            if max_confidence >= confidence_90th:
+                                action_score[sec] += ACTION_POINTS * 1.5
+                            elif max_confidence >= confidence_50th:
+                                action_score[sec] += ACTION_POINTS
+                            else:
+                                action_score[sec] += ACTION_POINTS * 0.5
 
         log(f"✅ Object detection summary: {total_detections} detections")
 
