@@ -2,7 +2,11 @@
 Intel Training Script
 ======================
 
-Frozen OpenVINO encoder (CPU) → trainable LSTM decoder (Intel GPU).
+Frozen OpenVINO encoder (CPU) → trainable decoder (Intel GPU / CUDA / CPU).
+
+Decoder types (set via CONFIG["decoder_type"]):
+    "mlp"  → EncoderMLP   (default) — GPU-compatible at inference ✓
+    "lstm" → EncoderLSTM  (legacy)  — falls back to CPU at inference ✗
 
 Feature caching (default): Encodes all clips ONCE with OpenVINO, saves
 to disk, then every epoch loads cached tensors at GPU speed.
@@ -21,6 +25,7 @@ Usage (run from project root, e.g. D:\\movie_highlighter):
     python -m model_training.intel.train --no-feature-cache
     python -m model_training.intel.train --rebuild-feature-cache
     python -m model_training.intel.train --force-cpu
+    python -m model_training.intel.train --decoder lstm   # legacy LSTM (CPU-only at inference)
 
 Options:
     --data-path              Path to dataset folder (default: dataset/)
@@ -28,6 +33,7 @@ Options:
     --batch-size             Batch size (default: 2)
     --lr                     Learning rate (default: 1e-4)
     --resume                 Resume from checkpoint path
+    --decoder                Decoder type: mlp (default) or lstm
     --no-viz                 Skip sample visualizations before training
     --viz                    Create sample visualizations before training
     --no-cache               Disable ROI cache (slow — runs YOLO every epoch)
@@ -78,7 +84,7 @@ from model_training.shared.feature_cache import (
 
 # Intel-specific
 from model_training.intel.config import CONFIG
-from model_training.intel.model import IntelFeatureExtractor, EncoderLSTM
+from model_training.intel.model import IntelFeatureExtractor, build_decoder
 
 # =============================
 # Intel GPU Detection
@@ -188,22 +194,22 @@ def validate_live(encoder, model, val_loader, device, criterion, use_amp=False):
 # =============================
 def train_classifier_cached(train_loader, val_loader, feature_dim, num_classes,
                             label_to_idx, idx_to_label):
-    """Train LSTM from cached features — pure GPU, no encoder needed."""
+    """Train decoder from cached features — pure GPU, no encoder needed."""
     device = torch.device(CONFIG["device"])
     use_intel_gpu = device.type == 'xpu' and HAS_INTEL_GPU
 
-    print(f"Feature dimension: {feature_dim}")
+    decoder_type = CONFIG.get("decoder_type", "mlp")
+    print(f"\n🏗️  Building decoder: '{decoder_type}' | feature_dim={feature_dim}")
 
-    model = EncoderLSTM(
+    model = build_decoder(
+        decoder_type=decoder_type,
         feature_dim=feature_dim,
         hidden_dim=CONFIG.get("hidden_dim", 256),
         num_classes=num_classes,
+        sequence_length=CONFIG["sequence_length"],
         num_layers=CONFIG.get("num_layers", 2),
         dropout=CONFIG.get("dropout", 0.3),
     ).to(device)
-
-    total_p = sum(p.numel() for p in model.parameters())
-    print(f"📊 EncoderLSTM: {total_p:,} parameters")
 
     # Loss
     if CONFIG.get("use_class_weights", True):
@@ -317,20 +323,25 @@ def train_classifier_cached(train_loader, val_loader, feature_dim, num_classes,
                 model, optimizer, epoch, best_acc, label_to_idx, idx_to_label,
                 feature_dim, os.path.join(ckpt_dir, f"checkpoint_epoch_{epoch + 1}.pth"),
                 best_val_loss=best_loss,
-                extra={"sequence_length": CONFIG["sequence_length"]},
+                extra={
+                    "sequence_length": CONFIG["sequence_length"],
+                    "decoder_type": decoder_type,
+                },
             )
 
     if best_state:
         model.load_state_dict(best_state)
         print(f"\n✅ Best model loaded (loss={best_loss:.4f}, acc={best_acc:.4f})")
 
-    # Save full model
     wrapped = ActionRecognitionModel(
         model=model, label_to_idx=label_to_idx, idx_to_label=idx_to_label,
         feature_dim=feature_dim, sequence_length=CONFIG["sequence_length"],
-        model_type="EncoderLSTM",
-        extra_meta={"hidden_dim": CONFIG.get("hidden_dim", 256),
-                    "num_layers": CONFIG.get("num_layers", 2)},
+        model_type=f"Encoder{decoder_type.upper()}",
+        extra_meta={
+            "hidden_dim": CONFIG.get("hidden_dim", 256),
+            "num_layers": CONFIG.get("num_layers", 2),
+            "decoder_type": decoder_type,
+        },
     )
     wrapped.save(CONFIG["model_save_path"])
     return wrapped, use_amp
@@ -345,23 +356,24 @@ def train_classifier_live(encoder, train_loader, val_loader, num_classes,
     device = torch.device(CONFIG["device"])
     use_intel_gpu = device.type == 'xpu' and HAS_INTEL_GPU
 
-    # Discover feature dim
+    # Discover feature dim from a dummy encode pass
     with torch.no_grad():
         sample, _ = next(iter(train_loader))
         dummy = encoder.encode(sample[0:1].cpu())
         feature_dim = dummy.shape[-1]
-    print(f"Feature dimension: {feature_dim}")
 
-    model = EncoderLSTM(
+    decoder_type = CONFIG.get("decoder_type", "mlp")
+    print(f"\n🏗️  Building decoder: '{decoder_type}' | feature_dim={feature_dim}")
+
+    model = build_decoder(
+        decoder_type=decoder_type,
         feature_dim=feature_dim,
         hidden_dim=CONFIG.get("hidden_dim", 256),
         num_classes=num_classes,
+        sequence_length=CONFIG["sequence_length"],
         num_layers=CONFIG.get("num_layers", 2),
         dropout=CONFIG.get("dropout", 0.3),
     ).to(device)
-
-    total_p = sum(p.numel() for p in model.parameters())
-    print(f"📊 EncoderLSTM: {total_p:,} parameters")
 
     # Loss
     if CONFIG.get("use_class_weights", True):
@@ -478,7 +490,10 @@ def train_classifier_live(encoder, train_loader, val_loader, num_classes,
                 model, optimizer, epoch, best_acc, label_to_idx, idx_to_label,
                 feature_dim, os.path.join(ckpt_dir, f"checkpoint_epoch_{epoch + 1}.pth"),
                 best_val_loss=best_loss,
-                extra={"sequence_length": CONFIG["sequence_length"]},
+                extra={
+                    "sequence_length": CONFIG["sequence_length"],
+                    "decoder_type": decoder_type,
+                },
             )
 
     if best_state:
@@ -488,9 +503,12 @@ def train_classifier_live(encoder, train_loader, val_loader, num_classes,
     wrapped = ActionRecognitionModel(
         model=model, label_to_idx=label_to_idx, idx_to_label=idx_to_label,
         feature_dim=feature_dim, sequence_length=CONFIG["sequence_length"],
-        model_type="EncoderLSTM",
-        extra_meta={"hidden_dim": CONFIG.get("hidden_dim", 256),
-                    "num_layers": CONFIG.get("num_layers", 2)},
+        model_type=f"Encoder{decoder_type.upper()}",
+        extra_meta={
+            "hidden_dim": CONFIG.get("hidden_dim", 256),
+            "num_layers": CONFIG.get("num_layers", 2),
+            "decoder_type": decoder_type,
+        },
     )
     wrapped.save(CONFIG["model_save_path"])
     return wrapped, use_amp
@@ -500,12 +518,14 @@ def train_classifier_live(encoder, train_loader, val_loader, num_classes,
 # Main
 # =============================
 def main():
-    parser = argparse.ArgumentParser(description="Intel OpenVINO encoder → LSTM training")
+    parser = argparse.ArgumentParser(description="Intel OpenVINO encoder → decoder training")
     parser.add_argument("--data-path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--decoder", type=str, default=None, choices=["mlp", "lstm"],
+                        help="Decoder type: mlp (default, GPU-compatible) or lstm (CPU-only at inference)")
     parser.add_argument("--no-viz", action="store_true",
                         help="Skip sample visualizations before training")
     parser.add_argument("--viz", action="store_true",
@@ -535,6 +555,8 @@ def main():
         CONFIG["batch_size"] = args.batch_size
     if args.lr:
         CONFIG["base_learning_rate"] = args.lr
+    if args.decoder:
+        CONFIG["decoder_type"] = args.decoder
     if args.no_viz:
         CONFIG["create_visualizations"] = False
     if args.viz:
@@ -548,7 +570,7 @@ def main():
         print("🎯 Forced CPU training")
     elif HAS_INTEL_GPU:
         CONFIG["device"] = "xpu"
-        print("✅ LSTM will train on Intel GPU")
+        print("✅ Decoder will train on Intel GPU (XPU)")
     elif torch.cuda.is_available():
         CONFIG["device"] = "cuda"
         print(f"✅ Using CUDA: {torch.cuda.get_device_name(0)}")
@@ -556,9 +578,19 @@ def main():
         CONFIG["device"] = "cpu"
         print("🎯 Training on CPU")
 
+    # ---- Decoder type warning ----
+    decoder_type = CONFIG.get("decoder_type", "mlp")
+    if decoder_type == "lstm":
+        print("\n⚠️  WARNING: LSTM decoder selected.")
+        print("   The trained model will fall back to CPU at inference time")
+        print("   (OpenVINO GPU plugin does not support LSTMSequence ops).")
+        print("   Use '--decoder mlp' for GPU-compatible inference.\n")
+    else:
+        print(f"\n✅ Decoder: {decoder_type} (GPU-compatible at inference)")
+
     set_seed(42)
     print("=" * 60)
-    print("🧠 INTEL ENCODER (CPU) → LSTM TRAINING (" + CONFIG["device"].upper() + ")")
+    print(f"🧠 INTEL ENCODER (CPU) → {decoder_type.upper()} TRAINING ({CONFIG['device'].upper()})")
     print("=" * 60)
 
     # Check encoder
@@ -649,7 +681,6 @@ def main():
         cache_dir = CONFIG.get("checkpoint_dir", "checkpoints_intel")
         force_rebuild = args.rebuild_feature_cache
 
-        # Cache train and val separately
         print("\n--- Training set ---")
         train_cache_path = precompute_feature_cache(
             train_ds, encoder, CONFIG,
@@ -662,7 +693,6 @@ def main():
             cache_dir=cache_dir, force_rebuild=force_rebuild,
         )
 
-        # Create cached datasets
         train_cached = CachedFeatureDataset(
             train_cache_path,
             label_to_idx=label_to_idx, idx_to_label=idx_to_label,
@@ -674,7 +704,6 @@ def main():
 
         feature_dim = train_cached.feature_dim
 
-        # DataLoaders — pure tensor loading, can use many workers
         nw = CONFIG.get("num_workers", 4)
         pin = CONFIG["device"] in ("cuda", "xpu")
         pf = CONFIG.get("prefetch_factor", 2) if nw > 0 else None
@@ -689,8 +718,7 @@ def main():
                                 shuffle=False, num_workers=nw, pin_memory=pin,
                                 prefetch_factor=pf, persistent_workers=pw)
 
-        # Train (cached — no encoder in the loop)
-        print(f"\n🚀 Training from cached features...\n")
+        print(f"\n🚀 Training from cached features ({decoder_type.upper()} decoder)...\n")
         wrapped, use_amp = train_classifier_cached(
             train_loader, val_loader,
             feature_dim=feature_dim,
@@ -699,7 +727,6 @@ def main():
             idx_to_label=idx_to_label,
         )
 
-        # For post-training validation, use cached validate
         def _val_fn():
             prod_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
             device = torch.device(CONFIG["device"])
@@ -709,9 +736,6 @@ def main():
             return pc, preds
 
     else:
-        # ==============================
-        # LIVE ENCODING (no cache)
-        # ==============================
         nw = CONFIG.get("num_workers", 4) if roi_cache is not None else 0
         pin = CONFIG["device"] in ("cuda", "xpu")
         pf = CONFIG.get("prefetch_factor", 2) if nw > 0 else None
@@ -726,7 +750,7 @@ def main():
                                 shuffle=False, num_workers=nw, pin_memory=pin,
                                 prefetch_factor=pf, persistent_workers=pw)
 
-        print(f"\n🚀 Training (live encoding)...\n")
+        print(f"\n🚀 Training (live encoding, {decoder_type.upper()} decoder)...\n")
         wrapped, use_amp = train_classifier_live(
             encoder, train_loader, val_loader,
             num_classes=len(valid_actions),
@@ -734,7 +758,6 @@ def main():
             idx_to_label=idx_to_label,
         )
 
-        # For post-training validation, use live validate
         def _val_fn():
             prod_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
             device = torch.device(CONFIG["device"])
@@ -759,7 +782,6 @@ def main():
             per_class_acc=per_class_acc, suffix="",
         )
 
-    # --- Production filtering: remove <30% accuracy classes ---
     min_prod_acc = CONFIG.get("min_production_accuracy", 0.3)
     prod_keep = [idx for idx in sorted(wrapped.idx_to_label.keys())
                  if per_class_acc.get(idx, 0.0) >= min_prod_acc]
@@ -774,14 +796,19 @@ def main():
         per_class_acc=per_class_acc, suffix="_production",
     )
 
-    # --- Summary ---
     base_mapping = CONFIG["model_save_path"].replace(".pth", "_mapping.json")
     prod_mapping = CONFIG["model_save_path"].replace(".pth", "_production_mapping.json")
 
     print(f"\n✅ Done!")
+    print(f"  Decoder type:        {decoder_type}")
     print(f"  Weights:             {CONFIG['model_save_path']}")
     print(f"  Base mapping:        {base_mapping} ({len(base_keep)} classes)")
     print(f"  Production mapping:  {prod_mapping} ({len(prod_keep)} classes)")
+    if decoder_type == "mlp":
+        print(f"\n  ✅ This model will compile on OpenVINO GPU at inference time.")
+    else:
+        print(f"\n  ⚠️  This model will fall back to CPU at inference time (LSTM).")
+
     if base_remove:
         print(f"\n  Removed from base (0% accuracy):")
         for ri in base_remove:
