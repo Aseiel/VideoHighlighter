@@ -2069,7 +2069,7 @@ class VideoHighlighterGUI(QWidget):
 
         if action_models == "custom_only":
             label_file = INTEL_CUSTOM_LABELS_FILE
-            title = "Select Action Labels (Custom Fine-tuned — 37 classes)"
+            title = f"Select Action Labels (Custom Fine-tuned — {self._custom_ov_count} classes)"
         elif action_models == "intel_only":
             label_file = KINETICS_400_LABELS_FILE
             title = "Select Action Labels (Intel Kinetics-400 — 400 classes)"
@@ -2164,7 +2164,7 @@ class VideoHighlighterGUI(QWidget):
         if action_models == "custom_only":
             if os.path.exists(INTEL_CUSTOM_LABELS_FILE):
                 action_labels = self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)
-                source = "Custom fine-tuned (37 classes)"
+                source = f"Custom fine-tuned ({self._custom_ov_count} classes)"
         elif action_models == "intel_only":
             if os.path.exists(KINETICS_400_LABELS_FILE):
                 action_labels = self.load_labels_from_json(KINETICS_400_LABELS_FILE)
