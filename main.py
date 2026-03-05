@@ -24,12 +24,6 @@ from pipeline import build_analysis_cache_params
 from pipeline import run_highlighter
 import multiprocessing
 
-
-# At app startup
-multiprocessing.freeze_support()
-reset_duration_method_cache()
-
-
 CONFIG_FILE = "config.yaml"
 
 YOLO_OBJECTS_LABELS_FILE = "yolo_objects_labels.json"
@@ -2965,6 +2959,8 @@ class VideoHighlighterGUI(QWidget):
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    multiprocessing.set_start_method("spawn", force=True)  # Explicit on Mac
+    reset_duration_method_cache()             # Only runs in the real main process
     app = QApplication(sys.argv)
     gui = VideoHighlighterGUI()
     gui.show()
