@@ -90,9 +90,13 @@ jobs:
       - name: Fix OpenVINO problematic libraries
         run: |
           OV_LIBS=$(python -c "import openvino; import os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs'))")
-          echo "Removing all bundled OpenVINO libs: $OV_LIBS"
-          ls -la "$OV_LIBS"
-          rm -f "$OV_LIBS"/*.dylib
+          rm -f "$OV_LIBS"/libtbbbind*
+          rm -f "$OV_LIBS"/libtbbmalloc*
+          rm -f "$OV_LIBS"/libtbb.12.dylib
+          rm -f "$OV_LIBS"/libtbb.dylib
+          rm -f "$OV_LIBS"/libhwloc*
+          echo "Remaining libs:"
+          ls "$OV_LIBS"
       - name: Clear PyInstaller cache
         run: rm -rf ~/Library/Application\ Support/pyinstaller
       - name: Build APP
