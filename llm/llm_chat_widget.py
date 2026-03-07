@@ -60,7 +60,8 @@ class _LLMWorker(QThread):
                  analysis_data: dict | None = None,
                  video_path: str = "",
                  timeline_context: str = "",
-                 frame_base64: str | None = None):
+                 frame_base64: str | None = None,
+                 free_chat_mode: bool = False):
         super().__init__()
         self.llm = llm
         self.message = message
@@ -68,6 +69,7 @@ class _LLMWorker(QThread):
         self.video_path = video_path
         self.timeline_context = timeline_context
         self.frame_base64 = frame_base64
+        self.free_chat_mode = free_chat_mode
         self._cancel_token = CancellationToken()
 
     def cancel(self):
@@ -89,6 +91,7 @@ class _LLMWorker(QThread):
                 frame_base64=self.frame_base64,
                 stream_callback=_stream_callback,
                 cancellation_token=self._cancel_token,
+                free_chat_mode=self.free_chat_mode,
             )
             if self._cancel_token.is_cancelled:
                 self.finished.emit(full_response + "\n[stopped]")
@@ -491,6 +494,12 @@ class LLMChatWidget(QWidget):
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self._clear_chat)
         input_layout.addWidget(self.clear_btn)
+
+        self.free_chat_chk = QCheckBox("💬 Free chat")
+        self.free_chat_chk.setToolTip(
+            "When checked, the LLM answers freely without being restricted to video data"
+        )
+        input_layout.addWidget(self.free_chat_chk)
 
         root.addLayout(input_layout)
         self.setLayout(root)
@@ -1378,13 +1387,15 @@ class LLMChatWidget(QWidget):
                         self._append_system("⚠️ Frame capture failed")
 
         # Create and start worker thread
+        _free_chat = self.free_chat_chk.isChecked()
         self._worker = _LLMWorker(
             llm=self._llm,
             message=actual_message,
-            analysis_data=self._analysis_data,
+            analysis_data=self._analysis_data if not _free_chat else None,
             video_path=self._video_path,
             timeline_context=timeline_ctx,
             frame_base64=frame_b64,
+            free_chat_mode=_free_chat,
         )
         self._worker.token_received.connect(self._on_token)
         self._worker.finished.connect(self._on_response_done)

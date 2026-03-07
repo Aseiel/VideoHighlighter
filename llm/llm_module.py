@@ -795,6 +795,14 @@ class LLMModule:
         "5. NEVER generate commands, code, follow-up questions, or fake conversation.\n"
     )
 
+    SYSTEM_PROMPT_GENERAL = (
+    "You are a helpful assistant. Answer the user's questions directly and concisely.\n"
+    "1. Give ONE answer and STOP.\n"
+    "2. NEVER output commands, code blocks, or system messages.\n"
+    "3. NEVER generate follow-up questions or fake conversation.\n"
+    )
+
+
     def __init__(
         self,
         backend: str = "ollama",
@@ -841,6 +849,7 @@ class LLMModule:
         self,
         user_message: str,
         analysis_data: dict | None = None,
+        free_chat_mode: bool = False,
         video_path: str = "",
         system_prompt: str | None = None,
         timeline_context: str = "",
@@ -876,7 +885,7 @@ class LLMModule:
                     "--- END ---\n"
                 )
             
-            if analysis_data:
+            if analysis_data and not free_chat_mode:
                 context = VideoContextBuilder.build(analysis_data, video_path)
                 prompt_parts.append(
                     "--- VIDEO ANALYSIS DATA ---\n"
@@ -887,7 +896,7 @@ class LLMModule:
             prompt_parts.append(user_message)
             full_prompt = "\n".join(prompt_parts)
             
-            system = system_prompt or self.SYSTEM_PROMPT_VISION
+            system = system_prompt or (self.SYSTEM_PROMPT_GENERAL if free_chat_mode else self.SYSTEM_PROMPT_VISION)
             
             return self._backend.generate(
                 prompt=full_prompt,
@@ -902,7 +911,7 @@ class LLMModule:
         # ===== TEXT MODE =====
         prompt_parts = []
         
-        if analysis_data:
+        if analysis_data and not free_chat_mode:
             context = VideoContextBuilder.build(analysis_data, video_path)
             prompt_parts.append(
                 "--- VIDEO ANALYSIS DATA ---\n"
@@ -920,7 +929,9 @@ class LLMModule:
         prompt_parts.append(user_message)
         full_prompt = "\n".join(prompt_parts)
         
-        if system_prompt:
+        if free_chat_mode:
+            system = system_prompt or self.SYSTEM_PROMPT_GENERAL
+        elif system_prompt:
             system = system_prompt
         elif timeline_context:
             system = self.SYSTEM_PROMPT_TIMELINE
