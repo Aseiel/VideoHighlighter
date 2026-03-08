@@ -7,6 +7,8 @@ from multiprocessing import Process, Manager
 import time
 import numpy as np
 
+from modules.device_utils import resolve_device
+
 # ---------------- CONFIG ----------------
 NUM_WORKERS = 4
 FRAME_SKIP = 5
@@ -145,6 +147,7 @@ def worker_process(video_path, start_frame, end_frame, objects_of_interest, retu
         draw_boxes: If True, create annotated video output
         annotated_output_path: Path for annotated video (worker will append _workerN.mp4)
     """
+    device = resolve_device(device)
     # Load model based on device
     if "cuda" in device:
         # CUDA: use .pt model directly (OpenVINO doesn't support CUDA)
@@ -256,6 +259,7 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
     Returns:
         dict: Dictionary of {second: [objects]} detections
     """
+    device = resolve_device(device)
     if not os.path.exists(video_path):
         error_msg = f"⚠️ Video not found: {video_path}"
         print(error_msg)
