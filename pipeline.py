@@ -349,7 +349,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                          object_detections, action_detections, scenes, 
                          motion_events, motion_peaks, audio_peaks, source_lang="en",
                          waveform_data=None, keyword_segments_only=False, 
-                         search_keywords=None, keyword_matches=None):  # Add this parameter
+                         search_keywords=None, keyword_matches=None, action_bboxes=None):
     """
     Collect all analysis results into a structured dictionary for caching.
 
@@ -436,6 +436,10 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
     
     # Also keep legacy key for backward compatibility
     analysis_data["audio_peaks"] = audio_peaks_clean
+    
+    # Bbox data for realtime overlay (realtime_overlay.py reads 'action_bboxes')
+    if action_bboxes:
+        analysis_data["action_bboxes"] = action_bboxes
     
     return analysis_data
 
@@ -1208,6 +1212,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- Action recognition with grouping ---
         interesting_actions = gui_config.get("interesting_actions", [])
+        action_bboxes_cache = []
 
         if not using_cache and interesting_actions:
             try:
@@ -1239,7 +1244,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
                 log(f"🎯 Action backend: {action_backend} | R3D model: {r3d_model} | enable_r3d: {enable_r3d}")
 
-                all_action_detections, _ = run_action_detection(
+                all_action_detections, action_bboxes_cache = run_action_detection(
                     video_path=processed_video_path,
                     sample_rate=sample_rate,
                     debug=False,
@@ -1397,7 +1402,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     waveform_data=waveform_data,
                     keyword_segments_only=keyword_segments_only,
                     search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None,
-                    keyword_matches=keyword_matches
+                    keyword_matches=keyword_matches,
+                    action_bboxes=action_bboxes_cache,
                 )
                 
                 # Add analysis parameters for future validation
