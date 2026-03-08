@@ -19,6 +19,8 @@ from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData
 from modules.video_cutter import cut_video
 from modules.auto_segments import build_auto_segments
+from modules.device_utils import resolve_yolo_device
+
 
 # Keep warnings about CUDA quiet
 warnings.filterwarnings("ignore", message="torch.cuda")
@@ -168,6 +170,9 @@ def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=pr
                                  yolo_pt_path=None, openvino_model_folder=None,
                                  device="cpu"):
     """Object detection with progress tracking, cancellation support, and optional CSV export in mm:ss format"""
+    from modules.device_utils import resolve_yolo_device
+    device = resolve_yolo_device(device)
+    log_fn(f"🖥️ Object detection device (resolved): {device}")
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1091,16 +1096,18 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         try:
             check_cancellation(cancel_flag, log, "YOLO model loading")
             
-            if "cuda" in yolo_device:
-                # CUDA: load the .pt model directly (OpenVINO doesn't use CUDA)
-                log(f"🎯 Loading YOLO .pt model for CUDA: {yolo_pt_path}")
-                yolo_model = YOLO(yolo_pt_path)
-                yolo_model.to(yolo_device)
-                log(f"✅ YOLO model loaded on {yolo_device}")
-            else:
-                # CPU/XPU: use OpenVINO
+            from modules.device_utils import detect_best_device, resolve_yolo_device
+            devices = detect_best_device(log_fn=log)
+            if devices.use_openvino_yolo:
                 yolo_model = YOLO(openvino_model_folder, task="detect")
-                log(f"✅ YOLO OpenVINO model loaded")
+                yolo_device_for_inference = "cpu"   # OpenVINO handles device selection internally
+                log(f"✅ YOLO OpenVINO model loaded (OpenVINO manages device)")
+            else:
+                yolo_model = YOLO(yolo_pt_path)
+                yolo_model.to(devices.yolo_pt_device)
+                yolo_device_for_inference = devices.yolo_pt_device
+                log(f"✅ YOLO .pt model loaded on {yolo_device_for_inference}")
+
         except RuntimeError:
             return None
         except Exception as e:

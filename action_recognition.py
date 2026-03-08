@@ -25,14 +25,13 @@ try:
     import torchvision.models.video as video_models
     import torchvision.transforms as transforms
     TORCH_AVAILABLE = True
-    CUDA_AVAILABLE = torch.cuda.is_available()
-    print(f"✓ PyTorch available (version {torch.__version__})")
-    if CUDA_AVAILABLE:
-        print(f"✓ CUDA available: {torch.cuda.get_device_name(0)}")
-    else:
-        print("⚠️ CUDA not available — R3D will run on CPU (slow)")
+    from modules.device_utils import detect_best_device as _detect_device
+    _devices = _detect_device()          # logs GPU info at import time
+    CUDA_AVAILABLE = _devices.gpu_available and _devices.pytorch_device == 'cuda'
+    _PYTORCH_DEVICE = _devices.pytorch_device  # 'cuda' | 'cpu'
 except ImportError:
     print("⚠️ PyTorch not installed — R3D/CUDA backend disabled")
+    _PYTORCH_DEVICE = 'cpu'
 
 # =============================
 # Load labels - support Kinetics-400, custom, and R3D models
@@ -875,7 +874,7 @@ def load_models(device="AUTO", openvino_threads=None,
     r3d_wrapper = None
     if load_r3d_pre and enable_r3d and TORCH_AVAILABLE:
         try:
-            r3d_device = 'cuda' if CUDA_AVAILABLE else 'cpu'
+            r3d_device = _PYTORCH_DEVICE
             print(f"🔄 Initializing R3D pretrained model on {r3d_device}...")
             r3d_wrapper = R3DModelWrapper(
                 model_name=r3d_model_name,
