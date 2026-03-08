@@ -307,8 +307,7 @@ class SignalTimelineScene(QGraphicsScene):
         
         # ONLY add waveform height if it's visible AND has data
         if self.waveform_visible and self.waveform and len(self.waveform) > 0:
-            height += 80  # Waveform height
-            height += self.layer_spacing  # Add spacing after waveform
+            height += 80 + self.layer_spacing  # Waveform height with spacing after waveform
         
         # Add height for other visible layers
         for _, tracks in self.group_order:
@@ -328,51 +327,21 @@ class SignalTimelineScene(QGraphicsScene):
         self.clear()
         self.bars = []
         
-        # Draw background and time markers FIRST
+        # Draw background
         self.draw_background()
-        self.draw_time_markers()
         
         # Start drawing below time markers
         current_y = 40
         
         # Draw waveform if visible
-        if self.waveform_visible and self.waveform and len(self.waveform) > 0:
+        if self.waveform_visible and self.waveform:
             current_y = self.draw_waveform_layer(current_y, 80)
-        
-        # Draw other layers (rest of your existing code...)
-        
-        # Draw time markers
-        self.draw_time_markers()
-        
-        # Restore current time indicator if it was set
-        if hasattr(self, 'current_time_seconds'):
-            self.set_current_time(self.current_time_seconds)
-        
-        # Restore view transform if we had one
-        if views and old_transform:
-            view = views[0]
-            
-            # Calculate the horizontal scaling needed to maintain same visible area
-            old_visible_width = self.sceneRect().width() / old_transform.m11()
-            new_visible_width = width
-            
-            # Only adjust horizontal scale if scene width changed significantly
-            if abs(old_visible_width - new_visible_width) > 10:
-                scale_factor = new_visible_width / old_visible_width
-                new_transform = old_transform.scale(scale_factor, 1.0)
-                view.setTransform(new_transform)
-                view.horizontalScrollBar().setValue(old_h_scroll)
-        
-        print(f"✅ Timeline rebuilt successfully, final height={height}")
-
-        
-        
+               
         # Draw other layers
         # Layer 1: Transcript
         if self.visible_layers.get('transcript', True):
             current_y = self.draw_transcript_layer(current_y)
 
-        
         # Layer 2: Actions (with better naming)
         if self.visible_layers.get('actions', True):
             current_y = self.draw_improved_actions_layer(current_y)
@@ -403,14 +372,22 @@ class SignalTimelineScene(QGraphicsScene):
         
         # Draw time markers
         self.draw_time_markers()
-        
-        # Restore current time indicator if it was set
+
+        # Restore playhead
         if hasattr(self, 'current_time_seconds'):
             self.set_current_time(self.current_time_seconds)
         
+        # Restore view zoom/scroll
+        if views and old_transform:
+            view = views[0]
+            old_visible_width = self.sceneRect().width() / old_transform.m11()
+            if abs(old_visible_width - width) > 10:
+                scale_factor = width / old_visible_width
+                view.setTransform(old_transform.scale(scale_factor, 1.0))
+                view.horizontalScrollBar().setValue(old_h_scroll)
+
         print(f"✅ Timeline rebuilt successfully, final height={height}")
 
-        
     def draw_background(self):
         """Draw gradient background with subtle grid"""
         gradient = QLinearGradient(0, 0, 0, self.sceneRect().height())
@@ -616,32 +593,37 @@ class SignalTimelineScene(QGraphicsScene):
         label = self.addText("MOTION EVENTS", QFont("Arial", 10, QFont.Weight.Bold))
         label.setPos(5, y_pos - 20)
         label.setDefaultTextColor(QColor(180, 220, 255))
-        
-        if 'motion_events' in self.cache_data:
-            print(f"DEBUG: Drawing {len(self.cache_data['motion_events'])} motion events")
-            for timestamp in self.cache_data['motion_events']:
-                x = timestamp * self.pixels_per_second
-                # Draw vertical line with varying height based on intensity
-                pen = QPen(self.colors['motion_events'], 2)
-                self.addLine(x, y_pos, x, y_pos + self.layer_height, pen)
-        else:
-            print("DEBUG: No motion_events key in cache_data")
-        
-        return y_pos + self.layer_height + self.layer_spacing
 
-    
+        for timestamp in self.cache_data.get('motion_events', []):
+            bar = TimelineBar(
+                timestamp, timestamp + 0.5,
+                y_pos, self.layer_height,
+                self.colors['motion_events'], "Motion",
+                confidence=7,
+                metadata={'timestamp': timestamp}
+            )
+            self.draw_bar(bar)
+            self.bars.append(bar)
+
+        return y_pos + self.layer_height + self.layer_spacing
+   
     def draw_motion_peaks_layer(self, y_pos):
         """Draw motion peaks"""
         label = self.addText("MOTION PEAKS", QFont("Arial", 10, QFont.Weight.Bold))
         label.setPos(5, y_pos - 20)
         label.setDefaultTextColor(QColor(180, 220, 255))
-        
-        if 'motion_peaks' in self.cache_data:
-            for timestamp in self.cache_data['motion_peaks']:
-                x = timestamp * self.pixels_per_second
-                pen = QPen(self.colors['motion_peaks'], 3)
-                self.addLine(x, y_pos, x, y_pos + self.layer_height, pen)
-        
+
+        for timestamp in self.cache_data.get('motion_peaks', []):
+            bar = TimelineBar(
+                timestamp, timestamp + 0.5,
+                y_pos, self.layer_height,
+                self.colors['motion_peaks'], "Peak",
+                confidence=9,
+                metadata={'timestamp': timestamp}
+            )
+            self.draw_bar(bar)
+            self.bars.append(bar)
+
         return y_pos + self.layer_height + self.layer_spacing
     
     def draw_audio_peaks_layer(self, y_pos):
@@ -649,13 +631,18 @@ class SignalTimelineScene(QGraphicsScene):
         label = self.addText("AUDIO PEAKS", QFont("Arial", 10, QFont.Weight.Bold))
         label.setPos(5, y_pos - 20)
         label.setDefaultTextColor(QColor(180, 220, 255))
-        
-        if 'audio_peaks' in self.cache_data:
-            for timestamp in self.cache_data['audio_peaks']:
-                x = timestamp * self.pixels_per_second
-                pen = QPen(self.colors['audio_peaks'], 3)
-                self.addLine(x, y_pos, x, y_pos + self.layer_height, pen)
-        
+
+        for timestamp in self.cache_data.get('audio_peaks', []):
+            bar = TimelineBar(
+                timestamp, timestamp + 0.5,
+                y_pos, self.layer_height,
+                self.colors['audio_peaks'], "Audio",
+                confidence=8,
+                metadata={'timestamp': timestamp}
+            )
+            self.draw_bar(bar)
+            self.bars.append(bar)
+
         return y_pos + self.layer_height + self.layer_spacing
     
     def draw_highlights_layer(self, y_pos):
