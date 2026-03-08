@@ -187,28 +187,21 @@ class OverlayScene(QGraphicsScene):
         """
         Load object/action detections from cache and create overlay items.
 
-        Expected cache format:
-            cache_data['objects'] = [
-                {
-                    'timestamp': 2.5,
-                    'objects': ['person', 'dog'],
-                    'bboxes': [[0.1, 0.2, 0.3, 0.5], ...],   # normalised xywh
-                    'confidences': [0.92, 0.87],                # optional
-                },
-                ...
+        Checks multiple cache key formats for maximum compatibility:
+
+        Dedicated bbox keys (preferred):
+            cache_data['object_bboxes'] = [
+                {'timestamp': 2.5, 'objects': ['person'], 'bboxes': [[x,y,w,h]], 'confidences': [0.9]},
+            ]
+            cache_data['action_bboxes'] = [
+                {'timestamp': 3.0, 'action_name': 'running', 'confidence': 0.85, 'bbox': [x,y,w,h]},
             ]
 
-            cache_data['actions'] = [
-                {
-                    'timestamp': 3.0,
-                    'action_name': 'running',
-                    'confidence': 0.85,
-                    'bbox': [0.1, 0.1, 0.4, 0.6],  # optional
-                },
-                ...
-            ]
+        Standard keys (fallback — entries with bbox data are used):
+            cache_data['objects'] — entries that have a 'bboxes' field
+            cache_data['actions'] — entries that have a 'bbox' field
         """
-        # Clear existing
+        # Clear existing items
         for item in self._all_bbox_items:
             self.removeItem(item)
         self._all_bbox_items.clear()
@@ -218,15 +211,28 @@ class OverlayScene(QGraphicsScene):
         count = 0
 
         # ── Objects with bboxes ──
-        for entry in cache_data.get('object_bboxes', []):
+        # Check dedicated key first, fall back to standard 'objects' key
+        object_entries = cache_data.get('object_bboxes') or []
+        if not object_entries:
+            object_entries = [
+                e for e in cache_data.get('objects', [])
+                if e.get('bboxes') or e.get('bbox')
+            ]
+
+        for entry in object_entries:
             ts = entry.get('timestamp', 0)
             names = entry.get('objects', [])
+
+            # Support both 'bboxes' (list) and 'bbox' (single)
             bboxes = entry.get('bboxes', [])
+            if not bboxes and entry.get('bbox'):
+                bboxes = [entry['bbox']] * max(1, len(names))
+
             confidences = entry.get('confidences', [])
 
             for i, name in enumerate(names):
                 if i >= len(bboxes):
-                    break  # no bbox for this object
+                    break
 
                 bbox = bboxes[i]
                 if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
@@ -244,13 +250,20 @@ class OverlayScene(QGraphicsScene):
                 self.addItem(item)
                 self._all_bbox_items.append(item)
 
-                # Bucket by 100ms
                 bucket = int(ts * 10)
                 self._bbox_items[bucket].append(item)
                 count += 1
 
         # ── Actions with bboxes ──
-        for entry in cache_data.get('action_bboxes', []):
+        # Check dedicated key first, fall back to standard 'actions' key
+        action_entries = cache_data.get('action_bboxes') or []
+        if not action_entries:
+            action_entries = [
+                e for e in cache_data.get('actions', [])
+                if e.get('bbox')
+            ]
+
+        for entry in action_entries:
             ts = entry.get('timestamp', 0)
             bbox = entry.get('bbox')
             if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
@@ -273,7 +286,15 @@ class OverlayScene(QGraphicsScene):
             self._bbox_items[bucket].append(item)
             count += 1
 
+        # ── Debug output ──
         print(f"🎯 Loaded {count} bbox overlays ({len(self._bbox_items)} time buckets)")
+        print(f"   Cache keys: object_bboxes={len(cache_data.get('object_bboxes') or [])}, "
+            f"action_bboxes={len(cache_data.get('action_bboxes') or [])}, "
+            f"objects(w/bbox)={len([e for e in cache_data.get('objects',[]) if e.get('bboxes')])}, "
+            f"actions(w/bbox)={len([e for e in cache_data.get('actions',[]) if e.get('bbox')])}")
+        if count == 0:
+            relevant = [k for k in cache_data if any(s in k.lower() for s in ('bbox','detect','object','action'))]
+            print(f"   ⚠️  No bbox data found. Relevant keys in cache: {relevant or 'none'}")
         return count
 
     def update_time(self, time_seconds: float, window: float = 0.3):
@@ -292,7 +313,7 @@ class OverlayScene(QGraphicsScene):
         half_window_buckets = max(1, int(window * 10))
         active_buckets = set(
             range(center_bucket - half_window_buckets,
-                  center_bucket + half_window_buckets + 1)
+                    center_bucket + half_window_buckets + 1)
         )
 
         # Show/hide items
