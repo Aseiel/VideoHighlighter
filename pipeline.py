@@ -1239,7 +1239,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
                 log(f"🎯 Action backend: {action_backend} | R3D model: {r3d_model} | enable_r3d: {enable_r3d}")
 
-                all_action_detections = run_action_detection(
+                all_action_detections, _ = run_action_detection(
                     video_path=processed_video_path,
                     sample_rate=sample_rate,
                     debug=False,
