@@ -298,6 +298,7 @@ class SignalTimelineScene(QGraphicsScene):
             view = views[0]
             old_transform = view.transform()
             old_h_scroll = view.horizontalScrollBar().value()
+            QTimer.singleShot(0, views[0]._fit_vertical)
         
         # Calculate width based on video duration
         width = self.video_duration * self.pixels_per_second
@@ -401,10 +402,6 @@ class SignalTimelineScene(QGraphicsScene):
             pen = QPen(QColor(45, 45, 55) if sec % 30 else QColor(70, 70, 90), 1)
             self.addLine(x, 0, x, self.sceneRect().height(), pen)
         
-        # FIX: Draw time markers AFTER background but BEFORE waveform
-        self.draw_time_markers()
-
-    
     def draw_transcript_layer(self, y_pos):
         """Draw transcript segments with improved labeling"""
         label = self.addText("TRANSCRIPT", QFont("Arial", 10, QFont.Weight.Bold))
@@ -1089,6 +1086,31 @@ class SignalTimelineView(QGraphicsView):
         self.follow_anchor = 0.35       # keep playhead ~35% from left
         self.follow_margin_left = 0.10  # scroll when playhead < 10% from left
         self.follow_margin_right = 0.85 # scroll when playhead > 85% from left
+
+    def resizeEvent(self, event):
+        """When view is resized, fit the scene vertically"""
+        super().resizeEvent(event)
+        self._fit_vertical()
+
+    def _fit_vertical(self):
+        """Scale scene to fit view height exactly"""
+        scene = self.scene()
+        if not scene:
+            return
+        scene_rect = scene.sceneRect()
+        if scene_rect.height() <= 0:
+            return
+        view_height = self.viewport().height()
+        scale_y = view_height / scene_rect.height()
+        # Only adjust vertical scale, keep horizontal untouched
+        current = self.transform()
+        self.setTransform(
+            current.__class__(
+                current.m11(), current.m12(),
+                current.m21(), scale_y,
+                current.dx(),  current.dy()
+            )
+        )
 
     def ensure_time_visible(self, time_seconds):
         """Auto-scroll so the playhead stays visible during playback."""
