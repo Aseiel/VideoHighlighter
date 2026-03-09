@@ -1349,11 +1349,6 @@ class SignalTimelineWindow(QMainWindow):
                 print(f"❌ Could not read frame at {self.current_time:.1f}s")
                 return None
 
-            # Optionally annotate with cached action/object labels
-            if (hasattr(self, 'annotate_llm_frames')
-                    and self.annotate_llm_frames.isChecked()):
-                frame = self._annotate_frame_for_llm(frame, self.current_time)
-
             # Resize
             h, w = frame.shape[:2]
             max_dim = 1024
@@ -1369,9 +1364,6 @@ class SignalTimelineWindow(QMainWindow):
             tag = ""
             if source_path != self.video_path:
                 tag = " [precomp annotated]"
-            elif (hasattr(self, 'annotate_llm_frames')
-                  and self.annotate_llm_frames.isChecked()):
-                tag = " [cv2 annotated]"
 
             print(f"📷 Captured frame at {self.current_time:.1f}s "
                   f"({len(b64) // 1024}KB){tag}")
@@ -1380,149 +1372,6 @@ class SignalTimelineWindow(QMainWindow):
         except Exception as e:
             print(f"❌ Frame capture failed: {e}")
             return None
-
-    def _annotate_frame_for_llm(self, frame, timestamp, time_window=1.0):
-        """Draw action/object labels onto frame before sending to LLM."""
-        import cv2
-
-        if not self.cache_data:
-            return frame
-
-        annotated = frame.copy()
-        h, w = annotated.shape[:2]
-
-        # ── Actions (top-left) ──
-        actions = []
-        for act in self.cache_data.get('actions', []):
-            ts = act.get('timestamp', -999)
-            if abs(ts - timestamp) > time_window:
-                continue
-            name = act.get('action_name') or act.get('action', '?')
-            conf = act.get('confidence', 0)
-            model = act.get('model_type', '')
-            actions.append((name, conf, model))
-
-        actions.sort(key=lambda x: x[1], reverse=True)
-
-        for i, (name, conf, model) in enumerate(actions[:5]):
-            y = 30 + i * 35
-            tag = f" [{model}]" if model else ""
-            text = f"{name}{tag} {conf:.0%}"
-
-            if 'custom' in model:
-                color = (0, 255, 0)
-            elif 'cuda' in model or 'r3d' in model:
-                color = (0, 128, 255)
-            else:
-                color = (0, 165, 255)
-
-            # Semi-transparent confidence bar
-            bar_w = int(min(w - 20, 350) * conf)
-            overlay = annotated.copy()
-            cv2.rectangle(overlay, (10, y - 18), (10 + bar_w, y + 10), color, -1)
-            cv2.addWeighted(overlay, 0.35, annotated, 0.65, 0, annotated)
-
-            # Text
-            cv2.putText(annotated, text, (14, y + 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)  # outline
-            cv2.putText(annotated, text, (14, y + 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        # ── Objects (bottom-left) ──
-        objects = []
-        for obj_entry in self.cache_data.get('objects', []):
-            ts = obj_entry.get('timestamp', -999)
-            if abs(ts - timestamp) > time_window:
-                continue
-            for obj_name in obj_entry.get('objects', []):
-                if isinstance(obj_name, str) and obj_name not in objects:
-                    objects.append(obj_name)
-
-        if objects:
-            text = "Objects: " + ", ".join(objects[:6])
-            overlay = annotated.copy()
-            cv2.rectangle(overlay, (8, h - 40), (len(text) * 11 + 20, h - 8), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
-            cv2.putText(annotated, text, (12, h - 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
-
-        # ── Timestamp (top-right) ──
-        mins, secs = divmod(int(timestamp), 60)
-        cv2.putText(annotated, f"{mins:02d}:{secs:02d}", (w - 100, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3)
-        cv2.putText(annotated, f"{mins:02d}:{secs:02d}", (w - 100, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-
-        return annotated
-
-    def _annotate_frame_from_cache(self, frame, timestamp, time_window=1.0):
-        """Draw action/object labels from cached analysis data onto frame."""
-        import cv2
-
-        if not self.cache_data:
-            return frame
-
-        annotated = frame.copy()
-        h, w = annotated.shape[:2]
-
-        # ── 1. Action labels (top-left) ──
-        actions_at_time = []
-        for act in self.cache_data.get('actions', []):
-            act_ts = act.get('timestamp', -999)
-            if abs(act_ts - timestamp) > time_window:
-                continue
-            name = act.get('action_name') or act.get('action', '?')
-            conf = act.get('confidence', 0)
-            model = act.get('model_type', '')
-            actions_at_time.append((name, conf, model))
-
-        actions_at_time.sort(key=lambda x: x[1], reverse=True)
-        for i, (name, conf, model) in enumerate(actions_at_time[:5]):
-            y_pos = 30 + i * 35
-            tag = f" [{model}]" if model else ""
-            text = f"{name}{tag} {conf:.0%}"
-
-            # Color by model
-            if 'custom' in model:
-                color = (0, 255, 0)
-            elif 'cuda' in model or 'r3d' in model:
-                color = (0, 128, 255)
-            else:
-                color = (0, 165, 255)
-
-            # Confidence bar background
-            bar_width = int(min(w - 20, 350) * conf)
-            overlay = annotated.copy()
-            cv2.rectangle(overlay, (10, y_pos - 18), (10 + bar_width, y_pos + 8), color, -1)
-            cv2.addWeighted(overlay, 0.35, annotated, 0.65, 0, annotated)
-
-            cv2.putText(annotated, text, (14, y_pos + 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        # ── 2. Object names (bottom-left) ──
-        objects_at_time = []
-        for obj_entry in self.cache_data.get('objects', []):
-            obj_ts = obj_entry.get('timestamp', -999)
-            if abs(obj_ts - timestamp) > time_window:
-                continue
-            for obj_name in obj_entry.get('objects', []):
-                if isinstance(obj_name, str) and obj_name not in objects_at_time:
-                    objects_at_time.append(obj_name)
-
-        if objects_at_time:
-            text = "Objects: " + ", ".join(objects_at_time[:6])
-            overlay = annotated.copy()
-            cv2.rectangle(overlay, (8, h - 38), (len(text) * 11 + 16, h - 8), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
-            cv2.putText(annotated, text, (12, h - 16),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1)
-
-        # ── 3. Timestamp ──
-        mins, secs = divmod(int(timestamp), 60)
-        cv2.putText(annotated, f"{mins:02d}:{secs:02d}", (w - 90, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-        return annotated
 
     def eventFilter(self, obj, event):
         """Global event filter for handling delete, spacebar, and cut mode exit"""
@@ -1861,11 +1710,6 @@ class SignalTimelineWindow(QMainWindow):
             }
         """)
         playback_layout.addWidget(play_btn)
-
-        self.annotate_llm_frames = QCheckBox("Annotate LLM frames (labels + confidence)")
-        self.annotate_llm_frames.setChecked(False)
-        self.annotate_llm_frames.setToolTip("Draw action/object labels on frames before sending to LLM vision")
-        playback_layout.addWidget(self.annotate_llm_frames)
 
         self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
         self.follow_playhead_checkbox.setChecked(True)
