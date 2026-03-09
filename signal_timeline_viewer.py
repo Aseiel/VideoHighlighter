@@ -899,28 +899,28 @@ class SignalTimelineWindow(QMainWindow):
     def load_waveform_from_cache(self):
         """Try to load waveform from cache data"""
         try:
-            if self.cache_data:
-                # Check in various possible locations
-                waveform_data = None
-                
-                # Try direct access
-                if 'waveform_data' in self.cache_data:
-                    waveform_data = self.cache_data['waveform_data']
-                
-                # Try under video_metadata
-                elif 'video_metadata' in self.cache_data and 'waveform' in self.cache_data['video_metadata']:
-                    waveform_data = self.cache_data['video_metadata']['waveform']
-                
+            if not self.cache_data:
+                return None
+
+            # Check under audio key (where it gets saved)
+            audio = self.cache_data.get('audio', {})
+            if isinstance(audio, dict):
+                waveform_data = audio.get('waveform')
                 if waveform_data and len(waveform_data) > 0:
-                    print(f"✅ Loaded waveform from cache ({len(waveform_data)} points)")
+                    print(f"✅ Loaded waveform from cache audio key ({len(waveform_data)} points)")
                     return waveform_data
-                else:
-                    print(f"⚠️ Waveform data found but empty")
+
+            # Fallback: check legacy locations
+            waveform_data = self.cache_data.get('waveform_data')
+            if waveform_data and len(waveform_data) > 0:
+                print(f"✅ Loaded waveform from cache waveform_data ({len(waveform_data)} points)")
+                return waveform_data
+
+            print("⚠️ No waveform found in cache")
         except Exception as e:
             print(f"⚠️ Could not load cached waveform: {e}")
-        
-        return None
 
+        return None
 
     def init_waveform(self):
         """Initialize waveform visualization in background with better debugging"""
@@ -999,16 +999,50 @@ class SignalTimelineWindow(QMainWindow):
 
 
     def save_waveform_to_cache(self, waveform_data):
-        """Save waveform to cache for future use"""
+        """Save waveform to cache file on disk"""
         try:
+            # Update in-memory cache_data
             if not self.cache_data:
                 self.cache_data = {}
-            
-            if 'video_metadata' not in self.cache_data:
-                self.cache_data['video_metadata'] = {}
-            
-            self.cache_data['video_metadata']['waveform'] = waveform_data
-            print(f"💾 Saved waveform to cache ({len(waveform_data)} points)")
+            if 'audio' not in self.cache_data or not isinstance(self.cache_data['audio'], dict):
+                self.cache_data['audio'] = {}
+            self.cache_data['audio']['waveform'] = waveform_data
+
+            # Find and update the actual cache file on disk
+            from pathlib import Path
+            import json
+
+            cache_dir = Path("./cache")
+            if not cache_dir.exists():
+                print("⚠️ Cache directory not found, waveform not persisted")
+                return
+
+            video_hash = self.cache_data.get('video_hash')
+            if not video_hash:
+                print("⚠️ No video_hash in cache_data, cannot save waveform to disk")
+                return
+
+            # Find the matching cache file
+            matching = list(cache_dir.glob(f"{video_hash}*.cache.json"))
+            if not matching:
+                print(f"⚠️ No cache file found for hash {video_hash[:16]}...")
+                return
+
+            cache_file = matching[0]
+
+            # Load, update, write back
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                disk_data = json.load(f)
+
+            if 'audio' not in disk_data or not isinstance(disk_data['audio'], dict):
+                disk_data['audio'] = {}
+            disk_data['audio']['waveform'] = waveform_data
+
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(disk_data, f)
+
+            print(f"💾 Saved waveform to disk ({len(waveform_data)} points) → {cache_file.name}")
+
         except Exception as e:
             print(f"⚠️ Could not save waveform to cache: {e}")
 
@@ -1203,6 +1237,8 @@ class SignalTimelineWindow(QMainWindow):
         # Create scene with current waveform data (may be empty initially)
         self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration, waveform=self.waveform)
         self.signal_view = SignalTimelineView(self.signal_scene)
+        self.signal_view.setMinimumHeight(400)
+        self.signal_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         
         # Enable drag and drop on the viewport
         self.signal_view.viewport().setAcceptDrops(True)
@@ -1281,7 +1317,7 @@ class SignalTimelineWindow(QMainWindow):
         splitter.addWidget(edit_widget)
         
         # Set splitter sizes (signal timeline gets more space)
-        splitter.setSizes([700, 300])
+        splitter.setSizes([500, 200])
         
         main_layout.addWidget(splitter)
         
