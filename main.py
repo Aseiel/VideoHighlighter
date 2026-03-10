@@ -960,10 +960,6 @@ class VideoHighlighterGUI(QWidget):
         self._custom_ov_count = len(self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)) if os.path.exists(INTEL_CUSTOM_LABELS_FILE) else 0
         self._r3d_custom_count = len(self.load_labels_from_json(R3D_CUSTOM_LABELS_FILE)) if os.path.exists(R3D_CUSTOM_LABELS_FILE) else 0
 
-        current_action_models = advanced_cfg.get("action_models", "mixed")
-        idx_am = self.action_models_combo.findData(current_action_models)
-        self.action_models_combo.setCurrentIndex(idx_am if idx_am >= 0 else 0)
-
         self.r3d_model_combo = QComboBox()
         self.r3d_model_combo.addItem("R3D-18 (fastest)", "r3d_18")
         self.r3d_model_combo.addItem("MC3-18 (mixed convolution)", "mc3_18")
@@ -1029,6 +1025,11 @@ class VideoHighlighterGUI(QWidget):
         self.action_models_combo.currentIndexChanged.connect(
             lambda: self.update_actions_completer())
         on_action_backend_changed(0)
+        current_action_models = advanced_cfg.get("action_models", "mixed")
+        restore_idx = self.action_models_combo.findData(current_action_models)
+        if restore_idx >= 0:
+            self.action_models_combo.setCurrentIndex(restore_idx)
+
 
         misc_layout.addRow("Action recognition backend:", self.action_backend_combo)
         misc_layout.addRow("Action models:", self.action_models_combo)
