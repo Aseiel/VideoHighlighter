@@ -46,7 +46,7 @@ from video_ai_editor.timeline_bars import TimelineBar
 from video_ai_editor.signal_timeline import SignalTimelineScene, SignalTimelineView
 from video_ai_editor.edit_timeline import EditTimelineScene
 from video_ai_editor.filter_dialogs import FilterDialog, ConfidenceFilterDialog
-
+from video_ai_editor.transcript_panel import TranscriptPanel
 
 
 class SignalTimelineWindow(QMainWindow):
@@ -558,6 +558,11 @@ class SignalTimelineWindow(QMainWindow):
             self.signal_scene.set_current_time(self.current_time)
             if hasattr(self, 'signal_view'):
                 self.signal_view.ensure_time_visible(self.current_time)
+        
+        # Sync transcript panel
+        if hasattr(self, 'transcript_panel'):
+            self.transcript_panel.update_current_time(self.current_time)
+
 
     def _toggle_detection_panel(self, state):
         """Show/hide detection panel"""
@@ -1333,6 +1338,17 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ Could not create preview dock: {e}")
             # Continue without preview
 
+        # Transcript dock (hidden by default, toggle from View menu)
+        try:
+            transcript_dock = self.create_transcript_dock()
+            self.addDockWidget(Qt.RightDockWidgetArea, transcript_dock)
+            transcript_dock.setVisible(False)
+            # Connect the toggle button that was already added in create_controls_dock
+            if hasattr(self, 'transcript_toggle_btn'):
+                self.transcript_toggle_btn.toggled.connect(transcript_dock.setVisible)
+        except Exception as e:
+            print(f"⚠️ Could not create transcript dock: {e}")
+
         # Connect render signal
         self.render_finished.connect(self.on_render_finished)
 
@@ -1659,6 +1675,128 @@ class SignalTimelineWindow(QMainWindow):
         
         return controls
 
+    def create_transcript_dock(self):
+        """Create transcript dock — reads from SRT or transcript txt next to video"""
+        from PySide6.QtWidgets import QDockWidget
+        import os
+
+        dock = QDockWidget("📝 Transcript", self)
+        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        dock.setMinimumWidth(260)
+
+        segments = self._load_transcript_segments()
+
+        self.transcript_panel = TranscriptPanel(segments, parent=self)
+        self.transcript_panel.seek_requested.connect(self.on_time_clicked)
+
+        dock.setWidget(self.transcript_panel)
+        return dock
+
+    def _load_transcript_segments(self) -> list:
+        """
+        Try to load transcript segments from files next to the video.
+        Priority: .srt (has timestamps) → _transcript.txt (fallback, no timestamps)
+        """
+        import os
+        import re
+
+        base = os.path.splitext(self.video_path)[0]
+        video_dir = os.path.dirname(self.video_path)
+
+        # ── 1. Try any SRT next to the video ──
+        # Check base.srt, base_en.srt, base_pl.srt etc.
+        srt_candidates = [
+            f"{base}.srt",
+        ]
+        # Also scan directory for any srt matching the base name
+        try:
+            video_name = os.path.splitext(os.path.basename(self.video_path))[0]
+            for f in os.listdir(video_dir):
+                if f.startswith(video_name) and f.endswith(".srt"):
+                    srt_candidates.append(os.path.join(video_dir, f))
+        except Exception:
+            pass
+
+        for srt_path in srt_candidates:
+            if os.path.exists(srt_path):
+                segments = self._parse_srt(srt_path)
+                if segments:
+                    print(f"✅ Transcript: loaded {len(segments)} segments from {os.path.basename(srt_path)}")
+                    return segments
+
+        # ── 2. Fallback: _transcript.txt (no timestamps, show as one block) ──
+        txt_path = f"{base}_transcript.txt"
+        if os.path.exists(txt_path):
+            return self._parse_transcript_txt(txt_path)
+
+        print("⚠️ No transcript file found next to video")
+        return []
+
+    def _parse_srt(self, srt_path: str) -> list:
+        """Parse SRT file into [{start, end, text}] segments"""
+        import re
+        segments = []
+        try:
+            with open(srt_path, "r", encoding="utf-8-sig") as f:
+                content = f.read()
+
+            # Split into blocks
+            blocks = re.split(r'\n\s*\n', content.strip())
+            for block in blocks:
+                lines = block.strip().splitlines()
+                if len(lines) < 3:
+                    continue
+                # lines[0] = index, lines[1] = timestamps, lines[2+] = text
+                time_match = re.match(
+                    r'(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})',
+                    lines[1]
+                )
+                if not time_match:
+                    continue
+                h1,m1,s1,ms1, h2,m2,s2,ms2 = map(int, time_match.groups())
+                start = h1*3600 + m1*60 + s1 + ms1/1000
+                end   = h2*3600 + m2*60 + s2 + ms2/1000
+                text  = " ".join(lines[2:]).strip()
+                if text:
+                    segments.append({"start": start, "end": end, "text": text})
+        except Exception as e:
+            print(f"⚠️ SRT parse error: {e}")
+        return segments
+
+    def _parse_transcript_txt(self, txt_path: str) -> list:
+        """
+        Parse enhanced transcript txt into segments.
+        Format: [12.3s] Some text. [45.1s pause] More text.
+        Returns segments with approximate timestamps.
+        """
+        import re
+        segments = []
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Split on timestamp markers like [12.3s]
+            parts = re.split(r'(\[\d+\.?\d*s\])', content)
+            current_time = 0.0
+            for i, part in enumerate(parts):
+                ts_match = re.match(r'\[(\d+\.?\d*)s\]', part.strip())
+                if ts_match:
+                    current_time = float(ts_match.group(1))
+                else:
+                    text = part.strip()
+                    # Skip pause markers
+                    text = re.sub(r'\[\d+\.?\d*s pause\]', '', text).strip()
+                    if text and len(text) > 3:
+                        segments.append({
+                            "start": current_time,
+                            "end": current_time + 5.0,  # approximate
+                            "text": text
+                        })
+        except Exception as e:
+            print(f"⚠️ Transcript txt parse error: {e}")
+        return segments
+
+
     def create_controls_dock(self):
         """Create dock widget with controls including filters"""
         dock = QDockWidget("Controls", self)
@@ -1746,6 +1884,25 @@ class SignalTimelineWindow(QMainWindow):
             }
         """)
         playback_layout.addWidget(play_btn)
+
+        # Transcript toggle — connected later in init_ui once dock exists
+        self.transcript_toggle_btn = QPushButton("📝 Transcript")
+        self.transcript_toggle_btn.setCheckable(True)
+        self.transcript_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a1a2e; color: #7a9acd;
+                border: 1px solid #3a3a5a; border-radius: 3px;
+                font-size: 10px; padding: 4px 8px;
+            }
+            QPushButton:checked {
+                background: #1a2a3f; color: #aac0ff;
+                border-color: #4a7fcd;
+            }
+        """)
+        playback_layout.addWidget(self.transcript_toggle_btn)
+
+        self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
+
 
         self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
         self.follow_playhead_checkbox.setChecked(True)
