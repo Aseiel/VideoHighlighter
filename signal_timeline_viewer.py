@@ -179,8 +179,29 @@ class SignalTimelineWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Close preview when timeline closes"""
+        # Stop all players to prevent audio playing in background
+        try:
+            if hasattr(self, '_active_player'):
+                self._active_player.stop()
+            if hasattr(self, 'video_player'):
+                self.video_player.stop()
+            if hasattr(self, 'realtime_preview') and self.realtime_preview:
+                self.realtime_preview.player.stop()
+        except Exception:
+            pass
+
+        # Stop edit playback timers
+        try:
+            if hasattr(self, '_edit_clip_timer'):
+                self._edit_clip_timer.stop()
+            if hasattr(self, '_edit_progress_timer'):
+                self._edit_progress_timer.stop()
+        except Exception:
+            pass
+
         if hasattr(self, 'preview_window') and self.preview_window:
             self.preview_window.close()
+
         super().closeEvent(event)
 
     def _on_bbox_toggled(self, label: str):
