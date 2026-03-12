@@ -117,6 +117,42 @@ class LabelSelectorDialog(QDialog):
     def get_selected_labels(self):
         return [item.text() for item in self.label_list.selectedItems()]
 
+class NoAnalysisWarningDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("No Analysis Data")
+        self.setFixedWidth(420)
+        
+        layout = QVBoxLayout()
+        
+        icon_label = QLabel("⚠️")
+        icon_label.setStyleSheet("font-size: 32px;")
+        icon_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(icon_label)
+        
+        msg = QLabel(
+            "No analysis cache found for this video.\n\n"
+            "You can still use the timeline viewer to seek through\n"
+            "the video and chat with the LLM — but motion, audio,\n"
+            "object and action signals won't be available.\n\n"
+            "Run the pipeline first to get full signal data."
+        )
+        msg.setWordWrap(True)
+        msg.setAlignment(Qt.AlignCenter)
+        layout.addWidget(msg)
+        
+        self.dont_show_chk = QCheckBox("Don't show this warning again")
+        self.dont_show_chk.setStyleSheet("color: #666;")
+        layout.addWidget(self.dont_show_chk)
+        
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Open Anyway")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        
+        self.setLayout(layout)
+
 class MultiCompleter(QCompleter):
     """QCompleter that works on comma-separated fields, completing only the current token.
     Matches labels where any word starts with the typed text."""
@@ -1976,6 +2012,9 @@ class VideoHighlighterGUI(QWidget):
                 "draw_object_boxes": self.bbox_objects_chk.isChecked(),
                 "draw_action_labels": self.bbox_actions_chk.isChecked(),
             },
+            "ui": {
+                "suppress_no_cache_warning": self.config_data.get("ui", {}).get("suppress_no_cache_warning", False),
+            },
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             yaml.dump(data, f, sort_keys=False, allow_unicode=True)
@@ -2919,7 +2958,6 @@ class VideoHighlighterGUI(QWidget):
             cache_data = cache.load(video_path, params=analysis_params)
             
             if not cache_data:
-                # If not found, try looking for ANY cache file with this video hash
                 import json
                 from pathlib import Path
                 
@@ -2928,17 +2966,29 @@ class VideoHighlighterGUI(QWidget):
                 matching_files = list(cache_dir.glob(f"{video_hash}*.cache.json"))
                 
                 if matching_files:
-                    # Load the most recent one
                     latest_file = max(matching_files, key=lambda p: p.stat().st_mtime)
-                    self.append_log(f"📁 Found cache file: {latest_file.name}")
-                    
                     with open(latest_file, 'r') as f:
                         cache_data = json.load(f)
-                    self.append_log(f"✅ Loaded cache data from file")
+                    self.append_log(f"✅ Loaded cache: {latest_file.name}")
                 else:
-                    self.append_log("⚠️ No analysis cache found for this video.")
-                    self.append_log("   Please run the highlighter pipeline first to generate analysis data.")
-                    return
+                    # Check if user suppressed this warning
+                    suppress = self.config_data.get("ui", {}).get("suppress_no_cache_warning", False)
+                    
+                    if not suppress:
+                        dlg = NoAnalysisWarningDialog(self)
+                        if dlg.exec() != QDialog.Accepted:
+                            return  # User clicked Cancel
+                        
+                        if dlg.dont_show_chk.isChecked():
+                            # Persist the preference
+                            if "ui" not in self.config_data:
+                                self.config_data["ui"] = {}
+                            self.config_data["ui"]["suppress_no_cache_warning"] = True
+                            self.save_config()
+                    
+                    self.append_log("⚠️ Opening timeline without signal data — run pipeline to populate signals.")
+                    cache_data = {}
+
             
             self.append_log(f"📊 Opening timeline viewer for: {os.path.basename(video_path)}")
             
