@@ -204,7 +204,8 @@ def adjust_subtitle_duration(start: float, end: float, text: str,
     
     return start, end
 
-def create_srt_content(segments, max_chars=80, min_duration=0.8, chars_per_second=15):
+def create_srt_content(segments, max_chars=80, min_duration=0.8, chars_per_second=15,
+                       show_speakers=False):
     """
     Create SRT content with precise timestamps from original segments.
     Translation text is used, but timing is preserved.
@@ -217,6 +218,12 @@ def create_srt_content(segments, max_chars=80, min_duration=0.8, chars_per_secon
         text = clean_subtitle_text(seg['text'])
         if not text or len(text) < 2 or not is_valid_speech(text):
             continue
+
+        # Optionally prepend speaker label
+        if show_speakers:
+            label = seg.get('speaker_label')
+            if label:
+                text = f"[{label}] {text}"
 
         start_seconds = float(seg.get('start', 0))
         end_seconds = float(seg.get('end', start_seconds + 2))
@@ -280,7 +287,14 @@ def create_enhanced_transcript(segments: List[Dict], pause_threshold=2.0) -> str
         if show_timestamp:
             transcript_parts.append(f"[{current_start:.1f}s] ")
             last_timestamp = current_start
+        # Show speaker label on speaker change
+        speaker_label = seg.get('speaker_label')
+        if speaker_label:
+            prev_speaker = segments[i-1].get('speaker_label') if i > 0 else None
+            if speaker_label != prev_speaker:
+                transcript_parts.append(f"\n[{speaker_label}]: ")
         transcript_parts.append(seg['text'])
+
         if not seg['text'].strip().endswith(('.', '!', '?')):
             transcript_parts.append(".")
         transcript_parts.append(" ")
@@ -303,12 +317,22 @@ def get_llm_translator():
         pass
     return None
 
-def translate_with_llm(text, source_lang="en", target_lang="pl", model="llama3"):
+def translate_with_llm(text, source_lang="en", target_lang="pl", model="llama3",
+                       gender=None):
     """Translate a single text using local LLM via ollama"""
     import subprocess
 
+    gender_hint = ""
+    if gender and gender != "unknown":
+        gender_hint = (
+            f"The speaker is {gender}. "
+            f"Use grammatically correct {gender} gender forms "
+            f"(verbs, adjectives, pronouns). "
+        )
+
     prompt = (
         f"Translate the following text from {source_lang} to {target_lang}. "
+        f"{gender_hint}"
         f"Return ONLY the translated text, nothing else. "
         f"Keep the same tone and style. Do not add quotes or explanations.\n\n"
         f"{text}"
@@ -335,8 +359,10 @@ def translate_with_llm(text, source_lang="en", target_lang="pl", model="llama3")
     return None
 
 def translate_batch_with_llm(texts, source_lang="en", target_lang="pl",
-                             model="llama3", batch_size=10):
-    """Translate multiple texts in batches for efficiency"""
+                             model="llama3", batch_size=10, genders=None):
+    """Translate multiple texts in batches for efficiency.
+    genders: optional list of gender strings matching texts list.
+    """
     import subprocess
 
     results = []
@@ -348,9 +374,30 @@ def translate_batch_with_llm(texts, source_lang="en", target_lang="pl",
         total_batches = (total + batch_size - 1) // batch_size
         print(f"  🦙 Batch {batch_num}/{total_batches} ({len(batch)} segments)...")
 
-        numbered = "\n".join(f"{j+1}. {t}" for j, t in enumerate(batch))
+        # Build numbered lines with gender hints per segment
+        numbered_lines = []
+        for j, t in enumerate(batch):
+            global_idx = i + j
+            g = genders[global_idx] if genders and global_idx < len(genders) else None
+            gender_tag = f" [{g}]" if g and g != "unknown" else ""
+            numbered_lines.append(f"{j+1}.{gender_tag} {t}")
+        numbered = "\n".join(numbered_lines)
+
+        has_genders = genders and any(
+            g and g != "unknown"
+            for g in genders[i:i + batch_size]
+        )
+        gender_instruction = ""
+        if has_genders:
+            gender_instruction = (
+                "Each line may have a [male] or [female] tag. "
+                "Use the grammatically correct gender forms for that speaker. "
+                "Do NOT include the gender tag in your translation. "
+            )
+
         prompt = (
             f"Translate each numbered line from {source_lang} to {target_lang}. "
+            f"{gender_instruction}"
             f"Return ONLY the translations, one per line, keeping the same numbering. "
             f"Do not add explanations or extra text.\n\n{numbered}"
         )
@@ -380,7 +427,9 @@ def translate_batch_with_llm(texts, source_lang="en", target_lang="pl",
 
         # Fallback: translate individually for this batch
         for j, text in enumerate(batch):
-            translated = translate_with_llm(text, source_lang, target_lang, model)
+            global_idx = i + j
+            g = genders[global_idx] if genders and global_idx < len(genders) else None
+            translated = translate_with_llm(text, source_lang, target_lang, model, gender=g)
             if translated:
                 results.append(translated)
             else:
@@ -426,17 +475,31 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
     llm_backend = get_llm_translator()
     if llm_backend:
         print(f"🦙 Using local LLM ({llm_backend}) for translation (better quality)")
+        
+        # DEBUG — remove after confirming
+        for seg in segments[:5]:
+            print(f"  🔍 DEBUG: '{seg['text'][:40]}' | gender={seg.get('gender', 'MISSING')} | speaker={seg.get('speaker_label', 'MISSING')}")
+        
         texts = [seg["text"] for seg in segments]
-        translated_texts = translate_batch_with_llm(texts, source_lang, target_lang)
+        genders = [seg.get("gender") for seg in segments]
+        translated_texts = translate_batch_with_llm(
+            texts, source_lang, target_lang, genders=genders
+        )
 
         if len(translated_texts) == len(segments):
             translated_segments = []
             for seg, translated_text in zip(segments, translated_texts):
-                translated_segments.append({
+                new_seg = {
                     'start': seg['start'],
                     'end': seg['end'],
                     'text': translated_text
-                })
+                }
+                # Preserve speaker metadata through translation
+                for key in ('speaker', 'speaker_label', 'gender', 'gender_confidence'):
+                    if key in seg:
+                        new_seg[key] = seg[key]
+                translated_segments.append(new_seg)
+
             print(f"✅ Translated {len(translated_segments)} segments via LLM")
             return translated_segments
         else:
@@ -454,11 +517,15 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
     translated_segments = []
     for i, seg in enumerate(segments):
         translated_text = safe_translate(translator, seg["text"], src=source_lang, dest=target_lang)
-        translated_segments.append({
+        new_seg = {
             'start': seg['start'],
             'end': seg['end'],
             'text': translated_text
-        })
+        }
+        for key in ('speaker', 'speaker_label', 'gender', 'gender_confidence'):
+            if key in seg:
+                new_seg[key] = seg[key]
+        translated_segments.append(new_seg)
         print(f"  Translated {i+1}/{len(segments)}", end='\r')
 
     print(f"\n✅ Translated {len(translated_segments)} segments via googletrans")
@@ -468,13 +535,14 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
 # FILE GENERATION
 # --------------------------
 
-def create_srt_file(segments, output_path, source_lang="en", target_lang=None):
+def create_srt_file(segments, output_path, source_lang="en", target_lang=None,
+                    show_speakers=False):
     """Create SRT subtitle file from transcript segments with optional translation"""
     if target_lang and target_lang != source_lang:
         print(f"Translating subtitles from {source_lang} to {target_lang}...")
         segments = translate_segments(segments, source_lang, target_lang)
 
-    srt_content = create_srt_content(segments)
+    srt_content = create_srt_content(segments, show_speakers=show_speakers)
 
     with open(output_path, "w", encoding="utf-8-sig") as f:
         f.write(srt_content)

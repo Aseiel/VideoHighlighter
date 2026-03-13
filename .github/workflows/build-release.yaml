@@ -49,8 +49,6 @@ jobs:
           --hidden-import pipeline
           --hidden-import signal_timeline_viewer
           --hidden-import sorter
-          --hidden-import transcript
-          --hidden-import transcript_srt
           --hidden-import train_action_recognition
           --hidden-import PySide6.QtCore
           --hidden-import PySide6.QtGui

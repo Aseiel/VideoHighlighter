@@ -72,7 +72,9 @@ def split_audio(video_file, chunk_length=600):
     return sorted(chunks)
 
 def get_transcript_segments(video_file, model_name="small", progress_fn=None, log_fn=print, 
-                           chunk_length=600, cleanup=True, language="en"):
+                           chunk_length=600, cleanup=True, language="en",
+                           enable_diarization=False, num_speakers=None,
+                           min_speakers=None, max_speakers=None):
     """
     Transcribe video safely by splitting into chunks.
     - Uses Whisper for transcription
@@ -156,6 +158,36 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
                 pass
 
     log_fn(f"✅ Transcript ready: {len(all_segments)} segments (from {len(chunks)} chunks)")
+
+    # --- Optional: Speaker diarization & gender estimation ---
+    if enable_diarization:
+        try:
+            from modules.speaker_utils import enrich_segments_with_speakers
+
+            if progress_fn:
+                progress_fn(96, 100, "Diarization", "Identifying speakers...")
+
+            all_segments = enrich_segments_with_speakers(
+                video_path=video_file,
+                whisper_segments=all_segments,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                cleanup_audio=True,
+                log_fn=log_fn
+            )
+
+            if progress_fn:
+                progress_fn(98, 100, "Diarization", "Speaker identification complete")
+
+        except ImportError as e:
+            log_fn(f"⚠️ Diarization module not available: {e}")
+            log_fn("   Install: pip install speechbrain torchaudio librosa scikit-learn")
+            log_fn("   Proceeding without speaker identification")
+        except Exception as e:
+            log_fn(f"⚠️ Diarization failed: {e}")
+            log_fn("   Proceeding without speaker identification")
+
     return all_segments
 
 def search_transcript_for_keywords(transcript_segments, keywords, context_seconds=5):
