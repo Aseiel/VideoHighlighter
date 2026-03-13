@@ -100,8 +100,8 @@ class ProgressTracker:
 
 # Transcript modules (optional)
 try:
-    from transcript import get_transcript_segments, search_transcript_for_keywords
-    from transcript_srt import create_highlight_subtitles, create_enhanced_transcript, create_srt_file, translate_segments
+    from modules.transcript import get_transcript_segments, search_transcript_for_keywords
+    from modules.transcript_srt import create_highlight_subtitles, create_enhanced_transcript, create_srt_file, translate_segments
     TRANSCRIPT_AVAILABLE = True
 except ImportError:
     TRANSCRIPT_AVAILABLE = False
@@ -862,9 +862,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         model_name=TRANSCRIPT_MODEL, 
                         progress_fn=progress_fn, 
                         log_fn=log,
-                        language=TRANSCRIPT_SOURCE_LANG
+                        language=TRANSCRIPT_SOURCE_LANG,
+                        enable_diarization=True
                     )
-
                     
                     check_cancellation(cancel_flag, log, "transcript processing")
                     
