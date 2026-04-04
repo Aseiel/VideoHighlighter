@@ -49,19 +49,9 @@ Intel Action Recognition
 Download manually and place in models/intel_action/:
 
 
-
-Encoder:
-https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/action-recognition-0001/action-recognition-0001-encoder/FP32/
-move to VideoHighlighter/models/intel_action/encoder/FP32/
-
-Decoder:
-https://storage.openvinotoolkit.org/repositories/open_model_zoo/2023.0/models_bin/1/action-recognition-0001/action-recognition-0001-decoder/FP32
-move to VideoHighlighter/models/intel_action/decoder/FP32/
-
-
 Usage
-python main.py 
-
+Linux: python main.py 
+Windows: run Videohighlighter.exe
 
 
 Notes
@@ -76,8 +66,7 @@ This project does not include any paid API keys. Users must provide their own if
 
 License
 
-This repository is released under the MIT License. You are free to use, modify, and distribute the code.
-
+This repository is released under the GNU Affero General Public License v3.0 (AGPLv3). You are free to use, modify, and distribute the code, provided that any modified versions, including those offered over a network, make their complete source code available under the same license.
 
 
 Project Background
