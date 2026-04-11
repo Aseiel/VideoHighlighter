@@ -13,6 +13,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 from action_recognition import run_action_detection, load_models
+from object_recognition import run_object_detection_single
 # modules
 from modules.audio_peaks import extract_audio_peaks
 from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
@@ -20,6 +21,7 @@ from modules.video_cache import VideoAnalysisCache, CachedAnalysisData
 from modules.video_cutter import cut_video
 from modules.auto_segments import build_auto_segments
 from modules.device_utils import resolve_yolo_device
+
 
 
 # Keep warnings about CUDA quiet
@@ -162,193 +164,6 @@ def check_gpu_availability(log_fn=print):
 
 # Keep old name as alias for backward compatibility
 check_xpu_availability = check_gpu_availability
-
-def detect_objects_with_progress(video_path, model, highlight_objects, log_fn=print,
-                                 progress_fn=None, frame_skip=5, cancel_flag=None,
-                                 csv_output="object_log.csv", draw_boxes=False,
-                                 annotated_output=None, yolo_model_size="n",
-                                 yolo_pt_path=None, openvino_model_folder=None,
-                                 device="cpu"):
-    """Object detection with progress tracking, cancellation support, and optional CSV export in mm:ss format"""
-    from modules.device_utils import resolve_yolo_device
-    device = resolve_yolo_device(device)
-    log_fn(f"🖥️ Object detection device (resolved): {device}")
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        log_fn(f"❌ Failed to open video: {video_path}")
-        return {}  # or raise an exception
-    
-    # Get fps for video writer
-    fps_local = cap.get(cv2.CAP_PROP_FPS)
-
-    # Setup video writer if drawing boxes
-    video_writer = None
-    if draw_boxes and annotated_output:
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        video_writer = cv2.VideoWriter(annotated_output, fourcc, fps_local, (frame_width, frame_height))
-        log_fn(f"🎨 Creating object detection annotated video: {annotated_output}")
-
-    # Bounding box visualization settings
-    BBOX_COLORS = {
-        'person': (0, 255, 0),
-        'car': (255, 0, 0),
-        'dog': (0, 165, 255),
-        'cat': (147, 20, 255),
-        'default': (0, 255, 255)
-    }
-    BBOX_THICKNESS = 2
-    FONT_SCALE = 0.6
-    FONT_THICKNESS = 2
-
-    if model is None:
-        log_fn("⚠️ No YOLO model available, skipping object detection")
-        return {}
-
-    def seconds_to_mmss(sec):
-        minutes, seconds = divmod(int(sec), 60)
-        return f"{minutes:02d}:{seconds:02d}"
-
-    cap = cv2.VideoCapture(video_path)
-    fps_local = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total_frames_local = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    total_seconds = int(total_frames_local / fps_local) if fps_local else 0
-
-    if total_seconds <= 0:
-        log_fn("⚠️ Could not determine video duration")
-        cap.release()
-        return {}
-
-    # Create progress tracker
-    progress = ProgressTracker(progress_fn, log_fn)
-    progress.update_progress(0, total_seconds, "Object Detection",
-                             f"Analyzing {seconds_to_mmss(total_seconds)} of video")
-
-    sec_objects = {}
-    frame_idx = 0
-    current_second = -1
-    objects_found = 0
-
-    try:
-        while True:
-            if cancel_flag and cancel_flag.is_set():
-                log_fn("⏹️ Object detection cancelled")
-                break
-
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if frame_idx % frame_skip == 0:
-                sec = int(frame_idx / fps_local)  # keep as integer for calculations
-                if sec > current_second:
-                    if cancel_flag and cancel_flag.is_set():
-                        log_fn("⏹️ Object detection cancelled")
-                        break
-
-                    progress.update_progress(sec, total_seconds, "Object Detection",
-                                             f"Found {objects_found} objects so far ({seconds_to_mmss(sec)})")
-                    current_second = sec
-
-                    try:
-                        results = model(frame, verbose=False, imgsz=640, device=device)
-                        objs = []
-                        annotated_frame = frame.copy() if draw_boxes else None
-                        
-                        for result in results:
-                            if result.boxes is not None:
-                                for box in result.boxes:
-                                    cls_id = int(box.cls[0])
-                                    cls_name = model.names[cls_id]
-                                    conf = float(box.conf[0])
-                                    if conf > 0.3 and cls_name in highlight_objects:
-                                        objs.append(cls_name)
-                                        
-                                        # Draw bounding box if enabled
-                                        if draw_boxes and annotated_frame is not None:
-                                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                                            color = BBOX_COLORS.get(cls_name, BBOX_COLORS['default'])
-                                            
-                                            # Draw rectangle
-                                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, BBOX_THICKNESS)
-                                            
-                                            # Prepare label
-                                            label = f"{cls_name} {conf:.2f}"
-                                            (text_width, text_height), baseline = cv2.getTextSize(
-                                                label, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, FONT_THICKNESS
-                                            )
-                                            
-                                            # Draw background for text
-                                            cv2.rectangle(
-                                                annotated_frame,
-                                                (x1, y1 - text_height - baseline - 5),
-                                                (x1 + text_width, y1),
-                                                color,
-                                                -1
-                                            )
-                                            
-                                            # Draw text
-                                            cv2.putText(
-                                                annotated_frame,
-                                                label,
-                                                (x1, y1 - baseline - 2),
-                                                cv2.FONT_HERSHEY_SIMPLEX,
-                                                FONT_SCALE,
-                                                (255, 255, 255),
-                                                FONT_THICKNESS
-                                            )
-
-                        if objs:
-                            sec_objects.setdefault(sec, []).extend(objs)
-                            objects_found += len(objs)
-                        
-                        # Write annotated frame if enabled
-                        if video_writer and draw_boxes and annotated_frame is not None:
-                            video_writer.write(annotated_frame)
-
-                        if objs:
-                            sec_objects.setdefault(sec, []).extend(objs)  # keep key as int
-                            objects_found += len(objs)
-                        else:
-                            # For frames we skip detection, still write original frame if creating annotated video
-                            if video_writer and draw_boxes:
-                                video_writer.write(frame)
-
-                    except Exception as e:
-                        log_fn(f"⚠️ Error in object detection at frame: {e}")
-
-            frame_idx += 1
-
-    except Exception as e:
-        log_fn(f"❌ Object detection error: {e}")
-    finally:
-        cap.release()
-        if video_writer:
-            video_writer.release()
-            if draw_boxes:
-                log_fn(f"✅ Object detection annotated video saved: {annotated_output}")
-
-        if not (cancel_flag and cancel_flag.is_set()):
-            progress.update_progress(total_seconds, total_seconds, "Object Detection",
-                                     f"Complete - {objects_found} objects found")
-            log_fn(f"✅ Object detection complete: {objects_found} total objects detected")
-
-        # Optional CSV output
-        if csv_output:
-            try:
-                with open(csv_output, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["timestamp_mmss", "timestamp_seconds", "Objects"])
-                    for sec, objs in sorted(sec_objects.items()):
-                        writer.writerow([seconds_to_mmss(sec), sec, ";".join(objs)])
-                log_fn(f"✅ CSV saved to {csv_output}")
-            except Exception as e:
-                log_fn(f"⚠️ Failed to save CSV: {e}")
-
-    return sec_objects
-
 
 def collect_analysis_data(video_path, video_duration, fps, transcript_segments, 
                          object_detections, action_detections, scenes, 
@@ -1092,21 +907,49 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             except Exception as e:
                 log(f"❌ YOLO export to OpenVINO failed: {e}")
 
-        # Load YOLO model — use CUDA .pt model if GPU available, else OpenVINO
+        # Load YOLO model — YOLO-World or Standard YOLO
         try:
             check_cancellation(cancel_flag, log, "YOLO model loading")
             
-            from modules.device_utils import detect_best_device, resolve_yolo_device
-            devices = detect_best_device(log_fn=log)
-            if devices.use_openvino_yolo:
-                yolo_model = YOLO(openvino_model_folder, task="detect")
-                yolo_device_for_inference = "cpu"   # OpenVINO handles device selection internally
-                log(f"✅ YOLO OpenVINO model loaded (OpenVINO manages device)")
+            yolo_type = gui_config.get("yolo_type", "standard")
+            
+            if yolo_type == "yolo_world":
+                # YOLO-World: open-vocabulary detection (no OpenVINO support)
+                from ultralytics import YOLOWorld
+                world_pt = f"yolov8{yolo_model_size}-worldv2.pt"
+                log(f"🌍 Loading YOLO-World model: {world_pt}")
+                yolo_model = YOLOWorld(world_pt)
+                
+                # Set classes from user's object list
+                if highlight_objects:
+                    yolo_model.set_classes(highlight_objects)
+                    log(f"🌍 YOLO-World classes set to: {highlight_objects}")
+                else:
+                    log("⚠️ YOLO-World loaded but no objects specified — nothing will be detected")
+                
+                # Move to GPU if available
+                from modules.device_utils import detect_best_device
+                devices = detect_best_device(log_fn=log)
+                if "cuda" in yolo_device:
+                    yolo_model.to(yolo_device)
+                    yolo_device_for_inference = yolo_device
+                    log(f"✅ YOLO-World loaded on {yolo_device}")
+                else:
+                    yolo_device_for_inference = "cpu"
+                    log(f"✅ YOLO-World loaded on CPU")
             else:
-                yolo_model = YOLO(yolo_pt_path)
-                yolo_model.to(devices.yolo_pt_device)
-                yolo_device_for_inference = devices.yolo_pt_device
-                log(f"✅ YOLO .pt model loaded on {yolo_device_for_inference}")
+                # Standard YOLO11 (supports OpenVINO)
+                from modules.device_utils import detect_best_device, resolve_yolo_device
+                devices = detect_best_device(log_fn=log)
+                if devices.use_openvino_yolo:
+                    yolo_model = YOLO(openvino_model_folder, task="detect")
+                    yolo_device_for_inference = "cpu"
+                    log(f"✅ YOLO OpenVINO model loaded (OpenVINO manages device)")
+                else:
+                    yolo_model = YOLO(yolo_pt_path)
+                    yolo_model.to(devices.yolo_pt_device)
+                    yolo_device_for_inference = devices.yolo_pt_device
+                    log(f"✅ YOLO .pt model loaded on {yolo_device_for_inference}")
 
         except RuntimeError:
             return None
@@ -1132,7 +975,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"🎨 Object bounding boxes enabled, output: {object_annotated_path}")
 
                 # Run detection with cancellation support and bounding boxes
-                object_detections = detect_objects_with_progress(
+                object_detections, object_bboxes_cache = run_object_detection_single(
                     processed_video_path,
                     yolo_model,
                     highlight_objects,
@@ -1142,11 +985,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     cancel_flag=cancel_flag,
                     draw_boxes=draw_object_boxes,
                     annotated_output=object_annotated_path,
-                    yolo_model_size=yolo_model_size,
-                    yolo_pt_path=yolo_pt_path,
-                    openvino_model_folder=openvino_model_folder,
-                    device=yolo_device
+                    device=yolo_device,
+                    confidence_threshold=float(gui_config.get("object_confidence", 0.3)),
                 )
+
 
                 log(f"✅ Object detection complete: {len(object_detections)} seconds with objects")
         else:
