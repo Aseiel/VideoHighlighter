@@ -750,13 +750,28 @@ class VideoHighlighterGUI(QWidget):
         points_layout = QFormLayout()
 
         self.spin_scene_points = QSpinBox(); self.spin_scene_points.setRange(0,100); self.spin_scene_points.setValue(scoring_cfg.get("scene_points", 0))
+        self.spin_scene_points.setToolTip("Points awarded when a new scene cut is detected (abrupt visual change)")
+
         self.spin_motion_event_points = QSpinBox(); self.spin_motion_event_points.setRange(0,100); self.spin_motion_event_points.setValue(scoring_cfg.get("motion_event_points", 0))
+        self.spin_motion_event_points.setToolTip("Points for any frame with detected movement above the threshold")
+
         self.spin_motion_peak = QSpinBox(); self.spin_motion_peak.setRange(0,100); self.spin_motion_peak.setValue(scoring_cfg.get("motion_peak_points", 3))
+        self.spin_motion_peak.setToolTip("Points for a sudden burst of motion followed by stillness (e.g. a goal followed by replay, an explosion then calm)")
+
         self.spin_audio_peak = QSpinBox(); self.spin_audio_peak.setRange(0,100); self.spin_audio_peak.setValue(scoring_cfg.get("audio_peak_points", 0))
+        self.spin_audio_peak.setToolTip("Points when audio intensity spikes (e.g. crowd roar, explosions, bells, loud impacts)")
+
         self.spin_keyword_points = QSpinBox(); self.spin_keyword_points.setRange(0,100); self.spin_keyword_points.setValue(scoring_cfg.get("keyword_points", 2))
+        self.spin_keyword_points.setToolTip("Points when a search keyword (configured in Transcript & Subtitles tab) is found in speech")
+
         self.spin_transcript_points = QSpinBox(); self.spin_transcript_points.setRange(0,100); self.spin_transcript_points.setValue(scoring_cfg.get("transcript_points", 2))
+        self.spin_transcript_points.setToolTip("Points for any moment where speech is detected, regardless of content")
+
         self.spin_object = QSpinBox(); self.spin_object.setRange(0,100); self.spin_object.setValue(scoring_cfg.get("object_points", 1))
+        self.spin_object.setToolTip("Points when a configured object class is detected in the frame")
+
         self.spin_action = QSpinBox(); self.spin_action.setRange(0,1000); self.spin_action.setValue(scoring_cfg.get("action_points", 10))
+        self.spin_action.setToolTip("Points when a configured action is recognized (e.g. punching, jumping, dancing)")
 
         points_layout.addRow("Scene points:", self.spin_scene_points)
         points_layout.addRow("Motion event points:", self.spin_motion_event_points)
@@ -938,69 +953,117 @@ class VideoHighlighterGUI(QWidget):
         transcript_layout.addWidget(subtitle_group)
 
         transcript_tab.setLayout(transcript_layout)
-        tabs.addTab(transcript_tab, "Transcript & Subtitles")
+        tabs.addTab(transcript_tab, "Transcript && Subtitles")
 
-        # --- Tab 3: Advanced Tab ---
+# --- Tab 3: Advanced Tab ---
         advanced_cfg = self.config_data.get("advanced", {})
         visualization_cfg = self.config_data.get("visualization", {})
 
         advanced_tab = QWidget()
         advanced_layout = QVBoxLayout()
-        misc_box = QGroupBox("Advanced / Optional")
-        misc_layout = QFormLayout()
-        self.frame_skip_spin = QSpinBox(); self.frame_skip_spin.setRange(1,30); self.frame_skip_spin.setValue(advanced_cfg.get("frame_skip", 5))
-        self.obj_frame_skip_spin = QSpinBox(); self.obj_frame_skip_spin.setRange(1,60); self.obj_frame_skip_spin.setValue(advanced_cfg.get("object_frame_skip", 10))
 
+        # ── Group 1: Motion Recognition ──
+        motion_box = QGroupBox("Motion Recognition")
+        motion_layout = QFormLayout()
 
-        # === CREATE THE YOLO MODEL COMBOBOX ===
+        self.frame_skip_spin = QSpinBox()
+        self.frame_skip_spin.setRange(1, 30)
+        self.frame_skip_spin.setValue(advanced_cfg.get("frame_skip", 5))
+        self.frame_skip_spin.setToolTip("Analyze every Nth frame for motion detection (higher = faster, less precise)")
+
+        motion_layout.addRow("Frame skip:", self.frame_skip_spin)
+        motion_box.setLayout(motion_layout)
+        advanced_layout.addWidget(motion_box)
+
+        # ── Group 2: Object Recognition ──
+        object_box = QGroupBox("Object Recognition")
+        object_layout = QFormLayout()
+
+        self.obj_frame_skip_spin = QSpinBox()
+        self.obj_frame_skip_spin.setRange(1, 60)
+        self.obj_frame_skip_spin.setValue(advanced_cfg.get("object_frame_skip", 10))
+        self.obj_frame_skip_spin.setToolTip("Analyze every Nth frame for object detection (higher = faster, less precise)")
+
+        self.yolo_type_combo = QComboBox()
+        self.yolo_type_combo.addItem("Standard YOLO11 (80 objects, fast, OpenVINO support)", "standard")
+        self.yolo_type_combo.addItem("YOLO-World (unlimited objects, no OpenVINO)", "yolo_world")
+        current_type = advanced_cfg.get("yolo_type", "standard")
+        idx_type = self.yolo_type_combo.findData(current_type)
+        self.yolo_type_combo.setCurrentIndex(idx_type if idx_type >= 0 else 0)
+
         self.yolo_model_combo = QComboBox()
-        self.yolo_model_combo.addItem("Nano (fastest, lowest accuracy)", "n")
-        self.yolo_model_combo.addItem("Small (fast, good balance)", "s")
-        self.yolo_model_combo.addItem("Medium (balanced)", "m")
-        self.yolo_model_combo.addItem("Large (accurate, slower)", "l")
-        self.yolo_model_combo.addItem("Extra-Large (most accurate, slowest)", "x")
+
+        def on_yolo_type_changed(index):
+            yolo_type = self.yolo_type_combo.currentData()
+            prev_size = self.yolo_model_combo.currentData()
+            self.yolo_model_combo.blockSignals(True)
+            self.yolo_model_combo.clear()
+
+            if yolo_type == "yolo_world":
+                self.yolo_model_combo.addItem("Small (~90MB, fastest)", "s")
+                self.yolo_model_combo.addItem("Medium (~140MB, balanced)", "m")
+                self.yolo_model_combo.addItem("Large (~180MB, most accurate)", "l")
+            else:
+                self.yolo_model_combo.addItem("Nano (fastest, lowest accuracy)", "n")
+                self.yolo_model_combo.addItem("Small (fast, good balance)", "s")
+                self.yolo_model_combo.addItem("Medium (balanced)", "m")
+                self.yolo_model_combo.addItem("Large (accurate, slower)", "l")
+                self.yolo_model_combo.addItem("Extra-Large (most accurate, slowest)", "x")
+
+            restore_idx = self.yolo_model_combo.findData(prev_size)
+            if restore_idx >= 0:
+                self.yolo_model_combo.setCurrentIndex(restore_idx)
+            self.yolo_model_combo.blockSignals(False)
+
+        self.yolo_type_combo.currentIndexChanged.connect(on_yolo_type_changed)
 
         current_model = advanced_cfg.get("yolo_model_size", "n")
+        on_yolo_type_changed(0)
         idx = self.yolo_model_combo.findData(current_model)
         self.yolo_model_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
+        self.obj_confidence_spin = QSpinBox()
+        self.obj_confidence_spin.setRange(5, 95)
+        self.obj_confidence_spin.setSuffix("%")
+        self.obj_confidence_spin.setValue(int(self.config_data.get("objects", {}).get("confidence", 30)))
+        self.obj_confidence_spin.setToolTip("Minimum confidence threshold for object detection (lower = more detections, more false positives)")
 
-        # === YOLO MODEL DROPDOWN ===
-        self.yolo_pt_path = QLineEdit(advanced_cfg.get("yolo_pt_path", ""))
-        self.openvino_model_folder = QLineEdit(advanced_cfg.get("openvino_model_folder", ""))
+        object_layout.addRow("Frame skip:", self.obj_frame_skip_spin)
+        object_layout.addRow("YOLO type:", self.yolo_type_combo)
+        object_layout.addRow("YOLO model size:", self.yolo_model_combo)
+        object_layout.addRow("Confidence threshold:", self.obj_confidence_spin)
+
+        object_box.setLayout(object_layout)
+        advanced_layout.addWidget(object_box)
+
+        # ── Group 3: Action Recognition ──
+        action_box = QGroupBox("Action Recognition")
+        action_layout = QFormLayout()
+
         self.sample_rate_spin = QSpinBox()
-        self.sample_rate_spin.setRange(1,30)  # 1 = process every frame, 30 = every 30th frame
-        self.sample_rate_spin.setValue(advanced_cfg.get("sample_rate", 5))  # default 5
+        self.sample_rate_spin.setRange(1, 30)
+        self.sample_rate_spin.setValue(advanced_cfg.get("sample_rate", 5))
+        self.sample_rate_spin.setToolTip("Sample every Nth frame for action recognition clips")
 
-        misc_layout.addRow("Frame skip (motion):", self.frame_skip_spin)
-        misc_layout.addRow("Frame skip (objects):", self.obj_frame_skip_spin)
-        misc_layout.addRow("Sample rate (actions):", self.sample_rate_spin)
-        misc_layout.addRow("YOLO model size:", self.yolo_model_combo)
-        misc_layout.addRow("YOLO .pt path (optional):", self.yolo_pt_path)
-        misc_layout.addRow("OpenVINO model folder (optional):", self.openvino_model_folder)
-        # === ACTION RECOGNITION BACKEND ===
-        # === ACTION RECOGNITION BACKEND ===
         self.action_backend_combo = QComboBox()
         self.action_backend_combo.addItem("Auto (CUDA / OpenVINO / CPU)", "auto")
         self.action_backend_combo.addItem("OpenVINO (Intel GPU / CPU)", "openvino")
         self.action_backend_combo.addItem("R3D + CUDA (NVIDIA GPU)", "r3d_cuda")
         self.action_backend_combo.addItem("R3D + CPU (PyTorch, slow)", "r3d_cpu")
-
         current_backend = advanced_cfg.get("action_backend", "auto")
         idx_ab = self.action_backend_combo.findData(current_backend)
         self.action_backend_combo.setCurrentIndex(idx_ab if idx_ab >= 0 else 0)
 
-        # === ACTION MODELS (which decoders to load) ===
-        self.action_models_combo = QComboBox()
         self._intel_count = len(self.load_labels_from_json(KINETICS_400_LABELS_FILE)) if os.path.exists(KINETICS_400_LABELS_FILE) else 0
         self._custom_ov_count = len(self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)) if os.path.exists(INTEL_CUSTOM_LABELS_FILE) else 0
         self._r3d_custom_count = len(self.load_labels_from_json(R3D_CUSTOM_LABELS_FILE)) if os.path.exists(R3D_CUSTOM_LABELS_FILE) else 0
+
+        self.action_models_combo = QComboBox()
 
         self.r3d_model_combo = QComboBox()
         self.r3d_model_combo.addItem("R3D-18 (fastest)", "r3d_18")
         self.r3d_model_combo.addItem("MC3-18 (mixed convolution)", "mc3_18")
         self.r3d_model_combo.addItem("R(2+1)D-18 (most accurate)", "r2plus1d_18")
-
         current_r3d = advanced_cfg.get("r3d_model", "r3d_18")
         idx_r3d = self.r3d_model_combo.findData(current_r3d)
         self.r3d_model_combo.setCurrentIndex(idx_r3d if idx_r3d >= 0 else 0)
@@ -1009,15 +1072,11 @@ class VideoHighlighterGUI(QWidget):
             backend = self.action_backend_combo.currentData()
             self.r3d_model_combo.setEnabled(backend in ("auto", "r3d_cuda", "r3d_cpu"))
 
-            # Remember current selection to restore if still valid
             prev_data = self.action_models_combo.currentData()
-
-            # Rebuild combo with only compatible models
             self.action_models_combo.blockSignals(True)
             self.action_models_combo.clear()
 
             if backend in ("openvino",):
-                # OpenVINO decoders only
                 if self._intel_count:
                     self.action_models_combo.addItem(f"Intel Kinetics-400 ({self._intel_count} classes)", "intel_only")
                 if self._custom_ov_count:
@@ -1025,9 +1084,7 @@ class VideoHighlighterGUI(QWidget):
                 if self._intel_count and self._custom_ov_count:
                     total = self._intel_count + self._custom_ov_count
                     self.action_models_combo.addItem(f"Mixed — both decoders ({total} classes)", "mixed")
-
             elif backend in ("r3d_cuda", "r3d_cpu"):
-                # R3D models only
                 if self._intel_count:
                     self.action_models_combo.addItem(f"R3D Kinetics-400 pretrained ({self._intel_count} classes)", "intel_only")
                 if self._r3d_custom_count:
@@ -1035,9 +1092,7 @@ class VideoHighlighterGUI(QWidget):
                 if self._intel_count and self._r3d_custom_count:
                     total = self._intel_count + self._r3d_custom_count
                     self.action_models_combo.addItem(f"Mixed — both R3D ({total} classes)", "mixed")
-
             else:
-                # Auto — show everything available
                 if self._intel_count:
                     self.action_models_combo.addItem(f"Intel Kinetics-400 ({self._intel_count} classes)", "intel_only")
                 if self._custom_ov_count:
@@ -1049,54 +1104,50 @@ class VideoHighlighterGUI(QWidget):
                     total = self._intel_count + self._custom_ov_count + self._r3d_custom_count
                     self.action_models_combo.addItem(f"Mixed — all models ({total} classes)", "mixed")
 
-            # Restore previous selection if still valid
             restore_idx = self.action_models_combo.findData(prev_data)
             if restore_idx >= 0:
                 self.action_models_combo.setCurrentIndex(restore_idx)
-
             self.action_models_combo.blockSignals(False)
             self.update_actions_completer()
 
         self.action_backend_combo.currentIndexChanged.connect(on_action_backend_changed)
-        self.action_models_combo.currentIndexChanged.connect(
-            lambda: self.update_actions_completer())
+        self.action_models_combo.currentIndexChanged.connect(lambda: self.update_actions_completer())
         on_action_backend_changed(0)
         current_action_models = advanced_cfg.get("action_models", "mixed")
         restore_idx = self.action_models_combo.findData(current_action_models)
         if restore_idx >= 0:
             self.action_models_combo.setCurrentIndex(restore_idx)
 
+        action_layout.addRow("Frame skip:", self.sample_rate_spin)
+        action_layout.addRow("Backend:", self.action_backend_combo)
+        action_layout.addRow("Models:", self.action_models_combo)
+        action_layout.addRow("R3D model variant:", self.r3d_model_combo)
 
-        misc_layout.addRow("Action recognition backend:", self.action_backend_combo)
-        misc_layout.addRow("Action models:", self.action_models_combo)
-        misc_layout.addRow("R3D model variant:", self.r3d_model_combo)
+        action_box.setLayout(action_layout)
+        advanced_layout.addWidget(action_box)
 
-        misc_box.setLayout(misc_layout)
-
-        misc_box.setLayout(misc_layout)
-        advanced_layout.addWidget(misc_box)
-        
-        # --- Bounding Box Visualization Options ---
+        # ── Group 4: Bounding Box Visualization ──
         bbox_box = QGroupBox("Bounding Box Visualization")
         bbox_layout = QVBoxLayout()
-        
+
         info_label = QLabel("ℹ️ Enable bounding boxes, creates new file with extension _annotated.mp4 for debugging")
         info_label.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
         bbox_layout.addWidget(info_label)
-        
+
         self.bbox_objects_chk = QCheckBox("Draw bounding boxes for object detection")
         self.bbox_objects_chk.setChecked(visualization_cfg.get("draw_object_boxes", False))
         self.bbox_objects_chk.setToolTip("Visualize detected objects with labeled bounding boxes")
         bbox_layout.addWidget(self.bbox_objects_chk)
-        
+
         self.bbox_actions_chk = QCheckBox("Draw labels for action recognition")
         self.bbox_actions_chk.setChecked(visualization_cfg.get("draw_action_labels", False))
         self.bbox_actions_chk.setToolTip("Display detected action names on frames")
         bbox_layout.addWidget(self.bbox_actions_chk)
-        
+
         bbox_box.setLayout(bbox_layout)
         advanced_layout.addWidget(bbox_box)
-        
+
+        advanced_layout.addStretch()
         advanced_tab.setLayout(advanced_layout)
         tabs.addTab(advanced_tab, "Advanced")
 
@@ -1142,6 +1193,7 @@ class VideoHighlighterGUI(QWidget):
         layout.addWidget(QLabel("Log Output:"))
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
+        self.log_output.setMinimumHeight(100)
         self.log_output.setStyleSheet("QTextEdit { font-family: 'Courier New', monospace; font-size: 9pt; }")
         layout.addWidget(self.log_output)
 
@@ -1462,9 +1514,8 @@ class VideoHighlighterGUI(QWidget):
             "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
+            "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_pt_path": self.yolo_pt_path.text().strip() or None,
-            "openvino_model_folder": self.openvino_model_folder.text().strip() or None,
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
@@ -1474,6 +1525,7 @@ class VideoHighlighterGUI(QWidget):
             "action_backend": self.action_backend_combo.currentData(),
             "r3d_model": self.r3d_model_combo.currentData(),
             "action_models": self.action_models_combo.currentData(),
+            "object_confidence": self.obj_confidence_spin.value() / 100.0,
         }
       
         # Add time range if enabled
@@ -1981,7 +2033,10 @@ class VideoHighlighterGUI(QWidget):
                 "interesting": get_text_list(self.actions_input),
                 "require_objects": self.actions_require_objects_chk.isChecked()
             },
-            "objects": {"interesting": get_text_list(self.objects_input)},
+            "objects": {
+                "interesting": get_text_list(self.objects_input),
+                "confidence": self.obj_confidence_spin.value(),
+            },
             "keywords": {
                 "transcript_file": "transcript.txt",
                 "interesting": get_text_list(self.search_keywords_input),
@@ -2001,9 +2056,8 @@ class VideoHighlighterGUI(QWidget):
                 "frame_skip": int(self.frame_skip_spin.value()),
                 "object_frame_skip": int(self.obj_frame_skip_spin.value()),
                 "sample_rate": int(self.sample_rate_spin.value()),
+                "yolo_type": self.yolo_type_combo.currentData(),
                 "yolo_model_size": self.yolo_model_combo.currentData(),
-                "yolo_pt_path": self.yolo_pt_path.text().strip(),
-                "openvino_model_folder": self.openvino_model_folder.text().strip(),
                 "action_backend": self.action_backend_combo.currentData(),
                 "r3d_model": self.r3d_model_combo.currentData(),
                 "action_models": self.action_models_combo.currentData(),
@@ -2614,9 +2668,8 @@ class VideoHighlighterGUI(QWidget):
             "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
+            "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_pt_path": self.yolo_pt_path.text().strip() or None,
-            "openvino_model_folder": self.openvino_model_folder.text().strip() or None,
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
