@@ -55,9 +55,11 @@ class SignalTimelineScene(QGraphicsScene):
         self.visible_actions = {action: True for action in self.action_types}
         self.visible_objects = {obj: True for obj in self.object_classes}
         
-        # NEW: Confidence filters (0.0 to 1.0 scale)
-        self.min_confidence = 0.0  # Minimum confidence threshold
-        self.max_confidence = 1.0  # Maximum confidence threshold
+        # Confidence filters — separate for actions and objects
+        self.min_action_confidence = 0.0
+        self.max_action_confidence = 1.0
+        self.min_object_confidence = 0.0
+        self.max_object_confidence = 1.0
         
         # Define logical groups (order matters)
         self.group_order = [
@@ -453,8 +455,8 @@ class SignalTimelineScene(QGraphicsScene):
         # If no visible actions, still show the layer but empty
         if not action_groups:
             # Show filter status message
-            if self.min_confidence > 0 or self.max_confidence < 1:
-                text = self.addText(f"(filtered: confidence {self.min_confidence:.1f}-{self.max_confidence:.1f})", 
+            if self.min_action_confidence > 0 or self.max_action_confidence < 1:
+                text = self.addText(f"(filtered: confidence {self.min_action_confidence:.0%}-{self.max_action_confidence:.0%})",
                                    QFont("Arial", 9))
             else:
                 text = self.addText("(no actions)", QFont("Arial", 9))
@@ -519,8 +521,8 @@ class SignalTimelineScene(QGraphicsScene):
         # If no visible objects, still show the layer but empty
         if not object_groups:
             # Show filter status message
-            if self.min_confidence > 0 or self.max_confidence < 1:
-                text = self.addText(f"(filtered: confidence {self.min_confidence:.1f}-{self.max_confidence:.1f})", 
+            if self.min_object_confidence > 0 or self.max_object_confidence < 1:
+                text = self.addText(f"(filtered: confidence {self.min_object_confidence:.0%}-{self.max_object_confidence:.0%})",
                                    QFont("Arial", 9))
             else:
                 text = self.addText("(no objects)", QFont("Arial", 9))
@@ -683,7 +685,7 @@ class SignalTimelineScene(QGraphicsScene):
         gradient.setColorAt(0, light_color)
         gradient.setColorAt(1, color)
         
-        # FIX: Create draggable item instead of regular rectangle
+        # Create draggable item instead of regular rectangle
         bar.scene = self  # Set reference to scene
         draggable_item = DraggableTimelineBar(bar, x, width)
         self.addItem(draggable_item)
@@ -814,7 +816,10 @@ class SignalTimelineScene(QGraphicsScene):
         
         # Add confidence if available
         if bar.confidence is not None:
-            tooltip_lines.append(f"Confidence: {bar.confidence}/10")
+            if bar.confidence <= 1.0:
+                tooltip_lines.append(f"Confidence: {bar.confidence:.0%}")
+            else:
+                tooltip_lines.append(f"Confidence: {bar.confidence:.1f}/10")
         
         # Add metadata
         if bar.metadata:
@@ -981,70 +986,43 @@ class SignalTimelineScene(QGraphicsScene):
             self._selection_rect_item.mapFromScene(scene_pos)
         )
        
-    def set_confidence_filter(self, min_confidence, max_confidence=None):
-        """Set confidence filter range (0.0 to 1.0)"""
-        self.min_confidence = max(0.0, min(min_confidence, 1.0))
-        if max_confidence is not None:
-            self.max_confidence = min(1.0, max(max_confidence, 0.0))
-        else:
-            self.max_confidence = 1.0
-        
-        # Rebuild timeline with new filters
+    def set_action_confidence_filter(self, min_conf, max_conf=1.0):
+        self.min_action_confidence = max(0.0, min(min_conf, 1.0))
+        self.max_action_confidence = min(1.0, max(max_conf, 0.0))
         self.build_timeline()
-        
-        # Emit filter change signal
-        self.filter_changed.emit({
-            'actions': self.visible_actions.copy(),
-            'objects': self.visible_objects.copy(),
-            'min_confidence': self.min_confidence,
-            'max_confidence': self.max_confidence
-        })
+
+    def set_object_confidence_filter(self, min_conf, max_conf=1.0):
+        self.min_object_confidence = max(0.0, min(min_conf, 1.0))
+        self.max_object_confidence = min(1.0, max(max_conf, 0.0))
+        self.build_timeline()
     
     def should_show_action(self, action_data):
-        """Check if an action should be shown based on filters"""
         action_name = action_data.get('action_name') or action_data.get('action') or 'Unknown'
         action_name = action_name.strip().title()
-        
-        # Check if action type is visible
         if not self.visible_actions.get(action_name, True):
             return False
-        
-        # Check confidence filter
         confidence = action_data.get('confidence')
         if confidence is not None:
-            # Normalize confidence to 0-1 scale
-            if confidence > 1.0:  # Assuming 0-10 scale
+            if confidence > 1.0:
                 confidence = confidence / 10.0
-            
-            if confidence < self.min_confidence or confidence > self.max_confidence:
+            if confidence < self.min_action_confidence or confidence > self.max_action_confidence:
                 return False
-        
         return True
     
     def should_show_object(self, obj_data):
-        """Check if an object should be shown based on filters"""
-        # For objects, we check each object in the detection
         objects = obj_data.get('objects', [])
-        timestamp = obj_data.get('timestamp', 0)
-        
-        # Check if any visible objects are in this detection
         for obj_name in objects:
             if isinstance(obj_name, str):
                 obj_name = obj_name.strip().title()
                 if obj_name in self.visible_objects and self.visible_objects[obj_name]:
-                    # Check confidence if available
                     confidence = obj_data.get('confidence')
                     if confidence is not None:
-                        # Normalize confidence to 0-1 scale
                         if confidence > 1.0:
                             confidence = confidence / 10.0
-                        
-                        if confidence >= self.min_confidence and confidence <= self.max_confidence:
+                        if confidence >= self.min_object_confidence and confidence <= self.max_object_confidence:
                             return True
                     else:
-                        # No confidence data, show it
                         return True
-        
         return False
 
 class SignalTimelineView(QGraphicsView):

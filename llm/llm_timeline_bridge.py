@@ -179,7 +179,7 @@ class TimelineBridge:
                 parts.append(f"Hidden actions: {', '.join(hidden_actions)}")
             if hidden_objects:
                 parts.append(f"Hidden objects: {', '.join(hidden_objects)}")
-            if scene.min_confidence > 0 or scene.max_confidence < 1:
+            if scene.min_action_confidence > 0 or scene.max_action_confidence < 1 or scene.min_object_confidence > 0 or scene.max_object_confidence < 1:
                 parts.append(f"Confidence filter: {scene.min_confidence:.2f} - {scene.max_confidence:.2f}")
 
         return "\n".join(parts)

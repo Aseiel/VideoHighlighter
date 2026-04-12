@@ -124,13 +124,15 @@ class _VisualSearchWorker(QThread):
 
     def __init__(self, analyzer: VideoSeekAnalyzer, target: str,
                  interval: float = 1.0, max_seeks: int = 100,
-                 stop_on_first_match: bool = True):
+                 stop_on_first_match: bool = True,
+                 start_time: float = 0.0):
         super().__init__()
         self.analyzer = analyzer
         self.target = target
         self.interval = interval
         self.max_seeks = max_seeks
         self.stop_on_first_match = stop_on_first_match
+        self.start_time = start_time
         self._cancel_token = CancellationToken()
 
     def cancel(self):
@@ -142,7 +144,7 @@ class _VisualSearchWorker(QThread):
             
             # Calculate timestamps
             num_analyses = min(int(self.analyzer.duration / self.interval) + 1, self.max_seeks)
-            timestamps = [i * self.interval for i in range(num_analyses)]
+            timestamps = [self.start_time + i * self.interval for i in range(num_analyses)]
             
             for i, timestamp in enumerate(timestamps):
                 # Check cancellation token (works even mid-generation)
@@ -377,6 +379,15 @@ class LLMChatWidget(QWidget):
         self.search_target.setPlaceholderText("explosion, person, car, etc.")
         search_layout.addWidget(self.search_target)
         
+        search_layout.addWidget(QLabel("From:"))
+        self.search_start_time = QDoubleSpinBox()
+        self.search_start_time.setRange(0, 99999)
+        self.search_start_time.setValue(0)
+        self.search_start_time.setSingleStep(10)
+        self.search_start_time.setSuffix("s")
+        self.search_start_time.setToolTip("Start searching from this timestamp (0 = beginning)")
+        search_layout.addWidget(self.search_start_time)
+
         search_layout.addWidget(QLabel("Interval (s):"))
         self.search_interval = QDoubleSpinBox()
         self.search_interval.setRange(0.5, 120.0)  # Allow up to 120s intervals
@@ -446,7 +457,7 @@ class LLMChatWidget(QWidget):
 
         settings_group.setLayout(settings_layout)
         if self._compact:
-            settings_group.setMaximumHeight(250)
+            settings_group.setMaximumHeight(450)
         root.addWidget(settings_group)
 
         # --- Chat display ---
@@ -521,19 +532,18 @@ class LLMChatWidget(QWidget):
         if hasattr(self, 'reasoning_checkbox') and self.reasoning_checkbox.isChecked():
             try:
                 from .llm_reasoning import ReasoningLLMIntegration
-                if self._llm and self._llm.is_loaded():
-                    self.reasoning_engine = ReasoningLLMIntegration(
-                        self._llm, data, video_path
-                    )
-                    stats = self.reasoning_engine.reasoning_engine.get_action_statistics()
+                llm = self._llm if (self._llm and self._llm.is_loaded()) else None
+                self.reasoning_engine = ReasoningLLMIntegration(
+                    llm, data, video_path
+                )
+                stats = self.reasoning_engine.reasoning_engine.get_action_statistics()
+                self._append_system(
+                    f"🧠 Reasoning engine initialized with {stats['total_actions']} actions analyzed"
+                )
+                if not llm:
                     self._append_system(
-                        f"🧠 Reasoning engine initialized with {stats['total_actions']} actions analyzed"
+                        "ℹ️ Stats available now. Connect a model for reasoning questions."
                     )
-                else:
-                    self._append_system(
-                        "⚠️ LLM not connected yet. Reasoning engine will initialize when you connect."
-                    )
-                    self._pending_reasoning_data = data
             except Exception as e:
                 self._append_system(f"⚠️ Could not initialize reasoning: {e}")
                 self.reasoning_engine = None
@@ -553,6 +563,20 @@ class LLMChatWidget(QWidget):
                 "Examples: 'add a clip at 0:10 to 0:15', 'remove clip 2', "
                 "'show only person detections', 'play the clip at 0:30'"
             )
+
+        # Always grab video path from timeline window
+        if hasattr(window, 'video_path') and window.video_path:
+            self._video_path = window.video_path
+            self._update_context_label()
+
+        # Sync search start time with timeline clicks
+        if hasattr(window, 'signal_scene'):
+            window.signal_scene.time_clicked.connect(self._update_search_start_time)
+
+    def _update_search_start_time(self, time):
+        """Update visual search start time when user clicks timeline."""
+        if hasattr(self, 'search_start_time'):
+            self.search_start_time.setValue(time)
 
     def get_llm_module(self) -> Optional[LLMModule]:
         return self._llm
@@ -647,11 +671,14 @@ class LLMChatWidget(QWidget):
             self._search_worker.cancel()
         
         interval = self.search_interval.value()
-        max_seeks = int(self._analyzer.duration / interval) + 1
+        start_from = self.search_start_time.value()
+        remaining = max(0, self._analyzer.duration - start_from)
+        max_seeks = int(remaining / interval) + 1
         stop_on_match = self.stop_on_match_cb.isChecked()
         
         mode_str = "stop on first match" if stop_on_match else "scan entire video"
-        self._append_system(f"🔍 Starting visual search for '{target}' every {interval}s ({mode_str})...")
+        start_str = f"{int(start_from)//60}:{int(start_from)%60:02d}"
+        self._append_system(f"🔍 Starting visual search for '{target}' from {start_str} every {interval}s ({mode_str})...")
         self.search_progress.setText(f"Searching for '{target}'...")
         self.search_btn.setEnabled(False)
         self.stop_search_btn.setEnabled(True)
@@ -663,6 +690,7 @@ class LLMChatWidget(QWidget):
             interval=interval,
             max_seeks=max_seeks,
             stop_on_first_match=stop_on_match,
+            start_time=start_from,
         )
         self._search_worker.progress.connect(self._on_search_progress)
         self._search_worker.frame_analyzed.connect(self._on_frame_analyzed)
@@ -995,7 +1023,10 @@ class LLMChatWidget(QWidget):
         branch, and handles missing attributes gracefully.
         """
         if not hasattr(self, 'reasoning_engine') or not self.reasoning_engine:
-            self._append_system("⚠️ Reasoning engine not initialized. Load a cache file first.")
+            if self._analysis_data:
+                self._append_system("⚠️ Reasoning engine not initialized. Try toggling 'Enable reasoning' checkbox.")
+            else:
+                self._append_system("⚠️ No analysis data loaded. Load a cache file first.")
             return
         
         try:
@@ -1130,7 +1161,6 @@ class LLMChatWidget(QWidget):
         gguf_path = ""
         mmproj_path = None
 
-
         self.status_label.setText("Connecting...")
         self.status_label.setStyleSheet("color:#2196F3;font-style:italic;")
         self.connect_btn.setEnabled(False)
@@ -1183,19 +1213,10 @@ class LLMChatWidget(QWidget):
             if self._video_path and os.path.exists(self._video_path):
                 self._init_analyzer()
 
-            if hasattr(self, '_pending_reasoning_data') and self._pending_reasoning_data:
-                try:
-                    from .llm_reasoning import ReasoningLLMIntegration
-                    self.reasoning_engine = ReasoningLLMIntegration(
-                        self._llm, self._pending_reasoning_data, self._video_path
-                    )
-                    stats = self.reasoning_engine.reasoning_engine.get_action_statistics()
-                    self._append_system(
-                        f"🧠 Reasoning engine initialized with {stats['total_actions']} actions analyzed"
-                    )
-                    delattr(self, '_pending_reasoning_data')
-                except Exception as e:
-                    self._append_system(f"⚠️ Could not initialize reasoning: {e}")
+            # Update reasoning engine with now-connected LLM
+            if hasattr(self, 'reasoning_engine') and self.reasoning_engine:
+                self.reasoning_engine.llm = self._llm
+                self._append_system("🧠 Reasoning engine now has LLM — 'why' questions enabled")
 
             if self._analysis_data:
                 n_obj = len(self._analysis_data.get("objects", []))

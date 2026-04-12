@@ -23,6 +23,7 @@ Optional GUI for easy interaction.
 ![VideoHighlighter](assets/Highlighter.png)
 ![Transcript Subtitles](assets/Transcript_Subtitles.png)
 ![Transcript Subtitles](assets/TimelineViewer.png)
+![Visual Search](assets/VisualSearch.png)
 ![Action Recognition](assets/power_rangers_actions_annotated.gif)
 
 
@@ -44,10 +45,6 @@ For GUI: PySide6
 
 3. Download Models
 The code will automatically download YOLO models on first run.
-
-Intel Action Recognition
-Download manually and place in models/intel_action/:
-
 
 Usage
 Linux: python main.py 
