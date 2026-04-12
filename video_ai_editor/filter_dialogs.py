@@ -211,220 +211,157 @@ class FilterDialog(QDialog):
         self.accept()
 
 class ConfidenceFilterDialog(QDialog):
-    """Dialog for filtering by confidence level"""
+    """Dialog for filtering by confidence level — separate for actions and objects"""
     def __init__(self, scene, parent=None):
         super().__init__(parent)
         self.scene = scene
         self.setWindowTitle("Confidence Filter")
         self.setModal(False)
-        self.resize(400, 300)
+        self.resize(450, 400)
         self.init_ui()
 
     def init_ui(self):
-        """Initialize the confidence filter UI"""
         layout = QVBoxLayout(self)
-        
-        # Title
+
         title = QLabel("Filter by Confidence Level")
         title.setStyleSheet("font-weight: bold; font-size: 14px; color: #a0c0ff;")
         layout.addWidget(title)
-        
-        # Description
-        desc = QLabel("Adjust the confidence range to filter actions and objects.\nConfidence range: 0.0 (low) to 1.0 (high)")
+
+        desc = QLabel("Adjust minimum confidence separately for actions and objects.")
         desc.setStyleSheet("color: #cccccc; font-size: 11px;")
         desc.setWordWrap(True)
         layout.addWidget(desc)
-        
-        # Current range display
-        self.range_label = QLabel(f"Current: {self.scene.min_confidence:.2f} - {self.scene.max_confidence:.2f}")
-        self.range_label.setStyleSheet("font-weight: bold; color: #a0ffa0;")
-        layout.addWidget(self.range_label)
-        
-        # Minimum confidence slider
-        min_group = QGroupBox("Minimum Confidence")
-        min_layout = QVBoxLayout()
-        
-        self.min_slider = QSlider(Qt.Horizontal)
-        self.min_slider.setRange(0, 100)
-        self.min_slider.setValue(int(self.scene.min_confidence * 100))
-        self.min_slider.valueChanged.connect(self.on_slider_changed)
-        
-        self.min_value_label = QLabel(f"{self.scene.min_confidence:.2f}")
-        self.min_value_label.setStyleSheet("color: #ffa0a0;")
-        
-        min_layout.addWidget(self.min_slider)
-        min_layout.addWidget(self.min_value_label)
-        min_group.setLayout(min_layout)
-        layout.addWidget(min_group)
-        
-        # Maximum confidence slider
-        max_group = QGroupBox("Maximum Confidence")
-        max_layout = QVBoxLayout()
-        
-        self.max_slider = QSlider(Qt.Horizontal)
-        self.max_slider.setRange(0, 100)
-        self.max_slider.setValue(int(self.scene.max_confidence * 100))
-        self.max_slider.valueChanged.connect(self.on_slider_changed)
-        
-        self.max_value_label = QLabel(f"{self.scene.max_confidence:.2f}")
-        self.max_value_label.setStyleSheet("color: #ffa0a0;")
-        
-        max_layout.addWidget(self.max_slider)
-        max_layout.addWidget(self.max_value_label)
-        max_group.setLayout(max_layout)
-        layout.addWidget(max_group)
-        
-        # Preset buttons
+
+        # ── Actions confidence ──
+        action_group = QGroupBox("🎬 Action Confidence")
+        action_layout = QVBoxLayout()
+
+        self.action_slider = QSlider(Qt.Horizontal)
+        self.action_slider.setRange(0, 100)
+        self.action_slider.setValue(int(self.scene.min_action_confidence * 100))
+        self.action_slider.valueChanged.connect(self.on_slider_changed)
+
+        self.action_label = QLabel(f"{self.scene.min_action_confidence:.0%}")
+        self.action_label.setStyleSheet("color: #a0ffa0; font-weight: bold;")
+
+        action_layout.addWidget(self.action_slider)
+        action_layout.addWidget(self.action_label)
+        action_group.setLayout(action_layout)
+        layout.addWidget(action_group)
+
+        # ── Objects confidence ──
+        object_group = QGroupBox("📦 Object Confidence")
+        object_layout = QVBoxLayout()
+
+        self.object_slider = QSlider(Qt.Horizontal)
+        self.object_slider.setRange(0, 100)
+        self.object_slider.setValue(int(self.scene.min_object_confidence * 100))
+        self.object_slider.valueChanged.connect(self.on_slider_changed)
+
+        self.object_label = QLabel(f"{self.scene.min_object_confidence:.0%}")
+        self.object_label.setStyleSheet("color: #ffa0a0; font-weight: bold;")
+
+        object_layout.addWidget(self.object_slider)
+        object_layout.addWidget(self.object_label)
+        object_group.setLayout(object_layout)
+        layout.addWidget(object_group)
+
+        # ── Presets ──
         preset_layout = QHBoxLayout()
-        
-        high_btn = QPushButton("High (0.7-1.0)")
-        high_btn.clicked.connect(lambda: self.set_range(0.7, 1.0))
-        
-        medium_btn = QPushButton("Medium (0.4-0.7)")
-        medium_btn.clicked.connect(lambda: self.set_range(0.4, 0.7))
-        
-        low_btn = QPushButton("Low (0.0-0.4)")
-        low_btn.clicked.connect(lambda: self.set_range(0.0, 0.4))
-        
-        all_btn = QPushButton("All (0.0-1.0)")
-        all_btn.clicked.connect(lambda: self.set_range(0.0, 1.0))
-        
+
+        high_btn = QPushButton("High (70%)")
+        high_btn.clicked.connect(lambda: self.set_both(70))
+        medium_btn = QPushButton("Medium (40%)")
+        medium_btn.clicked.connect(lambda: self.set_both(40))
+        low_btn = QPushButton("Low (10%)")
+        low_btn.clicked.connect(lambda: self.set_both(10))
+        all_btn = QPushButton("All (0%)")
+        all_btn.clicked.connect(lambda: self.set_both(0))
+
         preset_layout.addWidget(high_btn)
         preset_layout.addWidget(medium_btn)
         preset_layout.addWidget(low_btn)
         preset_layout.addWidget(all_btn)
         layout.addLayout(preset_layout)
-        
-        # Statistics
+
+        # ── Stats ──
         self.stats_label = QLabel()
         self.stats_label.setStyleSheet("color: #cccccc; font-size: 10px; margin-top: 10px;")
         self.stats_label.setWordWrap(True)
         layout.addWidget(self.stats_label)
-        
-        # Update initial statistics
         self.update_statistics()
-        
-        # Dialog buttons
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Apply | QDialogButtonBox.Close
-        )
+
+        # ── Buttons ──
+        buttons = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Close)
         buttons.button(QDialogButtonBox.Apply).clicked.connect(self.apply_filters)
         buttons.button(QDialogButtonBox.Close).clicked.connect(self.close)
         layout.addWidget(buttons)
-        
-        # Apply dark theme
+
         self.setStyleSheet("""
-            QDialog {
-                background-color: #1a1a2a;
-            }
+            QDialog { background-color: #1a1a2a; }
             QGroupBox {
-                color: #d0e0ff;
-                border: 1px solid #3a3a50;
-                border-radius: 6px;
-                margin-top: 14px;
-                padding-top: 10px;
+                color: #d0e0ff; border: 1px solid #3a3a50;
+                border-radius: 6px; margin-top: 14px; padding-top: 10px;
                 font-weight: bold;
             }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-            QSlider::groove:horizontal {
-                height: 8px;
-                background: #3a3a5a;
-                border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: #3a5fcd;
-                width: 18px;
-                margin: -5px 0;
-                border-radius: 9px;
-            }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
+            QSlider::groove:horizontal { height: 8px; background: #3a3a5a; border-radius: 4px; }
+            QSlider::handle:horizontal { background: #3a5fcd; width: 18px; margin: -5px 0; border-radius: 9px; }
             QPushButton {
-                background-color: #2a2a44;
-                color: white;
-                border: 1px solid #4a4a6a;
-                padding: 6px;
-                border-radius: 4px;
+                background-color: #2a2a44; color: white;
+                border: 1px solid #4a4a6a; padding: 6px; border-radius: 4px;
             }
-            QPushButton:hover {
-                background-color: #3a3a5c;
-            }
+            QPushButton:hover { background-color: #3a3a5c; }
         """)
 
-
-
     def on_slider_changed(self):
-        """Update labels when sliders change"""
-        min_val = self.min_slider.value() / 100.0
-        max_val = self.max_slider.value() / 100.0
-        
-        # Ensure min <= max
-        if min_val > max_val:
-            self.max_slider.setValue(int(min_val * 100))
-            max_val = min_val
-        
-        self.min_value_label.setText(f"{min_val:.2f}")
-        self.max_value_label.setText(f"{max_val:.2f}")
-        self.range_label.setText(f"Current: {min_val:.2f} - {max_val:.2f}")
-        
-        # Update statistics preview (without applying)
+        action_val = self.action_slider.value() / 100.0
+        object_val = self.object_slider.value() / 100.0
+        self.action_label.setText(f"{action_val:.0%}")
+        self.object_label.setText(f"{object_val:.0%}")
         self.update_statistics()
 
-    def set_range(self, min_val, max_val):
-        """Set range from preset"""
-        self.min_slider.setValue(int(min_val * 100))
-        self.max_slider.setValue(int(max_val * 100))
-        self.on_slider_changed()
+    def set_both(self, percent):
+        self.action_slider.setValue(percent)
+        self.object_slider.setValue(percent)
 
     def update_statistics(self):
-        """Update filter statistics preview"""
-        min_val = self.min_slider.value() / 100.0
-        max_val = self.max_slider.value() / 100.0
-        
-        # Count items that would be visible with these settings
+        action_min = self.action_slider.value() / 100.0
+        object_min = self.object_slider.value() / 100.0
+
         total_actions = len(self.scene.cache_data.get('actions', []))
         total_objects = len(self.scene.cache_data.get('objects', []))
-        
+
         visible_actions = 0
         for action in self.scene.cache_data.get('actions', []):
-            confidence = action.get('confidence')
-            if confidence is not None:
-                if confidence > 1.0:
-                    confidence = confidence / 10.0
-                if min_val <= confidence <= max_val:
+            conf = action.get('confidence')
+            if conf is not None:
+                if conf > 1.0:
+                    conf = conf / 10.0
+                if conf >= action_min:
                     visible_actions += 1
             else:
-                visible_actions += 1  # Count items without confidence
-        
+                visible_actions += 1
+
         visible_objects = 0
-        for obj_data in self.scene.cache_data.get('objects', []):
-            confidence = obj_data.get('confidence')
-            if confidence is not None:
-                if confidence > 1.0:
-                    confidence = confidence / 10.0
-                if min_val <= confidence <= max_val:
+        for obj in self.scene.cache_data.get('objects', []):
+            conf = obj.get('confidence')
+            if conf is not None:
+                if conf > 1.0:
+                    conf = conf / 10.0
+                if conf >= object_min:
                     visible_objects += 1
             else:
                 visible_objects += 1
-        
-        filtered_out = (total_actions + total_objects) - (visible_actions + visible_objects)
-        
-        stats_text = f"""
-Statistics (Preview):
-- Total actions: {total_actions} → Visible: {visible_actions}
-- Total objects: {total_objects} → Visible: {visible_objects}
-- Filtered out: {filtered_out} items
-"""
-        self.stats_label.setText(stats_text.strip())
+
+        self.stats_label.setText(
+            f"Actions: {visible_actions}/{total_actions} visible (≥{action_min:.0%})\n"
+            f"Objects: {visible_objects}/{total_objects} visible (≥{object_min:.0%})"
+        )
 
     def apply_filters(self):
-        """Apply the confidence filters"""
-        min_val = self.min_slider.value() / 100.0
-        max_val = self.max_slider.value() / 100.0
-        
-        self.scene.set_confidence_filter(min_val, max_val)
-        
-        # Update statistics with actual results
+        action_min = self.action_slider.value() / 100.0
+        object_min = self.object_slider.value() / 100.0
+        self.scene.set_action_confidence_filter(action_min)
+        self.scene.set_object_confidence_filter(object_min)
         self.update_statistics()
