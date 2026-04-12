@@ -39,6 +39,9 @@ class EditClipItem(QGraphicsRectItem):
         
         # Add text label
         self.text_item = QGraphicsTextItem(self)
+        self.text_item.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.text_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.text_item.setAcceptHoverEvents(False)
         self.update_label()
     
     def update_label(self):

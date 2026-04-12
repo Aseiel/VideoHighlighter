@@ -55,7 +55,6 @@ class SignalTimelineWindow(QMainWindow):
     render_finished = Signal(bool, str)
     
     def __init__(self, video_path, cache_data=None):
-        # Add this IMMEDIATELY at the start of __init__
         debug_log(f"SignalTimelineWindow.__init__ CALLED with video_path={video_path}")
         debug_log(f"  cache_data provided: {cache_data is not None}")
         debug_log(f"\n{'='*60}")
@@ -129,6 +128,7 @@ class SignalTimelineWindow(QMainWindow):
         debug_log(f"  - cache instance: {self.cache is not None}")
         
         self.current_time = 0
+        self._block_position_updates = False
         
         # Track clip removals for batch updates
         self.pending_clip_removals = []
@@ -275,6 +275,7 @@ class SignalTimelineWindow(QMainWindow):
         # Stacked video area: page 0 = QVideoWidget, page 1 = Live overlay
         # ──────────────────────────────────────────────────────────
         video_and_info = QSplitter(Qt.Orientation.Horizontal)
+        self._video_info_splitter = video_and_info
 
         # -- Left: stacked video widget --
         self.preview_stack = QStackedWidget()
@@ -361,7 +362,9 @@ class SignalTimelineWindow(QMainWindow):
         # Time slider
         self.time_slider = QSlider(Qt.Horizontal)
         self.time_slider.setRange(0, 100)
+        self.time_slider.sliderPressed.connect(lambda: setattr(self, '_block_position_updates', True))
         self.time_slider.sliderMoved.connect(self.seek_video)
+        self.time_slider.sliderReleased.connect(lambda: self.seek_video(self.time_slider.value()))
         controls_layout.addWidget(self.time_slider)
 
         # Time label
@@ -386,7 +389,16 @@ class SignalTimelineWindow(QMainWindow):
 
         # Volume
         volume_layout = QHBoxLayout()
-        volume_layout.addWidget(QLabel("🔊"))
+        self.mute_btn = QPushButton("🔊")
+        self.mute_btn.setFixedWidth(36)
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setToolTip("Mute / Unmute")
+        self.mute_btn.setStyleSheet("""
+            QPushButton { background: transparent; border: none; font-size: 16px; }
+            QPushButton:checked { color: #ff4444; }
+        """)
+        self.mute_btn.toggled.connect(self.toggle_mute)
+        volume_layout.addWidget(self.mute_btn)
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(80)
@@ -556,6 +568,8 @@ class SignalTimelineWindow(QMainWindow):
 
     def _handle_position_update(self, position):
         """Shared logic for any player position update."""
+        if self._block_position_updates:
+            return
         duration = self._active_player.duration()
         if duration <= 0:
             return
@@ -584,11 +598,27 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self, 'transcript_panel'):
             self.transcript_panel.update_current_time(self.current_time)
 
-
     def _toggle_detection_panel(self, state):
         """Show/hide detection panel"""
-        if hasattr(self, 'detection_panel'):
-            self.detection_panel.setVisible(state == Qt.Checked)
+        if not hasattr(self, 'detection_panel'):
+            return
+        if not hasattr(self, '_video_info_splitter'):
+            return
+        
+        splitter = self._video_info_splitter
+        
+        if state:
+            # Save didn't exist yet? Use defaults
+            saved = getattr(self, '_det_panel_saved_sizes', [500, 200])
+            self.detection_panel.setVisible(True)
+            self.detection_panel.setMinimumWidth(180)
+            # Force splitter to give it space
+            QTimer.singleShot(50, lambda: splitter.setSizes(saved))
+            self._update_detection_panel(self.current_time)
+        else:
+            # Save current sizes before hiding
+            self._det_panel_saved_sizes = splitter.sizes()
+            self.detection_panel.setVisible(False)
 
     def _update_detection_panel(self, time_seconds):
         """Update detection info panel with actions/objects at current time"""
@@ -670,13 +700,27 @@ class SignalTimelineWindow(QMainWindow):
 
     def seek_video(self, position):
         """Seek video to specific position"""
-        if self.video_player.duration() > 0:
-            new_position = (position / 100.0) * self.video_player.duration()
-            self.video_player.setPosition(int(new_position))
+        if self._active_player.duration() > 0:
+            self._block_position_updates = True
+            new_position = (position / 100.0) * self._active_player.duration()
+            self._active_player.setPosition(int(new_position))
+            QTimer.singleShot(200, lambda: setattr(self, '_block_position_updates', False))
 
     def set_volume(self, value):
         """Set video volume"""
         self.audio_output.setVolume(value / 100.0)
+
+    def toggle_mute(self, muted):
+        """Toggle audio mute"""
+        if muted:
+            self._pre_mute_volume = self.audio_output.volume()
+            self.audio_output.setVolume(0)
+            self.mute_btn.setText("🔇")
+            self.volume_slider.setEnabled(False)
+        else:
+            self.audio_output.setVolume(getattr(self, '_pre_mute_volume', 0.8))
+            self.mute_btn.setText("🔊")
+            self.volume_slider.setEnabled(True)
 
     def update_video_duration(self, duration):
         """Update video duration display"""
@@ -1528,7 +1572,7 @@ class SignalTimelineWindow(QMainWindow):
         filter_layout.addWidget(self.filter_summary)
         
         # Confidence filter display
-        self.confidence_label = QLabel(f"Confidence: {self.signal_scene.min_confidence:.1f}-{self.signal_scene.max_confidence:.1f}")
+        self.confidence_label = QLabel(f"Actions: {self.signal_scene.min_action_confidence:.0%} | Objects: {self.signal_scene.min_object_confidence:.0%}")
         self.confidence_label.setStyleSheet("color: #ffa0a0; font-size: 11px;")
         filter_layout.addWidget(self.confidence_label)
         
@@ -1968,13 +2012,14 @@ class SignalTimelineWindow(QMainWindow):
             object_text = f"{len(visible_objects)}/{total_objects} objects"
             
             self.filter_summary.setText(f"Showing: {action_text}, {object_text}")
-            self.confidence_label.setText(f"Confidence: {self.signal_scene.min_confidence:.1f}-{self.signal_scene.max_confidence:.1f}")
-            
+            self.confidence_label.setText(f"Actions: {self.signal_scene.min_action_confidence:.0%} | Objects: {self.signal_scene.min_object_confidence:.0%}")
+
             # Show which specific filters are active
             filter_details = []
             
-            if self.signal_scene.min_confidence > 0 or self.signal_scene.max_confidence < 1:
-                filter_details.append(f"Confidence: {self.signal_scene.min_confidence:.1f}-{self.signal_scene.max_confidence:.1f}")
+            if (self.signal_scene.min_action_confidence > 0 or self.signal_scene.max_action_confidence < 1 
+                or self.signal_scene.min_object_confidence > 0 or self.signal_scene.max_object_confidence < 1):
+                filter_details.append(f"Actions≥{self.signal_scene.min_action_confidence:.0%}, Objects≥{self.signal_scene.min_object_confidence:.0%}")
             
             if len(visible_actions) < total_actions:
                 if len(visible_actions) <= 3:
@@ -2545,7 +2590,8 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self, 'signal_scene'):
             self.signal_scene.set_all_actions_visible(True)
             self.signal_scene.set_all_objects_visible(True)
-            self.signal_scene.set_confidence_filter(0.0, 1.0)  # Reset confidence filter
+            self.signal_scene.set_action_confidence_filter(0.0, 1.0)
+            self.signal_scene.set_object_confidence_filter(0.0, 1.0)
             self.update_filter_summary()
     
     def hide_all_filters(self):
