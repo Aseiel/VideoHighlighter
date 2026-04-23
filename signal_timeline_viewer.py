@@ -49,6 +49,59 @@ from video_ai_editor.filter_dialogs import FilterDialog, ConfidenceFilterDialog
 from video_ai_editor.transcript_panel import TranscriptPanel
 
 
+class SignalLabelPanel(QWidget):
+    """Frozen label column that syncs vertically with the signal timeline"""
+
+    def __init__(self, signal_view, parent=None):
+        super().__init__(parent)
+        self.signal_view = signal_view
+        self.setFixedWidth(110)
+        self.setMinimumHeight(100)
+        self._labels = []  # [(name, y_pos), ...]
+
+        # Sync vertical scroll
+        signal_view.verticalScrollBar().valueChanged.connect(self.update)
+
+    def refresh_labels(self):
+        """Pull label positions from the scene"""
+        scene = self.signal_view.scene()
+        if scene and hasattr(scene, 'row_labels'):
+            self._labels = list(scene.row_labels)
+        else:
+            self._labels = []
+        self.update()
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QColor, QFont
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Background
+        p.fillRect(self.rect(), QColor(20, 20, 30))
+
+        if not self._labels:
+            p.end()
+            return
+
+        view = self.signal_view
+        font = QFont("Arial", 9, QFont.Weight.Bold)
+        p.setFont(font)
+        p.setPen(QColor(180, 220, 255))
+
+        for name, scene_y in self._labels:
+            # Map scene Y to view Y, then to this widget's Y
+            view_pt = view.mapFromScene(0, scene_y)
+            local_y = view_pt.y()
+
+            # Draw label centered vertically in the row
+            p.drawText(6, local_y + 2, name)
+
+        # Right border line
+        p.setPen(QColor(60, 60, 80))
+        p.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
+
+        p.end()
+
 class SignalTimelineWindow(QMainWindow):
     """Main window for signal timeline viewer with edit timeline and filters"""
     waveform_ready = Signal(object)
@@ -1323,7 +1376,26 @@ class SignalTimelineWindow(QMainWindow):
             self.signal_scene.waveform_clicked.connect(self.on_waveform_clicked)
         
         signal_layout.addWidget(QLabel("Signal Timeline (Drag items to edit timeline below)"))
-        signal_layout.addWidget(self.signal_view)
+
+        # Timeline with frozen label column
+        timeline_row = QHBoxLayout()
+        self.label_panel = SignalLabelPanel(self.signal_view)
+        timeline_row.addWidget(self.label_panel)
+        timeline_row.addWidget(self.signal_view)
+        timeline_row.setSpacing(0)
+        timeline_row.setContentsMargins(0, 0, 0, 0)
+        signal_layout.addLayout(timeline_row)
+
+        # Refresh labels when timeline rebuilds
+        original_build = self.signal_scene.build_timeline
+        def _build_and_refresh():
+            original_build()
+            if hasattr(self, 'label_panel'):
+                self.label_panel.refresh_labels()
+        self.signal_scene.build_timeline = _build_and_refresh
+
+        # Initial label load
+        self.label_panel.refresh_labels()
         
         splitter.addWidget(signal_widget)
        
