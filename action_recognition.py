@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from pathlib import Path
-from openvino.runtime import Core
+from openvino import Core
 import csv
 import json
 import threading
@@ -753,7 +753,7 @@ def compile_with_fallback(ie, model, preferred_device, model_name="model"):
     except Exception as e:
         # Check if it's the LSTM/dynamic shape error
         error_str = str(e)
-        if ("LSTMSequence" in error_str or "dynamic shape" in error_str) and preferred_device != "CPU":
+        if preferred_device != "CPU":
             print(f"⚠️ Compilation on {preferred_device} failed with LSTM/dynamic shape error")
             print(f"🔄 Falling back {model_name} to CPU...")
             try:

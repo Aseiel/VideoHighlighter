@@ -1935,6 +1935,36 @@ class SignalTimelineWindow(QMainWindow):
         
         zoom_group.setLayout(zoom_layout)
         layout.addWidget(zoom_group)
+
+        # Merge threshold controls
+        merge_group = QGroupBox("Merge Signals")
+        merge_layout = QVBoxLayout()
+
+        merge_row = QHBoxLayout()
+        merge_row.addWidget(QLabel("Gap:"))
+
+        self.merge_slider = QSlider(Qt.Orientation.Horizontal)
+        self.merge_slider.setMinimum(0)
+        self.merge_slider.setMaximum(50)  # 0 to 5.0 seconds
+        self.merge_slider.setValue(0)
+        self.merge_slider.setTickInterval(10)
+        self.merge_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.merge_slider.valueChanged.connect(self.on_merge_changed)
+        merge_row.addWidget(self.merge_slider)
+
+        self.merge_value_label = QLabel("Off")
+        self.merge_value_label.setStyleSheet("color: #a0ffa0; font-weight: bold; min-width: 36px;")
+        merge_row.addWidget(self.merge_value_label)
+
+        merge_layout.addLayout(merge_row)
+
+        merge_hint = QLabel("Merge nearby signals into continuous blocks")
+        merge_hint.setStyleSheet("color: #888; font-size: 10px;")
+        merge_hint.setWordWrap(True)
+        merge_layout.addWidget(merge_hint)
+
+        merge_group.setLayout(merge_layout)
+        layout.addWidget(merge_group)
         
         # Playback controls
         playback_group = QGroupBox("Playback")
@@ -2184,6 +2214,29 @@ class SignalTimelineWindow(QMainWindow):
     def on_zoom_changed(self, value):
         """Handle zoom slider changes"""
         self.signal_scene.set_zoom(value)
+
+    @Slot(int)
+    def on_merge_changed(self, value):
+        """Handle merge threshold slider change (debounced)"""
+        seconds = value / 10.0
+        if seconds == 0:
+            self.merge_value_label.setText("Off")
+        else:
+            self.merge_value_label.setText(f"{seconds:.1f}s")
+        
+        # Debounce: only rebuild after user stops dragging
+        if not hasattr(self, '_merge_timer'):
+            self._merge_timer = QTimer()
+            self._merge_timer.setSingleShot(True)
+            self._merge_timer.timeout.connect(self._apply_merge_threshold)
+        
+        self._pending_merge_value = seconds
+        self._merge_timer.start(200)  # wait 200ms after last change
+
+    def _apply_merge_threshold(self):
+        """Actually apply the merge threshold after debounce"""
+        if hasattr(self, 'signal_scene') and hasattr(self, '_pending_merge_value'):
+            self.signal_scene.set_merge_threshold(self._pending_merge_value)
     
     @Slot(float)
     def on_time_clicked(self, time):
