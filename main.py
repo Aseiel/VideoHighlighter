@@ -408,6 +408,123 @@ class Worker(QThread):
     def is_cancelled(self):
         return self._cancel_flag.is_set()
 
+class RangeSlider(QWidget):
+    """Single slider with two handles for selecting a range"""
+    startChanged = Signal(int)
+    endChanged = Signal(int)
+
+    def __init__(self, minimum=0, maximum=100, parent=None):
+        super().__init__(parent)
+        self._min = minimum
+        self._max = maximum
+        self._start = minimum
+        self._end = maximum
+        self._dragging = None  # 'start', 'end', or None
+        self.setFixedHeight(32)
+        self.setMinimumWidth(200)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def start(self):
+        return self._start
+
+    def end(self):
+        return self._end
+
+    def setStart(self, val):
+        val = max(self._min, min(val, self._end - 1))
+        if val != self._start:
+            self._start = val
+            self.startChanged.emit(val)
+            self.update()
+
+    def setEnd(self, val):
+        val = min(self._max, max(val, self._start + 1))
+        if val != self._end:
+            self._end = val
+            self.endChanged.emit(val)
+            self.update()
+
+    def setRange(self, minimum, maximum):
+        self._min = minimum
+        self._max = maximum
+        self._start = max(self._start, minimum)
+        self._end = min(self._end, maximum)
+        self.update()
+
+    def _val_to_x(self, val):
+        inset = 8
+        w = self.width() - 2 * inset
+        if self._max == self._min:
+            return inset
+        return inset + int((val - self._min) / (self._max - self._min) * w)
+
+    def _x_to_val(self, x):
+        inset = 8
+        w = self.width() - 2 * inset
+        if w <= 0:
+            return self._min
+        ratio = max(0.0, min(1.0, (x - inset) / w))
+        return int(self._min + ratio * (self._max - self._min))
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QColor
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        x0 = self._val_to_x(self._start)
+        x1 = self._val_to_x(self._end)
+        track_y = self.height() // 2 - 3
+        track_h = 6
+
+        # Full track background
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(60, 60, 80))
+        inset = 8
+        p.drawRoundedRect(inset, track_y, self.width() - 2 * inset, track_h, 3, 3)
+
+        # Selected range
+        p.setBrush(QColor(33, 150, 243))
+        p.drawRoundedRect(x0, track_y, max(2, x1 - x0), track_h, 3, 3)
+
+        # Start handle
+        p.setBrush(QColor(220, 220, 240))
+        p.setPen(QColor(33, 150, 243))
+        p.drawEllipse(x0 - 7, self.height() // 2 - 7, 14, 14)
+
+        # End handle
+        p.drawEllipse(x1 - 7, self.height() // 2 - 7, 14, 14)
+
+        p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        x = event.position().toPoint().x()
+        x0 = self._val_to_x(self._start)
+        x1 = self._val_to_x(self._end)
+
+        dist_start = abs(x - x0)
+        dist_end = abs(x - x1)
+
+        if dist_start <= dist_end and dist_start < 20:
+            self._dragging = 'start'
+        elif dist_end < 20:
+            self._dragging = 'end'
+        elif x0 < x < x1:
+            # Click between handles — move nearest
+            self._dragging = 'start' if dist_start < dist_end else 'end'
+
+    def mouseMoveEvent(self, event):
+        if self._dragging is None:
+            return
+        val = self._x_to_val(event.position().toPoint().x())
+        if self._dragging == 'start':
+            self.setStart(val)
+        else:
+            self.setEnd(val)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = None
 
 class VideoHighlighterGUI(QWidget):
     def __init__(self):
@@ -490,37 +607,33 @@ class VideoHighlighterGUI(QWidget):
         slider_layout = QVBoxLayout()
         slider_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Start position slider
-        start_slider_layout = QHBoxLayout()
-        start_slider_layout.addWidget(QLabel("Start:"))
-        self.start_time_slider = QSlider(Qt.Horizontal)
-        self.start_time_slider.setMinimum(0)
-        self.start_time_slider.setMaximum(100)
-        self.start_time_slider.setValue(highlights_cfg.get("range_start_pct", 0))
-        self.start_time_slider.setEnabled(False)
-        self.start_time_slider.valueChanged.connect(self.on_slider_changed)
+        # Range slider (single bar with two handles)
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("Start:"))
+        self.range_slider = RangeSlider(0, 100)
+        self.range_slider.setStart(highlights_cfg.get("range_start_pct", 0))
+        self.range_slider.setEnd(highlights_cfg.get("range_end_pct", 100))
+        self.range_slider.setEnabled(False)
+        self.range_slider.startChanged.connect(self.on_slider_changed)
+        self.range_slider.endChanged.connect(self.on_slider_changed)
+        range_row.addWidget(self.range_slider, stretch=1)
+        range_row.addWidget(QLabel("End"))
+
         self.start_time_label = QLabel("0%")
         self.start_time_label.setMinimumWidth(80)
         self.start_time_label.setStyleSheet("font-weight: bold;")
-        start_slider_layout.addWidget(self.start_time_slider, stretch=1)
-        start_slider_layout.addWidget(self.start_time_label)
-        slider_layout.addLayout(start_slider_layout)
 
-        # End position slider
-        end_slider_layout = QHBoxLayout()
-        end_slider_layout.addWidget(QLabel("End:"))
-        self.end_time_slider = QSlider(Qt.Horizontal)
-        self.end_time_slider.setMinimum(0)
-        self.end_time_slider.setMaximum(100)
-        self.end_time_slider.setValue(highlights_cfg.get("range_end_pct", 100))
-        self.end_time_slider.setEnabled(False)
-        self.end_time_slider.valueChanged.connect(self.on_slider_changed)
         self.end_time_label = QLabel("100%")
         self.end_time_label.setMinimumWidth(80)
         self.end_time_label.setStyleSheet("font-weight: bold;")
-        end_slider_layout.addWidget(self.end_time_slider, stretch=1)
-        end_slider_layout.addWidget(self.end_time_label)
-        slider_layout.addLayout(end_slider_layout)
+
+        labels_row = QHBoxLayout()
+        labels_row.addWidget(self.start_time_label)
+        labels_row.addStretch()
+        labels_row.addWidget(self.end_time_label)
+
+        slider_layout.addLayout(range_row)
+        slider_layout.addLayout(labels_row)
 
         slider_container.setLayout(slider_layout)
         time_range_layout.addWidget(slider_container)
@@ -559,8 +672,18 @@ class VideoHighlighterGUI(QWidget):
         time_range_group.setLayout(time_range_layout)
         layout.addWidget(time_range_group)
 
+        # Enable slider if checkbox was already checked from config
+        if self.use_time_range_chk.isChecked():
+            self.range_slider.setEnabled(True)
+
         # Initialize the selection info display with saved values
         self.update_selection_info()
+
+        # Load duration from first saved video
+        if self.file_list.count() > 0:
+            first_path = self.file_list.item(0).text()
+            if os.path.exists(first_path):
+                self.update_video_duration(first_path)
 
         # --- Progress Section ---
         progress_group = QGroupBox("Progress")
@@ -1249,8 +1372,8 @@ class VideoHighlighterGUI(QWidget):
                 return
             
             # Get percentage values directly from sliders
-            start_pct = self.start_time_slider.value()
-            end_pct = self.end_time_slider.value()
+            start_pct = self.range_slider.start()
+            end_pct = self.range_slider.end()
             
             if end_pct <= start_pct:
                 self.append_log("⚠️ Invalid time range - end must be greater than start")
@@ -1530,8 +1653,8 @@ class VideoHighlighterGUI(QWidget):
       
         # Add time range if enabled
         if self.use_time_range_chk.isChecked() and self.current_video_duration > 0:
-            start_pct = self.start_time_slider.value() / 100
-            end_pct = self.end_time_slider.value() / 100
+            start_pct = self.range_slider.start() / 100
+            end_pct = self.range_slider.end() / 100
             config["use_time_range"] = True
             config["range_start"] = int(start_pct * self.current_video_duration)
             config["range_end"] = int(end_pct * self.current_video_duration)
@@ -2014,8 +2137,8 @@ class VideoHighlighterGUI(QWidget):
                 "auto_max_clip": int(self.spin_auto_max_clip.value()),
                 "auto_merge_gap": int(self.spin_auto_merge_gap.value()),
                 "use_time_range": self.use_time_range_chk.isChecked(),
-                "range_start_pct": self.start_time_slider.value(),
-                "range_end_pct": self.end_time_slider.value(),
+                "range_start_pct": self.range_slider.start(),
+                "range_end_pct": self.range_slider.end(),
             },
             "scoring": {
                 "scene_points": int(self.spin_scene_points.value()),
@@ -2379,8 +2502,7 @@ class VideoHighlighterGUI(QWidget):
     def on_time_range_toggle(self, checked):
         """Enable/disable time range controls"""
         # Always enable sliders when checkbox is checked, even without video
-        self.start_time_slider.setEnabled(checked)
-        self.end_time_slider.setEnabled(checked)
+        self.range_slider.setEnabled(checked)
         
         # Preset buttons only work when video duration is known
         has_duration = self.current_video_duration > 0
@@ -2393,23 +2515,12 @@ class VideoHighlighterGUI(QWidget):
         self.update_selection_info()
 
     def on_slider_changed(self):
-        """Handle slider value changes"""
-        # Ensure start is always before end
-        if self.start_time_slider.value() >= self.end_time_slider.value():
-            if self.sender() == self.start_time_slider:
-                # Start moved, adjust to be 1 second before end
-                self.start_time_slider.setValue(max(0, self.end_time_slider.value() - 1))
-            else:
-                # End moved, adjust to be 1 second after start
-                self.end_time_slider.setValue(min(self.start_time_slider.maximum(), 
-                                                self.start_time_slider.value() + 1))
-        
         self.update_selection_info()
 
     def update_selection_info(self):
         """Update the selection information labels"""
-        start_pct = self.start_time_slider.value()
-        end_pct = self.end_time_slider.value()
+        start_pct = self.range_slider.start()
+        end_pct = self.range_slider.end()
         
         if self.current_video_duration == 0:
             # No video loaded - show percentages
@@ -2461,8 +2572,7 @@ class VideoHighlighterGUI(QWidget):
                 self.current_video_duration = duration
                 
                 # Update sliders with 100 steps (0-100 representing 0%-100% of video)
-                self.start_time_slider.setMaximum(100)
-                self.end_time_slider.setMaximum(100)
+                self.range_slider.setRange(0, 100)
                 
                 # Keep existing slider values (don't reset user's choice)
                 # Only update the display labels
@@ -2475,8 +2585,7 @@ class VideoHighlighterGUI(QWidget):
                 
                 # Enable controls if checkbox is checked
                 if self.use_time_range_chk.isChecked():
-                    self.start_time_slider.setEnabled(True)
-                    self.end_time_slider.setEnabled(True)
+                    self.range_slider.setEnabled(True)
                     self.first_5min_btn.setEnabled(True)
                     self.last_5min_btn.setEnabled(True)
                     self.last_10min_btn.setEnabled(True)
@@ -2531,8 +2640,8 @@ class VideoHighlighterGUI(QWidget):
         else:
             return
         
-        self.start_time_slider.setValue(start_pct)
-        self.end_time_slider.setValue(end_pct)
+        self.range_slider.setStart(start_pct)
+        self.range_slider.setEnd(end_pct)
         
         start_time = int((start_pct / 100) * duration)
         end_time = int((end_pct / 100) * duration)
@@ -2706,8 +2815,8 @@ class VideoHighlighterGUI(QWidget):
         self.append_log("")
 
         if self.use_time_range_chk.isChecked() and self.current_video_duration > 0:
-            start_pct = self.start_time_slider.value() / 100
-            end_pct = self.end_time_slider.value() / 100
+            start_pct = self.range_slider.start() / 100
+            end_pct = self.range_slider.end() / 100
             config["use_time_range"] = True
             config["range_start"] = int(start_pct * self.current_video_duration)
             config["range_end"] = int(end_pct * self.current_video_duration)
