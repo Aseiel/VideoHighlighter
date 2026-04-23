@@ -101,6 +101,8 @@ class SignalTimelineScene(QGraphicsScene):
         self.action_colors = self._color_palette(len(self.action_types), start_hue=100)
         self.object_colors = self._color_palette(len(self.object_classes), start_hue=340)
         
+        # Merge threshold (seconds) — 0 = no merging
+        self.merge_threshold = 0.0
         self.bars = []
 
         # Range selection state
@@ -232,6 +234,92 @@ class SignalTimelineScene(QGraphicsScene):
         return [QColor.fromHsvF((start_hue + i * 0.618) % 1.0, 0.85, 0.92) 
                 for i in range(count)]
     
+    def set_merge_threshold(self, seconds):
+        """Set the merge threshold and rebuild timeline"""
+        self.merge_threshold = max(0.0, seconds)
+        self.build_timeline()
+
+    def _merge_intervals(self, intervals, threshold=None):
+        """
+        Merge (start, end, metadata) tuples that are within threshold seconds.
+        
+        Args:
+            intervals: list of (start, end) or (start, end, metadata) tuples
+            threshold: override threshold (uses self.merge_threshold if None)
+        
+        Returns:
+            list of (start, end, merged_metadata) tuples
+            merged_metadata contains:
+            - 'merged_count': how many original intervals were merged
+            - 'original_labels': list of labels from merged intervals
+            - any metadata from the first interval in the group
+        """
+        if threshold is None:
+            threshold = self.merge_threshold
+        
+        if not intervals or threshold <= 0:
+            # Return with metadata wrapper if not already present
+            result = []
+            for iv in intervals:
+                if len(iv) == 2:
+                    result.append((iv[0], iv[1], {'merged_count': 1}))
+                else:
+                    meta = iv[2] if isinstance(iv[2], dict) else {'merged_count': 1}
+                    meta.setdefault('merged_count', 1)
+                    result.append((iv[0], iv[1], meta))
+            return result
+        
+        # Normalize to (start, end, metadata)
+        normalized = []
+        for iv in intervals:
+            if len(iv) == 2:
+                normalized.append((iv[0], iv[1], {}))
+            else:
+                normalized.append((iv[0], iv[1], iv[2] if isinstance(iv[2], dict) else {}))
+        
+        # Sort by start time
+        sorted_iv = sorted(normalized, key=lambda x: x[0])
+        
+        # Merge
+        merged = []
+        current_start, current_end, current_meta = sorted_iv[0]
+        merged_count = 1
+        original_labels = [current_meta.get('label', '')]
+        
+        confidences = [current_meta.get('confidence', 0)]
+
+        for start, end, meta in sorted_iv[1:]:
+            if start - current_end <= threshold:
+                current_end = max(current_end, end)
+                merged_count += 1
+                original_labels.append(meta.get('label', ''))
+                confidences.append(meta.get('confidence', 0))
+            else:
+                # Gap too large: finalize current group, start new one
+                result_meta = dict(current_meta)
+                result_meta['merged_count'] = merged_count
+                result_meta['original_labels'] = [l for l in original_labels if l]
+                result_meta['avg_confidence'] = sum(confidences) / len(confidences) if confidences else 0
+                result_meta['max_confidence'] = max(confidences) if confidences else 0
+                merged.append((current_start, current_end, result_meta))
+                
+                current_start = start
+                current_end = end
+                current_meta = meta
+                merged_count = 1
+                original_labels = [meta.get('label', '')]
+                confidences = [meta.get('confidence', 0)]
+        
+        # Don't forget the last group
+        result_meta = dict(current_meta)
+        result_meta['merged_count'] = merged_count
+        result_meta['original_labels'] = [l for l in original_labels if l]
+        result_meta['avg_confidence'] = sum(confidences) / len(confidences) if confidences else 0
+        result_meta['max_confidence'] = max(confidences) if confidences else 0
+        merged.append((current_start, current_end, result_meta))
+        
+        return merged
+        
     # Filter methods
     def set_action_filter(self, action_name, visible):
         """Set visibility for a specific action"""
@@ -383,8 +471,9 @@ class SignalTimelineScene(QGraphicsScene):
         # Restore view zoom/scroll
         if views and old_transform:
             view = views[0]
-            old_visible_width = self.sceneRect().width() / old_transform.m11()
-            if abs(old_visible_width - width) > 10:
+            m11 = old_transform.m11()
+            old_visible_width = self.sceneRect().width() / m11 if m11 != 0 else 1
+            if old_visible_width > 0 and abs(old_visible_width - width) > 10:
                 scale_factor = width / old_visible_width
                 view.setTransform(old_transform.scale(scale_factor, 1.0))
                 view.horizontalScrollBar().setValue(old_h_scroll)
@@ -478,22 +567,43 @@ class SignalTimelineScene(QGraphicsScene):
                     color = QColor(180, 220, 120)
             else:
                 color = QColor(180, 220, 120)
-            
-            # Draw each action occurrence
+
+            # Build intervals for this action type
+            intervals = []
             for action in actions:
                 timestamp = action.get('timestamp', 0)
-                confidence = action.get('confidence', 0.5)  # Default if missing
-                
+                confidence = action.get('confidence', 0.5)
+                intervals.append((timestamp, timestamp + 0.5, {
+                    'label': action_type,
+                    'type': action_type,
+                    'confidence': confidence
+                }))
+
+            # Merge nearby intervals of the same type
+            merged = self._merge_intervals(intervals)
+
+            for start, end, meta in merged:
+                count = meta.get('merged_count', 1)
+                confidence = meta.get('confidence', 0.5)
+                if count > 1:
+                    avg_conf = meta.get('avg_confidence', confidence)
+                    bar_label = f"{action_type} x{count} ({avg_conf:.0%})"
+                else:
+                    bar_label = f"{action_type} ({confidence:.0%})"
+
                 bar = TimelineBar(
-                    timestamp, timestamp + 0.5,
+                    start, end,
                     current_type_y, type_height,
-                    color, action_type,
+                    color, bar_label,
                     confidence=confidence,
-                    metadata={'type': action_type, 'confidence': confidence}
+                    metadata={'type': action_type, 'confidence': confidence,
+                            'merged_count': count,
+                            'avg_confidence': meta.get('avg_confidence', confidence),
+                            'max_confidence': meta.get('max_confidence', confidence)}
                 )
                 self.draw_bar(bar)
                 self.bars.append(bar)
-            
+
             current_type_y += type_height
         
         return y_pos + self.layer_height + self.layer_spacing
@@ -544,19 +654,41 @@ class SignalTimelineScene(QGraphicsScene):
                     color = QColor(220, 140, 180)
             else:
                 color = QColor(220, 140, 180)
-            
-            # Draw each object occurrence
+
+            # Build intervals for this object type
+            intervals = []
             for timestamp, confidence in detections:
+                intervals.append((timestamp, timestamp + 0.3, {
+                    'label': obj_type,
+                    'type': obj_type,
+                    'confidence': confidence
+                }))
+
+            # Merge nearby intervals of the same type
+            merged = self._merge_intervals(intervals)
+
+            for start, end, meta in merged:
+                count = meta.get('merged_count', 1)
+                confidence = meta.get('confidence', 0.5)
+                if count > 1:
+                    avg_conf = meta.get('avg_confidence', confidence)
+                    bar_label = f"{obj_type} x{count} ({avg_conf:.0%})"
+                else:
+                    bar_label = f"{obj_type} ({confidence:.0%})"
+
                 bar = TimelineBar(
-                    timestamp, timestamp + 0.3,
+                    start, end,
                     current_type_y, type_height,
-                    color, obj_type,
+                    color, bar_label,
                     confidence=confidence,
-                    metadata={'type': obj_type, 'confidence': confidence}
+                    metadata={'type': obj_type, 'confidence': confidence,
+                            'merged_count': count,
+                            'avg_confidence': meta.get('avg_confidence', confidence),
+                            'max_confidence': meta.get('max_confidence', confidence)}
                 )
                 self.draw_bar(bar)
                 self.bars.append(bar)
-            
+
             current_type_y += type_height
         
         return y_pos + self.layer_height + self.layer_spacing
@@ -588,18 +720,34 @@ class SignalTimelineScene(QGraphicsScene):
         return y_pos + self.layer_height + self.layer_spacing
     
     def draw_motion_events_layer(self, y_pos):
-        """Draw motion events as spikes"""
+        """Draw motion events as spikes, with optional merging"""
         label = self.addText("MOTION EVENTS", QFont("Arial", 10, QFont.Weight.Bold))
         label.setPos(5, y_pos - 20)
         label.setDefaultTextColor(QColor(180, 220, 255))
 
+        # Build intervals
+        intervals = []
         for timestamp in self.cache_data.get('motion_events', []):
+            intervals.append((timestamp, timestamp + 0.5, {'label': 'Motion'}))
+
+        # Merge nearby intervals
+        merged = self._merge_intervals(intervals)
+
+        for start, end, meta in merged:
+            count = meta.get('merged_count', 1)
+            if count > 1:
+                avg_conf = meta.get('avg_confidence', 0)
+                bar_label = f"Motion x{count} ({avg_conf:.0%})"
+            else:
+                conf = meta.get('confidence', 0)
+                bar_label = f"Motion ({conf:.0%})" if conf else "Motion"
+
             bar = TimelineBar(
-                timestamp, timestamp + 0.5,
+                start, end,
                 y_pos, self.layer_height,
-                self.colors['motion_events'], "Motion",
+                self.colors['motion_events'], bar_label,
                 confidence=7,
-                metadata={'timestamp': timestamp}
+                metadata={'timestamp': start, 'merged_count': count}
             )
             self.draw_bar(bar)
             self.bars.append(bar)
@@ -607,37 +755,67 @@ class SignalTimelineScene(QGraphicsScene):
         return y_pos + self.layer_height + self.layer_spacing
    
     def draw_motion_peaks_layer(self, y_pos):
-        """Draw motion peaks"""
+        """Draw motion peaks, with optional merging"""
         label = self.addText("MOTION PEAKS", QFont("Arial", 10, QFont.Weight.Bold))
         label.setPos(5, y_pos - 20)
         label.setDefaultTextColor(QColor(180, 220, 255))
 
+        intervals = []
         for timestamp in self.cache_data.get('motion_peaks', []):
+            intervals.append((timestamp, timestamp + 0.5, {'label': 'Peak'}))
+
+        merged = self._merge_intervals(intervals)
+
+        for start, end, meta in merged:
+            count = meta.get('merged_count', 1)
+            if count > 1:
+                avg_conf = meta.get('avg_confidence', 0)
+                bar_label = f"Peak x{count} ({avg_conf:.0%})" if avg_conf else f"Peak x{count}"
+            else:
+                bar_label = "Peak"
+
             bar = TimelineBar(
-                timestamp, timestamp + 0.5,
+                start, end,
                 y_pos, self.layer_height,
-                self.colors['motion_peaks'], "Peak",
+                self.colors['motion_peaks'], bar_label,
                 confidence=9,
-                metadata={'timestamp': timestamp}
+                metadata={'timestamp': start, 'merged_count': count,
+                        'avg_confidence': meta.get('avg_confidence'),
+                        'max_confidence': meta.get('max_confidence')}
             )
             self.draw_bar(bar)
             self.bars.append(bar)
 
         return y_pos + self.layer_height + self.layer_spacing
-    
+
     def draw_audio_peaks_layer(self, y_pos):
-        """Draw audio peaks"""
+        """Draw audio peaks, with optional merging"""
         label = self.addText("AUDIO PEAKS", QFont("Arial", 10, QFont.Weight.Bold))
         label.setPos(5, y_pos - 20)
         label.setDefaultTextColor(QColor(180, 220, 255))
 
+        intervals = []
         for timestamp in self.cache_data.get('audio_peaks', []):
+            intervals.append((timestamp, timestamp + 0.5, {'label': 'Audio'}))
+
+        merged = self._merge_intervals(intervals)
+
+        for start, end, meta in merged:
+            count = meta.get('merged_count', 1)
+            if count > 1:
+                avg_conf = meta.get('avg_confidence', 0)
+                bar_label = f"Audio x{count} ({avg_conf:.0%})" if avg_conf else f"Audio x{count}"
+            else:
+                bar_label = "Audio"
+
             bar = TimelineBar(
-                timestamp, timestamp + 0.5,
+                start, end,
                 y_pos, self.layer_height,
-                self.colors['audio_peaks'], "Audio",
+                self.colors['audio_peaks'], bar_label,
                 confidence=8,
-                metadata={'timestamp': timestamp}
+                metadata={'timestamp': start, 'merged_count': count,
+                        'avg_confidence': meta.get('avg_confidence'),
+                        'max_confidence': meta.get('max_confidence')}
             )
             self.draw_bar(bar)
             self.bars.append(bar)
