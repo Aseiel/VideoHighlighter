@@ -104,6 +104,7 @@ class SignalTimelineScene(QGraphicsScene):
         # Merge threshold (seconds) — 0 = no merging
         self.merge_threshold = 0.0
         self.bars = []
+        self.row_labels = []
 
         # Range selection state
         self._selection_rect_item = None   # QGraphicsRectItem — the blue highlight
@@ -165,9 +166,7 @@ class SignalTimelineScene(QGraphicsScene):
                     QPen(Qt.NoPen), QBrush(QColor(10, 10, 20, 50)))
         
         # Draw waveform label
-        label = self.addText("AUDIO WAVEFORM", QFont("Arial", 10, QFont.Weight.Bold))
-        label.setPos(5, waveform_y - 20)
-        label.setDefaultTextColor(QColor(180, 220, 255))
+        self.row_labels.append(("AUDIO WAVEFORM", waveform_y))
         
         # Draw the actual waveform
         if len(self.waveform) > 0 and self.video_duration > 0:
@@ -423,6 +422,7 @@ class SignalTimelineScene(QGraphicsScene):
         
         # Start drawing below time markers
         current_y = 40
+        self.row_labels = []
         
         # Draw waveform if visible
         if self.waveform_visible and self.waveform:
@@ -495,9 +495,7 @@ class SignalTimelineScene(QGraphicsScene):
         
     def draw_transcript_layer(self, y_pos):
         """Draw transcript segments with improved labeling"""
-        label = self.addText("TRANSCRIPT", QFont("Arial", 10, QFont.Weight.Bold))
-        label.setPos(5, y_pos - 20)
-        label.setDefaultTextColor(QColor(180, 220, 255))
+        self.row_labels.append(("TRANSCRIPT", y_pos))
         
         if 'transcript' in self.cache_data and self.cache_data['transcript'].get('segments'):
             for segment in self.cache_data['transcript']['segments']:
@@ -525,9 +523,7 @@ class SignalTimelineScene(QGraphicsScene):
     
     def draw_improved_actions_layer(self, y_pos):
         """Draw action detections with organized classification and filtering"""
-        label = self.addText("ACTIONS", QFont("Arial", 10, QFont.Weight.Bold))
-        label.setPos(5, y_pos - 20)
-        label.setDefaultTextColor(QColor(180, 220, 255))
+        self.row_labels.append(("ACTIONS", y_pos))
         
         # Group actions by type
         action_groups = defaultdict(list)
@@ -610,9 +606,7 @@ class SignalTimelineScene(QGraphicsScene):
     
     def draw_improved_objects_layer(self, y_pos):
         """Draw object detections organized by class with filtering"""
-        label = self.addText("OBJECTS", QFont("Arial", 10, QFont.Weight.Bold))
-        label.setPos(5, y_pos - 20)
-        label.setDefaultTextColor(QColor(180, 220, 255))
+        self.row_labels.append(("OBJECTS", y_pos))
         
         # Group objects by class
         object_groups = defaultdict(list)
@@ -695,9 +689,7 @@ class SignalTimelineScene(QGraphicsScene):
     
     def draw_scenes_layer(self, y_pos):
         """Draw scene changes with improved labeling"""
-        label = self.addText("SCENES", QFont("Arial", 10, QFont.Weight.Bold))
-        label.setPos(5, y_pos - 20)
-        label.setDefaultTextColor(QColor(180, 220, 255))
+        self.row_labels.append(("SCENES", y_pos))
         
         if 'scenes' in self.cache_data:
             for i, scene in enumerate(self.cache_data['scenes']):
@@ -721,9 +713,7 @@ class SignalTimelineScene(QGraphicsScene):
     
     def draw_motion_events_layer(self, y_pos):
         """Draw motion events as spikes, with optional merging"""
-        label = self.addText("MOTION EVENTS", QFont("Arial", 10, QFont.Weight.Bold))
-        label.setPos(5, y_pos - 20)
-        label.setDefaultTextColor(QColor(180, 220, 255))
+        self.row_labels.append(("MOTION EVENTS", y_pos))
 
         # Build intervals
         intervals = []
@@ -756,9 +746,7 @@ class SignalTimelineScene(QGraphicsScene):
    
     def draw_motion_peaks_layer(self, y_pos):
         """Draw motion peaks, with optional merging"""
-        label = self.addText("MOTION PEAKS", QFont("Arial", 10, QFont.Weight.Bold))
-        label.setPos(5, y_pos - 20)
-        label.setDefaultTextColor(QColor(180, 220, 255))
+        self.row_labels.append(("MOTION PEAKS", y_pos))
 
         intervals = []
         for timestamp in self.cache_data.get('motion_peaks', []):
@@ -790,9 +778,7 @@ class SignalTimelineScene(QGraphicsScene):
 
     def draw_audio_peaks_layer(self, y_pos):
         """Draw audio peaks, with optional merging"""
-        label = self.addText("AUDIO PEAKS", QFont("Arial", 10, QFont.Weight.Bold))
-        label.setPos(5, y_pos - 20)
-        label.setDefaultTextColor(QColor(180, 220, 255))
+        self.row_labels.append(("AUDIO PEAKS", y_pos))
 
         intervals = []
         for timestamp in self.cache_data.get('audio_peaks', []):
@@ -824,9 +810,7 @@ class SignalTimelineScene(QGraphicsScene):
     
     def draw_highlights_layer(self, y_pos):
         """Draw final highlight segments with improved labeling"""
-        label = self.addText("HIGHLIGHTS", QFont("Arial", 10, QFont.Weight.Bold))
-        label.setPos(5, y_pos - 20)
-        label.setDefaultTextColor(QColor(180, 220, 255))
+        self.row_labels.append(("HIGHLIGHTS", y_pos))
         
         # Check if highlight segments are in cache
         if 'final_segments' in self.cache_data:
