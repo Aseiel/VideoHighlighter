@@ -73,3 +73,5 @@ This project started as a personal tool to automatically generate subtitles for 
 ⚠️ Note: Development may be slow, minimal or none in the future, due to time constraints and family responsibilities. Contributions and improvements from the community are welcome!
 
 The primary goal remains practical: speed up video analysis, generate highlights, and create accessible subtitles automatically.
+
+![Stars History](assets/star-history-2026423.png)
