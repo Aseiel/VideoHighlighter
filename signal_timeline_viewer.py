@@ -2316,30 +2316,36 @@ class SignalTimelineWindow(QMainWindow):
     
     @Slot(float)
     def on_time_clicked(self, time):
-        """Handle timeline click"""
-        # Stop edit playback if running
+        # Pause edit playback if running, but DON'T destroy state
         if hasattr(self, '_edit_playlist') and self._edit_playlist:
-            self.stop_edit_playback()
+            if not getattr(self, '_edit_paused', True):
+                self._pause_edit_playback()
         
         self.current_time = max(0, min(self.video_duration, time))
-        
-        # Update signal scene
         self.signal_scene.current_time_seconds = self.current_time
         self.signal_scene.set_current_time(self.current_time)
         if hasattr(self, 'signal_view'):
             self.signal_view.ensure_time_visible(self.current_time)
         
-        # Seek video player to this time
         if hasattr(self, 'video_player'):
-            ms = int(self.current_time * 1000)
-            self._active_player.setPosition(ms)
-            # No play() call. No pause() call. Just seek.
+            self._active_player.setPosition(int(self.current_time * 1000))
         
-        # Update label
         minutes = int(self.current_time // 60)
         secs = int(self.current_time % 60)
         msec = int((self.current_time % 1) * 1000)
         self.time_label.setText(f"{minutes:02d}:{secs:02d}.{msec:03d}")
+
+    def _pause_edit_playback(self):
+        """Pause edit playback while preserving playlist state."""
+        self._edit_paused = True
+        self.play_edit_btn.setText("▶ Play Edit")
+        self._active_player.pause()
+        
+        if hasattr(self, '_edit_clip_timer') and self._edit_clip_timer.isActive():
+            self._edit_remaining_ms = self._edit_clip_timer.remainingTime()
+            self._edit_clip_timer.stop()
+        if hasattr(self, '_edit_progress_timer'):
+            self._edit_progress_timer.stop()
 
     def _get_active_audio_output(self):
         """Return the QAudioOutput attached to whichever player is currently active."""
@@ -2816,7 +2822,7 @@ class SignalTimelineWindow(QMainWindow):
             return
 
         self._edit_paused = False
-        self._edit_playlist = list(clips)
+        self._edit_playback_active = True   # sentinel instead of snapshot
         self._edit_playlist_index = 0
         self.play_edit_btn.setText("⏸ Pause")
         self.statusBar().showMessage(f"▶ Playing edit timeline: {len(clips)} clips", 3000)
@@ -2824,16 +2830,33 @@ class SignalTimelineWindow(QMainWindow):
 
     def toggle_edit_playback(self):
         """Toggle play/pause for edit timeline"""
-        if not hasattr(self, '_edit_playlist') or not self._edit_playlist:
+        if not getattr(self, '_edit_playback_active', False):
             # Nothing playing — start fresh
             self.play_edit_timeline()
             return
 
-        if hasattr(self, '_edit_paused') and self._edit_paused:
-            # Resume
+        if getattr(self, '_edit_paused', False):
+            # Resume — restore video player to edit playhead position
+            idx = self._edit_playlist_index - 1  # current clip
+            clips = self.edit_scene.get_clip_times()
+            
+            if 0 <= idx < len(clips):
+                start, end = clips[idx]
+                
+                # Where was the edit playhead when we paused?
+                if hasattr(self, '_edit_remaining_ms') and self._edit_remaining_ms > 0:
+                    edit_pos = end - (self._edit_remaining_ms / 1000.0)
+                else:
+                    edit_pos = start
+                
+                # Snap video player back to edit position (in case timeline was clicked)
+                self._active_player.setPosition(int(edit_pos * 1000))
+                self.current_time = edit_pos
+                self.signal_scene.set_current_time(edit_pos)
+            
             self._edit_paused = False
             self.play_edit_btn.setText("⏸ Pause")
-            self.video_player.play()
+            self._active_player.play()
             
             # Restart progress timer
             if hasattr(self, '_edit_progress_timer'):
@@ -2849,7 +2872,7 @@ class SignalTimelineWindow(QMainWindow):
             # Pause
             self._edit_paused = True
             self.play_edit_btn.setText("▶ Play Edit")
-            self.video_player.pause()
+            self._active_player.pause()
             
             # Stop timers but remember remaining time
             if hasattr(self, '_edit_clip_timer') and self._edit_clip_timer.isActive():
@@ -2863,24 +2886,30 @@ class SignalTimelineWindow(QMainWindow):
 
     def _play_next_edit_clip(self):
         """Play the next clip in the edit playlist"""
-        if not hasattr(self, '_edit_playlist') or self._edit_playlist_index >= len(self._edit_playlist):
+        clips = self.edit_scene.get_clip_times()
+        
+        if not clips or self._edit_playlist_index >= len(clips):
             self.statusBar().showMessage("✅ Edit timeline playback complete", 3000)
-            self.video_player.pause()
+            self._active_player.pause()
             self.edit_scene.clear_active_clip()
-            self._edit_playlist = []
+            self._edit_playback_active = False
+            self._edit_playlist_index = 0
             self._edit_paused = False
             self.play_edit_btn.setText("▶ Play Edit")
             if hasattr(self, '_edit_progress_timer'):
                 self._edit_progress_timer.stop()
             return
 
-        start, end = self._edit_playlist[self._edit_playlist_index]
+        start, end = clips[self._edit_playlist_index]
         duration = end - start
         self._edit_playlist_index += 1
 
         clip_num = self._edit_playlist_index
-        total = len(self._edit_playlist)
-        self.statusBar().showMessage(f"▶ Clip {clip_num}/{total}: {start:.1f}s - {end:.1f}s", int(duration * 1000))
+        total = len(clips)
+        self.statusBar().showMessage(
+            f"▶ Clip {clip_num}/{total}: {start:.1f}s - {end:.1f}s",
+            int(duration * 1000)
+        )
 
         # Seek and play
         self.current_time = start
@@ -2888,8 +2917,8 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self, 'signal_view'):
             self.signal_view.ensure_time_visible(start)
 
-        self.video_player.setPosition(int(start * 1000))
-        self.video_player.play()
+        self._active_player.setPosition(int(start * 1000))
+        self._active_player.play()
 
         # Highlight active clip in edit timeline
         self.edit_scene.set_active_clip(self._edit_playlist_index - 1)
@@ -2912,16 +2941,21 @@ class SignalTimelineWindow(QMainWindow):
 
     def _update_edit_progress(self):
         """Update progress line in active edit clip"""
-        if not hasattr(self, '_edit_playlist') or self._edit_playlist_index <= 0:
+        if not getattr(self, '_edit_playback_active', False):
             return
+        
         idx = self._edit_playlist_index - 1
-        if idx >= len(self._edit_playlist):
+        clips = self.edit_scene.get_clip_times()
+        
+        if idx < 0 or idx >= len(clips):
             return
-        start, end = self._edit_playlist[idx]
+        
+        start, end = clips[idx]
         duration = end - start
         if duration <= 0:
             return
-        current = self.video_player.position() / 1000.0
+        
+        current = self._active_player.position() / 1000.0
         
         # Ignore updates until player has actually seeked to the clip
         if current < start - 0.5 or current > end + 0.5:
