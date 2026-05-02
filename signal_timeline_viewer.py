@@ -1371,6 +1371,10 @@ class SignalTimelineWindow(QMainWindow):
         self.signal_scene.add_to_edit_requested.connect(self.on_add_to_edit_requested)
         self.signal_scene.filter_changed.connect(self.on_filter_changed)
         
+        # Preview follows drag
+        if hasattr(self.signal_scene, 'time_dragged'):
+            self.signal_scene.time_dragged.connect(self.on_time_dragged)
+        
         # Check if waveform clicked signal exists
         if hasattr(self.signal_scene, 'waveform_clicked'):
             self.signal_scene.waveform_clicked.connect(self.on_waveform_clicked)
@@ -2324,20 +2328,47 @@ class SignalTimelineWindow(QMainWindow):
         self.signal_scene.set_current_time(self.current_time)
         if hasattr(self, 'signal_view'):
             self.signal_view.ensure_time_visible(self.current_time)
-           
+        
         # Seek video player to this time
         if hasattr(self, 'video_player'):
-            milliseconds = int(self.current_time * 1000)
-            self._active_player.setPosition(milliseconds)
-            if self.video_player.playbackState() != QMediaPlayer.PlayingState:
-                self._active_player.play()
-                QTimer.singleShot(50, self._active_player.pause)
+            ms = int(self.current_time * 1000)
+            self._active_player.setPosition(ms)
+            # No play() call. No pause() call. Just seek.
         
         # Update label
         minutes = int(self.current_time // 60)
+        secs = int(self.current_time % 60)
+        msec = int((self.current_time % 1) * 1000)
+        self.time_label.setText(f"{minutes:02d}:{secs:02d}.{msec:03d}")
+
+    def _get_active_audio_output(self):
+        """Return the QAudioOutput attached to whichever player is currently active."""
+        if self._active_player is self.video_player:
+            return getattr(self, 'audio_output', None)
+        if self.realtime_preview and self._active_player is self.realtime_preview.player:
+            return getattr(self.realtime_preview, 'audio_output', None)
+        return None
+
+    @Slot(float)
+    def on_time_dragged(self, time):
+        """Update video preview during timeline drag"""
+        self.current_time = max(0, min(self.video_duration, time))
+        
+        # Seek the video player to show the frame
+        if hasattr(self, '_active_player'):
+            self._active_player.setPosition(int(self.current_time * 1000))
+        
+        # Update playhead
+        self.signal_scene.set_current_time(self.current_time)
+        
+        # Update time label
+        minutes = int(self.current_time // 60)
         seconds = int(self.current_time % 60)
-        milliseconds = int((self.current_time % 1) * 1000)
-        self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}")
+        ms = int((self.current_time % 1) * 1000)
+        self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{ms:03d}")
+        
+        # Update detection panel
+        self._update_detection_panel(self.current_time)
 
     @Slot(float, float, float)
     def on_waveform_clicked(self, start_time, end_time, amplitude):
