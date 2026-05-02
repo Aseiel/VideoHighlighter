@@ -14,6 +14,7 @@ class SignalTimelineScene(QGraphicsScene):
     """Improved graphics scene with filtering capabilities"""
     
     time_clicked = Signal(float)
+    time_dragged = Signal(float)
     add_to_edit_requested = Signal(float)
     filter_changed = Signal(dict)
     waveform_clicked = Signal(float, float, float)
@@ -105,6 +106,7 @@ class SignalTimelineScene(QGraphicsScene):
         self.merge_threshold = 0.0
         self.bars = []
         self.row_labels = []
+        self._last_drag_emit = 0  # throttle for time_dragged signal
 
         # Range selection state
         self._selection_rect_item = None   # QGraphicsRectItem — the blue highlight
@@ -1432,6 +1434,13 @@ class SignalTimelineView(QGraphicsView):
                 scene_pos = self.mapToScene(event.pos())
                 current_t = scene_pos.x() / scene.pixels_per_second
                 scene.update_selection_rect(self._range_start_time, current_t)
+                
+                # Update video preview during drag (throttled to ~20fps)
+                import time as _time
+                now = _time.time()
+                if now - scene._last_drag_emit > 0.05:
+                    scene._last_drag_emit = now
+                    scene.time_dragged.emit(current_t)
             event.accept()
             return
 
