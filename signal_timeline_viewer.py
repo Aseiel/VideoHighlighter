@@ -2407,41 +2407,96 @@ class SignalTimelineWindow(QMainWindow):
     def on_edit_time_clicked(self, time):
         """Handle click on edit timeline — seek to source time"""
         self.current_time = max(0, min(self.video_duration, time))
-        
+
         # Update signal timeline playhead
         self.signal_scene.current_time_seconds = self.current_time
         self.signal_scene.set_current_time(self.current_time)
         if hasattr(self, 'signal_view'):
             self.signal_view.ensure_time_visible(self.current_time)
-        
+
         # Seek video player
         if hasattr(self, 'video_player'):
-            self.video_player.setPosition(int(self.current_time * 1000))
-        
-        # If playing — update which clip we're in and let timer handle progress
-        is_playing = (hasattr(self, '_edit_paused') and not self._edit_paused 
-                      and hasattr(self, '_edit_playlist') and self._edit_playlist)
-        
+            self._active_player.setPosition(int(self.current_time * 1000))
+
+        # Edit-playback state (use the real sentinel, not the never-set _edit_playlist)
+        edit_active = getattr(self, '_edit_playback_active', False)
+        is_playing  = edit_active and not getattr(self, '_edit_paused', False)
+
+        # Find the clip containing the clicked time
+        found = -1
         for i, (start, end) in enumerate(self.edit_scene.clips):
             if start <= self.current_time <= end:
-                if is_playing:
-                    # During playback: update playlist index, let timer do progress
-                    self._edit_playlist_index = i + 1
-                    self.edit_scene.set_active_clip(i)
-                else:
-                    # When paused: set both clip and progress from click
-                    self.edit_scene.set_active_clip(i)
-                    progress = (self.current_time - start) / (end - start) if end > start else 0
-                    self.edit_scene.set_active_progress(progress)
+                found = i
                 break
+
+        if found >= 0:
+            start, end = self.edit_scene.clips[found]
+            self.edit_scene.set_active_clip(found)
+
+            if is_playing:
+                # Reroute the live playback so this clip plays through to its
+                # end, then continues with the next clip in the timeline.
+                self._reroute_edit_playback_to(found, self.current_time)
+            else:
+                # Static progress while not playing
+                progress = (self.current_time - start) / (end - start) if end > start else 0
+                self.edit_scene.set_active_progress(progress)
+
+                # If edit playback is paused, also fix the resume state so the
+                # next "play" continues from this clip, not from where we paused.
+                if edit_active:
+                    self._edit_playlist_index = found + 1
+                    self._edit_remaining_ms = int(max(0.0, end - self.current_time) * 1000)
         else:
             self.edit_scene.clear_active_clip()
-        
+
         # Update time label
         minutes = int(self.current_time // 60)
         seconds = int(self.current_time % 60)
-        milliseconds = int((self.current_time % 1) * 1000)
-        self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}")
+        ms      = int((self.current_time % 1) * 1000)
+        self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{ms:03d}")
+
+    def _reroute_edit_playback_to(self, clip_index: int, current_pos: float):
+        """
+        Reroute active edit playback to play clips[clip_index] from current_pos
+        through to its end, then continue with the next clip in the timeline.
+
+        Stops the stale clip-end and progress timers from the previously playing
+        clip and restarts them sized to the remaining duration of the clicked
+        clip. Without this, the stale timer fires later and jumps playback to
+        whatever its outdated _edit_playlist_index points at — which is the
+        "plays clip 1 then jumps to clip 6" bug.
+        """
+        clips = self.edit_scene.get_clip_times()
+        if not (0 <= clip_index < len(clips)):
+            return
+
+        start, end   = clips[clip_index]
+        remaining_ms = max(0, int((end - current_pos) * 1000))
+
+        # Kill stale timers from the previously playing clip
+        if hasattr(self, '_edit_clip_timer') and self._edit_clip_timer.isActive():
+            self._edit_clip_timer.stop()
+        if hasattr(self, '_edit_progress_timer') and self._edit_progress_timer.isActive():
+            self._edit_progress_timer.stop()
+
+        # Next clip to play after this one ends
+        self._edit_playlist_index = clip_index + 1
+
+        # Should still be in PlayingState, but make sure
+        if self._active_player.playbackState() != QMediaPlayer.PlayingState:
+            self._active_player.play()
+
+        # Restart progress timer (~30 fps)
+        self._edit_progress_timer = QTimer()
+        self._edit_progress_timer.timeout.connect(self._update_edit_progress)
+        self._edit_progress_timer.start(33)
+
+        # Restart clip-end timer with REMAINING time of the clicked clip
+        self._edit_clip_timer = QTimer()
+        self._edit_clip_timer.setSingleShot(True)
+        self._edit_clip_timer.timeout.connect(self._play_next_edit_clip)
+        self._edit_clip_timer.start(remaining_ms)
 
     @Slot(float, float)
     def on_clip_double_clicked(self, start_time, end_time):
@@ -2971,7 +3026,6 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self, '_edit_progress_timer'):
             self._edit_progress_timer.stop()
         self.edit_scene.clear_active_clip()
-        self._edit_playlist = []
         self._edit_playlist_index = 0
         self._edit_paused = False
         self.play_edit_btn.setText("▶ Play Edit")
