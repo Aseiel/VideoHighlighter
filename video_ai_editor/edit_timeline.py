@@ -1,4 +1,5 @@
 import os
+import hashlib
 import json
 from pathlib import Path
 from PySide6.QtWidgets import (
@@ -7,7 +8,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QDialogButtonBox, QMessageBox, QMenu,
     QStyle,
 )
-from PySide6.QtCore import Qt, QRectF, Signal, QTimer
+from PySide6.QtCore import Qt, QRectF, Signal, QTimer, QPointF
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QFont, QLinearGradient, QCursor, QPainter
 )
@@ -43,9 +44,9 @@ class EditClipItem(QGraphicsRectItem):
         self.start_time = start_time
         self.end_time = end_time
         self.color = color
-        self.index = index
         self.is_selected = False
         self.original_pos = None
+        self.drag_start_pos = None
 
         # Set rectangle properties
         self.setRect(0, 0, 0, height)
@@ -72,15 +73,27 @@ class EditClipItem(QGraphicsRectItem):
     def update_label(self):
         """Update clip label text"""
         duration = self.end_time - self.start_time
-        label_text = f"Clip {self.index}\n{_fmt_time(self.start_time)} - {_fmt_time(self.end_time)}\n({_fmt_duration(duration)})"
+        
+        # Get current index from scene dynamically
+        idx = -1
+        scene = self.scene()
+        if scene and hasattr(scene, 'clip_items') and self in scene.clip_items:
+            idx = scene.clip_items.index(self)
+        
+        # Build label text with or without clip number
+        if idx >= 0:
+            label_text = f"Clip {idx + 1}\n{_fmt_time(self.start_time)} - {_fmt_time(self.end_time)}\n({_fmt_duration(duration)})"
+        else:
+            label_text = f"{_fmt_time(self.start_time)} - {_fmt_time(self.end_time)}\n({_fmt_duration(duration)})"
+        
         self.text_item.setPlainText(label_text)
         self.text_item.setFont(QFont("Arial", 8, QFont.Weight.Bold))
         self.text_item.setDefaultTextColor(Qt.white)
-
+        
         # Center text in clip
         text_rect = self.text_item.boundingRect()
         self.text_item.setPos(self.rect().width()/2 - text_rect.width()/2,
-                              self.rect().height()/2 - text_rect.height()/2)
+                            self.rect().height()/2 - text_rect.height()/2)
 
     def set_selected(self, selected):
         """Update selection state"""
@@ -171,9 +184,12 @@ class EditClipItem(QGraphicsRectItem):
                             item.setSelected(False)
 
             self.setSelected(True)
-            self.original_pos = self.pos()
+            
+            # Store the initial drag position in scene coordinates
+            self.drag_start_pos = event.scenePos()
+            self.original_pos = self.pos()  # Store original item position
             self.setCursor(QCursor(Qt.ClosedHandCursor))
-
+            
             # Seek to the source time at the click position
             local_x = event.pos().x()
             width = self.rect().width()
@@ -182,31 +198,107 @@ class EditClipItem(QGraphicsRectItem):
                 source_time = self.start_time + progress * (self.end_time - self.start_time)
                 if scene and hasattr(scene, 'time_clicked'):
                     scene.time_clicked.emit(source_time)
-
+            
+            event.accept()  # Accept the event to ensure we get move events
+            return
+        
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event):
+        """Handle mouse move during drag - manual positioning for better control"""
+        if self.original_pos is not None and self.drag_start_pos is not None:
+            # Calculate the movement delta in scene coordinates
+            current_scene_pos = event.scenePos()
+            delta = current_scene_pos - self.drag_start_pos
+            
+            # Calculate new position (only horizontal movement matters for reordering)
+            new_x = self.original_pos.x() + delta.x()
+            new_y = self.original_pos.y()  # Keep Y position fixed
+            
+            # Set the new position
+            self.setPos(new_x, new_y)
+            
+            # Visual feedback
+            self.setOpacity(0.55)
+            self.setZValue(20)
+            
+            # Show drop indicator
+            scene = self.scene()
+            if scene is not None:
+                # Use the LEFT edge of the clip for consistent positioning
+                left_edge = self.pos().x()
+                center_y = self.pos().y() + self.rect().height() / 2
+                scene.show_drop_indicator(QPointF(left_edge, center_y))
+            
+            event.accept()
+            return
+        
+        super().mouseMoveEvent(event)
+
     def mouseReleaseEvent(self, event):
-        """Handle mouse release - reorder if moved"""
+        """Handle mouse release - finish drag and drop"""
         try:
-            if event.button() == Qt.LeftButton and hasattr(self, 'original_pos') and self.original_pos:
+            if event.button() == Qt.LeftButton and self.original_pos is not None:
                 self.setCursor(QCursor(Qt.OpenHandCursor))
+                self.setOpacity(1.0)
+                self.setZValue(0)
 
-                # Check if item was moved significantly
+                scene = self.scene()
+                if scene is not None:
+                    scene.hide_drop_indicator()
+
                 new_pos = self.pos()
-                if (new_pos - self.original_pos).manhattanLength() > 10:
-                    # Item was dragged - trigger reorder
-                    scene = self.scene()
-                    if scene and hasattr(scene, 'reorder_clip'):
-                        scene.reorder_clip(self.index - 1, new_pos.x())  # Convert to 0-based index
+                moved = (new_pos - self.original_pos).manhattanLength() > 10
 
+                if moved and scene and hasattr(scene, 'reorder_clip'):
+                    # Get current index dynamically
+                    current_index = self._get_current_index()
+                    if current_index >= 0:
+                        left_edge = new_pos.x()
+                        scene.reorder_clip(current_index, left_edge)
+                else:
+                    # Snap back to original position if not moved enough
+                    self._animate_to(self.original_pos)
+
+                # Reset drag state
                 self.original_pos = None
+                self.drag_start_pos = None
+                
+                event.accept()
+                return
 
-            # Call parent only if item still exists
             if self.scene():
                 super().mouseReleaseEvent(event)
         except RuntimeError:
-            # Item was deleted, ignore
             pass
+
+        # Ensure drag state is cleared even if there's an error
+        self.original_pos = None
+        self.drag_start_pos = None
+
+    def _animate_to(self, target_pos, duration_ms=180, steps=14):
+        """Manual ease-out tween — QGraphicsRectItem isn't a QObject for QPropertyAnimation."""
+        start = self.pos()
+        if (start - target_pos).manhattanLength() < 1:
+            return
+        interval = max(1, duration_ms // steps)
+
+        def tick(i=[0]):
+            try:
+                if i[0] > steps or self.scene() is None:
+                    self.setPos(target_pos)
+                    return
+                t = i[0] / steps
+                ease = 1 - (1 - t) ** 3
+                self.setPos(
+                    start.x() + (target_pos.x() - start.x()) * ease,
+                    start.y() + (target_pos.y() - start.y()) * ease,
+                )
+                i[0] += 1
+                QTimer.singleShot(interval, tick)
+            except RuntimeError:
+                pass
+        tick()
 
     def itemChange(self, change, value):
         """Handle item changes (like selection)"""
@@ -228,11 +320,21 @@ class EditClipItem(QGraphicsRectItem):
                 scene.clip_double_clicked.emit(self.start_time, self.end_time)
         super().mouseDoubleClickEvent(event)
 
+    def _get_current_index(self):
+        """Get current index from scene's clip_items list"""
+        scene = self.scene()
+        if scene and hasattr(scene, 'clip_items') and self in scene.clip_items:
+            return scene.clip_items.index(self)
+        return -1
+
     def hoverEnterEvent(self, event):
-        """Show tooltip on hover; hover preview is updated by hoverMoveEvent."""
+        """Show tooltip on hover"""
         duration = self.end_time - self.start_time
+        idx = self._get_current_index()
+        clip_num = idx + 1 if idx >= 0 else "?"
+        
         self.setToolTip(
-            f"Clip {self.index}\n"
+            f"Clip {clip_num}\n"
             f"{self.start_time:.1f}s - {self.end_time:.1f}s\n"
             f"Duration: {duration:.1f}s\n"
             f"Drag to reorder · Double-click to play · Right-click for menu"
@@ -250,6 +352,10 @@ class EditClipItem(QGraphicsRectItem):
         """
         scene = self.scene()
         if not scene:
+            return
+        
+        current_index = self._get_current_index()
+        if current_index < 0:
             return
 
         # Hide hover preview while the context menu is open
@@ -280,7 +386,7 @@ class EditClipItem(QGraphicsRectItem):
         """)
 
         header = menu.addAction(
-            f"Clip {self.index}   {_fmt_time(self.start_time)} → {_fmt_time(self.end_time)}  ({_fmt_duration(duration)})"
+            f"Clip {current_index}   {_fmt_time(self.start_time)} → {_fmt_time(self.end_time)}  ({_fmt_duration(duration)})"
         )
         header.setEnabled(False)
         menu.addSeparator()
@@ -391,6 +497,7 @@ class EditTimelineScene(QGraphicsScene):
     time_clicked = Signal(float)                # source video time
     clip_cut = Signal(float)                    # cut time after a successful cut
     clip_trimmed = Signal(int)                  # clip index after a trim
+    clip_reordered = Signal(int, int)           # from_index, to_index
 
     def __init__(self, video_path, video_duration, parent=None, cache=None):
         super().__init__(parent)
@@ -701,11 +808,21 @@ class EditTimelineScene(QGraphicsScene):
             width = max(60, duration * self.pixels_per_second)
 
             color = self.get_clip_color(i)
-            clip_item = EditClipItem(start, end, y_pos, self.clip_height, color, i + 1)
+            # FIX: Added missing 'i' parameter for index
+            clip_item = EditClipItem(start, end, y_pos, self.clip_height, color, i)
             clip_item.setRect(0, 0, width, self.clip_height)
             clip_item.setPos(current_x, y_pos)
             self.addItem(clip_item)
             self.clip_items.append(clip_item)
+
+            # ── prefetch this clip's filmstrip ─────────────────────
+            if self.thumb_cache is not None:
+                aspect = 16 / 9
+                target_slot_w = max(40, int(self.clip_height * aspect))
+                n_slots = max(1, int(width // target_slot_w))
+                self.thumb_cache.prefetch_range(
+                    start, end, self.clip_height, n_slots
+                )
 
             clip_item.update_label()
             current_x += width + self.clip_spacing
@@ -744,7 +861,8 @@ class EditTimelineScene(QGraphicsScene):
                 self.addLine(x, ruler_y - 4, x, ruler_y, QPen(QColor(150, 150, 150), 1))
 
     def get_clip_color(self, index):
-        """Get a color for a clip based on its index"""
+        """Stable color per clip based on (start, end) — survives reorders
+        and app restarts."""
         colors = [
             QColor(100, 150, 255, 220),  # Blue
             QColor(100, 255, 100, 220),  # Green
@@ -753,8 +871,13 @@ class EditTimelineScene(QGraphicsScene):
             QColor(200, 100, 255, 220),  # Purple
             QColor(50, 255, 255, 220),   # Cyan
         ]
+        if 0 <= index < len(self.clips):
+            start, end = self.clips[index]
+            key = f"{round(start, 2)}_{round(end, 2)}".encode()
+            color_idx = int(hashlib.md5(key).hexdigest(), 16) % len(colors)
+            return colors[color_idx]
         return colors[index % len(colors)]
-
+    
     def add_clip(self, start_time, end_time):
         """Add a new clip to the timeline"""
         start_time = max(0, min(start_time, self.video_duration - 1))
@@ -871,14 +994,22 @@ class EditTimelineScene(QGraphicsScene):
         self.is_dragging_over = False
         self.hide_drop_indicator()
 
-    def show_drop_indicator(self, pos):
+    def show_drop_indicator(self, pos_or_x, y=None):
         """Show visual indicator where clip will be inserted"""
         self.clear_drop_indicators()
-
-        insert_index = self.get_insert_index(pos.x())
+        
+        # Handle both QPointF and (x, y) parameter patterns
+        if isinstance(pos_or_x, QPointF):
+            x_pos = pos_or_x.x()
+            y_pos = pos_or_x.y()
+        else:
+            x_pos = pos_or_x
+            y_pos = y if y is not None else 35
+        
+        insert_index = self.get_insert_index(x_pos)
         x_pos = self.calculate_insert_x(insert_index)
         self.drop_indicator = self.addLine(x_pos, 35, x_pos, 35 + self.clip_height,
-                                          QPen(QColor(0, 255, 0), 2, Qt.DashLine))
+                                        QPen(QColor(0, 255, 0), 2, Qt.DashLine))
         self.drop_indicator_marker = self.addEllipse(x_pos - 5, 30, 10, 10,
                                                     QPen(Qt.green, 2), QBrush(Qt.green))
         self.drop_position = insert_index
@@ -891,18 +1022,23 @@ class EditTimelineScene(QGraphicsScene):
             self.removeItem(self.drop_indicator_marker)
 
     def get_insert_index(self, x_pos):
-        """Determine where to insert based on x position"""
+        """
+        Determine where to insert based on x position.
+        Compare against clip boundaries (left edges + half width for equal spacing)
+        """
         current_x = 20
-
+        
         for i, (start, end) in enumerate(self.clips):
             duration = end - start
             width = max(60, duration * self.pixels_per_second)
-
-            if x_pos < current_x + width / 2:
+            
+            # Compare against clip's right edge (more predictable than center)
+            right_edge = current_x + width
+            if x_pos < current_x + (width / 2):  # Insert before if left of center
                 return i
-
+            
             current_x += width + self.clip_spacing
-
+        
         return len(self.clips)
 
     def calculate_insert_x(self, index):
@@ -1011,15 +1147,22 @@ class EditTimelineScene(QGraphicsScene):
             pass
         self._progress_line = None
 
-    def reorder_clip(self, clip_index, new_x_pos):
-        """Reorder a clip based on drag position"""
+    def reorder_clip(self, clip_index, new_left_x):
+        """Reorder clip based on its left edge position, not center"""
         if 0 <= clip_index < len(self.clips):
             clip = self.clips.pop(clip_index)
-            insert_index = self.get_insert_index(new_x_pos)
+            insert_index = self.get_insert_index(new_left_x)
+            
+            # Adjust insert_index if we're moving forward
             if insert_index > clip_index:
                 insert_index -= 1
+            
             self.clips.insert(insert_index, clip)
-            self.build_timeline()
+            self.build_timeline()  # This recreates all clip items with new indices
+            
+            if insert_index != clip_index:
+                self.show_drop_feedback(insert_index)
+                self.clip_reordered.emit(clip_index, insert_index)
 
     # ── CUT / TRIM OPERATIONS ──────────────────────────────────────────
     def cut_clip_at(self, source_time):
