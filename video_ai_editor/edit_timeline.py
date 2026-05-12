@@ -4,17 +4,40 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QGraphicsRectItem, QGraphicsTextItem, QGraphicsScene,
     QGraphicsView, QDialog, QVBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QDialogButtonBox, QMessageBox, QMenu
+    QListWidget, QListWidgetItem, QDialogButtonBox, QMessageBox, QMenu,
+    QStyle,
 )
 from PySide6.QtCore import Qt, QRectF, Signal, QTimer
 from PySide6.QtGui import (
-    QColor, QPen, QBrush, QFont, QLinearGradient, QCursor
+    QColor, QPen, QBrush, QFont, QLinearGradient, QCursor, QPainter
 )
 from .timeline_bars import TimelineBar
 
+# ── thumbnail / hover modules ─────────────────────────────────────
+from .thumbnail_cache import ThumbnailCache
+from .hover_preview import HoverPreview
+from .filmstrip_painter import paint_filmstrip
+
+
+# Hover preview pulls a larger thumb than the filmstrip slots.
+HOVER_PREVIEW_HEIGHT = 180
+
+
+def _fmt_time(seconds: float) -> str:
+    """Format timestamp as M:SS.t  →  1268.4 becomes '21:08.4'"""
+    mins = int(seconds // 60)
+    secs = seconds - mins * 60
+    return f"{mins}:{secs:04.1f}"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Durations under a minute keep 'X.Xs', longer ones use M:SS.t"""
+    return f"{seconds:.1f}s" if seconds < 60 else _fmt_time(seconds)
+
+
 class EditClipItem(QGraphicsRectItem):
     """Represents a clip in the edit timeline that can be dragged for reordering"""
-    
+
     def __init__(self, start_time, end_time, y, height, color, index):
         super().__init__()
         self.start_time = start_time
@@ -23,40 +46,42 @@ class EditClipItem(QGraphicsRectItem):
         self.index = index
         self.is_selected = False
         self.original_pos = None
-        
+
         # Set rectangle properties
         self.setRect(0, 0, 0, height)
         self.setPos(0, y)
         self.setBrush(QBrush(color))
         self.setPen(QPen(color.darker(150), 1))
-        
+
         # Make it draggable
         self.setFlag(QGraphicsRectItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsRectItem.ItemIsMovable, True)
         self.setFlag(QGraphicsRectItem.ItemSendsGeometryChanges, True)
         self.setAcceptHoverEvents(True)
         self.setCursor(QCursor(Qt.OpenHandCursor))
-        
+
         # Add text label
         self.text_item = QGraphicsTextItem(self)
         self.text_item.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         self.text_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.text_item.setAcceptHoverEvents(False)
+        # Ensure text renders above our filmstrip paint() output.
+        self.text_item.setZValue(2)
         self.update_label()
-    
+
     def update_label(self):
         """Update clip label text"""
         duration = self.end_time - self.start_time
-        label_text = f"Clip {self.index}\n{self.start_time:.1f}s-{self.end_time:.1f}s\n({duration:.1f}s)"
+        label_text = f"Clip {self.index}\n{_fmt_time(self.start_time)} - {_fmt_time(self.end_time)}\n({_fmt_duration(duration)})"
         self.text_item.setPlainText(label_text)
-        self.text_item.setFont(QFont("Arial", 8))
+        self.text_item.setFont(QFont("Arial", 8, QFont.Weight.Bold))
         self.text_item.setDefaultTextColor(Qt.white)
-        
+
         # Center text in clip
         text_rect = self.text_item.boundingRect()
-        self.text_item.setPos(self.rect().width()/2 - text_rect.width()/2, 
-                             self.rect().height()/2 - text_rect.height()/2)
-    
+        self.text_item.setPos(self.rect().width()/2 - text_rect.width()/2,
+                              self.rect().height()/2 - text_rect.height()/2)
+
     def set_selected(self, selected):
         """Update selection state"""
         self.is_selected = selected
@@ -64,7 +89,62 @@ class EditClipItem(QGraphicsRectItem):
             self.setPen(QPen(Qt.yellow, 2))
         else:
             self.setPen(QPen(self.color.darker(150), 1))
-    
+
+    # ── custom paint that draws filmstrip + dark label backdrop ──
+    def paint(self, painter, option, widget=None):
+        """
+        Custom paint:
+          1. Colored background (uses self.brush() — same color as before)
+          2. Filmstrip thumbnails (from scene.thumb_cache)
+          3. Semi-transparent dark backdrop behind the text label
+          4. Border (selection-aware)
+
+        The QGraphicsTextItem child renders on top automatically (its z=2),
+        so the text appears clearly readable on the dark backdrop.
+        """
+        rect = self.rect()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # 1. Background — keep the existing color, but rounded for polish
+        painter.setBrush(self.brush())
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(rect, 4, 4)
+
+        # 2. Filmstrip — only if scene exposes a thumb_cache
+        scene = self.scene()
+        if scene is not None and getattr(scene, "thumb_cache", None) is not None:
+            # Inset 1px so thumbs don't overdraw the rounded corners
+            inset = rect.adjusted(1, 1, -1, -1)
+            paint_filmstrip(
+                painter,
+                inset,
+                self.start_time,
+                self.end_time,
+                scene.thumb_cache,
+            )
+
+        # 3. Label backdrop — Premiere-style dark pill behind the text
+        if self.text_item is not None:
+            tr = self.text_item.boundingRect()
+            tp = self.text_item.pos()
+            backdrop = QRectF(
+                tp.x() - 8, tp.y() - 4,
+                tr.width() + 16, tr.height() + 8
+            )
+            # Don't draw if the backdrop wouldn't fit (very narrow clips)
+            if backdrop.width() < rect.width() - 2:
+                painter.setBrush(QBrush(QColor(0, 0, 0, 160)))
+                painter.setPen(Qt.NoPen)
+                painter.drawRoundedRect(backdrop, 5, 5)
+
+        # 4. Border — yellow when selected (matches old behavior), pen otherwise
+        if option is not None and (option.state & QStyle.State_Selected):
+            painter.setPen(QPen(Qt.yellow, 2))
+        else:
+            painter.setPen(self.pen())
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(rect, 4, 4)
+
     def mousePressEvent(self, event):
         """Handle mouse press — cut mode takes priority over drag/seek."""
         scene = self.scene()
@@ -104,13 +184,13 @@ class EditClipItem(QGraphicsRectItem):
                     scene.time_clicked.emit(source_time)
 
         super().mousePressEvent(event)
-    
+
     def mouseReleaseEvent(self, event):
         """Handle mouse release - reorder if moved"""
         try:
             if event.button() == Qt.LeftButton and hasattr(self, 'original_pos') and self.original_pos:
                 self.setCursor(QCursor(Qt.OpenHandCursor))
-                
+
                 # Check if item was moved significantly
                 new_pos = self.pos()
                 if (new_pos - self.original_pos).manhattanLength() > 10:
@@ -118,9 +198,9 @@ class EditClipItem(QGraphicsRectItem):
                     scene = self.scene()
                     if scene and hasattr(scene, 'reorder_clip'):
                         scene.reorder_clip(self.index - 1, new_pos.x())  # Convert to 0-based index
-                
+
                 self.original_pos = None
-            
+
             # Call parent only if item still exists
             if self.scene():
                 super().mouseReleaseEvent(event)
@@ -136,9 +216,9 @@ class EditClipItem(QGraphicsRectItem):
                 self.setPen(QPen(Qt.yellow, 2))
             else:
                 self.setPen(QPen(self.color.darker(150), 1))
-        
+
         return super().itemChange(change, value)
-    
+
     def mouseDoubleClickEvent(self, event):
         """Handle double click - play this clip"""
         if event.button() == Qt.LeftButton:
@@ -147,116 +227,110 @@ class EditClipItem(QGraphicsRectItem):
             if hasattr(scene, 'clip_double_clicked'):
                 scene.clip_double_clicked.emit(self.start_time, self.end_time)
         super().mouseDoubleClickEvent(event)
-    
+
     def hoverEnterEvent(self, event):
-        """Show tooltip on hover"""
+        """Show tooltip on hover; hover preview is updated by hoverMoveEvent."""
         duration = self.end_time - self.start_time
-        self.setToolTip(f"Clip {self.index}\n{self.start_time:.1f}s - {self.end_time:.1f}s\nDuration: {duration:.1f}s\nDrag to reorder\nDouble-click to play")
+        self.setToolTip(
+            f"Clip {self.index}\n"
+            f"{self.start_time:.1f}s - {self.end_time:.1f}s\n"
+            f"Duration: {duration:.1f}s\n"
+            f"Drag to reorder · Double-click to play · Right-click for menu"
+        )
         super().hoverEnterEvent(event)
 
-        def contextMenuEvent(self, event):
-            """
-            Right-click context menu for a clip.
-            Provides:
-            - Cut here        (at the exact pixel the user right-clicked)
-            - Trim start      (move in-point to click position)
-            - Trim end        (move out-point to click position)
-            - Delete clip
-            """
-            scene = self.scene()
-            if not scene:
-                return
+    def contextMenuEvent(self, event):
+        """
+        Right-click context menu for a clip.
+        Provides:
+          - Cut here     (at the exact pixel the user right-clicked)
+          - Trim start   (move in-point to click position)
+          - Trim end     (move out-point to click position)
+          - Delete clip
+        """
+        scene = self.scene()
+        if not scene:
+            return
 
-            # ── Calculate source time at click position ────────────────────
-            local_x = event.pos().x()
-            width = self.rect().width()
-            progress = max(0.0, min(1.0, local_x / width)) if width > 0 else 0.5
-            click_time = self.start_time + progress * (self.end_time - self.start_time)
-            duration = self.end_time - self.start_time
+        # Hide hover preview while the context menu is open
+        if hasattr(scene, '_hover_preview') and scene._hover_preview is not None:
+            scene._hover_preview.hide_preview()
 
-            # ── Build menu ─────────────────────────────────────────────────
-            menu = QMenu()
-            menu.setStyleSheet("""
-                QMenu {
-                    background-color: #1a1a2a;
-                    color: #d0d8ff;
-                    border: 1px solid #3a3a5a;
-                    border-radius: 4px;
-                    padding: 4px 0;
-                }
-                QMenu::item { padding: 6px 20px; border-radius: 3px; }
-                QMenu::item:selected { background-color: #3a5fcd; }
-                QMenu::item:disabled { color: #555577; }
-                QMenu::separator { height: 1px; background: #3a3a5a; margin: 4px 8px; }
-            """)
+        # ── Calculate source time at click position ─────────────────────
+        local_x = event.pos().x()
+        width = self.rect().width()
+        progress = max(0.0, min(1.0, local_x / width)) if width > 0 else 0.5
+        click_time = self.start_time + progress * (self.end_time - self.start_time)
+        duration = self.end_time - self.start_time
 
-            # Non-clickable header showing clip info
-            header = menu.addAction(
-                f"Clip {self.index}   {self.start_time:.2f}s → {self.end_time:.2f}s  ({duration:.1f}s)"
-            )
-            header.setEnabled(False)
-            menu.addSeparator()
+        # ── Build menu ───────────────────────────────────────────────────
+        menu = QMenu()
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #1a1a2a;
+                color: #d0d8ff;
+                border: 1px solid #3a3a5a;
+                border-radius: 4px;
+                padding: 4px 0;
+            }
+            QMenu::item { padding: 6px 20px; border-radius: 3px; }
+            QMenu::item:selected { background-color: #3a5fcd; }
+            QMenu::item:disabled { color: #555577; }
+            QMenu::separator { height: 1px; background: #3a3a5a; margin: 4px 8px; }
+        """)
 
-            # ── Cut action ─────────────────────────────────────────────────
-            cut_action = menu.addAction(f"✂️   Cut here  ({click_time:.2f}s)")
+        header = menu.addAction(
+            f"Clip {self.index}   {_fmt_time(self.start_time)} → {_fmt_time(self.end_time)}  ({_fmt_duration(duration)})"
+        )
+        header.setEnabled(False)
+        menu.addSeparator()
 
-            # Disable if click is within 0.2 s of either edge
-            too_close = (
-                click_time - self.start_time < 0.2
-                or self.end_time - click_time < 0.2
-            )
-            cut_action.setEnabled(not too_close)
-            if too_close:
-                cut_action.setToolTip("Click closer to the centre of the clip")
+        cut_action = menu.addAction(f"✂️   Cut here  ({_fmt_time(click_time)})")
+        too_close = (
+            click_time - self.start_time < 0.2
+            or self.end_time - click_time < 0.2
+        )
+        cut_action.setEnabled(not too_close)
+        if too_close:
+            cut_action.setToolTip("Click closer to the centre of the clip")
 
-            # ── Trim actions ───────────────────────────────────────────────
-            trim_start_action = menu.addAction(
-                f"⬅️   Trim start  →  {click_time:.2f}s"
-            )
-            trim_end_action = menu.addAction(
-                f"➡️   Trim end  ←  {click_time:.2f}s"
-            )
+        trim_start_action = menu.addAction(f"⬅️   Trim start  →  {_fmt_time(click_time)}")
+        trim_end_action   = menu.addAction(f"➡️   Trim end  ←  {_fmt_time(click_time)}")
+        trim_start_action.setEnabled(click_time > self.start_time + 0.2)
+        trim_end_action.setEnabled(click_time < self.end_time - 0.2)
 
-            # Disable trim-start if click is already past or at current start
-            trim_start_action.setEnabled(click_time > self.start_time + 0.2)
-            # Disable trim-end if click is already before or at current end
-            trim_end_action.setEnabled(click_time < self.end_time - 0.2)
+        menu.addSeparator()
+        delete_action = menu.addAction("🗑️   Delete clip")
 
-            menu.addSeparator()
+        chosen = menu.exec(event.screenPos())
 
-            # ── Delete action ──────────────────────────────────────────────
-            delete_action = menu.addAction("🗑️   Delete clip")
+        if chosen == cut_action:
+            scene.cut_clip_at(click_time)
 
-            # ── Execute menu ───────────────────────────────────────────────
-            chosen = menu.exec(event.screenPos())
+        elif chosen == trim_start_action:
+            if self in scene.clip_items:
+                idx = scene.clip_items.index(self)
+                scene.trim_clip_start(idx, click_time)
 
-            if chosen == cut_action:
-                scene.cut_clip_at(click_time)
+        elif chosen == trim_end_action:
+            if self in scene.clip_items:
+                idx = scene.clip_items.index(self)
+                scene.trim_clip_end(idx, click_time)
 
-            elif chosen == trim_start_action:
-                # Find this clip's index in the scene
-                if self in scene.clip_items:
-                    idx = scene.clip_items.index(self)
-                    scene.trim_clip_start(idx, click_time)
-
-            elif chosen == trim_end_action:
-                if self in scene.clip_items:
-                    idx = scene.clip_items.index(self)
-                    scene.trim_clip_end(idx, click_time)
-
-            elif chosen == delete_action:
-                if self in scene.clip_items:
-                    idx = scene.clip_items.index(self)
-                    scene.clips.pop(idx)
-                    scene.clip_items.pop(idx)
-                    scene.removeItem(self)
-                    scene.build_timeline()
-                    scene.clip_removed.emit(idx)
+        elif chosen == delete_action:
+            if self in scene.clip_items:
+                idx = scene.clip_items.index(self)
+                scene.clips.pop(idx)
+                scene.clip_items.pop(idx)
+                scene.removeItem(self)
+                scene.build_timeline()
+                scene.clip_removed.emit(idx)
 
     def hoverMoveEvent(self, event):
         """
         Track the source-time under the cursor for the C key shortcut,
-        and update the cut indicator line when in cut mode.
+        update the cut indicator line when in cut mode, and drive the
+        hover thumbnail preview when NOT in cut mode.
         """
         scene = self.scene()
         if scene is not None:
@@ -265,83 +339,131 @@ class EditClipItem(QGraphicsRectItem):
             progress = max(0.0, min(1.0, local_x / width)) if width > 0 else 0.5
             source_time = self.start_time + progress * (self.end_time - self.start_time)
 
-            # Always keep scene informed of hover time (used by C key)
             scene._hover_source_time = source_time
 
-            # Show cut indicator only while in cut mode
             if getattr(scene, 'cut_mode', False):
+                # Cut mode: show cut indicator, hide hover preview
                 item_pos = self.pos()
                 scene._update_cut_indicator(
-                    item_pos.x() + local_x,   # scene x
-                    item_pos.y(),              # scene y (top of clip)
-                    self.rect().height()       # clip height
+                    item_pos.x() + local_x,
+                    item_pos.y(),
+                    self.rect().height()
                 )
-
-                # Change cursor to scissors-style cross
                 self.setCursor(QCursor(Qt.CrossCursor))
+                if hasattr(scene, '_hover_preview') and scene._hover_preview is not None:
+                    scene._hover_preview.hide_preview()
             else:
+                # Normal mode: drive hover preview
                 self.setCursor(QCursor(Qt.OpenHandCursor))
+                if (hasattr(scene, '_hover_preview')
+                        and scene._hover_preview is not None
+                        and getattr(scene, 'thumb_cache', None) is not None):
+                    pix = scene.thumb_cache.request(source_time, HOVER_PREVIEW_HEIGHT)
+                    scene._hover_preview.show_at(
+                        event.screenPos(),
+                        pix,
+                        caption=_fmt_time(source_time),
+                    )
 
         super().hoverMoveEvent(event)
 
     def hoverLeaveEvent(self, event):
         """
-        Hide the cut indicator when the mouse leaves this clip.
-        Also restores tooltip text set by the original hoverEnterEvent.
+        Hide the cut indicator and hover preview when the mouse leaves this clip.
         """
         scene = self.scene()
         if scene is not None:
             scene._hide_cut_indicator()
             scene._hover_source_time = None
+            if hasattr(scene, '_hover_preview') and scene._hover_preview is not None:
+                scene._hover_preview.hide_preview()
 
-        # Restore normal cursor
         self.setCursor(QCursor(Qt.OpenHandCursor))
-
         super().hoverLeaveEvent(event)
 
 
 class EditTimelineScene(QGraphicsScene):
     """Simple timeline showing clips as colored rectangles"""
-    
+
     clip_double_clicked = Signal(float, float)  # start, end
-    clip_added = Signal(float, float)  # start, end
-    clip_removed = Signal(int)  # index
-    time_clicked = Signal(float)  # source video time
-    clip_cut = Signal(float)      # emits the cut time after a successful cut
-    clip_trimmed = Signal(int)    # emits clip index after a trim
-    
-    def __init__(self, video_path, video_duration, parent=None, cache=None):  # ADD cache parameter
+    clip_added = Signal(float, float)           # start, end
+    clip_removed = Signal(int)                  # index
+    time_clicked = Signal(float)                # source video time
+    clip_cut = Signal(float)                    # cut time after a successful cut
+    clip_trimmed = Signal(int)                  # clip index after a trim
+
+    def __init__(self, video_path, video_duration, parent=None, cache=None):
         super().__init__(parent)
         self.video_path = video_path
         self.video_duration = video_duration
-        self.cache = cache  # Store cache reference
-        self.clips = []  # List of (start_time, end_time) tuples
-        self.clip_items = []  # List of EditClipItem objects
+        self.cache = cache
+        self.clips = []
+        self.clip_items = []
         self.pixels_per_second = 50
         self.clip_height = 60
         self.clip_spacing = 5
-        
+
+        # ── thumbnail cache (per-video, async, persistent) ──
+        try:
+            self.thumb_cache = ThumbnailCache(video_path)
+            self.thumb_cache.thumbnail_ready.connect(self._on_thumb_ready)
+        except Exception as e:
+            print(f"⚠️ ThumbnailCache init failed: {e} — filmstrip disabled")
+            self.thumb_cache = None
+
+        # ── hover preview popup (single instance, shared by clips) ──
+        try:
+            self._hover_preview = HoverPreview()
+        except Exception as e:
+            print(f"⚠️ HoverPreview init failed: {e}")
+            self._hover_preview = None
+
         # Visual feedback for drop target
         self.drop_indicator = None
         self.drop_indicator_marker = None
         self.drop_position = None
         self.is_dragging_over = False
-        
+
         # Load initial highlights if available
         self.load_initial_clips()
-        
+
         self.active_clip_index = -1
         self.active_progress = 0.0
         self._active_overlay = None
         self._progress_line = None
 
         # Cut mode state
-        self.cut_mode = False           # when True, left-click cuts a clip
-        self._cut_line = None           # the red dashed indicator line
-        self._hover_source_time = None  # updated by EditClipItem.hoverMoveEvent
+        self.cut_mode = False
+        self._cut_line = None
+        self._hover_source_time = None
 
         self.setSceneRect(0, 0, 1000, self.clip_height + 40)
         self.build_timeline()
+
+    # ── cache → repaint relevant clips ──────────────────────────
+    def _on_thumb_ready(self, time_seconds, height, pixmap):
+        """When a new thumbnail arrives, repaint every clip whose range covers it."""
+        for item in self.clip_items:
+            if not hasattr(item, 'start_time'):
+                continue
+            if item.start_time <= time_seconds <= item.end_time:
+                item.update()
+
+    # ── clean shutdown hook (call from SignalTimelineWindow.closeEvent) ──
+    def cleanup(self):
+        """Tear down the thumbnail worker and hide the hover popup."""
+        try:
+            if self.thumb_cache is not None:
+                self.thumb_cache.stop()
+        except Exception:
+            pass
+        try:
+            if self._hover_preview is not None:
+                self._hover_preview.hide()
+                self._hover_preview.deleteLater()
+                self._hover_preview = None
+        except Exception:
+            pass
 
     def mousePressEvent(self, event):
         """Handle mouse clicks - emit time signal"""
@@ -349,47 +471,47 @@ class EditTimelineScene(QGraphicsScene):
             pos = event.scenePos()
             time = pos.x() / self.pixels_per_second
             self.time_clicked.emit(time)
-            
+
             # If Ctrl is pressed, also request to add to edit timeline
             if event.modifiers() & Qt.ControlModifier:
                 self.add_to_edit_requested.emit(time)
-        
+
         super().mousePressEvent(event)
 
     def contextMenuEvent(self, event):
         """Show context menu for loading different highlight versions"""
+        # If we're over a clip, EditClipItem.contextMenuEvent handles it.
+        # Only fall back here for empty timeline area.
+        item = self.itemAt(event.scenePos(), self.views()[0].transform()) if self.views() else None
+        if isinstance(item, EditClipItem):
+            super().contextMenuEvent(event)
+            return
+
         menu = QMenu()
-        
-        # Load from cache action
         load_action = menu.addAction("📂 Load from Cache...")
         load_action.triggered.connect(self.load_from_cache_menu)
-        
-        # Save to cache action
         save_action = menu.addAction("💾 Save to Cache")
         save_action.triggered.connect(lambda: self.save_clips_to_cache())
-        
         menu.exec(event.screenPos())
-    
+
     def load_from_cache_menu(self):
         """Show dialog to load different highlight versions from cache"""
         if not self.cache or not hasattr(self.cache, 'get_highlight_history'):
-            QMessageBox.warning(None, "Cache Error", 
+            QMessageBox.warning(None, "Cache Error",
                                "Enhanced cache not available. Cannot load from cache.")
             return
-        
-        # Get highlight history
+
         history = self.cache.get_highlight_history(self.video_path)
         if not history:
-            QMessageBox.information(None, "No Cache", 
+            QMessageBox.information(None, "No Cache",
                                    "No cached highlight versions found for this video.")
             return
-        
-        # Create selection dialog
+
         dialog = QDialog()
         dialog.setWindowTitle("Load Highlight Version")
         dialog.resize(500, 400)
         layout = QVBoxLayout(dialog)
-        
+
         list_widget = QListWidget()
         for i, entry in enumerate(history):
             created = entry.get('created_at', 'Unknown')
@@ -397,41 +519,38 @@ class EditTimelineScene(QGraphicsScene):
             duration = entry.get('total_duration', 0)
             item_text = f"Version {i+1}: {segments} clips, {duration:.1f}s ({created})"
             list_widget.addItem(item_text)
-        
+
         layout.addWidget(QLabel("Select cached highlight version:"))
         layout.addWidget(list_widget)
-        
-        # Buttons
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(lambda: self.load_selected_version(dialog, list_widget, history))
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        
+
         dialog.exec()
-    
+
     def load_selected_version(self, dialog, list_widget, history):
         """Load selected highlight version"""
         selected = list_widget.currentRow()
         if 0 <= selected < len(history):
             entry = history[selected]
             segments = entry.get('segments', [])
-            
+
             if segments:
                 self.clips = segments
                 self.build_timeline()
-                QMessageBox.information(None, "Loaded", 
+                QMessageBox.information(None, "Loaded",
                                        f"Loaded {len(segments)} clips from cache.")
-        
-        dialog.accept()
 
+        dialog.accept()
 
     def save_clips_to_cache(self, parameters=None):
         """Save current clips to cache for future use"""
         if not self.cache or not hasattr(self.cache, 'save_highlight_segments'):
             print("⚠️ Cache not available for saving")
             return False
-        
-        # Default parameters if none provided
+
         if parameters is None:
             parameters = {
                 'max_duration': 420,
@@ -443,8 +562,7 @@ class EditTimelineScene(QGraphicsScene):
                 'motion_peak_points': 3,
                 'exact_duration': None
             }
-        
-        # Prepare segments metadata
+
         segments_metadata = []
         for start, end in self.clips:
             segments_metadata.append({
@@ -452,8 +570,7 @@ class EditTimelineScene(QGraphicsScene):
                 'signals': {'user_edited': 1.0},
                 'primary_reason': 'manual_selection'
             })
-        
-        # Save to cache
+
         try:
             success = self.cache.save_highlight_segments(
                 self.video_path,
@@ -462,7 +579,7 @@ class EditTimelineScene(QGraphicsScene):
                 segments_metadata,
                 score_info={'user_edited': True}
             )
-            
+
             if success:
                 print(f"✅ Saved {len(self.clips)} clips to cache")
                 return True
@@ -476,62 +593,48 @@ class EditTimelineScene(QGraphicsScene):
         if event.key() == Qt.Key_Delete or event.key() == Qt.Key_Backspace:
             self.remove_selected_clips()
             event.accept()
-
         elif event.key() == Qt.Key_C:
-            # Cut at the last known hover position
             if self._hover_source_time is not None:
-                success = self.cut_clip_at(self._hover_source_time)
-                if not success:
-                    # Optionally surface this to the parent window status bar
-                    pass
+                self.cut_clip_at(self._hover_source_time)
             event.accept()
-
         else:
             super().keyPressEvent(event)
-    
+
     def remove_selected_clips(self):
-        selected_items = [item for item in self.items() if isinstance(item, EditClipItem) and item.isSelected()]
-        
+        selected_items = [item for item in self.items()
+                          if isinstance(item, EditClipItem) and item.isSelected()]
         if not selected_items:
             return
-        
-        # Collect indices first (from high to low)
+
         indices_to_remove = sorted(
             (self.clip_items.index(item) for item in selected_items),
             reverse=True
         )
-        
+
         for idx in indices_to_remove:
-            # Remove graphics item
             if self.clip_items[idx] in self.items():
                 self.removeItem(self.clip_items[idx])
-            
-            # Remove data
             self.clip_items.pop(idx)
             self.clips.pop(idx)
-            
             self.clip_removed.emit(idx)
-        
+
         self.build_timeline()
 
     def load_initial_clips(self):
         """Load initial clips from highlight cache"""
         self.clips = []
 
-        # Try ANY cached highlight version (not just default params)
         if self.cache and hasattr(self.cache, 'get_highlight_history'):
-            # Try with None to get all versions
             history = self.cache.get_highlight_history(self.video_path, analysis_params=None)
             if history:
-                # Use the most recent highlight version
-                entry = history[0]  # Most recent first
+                entry = history[0]
                 segments = entry.get('segments', [])
                 if segments:
                     self.clips = segments
                     print(f"✅ Loaded {len(self.clips)} highlight segments from cache (most recent)")
                     return
-   
-        # 2) Fallback: Check if pipeline saved segments in analysis cache
+
+        # Fallback: check pipeline-saved segments in analysis cache
         cache_data = None
         parent = self.parent()
         while parent is not None and not hasattr(parent, "cache_data"):
@@ -547,13 +650,12 @@ class EditTimelineScene(QGraphicsScene):
                     start, end = float(segment[0]), float(segment[1])
                     if end > start and (end - start) >= 0.5:
                         loaded.append((start, end))
-
             if loaded:
                 self.clips = loaded
                 print(f"✅ Loaded {len(self.clips)} segments from cache_data['final_segments']")
                 return
-        
-        # 3) Last resort: sample clips
+
+        # Last resort: sample clips
         print("⚠️ No cached highlights found, creating sample clips")
         if self.video_duration > 30:
             sample_points = [(0.1, 0.2), (0.3, 0.4), (0.7, 0.8)]
@@ -572,50 +674,47 @@ class EditTimelineScene(QGraphicsScene):
             end = min(self.video_duration, self.video_duration * 3 / 4)
             if end - start >= 3:
                 self.clips.append((start, end))
-    
+
     def build_timeline(self):
         """Build the edit timeline visualization"""
         print("build_timeline() called")
         self.clear()
         self.clip_items = []
-        
-        # Draw background
+
+        # Background
         self.addRect(self.sceneRect(), QPen(Qt.NoPen), QBrush(QColor(30, 30, 40)))
-        
-        # Draw title
+
+        # Title
         title = self.addText("Edit Timeline", QFont("Arial", 12, QFont.Weight.Bold))
         title.setDefaultTextColor(Qt.white)
         title.setPos(10, 5)
-        
-        # Draw time ruler
+
+        # Time ruler
         self.draw_time_ruler()
-        
-        # Draw clips
+
+        # Clips
         current_x = 20
         y_pos = 35
-        
+
         for i, (start, end) in enumerate(self.clips):
             duration = end - start
             width = max(60, duration * self.pixels_per_second)
-            
-            # Create clip item
+
             color = self.get_clip_color(i)
             clip_item = EditClipItem(start, end, y_pos, self.clip_height, color, i + 1)
             clip_item.setRect(0, 0, width, self.clip_height)
             clip_item.setPos(current_x, y_pos)
             self.addItem(clip_item)
             self.clip_items.append(clip_item)
-            
-            # Update clip item with actual width for text positioning
+
             clip_item.update_label()
-            
             current_x += width + self.clip_spacing
-        
-        # Update scene width based on total clips width
+
+        # Update scene width
         total_width = max(1000, current_x + 20)
         self.setSceneRect(0, 0, total_width, self.clip_height + 40)
-        
-        # Draw clip count
+
+        # Clip count
         count_text = self.addText(f"{len(self.clips)} clips", QFont("Arial", 10))
         count_text.setDefaultTextColor(QColor(200, 200, 200))
         count_text.setPos(total_width - 100, 5)
@@ -625,28 +724,25 @@ class EditTimelineScene(QGraphicsScene):
             self._active_overlay = None
             self._progress_line = None
             self._create_active_overlay()
-    
+
     def draw_time_ruler(self):
         """Draw a time ruler above the clips"""
         ruler_y = 30
-        self.addLine(20, ruler_y, self.sceneRect().width() - 20, ruler_y, 
+        self.addLine(20, ruler_y, self.sceneRect().width() - 20, ruler_y,
                     QPen(QColor(150, 150, 150), 1))
-        
-        # Draw time markers every 10 pixels
+
         for i in range(0, int(self.sceneRect().width()), 10):
             x = 20 + i
-            if i % 50 == 0:  # Major tick every 50 pixels
+            if i % 50 == 0:
                 self.addLine(x, ruler_y - 8, x, ruler_y, QPen(QColor(200, 200, 200), 1))
-                
-                # Calculate time
                 time_seconds = i / self.pixels_per_second
                 if time_seconds <= self.video_duration:
-                    time_text = self.addText(f"{time_seconds:.1f}s", QFont("Arial", 8))
+                    time_text = self.addText(_fmt_time(time_seconds), QFont("Arial", 8))
                     time_text.setDefaultTextColor(QColor(180, 180, 180))
                     time_text.setPos(x - 10, ruler_y - 25)
             else:
                 self.addLine(x, ruler_y - 4, x, ruler_y, QPen(QColor(150, 150, 150), 1))
-    
+
     def get_clip_color(self, index):
         """Get a color for a clip based on its index"""
         colors = [
@@ -658,37 +754,35 @@ class EditTimelineScene(QGraphicsScene):
             QColor(50, 255, 255, 220),   # Cyan
         ]
         return colors[index % len(colors)]
-    
+
     def add_clip(self, start_time, end_time):
         """Add a new clip to the timeline"""
-        # Ensure valid times
         start_time = max(0, min(start_time, self.video_duration - 1))
         end_time = max(start_time + 1, min(end_time, self.video_duration))
-        
+
         self.clips.append((start_time, end_time))
         self.build_timeline()
         self.clip_added.emit(start_time, end_time)
-    
+
     def add_clip_from_selection(self, start_time, end_time=None):
         """Add a clip from a time selection (default 5 second duration)"""
         if end_time is None:
-            end_time = start_time + 5  # Default 5 second clip
-        
-        # Ensure minimum duration
+            end_time = start_time + 5
+
         if end_time - start_time < 0.5:
-            end_time = start_time + 3  # Minimum 3 seconds
-        
+            end_time = start_time + 3
+
         self.add_clip(start_time, end_time)
-    
+
     def get_total_duration(self):
         """Get total duration of all clips"""
         return sum(end - start for start, end in self.clips)
-    
+
     def get_clip_times(self):
         """Get list of all clip time ranges"""
         return self.clips.copy()
-    
-    # DRAG AND DROP METHODS
+
+    # ── DRAG AND DROP ──────────────────────────────────────────────────
     def clear_drop_indicators(self):
         """Safely remove drop indicators"""
         try:
@@ -697,7 +791,7 @@ class EditTimelineScene(QGraphicsScene):
                 self.drop_indicator = None
         except:
             self.drop_indicator = None
-        
+
         try:
             if hasattr(self, 'drop_indicator_marker') and self.drop_indicator_marker:
                 self.removeItem(self.drop_indicator_marker)
@@ -705,32 +799,27 @@ class EditTimelineScene(QGraphicsScene):
         except:
             self.drop_indicator_marker = None
 
-
     def dragEnterEvent(self, event):
         """Accept drag events with timeline bar data"""
         self.clear_drop_indicators()
-        
+
         if event.mimeData().hasText():
             try:
-                import json
                 data = json.loads(event.mimeData().text())
                 if data.get('type') == 'timeline_bar':
                     event.acceptProposedAction()
                     self.is_dragging_over = True
-                    
-                    # Show drop indicator
                     self.show_drop_indicator(event.scenePos())
                     return
             except:
                 pass
-        
+
         event.ignore()
 
     def dragMoveEvent(self, event):
         """Update drop indicator position"""
         if event.mimeData().hasText():
             try:
-                import json
                 data = json.loads(event.mimeData().text())
                 if data.get('type') == 'timeline_bar':
                     event.acceptProposedAction()
@@ -739,137 +828,120 @@ class EditTimelineScene(QGraphicsScene):
                     return
             except:
                 pass
-        
+
         event.ignore()
 
     def dragLeaveEvent(self, event):
         """Remove drop indicator"""
         self.is_dragging_over = False
         self.clear_drop_indicators()
-    
+
     def dropEvent(self, event):
         """Handle drop to create a new clip"""
         if event.mimeData().hasText():
             try:
-                import json
                 data = json.loads(event.mimeData().text())
-                
+
                 if data.get('type') == 'timeline_bar':
-                    # Get drop position
                     pos = event.scenePos()
-                    
-                    # Calculate which clip position this is (between clips)
                     insert_index = self.get_insert_index(pos.x())
-                    
-                    # Add the clip
+
                     start_time = data['start_time']
                     end_time = data['end_time']
-                    
-                    # Ensure valid duration
+
                     if end_time - start_time < 0.5:
-                        end_time = start_time + 3.0  # Minimum 3 seconds
-                    
-                    # Insert at the calculated position
+                        end_time = start_time + 3.0
+
                     self.clips.insert(insert_index, (start_time, end_time))
                     self.build_timeline()
                     self.clip_added.emit(start_time, end_time)
-                    
+
                     event.accept()
-                    
-                    # Show feedback
                     self.show_drop_feedback(insert_index)
-                    
-                    # Update parent window if available
+
                     if hasattr(self.parent(), 'update_edit_duration'):
                         self.parent().update_edit_duration()
-                    
+
                     return
-            
+
             except Exception as e:
                 print(f"Drop error: {e}")
-        
+
         event.ignore()
         self.is_dragging_over = False
         self.hide_drop_indicator()
-    
+
     def show_drop_indicator(self, pos):
         """Show visual indicator where clip will be inserted"""
-        # Clear old indicators first
         self.clear_drop_indicators()
-        
-        # Calculate insertion point
+
         insert_index = self.get_insert_index(pos.x())
-        
-        # Create indicator line
         x_pos = self.calculate_insert_x(insert_index)
-        self.drop_indicator = self.addLine(x_pos, 35, x_pos, 35 + self.clip_height, 
+        self.drop_indicator = self.addLine(x_pos, 35, x_pos, 35 + self.clip_height,
                                           QPen(QColor(0, 255, 0), 2, Qt.DashLine))
-        
-        # Create insertion point marker
-        self.drop_indicator_marker = self.addEllipse(x_pos - 5, 30, 10, 10, 
+        self.drop_indicator_marker = self.addEllipse(x_pos - 5, 30, 10, 10,
                                                     QPen(Qt.green, 2), QBrush(Qt.green))
-        
         self.drop_position = insert_index
-    
+
     def hide_drop_indicator(self):
         """Remove drop indicator - SAFE version"""
         self.clear_drop_indicators()
-        
+
         if hasattr(self, 'drop_indicator_marker'):
             self.removeItem(self.drop_indicator_marker)
-    
+
     def get_insert_index(self, x_pos):
         """Determine where to insert based on x position"""
-        # Convert x position to clip index
         current_x = 20
-        
+
         for i, (start, end) in enumerate(self.clips):
             duration = end - start
             width = max(60, duration * self.pixels_per_second)
-            
-            # Check if position is before this clip
+
             if x_pos < current_x + width / 2:
                 return i
-            
+
             current_x += width + self.clip_spacing
-        
-        # If beyond all clips, append at end
+
         return len(self.clips)
-    
+
     def calculate_insert_x(self, index):
         """Calculate x position for insertion at given index"""
         current_x = 20
-        
+
         for i in range(index):
             if i < len(self.clips):
                 start, end = self.clips[i]
                 duration = end - start
                 width = max(60, duration * self.pixels_per_second)
                 current_x += width + self.clip_spacing
-        
+
         return current_x
-    
+
     def show_drop_feedback(self, insert_index):
         """Show visual feedback after successful drop"""
-        # Highlight the newly inserted clip briefly
         if insert_index < len(self.clip_items):
             item = self.clip_items[insert_index]
-            
-            # Store original pen
             original_pen = item.pen()
-            
-            # Flash with highlight color
+
             def flash():
                 item.setPen(QPen(Qt.yellow, 3))
                 QTimer.singleShot(300, lambda: item.setPen(original_pen))
-            
+
             QTimer.singleShot(100, flash)
 
+    # ── ACTIVE CLIP OVERLAY ────────────────────────────────────────────
     def set_active_clip(self, index):
         """Highlight the currently playing clip"""
+        old_index = self.active_clip_index
         self.active_clip_index = index
         self.active_progress = 0.0
-        self._create_active_overlay()
+
+        if old_index != index:
+            self._remove_active_overlay()
+            self._create_active_overlay()
+
+        self._move_progress_line()
 
     def set_active_progress(self, progress):
         """Update progress within the active clip (0.0 to 1.0)"""
@@ -882,19 +954,6 @@ class EditTimelineScene(QGraphicsScene):
         self.active_progress = 0.0
         self._remove_active_overlay()
 
-    def set_active_clip(self, index):
-        """Highlight the currently playing clip"""
-        old_index = self.active_clip_index
-        self.active_clip_index = index
-        self.active_progress = 0.0
-
-        if old_index != index:
-            # Only recreate overlay when clip changes
-            self._remove_active_overlay()
-            self._create_active_overlay()
-        
-        self._move_progress_line()
-
     def _create_active_overlay(self):
         """Create glow overlay and progress line (once per clip)"""
         if self.active_clip_index < 0 or self.active_clip_index >= len(self.clip_items):
@@ -904,7 +963,6 @@ class EditTimelineScene(QGraphicsScene):
         rect = item.rect()
         pos = item.pos()
 
-        # Glow overlay
         self._active_overlay = self.addRect(
             pos.x() - 3, pos.y() - 3,
             rect.width() + 6, rect.height() + 6,
@@ -913,7 +971,6 @@ class EditTimelineScene(QGraphicsScene):
         )
         self._active_overlay.setZValue(10)
 
-        # Progress line — create once, then just move it
         x = pos.x()
         self._progress_line = self.addLine(
             x, pos.y(), x, pos.y() + rect.height(),
@@ -926,7 +983,6 @@ class EditTimelineScene(QGraphicsScene):
         if self.active_clip_index < 0 or self.active_clip_index >= len(self.clip_items):
             return
 
-        # Recreate if missing (e.g. after build_timeline cleared everything)
         if not self._progress_line or self._progress_line not in self.items():
             self._progress_line = None
             self._active_overlay = None
@@ -937,8 +993,6 @@ class EditTimelineScene(QGraphicsScene):
         rect = item.rect()
         pos = item.pos()
         x = pos.x() + rect.width() * self.active_progress
-
-        # Just update the line coordinates — no remove/add
         self._progress_line.setLine(x, pos.y(), x, pos.y() + rect.height())
 
     def _remove_active_overlay(self):
@@ -960,108 +1014,71 @@ class EditTimelineScene(QGraphicsScene):
     def reorder_clip(self, clip_index, new_x_pos):
         """Reorder a clip based on drag position"""
         if 0 <= clip_index < len(self.clips):
-            # Remove clip from current position
             clip = self.clips.pop(clip_index)
-            
-            # Determine new insertion index
             insert_index = self.get_insert_index(new_x_pos)
-            
-            # Adjust index if moving forward in list
             if insert_index > clip_index:
                 insert_index -= 1
-            
-            # Insert at new position
             self.clips.insert(insert_index, clip)
-            
-            # Rebuild timeline
             self.build_timeline()
 
-        # ──────────────────────────────────────────────────────────────────────
-    # CUT / TRIM OPERATIONS
-    # ──────────────────────────────────────────────────────────────────────
-
+    # ── CUT / TRIM OPERATIONS ──────────────────────────────────────────
     def cut_clip_at(self, source_time):
         """
         Split whichever clip contains source_time into two clips.
-
-        Rules:
-        - source_time must be at least 0.2 s from both edges to avoid
-          creating clips that are too small to be useful.
-        - Returns True if a cut was made, False otherwise.
+        source_time must be at least 0.2 s from both edges.
+        Returns True if a cut was made.
         """
-        MIN_SIDE = 0.2  # minimum seconds on each side of the cut
+        MIN_SIDE = 0.2
 
         for i, (start, end) in enumerate(self.clips):
             if start + MIN_SIDE < source_time < end - MIN_SIDE:
-                # Replace the original clip with two halves
                 self.clips[i] = (start, source_time)
                 self.clips.insert(i + 1, (source_time, end))
                 self.build_timeline()
                 self.clip_cut.emit(source_time)
                 return True
 
-        return False  # source_time is not inside any clip
+        return False
 
     def trim_clip_start(self, clip_index, new_start):
-        """
-        Move the in-point (left edge) of a clip to new_start.
-
-        new_start is clamped so the clip keeps a minimum duration of 0.5 s.
-        """
+        """Move the in-point of a clip to new_start (clamped to ≥0.5s duration)."""
         MIN_DURATION = 0.5
-
         if not (0 <= clip_index < len(self.clips)):
             return
-
         start, end = self.clips[clip_index]
-        # Clamp: can't go further right than (end - MIN_DURATION)
         new_start = max(start, min(new_start, end - MIN_DURATION))
         self.clips[clip_index] = (new_start, end)
         self.build_timeline()
         self.clip_trimmed.emit(clip_index)
 
     def trim_clip_end(self, clip_index, new_end):
-        """
-        Move the out-point (right edge) of a clip to new_end.
-
-        new_end is clamped so the clip keeps a minimum duration of 0.5 s.
-        """
+        """Move the out-point of a clip to new_end (clamped to ≥0.5s duration)."""
         MIN_DURATION = 0.5
-
         if not (0 <= clip_index < len(self.clips)):
             return
-
         start, end = self.clips[clip_index]
-        # Clamp: can't go further left than (start + MIN_DURATION)
         new_end = min(end, max(new_end, start + MIN_DURATION))
         self.clips[clip_index] = (start, new_end)
         self.build_timeline()
         self.clip_trimmed.emit(clip_index)
 
-    # ──────────────────────────────────────────────────────────────────────
-    # CUT INDICATOR (the red dashed line that follows the mouse in cut mode)
-    # ──────────────────────────────────────────────────────────────────────
-
+    # ── CUT INDICATOR LINE ─────────────────────────────────────────────
     def _update_cut_indicator(self, x, y, height):
-        """
-        Draw or reposition the dashed red vertical line that previews
-        where the cut will happen.  Called by EditClipItem.hoverMoveEvent.
-        """
+        """Draw or reposition the dashed red vertical line previewing the cut."""
         if self._cut_line is not None and self._cut_line in self.items():
-            # Just move the existing line — no remove/add overhead
             self._cut_line.setLine(x, y, x, y + height)
         else:
             self._cut_line = self.addLine(
                 x, y, x, y + height,
                 QPen(QColor(255, 80, 80, 220), 2, Qt.DashLine)
             )
-            self._cut_line.setZValue(50)  # above clips but below active overlay
+            self._cut_line.setZValue(50)
 
     def _hide_cut_indicator(self):
-        """Remove the cut indicator line.  Called when mouse leaves a clip."""
+        """Remove the cut indicator line."""
         if self._cut_line is not None and self._cut_line in self.items():
             try:
                 self.removeItem(self._cut_line)
             except RuntimeError:
-                pass  # item already removed (e.g. after build_timeline)
+                pass
         self._cut_line = None
