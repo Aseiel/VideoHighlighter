@@ -139,64 +139,84 @@ class ThumbnailCache(QObject):
         return hashlib.md5(sig.encode("utf-8")).hexdigest()[:16]
 
     def _worker_loop(self):
-        """Background thread: pull keys from queue, extract frames with cv2."""
+        """Background thread: pull keys, sort by time, extract frames."""
         cap = None
         try:
             while not self._stopped:
+                # Block for the first key
                 try:
-                    key = self._queue.get(timeout=0.5)
+                    first = self._queue.get(timeout=0.5)
                 except Empty:
                     continue
 
-                time_ms, height = key
+                # Drain everything else that's already waiting, then sort by time.
+                # Forward seeks are much cheaper than backward seeks.
+                batch = [first]
+                try:
+                    while True:
+                        batch.append(self._queue.get_nowait())
+                except Empty:
+                    pass
+                batch.sort(key=lambda k: k[0])  # by time_ms
 
-                # Lazy-open the capture and keep it warm
+                # Lazy-open capture once
                 if cap is None:
                     cap = cv2.VideoCapture(self.video_path)
                     if not cap.isOpened():
                         print(f"⚠️ ThumbnailCache: cannot open {self.video_path}")
                         return
 
-                cap.set(cv2.CAP_PROP_POS_MSEC, time_ms)
-                ok, frame = cap.read()
-
-                with self._lock:
-                    self._in_flight.discard(key)
-
-                if not ok or frame is None:
-                    continue
-
-                # Resize to target height, preserve aspect ratio
-                h, w = frame.shape[:2]
-                if h != height:
-                    new_w = max(1, int(round(w * height / h)))
-                    frame = cv2.resize(
-                        frame, (new_w, height), interpolation=cv2.INTER_AREA
-                    )
-                    h, w = frame.shape[:2]
-
-                # Persist to disk (BGR — cv2 native)
-                try:
-                    cv2.imwrite(
-                        str(self._disk_path(key)),
-                        frame,
-                        [cv2.IMWRITE_JPEG_QUALITY, 80],
-                    )
-                except Exception as e:
-                    print(f"⚠️ ThumbnailCache disk write failed: {e}")
-
-                # Convert BGR → RGB for Qt, build QImage (thread-safe construction)
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                # .copy() detaches from the numpy buffer that's about to go out of scope
-                qimg = QImage(
-                    rgb.data, w, h, w * 3, QImage.Format_RGB888
-                ).copy()
-
-                # Hop to main thread for QPixmap construction + caching + public signal
-                self._image_ready.emit(time_ms, height, qimg)
+                for key in batch:
+                    if self._stopped:
+                        break
+                    self._extract_one(cap, key)
         finally:
             if cap is not None:
                 cap.release()
+
+    def _extract_one(self, cap, key):
+        """Extract, persist, and emit a single thumbnail."""
+        time_ms, height = key
+
+        cap.set(cv2.CAP_PROP_POS_MSEC, time_ms)
+        ok, frame = cap.read()
+
+        with self._lock:
+            self._in_flight.discard(key)
+
+        if not ok or frame is None:
+            return
+
+        h, w = frame.shape[:2]
+        if h != height:
+            new_w = max(1, int(round(w * height / h)))
+            frame = cv2.resize(frame, (new_w, height), interpolation=cv2.INTER_AREA)
+            h, w = frame.shape[:2]
+
+        try:
+            cv2.imwrite(
+                str(self._disk_path(key)),
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, 60],  # ← lowered from 80
+            )
+        except Exception as e:
+            print(f"⚠️ ThumbnailCache disk write failed: {e}")
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        self._image_ready.emit(time_ms, height, qimg)
+
+    def prefetch_range(self, start_time: float, end_time: float,
+                    height_px: int, n_slots: int):
+        """
+        Queue up all thumbs for a clip's filmstrip in one go.
+        Match the slot calculation in filmstrip_painter so we request
+        exactly the frames paint() will ask for.
+        """
+        duration = max(1e-6, end_time - start_time)
+        for i in range(n_slots):
+            t = start_time + (i + 0.5) / n_slots * duration
+            self.request(t, height_px)  # return value ignored — just queue it
 
     @Slot(int, int, QImage)
     def _on_image_ready(self, time_ms: int, height: int, qimg: QImage):
