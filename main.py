@@ -16,12 +16,9 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QAbstractItemView, 
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
-from pipeline import run_highlighter
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 from llm.llm_chat_widget import LLMChatWidget
-from modules.video_cache import VideoAnalysisCache
-from pipeline import build_analysis_cache_params
-from pipeline import run_highlighter
+from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 import multiprocessing
 
 CONFIG_FILE = "config.yaml"
@@ -364,6 +361,7 @@ class Worker(QThread):
         self._is_running = False
 
     def run(self):
+        from pipeline import run_highlighter
         try:
             self._is_running = True
             # Check if single or multiple files
@@ -2649,6 +2647,7 @@ class VideoHighlighterGUI(QWidget):
 
 
     def run_pipeline(self):
+        from pipeline import run_highlighter
         """Start the pipeline processing (UPDATED for multi-file)"""
         video_paths = self.get_file_list()
         
@@ -2897,8 +2896,9 @@ class VideoHighlighterGUI(QWidget):
     def pipeline_done(self, output_file):
         """Handle pipeline completion"""
         self.status_timer.stop()
+        was_cancelled = bool(self.worker and self.worker.is_cancelled())
         
-        if output_file and not self.worker.is_cancelled():
+        if output_file and not was_cancelled:
             self.append_log(f"\n✅ === PIPELINE COMPLETED SUCCESSFULLY ===")
             
             # Handle both single file (string) and multiple files (list of tuples)
@@ -2975,7 +2975,7 @@ class VideoHighlighterGUI(QWidget):
                 
             self.task_label.setText("✅ Complete!")
             self.task_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
-        elif not self.worker.is_cancelled():
+        elif not was_cancelled:
             self.append_log("\n⚠️ === PIPELINE COMPLETED WITH ERRORS ===")
             self.append_log("❌ No output file was generated. Check the log for errors.")
             self.task_label.setText("❌ Failed")
