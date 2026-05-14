@@ -17,7 +17,7 @@ from object_recognition import run_object_detection_single
 # modules
 from modules.audio_peaks import extract_audio_peaks
 from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
-from modules.video_cache import VideoAnalysisCache, CachedAnalysisData
+from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 from modules.video_cutter import cut_video
 from modules.auto_segments import build_auto_segments
 from modules.device_utils import resolve_yolo_device
@@ -26,65 +26,6 @@ from modules.device_utils import resolve_yolo_device
 
 # Keep warnings about CUDA quiet
 warnings.filterwarnings("ignore", message="torch.cuda")
-
-def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int, video_duration: float):
-    # “Analysis params” = anything that changes the computed analysis artifacts
-    # Keep values JSON-serializable and stable (sort lists)
-    highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", [])) or []
-    interesting_actions = gui_config.get("interesting_actions", []) or []
-    search_keywords = gui_config.get("search_keywords", []) or []
-
-    # Time range settings (if enabled)
-    use_time_range = bool(gui_config.get("use_time_range", False))
-    range_start = int(gui_config.get("range_start", 0) or 0)
-    range_end = gui_config.get("range_end", None)
-    range_end = int(range_end) if range_end is not None else None
-
-    # YOLO settings
-    yolo_model_size = str(gui_config.get("yolo_model_size") or "n").lower()
-    openvino_model_folder = gui_config.get("openvino_model_folder", f"yolo11{yolo_model_size}_openvino_model/")
-    yolo_pt_path = gui_config.get("yolo_pt_path", f"yolo11{yolo_model_size}.pt")
-
-    params = {
-        # bump this when you change the meaning/format of cached analysis
-        "analysis_cache_schema": "analysis_v2",
-
-        # core toggles
-        "use_transcript": bool(gui_config.get("use_transcript", False)),
-        "transcript_model": str(gui_config.get("transcript_model", "medium")),
-        "search_keywords": sorted([str(k).lower() for k in search_keywords]),
-
-        "highlight_objects": sorted([str(o) for o in highlight_objects]),
-        "interesting_actions": sorted([str(a) for a in interesting_actions]),
-
-        # object/action sampling knobs
-        "object_frame_skip": int(gui_config.get("object_frame_skip", gui_config.get("clip_time", 10) or 10)),
-        "sample_rate": int(sample_rate),
-
-        # action detector knobs used in your call
-        "action_use_person_detection": True,
-        "action_max_people": int(gui_config.get("action_max_people", 2) or 2),
-
-        # yolo identity
-        "yolo_model_size": yolo_model_size,
-        "yolo_pt_path": str(yolo_pt_path),
-        "openvino_model_folder": str(openvino_model_folder),
-
-        # time-range
-        "use_time_range": use_time_range,
-        "range_start": range_start if use_time_range else 0,
-        "range_end": range_end if use_time_range else None,
-
-        # optional: points affect scoring, not analysis — but if you cache “analysis only”
-        # you can omit scoring params. If you cache waveforms/peaks based on thresholds,
-        # include them.
-        "scene_threshold": float(gui_config.get("scene_threshold", 70.0)),
-        "motion_threshold": float(gui_config.get("motion_threshold", 100.0)),
-        "spike_factor": float(gui_config.get("spike_factor", 1.2)),
-        "freeze_seconds": float(gui_config.get("freeze_seconds", 4)),
-        "freeze_factor": float(gui_config.get("freeze_factor", 0.8)),
-    }
-    return params
 
 class ProgressTracker:
     """Simple progress tracker that works with or without GUI callback"""
