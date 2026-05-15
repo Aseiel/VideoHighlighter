@@ -234,6 +234,53 @@ _VISUAL_SEARCH_KEYWORDS = (
     "explosion", "fire", "person", "car", "object", "action",
 )
 
+# ---------------------------------------------------------------------------
+# Time spinbox — displays seconds as mm:ss, accepts both formats as input
+# ---------------------------------------------------------------------------
+class TimeSpinBox(QDoubleSpinBox):
+    """
+    QDoubleSpinBox that stores a float seconds value but displays it as mm:ss.
+    Accepts input in either form:  '90'  or  '1:30'  or  '1:30.5'
+    """
+
+    def textFromValue(self, value: float) -> str:
+        total = max(0.0, value)
+        minutes = int(total // 60)
+        secs = total - minutes * 60
+        if abs(secs - round(secs)) < 0.01:
+            return f"{minutes}:{int(round(secs)):02d}"
+        return f"{minutes}:{secs:05.2f}"  # e.g. 1:05.50
+
+    def valueFromText(self, text: str) -> float:
+        text = text.strip()
+        if not text:
+            return 0.0
+        if ':' in text:
+            parts = text.split(':')
+            try:
+                minutes = int(parts[0]) if parts[0] else 0
+                seconds = float(parts[1]) if len(parts) > 1 and parts[1] else 0.0
+                return minutes * 60.0 + seconds
+            except ValueError:
+                return self.value()
+        try:
+            return float(text)
+        except ValueError:
+            return self.value()
+
+    def validate(self, text: str, pos: int):
+        from PySide6.QtGui import QValidator
+        import re
+        stripped = text.strip()
+        if not stripped:
+            return (QValidator.Intermediate, text, pos)
+        if ':' in stripped:
+            if re.fullmatch(r'\d{0,3}:\d{0,2}(\.\d*)?', stripped):
+                return (QValidator.Acceptable, text, pos)
+            if re.fullmatch(r'\d{0,3}:', stripped):
+                return (QValidator.Intermediate, text, pos)
+            return (QValidator.Invalid, text, pos)
+        return super().validate(text, pos)
 
 class LLMChatWidget(QWidget):
     """
@@ -381,19 +428,25 @@ class LLMChatWidget(QWidget):
         search_layout.addWidget(self.search_target)
         
         search_layout.addWidget(QLabel("From:"))
-        self.search_start_time = QDoubleSpinBox()
+        self.search_start_time = TimeSpinBox()
         self.search_start_time.setRange(0, 99999)
         self.search_start_time.setValue(0)
         self.search_start_time.setSingleStep(10)
-        self.search_start_time.setSuffix("s")
-        self.search_start_time.setToolTip("Start searching from this timestamp (0 = beginning)")
+        self.search_start_time.setDecimals(2)
+        self.search_start_time.setToolTip(
+            "Start searching from this timestamp. Type seconds (90) or mm:ss (1:30)."
+        )
         search_layout.addWidget(self.search_start_time)
 
-        search_layout.addWidget(QLabel("Interval (s):"))
-        self.search_interval = QDoubleSpinBox()
-        self.search_interval.setRange(0.5, 120.0)  # Allow up to 120s intervals
+        search_layout.addWidget(QLabel("Interval:"))
+        self.search_interval = TimeSpinBox()
+        self.search_interval.setRange(0.5, 600.0)  # up to 10 minutes per step
         self.search_interval.setValue(1.0)
-        self.search_interval.setSingleStep(0.5)
+        self.search_interval.setSingleStep(1.0)
+        self.search_interval.setDecimals(2)
+        self.search_interval.setToolTip(
+            "Time between sampled frames. Type seconds (60) or mm:ss (1:00)."
+        )
         search_layout.addWidget(self.search_interval)
         
         # Add "stop on first match" checkbox
@@ -844,6 +897,7 @@ class LLMChatWidget(QWidget):
             # Worker is finished so _seek_to_timestamp (which touches the
             # analyzer's cv2.VideoCapture) is safe now — no race condition.
             self._seek_to_timestamp(found_results[0]["timestamp"])
+
         else:
             self._append_system(
                 f"❌ Search complete. No '{self.search_target.text()}' found in video."
