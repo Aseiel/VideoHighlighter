@@ -255,6 +255,7 @@ class LLMChatWidget(QWidget):
         self._chat_history: list[dict] = []
         self._worker: Optional[_LLMWorker] = None
         self._search_worker: Optional[_VisualSearchWorker] = None
+        self._orphaned_workers: list[QThread] = []  # cancelled-but-still-running workers
         self._compact = compact
         self._cache_dir = cache_dir
         self._timeline_bridge: Optional['TimelineBridge'] = None
@@ -668,8 +669,27 @@ class LLMChatWidget(QWidget):
                 return
         
         if self._search_worker and self._search_worker.isRunning():
+            # Cancel the previous worker, but DO NOT drop its reference yet —
+            # the image-decode step is a ~20s uninterruptible blocking C call,
+            # so the thread will still be running after cancel() returns.
+            # Destroying its Python wrapper while running triggers Qt's
+            # qFatal("QThread: Destroyed while thread is still running") and
+            # kills the whole process. Disconnect signals so the stopping worker
+            # can't fire stale handlers for the new search, then stash a
+            # reference so Python GC can't reap it until run() actually returns.
             self._search_worker.cancel()
-        
+            try:
+                self._search_worker.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            self._orphaned_workers.append(self._search_worker)
+            self._search_worker = None
+            self._append_system(
+                "⏹ Cancelling previous search (will finish current frame in background)..."
+            )
+            # Opportunistic cleanup of any orphans that have finished by now
+            self._orphaned_workers = [w for w in self._orphaned_workers if w.isRunning()]
+
         interval = self.search_interval.value()
         start_from = self.search_start_time.value()
         remaining = max(0, self._analyzer.duration - start_from)
@@ -678,6 +698,17 @@ class LLMChatWidget(QWidget):
         
         mode_str = "stop on first match" if stop_on_match else "scan entire video"
         start_str = f"{int(start_from)//60}:{int(start_from)%60:02d}"
+
+        # Generate a unique scan ID and clear any previous findings for this query
+        # so the timeline shows fresh results.
+        self._current_scan_id = f"scan_{int(_time.time())}"
+        if (self._timeline_bridge
+                and self._timeline_bridge._window
+                and hasattr(self._timeline_bridge._window, 'signal_scene')):
+            scene = self._timeline_bridge._window.signal_scene
+            if hasattr(scene, 'clear_visual_findings'):
+                scene.clear_visual_findings(query=target)
+
         self._append_system(f"🔍 Starting visual search for '{target}' from {start_str} every {interval}s ({mode_str})...")
         self.search_progress.setText(f"Searching for '{target}'...")
         self.search_btn.setEnabled(False)
@@ -732,6 +763,35 @@ class LLMChatWidget(QWidget):
         icon = "✅" if contains_target else "❌"
         short = response[:120] + "..." if len(response) > 120 else response
         self._append_system(f"  {icon} [{timestamp_str}] {short}")
+
+        # ── Live push YES hits onto the signal timeline ──
+        if (contains_target
+                and self._timeline_bridge
+                and self._timeline_bridge._window
+                and hasattr(self._timeline_bridge._window, 'add_visual_findings')):
+            window = self._timeline_bridge._window
+
+            # Resolve model name for metadata
+            model_name = ''
+            if self._llm:
+                model_name = (getattr(self._llm, 'model', None)
+                            or getattr(self._llm, 'model_path', None) or '')
+                if model_name and ('/' in model_name or '\\' in model_name):
+                    model_name = os.path.basename(model_name)
+
+            finding = {
+                'timestamp':  timestamp,
+                'query':      self.search_target.text().strip(),
+                'confidence': 1.0,  # YES/NO classification — see notes
+                'model':      model_name,
+                'scan_id':    getattr(self, '_current_scan_id', ''),
+                'analysis':   (response or '')[:200],
+            }
+            try:
+                # save=False — defer disk write until scan finishes (see D3)
+                window.add_visual_findings([finding], save=False)
+            except Exception as e:
+                print(f"⚠️ Failed to push visual finding to timeline: {e}")
         
         # Update preview window directly (QMediaPlayer has its own decoder,
         # so this is safe). Do NOT call _seek_to_timestamp() here — that
@@ -788,6 +848,17 @@ class LLMChatWidget(QWidget):
             self._append_system(
                 f"❌ Search complete. No '{self.search_target.text()}' found in video."
             )
+
+        # ── Persist findings (added live during scan) to disk once ──
+        if (self._timeline_bridge
+                and self._timeline_bridge._window
+                and hasattr(self._timeline_bridge._window, 'save_visual_findings_to_cache')):
+            saved = self._timeline_bridge._window.save_visual_findings_to_cache()
+            if saved and found_count > 0:
+                self._append_system(
+                    f"💾 Saved {found_count} '{self.search_target.text()}' "
+                    f"finding(s) to cache (will reload next session)"
+                )
         
         self.search_progress.setText("")
         self.search_btn.setEnabled(True)
@@ -1725,6 +1796,16 @@ class LLMChatWidget(QWidget):
                 print("⚠️ Search worker did not stop in time, terminating")
                 self._search_worker.terminate()
                 self._search_worker.wait(2000)
+
+        # Reap any cancelled-but-still-running workers from prior searches
+        for w in getattr(self, '_orphaned_workers', []):
+            if w.isRunning():
+                w.cancel()
+                if not w.wait(5000):
+                    print("⚠️ Orphaned worker did not stop, terminating")
+                    w.terminate()
+                    w.wait(2000)
+        self._orphaned_workers = []
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
             if not self._worker.wait(5000):  # 5s timeout
