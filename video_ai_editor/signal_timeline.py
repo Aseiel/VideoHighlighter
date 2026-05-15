@@ -61,12 +61,22 @@ class SignalTimelineScene(QGraphicsScene):
         self.max_action_confidence = 1.0
         self.min_object_confidence = 0.0
         self.max_object_confidence = 1.0
-        
+
+        # ── Visual Search Findings (LLM-driven / Visual Search panel scans) ──
+        self.visual_findings: list[dict] = []
+        self.visual_queries: list[str] = []
+        self.visible_visual_queries: dict[str, bool] = {}
+        self.min_visual_confidence = 0.0
+        self.max_visual_confidence = 1.0
+        self.visual_merge_gap = 2.0  # seconds — merge frame hits within this gap
+        self._extract_visual_findings()  # populate from cache_data
+
         # Define logical groups (order matters)
         self.group_order = [
             ('transcript', ['Transcript']),
             ('actions', [f"Action: {a}" for a in self.action_types]),
             ('objects', [f"Object: {o}" for o in self.object_classes]),
+            ('visual_search', [f"Search: {q}" for q in self.visual_queries]),
             ('scenes', ['Scenes']),
             ('motion', ['Motion Events', 'Motion Peaks']),
             ('audio', ['Audio Peaks']),
@@ -82,9 +92,14 @@ class SignalTimelineScene(QGraphicsScene):
                     key = 'actions'
                 elif 'object:' in key:
                     key = 'objects'
+                elif 'search:' in key:
+                    key = 'visual_search'
                 elif 'final highlights' in key.lower():
                     key = 'highlights'
                 self.visible_layers[key] = True
+
+        # Always make visual_search toggleable, even when no findings yet
+        self.visible_layers.setdefault('visual_search', True)
         
         # Color scheme
         self.colors = {
@@ -95,7 +110,8 @@ class SignalTimelineScene(QGraphicsScene):
             'motion_events': QColor(255, 150, 50),
             'motion_peaks': QColor(255, 200, 100),
             'audio_peaks': QColor(150, 100, 255),
-            'highlights': QColor(50, 200, 50)
+            'highlights': QColor(50, 200, 50),
+            'visual_search': QColor(255, 100, 255),
         }
         
         # Create color palettes
@@ -409,6 +425,8 @@ class SignalTimelineScene(QGraphicsScene):
                     key = 'actions'
                 elif 'object:' in key:
                     key = 'objects'
+                elif 'search:' in key:
+                    key = 'visual_search'
                 elif 'final highlights' in key.lower():
                     key = 'highlights'
                 
@@ -442,6 +460,10 @@ class SignalTimelineScene(QGraphicsScene):
         # Layer 3: Objects (organized by class)
         if self.visible_layers.get('objects', True):
             current_y = self.draw_improved_objects_layer(current_y)
+
+        # Layer 3.5: Visual Search Findings (LLM scans / Visual Search panel)
+        if self.visible_layers.get('visual_search', True) and self.visual_findings:
+            current_y = self.draw_visual_findings_layer(current_y)
         
         # Layer 4: Scenes
         if self.visible_layers.get('scenes', True):
@@ -1188,6 +1210,205 @@ class SignalTimelineScene(QGraphicsScene):
                     else:
                         return True
         return False
+
+# ─────────────────────────────────────────────────────────────────
+    # Visual Search Findings — public API
+    # ─────────────────────────────────────────────────────────────────
+    def _extract_visual_findings(self):
+        """Load visual_findings from cache and register unique queries."""
+        findings = self.cache_data.get('visual_findings', []) or []
+        self.visual_findings = list(findings)
+        queries = {f.get('query', '').strip() for f in self.visual_findings}
+        queries.discard('')
+        self.visual_queries = sorted(queries)
+        self.visible_visual_queries = {q: True for q in self.visual_queries}
+
+    def _query_color(self, query: str) -> QColor:
+        """Deterministic color per search query (stable across sessions)."""
+        import hashlib
+        h = int(hashlib.md5(query.encode('utf-8')).hexdigest(), 16) % 360
+        return QColor.fromHsv(h, 200, 235, 255)
+
+    def _rebuild_group_order_for_visual(self):
+        """Refresh visual_search tracks in group_order with current queries."""
+        for i, (name, tracks) in enumerate(self.group_order):
+            if name == 'visual_search':
+                self.group_order[i] = (
+                    'visual_search',
+                    [f"Search: {q}" for q in self.visual_queries]
+                )
+                return
+
+    def add_visual_findings(self, findings: list, rebuild: bool = True):
+        """
+        Append findings from a scan. Each finding is a dict:
+            {timestamp, query, confidence, model?, scan_id?}
+        Auto-registers new queries. Updates cache_data so the window's
+        save_visual_findings_to_cache() picks them up.
+        """
+        if not findings:
+            return
+
+        for f in findings:
+            if 'timestamp' not in f:
+                continue
+            f.setdefault('confidence', 1.0)
+            f.setdefault('query', 'unknown')
+            f.setdefault('model', '')
+            f.setdefault('scan_id', '')
+            self.visual_findings.append(f)
+
+        # Refresh query registry
+        queries = {f.get('query', '').strip() for f in self.visual_findings}
+        queries.discard('')
+        new_queries = queries - set(self.visual_queries)
+        self.visual_queries = sorted(queries)
+        for q in new_queries:
+            self.visible_visual_queries[q] = True
+
+        self._rebuild_group_order_for_visual()
+        self.cache_data['visual_findings'] = self.visual_findings
+
+        if rebuild:
+            self.build_timeline()
+
+    def clear_visual_findings(self, query: str | None = None,
+                              scan_id: str | None = None,
+                              rebuild: bool = True):
+        """
+        Clear findings. No args = all. With query/scan_id = filtered clear.
+        """
+        if query is None and scan_id is None:
+            self.visual_findings.clear()
+            self.visual_queries = []
+            self.visible_visual_queries.clear()
+        else:
+            def drop(f):
+                if query is not None and f.get('query') == query:
+                    return True
+                if scan_id is not None and f.get('scan_id') == scan_id:
+                    return True
+                return False
+            self.visual_findings = [f for f in self.visual_findings if not drop(f)]
+            remaining = {f.get('query', '').strip() for f in self.visual_findings}
+            remaining.discard('')
+            self.visual_queries = sorted(remaining)
+            self.visible_visual_queries = {q: True for q in self.visual_queries}
+
+        self._rebuild_group_order_for_visual()
+        self.cache_data['visual_findings'] = self.visual_findings
+
+        if rebuild:
+            self.build_timeline()
+
+    def get_visual_findings(self, query: str | None = None) -> list:
+        """Return findings (optionally filtered by query)."""
+        if query is None:
+            return list(self.visual_findings)
+        return [f for f in self.visual_findings if f.get('query') == query]
+
+    def set_visual_query_filter(self, query: str, visible: bool,
+                                rebuild: bool = True):
+        """Show/hide a specific search query row."""
+        if query in self.visible_visual_queries:
+            self.visible_visual_queries[query] = visible
+            if rebuild:
+                self.build_timeline()
+
+    def set_visual_confidence_filter(self, min_c: float, max_c: float = 1.0):
+        """Confidence range for visual findings."""
+        self.min_visual_confidence = max(0.0, min(min_c, 1.0))
+        self.max_visual_confidence = min(1.0, max(max_c, 0.0))
+        self.build_timeline()
+
+    # ─────────────────────────────────────────────────────────────────
+    # Visual Search Findings — rendering
+    # ─────────────────────────────────────────────────────────────────
+    def draw_visual_findings_layer(self, y_pos):
+        """Draw visual search findings: one row per query, merged into intervals."""
+        self.row_labels.append(("VISUAL SEARCH", y_pos))
+
+        # Group findings by query, applying filters
+        query_groups = defaultdict(list)
+        for f in self.visual_findings:
+            query = f.get('query', '').strip()
+            if not query:
+                continue
+            if not self.visible_visual_queries.get(query, True):
+                continue
+            conf = f.get('confidence', 0)
+            if conf < self.min_visual_confidence or conf > self.max_visual_confidence:
+                continue
+            query_groups[query].append(f)
+
+        # Empty state
+        if not query_groups:
+            msg = ("(no visual search results — search via the Visual Search "
+                   "panel or ask the LLM Assistant)") if not self.visual_findings \
+                  else "(visual findings filtered out)"
+            text = self.addText(msg, QFont("Arial", 9))
+            text.setPos(150, y_pos + 15)
+            text.setDefaultTextColor(QColor(150, 150, 150))
+            return y_pos + self.layer_height + self.layer_spacing
+
+        # One row per query
+        query_height = self.layer_height // max(1, len(query_groups))
+        current_y = y_pos
+        half_win = 0.75  # seconds around each frame hit → 1.5s baseline bar
+
+        for query in sorted(query_groups.keys()):
+            findings = query_groups[query]
+            color = self._query_color(query)
+
+            # Build per-finding intervals, then merge
+            intervals = []
+            for f in findings:
+                ts = f.get('timestamp', 0)
+                conf = f.get('confidence', 0.5)
+                intervals.append((
+                    max(0, ts - half_win),
+                    min(self.video_duration, ts + half_win),
+                    {
+                        'label': query,
+                        'confidence': conf,
+                        'frame_timestamp': ts,
+                        'model': f.get('model', ''),
+                        'scan_id': f.get('scan_id', ''),
+                    }
+                ))
+
+            merged = self._merge_intervals(intervals, threshold=self.visual_merge_gap)
+
+            for start, end, meta in merged:
+                count = meta.get('merged_count', 1)
+                max_conf = meta.get('max_confidence', meta.get('confidence', 0))
+                avg_conf = meta.get('avg_confidence', max_conf)
+
+                if count > 1:
+                    bar_label = f"🔍 {query} ×{count} ({max_conf:.0%})"
+                else:
+                    bar_label = f"🔍 {query} ({max_conf:.0%})"
+
+                bar = TimelineBar(
+                    start, end,
+                    current_y, query_height,
+                    color, bar_label,
+                    confidence=max_conf,
+                    metadata={
+                        'type': 'visual_search',
+                        'query': query,
+                        'merged_count': count,
+                        'avg_confidence': avg_conf,
+                        'max_confidence': max_conf,
+                        'model': meta.get('model', ''),
+                    }
+                )
+                self.draw_bar(bar)
+                self.bars.append(bar)
+
+            current_y += query_height
+
+        return y_pos + self.layer_height + self.layer_spacing
 
 class SignalTimelineView(QGraphicsView):
     """Custom view with smooth zooming and panning"""
