@@ -1120,6 +1120,70 @@ class SignalTimelineWindow(QMainWindow):
             print(f"Scene not ready yet, storing waveform data")
             self._pending_waveform_data = waveform_data
 
+    def add_visual_findings(self, findings: list, save: bool = True):
+            """
+            Public entry point for any scanner (Visual Search panel, LLM bridge, etc.)
+            to push findings onto the signal timeline.
+
+            Each finding is a dict:
+                {
+                    'timestamp': float,      # required, seconds
+                    'query':     str,        # required, e.g. 'explosion'
+                    'confidence': float,     # 0.0-1.0, default 1.0
+                    'model':     str,        # optional, e.g. 'llava-llama3:8b'
+                    'scan_id':   str,        # optional, groups one scan session
+                }
+            """
+            if not findings or not hasattr(self, 'signal_scene'):
+                return
+            self.signal_scene.add_visual_findings(findings)
+            if save:
+                self.save_visual_findings_to_cache()
+            if hasattr(self, 'label_panel'):
+                self.label_panel.refresh_labels()
+            self.statusBar().showMessage(
+                f"🔍 Added {len(findings)} visual finding(s) to timeline", 3000
+            )
+
+    def save_visual_findings_to_cache(self):
+        """Persist visual_findings to the on-disk cache file."""
+        try:
+            from pathlib import Path
+            import json
+
+            if not self.cache_data:
+                self.cache_data = {}
+            findings = (self.signal_scene.visual_findings
+                        if hasattr(self, 'signal_scene') else [])
+            self.cache_data['visual_findings'] = findings
+
+            cache_dir = Path("./cache")
+            if not cache_dir.exists():
+                print("⚠️ Cache directory not found, findings not persisted")
+                return False
+
+            video_hash = self.cache_data.get('video_hash')
+            if not video_hash:
+                print("⚠️ No video_hash in cache_data, cannot save findings")
+                return False
+
+            matching = list(cache_dir.glob(f"{video_hash}*.cache.json"))
+            if not matching:
+                print(f"⚠️ No cache file found for hash {video_hash[:16]}...")
+                return False
+
+            cache_file = matching[0]
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                disk_data = json.load(f)
+            disk_data['visual_findings'] = findings
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(disk_data, f)
+
+            print(f"💾 Saved {len(findings)} visual findings → {cache_file.name}")
+            return True
+        except Exception as e:
+            print(f"⚠️ Could not save visual findings: {e}")
+            return False
 
     def save_waveform_to_cache(self, waveform_data):
         """Save waveform to cache file on disk"""
@@ -1451,6 +1515,7 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_scene.time_clicked.connect(self.on_edit_time_clicked)
         self.edit_scene.clip_cut.connect(self.on_clip_cut)
         self.edit_scene.clip_trimmed.connect(self.on_clip_trimmed)
+        self.edit_scene.clip_reordered.connect(self.on_clip_reordered)
 
         
         edit_layout.addWidget(QLabel("Edit Timeline (Select clips and press Delete)"))
@@ -2178,6 +2243,12 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ Error extracting highlights from signal data: {e}")
         
         return highlights
+
+    @Slot(int, int)
+    def on_clip_reordered(self, from_idx, to_idx):
+        self.statusBar().showMessage(
+            f"✅ Moved Clip {from_idx + 1} → position {to_idx + 1}", 3000
+        )
 
     @Slot(int)
     def toggle_follow_playhead(self, state):

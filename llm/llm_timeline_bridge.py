@@ -41,7 +41,8 @@ KNOWN_COMMANDS = {
     'add_clip', 'remove_clip', 'clear_clips', 'seek', 'play', 'pause',
     'resume', 'filter_action', 'filter_object', 'show_all_filters',
     'confidence', 'zoom', 'list_clips', 'save', 'export',
-    'visual_scan',  # NEW: iterative frame-by-frame scanning
+    'visual_scan',
+    'get_visual_findings', 'clear_visual_findings',
 }
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,9 @@ Available commands:
   [CMD:save]                                    — Save edit timeline to cache
   [CMD:export format=edl]                       — Export timeline (edl or xml)
   [CMD:visual_scan interval=SECONDS target=DESCRIPTION] — Scan video frames looking for something
+  [CMD:get_visual_findings]                     — List all visual search findings on the timeline
+  [CMD:get_visual_findings query=NAME]          — List findings for one query only
+  [CMD:clear_visual_findings query=NAME]        — Remove findings (omit query to clear all)
 
 RULES for commands:
 - All numeric parameters are plain numbers: 60, 10.5, 0.3 (NO units like "s" or "sec")
@@ -466,3 +470,33 @@ Example:
                 f"  2. Set interval to {interval:.0f}s\n"
                 f"  3. Click 🔍 Search"
             )
+        
+    def _cmd_get_visual_findings(self, p: dict) -> str:
+        query = p.get('query', '').replace('_', ' ').strip() or None
+        scene = self._window.signal_scene
+        findings = scene.get_visual_findings(query)
+        if not findings:
+            suffix = f" for '{query}'" if query else ""
+            return f"ℹ️ No visual findings{suffix}"
+
+        lines = [f"ℹ️ {len(findings)} visual finding(s):"]
+        for f in findings[:30]:
+            q  = f.get('query', '?')
+            ts = f.get('timestamp', 0)
+            c  = f.get('confidence', 0)
+            lines.append(f"  {ts:.1f}s — {q} ({c:.0%})")
+        if len(findings) > 30:
+            lines.append(f"  ... and {len(findings) - 30} more")
+        return "\n".join(lines)
+
+    def _cmd_clear_visual_findings(self, p: dict) -> str:
+        query = p.get('query', '').replace('_', ' ').strip() or None
+        scene = self._window.signal_scene
+        before = len(scene.visual_findings)
+        scene.clear_visual_findings(query=query)
+        if hasattr(self._window, 'save_visual_findings_to_cache'):
+            self._window.save_visual_findings_to_cache()
+        after = len(scene.visual_findings)
+        if query:
+            return f"✅ Cleared {before - after} finding(s) for '{query}'"
+        return f"✅ Cleared all {before} visual finding(s)"
