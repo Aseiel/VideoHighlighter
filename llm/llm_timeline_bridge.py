@@ -180,8 +180,13 @@ class TimelineBridge:
                 parts.append(f"Hidden actions: {', '.join(hidden_actions)}")
             if hidden_objects:
                 parts.append(f"Hidden objects: {', '.join(hidden_objects)}")
-            if scene.min_action_confidence > 0 or scene.max_action_confidence < 1 or scene.min_object_confidence > 0 or scene.max_object_confidence < 1:
-                parts.append(f"Confidence filter: {scene.min_confidence:.2f} - {scene.max_confidence:.2f}")
+            ac_min, ac_max = scene.min_action_confidence, scene.max_action_confidence
+            ob_min, ob_max = scene.min_object_confidence, scene.max_object_confidence
+            if ac_min > 0 or ac_max < 1 or ob_min > 0 or ob_max < 1:
+                parts.append(
+                    f"Confidence filter — actions: {ac_min:.2f}-{ac_max:.2f}, "
+                    f"objects: {ob_min:.2f}-{ob_max:.2f}"
+                )
 
         return "\n".join(parts)
 
@@ -209,7 +214,8 @@ Available commands:
   [CMD:filter_action name=ACTION_NAME show=true/false]  — Show/hide an action type
   [CMD:filter_object name=OBJECT_NAME show=true/false]  — Show/hide an object type
   [CMD:show_all_filters]                        — Reset all filters to show everything
-  [CMD:confidence min=0.0 max=1.0]              — Set confidence threshold
+  [CMD:confidence min=0.0 max=1.0]              — Set confidence range (applies to both actions and objects)
+  [CMD:confidence min=0.0 max=1.0 type=action]  — Apply to actions only (or type=object)
   [CMD:zoom level=NUMBER]                       — Set zoom (10-200, default ~50)
   [CMD:list_clips]                              — List current edit timeline clips
   [CMD:save]                                    — Save edit timeline to cache
@@ -399,8 +405,18 @@ Example:
     def _cmd_confidence(self, p: dict) -> str:
         min_c = _parse_float(p.get('min', '0.0'))
         max_c = _parse_float(p.get('max', '1.0'))
-        self._window.signal_scene.set_confidence_filter(min_c, max_c)
-        return f"✅ Confidence filter set: {min_c:.2f} - {max_c:.2f}"
+        target = p.get('type', 'both').lower()  # 'action' / 'object' / 'both'
+        scene = self._window.signal_scene
+        applied = []
+        if target in ('action', 'actions', 'both'):
+            scene.set_action_confidence_filter(min_c, max_c)
+            applied.append('actions')
+        if target in ('object', 'objects', 'both'):
+            scene.set_object_confidence_filter(min_c, max_c)
+            applied.append('objects')
+        if not applied:
+            return f"⚠️ Unknown confidence type '{target}'. Use action, object, or both."
+        return f"✅ Confidence filter set ({', '.join(applied)}): {min_c:.2f} - {max_c:.2f}"
 
     def _cmd_zoom(self, p: dict) -> str:
         level = _parse_int(p.get('level', '50'))
