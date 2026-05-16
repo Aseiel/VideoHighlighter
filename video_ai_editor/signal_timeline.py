@@ -834,22 +834,64 @@ class SignalTimelineScene(QGraphicsScene):
     def draw_highlights_layer(self, y_pos):
         """Draw final highlight segments with improved labeling"""
         self.row_labels.append(("HIGHLIGHTS", y_pos))
-        
-        # Check if highlight segments are in cache
-        if 'final_segments' in self.cache_data:
-            for i, segment in enumerate(self.cache_data['final_segments']):
-                if isinstance(segment, (list, tuple)) and len(segment) >= 2:
-                    start, end = segment[0], segment[1]
-                    duration = end - start
-                    bar = TimelineBar(
-                        start, end, y_pos, self.layer_height,
-                        self.colors['highlights'], f"Highlight {i+1} ({duration:.1f}s)",
-                        confidence=10,  # Full opacity
-                        metadata={'index': i, 'duration': duration}
-                    )
-                    self.draw_bar(bar)
-                    self.bars.append(bar)
-        
+
+        # Pipeline writes 'highlight_segments'; keep older keys as fallback
+        segments = (
+            self.cache_data.get('highlight_segments')
+            or self.cache_data.get('final_segments')
+            or self.cache_data.get('highlights')
+            or self.cache_data.get('analysis', {}).get('final_segments')
+            or []
+        )
+
+        # Parallel scores array (same order as segments) if available
+        scores_meta = (
+            self.cache_data.get('highlight_metadata', {}).get('segments_metadata')
+            or []
+        )
+
+        if not segments:
+            text = self.addText(
+                "(no highlights — run highlight detection to populate)",
+                QFont("Arial", 9)
+            )
+            text.setPos(150, y_pos + 15)
+            text.setDefaultTextColor(QColor(150, 150, 150))
+            return y_pos + self.layer_height + self.layer_spacing
+
+        for i, segment in enumerate(segments):
+            if isinstance(segment, dict):
+                start = segment.get('start', segment.get('start_time'))
+                end   = segment.get('end',   segment.get('end_time'))
+                score = segment.get('score', segment.get('confidence'))
+            elif isinstance(segment, (list, tuple)) and len(segment) >= 2:
+                start, end = segment[0], segment[1]
+                score = segment[2] if len(segment) > 2 else None
+            else:
+                continue
+
+            if start is None or end is None or end <= start:
+                continue
+
+            # Pull score from the parallel metadata array if not embedded
+            if score is None and i < len(scores_meta):
+                score = scores_meta[i].get('score')
+
+            duration = end - start
+            if score is not None:
+                label = f"Highlight {i + 1} ({duration:.1f}s, score {score:.2f})"
+            else:
+                label = f"Highlight {i + 1} ({duration:.1f}s)"
+
+            bar = TimelineBar(
+                start, end, y_pos, self.layer_height,
+                self.colors['highlights'], label,
+                confidence=10,
+                metadata={'index': i, 'duration': duration, 'score': score}
+            )
+            self.draw_bar(bar)
+            self.bars.append(bar)
+
         return y_pos + self.layer_height + self.layer_spacing
     
     def draw_bar(self, bar):
