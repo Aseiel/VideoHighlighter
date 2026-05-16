@@ -785,25 +785,6 @@ class SignalTimelineWindow(QMainWindow):
             self.total_duration_str = f"{mins:02d}:{secs:02d}"
             self.update_time_display(self.video_player.position())
 
-    def update_video_position(self, position):
-        if self.video_player.duration() > 0:
-            percent = (position / self.video_player.duration()) * 100
-            self.time_slider.blockSignals(True)
-            self.time_slider.setValue(int(percent))
-            self.time_slider.blockSignals(False)
-            
-            self.update_time_display(position)
-            
-            # ── Update detection panel ──
-            time_seconds = position / 1000.0
-            self._update_detection_panel(time_seconds)
-            
-            if self.video_player.playbackState() == QMediaPlayer.PlayingState:
-                self.current_time = time_seconds
-                self.signal_scene.set_current_time(self.current_time)
-                if hasattr(self, 'signal_view'):
-                    self.signal_view.ensure_time_visible(self.current_time)
-
     def update_time_display(self, position):
         current_seconds = position // 1000
         mins = current_seconds // 60
@@ -821,192 +802,6 @@ class SignalTimelineWindow(QMainWindow):
             self.play_btn.setText("⏸ Pause")
         else:
             self.play_btn.setText("▶ Play")
-
-    def update_preview_time_label(self):
-        """Update the time label in preview"""
-        if hasattr(self, 'preview_time_label'):
-            current_mins = int(self.current_time // 60)
-            current_secs = int(self.current_time % 60)
-            total_mins = int(self.video_duration // 60)
-            total_secs = int(self.video_duration % 60)
-            self.preview_time_label.setText(f"{current_mins:02d}:{current_secs:02d} / {total_mins:02d}:{total_secs:02d}")
-
-
-    def simulate_playback(self):
-        """Simulate video playback progress"""
-        if hasattr(self, 'preview_playing') and self.preview_playing:
-            # Increment time
-            self.current_time += 0.1  # 100ms increments
-            
-            # Check if we reached the end
-            if self.current_time >= self.video_duration:
-                self.current_time = 0  # Loop back to start
-            
-            # Update timeline
-            self.signal_scene.set_current_time(self.current_time)
-            
-            # Update preview display
-            if hasattr(self, 'video_display'):
-                self.video_display.setText(f"▶ Playing at {self.current_time:.1f}s")
-            
-            # Update time label
-            self.update_preview_time_label()
-
-    def toggle_preview_playback(self):
-        """Start external player but show status in preview"""
-        if not hasattr(self, 'preview_playing'):
-            self.preview_playing = False
-        
-        if not self.preview_playing:
-            # Start external player
-            self.play_video_time(self.current_time)  # This opens external player
-            
-            # Mark as playing in preview
-            self.preview_playing = True
-            self.preview_play_btn.setText("⏸ Pause")
-            
-            # Show status in preview window
-            if hasattr(self, 'video_display'):
-                self.video_display.setText(f"▶ Playing in external player\nTime: {self.current_time:.1f}s")
-                self.video_display.setStyleSheet("""
-                    QLabel {
-                        background-color: #1a3a2a;
-                        color: #a0ffa0;
-                        border: 2px solid #4a7a5a;
-                        border-radius: 6px;
-                        font-size: 14px;
-                        padding: 20px;
-                    }
-                """)
-            
-            self.statusBar().showMessage(f"▶ Playing in external player at {self.current_time:.1f}s", 2000)
-        else:
-            # Can't actually pause external player, just update UI
-            self.preview_playing = False
-            self.preview_play_btn.setText("▶ Play")
-            
-            if hasattr(self, 'video_display'):
-                self.video_display.setText(f"⏸ Click to play\nLast time: {self.current_time:.1f}s")
-                self.video_display.setStyleSheet("""
-                    QLabel {
-                        background-color: #0a0a14;
-                        color: #c0d0ff;
-                        border: 2px solid #3a3a5a;
-                        border-radius: 6px;
-                        font-size: 14px;
-                        padding: 20px;
-                    }
-                """)
-            
-            self.statusBar().showMessage("⏸ Preview paused", 2000)
-
-    def update_preview_display_playing(self):
-        """Update display to show playing state"""
-        if hasattr(self, 'video_display'):
-            self.video_display.setText(f"▶ Playing at {self.current_time:.1f}s")
-            self.video_display.setStyleSheet("""
-                QLabel {
-                    background-color: #1a3a2a;
-                    color: #a0ffa0;
-                    border: 2px solid #4a7a5a;
-                    border-radius: 6px;
-                    font-size: 14px;
-                    padding: 20px;
-                }
-            """)
-
-    def update_preview_display_paused(self):
-        """Update display to show paused state"""
-        if hasattr(self, 'video_display'):
-            self.video_display.setText(f"⏸ Paused at {self.current_time:.1f}s")
-            self.video_display.setStyleSheet("""
-                QLabel {
-                    background-color: #0a0a14;
-                    color: #c0d0ff;
-                    border: 2px solid #3a3a5a;
-                    border-radius: 6px;
-                    font-size: 14px;
-                    padding: 20px;
-                }
-            """)
-
-    def update_preview_display(self):
-        """Update preview display during playback"""
-        if hasattr(self, 'preview_playing') and self.preview_playing:
-            # Simulate time progression (if using external player, this won't be accurate)
-            # For now, just show that we're playing
-            pass
-
-    def toggle_ai_overlay_preview(self, state):
-        """Toggle AI overlay in preview"""
-        from PySide6.QtCore import Qt
-        
-        if state == Qt.Checked:
-            self.statusBar().showMessage("AI Overlays: ON (requires annotated video)", 2000)
-        else:
-            self.statusBar().showMessage("AI Overlays: OFF", 2000)
-        
-        # Update the display based on overlay state
-        self.update_preview_display_based_on_state()
-
-    def update_preview_display_based_on_state(self):
-        """Update preview display based on current state"""
-        if not hasattr(self, 'video_display'):
-            return
-        
-        if hasattr(self, 'preview_playing') and self.preview_playing:
-            state_text = "Playing"
-            bg_color = "#1a3a2a"
-            text_color = "#a0ffa0"
-            border_color = "#4a7a5a"
-        else:
-            state_text = "Paused"
-            bg_color = "#0a0a14"
-            text_color = "#c0d0ff"
-            border_color = "#3a3a5a"
-        
-        if hasattr(self, 'preview_overlay_toggle') and self.preview_overlay_toggle.isChecked():
-            overlay_text = "\nAI Overlays: ON"
-            bg_color = "#2a1a3a"  # Purple for AI mode
-            text_color = "#ffa0ff"
-            border_color = "#7a4a7a"
-        else:
-            overlay_text = "\nAI Overlays: OFF"
-        
-        self.video_display.setText(f"{state_text} at {self.current_time:.1f}s{overlay_text}")
-        self.video_display.setStyleSheet(f"""
-            QLabel {{
-                background-color: {bg_color};
-                color: {text_color};
-                border: 2px solid {border_color};
-                border-radius: 6px;
-                font-size: 14px;
-                padding: 20px;
-            }}
-        """)
-
-    def update_waveform_checkbox_state(self):
-        """Enable/disable + sync the waveform checkbox with actual waveform availability."""
-        if not hasattr(self, "waveform_checkbox"):
-            return
-        if not hasattr(self, "signal_scene") or self.signal_scene is None:
-            return
-
-        has_waveform = bool(self.signal_scene.waveform) and len(self.signal_scene.waveform) > 0
-
-        # Avoid triggering toggle_waveform while we programmatically change the checkbox
-        self.waveform_checkbox.blockSignals(True)
-        try:
-            self.waveform_checkbox.setEnabled(has_waveform)
-
-            # If we have waveform data, reflect the scene's visibility state.
-            # If we don't, force unchecked.
-            if has_waveform:
-                self.waveform_checkbox.setChecked(bool(self.signal_scene.waveform_visible))
-            else:
-                self.waveform_checkbox.setChecked(False)
-        finally:
-            self.waveform_checkbox.blockSignals(False)
 
     def _apply_pending_waveform(self):
         if hasattr(self, '_pending_waveform_data'):
@@ -1104,12 +899,11 @@ class SignalTimelineWindow(QMainWindow):
         self.save_waveform_to_cache(waveform_data)
         
         if hasattr(self, 'signal_scene') and self.signal_scene is not None:
-            # Update scene with new waveform data
+            # Update scene with new waveform data — set_waveform_data also
+            # updates visible_layers['waveform'] and triggers build_timeline,
+            # so the layer checkbox in Visible Layers picks up the change.
             self.signal_scene.set_waveform_data(waveform_data)
-            
-            # Force checkbox update after scene is built
-            QTimer.singleShot(100, lambda: self.update_waveform_checkbox_state())
-            
+
             # Force a view update
             QTimer.singleShot(150, lambda: self.signal_view.viewport().update())
             
@@ -1232,12 +1026,6 @@ class SignalTimelineWindow(QMainWindow):
 
         except Exception as e:
             print(f"⚠️ Could not save waveform to cache: {e}")
-
-    def set_waveform_data(self, waveform_data):
-        self.waveform = waveform_data or []
-        self.waveform_visible = True if self.waveform else False  # FORCE ON when data exists
-        self.waveform_colors = self.generate_waveform_colors()
-        self.build_timeline()
 
     def get_cache_instance(self):
         """Get cache instance for highlight loading"""
@@ -1454,13 +1242,8 @@ class SignalTimelineWindow(QMainWindow):
         timeline_row.setContentsMargins(0, 0, 0, 0)
         signal_layout.addLayout(timeline_row)
 
-        # Refresh labels when timeline rebuilds
-        original_build = self.signal_scene.build_timeline
-        def _build_and_refresh():
-            original_build()
-            if hasattr(self, 'label_panel'):
-                self.label_panel.refresh_labels()
-        self.signal_scene.build_timeline = _build_and_refresh
+        # Refresh frozen labels whenever the scene rebuilds
+        self.signal_scene.timeline_rebuilt.connect(self.label_panel.refresh_labels)
 
         # Initial label load
         self.label_panel.refresh_labels()
@@ -1803,14 +1586,6 @@ class SignalTimelineWindow(QMainWindow):
         self.remove_clips_btn = QPushButton("🗑️ Delete Selected Clips")
         self.remove_clips_btn.clicked.connect(self.on_remove_clips_clicked)
         
-        # Add clip button
-        self.add_clip_btn = QPushButton("➕ Add Clip at Current Time")
-        self.add_clip_btn.clicked.connect(self.on_add_clip_clicked)
-
-        # Remove selected clips button
-        self.remove_clips_btn = QPushButton("🗑️ Delete Selected Clips")
-        self.remove_clips_btn.clicked.connect(self.on_remove_clips_clicked)
-
         # Cut Mode toggle
         self.cut_mode_btn = QPushButton("✂️  Cut Mode")
         self.cut_mode_btn.setCheckable(True)
@@ -2010,35 +1785,7 @@ class SignalTimelineWindow(QMainWindow):
         
         controls_widget = QWidget()
         layout = QVBoxLayout(controls_widget)
-        
-        # Waveform controls
-        waveform_group = QGroupBox("Waveform")
-        waveform_layout = QVBoxLayout()
-
-        # Waveform visibility toggle
-        self.waveform_checkbox = QCheckBox("Show Waveform")
-
-        # Initialize checkbox state
-        self.waveform_checkbox.setChecked(False)  # Start unchecked
-        self.waveform_checkbox.setEnabled(False)  # Disabled until data loads
-
-        # Connect signal
-        self.waveform_checkbox.stateChanged.connect(self.toggle_waveform)
-        waveform_layout.addWidget(self.waveform_checkbox)
-
-        # Waveform opacity slider
-        opacity_layout = QHBoxLayout()
-        opacity_layout.addWidget(QLabel("Opacity:"))
-        self.waveform_opacity_slider = QSlider(Qt.Horizontal)
-        self.waveform_opacity_slider.setRange(30, 100)
-        self.waveform_opacity_slider.setValue(70)
-        self.waveform_opacity_slider.valueChanged.connect(self.change_waveform_opacity)
-        opacity_layout.addWidget(self.waveform_opacity_slider)
-        waveform_layout.addLayout(opacity_layout)
-        
-        waveform_group.setLayout(waveform_layout)
-        layout.addWidget(waveform_group)
-        
+              
         # ADD FILTER CONTROLS
         filter_controls = self.create_filter_controls()
         layout.addWidget(filter_controls)
@@ -2111,16 +1858,6 @@ class SignalTimelineWindow(QMainWindow):
         playback_group = QGroupBox("Playback")
         playback_layout = QVBoxLayout()
         
-        play_btn = QPushButton("▶ Play at Selected Time")
-        play_btn.clicked.connect(self.play_video_at_current_time)
-        play_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #3a5fcd;
-                font-weight: bold;
-            }
-        """)
-        playback_layout.addWidget(play_btn)
-
         # Transcript toggle — connected later in init_ui once dock exists
         self.transcript_toggle_btn = QPushButton("📝 Transcript")
         self.transcript_toggle_btn.setCheckable(True)
@@ -2136,9 +1873,6 @@ class SignalTimelineWindow(QMainWindow):
             }
         """)
         playback_layout.addWidget(self.transcript_toggle_btn)
-
-        self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
-
 
         self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
         self.follow_playhead_checkbox.setChecked(True)
@@ -2257,81 +1991,7 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self, 'signal_view'):
             self.signal_view.follow_playhead = follow
         self.statusBar().showMessage(f"Follow playhead: {'ON' if follow else 'OFF'}", 2000)
-
-    @Slot(int)
-    def toggle_waveform(self, state):
-        """Toggle waveform visibility"""
-        # Prevent multiple rapid toggles
-        if not hasattr(self, 'signal_scene'):
-            return
-        
-        visible = bool(state == Qt.Checked)
-        
-        # Check if we actually have waveform data
-        has_waveform = self.signal_scene.waveform is not None and len(self.signal_scene.waveform) > 0
-        
-        if visible and not has_waveform:
-            # No data available, revert checkbox
-            self.waveform_checkbox.setChecked(False)
-            self.statusBar().showMessage("⚠️ No waveform data available", 3000)
-            return
-        
-        # Store current view transform for restoration
-        view_transform = self.signal_view.transform()
-        
-        # Store current scroll position
-        h_scroll = self.signal_view.horizontalScrollBar().value()
-        v_scroll = self.signal_view.verticalScrollBar().value()
-        
-        # Store current scene position under cursor
-        cursor_pos = self.signal_view.mapFromGlobal(QCursor.pos())
-        cursor_scene_pos = self.signal_view.mapToScene(cursor_pos)
-        
-        # Set visibility
-        self.signal_scene.waveform_visible = visible
-        
-        # FORCE complete rebuild with proper dimensions
-        self.signal_scene.build_timeline()
-        
-        # Calculate the scaling factor needed to maintain the same horizontal zoom
-        old_width = self.signal_scene.sceneRect().width() / view_transform.m11() if view_transform.m11() != 0 else 1
-        new_width = self.signal_scene.sceneRect().width()
-        
-        # Apply scaling to maintain horizontal zoom
-        if old_width > 0 and new_width > 0:
-            # Calculate how much we need to scale to maintain the same visible width
-            scale_factor = new_width / old_width
-            
-            # Create a new transform with adjusted scaling
-            new_transform = view_transform.scale(scale_factor, 1.0)
-            self.signal_view.setTransform(new_transform)
-        
-        # Restore scroll positions
-        self.signal_view.horizontalScrollBar().setValue(h_scroll)
-        self.signal_view.verticalScrollBar().setValue(v_scroll)
-        
-        # Adjust view to maintain cursor position if possible
-        if cursor_scene_pos.x() >= 0 and cursor_scene_pos.x() <= self.signal_scene.sceneRect().width():
-            # Calculate how much the scene shifted
-            scene_shift = cursor_scene_pos.y() - self.signal_view.mapToScene(cursor_pos).y()
-            if abs(scene_shift) > 10:  # Significant shift
-                self.signal_view.verticalScrollBar().setValue(
-                    v_scroll + int(scene_shift * self.signal_view.transform().m22())
-                )
-        
-        if visible:
-            self.statusBar().showMessage(f"✅ Waveform visible ({len(self.signal_scene.waveform)} points)", 2000)
-        else:
-            self.statusBar().showMessage("Waveform hidden", 2000)
-        
-    @Slot(int)
-    def change_waveform_opacity(self, value):
-        """Change waveform opacity"""
-        if hasattr(self, 'signal_scene'):
-            self.signal_scene.waveform_opacity = value / 100.0
-            self.signal_scene.waveform_colors = self.signal_scene.generate_waveform_colors()
-            self.signal_scene.build_timeline()
-
+       
     @Slot()
     def on_save_cache_clicked(self):
         """Save current edit timeline to cache"""
@@ -2927,19 +2587,6 @@ class SignalTimelineWindow(QMainWindow):
         """Handle filter changes from the scene"""
         self.update_filter_summary()
     
-    def play_video_at_current_time(self):
-        """Play video at current time position"""
-        if not hasattr(self, 'current_time') or self.current_time < 0:
-            self.statusBar().showMessage("⚠️ Click timeline to select a timestamp first", 2000)
-            return
-        
-        milliseconds = int(self.current_time * 1000)
-        self.video_player.setPosition(milliseconds)
-        self.video_player.play()
-        self.play_btn.setText("⏸ Pause")
-        
-        self.statusBar().showMessage(f"▶ Playing at {self.current_time:.1f}s", 2000)
-
     def play_edit_timeline(self):
         """Play all clips in the edit timeline sequentially"""
         clips = self.edit_scene.get_clip_times()
@@ -3133,12 +2780,6 @@ class SignalTimelineWindow(QMainWindow):
         self.clip_timer.setSingleShot(True)
         self.clip_timer.timeout.connect(lambda: self.video_player.pause())
         self.clip_timer.start(int(duration * 1000))
-
-    def play_video_time(self, time):
-        """Play video at specific time in preview"""
-        # This replaces the external player call
-        self.current_time = time
-        self.play_video_at_current_time()
 
     @Slot()
     def on_render_highlight_clicked(self):
