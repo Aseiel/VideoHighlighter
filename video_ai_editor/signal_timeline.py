@@ -18,6 +18,7 @@ class SignalTimelineScene(QGraphicsScene):
     add_to_edit_requested = Signal(float)
     filter_changed = Signal(dict)
     waveform_clicked = Signal(float, float, float)
+    timeline_rebuilt = Signal()  # fired after build_timeline finishes
     
     def __init__(self, cache_data, video_duration, parent=None, waveform=None):
         super().__init__(parent)
@@ -26,16 +27,11 @@ class SignalTimelineScene(QGraphicsScene):
         
         # Waveform visualization
         self.waveform = waveform or []
-        self.waveform_visible = bool(self.waveform)
         self.waveform_opacity = 0.7
         
-        print(f"🎵 SignalTimelineScene init: waveform={len(self.waveform)} points, visible={self.waveform_visible}")
+        print(f"🎵 SignalTimelineScene init: waveform={len(self.waveform)} points")
 
-        if self.waveform_visible:
-            # Generate colors for waveform
-            self.waveform_colors = self.generate_waveform_colors()
-        else:
-            self.waveform_colors = []
+        self.waveform_colors = []
         
         # Dynamic zoom for short videos
         if video_duration < 30:
@@ -100,6 +96,8 @@ class SignalTimelineScene(QGraphicsScene):
 
         # Always make visual_search toggleable, even when no findings yet
         self.visible_layers.setdefault('visual_search', True)
+        # Waveform is a regular layer — visible by default when data exists
+        self.visible_layers['waveform'] = bool(self.waveform)
         
         # Color scheme
         self.colors = {
@@ -155,24 +153,25 @@ class SignalTimelineScene(QGraphicsScene):
 
     
     def set_waveform_data(self, waveform_data):
-        """Set waveform data for visualization"""
-        self.waveform = waveform_data or []
-        
-        # IMPORTANT: Set visibility based on actual data
-        self.waveform_visible = True if waveform_data and len(waveform_data) > 0 else False
-        
-        # Recompute colors with current opacity
-        self.waveform_colors = self.generate_waveform_colors()
-        
-        print(f"✅ SignalTimelineScene.set_waveform_data: {len(self.waveform) if self.waveform else 0} points, visible={self.waveform_visible}")
-        
-        # Rebuild timeline to include waveform
-        self.build_timeline()
+            """Set waveform data for visualization"""
+            self.waveform = waveform_data or []
+            has_data = bool(self.waveform)
+
+            # Enable the layer when data arrives; respect user toggle otherwise
+            self.visible_layers['waveform'] = has_data
+
+            # Recompute colors with current opacity
+            self.waveform_colors = self.generate_waveform_colors()
+
+            print(f"✅ SignalTimelineScene.set_waveform_data: {len(self.waveform)} points, visible={has_data}")
+
+            # Rebuild timeline to include waveform
+            self.build_timeline()
 
     
     def draw_waveform_layer(self, y_pos, height):
         """Draw the waveform visualization layer"""
-        if not self.waveform or len(self.waveform) == 0 or not self.waveform_visible:
+        if not self.waveform or not self.visible_layers.get('waveform', False):
             # IMPORTANT: Return the SAME y_pos when not drawing
             return y_pos  # Don't add any height
         
@@ -390,7 +389,6 @@ class SignalTimelineScene(QGraphicsScene):
         """Rebuild the timeline with waveform"""
         print(f"🔄 SignalTimelineScene.build_timeline() called")
         print(f"   - Waveform data: {self.waveform is not None}, length: {len(self.waveform)}")
-        print(f"   - Waveform visible: {self.waveform_visible}")
         
         # Clear selection state — items are about to be wiped by self.clear()
         self._selection_rect_item  = None
@@ -414,7 +412,7 @@ class SignalTimelineScene(QGraphicsScene):
         height = 50  # Time ruler and labels
         
         # ONLY add waveform height if it's visible AND has data
-        if self.waveform_visible and self.waveform and len(self.waveform) > 0:
+        if self.visible_layers.get('waveform', False) and self.waveform:
             height += 80 + self.layer_spacing  # Waveform height with spacing after waveform
         
         # Add height for other visible layers
@@ -445,7 +443,7 @@ class SignalTimelineScene(QGraphicsScene):
         self.row_labels = []
         
         # Draw waveform if visible
-        if self.waveform_visible and self.waveform:
+        if self.visible_layers.get('waveform', False) and self.waveform:
             current_y = self.draw_waveform_layer(current_y, 80)
                
         # Draw other layers
@@ -503,6 +501,7 @@ class SignalTimelineScene(QGraphicsScene):
                 view.horizontalScrollBar().setValue(old_h_scroll)
 
         print(f"✅ Timeline rebuilt successfully, final height={height}")
+        self.timeline_rebuilt.emit()
 
     def draw_background(self):
         """Draw gradient background with subtle grid"""

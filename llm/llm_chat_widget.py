@@ -23,9 +23,9 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QLineEdit, QComboBox,
     QGroupBox, QFileDialog, QApplication, QCheckBox,
-    QDialog, QDialogButtonBox, QSpinBox, QDoubleSpinBox,
+    QDialog, QDialogButtonBox, QDoubleSpinBox,
 )
-from PySide6.QtCore import Qt, Signal, Slot, QThread, QTimer, QSettings
+from PySide6.QtCore import Qt, Signal, Slot, QThread, QSettings, QObject
 from PySide6.QtGui import QTextCursor
 
 from .llm_module import (
@@ -45,11 +45,13 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Worker thread for LLM queries
 # ---------------------------------------------------------------------------
-class _LLMWorker(QThread):
+class _LLMWorker(QObject):
     """Runs LLM.query() off the GUI thread with token-by-token streaming.
-    
-    Now uses CancellationToken so GGUF vision models can be interrupted
-    mid-generation, not just between tokens in the stream callback.
+
+    Uses the QObject + moveToThread() pattern. CancellationToken supports
+    mid-generation cancellation; blocking image-decode calls still have to
+    finish, but the worker emits `finished` cleanly via the event loop and
+    the `finished → deleteLater` chain handles teardown.
     """
 
     token_received = Signal(str)
@@ -76,6 +78,7 @@ class _LLMWorker(QThread):
         """Request cancellation — works even for blocking GGUF vision calls."""
         self._cancel_token.cancel()
 
+    @Slot()
     def run(self):
         try:
             def _stream_callback(token: str):
@@ -109,11 +112,12 @@ class _LLMWorker(QThread):
 # ---------------------------------------------------------------------------
 # Worker thread for visual search
 # ---------------------------------------------------------------------------
-class _VisualSearchWorker(QThread):
+class _VisualSearchWorker(QObject):
     """Runs VideoSeekAnalyzer visual search in background.
-    
-    Uses CancellationToken so each per-frame LLM call can be interrupted.
-    Supports stop_on_first_match to auto-stop after finding the target.
+
+    Uses the QObject + moveToThread() pattern. CancellationToken interrupts
+    per-frame LLM calls; the image decode itself is a ~20s blocking C call,
+    so cancellation takes effect at the next frame boundary.
     """
 
     progress = Signal(int, int, float, str)  # current, total, timestamp, preview
@@ -138,6 +142,7 @@ class _VisualSearchWorker(QThread):
     def cancel(self):
         self._cancel_token.cancel()
 
+    @Slot()
     def run(self):
         try:
             results = []
@@ -227,13 +232,6 @@ _VISION_KEYWORDS = (
     "what's happening here", "what is happening here",
 )
 
-# Keywords that indicate the user wants visual search
-_VISUAL_SEARCH_KEYWORDS = (
-    "search for", "find", "look for", "scan for", "seek for",
-    "visual search", "find me", "show me where", "locate",
-    "explosion", "fire", "person", "car", "object", "action",
-)
-
 # ---------------------------------------------------------------------------
 # Time spinbox — displays seconds as mm:ss, accepts both formats as input
 # ---------------------------------------------------------------------------
@@ -301,8 +299,9 @@ class LLMChatWidget(QWidget):
         self._video_path: str = video_path
         self._chat_history: list[dict] = []
         self._worker: Optional[_LLMWorker] = None
+        self._worker_thread: Optional[QThread] = None
         self._search_worker: Optional[_VisualSearchWorker] = None
-        self._orphaned_workers: list[QThread] = []  # cancelled-but-still-running workers
+        self._search_worker_thread: Optional[QThread] = None
         self._compact = compact
         self._cache_dir = cache_dir
         self._timeline_bridge: Optional['TimelineBridge'] = None
@@ -721,27 +720,22 @@ class LLMChatWidget(QWidget):
                 self._append_system("❌ Cannot start search: No video loaded or analyzer not ready")
                 return
         
-        if self._search_worker and self._search_worker.isRunning():
-            # Cancel the previous worker, but DO NOT drop its reference yet —
-            # the image-decode step is a ~20s uninterruptible blocking C call,
-            # so the thread will still be running after cancel() returns.
-            # Destroying its Python wrapper while running triggers Qt's
-            # qFatal("QThread: Destroyed while thread is still running") and
-            # kills the whole process. Disconnect signals so the stopping worker
-            # can't fire stale handlers for the new search, then stash a
-            # reference so Python GC can't reap it until run() actually returns.
-            self._search_worker.cancel()
-            try:
-                self._search_worker.disconnect()
-            except (RuntimeError, TypeError):
-                pass
-            self._orphaned_workers.append(self._search_worker)
-            self._search_worker = None
+        if self._search_worker_thread and self._search_worker_thread.isRunning():
+            # Cancel the previous worker. The QObject+moveToThread pattern
+            # handles cleanup via the finished→deleteLater chain — old worker
+            # finishes its current frame, emits finished, thread quits, both
+            # objects schedule themselves for deletion through the event loop.
+            # Qt's parent-child ownership keeps the old thread alive until then,
+            # even though we're about to reassign self._search_worker_thread.
+            if self._search_worker:
+                self._search_worker.cancel()
+                try:
+                    self._search_worker.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
             self._append_system(
                 "⏹ Cancelling previous search (will finish current frame in background)..."
             )
-            # Opportunistic cleanup of any orphans that have finished by now
-            self._orphaned_workers = [w for w in self._orphaned_workers if w.isRunning()]
 
         interval = self.search_interval.value()
         start_from = self.search_start_time.value()
@@ -768,6 +762,7 @@ class LLMChatWidget(QWidget):
         self.stop_search_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)  # Also enable main Stop button
         
+        self._search_worker_thread = QThread(self)  # parent=self for Qt ownership
         self._search_worker = _VisualSearchWorker(
             analyzer=self._analyzer,
             target=target,
@@ -776,16 +771,27 @@ class LLMChatWidget(QWidget):
             stop_on_first_match=stop_on_match,
             start_time=start_from,
         )
+        self._search_worker.moveToThread(self._search_worker_thread)
+
+        # Lifecycle
+        self._search_worker_thread.started.connect(self._search_worker.run)
+        self._search_worker.finished.connect(self._search_worker_thread.quit)
+        self._search_worker.finished.connect(self._search_worker.deleteLater)
+        self._search_worker.error.connect(self._search_worker_thread.quit)
+        self._search_worker_thread.finished.connect(self._search_worker_thread.deleteLater)
+
+        # Our handlers
         self._search_worker.progress.connect(self._on_search_progress)
         self._search_worker.frame_analyzed.connect(self._on_frame_analyzed)
         self._search_worker.found.connect(self._on_search_found)
         self._search_worker.finished.connect(self._on_search_finished)
         self._search_worker.error.connect(self._on_search_error)
-        self._search_worker.start()
+
+        self._search_worker_thread.start()
 
     def _stop_visual_search(self):
         """Stop ongoing visual search."""
-        if self._search_worker and self._search_worker.isRunning():
+        if self._search_worker_thread and self._search_worker_thread.isRunning():
             self._search_worker.cancel()
             self._append_system(
                 "⏹ Stop requested — will stop after current frame finishes.\n"
@@ -918,7 +924,7 @@ class LLMChatWidget(QWidget):
         self.search_btn.setEnabled(True)
         self.stop_search_btn.setEnabled(False)
         # Disable main stop button too (unless a chat query is still running)
-        if not (self._worker and self._worker.isRunning()):
+        if not (self._worker_thread and self._worker_thread.isRunning()):
             self.stop_btn.setEnabled(False)
 
     @Slot(str)
@@ -928,7 +934,7 @@ class LLMChatWidget(QWidget):
         self.search_progress.setText("Search failed")
         self.search_btn.setEnabled(True)
         self.stop_search_btn.setEnabled(False)
-        if not (self._worker and self._worker.isRunning()):
+        if not (self._worker_thread and self._worker_thread.isRunning()):
             self.stop_btn.setEnabled(False)
 
     def _seek_to_timestamp(self, seconds: float):
@@ -1391,7 +1397,7 @@ class LLMChatWidget(QWidget):
         if not self._llm or not self._llm.is_loaded():
             self._append_system("Not connected. Click 'Connect' first.")
             return
-        if self._worker and self._worker.isRunning():
+        if self._worker_thread and self._worker_thread.isRunning():
             self._append_system("Still generating... please wait.")
             return
         
@@ -1532,8 +1538,9 @@ class LLMChatWidget(QWidget):
                     else:
                         self._append_system("⚠️ Frame capture failed")
 
-        # Create and start worker thread
+        # Create worker and host thread
         _free_chat = self.free_chat_chk.isChecked()
+        self._worker_thread = QThread(self)
         self._worker = _LLMWorker(
             llm=self._llm,
             message=actual_message,
@@ -1543,10 +1550,21 @@ class LLMChatWidget(QWidget):
             frame_base64=frame_b64,
             free_chat_mode=_free_chat,
         )
+        self._worker.moveToThread(self._worker_thread)
+
+        # Lifecycle — worker.finished triggers thread.quit + deleteLater on both
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.error.connect(self._worker_thread.quit)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+
+        # Our handlers
         self._worker.token_received.connect(self._on_token)
         self._worker.finished.connect(self._on_response_done)
         self._worker.error.connect(self._on_response_error)
-        self._worker.start()
+
+        self._worker_thread.start()
 
     def _try_parse_chat_search(self, text: str) -> bool:
         """Parse visual search requests typed in the chat input.
@@ -1671,62 +1689,7 @@ class LLMChatWidget(QWidget):
                     pass
         
         return False
-
-    def _handle_visual_search_request(self, text: str) -> bool:
-        """Handle visual search requests directly."""
-        text_lower = text.lower()
-        
-        is_search = any(kw in text_lower for kw in _VISUAL_SEARCH_KEYWORDS)
-        
-        if is_search and ('explosion' in text_lower or 'fire' in text_lower or 
-                          'person' in text_lower or 'car' in text_lower or
-                          'object' in text_lower or 'action' in text_lower):
-            
-            words = text_lower.split()
-            search_target = None
-            
-            for i, word in enumerate(words):
-                if word in ['explosion', 'fire', 'person', 'car', 'object']:
-                    search_target = word
-                    break
-                if word in ['search', 'find', 'look'] and i + 1 < len(words):
-                    search_target = words[i + 1]
-                    break
-            
-            if search_target:
-                self.search_target.setText(search_target)
-                self._start_visual_search()
-                return True
-        
-        return False
-    
-    def capture_and_show_frame(self, timestamp: float):
-        """Manually capture and display a frame from the video"""
-        if not self._analyzer:
-            self._append_system("⚠️ No analyzer available")
-            return False
-        
-        # Seek and capture
-        frame = self._analyzer.seek_to_time(timestamp)
-        if frame is None:
-            self._append_system(f"⚠️ Could not read frame at {timestamp:.1f}s")
-            return False
-        
-        # Update preview
-        if hasattr(self, '_preview_window') and self._preview_window:
-            self._preview_window.seek_to_time(timestamp)
-            self._preview_window.force_frame_update()
-            
-            # Convert frame to base64 for potential LLM use
-            frame_b64 = self._analyzer.frame_to_base64(frame)
-            
-            ts_str = f"{int(timestamp)//60}:{int(timestamp)%60:02d}"
-            self._append_system(f"📸 Frame captured at {ts_str}")
-            
-            return frame_b64
-        
-        return False
-
+  
     def _stop_generation(self):
         """Stop the current LLM generation or visual search.
         
@@ -1735,11 +1698,13 @@ class LLMChatWidget(QWidget):
         Stop takes effect after the current frame finishes processing.
         """
         stopped_something = False
-        if self._worker and self._worker.isRunning():
-            self._worker.cancel()
+        if self._worker_thread and self._worker_thread.isRunning():
+            if self._worker:
+                self._worker.cancel()
             stopped_something = True
-        if self._search_worker and self._search_worker.isRunning():
-            self._search_worker.cancel()
+        if self._search_worker_thread and self._search_worker_thread.isRunning():
+            if self._search_worker:
+                self._search_worker.cancel()
             self.search_btn.setEnabled(True)
             self.stop_search_btn.setEnabled(False)
             self.search_progress.setText("Stopping after current frame...")
@@ -1840,36 +1805,33 @@ class LLMChatWidget(QWidget):
 
     def closeEvent(self, event):
         """Clean up resources on close.
-        
-        Must wait() for threads after cancel(), otherwise Qt destroys
-        the QThread object while the thread is still running → crash.
-        """
-        if self._search_worker and self._search_worker.isRunning():
-            self._search_worker.cancel()
-            if not self._search_worker.wait(5000):  # 5s timeout
-                print("⚠️ Search worker did not stop in time, terminating")
-                self._search_worker.terminate()
-                self._search_worker.wait(2000)
 
-        # Reap any cancelled-but-still-running workers from prior searches
-        for w in getattr(self, '_orphaned_workers', []):
-            if w.isRunning():
-                w.cancel()
-                if not w.wait(5000):
-                    print("⚠️ Orphaned worker did not stop, terminating")
-                    w.terminate()
-                    w.wait(2000)
-        self._orphaned_workers = []
-        if self._worker and self._worker.isRunning():
+        Wait for running threads to finish — destroying a QThread while
+        its run-loop is still active triggers qFatal. Cancellation sets a
+        flag; uninterruptible C calls (GGUF image decode) need to finish
+        naturally before the worker can emit finished.
+        """
+        # LLM worker
+        if self._worker:
             self._worker.cancel()
-            if not self._worker.wait(5000):  # 5s timeout
-                print("⚠️ LLM worker did not stop in time, terminating")
-                self._worker.terminate()
-                self._worker.wait(2000)
+        if self._worker_thread and self._worker_thread.isRunning():
+            if not self._worker_thread.wait(5000):
+                print("⚠️ LLM thread did not stop in time, terminating")
+                self._worker_thread.terminate()
+                self._worker_thread.wait(2000)
+
+        # Visual search worker
+        if self._search_worker:
+            self._search_worker.cancel()
+        if self._search_worker_thread and self._search_worker_thread.isRunning():
+            if not self._search_worker_thread.wait(5000):
+                print("⚠️ Search thread did not stop in time, terminating")
+                self._search_worker_thread.terminate()
+                self._search_worker_thread.wait(2000)
+
         if self._analyzer:
             self._analyzer.close()
         super().closeEvent(event)
-
 
 # ---------------------------------------------------------------------------
 # Standalone window for testing
