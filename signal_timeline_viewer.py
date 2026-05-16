@@ -416,8 +416,7 @@ class SignalTimelineWindow(QMainWindow):
         self.time_slider = QSlider(Qt.Horizontal)
         self.time_slider.setRange(0, 100)
         self.time_slider.sliderPressed.connect(lambda: setattr(self, '_block_position_updates', True))
-        self.time_slider.sliderMoved.connect(self.seek_video)
-        self.time_slider.sliderReleased.connect(lambda: self.seek_video(self.time_slider.value()))
+        self.time_slider.valueChanged.connect(self.seek_video)
         controls_layout.addWidget(self.time_slider)
 
         # Time label
@@ -752,12 +751,29 @@ class SignalTimelineWindow(QMainWindow):
             self.play_btn.setText("⏸ Pause")
 
     def seek_video(self, position):
-        """Seek video to specific position"""
-        if self._active_player.duration() > 0:
-            self._block_position_updates = True
-            new_position = (position / 100.0) * self._active_player.duration()
-            self._active_player.setPosition(int(new_position))
-            QTimer.singleShot(200, lambda: setattr(self, '_block_position_updates', False))
+        """Seek video to specific position (slider value 0-100)."""
+        duration = self._active_player.duration()
+        if duration <= 0:
+            return
+
+        self._block_position_updates = True
+        new_position_ms = int((position / 100.0) * duration)
+        self._active_player.setPosition(new_position_ms)
+
+        # Update everything immediately — don't wait for positionChanged,
+        # which won't fire reliably while the player is paused.
+        self.update_time_display(new_position_ms)
+
+        seconds = new_position_ms / 1000.0
+        self.current_time = seconds
+        self._update_detection_panel(seconds)
+
+        if hasattr(self, 'signal_scene'):
+            self.signal_scene.set_current_time(seconds)
+        if hasattr(self, 'signal_view'):
+            self.signal_view.ensure_time_visible(seconds)
+
+        QTimer.singleShot(200, lambda: setattr(self, '_block_position_updates', False))
 
     def set_volume(self, value):
         """Set video volume"""
@@ -1348,7 +1364,7 @@ class SignalTimelineWindow(QMainWindow):
         self.statusBar().showMessage(f"Video duration: {self.video_duration:.1f}s | Total edit duration: {self.edit_scene.get_total_duration():.1f}s")
         
         # Install event filter to handle global key events
-        self.installEventFilter(self)
+        QApplication.instance().installEventFilter(self)
 
     def capture_current_frame_base64(self) -> str | None:
         """
@@ -1415,17 +1431,21 @@ class SignalTimelineWindow(QMainWindow):
             return None
 
     def eventFilter(self, obj, event):
-        """Global event filter for handling delete, spacebar, and cut mode exit"""
+        """Global event filter for delete, spacebar, and cut-mode exit"""
         if event.type() == event.Type.KeyPress:
 
-            # Escape: exit cut mode
             if event.key() == Qt.Key_Escape:
                 if hasattr(self, 'cut_mode_btn') and self.cut_mode_btn.isChecked():
-                    self.cut_mode_btn.setChecked(False)  # triggers toggle_cut_mode(False)
+                    self.cut_mode_btn.setChecked(False)
                     return True
 
             if event.key() == Qt.Key_Space:
-                if hasattr(self, '_edit_playlist') and self._edit_playlist:
+                # Don't steal Space from text inputs
+                from PySide6.QtWidgets import QLineEdit, QTextEdit, QPlainTextEdit
+                focused = QApplication.focusWidget()
+                if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit)):
+                    return False
+                if getattr(self, '_edit_playback_active', False):
                     self.toggle_edit_playback()
                 else:
                     self.toggle_video_playback()
@@ -2231,18 +2251,22 @@ class SignalTimelineWindow(QMainWindow):
 
     @Slot(float, float)
     def on_clip_double_clicked(self, start_time, end_time):
-        """Handle double-click on edit clip - play it"""
-        # Play the clip (play from start_time for duration)
         self.current_time = start_time
         self.signal_scene.set_current_time(start_time)
-        
-        # Update time label
         minutes = int(start_time // 60)
         seconds = int(start_time % 60)
         self.time_label.setText(f"Clip: {minutes:02d}:{seconds:02d}")
         
-        # Play the clip
+        self._single_clip_playing = True
         self.play_video_clip(start_time, end_time)
+        
+        self.play_edit_btn.setText("⏸ Pause")
+        self.clip_timer.timeout.connect(self._on_single_clip_finished)
+
+    def _on_single_clip_finished(self):
+        """Clean up after a single-clip (double-click) playback ends."""
+        self._single_clip_playing = False
+        self.play_edit_btn.setText("▶ Play Edit")
 
     @Slot(float, float)
     def on_clip_added(self, start_time: float, end_time: float):
@@ -2603,6 +2627,16 @@ class SignalTimelineWindow(QMainWindow):
 
     def toggle_edit_playback(self):
         """Toggle play/pause for edit timeline"""
+        # Case: a single clip is mid-playback from a double-click.
+        # Use the flag instead of player state (which may lag behind).
+        if getattr(self, '_single_clip_playing', False):
+            self._single_clip_playing = False
+            self._active_player.pause()
+            if hasattr(self, 'clip_timer') and self.clip_timer.isActive():
+                self.clip_timer.stop()
+            self.play_edit_btn.setText("▶ Play Edit")
+            return
+
         if not getattr(self, '_edit_playback_active', False):
             # Nothing playing — start fresh
             self.play_edit_timeline()
@@ -2762,23 +2796,24 @@ class SignalTimelineWindow(QMainWindow):
     def play_video_clip(self, start_time, end_time):
         """Play a specific clip in the preview"""
         duration = end_time - start_time
-        self.statusBar().showMessage(f"Playing clip: {start_time:.1f}s for {duration:.1f}s", 3000)
-        
-        # Seek to start time
-        milliseconds = int(start_time * 1000)
-        self.video_player.setPosition(milliseconds)
-        
-        # Play the video
-        self.video_player.play()
+        self.statusBar().showMessage(
+            f"Playing clip: {start_time:.1f}s for {duration:.1f}s", 3000
+        )
+
+        player = self._active_player          # whichever is currently visible
+        player.setPosition(int(start_time * 1000))
+        player.play()
+
+        # Immediate UI update — the playbackStateChanged signal will agree
+        # a moment later, but this avoids the brief mismatch.
         self.play_btn.setText("⏸ Pause")
-        
-        # Set up timer to stop at end time
+
+        # Stop at clip end on the SAME player
         if hasattr(self, 'clip_timer'):
             self.clip_timer.stop()
-        
         self.clip_timer = QTimer()
         self.clip_timer.setSingleShot(True)
-        self.clip_timer.timeout.connect(lambda: self.video_player.pause())
+        self.clip_timer.timeout.connect(player.pause)   # signal will flip button back to ▶
         self.clip_timer.start(int(duration * 1000))
 
     @Slot()
