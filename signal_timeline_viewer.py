@@ -1828,22 +1828,6 @@ class SignalTimelineWindow(QMainWindow):
         layer_group.setLayout(layer_layout)
         layout.addWidget(layer_group)
         
-        # Zoom controls
-        zoom_group = QGroupBox("Zoom")
-        zoom_layout = QHBoxLayout()
-        
-        zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        zoom_slider.setMinimum(10)
-        zoom_slider.setMaximum(200)
-        zoom_slider.setValue(int(self.signal_scene.pixels_per_second))
-        zoom_slider.valueChanged.connect(self.on_zoom_changed)
-        
-        zoom_layout.addWidget(QLabel("Zoom:"))
-        zoom_layout.addWidget(zoom_slider)
-        
-        zoom_group.setLayout(zoom_layout)
-        layout.addWidget(zoom_group)
-
         # Merge threshold controls
         merge_group = QGroupBox("Merge Signals")
         merge_layout = QVBoxLayout()
@@ -2037,11 +2021,6 @@ class SignalTimelineWindow(QMainWindow):
         self.signal_scene.visible_layers[layer_name] = (state == Qt.CheckState.Checked.value)
         self.signal_scene.build_timeline()
     
-    @Slot(int)
-    def on_zoom_changed(self, value):
-        """Handle zoom slider changes"""
-        self.signal_scene.set_zoom(value)
-
     @Slot(int)
     def on_merge_changed(self, value):
         """Handle merge threshold slider change (debounced)"""
