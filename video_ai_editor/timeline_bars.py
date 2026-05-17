@@ -89,7 +89,7 @@ class DraggableTimelineBar(QGraphicsRectItem):
                 time = event.scenePos().x() / scene.pixels_per_second
 
                 # Optional: waveform click -> auto clip
-                if scene.waveform_visible and scene.waveform and scene.video_duration > 0:
+                if scene.visible_layers.get('waveform', False) and scene.waveform and scene.video_duration > 0:
                     sample_index = int(time * len(scene.waveform) / scene.video_duration)
                     if 0 <= sample_index < len(scene.waveform):
                         min_val, max_val = scene.waveform[sample_index]

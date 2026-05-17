@@ -1546,28 +1546,18 @@ class SignalTimelineView(QGraphicsView):
         self.centerOn(playhead_x + width * 0.15, center_y)
 
     def wheelEvent(self, event):
-        """Zoom with mouse wheel"""
+        """Zoom with mouse wheel, anchored at cursor position"""
         zoom_factor = 1.15
-        
-        # Store scene position before zoom
-        old_pos = self.mapToScene(event.position().toPoint())
-        
+
+        old_anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+
         if event.angleDelta().y() > 0:
             self.scale(zoom_factor, 1.0)
         else:
             self.scale(1.0 / zoom_factor, 1.0)
-        
-        # Get new position after zoom
-        new_pos = self.mapToScene(event.position().toPoint())
-        
-        # Calculate offset to keep mouse position stable
-        delta = new_pos - old_pos
-        
-        # Adjust view to maintain mouse position
-        self.horizontalScrollBar().setValue(
-            self.horizontalScrollBar().value() + int(delta.x())
-        )
-        
+
+        self.setTransformationAnchor(old_anchor)
         event.accept()
     
     def _item_is_bar(self, pos) -> bool:
