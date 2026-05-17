@@ -788,15 +788,19 @@ class EditTimelineScene(QGraphicsScene):
         self.clear()
         self.clip_items = []
 
+        # ── Calculate total width FIRST ──
+        current_x = 20
+        for start, end in self.clips:
+            duration = end - start
+            width = max(60, duration * self.pixels_per_second)
+            current_x += width + self.clip_spacing
+        total_width = max(1000, current_x + 20)
+        self.setSceneRect(0, 0, total_width, self.clip_height + 40)
+
         # Background
         self.addRect(self.sceneRect(), QPen(Qt.NoPen), QBrush(QColor(30, 30, 40)))
 
-        # Title
-        title = self.addText("Edit Timeline", QFont("Arial", 12, QFont.Weight.Bold))
-        title.setDefaultTextColor(Qt.white)
-        title.setPos(10, 5)
-
-        # Time ruler
+        # Time ruler — now uses correct sceneRect
         self.draw_time_ruler()
 
         # Clips
@@ -808,7 +812,7 @@ class EditTimelineScene(QGraphicsScene):
             width = max(60, duration * self.pixels_per_second)
 
             color = self.get_clip_color(i)
-            # FIX: Added missing 'i' parameter for index
+            # Added missing 'i' parameter for index
             clip_item = EditClipItem(start, end, y_pos, self.clip_height, color, i)
             clip_item.setRect(0, 0, width, self.clip_height)
             clip_item.setPos(current_x, y_pos)
@@ -831,11 +835,6 @@ class EditTimelineScene(QGraphicsScene):
         total_width = max(1000, current_x + 20)
         self.setSceneRect(0, 0, total_width, self.clip_height + 40)
 
-        # Clip count
-        count_text = self.addText(f"{len(self.clips)} clips", QFont("Arial", 10))
-        count_text.setDefaultTextColor(QColor(200, 200, 200))
-        count_text.setPos(total_width - 100, 5)
-
         # Restore active clip overlay if playing
         if self.active_clip_index >= 0 and self.active_clip_index < len(self.clip_items):
             self._active_overlay = None
@@ -843,22 +842,68 @@ class EditTimelineScene(QGraphicsScene):
             self._create_active_overlay()
 
     def draw_time_ruler(self):
-        """Draw a time ruler above the clips"""
+        """Draw time ruler showing accumulated edit duration (gap-aware)."""
         ruler_y = 30
-        self.addLine(20, ruler_y, self.sceneRect().width() - 20, ruler_y,
+        total_width = self.sceneRect().width()
+
+        # Ruler baseline
+        self.addLine(20, ruler_y, total_width - 20, ruler_y,
                     QPen(QColor(150, 150, 150), 1))
 
-        for i in range(0, int(self.sceneRect().width()), 10):
-            x = 20 + i
-            if i % 50 == 0:
-                self.addLine(x, ruler_y - 8, x, ruler_y, QPen(QColor(200, 200, 200), 1))
-                time_seconds = i / self.pixels_per_second
-                if time_seconds <= self.video_duration:
-                    time_text = self.addText(_fmt_time(time_seconds), QFont("Arial", 8))
-                    time_text.setDefaultTextColor(QColor(180, 180, 180))
-                    time_text.setPos(x - 10, ruler_y - 25)
+        if not self.clips:
+            return
+
+        # Build accumulated-time → pixel mapping at clip boundaries
+        waypoints = []  # (accumulated_seconds, pixel_x)
+        acc = 0.0
+        cx = 20.0
+        waypoints.append((0.0, cx))
+
+        for start, end in self.clips:
+            duration = end - start
+            width = max(60, duration * self.pixels_per_second)
+            acc += duration
+            cx += width
+            waypoints.append((acc, cx))
+            cx += self.clip_spacing
+
+        total_edit_time = acc
+        if total_edit_time <= 0:
+            return
+
+        # Interpolate: edit-seconds → pixel x
+        def time_to_x(t):
+            for i in range(len(waypoints) - 1):
+                t0, x0 = waypoints[i]
+                t1, x1 = waypoints[i + 1]
+                if t0 <= t <= t1 and t1 > t0:
+                    return x0 + (t - t0) / (t1 - t0) * (x1 - x0)
+            return waypoints[-1][1]
+
+        # Choose tick spacing based on total duration
+        if total_edit_time > 120:
+            minor, major = 5.0, 30.0
+        elif total_edit_time > 30:
+            minor, major = 1.0, 5.0
+        else:
+            minor, major = 0.5, 2.0
+
+        t = 0.0
+        while t <= total_edit_time + 0.01:
+            x = time_to_x(t)
+            is_major = (t % major) < 0.01 or t == 0
+
+            if is_major:
+                self.addLine(x, ruler_y - 8, x, ruler_y,
+                            QPen(QColor(200, 200, 200), 1))
+                label = self.addText(_fmt_time(t), QFont("Arial", 8))
+                label.setDefaultTextColor(QColor(180, 180, 180))
+                label.setPos(x - 10, ruler_y - 25)
             else:
-                self.addLine(x, ruler_y - 4, x, ruler_y, QPen(QColor(150, 150, 150), 1))
+                self.addLine(x, ruler_y - 4, x, ruler_y,
+                            QPen(QColor(150, 150, 150), 1))
+
+            t += minor
 
     def get_clip_color(self, index):
         """Stable color per clip based on (start, end) — survives reorders

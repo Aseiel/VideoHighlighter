@@ -1323,6 +1323,7 @@ class SignalTimelineWindow(QMainWindow):
         # Add edit controls
         edit_controls = self.create_edit_controls()
         edit_layout.addWidget(edit_controls)
+        self.update_edit_duration()
         
         splitter.addWidget(edit_widget)
         
