@@ -1,7 +1,6 @@
 import cv2
 import json
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -12,8 +11,8 @@ from PySide6.QtWidgets import (
     QApplication, QCompleter, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QLineEdit, QSpinBox,
     QGroupBox, QTextEdit, QFormLayout, QProgressBar, QCheckBox,
-    QComboBox, QTabWidget, QListWidget, QSlider,
-    QDialog, QDialogButtonBox, QAbstractItemView, 
+    QComboBox, QTabWidget, QListWidget, QSplitter,
+    QDialog, QDialogButtonBox, QAbstractItemView,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
@@ -358,24 +357,40 @@ class Worker(QThread):
         self.video_path = video_path
         self.gui_config = gui_config
         self._cancel_flag = threading.Event()
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # starts unpaused
         self._is_running = False
+
+    def pause(self):
+        self._pause_event.clear()
+
+    def resume(self):
+        self._pause_event.set()
+
+    def is_paused(self):
+        return not self._pause_event.is_set()
 
     def run(self):
         from pipeline import run_highlighter
         try:
             self._is_running = True
+
+            def pausing_progress(cur, tot, task, det):
+                self._pause_event.wait()  # blocks while paused
+                if not self._cancel_flag.is_set():
+                    self.progress.emit(cur, tot, task, det)
+
             # Check if single or multiple files
             if isinstance(self.video_path, list):
                 self.log.emit(f"🚀 Starting batch processing of {len(self.video_path)} videos...")
             else:
                 self.log.emit("🚀 Starting video highlighter pipeline...")
 
-
             output = run_highlighter(
                 self.video_path,
                 gui_config=self.gui_config,
                 log_fn=self.log.emit,
-                progress_fn=lambda cur, tot, task, det: self.progress.emit(cur, tot, task, det),
+                progress_fn=pausing_progress,
                 cancel_flag=self._cancel_flag
             )
 
@@ -528,7 +543,14 @@ class VideoHighlighterGUI(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Video Highlighter - Highlights & Subtitles")
-        self.setGeometry(200, 200, 1000, 800)
+        screen = QApplication.primaryScreen().availableGeometry()
+        w = min(1000, screen.width() - 20)
+        h = min(800, screen.height() - 20)
+        self.resize(w, h)
+        self.setMaximumHeight(screen.height())
+        self.move(screen.x() + (screen.width() - w) // 2, screen.y())
+
+        
         self.worker = None
 
         self.config_data = self.load_config()
@@ -683,17 +705,17 @@ class VideoHighlighterGUI(QWidget):
             if os.path.exists(first_path):
                 self.update_video_duration(first_path)
 
-        # --- Progress Section ---
-        progress_group = QGroupBox("Progress")
+        # --- Progress Section (hidden when idle) ---
+        self.progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout()
+        progress_layout.setContentsMargins(4, 4, 4, 4)
+        progress_layout.setSpacing(2)
 
-        progress_layout.addWidget(QLabel("Download"))
         self.download_progress_bar = QProgressBar()
         self.download_progress_bar.setVisible(False)
         self.download_progress_bar.setRange(0, 100)
         progress_layout.addWidget(self.download_progress_bar)
 
-        progress_layout.addWidget(QLabel("Processing"))
         self.process_progress_bar = QProgressBar()
         self.process_progress_bar.setVisible(False)
         self.process_progress_bar.setRange(0, 100)
@@ -703,8 +725,9 @@ class VideoHighlighterGUI(QWidget):
         self.task_label.setStyleSheet("color: #666; font-weight: bold;")
         progress_layout.addWidget(self.task_label)
 
-        progress_group.setLayout(progress_layout)
-        layout.addWidget(progress_group)
+        self.progress_group.setLayout(progress_layout)
+        self.progress_group.setVisible(False)
+        layout.addWidget(self.progress_group)
 
         # --- Tabs ---
         tabs = QTabWidget()
@@ -1272,7 +1295,9 @@ class VideoHighlighterGUI(QWidget):
         advanced_tab.setLayout(advanced_layout)
         tabs.addTab(advanced_tab, "Advanced")
 
-        layout.addWidget(tabs)
+        content_splitter = QSplitter(Qt.Vertical)
+        content_splitter.addWidget(tabs)
+        layout.addWidget(content_splitter)
 
         # --- Tab 4: LLM Chat ---
         llm_tab = QWidget()
@@ -1301,7 +1326,7 @@ class VideoHighlighterGUI(QWidget):
 
         self.run_btn = QPushButton("Run Highlighter")
         self.run_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
-        self.run_btn.clicked.connect(self.run_pipeline)
+        self.run_btn.clicked.connect(self.toggle_run)
 
         ctrl_layout.addWidget(self.cancel_btn)
         ctrl_layout.addWidget(self.keep_temp_chk)
@@ -1310,13 +1335,20 @@ class VideoHighlighterGUI(QWidget):
         ctrl_layout.addWidget(self.run_btn)
         layout.addLayout(ctrl_layout)
 
-        # --- Log view ---
-        layout.addWidget(QLabel("Log Output:"))
+        # --- Log view (inside splitter) ---
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
-        self.log_output.setMinimumHeight(100)
+        self.log_output.setMinimumHeight(80)
         self.log_output.setStyleSheet("QTextEdit { font-family: 'Courier New', monospace; font-size: 9pt; }")
-        layout.addWidget(self.log_output)
+        log_widget = QWidget()
+        log_layout = QVBoxLayout(log_widget)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(QLabel("Log Output:"))
+        log_layout.addWidget(self.log_output)
+        content_splitter.addWidget(log_widget)
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 1)
+        content_splitter.setSizes([h - 200, 150])  # give log ~150px
 
         self.setLayout(layout)
 
@@ -1409,6 +1441,7 @@ class VideoHighlighterGUI(QWidget):
         
         # Clear log and start
         self.log_output.clear()
+        self._show_progress(True)
         self.append_log("=== Starting Video Download ===")
         self.append_log(f"🌐 URL: {url}")
         self.append_log(f"📁 Save directory: {save_dir}")
@@ -1759,6 +1792,7 @@ class VideoHighlighterGUI(QWidget):
             self.task_label.setStyleSheet("color: #f44336; font-weight: bold;")
         
         self.download_cleanup()
+        self._show_progress(False)
 
     def auto_start_pipeline(self):
         """Automatically start pipeline processing after download"""
@@ -2436,6 +2470,9 @@ class VideoHighlighterGUI(QWidget):
         scrollbar = self.log_output.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def _show_progress(self, visible=True):
+        self.progress_group.setVisible(visible)
+
     def update_progress(self, current, total, task_name, details=""):
         # Decide which bar based on task_name or status
         if "download" in task_name.lower() or "extract" in task_name.lower():
@@ -2806,6 +2843,7 @@ class VideoHighlighterGUI(QWidget):
 
         # Clear previous logs
         self.log_output.clear()
+        self._show_progress(True)
         self.append_log("=== Starting Video Highlighter Pipeline ===")
         self.append_log(f"📁 Input: {video_paths}")
         self.append_log(f"📁 Output: {config.get('output_file', 'highlight.mp4')}")
@@ -2828,8 +2866,8 @@ class VideoHighlighterGUI(QWidget):
         self.process_progress_bar.setValue(0)
         self.download_progress_bar.setVisible(False)
         self.task_label.setText("🚀 Initializing...")
-        self.run_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(True)
+        self.run_btn.setText("⏸ Pause")
+        self.run_btn.setStyleSheet("QPushButton { background-color: #ff8c00; color: white; font-weight: bold; padding: 8px; }")
         
         # Disable form inputs during processing
         self.file_list.setEnabled(False)
@@ -2877,6 +2915,29 @@ class VideoHighlighterGUI(QWidget):
         # Nothing is running
         self.append_log("⚠️ Nothing to cancel - no active process")
 
+    def toggle_run(self):
+        """Run / Pause / Resume - single button"""
+        # Not running → start pipeline
+        if not self.worker or not self.worker._is_running:
+            self.run_pipeline()
+            return
+
+        # Running and not paused → pause
+        if not self.worker.is_paused():
+            self.worker.pause()
+            self.run_btn.setText("▶ Resume")
+            self.run_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px; }")
+            self.task_label.setText("⏸ Paused")
+            self.task_label.setStyleSheet("color: #ff8c00; font-weight: bold;")
+            self.append_log("⏸ Pipeline paused")
+            return
+
+        # Paused → resume
+        self.worker.resume()
+        self.run_btn.setText("⏸ Pause")
+        self.run_btn.setStyleSheet("QPushButton { background-color: #ff8c00; color: white; font-weight: bold; padding: 8px; }")
+        self.run_btn.setEnabled(True)  # keep enabled for pause
+
     def force_download_cleanup(self):
         """Force cleanup if download worker doesn't stop gracefully"""
         if hasattr(self, 'download_worker') and self.download_worker and self.download_worker.isRunning():
@@ -2892,6 +2953,7 @@ class VideoHighlighterGUI(QWidget):
             self.worker.terminate()
             self.worker.wait(3000)  # Wait up to 3 seconds
             self.pipeline_cleanup()
+            self._show_progress(False)
 
     def pipeline_done(self, output_file):
         """Handle pipeline completion"""
@@ -3046,6 +3108,8 @@ class VideoHighlighterGUI(QWidget):
 
         
         # Re-enable controls
+        self.run_btn.setText("Run Highlighter")
+        self.run_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setText("Cancel")

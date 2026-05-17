@@ -198,7 +198,12 @@ class SignalTimelineWindow(QMainWindow):
         debug_log(f"  - object_classes: {self.object_classes}")
         
         self.setWindowTitle(f"Signal Timeline - {os.path.basename(video_path)}")
-        self.setGeometry(100, 100, 1600, 1000)
+        screen = QApplication.primaryScreen().availableGeometry()
+        w = min(1600, screen.width() - 20)
+        h = min(1000, screen.height() - 20)
+        self.resize(w, h)
+        self.setMaximumHeight(screen.height())
+        self.move(screen.x() + (screen.width() - w) // 2, screen.y())
         
         # Make window semi-transparent
         self.setWindowOpacity(0.98)
@@ -1459,6 +1464,16 @@ class SignalTimelineWindow(QMainWindow):
                     if hasattr(self, 'edit_scene'):
                         self.edit_scene.remove_selected_clips()
                         return True
+
+            if event.key() == Qt.Key_Right:
+                step = 1.0 if not (event.modifiers() & Qt.ShiftModifier) else 5.0
+                self.on_time_clicked(self.current_time + step)
+                return True
+
+            if event.key() == Qt.Key_Left:
+                step = 1.0 if not (event.modifiers() & Qt.ShiftModifier) else 5.0
+                self.on_time_clicked(max(0, self.current_time - step))
+                return True
 
         return super().eventFilter(obj, event)
     
