@@ -209,14 +209,14 @@ class _OllamaBackend(_LLMBackend):
                 images: list[str] | None = None,
                 cancellation_token: Optional[CancellationToken] = None) -> str:
         import requests
-
-        formatted_prompt = prompt
+        import json as _json
+        import time as _time
 
         payload = {
             "model": self.model,
-            "prompt": formatted_prompt,
+            "prompt": prompt,
             "system": system,
-            "stream": stream_callback is not None,
+            "stream": True,  # Always stream internally so we can cancel + capture timing
             "options": {
                 "num_predict": max_tokens,
                 "num_ctx": 2048,
@@ -226,54 +226,92 @@ class _OllamaBackend(_LLMBackend):
                 "stop": STOP_SEQUENCES,
             },
         }
-
         if images:
             payload["images"] = images
 
-        if stream_callback:
-            full_text = []
-            with requests.post(f"{self.base_url}/api/generate", json=payload,
-                            stream=True, timeout=120) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    # Check cancellation on every token
-                    _check_cancel(cancellation_token)
-                    chunk = json.loads(line)
-                    token = chunk.get("response", "")
-                    if token:
-                        full_text.append(token)
-                        current_text = "".join(full_text)
-                        if _SELF_TALK_PATTERNS.search(current_text):
-                            break
+        # ── Phase 1: serialize JSON body ──
+        t0 = _time.perf_counter()
+        body = _json.dumps(payload).encode("utf-8")
+        t_serialize_ms = (_time.perf_counter() - t0) * 1000
+        body_kb = len(body) / 1024
+
+        # ── Phase 2: send request and stream response ──
+        full_text = []
+        final_chunk = None
+        t_send_start = _time.perf_counter()
+        t_headers_received = None
+        t_first_byte = None
+
+        with requests.post(
+            f"{self.base_url}/api/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            stream=True,
+            timeout=120,
+        ) as resp:
+            t_headers_received = _time.perf_counter()
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                if t_first_byte is None:
+                    t_first_byte = _time.perf_counter()
+                _check_cancel(cancellation_token)
+                chunk = _json.loads(line)
+                token = chunk.get("response", "")
+                if token:
+                    full_text.append(token)
+                    current_text = "".join(full_text)
+                    if _SELF_TALK_PATTERNS.search(current_text):
+                        break
+                    if stream_callback:
                         stream_callback(token)
-                    if chunk.get("done", False):
-                        break
-            raw = "".join(full_text)
-            return sanitize_response(raw)
-        else:
-            # Non-streaming: use streaming internally so we can cancel
-            full_text = []
-            payload["stream"] = True
-            with requests.post(f"{self.base_url}/api/generate", json=payload,
-                            stream=True, timeout=120) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line:
-                        continue
-                    _check_cancel(cancellation_token)
-                    chunk = json.loads(line)
-                    token = chunk.get("response", "")
-                    if token:
-                        full_text.append(token)
-                        current_text = "".join(full_text)
-                        if _SELF_TALK_PATTERNS.search(current_text):
-                            break
-                    if chunk.get("done", False):
-                        break
-            raw = "".join(full_text)
-            return sanitize_response(raw)
+                if chunk.get("done", False):
+                    final_chunk = chunk
+                    break
+
+        t_end = _time.perf_counter()
+
+        # ── Phase 3: report timing ──
+        if final_chunk:
+            headers_ms = ((t_headers_received - t_send_start) * 1000
+                        if t_headers_received else 0)
+            ttfb_ms    = ((t_first_byte - t_send_start) * 1000
+                        if t_first_byte else 0)
+            wall_ms    = (t_end - t_send_start) * 1000
+
+            load_ms = final_chunk.get("load_duration", 0)         / 1e6
+            pe_ms   = final_chunk.get("prompt_eval_duration", 0)  / 1e6
+            ev_ms   = final_chunk.get("eval_duration", 0)         / 1e6
+            total_ms = final_chunk.get("total_duration", 0)       / 1e6
+            pe_n = final_chunk.get("prompt_eval_count", 0)
+            ev_n = final_chunk.get("eval_count", 0)
+            pe_rate = (pe_n / (pe_ms / 1000)) if pe_ms > 0 else 0
+            ev_rate = (ev_n / (ev_ms / 1000)) if ev_ms > 0 else 0
+
+            # If ttfb > total, Ollama did unreported work (likely image preprocessing)
+            server_unaccounted_ms = ttfb_ms - total_ms
+
+            print(
+                f"   ⏱  body={body_kb:5.0f}KB  "
+                f"serialize={t_serialize_ms:5.0f}ms  "
+                f"headers_in={headers_ms:5.0f}ms  "
+                f"ttfb={ttfb_ms:5.0f}ms  "
+                f"wall={wall_ms:5.0f}ms"
+            )
+            print(
+                f"      ollama: load={load_ms:4.0f}ms  "
+                f"prompt_eval={pe_ms:5.0f}ms ({pe_n}t @ {pe_rate:5.1f}t/s)  "
+                f"eval={ev_ms:4.0f}ms ({ev_n}t @ {ev_rate:5.1f}t/s)  "
+                f"total={total_ms:5.0f}ms"
+            )
+            print(
+                f"      server_unaccounted (ttfb − total) = {server_unaccounted_ms:5.0f}ms  "
+                f"← likely image preprocess if >>0"
+            )
+
+        raw = "".join(full_text)
+        return sanitize_response(raw)
 
     def unload(self):
         self._loaded = False
