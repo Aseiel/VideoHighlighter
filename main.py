@@ -239,78 +239,53 @@ class DownloadWorker(QThread):
             self._is_running = True
             self.log.emit(f"🚀 Starting download from: {self.url}")
 
-            # Decide which downloader to use
-            if self.immediate_processing:
-                try:
-                    from downloader import download_videos_with_immediate_processing
-                    use_new_downloader = True
-                except ImportError:
-                    self.log.emit("⚠️ Immediate processing module not found → falling back to standard mode")
-                    use_new_downloader = False
-            else:
-                use_new_downloader = False
-
             def log_fn(message):
                 self.log.emit(message)
 
             def progress_fn(current, total, status, message):
                 self.progress.emit(current, total, status, message)
 
-            # Define processing callback wrapper
+            # Wraps the GUI-supplied callback. Emits video_processed so the GUI
+            # can react per file. Only used when immediate_processing is on
+            # AND a real callback was provided; otherwise the downloader runs
+            # without per-video processing.
             def wrapped_process_callback(filepath, metadata):
                 if self._cancelled:
                     return {'cancelled': True}
-
                 self.log.emit(f"🔧 Processing: {os.path.basename(filepath)}")
+                try:
+                    result = self.process_callback(filepath, metadata)
+                    self.log.emit(f"✅ Processed: {os.path.basename(filepath)}")
+                    self.video_processed.emit(filepath, result)
+                    return result
+                except Exception as e:
+                    self.log.emit(f"❌ Processing failed: {e}")
+                    return {'error': str(e)}
 
-                if self.process_callback:
-                    try:
-                        result = self.process_callback(filepath, metadata)
-                        self.log.emit(f"✅ Processed: {os.path.basename(filepath)}")
-                        # Emit signal so GUI can react (e.g. show highlight created)
-                        self.video_processed.emit(filepath, result)
-                        return result
-                    except Exception as e:
-                        self.log.emit(f"❌ Processing failed: {e}")
-                        return {'error': str(e)}
-                return {'status': 'processed'}
+            callback = (wrapped_process_callback
+                        if (self.immediate_processing and self.process_callback)
+                        else None)
 
-            if use_new_downloader:
-                results = download_videos_with_immediate_processing(
-                    search_url=self.url,
-                    save_dir=self.save_dir,
-                    pattern=self.pattern,
-                    log_fn=log_fn,
-                    progress_fn=progress_fn,
-                    process_callback=wrapped_process_callback,
-                    cancel_flag=self,                           # pass self → uses .is_set() / .is_cancelled()
-                    time_range=self.time_range,
-                    download_full=self.download_full,
-                    use_percentages=self.use_percentages,
-                    max_workers=self.max_concurrent
-                )
+            results = download_videos_with_immediate_processing(
+                search_url=self.url,
+                save_dir=self.save_dir,
+                pattern=self.pattern,
+                log_fn=log_fn,
+                progress_fn=progress_fn,
+                process_callback=callback,
+                cancel_flag=self,
+                time_range=self.time_range,
+                download_full=self.download_full,
+                use_percentages=self.use_percentages,
+                max_workers=self.max_concurrent,
+            )
 
-                # Collect downloaded files
-                downloaded_files = []
-                for result in results:
-                    if result.get('success') and result.get('filepath'):
-                        downloaded_files.append(result['filepath'])
-                        self._download_results.append(result)
-
-            else:
-                # Fallback / legacy path (adjust if you still have old function)
-                from downloader import download_videos  # assuming this exists
-                downloaded_files = download_videos(
-                    search_url=self.url,
-                    save_dir=self.save_dir,
-                    pattern=self.pattern,
-                    log_fn=log_fn,
-                    progress_fn=progress_fn,
-                    cancel_flag=self,
-                    time_range=self.time_range,
-                    download_full=self.download_full,
-                    use_percentages=self.use_percentages
-                )
+            # Collect downloaded files
+            downloaded_files = []
+            for result in results:
+                if result.get('success') and result.get('filepath'):
+                    downloaded_files.append(result['filepath'])
+                    self._download_results.append(result)
 
             if self._cancelled:
                 self.log.emit("⏹️ Download was cancelled")
