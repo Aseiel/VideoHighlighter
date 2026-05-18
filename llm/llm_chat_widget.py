@@ -144,39 +144,56 @@ class _VisualSearchWorker(QObject):
 
     @Slot()
     def run(self):
+        import time
+        from collections import defaultdict
+        
+        stage_totals = defaultdict(list)  # stage_name -> [duration_seconds, ...]
+        
         try:
             results = []
-            
-            # Calculate timestamps
             num_analyses = min(int(self.analyzer.duration / self.interval) + 1, self.max_seeks)
             timestamps = [self.start_time + i * self.interval for i in range(num_analyses)]
             
             for i, timestamp in enumerate(timestamps):
-                # Check cancellation token (works even mid-generation)
                 if self._cancel_token.is_cancelled:
                     break
-                    
                 if timestamp > self.analyzer.duration + 0.1:
                     break
                 
-                # Update progress
+                frame_t0 = time.perf_counter()
                 self.progress.emit(i + 1, len(timestamps), timestamp, f"Analyzing {timestamp:.1f}s")
                 
-                # Seek and analyze
+                # ── STAGE 1: seek + decode frame ──
+                t0 = time.perf_counter()
                 self.analyzer.current_time = timestamp
                 frame = self.analyzer.seek_to_time(timestamp)
+                t_seek = time.perf_counter() - t0
+                stage_totals['seek'].append(t_seek)
                 
                 if frame is None:
+                    print(f"[t={timestamp:6.1f}s] seek failed")
                     continue
                 
-                frame_b64 = self.analyzer.frame_to_base64(frame)
+                # Report frame size — useful to know how big the JPEG is
+                try:
+                    h, w = frame.shape[:2]
+                    frame_dims = f"{w}x{h}"
+                except Exception:
+                    frame_dims = "?"
                 
-                # Check cancellation again right before the expensive LLM call
-                # (image encode/decode in llama-cpp is ~20s and NOT interruptible)
+                # ── STAGE 2: encode to base64 JPEG ──
+                t0 = time.perf_counter()
+                frame_b64 = self.analyzer.frame_to_base64(frame)
+                t_encode = time.perf_counter() - t0
+                stage_totals['encode'].append(t_encode)
+                b64_kb = len(frame_b64) / 1024
+                
                 if self._cancel_token.is_cancelled:
                     break
                 
                 try:
+                    # ── STAGE 3: LLM query (vision encoder + generation) ──
+                    t0 = time.perf_counter()
                     response = self.analyzer.llm.query(
                         user_message=f"Does this frame contain a {self.target}? Answer with YES or NO, and briefly explain what you see.",
                         frame_base64=frame_b64,
@@ -185,10 +202,11 @@ class _VisualSearchWorker(QObject):
                         max_tokens=150,
                         cancellation_token=self._cancel_token,
                     )
+                    t_llm = time.perf_counter() - t0
+                    stage_totals['llm'].append(t_llm)
                     
-                    # Only check if the response starts with YES.
-                    # Do NOT substring-match the target word — the model
-                    # will mention it even when saying "NO, there is no X".
+                    # ── STAGE 4: post-processing + signal emit ──
+                    t0 = time.perf_counter()
                     response_stripped = response.strip().lower()
                     starts_with_yes = response_stripped.startswith("yes")
                     
@@ -198,18 +216,30 @@ class _VisualSearchWorker(QObject):
                         "analysis": response,
                         "contains_target": starts_with_yes,
                     }
-                    
                     results.append(result)
                     
-                    # Emit per-frame result so chat can show YES/NO for each frame
                     self.frame_analyzed.emit(
                         timestamp, result["timestamp_str"], response,
                         result["contains_target"]
                     )
+                    t_post = time.perf_counter() - t0
+                    stage_totals['post'].append(t_post)
+                    
+                    t_total = time.perf_counter() - frame_t0
+                    
+                    # Per-frame log line
+                    print(
+                        f"[t={timestamp:6.1f}s] {frame_dims} {b64_kb:5.0f}KB | "
+                        f"seek={t_seek*1000:6.0f}ms  "
+                        f"encode={t_encode*1000:5.0f}ms  "
+                        f"llm={t_llm*1000:6.0f}ms  "
+                        f"post={t_post*1000:4.0f}ms  "
+                        f"TOTAL={t_total*1000:6.0f}ms "
+                        f"({'YES' if starts_with_yes else 'no '})"
+                    )
                     
                     if result["contains_target"]:
                         self.found.emit(timestamp, result["timestamp_str"], response)
-                        # Stop scanning after first match if configured
                         if self.stop_on_first_match:
                             break
                 
@@ -218,11 +248,38 @@ class _VisualSearchWorker(QObject):
                 except Exception as e:
                     print(f"Error at {timestamp:.1f}s: {e}")
             
+            # ── Aggregate summary ──
+            if stage_totals['llm']:
+                print("\n" + "="*70)
+                print("PROFILE SUMMARY")
+                print("="*70)
+                print(f"{'stage':<10} {'count':>5} {'mean':>8} {'median':>8} {'min':>8} {'max':>8} {'total':>8}")
+                for stage in ('seek', 'encode', 'llm', 'post'):
+                    vals = stage_totals[stage]
+                    if not vals:
+                        continue
+                    vals_sorted = sorted(vals)
+                    mean_ms = (sum(vals)/len(vals)) * 1000
+                    median_ms = vals_sorted[len(vals)//2] * 1000
+                    min_ms = vals_sorted[0] * 1000
+                    max_ms = vals_sorted[-1] * 1000
+                    total_s = sum(vals)
+                    print(f"{stage:<10} {len(vals):>5} {mean_ms:>7.0f}ms {median_ms:>7.0f}ms "
+                        f"{min_ms:>7.0f}ms {max_ms:>7.0f}ms {total_s:>7.1f}s")
+                
+                # What fraction of time is on the GPU vs everywhere else
+                llm_total = sum(stage_totals['llm'])
+                other_total = sum(sum(stage_totals[s]) for s in ('seek', 'encode', 'post'))
+                grand_total = llm_total + other_total
+                if grand_total > 0:
+                    print(f"\nLLM stage : {llm_total:.1f}s ({llm_total/grand_total*100:.0f}%)")
+                    print(f"Other CPU : {other_total:.1f}s ({other_total/grand_total*100:.0f}%)")
+                print("="*70 + "\n")
+            
             self.finished.emit(results)
             
         except Exception as e:
             self.error.emit(str(e))
-
 
 # Keywords that indicate the user wants visual/frame analysis
 _VISION_KEYWORDS = (
