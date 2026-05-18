@@ -635,50 +635,6 @@ def get_duration_with_browser_automation(url: str, log_fn: Callable = print) -> 
     log_fn(" 💡 Tip: If this keeps failing, the site may require Playwright or yt-dlp is more reliable here.")
     return None
 
-def get_duration_by_downloading_segment(url: str, log_fn: Callable = print) -> Optional[float]:
-    """
-    Download a small segment to force extractor to resolve info; parse duration from JSON.
-    """
-    try:
-        log_fn("📥 Downloading small segment to get duration...")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_template = os.path.join(tmpdir, "temp_segment.%(ext)s")
-            cmd = [
-                "yt-dlp",
-                "-o", output_template,
-                "--download-sections", "*0-2",
-                "--dump-single-json",
-                "--no-warnings",
-                "--no-playlist",
-                "--force-ipv4",
-                "--socket-timeout", "60",
-                "--retries", "3",
-                "--fragment-retries", "5",
-                url
-            ]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=90,
-                check=False
-            )
-            if result.returncode == 0 and (result.stdout or "").strip():
-                try:
-                    info = json.loads(result.stdout.strip())
-                except Exception:
-                    info = None
-                d = _parse_yt_dlp_json_duration(info)
-                if d and d > 0:
-                    log_fn(f"✅ Got duration from segment JSON: {d:.1f}s")
-                    return d
-            log_fn("⚠️ Segment download didn't provide duration")
-    except subprocess.TimeoutExpired:
-        log_fn("⏰ Segment download timed out")
-    except Exception as e:
-        log_fn(f"⚠️ Segment download failed: {str(e)[:100]}...")
-    return None
-
 # -----------------------------
 # yt-dlp duration detection
 # -----------------------------
@@ -861,13 +817,7 @@ def get_video_duration_advanced(url: str, log_fn: Callable = print, skip_cache: 
                     return d
     except Exception as e:
         log_fn(f"⚠️ yt-dlp duration extraction failed: {e}")
-   
-    log_fn("🔍 Trying segment download...")
-    d = get_duration_by_downloading_segment(url, log_fn)
-    if d and d > 0:
-        _duration_method_cache["last_successful"] = {"type": "segment", "name": "segment download", "domain": current_domain}
-        return d
-   
+     
     log_fn("🔍 Trying browser automation...")
     d = get_duration_with_browser_automation(url, log_fn)
     if d and d > 0:
@@ -1857,11 +1807,7 @@ def download_video(
             
             # Get duration
             duration = get_video_duration_advanced(url, log_fn)
-            
-            if is_suspicious_duration(duration):
-                log_fn("⚠️ Duration looks wrong (too small). Trying segment download...")
-                duration = get_duration_by_downloading_segment(url, log_fn)
-            
+                       
             if is_suspicious_duration(duration):
                 log_fn("🌐 Trying browser automation...")
                 duration = get_duration_with_browser_automation(url, log_fn)
