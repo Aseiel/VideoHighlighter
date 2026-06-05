@@ -44,7 +44,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
     QGraphicsRectItem, QGraphicsTextItem, QGraphicsEllipseItem,
-    QCheckBox, QLabel, QGroupBox, QComboBox, QSlider, QGraphicsItem,
+    QCheckBox, QLabel, QGroupBox, QComboBox, QSlider, QGraphicsItem, QMenu, QInputDialog,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -348,6 +348,8 @@ class OverlayScene(QGraphicsScene):
 
 class OverlayView(QGraphicsView):
     """View that keeps video aspect ratio and supports smooth resize."""
+    identity_context_requested = Signal(object, object)   # (identity_id, global_pos)
+
 
     def __init__(self, scene: OverlayScene, parent=None):
         super().__init__(scene, parent)
@@ -372,7 +374,20 @@ class OverlayView(QGraphicsView):
         scene = self.scene()
         if scene and scene.sceneRect().width() > 0:
             self.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-
+        
+    def contextMenuEvent(self, event):
+        scene_pos = self.mapToScene(event.pos())
+        hit = None
+        for item in self.scene().items():
+            iid = item.data(0)
+            if iid and item.isVisible() and item.sceneBoundingRect().contains(scene_pos):
+                if hit is None or item.zValue() >= hit.zValue():
+                    hit = item
+        if hit is not None:
+            self.identity_context_requested.emit(hit.data(0), event.globalPos())
+            event.accept()
+            return
+        super().contextMenuEvent(event)
 
 # ──────────────────────────────────────────────────────────────────
 # RealtimeOverlayPreview — drop-in replacement for QVideoWidget
@@ -388,6 +403,7 @@ class RealtimeOverlayPreview(QWidget):
 
     # Emitted when overlay mode changes
     overlay_toggled = Signal(bool)
+    avoid_person_requested = Signal(str)
 
     def __init__(
         self,
@@ -403,6 +419,7 @@ class RealtimeOverlayPreview(QWidget):
         self._detection_count = 0
 
         self._init_ui()
+        self._view.identity_context_requested.connect(self._on_identity_context)
         self._init_player()
         self._load_detections()
         self._face_bank = None
@@ -563,6 +580,22 @@ class RealtimeOverlayPreview(QWidget):
                 self._live_face.set_enabled(enabled)
                 if not enabled and self._live_overlay is not None:
                     self._live_overlay.clear()
+
+    def _on_identity_context(self, identity_id, global_pos):
+        menu = QMenu(self)
+        a_name  = menu.addAction("✏️  Name this person…")
+        a_avoid = menu.addAction("🚫  Avoid this person")
+        chosen = menu.exec(global_pos)
+
+        if chosen == a_name and self._face_bank is not None:
+            ident = self._face_bank.get_identity(identity_id)
+            prefill = ident["name"] if (ident and ident["name"]) else ""
+            name, ok = QInputDialog.getText(self, "Name person", "Name:", text=prefill)
+            if ok and name.strip():
+                self._face_bank.name_identity(identity_id, name.strip())
+                self._face_bank.save()
+        elif chosen == a_avoid:
+            self.avoid_person_requested.emit(identity_id)
 
     def shutdown_live_face(self):
         """Stop the worker thread cleanly. Call from the window's closeEvent."""
