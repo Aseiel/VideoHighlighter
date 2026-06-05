@@ -9,12 +9,13 @@ Video Downloader Module for fetching videos from websites.
 Note: If Selenium still doesn't work, consider using Playwright as alternative (not implemented here).
 """
 
+import json
 import os
 import re
-import subprocess
-import json
-import tempfile
 import requests
+import subprocess
+import tempfile
+import threading
 from bs4 import BeautifulSoup
 from typing import List, Optional, Callable, Tuple, Any, Dict
 from pathlib import Path
@@ -678,13 +679,13 @@ def _parse_yt_dlp_json_duration(obj: Any) -> Optional[float]:
                     pass
     return None
 
-# Global cache for successful duration extraction methods
-_duration_method_cache = {"last_successful": None, "domain": None}
+_duration_method_cache: Dict[str, Dict[str, Any]] = {}  # domain -> method info
+_duration_method_cache_lock = threading.Lock()
 
 def reset_duration_method_cache():
-    """Reset the cached duration extraction method. Useful when switching domains or if cached method stops working."""
     global _duration_method_cache
-    _duration_method_cache = {"last_successful": None, "domain": None}
+    with _duration_method_cache_lock:
+        _duration_method_cache = {}
 
 def get_video_duration_advanced(url: str, log_fn: Callable = print, skip_cache: bool = False) -> Optional[float]:
     """
@@ -699,9 +700,12 @@ def get_video_duration_advanced(url: str, log_fn: Callable = print, skip_cache: 
     """
     current_domain = extract_domain(url)
    
-    # Try cached method first if it's from the same domain
-    if not skip_cache and _duration_method_cache["last_successful"] and _duration_method_cache["domain"] == current_domain:
-        cached_method = _duration_method_cache["last_successful"]
+    # Try cached method first if we have one for this domain
+    cached_method = None
+    if not skip_cache:
+        with _duration_method_cache_lock:
+            cached_method = _duration_method_cache.get(current_domain)
+    if cached_method:
         log_fn(f"🚀 Trying cached method first: {cached_method['name']}")
        
         try:
@@ -766,7 +770,8 @@ def get_video_duration_advanced(url: str, log_fn: Callable = print, skip_cache: 
     log_fn("🔍 Trying manifest duration...")
     d = try_duration_from_manifest(url, log_fn)
     if d and d > 0:
-        _duration_method_cache["last_successful"] = {"type": "manifest", "name": "manifest", "domain": current_domain}
+        with _duration_method_cache_lock:
+            _duration_method_cache[current_domain] = {"type": "...", "name": "..."}
         return d
    
     log_fn("🔍 Trying HTML/JS extraction...")
@@ -776,7 +781,8 @@ def get_video_duration_advanced(url: str, log_fn: Callable = print, skip_cache: 
         if resp.status_code == 200 and resp.text:
             d = parse_duration_comprehensive(resp.text, url, log_fn)
             if d and d >= 30:
-                _duration_method_cache["last_successful"] = {"type": "html_js", "name": "html_js", "domain": current_domain}
+                with _duration_method_cache_lock:
+                    _duration_method_cache[current_domain] = {"type": "...", "name": "..."}
                 return d
     except Exception as e:
         log_fn(f"⚠️ HTML fetch failed: {e}")
@@ -791,7 +797,8 @@ def get_video_duration_advanced(url: str, log_fn: Callable = print, skip_cache: 
                 d = float(result.stdout.strip())
                 if 0 < d <= 86400:
                     log_fn(f"✅ Got duration from yt-dlp print: {d:.1f}s")
-                    _duration_method_cache["last_successful"] = {"type": "yt_dlp", "name": "print duration", "cmd": cmd_print[:-1], "domain": current_domain}
+                    with _duration_method_cache_lock:
+                        _duration_method_cache[current_domain] = {"type": "...", "name": "..."}
                     return d
             except Exception:
                 pass
@@ -813,7 +820,8 @@ def get_video_duration_advanced(url: str, log_fn: Callable = print, skip_cache: 
                 d = _parse_yt_dlp_json_duration(data)
                 if d and 0 < d <= 86400:
                     log_fn(f"✅ Got duration from yt-dlp JSON: {d:.1f}s")
-                    _duration_method_cache["last_successful"] = {"type": "yt_dlp", "name": "dump json", "cmd": cmd_json[:-1], "domain": current_domain}
+                    with _duration_method_cache_lock:
+                        _duration_method_cache[current_domain] = {"type": "...", "name": "..."}
                     return d
     except Exception as e:
         log_fn(f"⚠️ yt-dlp duration extraction failed: {e}")
@@ -821,7 +829,8 @@ def get_video_duration_advanced(url: str, log_fn: Callable = print, skip_cache: 
     log_fn("🔍 Trying browser automation...")
     d = get_duration_with_browser_automation(url, log_fn)
     if d and d > 0:
-        _duration_method_cache["last_successful"] = {"type": "browser", "name": "browser automation", "domain": current_domain}
+        with _duration_method_cache_lock:
+            _duration_method_cache[current_domain] = {"type": "...", "name": "..."}
         return d
    
     log_fn("❌ All duration extraction methods failed")
@@ -1816,11 +1825,11 @@ def download_video(
                 log_fn("📡 Trying Playwright automation...")
                 duration = get_duration_with_playwright_automation(url, log_fn)
                 if duration and duration > 0:
-                    _duration_method_cache["last_successful"] = {
-                        "type": "playwright",
-                        "name": "Playwright browser duration",
-                        "domain": extract_domain(url)
-                    }
+                    with _duration_method_cache_lock:
+                        _duration_method_cache[extract_domain(url)] = {
+                            "type": "playwright",
+                            "name": "Playwright browser duration",
+                        }
                     log_fn(f"  ✓ Playwright gave us duration: {duration:.1f}s")
             
             metadata["duration"] = duration
@@ -1842,42 +1851,8 @@ def download_video(
                     log_fn(f"   ({int(start_pct)}% to {int(end_pct)}% = {end_seconds - start_seconds:.1f}s)")
                     time_range = (start_seconds, end_seconds)
                     use_percentages = False
-        
-        # 4. Yandex preview special extraction
-        extracted_source = extract_yandex_preview_source(url, log_fn)
-        if extracted_source:
-            t0 = time.time()
-            success, filename = download_from_extracted_source(extracted_source, output_template, log_fn)
-            metadata["download_time"] = time.time() - t0
-            if success:
-                if filename and os.path.exists(filename):
-                    size_mb = os.path.getsize(filename) / (1024 * 1024)
-                    metadata["file_size"] = size_mb
-                    apply_ffprobe_duration(filename)
-                    log_fn(f"✅ Downloaded from Yandex source: {os.path.basename(filename)}")
-                    log_fn(f"📊 File size: {size_mb:.2f} MB")
-                    log_fn(f"⏱️ Download time: {metadata['download_time']:.1f} seconds")
-                    if size_mb < 0.1:
-                        log_fn("⚠️ Warning: File is very small, might be corrupted")
-                    if process_callback:
-                        log_fn("🔄 Processing video immediately...")
-                        try:
-                            process_result = process_callback(filename, metadata)
-                            if process_result:
-                                log_fn("✅ Video processed successfully")
-                                metadata["processed"] = True
-                                metadata["process_result"] = process_result
-                            else:
-                                log_fn("⚠️ Processing returned no result")
-                                metadata["processed"] = False
-                        except Exception as e:
-                            log_fn(f"❌ Processing failed: {e}")
-                            metadata["processed"] = False
-                            metadata["process_error"] = str(e)
-                    return True, filename, metadata
-            log_fn("⚠️ Yandex direct download failed, falling back to standard yt-dlp...")
-        
-        # 5. Build yt-dlp download command
+              
+        # 4. Build yt-dlp download command
         cmd = [
             "yt-dlp",
             "-o", output_template,
@@ -1940,7 +1915,7 @@ def download_video(
                         metadata["processed"] = False
                 return True, existing, metadata
         
-        # Handle errors
+        # Handle errors with two-tier fallback
         if result.returncode != 0:
             log_fn(f"❌ Download failed with exit code: {result.returncode}")
             err = (result.stderr or "").lower()
@@ -1954,25 +1929,65 @@ def download_video(
                 for line in result.stderr.strip().split("\n")[:3]:
                     if line.strip():
                         log_fn(f"   {line.strip()}")
-            
-            # Fallback download
-            log_fn("🔄 Trying fallback download method...")
+
+            # Fallback 1: simpler yt-dlp format
+            log_fn("🔄 Fallback 1: simpler yt-dlp format...")
             fallback_cmd = [
                 "yt-dlp",
                 "-o", output_template,
                 "--no-playlist",
                 "--format", "best[height<=720]/best",
                 "--force-ipv4",
-                url
+                url,
             ]
             if skip_existing:
                 fallback_cmd.extend(["--no-overwrites", "--ignore-errors"])
             fr = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=300, check=False)
-            if fr.returncode != 0:
-                log_fn("❌ Fallback also failed")
-                return False, None, metadata
-            log_fn("✅ Fallback download succeeded!")
-            result = fr
+
+            if fr.returncode == 0:
+                log_fn("✅ Fallback 1 succeeded!")
+                result = fr
+            else:
+                # Fallback 2: browser extracts URL, yt-dlp/ffmpeg downloads it
+                log_fn("🔄 Fallback 2: browser-based URL extraction...")
+                extracted = extract_video_source_via_browser(url, log_fn)
+                if not extracted:
+                    log_fn("❌ Browser extraction found no video source")
+                    return False, None, metadata
+
+                t_fb = time.time()
+                success_fb, filename_fb = download_from_extracted_source(
+                    extracted, output_template, log_fn,
+                    time_range=time_range,
+                    download_full=download_full,
+                )
+                if not success_fb or not filename_fb or not os.path.exists(filename_fb):
+                    log_fn("❌ Browser-extracted source failed to download")
+                    return False, None, metadata
+
+                size_mb = os.path.getsize(filename_fb) / (1024 * 1024)
+                metadata["file_size"] = size_mb
+                metadata["download_time"] = time.time() - t_fb
+                metadata["fallback_used"] = "browser_extraction"
+                apply_ffprobe_duration(filename_fb)
+                log_fn(f"✅ Fallback 2 succeeded: {os.path.basename(filename_fb)}")
+                log_fn(f"📊 File size: {size_mb:.2f} MB")
+
+                if process_callback:
+                    log_fn("🔄 Processing video immediately...")
+                    try:
+                        process_result = process_callback(filename_fb, metadata)
+                        if process_result:
+                            metadata["processed"] = True
+                            metadata["process_result"] = process_result
+                        else:
+                            metadata["processed"] = False
+                    except Exception as e:
+                        log_fn(f"❌ Processing failed: {e}")
+                        metadata["processed"] = False
+                        metadata["process_error"] = str(e)
+
+                return True, filename_fb, metadata
         
         # Find output file
         filename = None
@@ -2313,15 +2328,14 @@ def extract_yandex_video_url(url: str, log_fn: Callable = print) -> Optional[str
     
     return None
 
-def extract_yandex_preview_source(url: str, log_fn: Callable = print) -> Optional[str]:
+def extract_video_source_via_browser(url: str, log_fn: Callable = print) -> Optional[str]:
     """
-    Extract the actual video source URL from a Yandex preview page.
-    Enhanced to handle Yandex's current page structure.
+    Generic Playwright-based video URL extractor. Works for any site:
+    rotates user agents, clicks play buttons, scans shadow DOM, captures
+    network requests, and returns the best media URL found (prefers .mp4).
+    Returns None if nothing usable is found.
     """
-    if "/video/preview/" not in url and "/video/touch/preview/" not in url:
-        return None
-    
-    log_fn("🔍 Detected Yandex preview link → trying enhanced Playwright extraction...")
+    log_fn("🔍 Trying browser-based video URL extraction...")
     
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -2404,7 +2418,7 @@ def extract_yandex_preview_source(url: str, log_fn: Callable = print) -> Optiona
                 
                 page.on("request", handle_request)
                 
-                log_fn(f"  • Loading Yandex preview with UA: {ua[:50]}...")
+                log_fn(f"  • Loading preview with UA: {ua[:50]}...")
                 
                 try:
                     # Navigate and wait for content
@@ -2591,12 +2605,41 @@ def extract_yandex_preview_source(url: str, log_fn: Callable = print) -> Optiona
                         log_fn(f"  • After filtering: {len(filtered_urls)} actual video URLs")
                         
                         if filtered_urls:
-                            # Sort by preference: .mp4 first, then .m3u8
-                            filtered_urls.sort(key=lambda x: (
-                                0 if '.mp4' in x.lower() else 
-                                1 if '.m3u8' in x.lower() else 2
-                            ))
-                            
+                            def _url_priority(u: str) -> tuple:
+                                u_lower = u.lower()
+                                parsed_u = urllib.parse.urlparse(u)
+                                path = parsed_u.path.lower()
+
+                                # Format: direct file extension in path beats query-string-only
+                                if path.endswith(".mp4") or ".mp4/" in path:
+                                    fmt = 0
+                                elif path.endswith(".m3u8") or ".m3u8/" in path:
+                                    fmt = 1
+                                elif ".mp4" in u_lower:
+                                    fmt = 2
+                                elif ".m3u8" in u_lower:
+                                    fmt = 3
+                                else:
+                                    fmt = 99
+
+                                # Penalize auth-token / hotlink-protected URLs
+                                auth = 0
+                                if path.count(",") >= 2:
+                                    auth += 10   # comma-separated key/limit/data segments
+                                if any(k in u_lower for k in ["key=", "token=", "sig=", "auth=", "referer=none"]):
+                                    auth += 5
+
+                                # Prefer shorter URLs (more canonical)
+                                length_bucket = len(u) // 100
+
+                                return (fmt, auth, length_bucket)
+
+                            filtered_urls.sort(key=_url_priority)
+
+                            log_fn(f"  • Top 3 candidates by priority:")
+                            for i, u in enumerate(filtered_urls[:3], 1):
+                                log_fn(f"      {i}. {u[:120]}...")
+
                             best_url = filtered_urls[0]
                             log_fn(f"  ✓ Best video URL from network: {best_url[:120]}...")
                             return best_url
@@ -2643,6 +2686,12 @@ def extract_yandex_preview_source(url: str, log_fn: Callable = print) -> Optiona
     except Exception as e:
         log_fn(f"  ✗ Playwright extraction failed: {str(e)[:120]}")
         return None
+
+def extract_yandex_preview_source(url: str, log_fn: Callable = print) -> Optional[str]:
+    """Yandex-specific guard around the generic extractor."""
+    if "/video/preview/" not in url and "/video/touch/preview/" not in url:
+        return None
+    return extract_video_source_via_browser(url, log_fn) 
 
 def _try_extract_video_src(driver, log_fn, context):
     try:
@@ -2704,9 +2753,15 @@ def _capture_yandex_network_media(driver, log_fn):
     log_fn(f"    ✓ Best media URL: {best[:140]}...")
     return best
 
-def download_from_extracted_source(source_url: str, output_template: str, log_fn: Callable = print) -> Tuple[bool, Optional[str]]:
-    log_fn(f"📥 Downloading extracted Yandex source: {source_url[:100]}...")
-    
+def download_from_extracted_source(
+    source_url: str,
+    output_template: str,
+    log_fn: Callable = print,
+    time_range: Optional[Tuple[float, float]] = None,
+    download_full: bool = True,
+) -> Tuple[bool, Optional[str]]:
+    log_fn(f"📥 Downloading extracted source: {source_url[:100]}...")
+
     cmd = [
         "yt-dlp",
         "-o", output_template,
@@ -2715,9 +2770,19 @@ def download_from_extracted_source(source_url: str, output_template: str, log_fn
         "--force-ipv4",
         "--socket-timeout", "90",
         "--retries", "6",
-        source_url
     ]
-    
+
+    # Apply section cut if a range was requested
+    if time_range and not download_full:
+        start_time, end_time = time_range
+        if end_time > start_time:
+            section = f"*{start_time:.1f}-{end_time:.1f}"
+            cmd.extend(["--download-sections", section])
+            log_fn(f"⏱️ Downloading section: {start_time:.1f}s to {end_time:.1f}s "
+                   f"({end_time - start_time:.1f}s)")
+
+    cmd.append(source_url)
+
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=400, check=True)
         filename = None
@@ -2730,10 +2795,27 @@ def download_from_extracted_source(source_url: str, output_template: str, log_fn
             return True, filename
     except Exception as e:
         log_fn(f"⚠ yt-dlp direct failed: {e}")
-    
+
+    # ffmpeg fallback for HLS
     if ".m3u8" in source_url.lower():
-        final_path = output_template.replace(".%(ext)s", ".mp4") if ".%(ext)s" in output_template else output_template + ".mp4"
-        cmd = ["ffmpeg", "-i", source_url, "-c", "copy", final_path]
+        final_path = (
+            output_template.replace(".%(ext)s", ".mp4")
+            if ".%(ext)s" in output_template
+            else output_template + ".mp4"
+        )
+        cmd = ["ffmpeg", "-y"]
+        # ffmpeg time-range cut (much faster than downloading full then trimming)
+        if time_range and not download_full:
+            start_time, end_time = time_range
+            if end_time > start_time:
+                cmd.extend(["-ss", f"{start_time:.1f}"])
+                cmd.extend(["-i", source_url])
+                cmd.extend(["-t", f"{end_time - start_time:.1f}"])
+            else:
+                cmd.extend(["-i", source_url])
+        else:
+            cmd.extend(["-i", source_url])
+        cmd.extend(["-c", "copy", final_path])
         try:
             subprocess.run(cmd, check=True, timeout=400)
             if os.path.exists(final_path):
@@ -2741,7 +2823,7 @@ def download_from_extracted_source(source_url: str, output_template: str, log_fn
                 return True, final_path
         except Exception as e:
             log_fn(f"⚠ ffmpeg failed: {e}")
-    
+
     return False, None
 
 if __name__ == "__main__":
