@@ -33,6 +33,9 @@ import os
 import base64
 from typing import Optional
 from collections import defaultdict
+from video_ai_editor.face_identity import FaceIdentityBank
+from video_ai_editor.live_face import LiveFaceController, LiveFaceOverlay
+
 
 from PySide6.QtCore import Qt, QRectF, QTimer, QUrl, QPointF, Signal, QSizeF
 from PySide6.QtGui import (
@@ -402,6 +405,9 @@ class RealtimeOverlayPreview(QWidget):
         self._init_ui()
         self._init_player()
         self._load_detections()
+        self._face_bank = None
+        self._live_face = None
+        self._live_overlay = None       
 
     @property
     def player(self) -> QMediaPlayer:
@@ -539,6 +545,29 @@ class RealtimeOverlayPreview(QWidget):
     def set_overlay_visible(self, visible: bool):
         """Programmatically toggle overlay."""
         self._overlay_cb.setChecked(visible)
+
+    def set_live_face_enabled(self, enabled: bool):
+            """Toggle TRUE real-time face recognition on the playing frame."""
+            if enabled and self._live_face is None:
+                # lazy init — only loads InsightFace the first time it's switched on
+                if self._face_bank is None:
+                    self._face_bank = FaceIdentityBank(db_path="./cache/face_db.json")
+                self._live_overlay = LiveFaceOverlay(self._scene)
+                self._live_face = LiveFaceController(
+                    bank=self._face_bank,
+                    video_sink=self._scene.video_item.videoSink(),   # the frame tap
+                )
+                self._live_face.results_ready.connect(self._live_overlay.update_boxes)
+
+            if self._live_face is not None:
+                self._live_face.set_enabled(enabled)
+                if not enabled and self._live_overlay is not None:
+                    self._live_overlay.clear()
+
+    def shutdown_live_face(self):
+        """Stop the worker thread cleanly. Call from the window's closeEvent."""
+        if self._live_face is not None:
+            self._live_face.shutdown()
 
     def capture_frame_base64(self, max_dim: int = 1024) -> str | None:
         """

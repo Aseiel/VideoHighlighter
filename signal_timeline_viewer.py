@@ -236,31 +236,39 @@ class SignalTimelineWindow(QMainWindow):
         self.preview_window = TimelineWithPreview.launch_preview(self, chat_widget=chat)
 
     def closeEvent(self, event):
-        """Close preview when timeline closes"""
-        # Stop all players to prevent audio playing in background
-        try:
-            if hasattr(self, '_active_player'):
-                self._active_player.stop()
-            if hasattr(self, 'video_player'):
-                self.video_player.stop()
-            if hasattr(self, 'realtime_preview') and self.realtime_preview:
-                self.realtime_preview.player.stop()
-        except Exception:
-            pass
+            """Close preview when timeline closes"""
+            # ── stop the true-live face worker thread cleanly ──
+            # Do this FIRST, before the player/sink it taps is stopped.
+            try:
+                if hasattr(self, 'realtime_preview') and self.realtime_preview:
+                    self.realtime_preview.shutdown_live_face()
+            except Exception:
+                pass
 
-        # Stop edit playback timers
-        try:
-            if hasattr(self, '_edit_clip_timer'):
-                self._edit_clip_timer.stop()
-            if hasattr(self, '_edit_progress_timer'):
-                self._edit_progress_timer.stop()
-        except Exception:
-            pass
+            # Stop all players to prevent audio playing in background
+            try:
+                if hasattr(self, '_active_player'):
+                    self._active_player.stop()
+                if hasattr(self, 'video_player'):
+                    self.video_player.stop()
+                if hasattr(self, 'realtime_preview') and self.realtime_preview:
+                    self.realtime_preview.player.stop()
+            except Exception:
+                pass
 
-        if hasattr(self, 'preview_window') and self.preview_window:
-            self.preview_window.close()
+            # Stop edit playback timers
+            try:
+                if hasattr(self, '_edit_clip_timer'):
+                    self._edit_clip_timer.stop()
+                if hasattr(self, '_edit_progress_timer'):
+                    self._edit_progress_timer.stop()
+            except Exception:
+                pass
 
-        super().closeEvent(event)
+            if hasattr(self, 'preview_window') and self.preview_window:
+                self.preview_window.close()
+
+            super().closeEvent(event)
 
     def _on_bbox_toggled(self, label: str):
         """Visual feedback when overlay is toggled."""
@@ -304,6 +312,7 @@ class SignalTimelineWindow(QMainWindow):
         self.overlay_mode_combo = QComboBox()
         self.overlay_mode_combo.addItems([
             "Off",
+            "Live (cache)",
             "Live (real-time)",
             "Precomp (swap video)",
         ])
@@ -560,12 +569,30 @@ class SignalTimelineWindow(QMainWindow):
             # Refit view after video dimensions are known
             QTimer.singleShot(200, self.realtime_preview._view._fit_video)
 
+            # only the "real-time" variant runs face recognition
+            is_realtime = ("real-time" in text)
+            self.realtime_preview.set_live_face_enabled(is_realtime)
+
+            if is_realtime:
+                self.statusBar().showMessage(
+                    "🟢 Live (real-time) — recognising faces on the current frame", 3000
+                )
+            else:
+                count = self.realtime_preview.get_detection_count()
+                self.statusBar().showMessage(
+                    f"🎯 Live (cache) — {count} detections from cache", 3000
+                )
+
             count = self.realtime_preview.get_detection_count()
             self.statusBar().showMessage(
                 f"🎯 Live overlay mode — {count} detections from cache", 3000
             )
             
         elif "Precomp" in text:
+            # leaving Live → stop real-time face recognition
+            if self.realtime_preview is not None:
+                self.realtime_preview.set_live_face_enabled(False)
+
             # ── Switch to Precomp (annotated video swap) ──
             self.preview_stack.setCurrentIndex(0)
             self._active_player = self.video_player
@@ -587,6 +614,10 @@ class SignalTimelineWindow(QMainWindow):
             )
 
         else:
+            # ── leaving Live → stop real-time face recognition ──
+            if self.realtime_preview is not None:
+                self.realtime_preview.set_live_face_enabled(False)
+
             # ── Off mode ──
             self.preview_stack.setCurrentIndex(0)
             self._active_player = self.video_player
