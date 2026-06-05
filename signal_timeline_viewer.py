@@ -524,6 +524,11 @@ class SignalTimelineWindow(QMainWindow):
         # ──────────────────────────────────────────────────────────
         self.overlay_mode_combo.currentTextChanged.connect(self._on_overlay_mode_changed)
 
+        # avoid-set: identities the render should exclude
+        self.avoided_identity_ids = set()
+        if self.realtime_preview is not None:
+            self.realtime_preview.avoid_person_requested.connect(self._on_avoid_person)
+
         dock.setWidget(preview_widget)
         return dock
 
@@ -2028,6 +2033,13 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ Error extracting highlights from signal data: {e}")
         
         return highlights
+
+    @Slot(str)
+    def _on_avoid_person(self, identity_id):
+        self.avoided_identity_ids.add(identity_id)
+        name = (self._face_bank.name_for(identity_id)
+                if getattr(self, "_face_bank", None) else identity_id[:8])
+        self.statusBar().showMessage(f"🚫 Avoiding {name} — {len(self.avoided_identity_ids)} total", 3000)
 
     @Slot(int, int)
     def on_clip_reordered(self, from_idx, to_idx):
