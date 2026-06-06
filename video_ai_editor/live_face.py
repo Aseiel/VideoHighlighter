@@ -78,7 +78,7 @@ class LiveFaceWorker(QObject):
     # results: list of dicts, plus the frame size they were computed at
     results_ready = Signal(list, int, int)
 
-    def __init__(self, bank, auto_enroll: bool = True, interval_ms: int = 33):
+    def __init__(self, bank, auto_enroll: bool = True, interval_ms: int = 33, learn_threshold=0.55):
         super().__init__()
         self._bank = bank
         self._auto_enroll = auto_enroll
@@ -87,6 +87,7 @@ class LiveFaceWorker(QObject):
         self._mutex = QMutex()
         self._timer: Optional[QTimer] = None
         self._busy = False
+        self._learn_threshold = learn_threshold
 
     @Slot()
     def start_processing(self):
@@ -127,6 +128,9 @@ class LiveFaceWorker(QObject):
                     thumb = _crop(frame, f["bbox"])
                     iid = self._bank.assign(f["embedding"], thumbnail=thumb,
                                             det_score=f["det_score"])
+                elif iid is not None and sim >= self._learn_threshold and f["det_score"] >= 0.6:
+                    # confident match on a good face → learn this angle
+                    self._bank.reinforce(iid, f["embedding"])
                 results.append({
                     "bbox": f["bbox"],                      # pixel coords in this frame
                     "identity_id": iid,
@@ -278,6 +282,7 @@ class LiveFaceOverlay:
             pen.setColor(color)
             rect.setPen(pen)
             rect.setRect(rx, ry, rw, rh)
+            rect.setData(0, r["identity_id"])
             rect.setVisible(True)
 
             name = r["name"] or f"? {r['sim']:.2f}"
