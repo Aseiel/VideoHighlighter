@@ -1074,7 +1074,7 @@ class VideoHighlighterGUI(QWidget):
         transcript_tab.setLayout(transcript_layout)
         tabs.addTab(transcript_tab, "Transcript && Subtitles")
 
-# --- Tab 3: Advanced Tab ---
+        # --- Tab 3: Advanced Tab ---
         advanced_cfg = self.config_data.get("advanced", {})
         visualization_cfg = self.config_data.get("visualization", {})
 
@@ -1282,6 +1282,51 @@ class VideoHighlighterGUI(QWidget):
         llm_tab.setLayout(llm_layout)
         tabs.addTab(llm_tab, "🤖 LLM Chat")
 
+        # --- Tab 5: Avoid ---
+        from PySide6.QtWidgets import QScrollArea
+
+        avoid_tab = QWidget()
+        avoid_layout = QVBoxLayout()
+
+        avoid_group = QGroupBox("🚫 Avoid People")
+        avoid_group_layout = QVBoxLayout()
+
+        avoid_info = QLabel(
+            "People you name in the Timeline Viewer (right-click a face → Name) "
+            "show up here. Tick someone to exclude them from generated highlights.\n"
+            "⚠️ Capture-only for now — actual cropping needs the cropper's "
+            "person-exclusion support."
+        )
+        avoid_info.setWordWrap(True)
+        avoid_info.setStyleSheet("color: #666; font-size: 9pt;")
+        avoid_group_layout.addWidget(avoid_info)
+
+        avoid_row = QHBoxLayout()
+        self.avoid_refresh_btn = QPushButton("🔄 Refresh from face database")
+        self.avoid_refresh_btn.clicked.connect(self.refresh_avoid_list)
+        avoid_row.addWidget(self.avoid_refresh_btn)
+        self.avoid_count_label = QLabel("")
+        self.avoid_count_label.setStyleSheet("color: #2196F3; font-weight: bold;")
+        avoid_row.addWidget(self.avoid_count_label)
+        avoid_row.addStretch()
+        avoid_group_layout.addLayout(avoid_row)
+
+        self.avoid_scroll = QScrollArea()
+        self.avoid_scroll.setWidgetResizable(True)
+        self.avoid_list_container = QWidget()
+        self.avoid_list_layout = QVBoxLayout(self.avoid_list_container)
+        self.avoid_list_layout.addStretch()
+        self.avoid_scroll.setWidget(self.avoid_list_container)
+        avoid_group_layout.addWidget(self.avoid_scroll)
+
+        avoid_group.setLayout(avoid_group_layout)
+        avoid_layout.addWidget(avoid_group, 1)
+        avoid_tab.setLayout(avoid_layout)
+        tabs.addTab(avoid_tab, "🚫 Avoid")
+
+        # Defer first populate until after __init__ finishes (so log_output exists)
+        QTimer.singleShot(0, self.refresh_avoid_list)
+
         # --- Run / Cancel Controls ---
         ctrl_layout = QHBoxLayout()
         self.keep_temp_chk = QPushButton("Keep temp clips: ON" if highlights_cfg.get("keep_temp", False) else "Keep temp clips: OFF")
@@ -1346,6 +1391,93 @@ class VideoHighlighterGUI(QWidget):
 
         # Setup auto-complete for label inputs
         self.setup_label_completers()
+
+    # --- Avoid methods ---
+    def _get_face_bank(self):
+        """Lazily create / reload the shared face identity bank."""
+        try:
+            from video_ai_editor.face_identity import FaceIdentityBank
+        except ImportError as e:
+            if hasattr(self, "log_output"):
+                self.append_log(f"⚠️ Face bank unavailable: {e}")
+            return None
+        if getattr(self, "_face_bank", None) is None:
+            self._face_bank = FaceIdentityBank(db_path="./cache/face_db.json")
+        else:
+            self._face_bank.load()   # pick up names/avoids set in the timeline viewer
+        return self._face_bank
+
+    def refresh_avoid_list(self):
+        """Rebuild the people rows from the face database."""
+        import base64
+        from PySide6.QtGui import QPixmap
+
+        # clear existing rows (keep the trailing stretch)
+        while self.avoid_list_layout.count() > 1:
+            item = self.avoid_list_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        bank = self._get_face_bank()
+        if bank is None:
+            self.avoid_count_label.setText("face database not available")
+            return
+
+        identities = bank.all_identities()
+        identities.sort(key=lambda i: (i["name"] is None, -(i.get("count") or 0)))
+
+        named = 0
+        for ident in identities:
+            r = QWidget()
+            rl = QHBoxLayout(r)
+            rl.setContentsMargins(4, 2, 4, 2)
+
+            thumb = QLabel()
+            thumb.setFixedSize(48, 48)
+            if ident.get("thumb"):
+                pix = QPixmap()
+                pix.loadFromData(base64.b64decode(ident["thumb"]), "JPEG")
+                if not pix.isNull():
+                    thumb.setPixmap(pix.scaled(48, 48, Qt.KeepAspectRatio,
+                                               Qt.SmoothTransformation))
+            rl.addWidget(thumb)
+
+            display = ident["name"] or f"Person {ident['id'][:8]}"
+            if ident["name"]:
+                named += 1
+            name_label = QLabel(
+                f"<b>{display}</b><br>"
+                f"<span style='color:#888;font-size:8pt;'>seen {ident.get('count', 0)}×</span>"
+            )
+            rl.addWidget(name_label, 1)
+
+            chk = QCheckBox("Avoid")
+            chk.setChecked(bool(ident.get("avoid", False)))
+            chk.toggled.connect(lambda checked, iid=ident["id"]: self._on_avoid_toggled(iid, checked))
+            rl.addWidget(chk)
+
+            self.avoid_list_layout.insertWidget(self.avoid_list_layout.count() - 1, r)
+
+        self.avoid_count_label.setText(
+            f"{len(identities)} people · {named} named · {len(bank.avoided_ids())} avoided"
+        )
+
+    def _on_avoid_toggled(self, identity_id, checked):
+        """Persist an avoid toggle to the face database."""
+        bank = getattr(self, "_face_bank", None)
+        if bank is None:
+            return
+        bank.set_avoid(identity_id, checked)
+        bank.save()
+        name = bank.name_for(identity_id)
+        self.append_log(f"{'🚫 Avoiding' if checked else '✅ Allowing'} {name} "
+                        f"({len(bank.avoided_ids())} avoided)")
+        self.avoid_count_label.setText(
+            f"{len(bank.all_identities())} people · "
+            f"{sum(1 for i in bank.all_identities() if i['name'])} named · "
+            f"{len(bank.avoided_ids())} avoided"
+        )
 
     # --- Downloader methods ---
     def browse_save_directory(self):
@@ -3220,4 +3352,3 @@ if __name__ == "__main__":
     gui = VideoHighlighterGUI()
     gui.show()
     sys.exit(app.exec())
-
