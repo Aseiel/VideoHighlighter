@@ -592,7 +592,15 @@ class RealtimeOverlayPreview(QWidget):
             prefill = ident["name"] if (ident and ident["name"]) else ""
             name, ok = QInputDialog.getText(self, "Name person", "Name:", text=prefill)
             if ok and name.strip():
-                self._face_bank.name_identity(identity_id, name.strip())
+                name = name.strip()
+                # if this name already belongs to someone, MERGE into them
+                existing = next((i for i in self._face_bank.all_identities()
+                                 if i["name"] and i["name"].lower() == name.lower()
+                                 and i["id"] != identity_id), None)
+                if existing:
+                    self._face_bank.merge_identities(existing["id"], identity_id)
+                else:
+                    self._face_bank.name_identity(identity_id, name)
                 self._face_bank.save()
         elif chosen == a_avoid:
             self.avoid_person_requested.emit(identity_id)

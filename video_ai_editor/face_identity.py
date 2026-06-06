@@ -242,6 +242,25 @@ class FaceIdentityBank:
                     ident["thumb"] = self._encode_thumb(thumbnail)
 
             return mid
+        
+    def reinforce(self, identity_id, embedding, novelty_max: float = 0.7) -> bool:
+        """
+        Teach a KNOWN identity a new view of itself.
+        Adds the embedding only if it's a genuinely new angle (not already
+        well-represented), so the gallery stays diverse instead of filling
+        up with near-duplicate frontal shots.
+        """
+        ident = self._id_index.get(identity_id)
+        if ident is None:
+            return False
+        emb = self._norm(embedding)
+        gal = ident["embeddings"]
+        if gal.size and float(np.max(gal @ emb)) > novelty_max:
+            return False           # already have a similar view — don't bloat
+        with self._lock:
+            ident["embeddings"] = self._grow_gallery(ident["embeddings"], emb)
+            ident["count"] = ident.get("count", 0) + 1
+        return True
 
     # ── face ↔ person-box association ─────────────────────────────
 
