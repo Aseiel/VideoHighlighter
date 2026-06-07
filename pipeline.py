@@ -55,6 +55,27 @@ def seconds_to_mmss(sec):
     minutes, seconds = divmod(int(sec), 60)
     return f"{minutes:02d}:{seconds:02d}"
 
+def subtract_forbidden(segments, forbidden_ranges, min_keep=0.5):
+    """Cut forbidden [a,b] ranges out of each (start,end) segment.
+    A segment can split into several pieces; slivers under min_keep are dropped."""
+    if not forbidden_ranges:
+        return segments
+    fr = sorted((max(0, a), b) for a, b in forbidden_ranges if b > a)
+    out = []
+    for s, e in segments:
+        pieces = [(s, e)]
+        for fa, fb in fr:
+            nxt = []
+            for ps, pe in pieces:
+                if fb <= ps or fa >= pe:
+                    nxt.append((ps, pe))
+                else:
+                    if fa > ps: nxt.append((ps, fa))
+                    if fb < pe: nxt.append((fb, pe))
+            pieces = nxt
+        out.extend(p for p in pieces if p[1] - p[0] >= min_keep)
+    return out
+
 def check_cancellation(cancel_flag, log_fn, step_name="operation"):
     """Check if cancellation was requested and raise exception if so"""
     if cancel_flag and cancel_flag.is_set():
@@ -326,6 +347,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         TRANSCRIPT_POINTS = int(gui_config.get("transcript_points", 0))
         SOURCE_LANG = gui_config.get("source_lang", "en")  # For subtitles
         TARGET_LANG = gui_config.get("target_lang", None)  # For subtitles
+
+        # Avoid settings
+        AVOID_ENABLED = gui_config.get("avoid_enabled", False)
+        AVOID_IDS = gui_config.get("avoid_identity_ids", []) or []
+        AVOID_METHOD = gui_config.get("avoid_method", "skip")   # "skip" | "crop" | "crop_then_skip"
+        forbidden_ranges = []          # [(start_sec, end_sec), ...] where an avoided id appears
+        forbidden_boxes_by_frame = {}  # {frame_idx: [(x1,y1,x2,y2), ...]} avoided ids only
 
         keyword_matches = []
 
@@ -1214,6 +1242,22 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log(f"Full error: {traceback.format_exc()}")
         # ========== END CACHE SAVE ==========
 
+        # ========== AVOID: locate the person(s) to avoid ==========
+        if AVOID_ENABLED and AVOID_IDS:
+            try:
+                from video_ai_editor.face_identity import FaceIdentityBank
+                from modules.compute_forbidden import compute_forbidden   # resolver — written next
+                bank = FaceIdentityBank(db_path=gui_config.get("face_db_path", "./cache/face_db.json"))
+                forbidden_ranges, forbidden_boxes_by_frame = compute_forbidden(
+                    processed_video_path, yolo_model, bank, AVOID_IDS, fps,
+                    log_fn=log, cancel_flag=cancel_flag,
+                )
+                log(f"🚫 Avoid: located {len(forbidden_ranges)} forbidden range(s)")
+            except Exception as e:
+                log(f"⚠️ Avoid resolver unavailable — running without exclusion: {e}")
+                forbidden_ranges, forbidden_boxes_by_frame = [], {}
+        # ========== END AVOID LOCATE ==========
+
         # 6 Compute scores per second
         progress.update_progress(80, 100, "Pipeline", "Computing scores...")
         check_cancellation(cancel_flag, log, "score computation")
@@ -1401,6 +1445,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             if signals >= MIN_SIGNALS_FOR_BOOST:
                 score[i] *= MULTI_SIGNAL_BOOST
 
+        # AVOID(skip, soft): discourage picking moments where the avoided person appears
+        if AVOID_ENABLED and AVOID_METHOD in ("skip", "crop_then_skip") and forbidden_ranges:
+            forbidden_seconds = {s for a, b in forbidden_ranges for s in range(int(a), int(b) + 1)}
+            for sec in forbidden_seconds:
+                if 0 <= sec < len(score):
+                    score[sec] = 0.0
+            log(f"🚫 Avoid(skip): zeroed score on {len(forbidden_seconds)} second(s)")
+
         progress.update_progress(80, 100, "Score Calculation", "Score computation complete")
         check_cancellation(cancel_flag, log, "score computation completion")
 
@@ -1552,6 +1604,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # Sort segments by start time (both modes)
         segments.sort(key=lambda x: x[0])
+
+        # AVOID(skip, hard): guarantee no forbidden time survives into the cut
+        if AVOID_ENABLED and AVOID_METHOD in ("skip", "crop_then_skip") and forbidden_ranges:
+            before_n = len(segments)
+            segments = subtract_forbidden(segments, forbidden_ranges)
+            log(f"🚫 Avoid(skip): {before_n} → {len(segments)} segment(s) after removing forbidden ranges")
 
         print("\n🔍 FINAL HIGHLIGHT BREAKDOWN:")
         print(f"Total segments: {len(segments)}")
