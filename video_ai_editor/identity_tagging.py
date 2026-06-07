@@ -58,7 +58,10 @@ def tag_video_with_identities(
     tracker: str = "bytetrack.yaml",
     min_votes: int = 1,                     # min face matches before trusting an identity
     save_bank: bool = False,
+    model=None,                             # pre-built YOLO model (reused if provided)
+    device=None,                            # tracking device: 'xpu' | 0 (cuda) | 'cpu'
     progress_cb=None,                       # optional: progress_cb(frame_idx, message)
+    
 ) -> list[dict]:
     """
     Run tracking + face identity over a video and return identity-tagged
@@ -87,7 +90,8 @@ def tag_video_with_identities(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
 
-    model = YOLO(yolo_model_path)
+    if model is None:
+        model = YOLO(yolo_model_path)
 
     # PASS 1 — track people, collect boxes, vote on identities per track
     # ------------------------------------------------------------------
@@ -103,6 +107,7 @@ def tag_video_with_identities(
         stream=True,
         vid_stride=vid_stride,
         tracker=tracker,
+        device=device,
         verbose=False,
     )
 
