@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import yaml
+import multiprocessing
 
 from PySide6.QtWidgets import (
     QApplication, QCompleter, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -18,7 +19,11 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
-import multiprocessing
+
+try:
+    import openvino  # registers OpenVINO's DLL dir on Windows
+except Exception:
+    pass
 
 CONFIG_FILE = "config.yaml"
 
@@ -408,20 +413,27 @@ class FaceScanWorker(QThread):
         self.db_path = db_path
 
     def run(self):
-        try:
-            from video_ai_editor.face_identity import FaceIdentityBank
-            from video_ai_editor.identity_tagging import tag_video_with_identities
-            bank = FaceIdentityBank(db_path=self.db_path)
-            self.log.emit(f"🔍 Scanning {os.path.basename(self.video_path)} for faces…")
-            tag_video_with_identities(
-                self.video_path, bank,
-                face_every=10, save_bank=True,   # persist the collected faces
-                progress_cb=lambda i, m: self.log.emit(f"  {m}") if i % 150 == 0 else None,
-            )
-            self.done.emit(len(bank))
-        except Exception as e:
-            self.log.emit(f"❌ Face scan failed: {e}")
-            self.done.emit(-1)
+            try:
+                from video_ai_editor.face_identity import FaceIdentityBank
+                from video_ai_editor.identity_tagging import tag_video_with_identities
+                from modules.compute_forbidden import build_tracking_model, track_device
+
+                bank = FaceIdentityBank(db_path=self.db_path)
+                model = build_tracking_model("n", log_fn=self.log.emit)
+                self.log.emit(f"🔍 Scanning {os.path.basename(self.video_path)} for faces…")
+                tag_video_with_identities(
+                    self.video_path, bank,
+                    model=model,
+                    device=track_device(),
+                    face_every=15,
+                    vid_stride=3,
+                    save_bank=True,
+                    progress_cb=lambda i, m: self.log.emit(f"  {m}") if i % 150 == 0 else None,
+                )
+                self.done.emit(len(bank))
+            except Exception as e:
+                self.log.emit(f"❌ Face scan failed: {e}")
+                self.done.emit(-1)
 
 class RangeSlider(QWidget):
     """Single slider with two handles for selecting a range"""

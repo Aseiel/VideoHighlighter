@@ -66,21 +66,18 @@ def detect_best_device(log_fn=print):
         except Exception as e:
             log_fn(f"⚠️ CUDA check failed: {e}")
 
-    # ---- Intel XPU ---------------------------------------------------------
-    if _TORCH_AVAILABLE:
+    # ---- Intel XPU (Arc dGPU / Xe iGPU) --------------------------------------
+    # torch 2.5+ '+xpu' builds expose torch.xpu natively — no ipex import needed.
+    if _TORCH_AVAILABLE and hasattr(torch, "xpu"):
         try:
-            import intel_extension_for_pytorch as ipex  # noqa: F401
-            if hasattr(torch, "xpu") and torch.xpu.is_available():
+            if torch.xpu.is_available():
                 count = torch.xpu.device_count()
                 log_fn(f"✅ Intel XPU available: {count} device(s)")
                 for i in range(count):
                     try:
-                        name = torch.xpu.get_device_name(i)
-                        log_fn(f"   Device {i}: {name}")
+                        log_fn(f"   Device {i}: {torch.xpu.get_device_name(i)}")
                     except Exception:
                         pass
-                # XPU: use OpenVINO GPU for YOLO + action recognition.
-                # PyTorch R3D stays on CPU — torchvision has no XPU backend.
                 return DeviceInfo(
                     yolo_pt_device="cpu",
                     yolo_ov_device="cpu",
@@ -91,8 +88,6 @@ def detect_best_device(log_fn=print):
                     gpu_available=True,
                     backend_name="Intel XPU (OpenVINO)",
                 )
-        except ImportError:
-            log_fn("ℹ️ Intel Extension for PyTorch not installed — XPU unavailable")
         except Exception as e:
             log_fn(f"⚠️ XPU check failed: {e}")
 

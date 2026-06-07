@@ -83,46 +83,10 @@ def check_cancellation(cancel_flag, log_fn, step_name="operation"):
         raise RuntimeError(f"Operation cancelled during {step_name}")
 
 def check_gpu_availability(log_fn=print):
-    """Check for available GPU acceleration: CUDA > XPU > CPU."""
-    
-    # 1. Check CUDA first (NVIDIA GPUs)
-    try:
-        if torch.cuda.is_available():
-            device_count = torch.cuda.device_count()
-            log_fn(f"✅ CUDA available: {device_count} device(s)")
-            for i in range(device_count):
-                try:
-                    device_name = torch.cuda.get_device_name(i)
-                    vram = torch.cuda.get_device_properties(i).total_mem / (1024**3)
-                    log_fn(f"   Device {i}: {device_name} ({vram:.1f} GB VRAM)")
-                except Exception:
-                    pass
-            return True, "cuda:0"
-    except Exception as e:
-        log_fn(f"⚠️ CUDA check failed: {e}")
-
-    # 2. Check Intel XPU
-    try:
-        import intel_extension_for_pytorch as ipex
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            device_count = torch.xpu.device_count()
-            log_fn(f"✅ Intel XPU available: {device_count} device(s)")
-            for i in range(device_count):
-                try:
-                    device_name = torch.xpu.get_device_name(i)
-                    log_fn(f"   Device {i}: {device_name}")
-                except Exception:
-                    pass
-            return True, "xpu:0"
-    except ImportError:
-        log_fn("ℹ️ Intel Extension for PyTorch not installed")
-    except Exception as e:
-        log_fn(f"⚠️ XPU initialization error: {e}")
-
-    # 3. Fallback to CPU
-    log_fn("ℹ️ No GPU acceleration found, using CPU")
-    return False, "cpu"
-
+    """Legacy shim — the single source of truth is device_utils.detect_best_device()."""
+    from modules.device_utils import detect_best_device
+    d = detect_best_device(log_fn=log_fn)
+    return d.gpu_available, d.yolo_pt_device   # ("cuda:0" | "cpu")
 
 # Keep old name as alias for backward compatibility
 check_xpu_availability = check_gpu_availability
@@ -1246,10 +1210,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         if AVOID_ENABLED and AVOID_IDS:
             try:
                 from video_ai_editor.face_identity import FaceIdentityBank
-                from modules.compute_forbidden import compute_forbidden   # resolver — written next
+                from modules.compute_forbidden import compute_forbidden
                 bank = FaceIdentityBank(db_path=gui_config.get("face_db_path", "./cache/face_db.json"))
                 forbidden_ranges, forbidden_boxes_by_frame = compute_forbidden(
-                    processed_video_path, yolo_model, bank, AVOID_IDS, fps,
+                    processed_video_path, bank, AVOID_IDS, fps,
                     log_fn=log, cancel_flag=cancel_flag,
                 )
                 log(f"🚫 Avoid: located {len(forbidden_ranges)} forbidden range(s)")
