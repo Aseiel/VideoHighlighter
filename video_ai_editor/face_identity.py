@@ -122,30 +122,42 @@ class FaceIdentityBank:
     # ── model lifecycle ───────────────────────────────────────────
 
     def _ensure_app(self):
-        """Lazy-load the InsightFace model on first use."""
-        if self._app is not None:
+            """Lazy-load the InsightFace model on first use."""
+            if self._app is not None:
+                return self._app
+
+            try:
+                from insightface.app import FaceAnalysis
+            except ImportError as e:
+                raise ImportError(
+                    "insightface is required for face recognition.\n"
+                    "  pip install insightface onnxruntime           (CPU)\n"
+                    "  pip install insightface onnxruntime-gpu        (NVIDIA)\n"
+                    "  pip install insightface onnxruntime-openvino   (Intel)"
+                ) from e
+
+            providers = self.providers
+            if not providers:
+                # auto-pick: prefer Intel GPU via OpenVINO, then CUDA, then CPU
+                try:
+                    import onnxruntime as ort
+                    avail = set(ort.get_available_providers())
+                except Exception:
+                    avail = set()
+                if "OpenVINOExecutionProvider" in avail:
+                    providers = [("OpenVINOExecutionProvider", {"device_type": "GPU"}),
+                                "CPUExecutionProvider"]
+                elif "CUDAExecutionProvider" in avail:
+                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                else:
+                    providers = ["CPUExecutionProvider"]
+
+            app = FaceAnalysis(name=self.model_name, providers=providers)
+            app.prepare(ctx_id=self.ctx_id, det_size=self.det_size)
+            self._app = app
+            print(f"✅ FaceIdentityBank: loaded '{self.model_name}' "
+                f"(providers={providers}, ctx_id={self.ctx_id})")
             return self._app
-
-        try:
-            from insightface.app import FaceAnalysis
-        except ImportError as e:
-            raise ImportError(
-                "insightface is required for face recognition.\n"
-                "  pip install insightface onnxruntime           (CPU)\n"
-                "  pip install insightface onnxruntime-gpu        (NVIDIA)\n"
-                "  pip install insightface onnxruntime-openvino   (Intel)"
-            ) from e
-
-        kwargs = {"name": self.model_name}
-        if self.providers:
-            kwargs["providers"] = self.providers
-
-        app = FaceAnalysis(**kwargs)
-        app.prepare(ctx_id=self.ctx_id, det_size=self.det_size)
-        self._app = app
-        print(f"✅ FaceIdentityBank: loaded '{self.model_name}' "
-              f"(providers={self.providers or 'auto'}, ctx_id={self.ctx_id})")
-        return self._app
 
     # ── detection ─────────────────────────────────────────────────
 
@@ -316,6 +328,20 @@ class FaceIdentityBank:
             return False
         ident["name"] = name
         return True
+    
+    def set_avoid(self, identity_id, avoid: bool = True) -> bool:
+        ident = self._id_index.get(identity_id)
+        if ident is None:
+            return False
+        ident["avoid"] = bool(avoid)
+        return True
+
+    def is_avoided(self, identity_id) -> bool:
+        ident = self._id_index.get(identity_id)
+        return bool(ident and ident.get("avoid", False))
+
+    def avoided_ids(self) -> list[str]:
+        return [i["id"] for i in self.identities if i.get("avoid", False)]
 
     def merge_identities(self, keep_id: str, merge_id: str) -> bool:
         """
@@ -349,6 +375,7 @@ class FaceIdentityBank:
             "name": ident.get("name"),
             "count": ident.get("count", 0),
             "thumb": ident.get("thumb"),
+            "avoid": ident.get("avoid", False),
             "gallery_size": int(ident["embeddings"].shape[0]),
         }
 
@@ -382,6 +409,7 @@ class FaceIdentityBank:
                         "name": i.get("name"),
                         "count": int(i.get("count", 0)),
                         "thumb": i.get("thumb"),
+                        "avoid": bool(i.get("avoid", False)),
                         "embeddings": i["embeddings"].astype(np.float32).tolist(),
                     }
                     for i in self.identities
@@ -418,6 +446,7 @@ class FaceIdentityBank:
                     "name": rec.get("name"),
                     "count": int(rec.get("count", 0)),
                     "thumb": rec.get("thumb"),
+                    "avoid": bool(rec.get("avoid", False)),
                     "embeddings": emb,
                 }
                 self.identities.append(ident)
