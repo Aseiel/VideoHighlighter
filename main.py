@@ -396,6 +396,33 @@ class Worker(QThread):
     def is_cancelled(self):
         return self._cancel_flag.is_set()
 
+class FaceScanWorker(QThread):
+    """Offline identity pass over a video to populate the face bank with everyone
+    who appears, so they show up in the Avoid list (the 'dry run')."""
+    log = Signal(str)
+    done = Signal(int)   # identity count after scan, or -1 on error
+
+    def __init__(self, video_path, db_path):
+        super().__init__()
+        self.video_path = video_path
+        self.db_path = db_path
+
+    def run(self):
+        try:
+            from video_ai_editor.face_identity import FaceIdentityBank
+            from video_ai_editor.identity_tagging import tag_video_with_identities
+            bank = FaceIdentityBank(db_path=self.db_path)
+            self.log.emit(f"🔍 Scanning {os.path.basename(self.video_path)} for faces…")
+            tag_video_with_identities(
+                self.video_path, bank,
+                face_every=10, save_bank=True,   # persist the collected faces
+                progress_cb=lambda i, m: self.log.emit(f"  {m}") if i % 150 == 0 else None,
+            )
+            self.done.emit(len(bank))
+        except Exception as e:
+            self.log.emit(f"❌ Face scan failed: {e}")
+            self.done.emit(-1)
+
 class RangeSlider(QWidget):
     """Single slider with two handles for selecting a range"""
     startChanged = Signal(int)
@@ -1300,11 +1327,26 @@ class VideoHighlighterGUI(QWidget):
         avoid_info.setWordWrap(True)
         avoid_info.setStyleSheet("color: #666; font-size: 9pt;")
         avoid_group_layout.addWidget(avoid_info)
+        avoid_method_row = QHBoxLayout()
+        avoid_method_row.addWidget(QLabel("When found:"))
+        self.avoid_method_combo = QComboBox()
+        self.avoid_method_combo.addItem("Skip those moments", "skip")
+        self.avoid_method_combo.addItem("Crop them out (experimental)", "crop")
+        self.avoid_method_combo.currentIndexChanged.connect(
+            lambda: setattr(self, "_avoid_method", self.avoid_method_combo.currentData()))
+        avoid_method_row.addWidget(self.avoid_method_combo)
+        avoid_method_row.addStretch()
+        avoid_group_layout.addLayout(avoid_method_row)
 
         avoid_row = QHBoxLayout()
         self.avoid_refresh_btn = QPushButton("🔄 Refresh from face database")
         self.avoid_refresh_btn.clicked.connect(self.refresh_avoid_list)
         avoid_row.addWidget(self.avoid_refresh_btn)
+        self.avoid_scan_btn = QPushButton("🔍 Scan video for faces")
+        self.avoid_scan_btn.setToolTip("Run face recognition over the first video in the list "
+                                       "to collect everyone who appears, then tick who to avoid.")
+        self.avoid_scan_btn.clicked.connect(self._on_scan_faces)
+        avoid_row.addWidget(self.avoid_scan_btn)
         self.avoid_count_label = QLabel("")
         self.avoid_count_label.setStyleSheet("color: #2196F3; font-weight: bold;")
         avoid_row.addWidget(self.avoid_count_label)
@@ -1478,6 +1520,29 @@ class VideoHighlighterGUI(QWidget):
             f"{sum(1 for i in bank.all_identities() if i['name'])} named · "
             f"{len(bank.avoided_ids())} avoided"
         )
+
+    def _on_scan_faces(self):
+        videos = self.get_file_list()
+        if not videos:
+            self.append_log("⚠️ Add a video first, then scan it for faces.")
+            return
+        video = videos[0]
+        if not os.path.exists(video):
+            self.append_log(f"⚠️ Video not found: {video}")
+            return
+        self.avoid_scan_btn.setEnabled(False)
+        self.avoid_scan_btn.setText("🔍 Scanning…")
+        self._scan_worker = FaceScanWorker(video, "./cache/face_db.json")
+        self._scan_worker.log.connect(self.append_log)
+        self._scan_worker.done.connect(self._on_scan_done)
+        self._scan_worker.start()
+
+    def _on_scan_done(self, n):
+        self.avoid_scan_btn.setEnabled(True)
+        self.avoid_scan_btn.setText("🔍 Scan video for faces")
+        if n >= 0:
+            self.append_log(f"✅ Face scan complete — {n} identities in the bank")
+        self.refresh_avoid_list()
 
     # --- Downloader methods ---
     def browse_save_directory(self):
@@ -2888,6 +2953,9 @@ class VideoHighlighterGUI(QWidget):
         interesting_actions = get_list_from_input(self.actions_input)
         use_transcript = self.transcript_checkbox.isChecked()
         search_keywords = get_list_from_input(self.search_keywords_input) if use_transcript else []
+        # Avoid: pull flagged identities from the shared face bank
+        avoid_bank = self._get_face_bank()
+        avoid_ids = avoid_bank.avoided_ids() if avoid_bank else []
 
         config = {
             "scene_points": int(self.spin_scene_points.value()),
@@ -2930,6 +2998,10 @@ class VideoHighlighterGUI(QWidget):
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
             "action_backend": self.action_backend_combo.currentData(),
             "r3d_model": self.r3d_model_combo.currentData(),
+            "avoid_enabled": bool(avoid_ids),
+            "avoid_method": getattr(self, "_avoid_method", "skip"),
+            "avoid_identity_ids": avoid_ids,
+            "face_db_path": "./cache/face_db.json",
         }
 
         # --- Skip highlights logic ---
