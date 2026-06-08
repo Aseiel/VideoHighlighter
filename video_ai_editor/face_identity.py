@@ -335,6 +335,17 @@ class FaceIdentityBank:
             return False
         ident["avoid"] = bool(avoid)
         return True
+    
+    def clear(self, keep_named: bool = False) -> int:
+        """Wipe the gallery. If keep_named, retain identities that have a name or
+        an avoid flag (your deliberate ones) and drop the rest. Returns kept count.
+        Call save() afterwards to persist."""
+        with self._lock:
+            kept = ([i for i in self.identities if i.get("name") or i.get("avoid")]
+                    if keep_named else [])
+            self.identities = kept
+            self._id_index = {i["id"]: i for i in kept}
+        return len(self.identities)
 
     def is_avoided(self, identity_id) -> bool:
         ident = self._id_index.get(identity_id)
@@ -342,6 +353,14 @@ class FaceIdentityBank:
 
     def avoided_ids(self) -> list[str]:
         return [i["id"] for i in self.identities if i.get("avoid", False)]
+    
+    def remove(self, identity_id: str) -> bool:
+        """Delete one identity from the bank. Call save() afterwards to persist."""
+        ident = self._id_index.pop(identity_id, None)
+        if ident is None:
+            return False
+        self.identities = [i for i in self.identities if i["id"] != identity_id]
+        return True
 
     def merge_identities(self, keep_id: str, merge_id: str) -> bool:
         """
