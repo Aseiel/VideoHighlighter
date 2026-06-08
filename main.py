@@ -1364,6 +1364,10 @@ class VideoHighlighterGUI(QWidget):
         avoid_row.addWidget(self.avoid_count_label)
         avoid_row.addStretch()
         avoid_group_layout.addLayout(avoid_row)
+        self.avoid_clear_btn = QPushButton("🗑 Clear faces")
+        self.avoid_clear_btn.setToolTip("Remove scanned faces from the bank (keeps named/avoided people).")
+        self.avoid_clear_btn.clicked.connect(self._on_clear_faces)
+        avoid_row.addWidget(self.avoid_clear_btn)
 
         self.avoid_scroll = QScrollArea()
         self.avoid_scroll.setWidgetResizable(True)
@@ -1511,6 +1515,12 @@ class VideoHighlighterGUI(QWidget):
             chk.toggled.connect(lambda checked, iid=ident["id"]: self._on_avoid_toggled(iid, checked))
             rl.addWidget(chk)
 
+            rm = QPushButton("✕")
+            rm.setFixedWidth(28)
+            rm.setToolTip("Remove this person from the face bank")
+            rm.clicked.connect(lambda _=False, iid=ident["id"]: self._on_remove_identity(iid))
+            rl.addWidget(rm)
+
             self.avoid_list_layout.insertWidget(self.avoid_list_layout.count() - 1, r)
 
         self.avoid_count_label.setText(
@@ -1548,6 +1558,37 @@ class VideoHighlighterGUI(QWidget):
         self._scan_worker.log.connect(self.append_log)
         self._scan_worker.done.connect(self._on_scan_done)
         self._scan_worker.start()
+
+    def _on_remove_identity(self, identity_id):
+            bank = self._get_face_bank()
+            if bank is None:
+                return
+            if bank.remove(identity_id):
+                bank.save()
+                self.append_log("🗑 Removed 1 person from the face bank")
+            self.refresh_avoid_list()
+
+    def _on_clear_faces(self):
+            from PySide6.QtWidgets import QMessageBox
+            bank = self._get_face_bank()
+            if not bank or len(bank) == 0:
+                self.append_log("ℹ️ Face bank is already empty.")
+                return
+            box = QMessageBox(self)
+            box.setWindowTitle("Clear faces")
+            box.setText(f"Clear the face bank ({len(bank)} identities)?")
+            box.setInformativeText("Choose what to remove.")
+            btn_all   = box.addButton("Clear everything", QMessageBox.ButtonRole.DestructiveRole)
+            btn_keep  = box.addButton("Keep named / avoided", QMessageBox.ButtonRole.AcceptRole)
+            btn_cancel = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_cancel:
+                return
+            kept = bank.clear(keep_named=(clicked is btn_keep))
+            bank.save()
+            self.append_log(f"🗑 Face bank cleared — {kept} identities kept")
+            self.refresh_avoid_list()
 
     def _on_scan_done(self, n):
         self.avoid_scan_btn.setEnabled(True)
