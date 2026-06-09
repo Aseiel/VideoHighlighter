@@ -277,42 +277,41 @@ def merge_regions(regions, gap_tolerance=1.5):
 # ---------------------------------------------------------------------------
 def constrain_regions(regions, score_arr, video_duration, min_dur=1.5, max_dur=30.0):
     """
-    - Regions shorter than min_dur get padded symmetrically (up to max_dur).
-    - Regions longer than max_dur get trimmed to the highest-scoring sub-window.
+    - Regions shorter than min_dur get padded symmetrically.
+    - Regions longer than max_dur get SPLIT into consecutive ≤max_dur windows,
+      so one long merged blob yields many candidate clips instead of just one.
     """
     constrained = []
     for r in regions:
-        # --- too short: pad ---
+        # too short: pad
         if r.duration < min_dur:
             deficit = min_dur - r.duration
             half = deficit / 2.0
             new_start = max(0.0, r.start - half)
             new_end = min(video_duration, r.end + half)
-            # Re-center if one side hit a boundary
             if new_end - new_start < min_dur:
                 if new_start == 0:
                     new_end = min(video_duration, min_dur)
                 else:
                     new_start = max(0, new_end - min_dur)
-            r = Region(new_start, new_end, r.score, r.sources)
+            constrained.append(Region(new_start, new_end, r.score, r.sources))
+            continue
 
-        # --- too long: find best sub-window ---
-        if r.duration > max_dur:
-            best_start = r.start
-            best_score = -1
-            s_base = int(r.start)
-            e_limit = int(r.end) - int(max_dur) + 1
-            for candidate_start in range(s_base, max(s_base + 1, e_limit)):
-                candidate_end = candidate_start + int(max_dur)
-                cs = max(0, candidate_start)
-                ce = min(len(score_arr), candidate_end)
-                window_score = float(np.sum(score_arr[cs:ce]))
-                if window_score > best_score:
-                    best_score = window_score
-                    best_start = candidate_start
-            r = Region(float(best_start), float(best_start + max_dur), best_score, r.sources)
+        # in range: keep
+        if r.duration <= max_dur:
+            constrained.append(r)
+            continue
 
-        constrained.append(r)
+        # too long: split into back-to-back windows of up to max_dur
+        seg_start = r.start
+        while seg_start < r.end - 0.01:
+            seg_end = min(r.end, seg_start + max_dur)
+            if seg_end - seg_start >= min_dur:
+                cs = max(0, int(seg_start))
+                ce = min(len(score_arr), int(seg_end) + 1)
+                win_score = float(np.sum(score_arr[cs:ce])) if ce > cs else 0.0
+                constrained.append(Region(seg_start, seg_end, win_score, r.sources))
+            seg_start = seg_end
     return constrained
 
 
@@ -321,54 +320,39 @@ def constrain_regions(regions, score_arr, video_duration, min_dur=1.5, max_dur=3
 # ---------------------------------------------------------------------------
 def select_regions(regions, target_duration, duration_mode="MAX"):
     """
-    Greedy selection: pick highest-score-density regions first,
-    skip any that overlap with already-selected regions.
-
-    Returns list of (start, end) tuples sorted chronologically.
+    Greedy: pick highest-density regions first, skipping any that TRULY overlap
+    (share time) with an already-selected one. Abutting clips (split sub-windows)
+    are allowed so they can fill the budget back-to-back.
     """
     if not regions:
-        return []
+        return [], []
 
-    # Score density = score / duration  (so short punchy moments can compete)
+    def _shares_time(a, b):
+        return min(a.end, b.end) - max(a.start, b.start) > 0.0
+
     for r in regions:
         r._density = r.score / max(0.5, r.duration)
 
-    # Primary sort: density desc, secondary: raw score desc
     ranked = sorted(regions, key=lambda r: (r._density, r.score), reverse=True)
 
     selected = []
     total_dur = 0.0
-
     for r in ranked:
-        # Check overlap with already selected
-        dominated = False
-        for sel in selected:
-            if r.overlaps(sel, gap_tolerance=0.5):
-                dominated = True
-                break
-        if dominated:
+        if any(_shares_time(r, sel) for sel in selected):
             continue
-
-        # Check budget
         remaining = target_duration - total_dur
         if remaining <= 0:
             break
-
-        # Trim if this region would exceed budget
         actual_end = r.end
         if r.duration > remaining:
             actual_end = r.start + remaining
-
         selected.append(Region(r.start, actual_end, r.score, r.sources))
         total_dur += actual_end - r.start
-
         if duration_mode == "EXACT" and total_dur >= target_duration:
             break
 
-    # Sort chronologically for final output
     selected.sort(key=lambda r: r.start)
     return [(r.start, r.end) for r in selected], selected
-
 
 # ---------------------------------------------------------------------------
 # 8. Main entry point
@@ -483,10 +467,12 @@ def build_auto_segments(
            f"(target: {target_duration}s, mode: {duration_mode})")
 
     # --- Debug: show what was selected ---
+    from collections import Counter
     for i, reg in enumerate(selected_regions):
         s_mm = f"{int(reg.start)//60:02d}:{int(reg.start)%60:02d}"
         e_mm = f"{int(reg.end)//60:02d}:{int(reg.end)%60:02d}"
+        src = ", ".join(f"{name} ×{n}" for name, n in Counter(reg.sources).most_common())
         log_fn(f"   Segment {i+1}: {s_mm}-{e_mm} ({reg.duration:.1f}s) "
-               f"score={reg.score:.1f} sources={reg.sources}")
+               f"score={reg.score:.1f} sources=[{src}]")
 
     return segments, selected_regions
