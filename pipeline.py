@@ -55,6 +55,40 @@ def seconds_to_mmss(sec):
     minutes, seconds = divmod(int(sec), 60)
     return f"{minutes:02d}:{seconds:02d}"
 
+def get_video_duration(video_path, log_fn=print):
+    """Robust duration via ffprobe. cv2's frame_count/fps is unreliable on VFR
+    or mis-tagged files and can read 2× on a re-open. Falls back to cv2."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        d = float(out)
+        if d > 0:
+            return d
+    except Exception as e:
+        log_fn(f"⚠️ ffprobe duration failed ({e}); using cv2 fallback")
+    cap = cv2.VideoCapture(video_path)
+    fps_ = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+    return n / fps_ if fps_ else 0.0
+
+def _collapse_runs(items, fmt="{val} ×{n}", sep=", "):
+    """['a','a','a','b','b'] -> 'a ×3, b ×2' (collapses CONSECUTIVE repeats)."""
+    if not items:
+        return ""
+    out, prev, n = [], items[0], 1
+    for it in items[1:]:
+        if it == prev:
+            n += 1
+        else:
+            out.append(fmt.format(val=prev, n=n))
+            prev, n = it, 1
+    out.append(fmt.format(val=prev, n=n))
+    return sep.join(out)
+
 def subtract_forbidden(segments, forbidden_ranges, min_keep=0.5):
     """Cut forbidden [a,b] ranges out of each (start,end) segment.
     A segment can split into several pieces; slivers under min_keep are dropped."""
@@ -350,8 +384,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        video_duration = total_frames / fps if fps else 0
         cap.release()
+        video_duration = get_video_duration(video_path, log_fn=log)  # robust; avoids cv2 VFR 2× misread
         log(f"🎬 Video duration: {video_duration:.2f}s, FPS: {fps}, total frames: {total_frames}")
 
         check_cancellation(cancel_flag, log, "video info extraction")
