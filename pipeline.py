@@ -2064,6 +2064,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         source_lang=SOURCE_LANG,
                         waveform_data=waveform_data
                     )
+
+                # Hand the edit timeline EXACTLY what we cut (post-subtract,
+                # so avoided-person splits are preserved) instead of letting it
+                # reload a stale highlight-history entry.
+                analysis_data['final_segments'] = [[float(s), float(e)] for s, e in segments]
                 
                 # Launch in separate thread/process so it doesn't block
                 import threading

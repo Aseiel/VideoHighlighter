@@ -499,11 +499,12 @@ class EditTimelineScene(QGraphicsScene):
     clip_trimmed = Signal(int)                  # clip index after a trim
     clip_reordered = Signal(int, int)           # from_index, to_index
 
-    def __init__(self, video_path, video_duration, parent=None, cache=None):
+    def __init__(self, video_path, video_duration, parent=None, cache=None, cache_data=None):
         super().__init__(parent)
         self.video_path = video_path
         self.video_duration = video_duration
         self.cache = cache
+        self.cache_data = cache_data or {}
         self.clips = []
         self.clip_items = []
         self.pixels_per_second = 50
@@ -728,59 +729,54 @@ class EditTimelineScene(QGraphicsScene):
         self.build_timeline()
 
     def load_initial_clips(self):
-        """Load initial clips from highlight cache"""
-        self.clips = []
+            """Load initial clips. Prefer THIS run's final (post-subtract) segments
+            so the edit timeline matches exactly what the pipeline cut — including
+            the splits that remove an avoided person. Fall back to cache history
+            only when opened standalone (no run data)."""
+            self.clips = []
 
-        if self.cache and hasattr(self.cache, 'get_highlight_history'):
-            history = self.cache.get_highlight_history(self.video_path, analysis_params=None)
-            if history:
-                entry = history[0]
-                segments = entry.get('segments', [])
-                if segments:
-                    self.clips = segments
-                    print(f"✅ Loaded {len(self.clips)} highlight segments from cache (most recent)")
+            # 1. PREFERRED — this run's final segments, stamped by the pipeline.
+            final = (self.cache_data or {}).get("final_segments")
+            if final:
+                loaded = []
+                for segment in final:
+                    if isinstance(segment, (list, tuple)) and len(segment) >= 2:
+                        start, end = float(segment[0]), float(segment[1])
+                        if end > start and (end - start) >= 0.5:
+                            loaded.append((start, end))
+                if loaded:
+                    self.clips = loaded
+                    print(f"✅ Loaded {len(self.clips)} segments from this run's final_segments")
                     return
 
-        # Fallback: check pipeline-saved segments in analysis cache
-        cache_data = None
-        parent = self.parent()
-        while parent is not None and not hasattr(parent, "cache_data"):
-            parent = parent.parent()
+            # 2. Fallback — most recent highlight version from cache history.
+            if self.cache and hasattr(self.cache, 'get_highlight_history'):
+                history = self.cache.get_highlight_history(self.video_path, analysis_params=None)
+                if history:
+                    segments = history[0].get('segments', [])
+                    if segments:
+                        self.clips = [tuple(s) for s in segments]
+                        print(f"✅ Loaded {len(self.clips)} highlight segments from cache history")
+                        return
 
-        if parent is not None and hasattr(parent, "cache_data"):
-            cache_data = parent.cache_data
-
-        if cache_data and "final_segments" in cache_data:
-            loaded = []
-            for segment in cache_data.get("final_segments", []):
-                if isinstance(segment, (list, tuple)) and len(segment) >= 2:
-                    start, end = float(segment[0]), float(segment[1])
-                    if end > start and (end - start) >= 0.5:
-                        loaded.append((start, end))
-            if loaded:
-                self.clips = loaded
-                print(f"✅ Loaded {len(self.clips)} segments from cache_data['final_segments']")
-                return
-
-        # Last resort: sample clips
-        print("⚠️ No cached highlights found, creating sample clips")
-        if self.video_duration > 30:
-            sample_points = [(0.1, 0.2), (0.3, 0.4), (0.7, 0.8)]
-            for start_ratio, end_ratio in sample_points:
-                start = self.video_duration * start_ratio
-                end = self.video_duration * end_ratio
-                duration = end - start
-                if duration > 15:
-                    end = start + 15
-                elif duration < 3:
-                    end = start + 3
-                if end <= self.video_duration:
+            # 3. Last resort — sample clips.
+            print("⚠️ No cached highlights found, creating sample clips")
+            if self.video_duration > 30:
+                for start_ratio, end_ratio in [(0.1, 0.2), (0.3, 0.4), (0.7, 0.8)]:
+                    start = self.video_duration * start_ratio
+                    end = self.video_duration * end_ratio
+                    duration = end - start
+                    if duration > 15:
+                        end = start + 15
+                    elif duration < 3:
+                        end = start + 3
+                    if end <= self.video_duration:
+                        self.clips.append((start, end))
+            else:
+                start = max(0, self.video_duration / 4)
+                end = min(self.video_duration, self.video_duration * 3 / 4)
+                if end - start >= 3:
                     self.clips.append((start, end))
-        else:
-            start = max(0, self.video_duration / 4)
-            end = min(self.video_duration, self.video_duration * 3 / 4)
-            if end - start >= 3:
-                self.clips.append((start, end))
 
     def build_timeline(self):
         """Build the edit timeline visualization"""

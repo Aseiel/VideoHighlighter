@@ -1312,7 +1312,7 @@ class SignalTimelineWindow(QMainWindow):
         edit_layout = QVBoxLayout(edit_widget)
         
         # Edit timeline
-        self.edit_scene = EditTimelineScene(self.video_path, self.video_duration, cache=self.cache)
+        self.edit_scene = EditTimelineScene(self.video_path, self.video_duration, cache=self.cache, cache_data=self.cache_data)
         self.edit_view = QGraphicsView(self.edit_scene)
         self.edit_view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.edit_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
