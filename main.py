@@ -3114,7 +3114,8 @@ class VideoHighlighterGUI(QWidget):
         self.task_label.setText("🚀 Initializing...")
         self.run_btn.setText("⏸ Pause")
         self.run_btn.setStyleSheet("QPushButton { background-color: #ff8c00; color: white; font-weight: bold; padding: 8px; }")
-        
+        self.cancel_btn.setEnabled(True)
+
         # Disable form inputs during processing
         self.file_list.setEnabled(False)
         self.output_input.setEnabled(False)
