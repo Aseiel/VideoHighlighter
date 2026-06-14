@@ -1335,11 +1335,17 @@ class VideoHighlighterGUI(QWidget):
         avoid_group = QGroupBox("🚫 Avoid People")
         avoid_group_layout = QVBoxLayout()
 
+        self.avoid_face_recognition_chk = QCheckBox("Enable face recognition")
+        self.avoid_face_recognition_chk.setChecked(self.config_data.get("avoid", {}).get("face_recognition_enabled", False))
+        self.avoid_face_recognition_chk.setToolTip(
+            "When enabled, the pipeline runs face recognition to locate avoided people and skip or crop them out.\n"
+            "Disable to skip the face-recognition step entirely (faster, no avoid enforcement)."
+        )
+        avoid_group_layout.addWidget(self.avoid_face_recognition_chk)
+
         avoid_info = QLabel(
             "People you name in the Timeline Viewer (right-click a face → Name) "
-            "show up here. Tick someone to exclude them from generated highlights.\n"
-            "⚠️ Capture-only for now — actual cropping needs the cropper's "
-            "person-exclusion support."
+            "show up here. Tick someone to exclude them from generated highlights."
         )
         avoid_info.setWordWrap(True)
         avoid_info.setStyleSheet("color: #666; font-size: 9pt;")
@@ -2451,6 +2457,9 @@ class VideoHighlighterGUI(QWidget):
                 "draw_object_boxes": self.bbox_objects_chk.isChecked(),
                 "draw_action_labels": self.bbox_actions_chk.isChecked(),
             },
+            "avoid": {
+                "face_recognition_enabled": self.avoid_face_recognition_chk.isChecked(),
+            },
             "ui": {
                 "suppress_no_cache_warning": self.config_data.get("ui", {}).get("suppress_no_cache_warning", False),
             },
@@ -3056,7 +3065,7 @@ class VideoHighlighterGUI(QWidget):
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
             "action_backend": self.action_backend_combo.currentData(),
             "r3d_model": self.r3d_model_combo.currentData(),
-            "avoid_enabled": bool(avoid_ids),
+            "avoid_enabled": self.avoid_face_recognition_chk.isChecked() and bool(avoid_ids),
             "avoid_method": getattr(self, "_avoid_method", "skip"),
             "avoid_identity_ids": avoid_ids,
             "face_db_path": "./cache/face_db.json",
