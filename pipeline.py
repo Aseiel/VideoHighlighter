@@ -125,11 +125,12 @@ def check_gpu_availability(log_fn=print):
 # Keep old name as alias for backward compatibility
 check_xpu_availability = check_gpu_availability
 
-def collect_analysis_data(video_path, video_duration, fps, transcript_segments, 
-                         object_detections, action_detections, scenes, 
+def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
+                         object_detections, action_detections, scenes,
                          motion_events, motion_peaks, audio_peaks, source_lang="en",
-                         waveform_data=None, keyword_segments_only=False, 
-                         search_keywords=None, keyword_matches=None, action_bboxes=None):
+                         waveform_data=None, keyword_segments_only=False,
+                         search_keywords=None, keyword_matches=None, action_bboxes=None,
+                         object_bboxes=None):
     """
     Collect all analysis results into a structured dictionary for caching.
 
@@ -217,10 +218,12 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
     # Also keep legacy key for backward compatibility
     analysis_data["audio_peaks"] = audio_peaks_clean
     
-    # Bbox data for realtime overlay (realtime_overlay.py reads 'action_bboxes')
+    # Bbox data for realtime overlay
     if action_bboxes:
         analysis_data["action_bboxes"] = action_bboxes
-    
+    if object_bboxes:
+        analysis_data["object_bboxes"] = object_bboxes
+
     return analysis_data
 
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None, 
@@ -925,6 +928,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             yolo_model = None
 
         # --- Object detection ---
+        object_bboxes_cache = []  # default so cache save never NameErrors when objects are skipped
         if not using_cache:
             if not highlight_objects:
                 log("ℹ Skipping object detection (no objects to highlight)")
@@ -1220,6 +1224,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     search_keywords=SEARCH_KEYWORDS if keyword_segments_only else None,
                     keyword_matches=keyword_matches,
                     action_bboxes=action_bboxes_cache,
+                    object_bboxes=object_bboxes_cache,
                 )
                 
                 # Add analysis parameters for future validation
