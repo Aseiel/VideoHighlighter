@@ -1501,14 +1501,16 @@ class SignalTimelineWindow(QMainWindow):
                         self.edit_scene.remove_selected_clips()
                         return True
 
-            if event.key() == Qt.Key_Right:
+            if event.key() in (Qt.Key_Left, Qt.Key_Right):
+                from PySide6.QtWidgets import QLineEdit, QTextEdit, QPlainTextEdit, QComboBox
+                focused = QApplication.focusWidget()
+                if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit, QComboBox)):
+                    return False
                 step = 1.0 if not (event.modifiers() & Qt.ShiftModifier) else 5.0
-                self.on_time_clicked(self.current_time + step)
-                return True
-
-            if event.key() == Qt.Key_Left:
-                step = 1.0 if not (event.modifiers() & Qt.ShiftModifier) else 5.0
-                self.on_time_clicked(max(0, self.current_time - step))
+                if event.key() == Qt.Key_Right:
+                    self.on_time_clicked(self.current_time + step)
+                else:
+                    self.on_time_clicked(max(0, self.current_time - step))
                 return True
 
         return super().eventFilter(obj, event)
