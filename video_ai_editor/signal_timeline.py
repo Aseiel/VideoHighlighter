@@ -29,6 +29,11 @@ class SignalTimelineScene(QGraphicsScene):
         self.waveform = waveform or []
         self.waveform_opacity = 0.7
 
+        # Always generate colors — they're used by draw_waveform_layer
+        # regardless of whether the waveform comes from the constructor
+        # (cached path) or from set_waveform_data (extraction path)
+        self.waveform_colors = self.generate_waveform_colors()
+
         print(f"🎵 SignalTimelineScene init: waveform={len(self.waveform)} points")
       
         # Dynamic zoom for short videos
@@ -201,7 +206,7 @@ class SignalTimelineScene(QGraphicsScene):
                 # Calculate amplitude
                 amplitude = (abs(min_val) + abs(max_val)) / 2
                 amplitude_index = min(255, int(amplitude * 500))
-
+              
                 # Get color
                 if self.waveform_colors and amplitude_index < len(self.waveform_colors):
                     color = self.waveform_colors[amplitude_index]
