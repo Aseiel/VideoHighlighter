@@ -25,12 +25,17 @@ try:
 except Exception:
     pass
 
-CONFIG_FILE = "config.yaml"
+def _resource_path(filename: str) -> str:
+    """Resolve a bundled resource path for both script and PyInstaller exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, filename)
 
-YOLO_OBJECTS_LABELS_FILE = "yolo_objects_labels.json"
-KINETICS_400_LABELS_FILE = "kinetics_400_labels.json"
-INTEL_CUSTOM_LABELS_FILE = "intel_finetuned_classifier_3d_mapping.json"
-R3D_CUSTOM_LABELS_FILE = "r3d_finetuned_mapping.json"
+CONFIG_FILE = _resource_path("config.yaml")
+
+YOLO_OBJECTS_LABELS_FILE = _resource_path("yolo_objects_labels.json")
+KINETICS_400_LABELS_FILE = _resource_path("kinetics_400_labels.json")
+INTEL_CUSTOM_LABELS_FILE = _resource_path("intel_finetuned_classifier_3d_mapping.json")
+R3D_CUSTOM_LABELS_FILE = _resource_path("r3d_finetuned_mapping.json")
 
 class LabelSelectorDialog(QDialog):
     """Dialog with search/filter and multi-select for labels."""
