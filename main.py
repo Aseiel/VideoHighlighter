@@ -420,20 +420,21 @@ class FaceScanWorker(QThread):
     def run(self):
             try:
                 from video_ai_editor.face_identity import FaceIdentityBank
-                from video_ai_editor.identity_tagging import tag_video_with_identities
-                from modules.compute_forbidden import build_tracking_model, track_device
+                from modules.compute_forbidden import build_tracking_model, tag_entries
 
                 bank = FaceIdentityBank(db_path=self.db_path)
                 model = build_tracking_model("n", log_fn=self.log.emit)
                 self.log.emit(f"🔍 Scanning {os.path.basename(self.video_path)} for faces…")
-                tag_video_with_identities(
+                # tag_entries caches the per-frame tagging so the pipeline's avoid step
+                # reuses this same pass instead of re-running face recognition.
+                tag_entries(
                     self.video_path, bank,
-                    model=model,
-                    device=track_device(),
+                    yolo_model=model,
+                    model_size="n",
                     face_every=15,
                     vid_stride=3,
                     save_bank=True,
-                    progress_cb=lambda i, m: self.log.emit(f"  {m}") if i % 150 == 0 else None,
+                    log_fn=self.log.emit,
                 )
                 self.done.emit(len(bank))
             except Exception as e:
