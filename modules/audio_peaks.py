@@ -3,7 +3,30 @@ import subprocess
 import tempfile
 import numpy as np
 import wave
+import sys
 from tqdm import tqdm
+
+def safe_tqdm(*args, **kwargs):
+    """
+    Safely create tqdm progress bar, handling cases where stderr is None or doesn't have write method.
+    This is particularly important for GUI applications and frozen executables.
+    """
+    # Check if stderr exists and has a write method
+    if sys.stderr is None or not hasattr(sys.stderr, "write"):
+        kwargs["disable"] = True
+    
+    # Ensure the file parameter is valid
+    if "file" not in kwargs or kwargs.get("file") is None:
+        # Use stdout if available and has write method, otherwise use stderr
+        if sys.stdout is not None and hasattr(sys.stdout, "write"):
+            kwargs["file"] = sys.stdout
+        elif sys.stderr is not None and hasattr(sys.stderr, "write"):
+            kwargs["file"] = sys.stderr
+        else:
+            # If both are invalid, disable the progress bar
+            kwargs["disable"] = True
+    
+    return tqdm(*args, **kwargs)
 
 def extract_waveform_data(video_path, num_points=1000):
     """Extract waveform amplitude data for visualization"""
@@ -102,8 +125,12 @@ def extract_audio_peaks(video_path, threshold_db=-20, chunk_duration_ms=10, merg
         # Store raw peaks with their amplitude
         raw_peaks = []
         
-        # Process audio in chunks with overlap for better detection
-        pbar = tqdm(total=len(audio) // samples_per_chunk, desc="Audio peak detection")
+        # Create progress bar with safe handling for GUI/EXE environments
+        total_chunks = len(audio) // samples_per_chunk
+        pbar = safe_tqdm(
+            total=total_chunks, 
+            desc="Audio peak detection"
+        )
         
         for chunk_start in range(0, len(audio), samples_per_chunk):
             # Check for cancellation every 100 chunks
