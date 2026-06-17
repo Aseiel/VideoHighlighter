@@ -61,22 +61,17 @@ def tag_video_with_identities(
     model=None,                             # pre-built YOLO model (reused if provided)
     device=None,                            # tracking device: 'xpu' | 0 (cuda) | 'cpu'
     progress_cb=None,                       # optional: progress_cb(frame_idx, message)
-    
+    avoid_match_threshold: float = 0.38,    # direct-match threshold for AVOIDED ids
+                                            # (looser than bank.sim_threshold on purpose)
 ) -> list[dict]:
     """
     Run tracking + face identity over a video and return identity-tagged
     per-timestamp box entries (object_bboxes shape).
 
-    Each returned entry:
-        {
-            "timestamp": float,
-            "objects":        ["person", ...],
-            "bboxes":         [[x, y, w, h], ...],   # normalised 0..1
-            "confidences":    [float, ...],
-            "track_ids":      [int|None, ...],
-            "identity_ids":   [str|None, ...],
-            "identity_names": [str|None, ...],
-        }
+    AVOID OVERRIDE: every detected face is also matched DIRECTLY against the
+    embeddings of avoided identities (bank.avoided_ids()) with a relaxed
+    threshold. A direct hit overrides the track's majority vote — for
+    exclusion, "appears at all" must win over "is the most common face".
     """
     try:
         from ultralytics import YOLO
@@ -93,11 +88,24 @@ def tag_video_with_identities(
     if model is None:
         model = YOLO(yolo_model_path)
 
+    # ── direct-match galleries for avoided identities ────────────────
+    avoid_galleries = []
+    try:
+        for av_iid in bank.avoided_ids():
+            ident = bank._id_index.get(av_iid)
+            if ident is not None and ident["embeddings"].size:
+                avoid_galleries.append((av_iid, ident["embeddings"]))
+    except Exception:
+        pass
+    if avoid_galleries:
+        print(f"🚫 Direct avoid-match active for {len(avoid_galleries)} identit(ies), "
+              f"threshold={avoid_match_threshold}")
+
     # PASS 1 — track people, collect boxes, vote on identities per track
     # ------------------------------------------------------------------
-    # Per-frame raw records (identity filled in pass 2)
     frame_records: list[dict] = []          # {timestamp, boxes:[{...}]}
     track_votes: dict[int, Counter] = defaultdict(Counter)
+    avoid_track_votes: dict[int, Counter] = defaultdict(Counter)
 
     results = model.track(
         source=video_path,
@@ -132,6 +140,7 @@ def tag_video_with_identities(
                     "px": (int(x1), int(y1), int(x2), int(y2)),
                     "conf": float(conf),
                     "track_id": (int(tid) if tid is not None else None),
+                    "force_iid": None,
                 })
 
         # face recognition only on sampled frames
@@ -149,6 +158,17 @@ def tag_video_with_identities(
                     if b["track_id"] is not None:
                         track_votes[b["track_id"]][iid] += 1
 
+                    # ── direct match against AVOIDED identities ─────
+                    # Independent of clustering and majority voting: if
+                    # this face IS the avoided person, mark it, period.
+                    for av_iid, gal in avoid_galleries:
+                        sim = float(np.max(gal @ face["embedding"]))
+                        if sim >= avoid_match_threshold:
+                            b["force_iid"] = av_iid
+                            if b["track_id"] is not None:
+                                avoid_track_votes[b["track_id"]][av_iid] += 1
+                            break
+
         # store normalised boxes for this frame (identity filled later)
         norm_boxes = []
         for b in boxes_px:
@@ -157,6 +177,7 @@ def tag_video_with_identities(
                 "bbox": [x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h],
                 "conf": b["conf"],
                 "track_id": b["track_id"],
+                "force_iid": b["force_iid"],
             })
         frame_records.append({"timestamp": timestamp, "boxes": norm_boxes})
 
@@ -172,9 +193,18 @@ def tag_video_with_identities(
         if n >= min_votes:
             track_identity[tid] = winner
 
+    # AVOID OVERRIDE — any direct avoid hit on a track wins over the vote.
+    forced = 0
+    for tid, votes in avoid_track_votes.items():
+        av_iid, _ = votes.most_common(1)[0]
+        if track_identity.get(tid) != av_iid:
+            forced += 1
+        track_identity[tid] = av_iid
+
     print(f"🪪 Resolved {len(track_identity)} track→identity mappings "
           f"from {len(track_votes)} tracks "
-          f"({len(bank)} identities in bank)")
+          f"({len(bank)} identities in bank)"
+          + (f" — 🚫 {forced} track(s) forced to avoided identity" if forced else ""))
 
     # PASS 3 — emit object_bboxes shape with identity filled in
     # ------------------------------------------------------------------
@@ -186,7 +216,7 @@ def tag_video_with_identities(
         track_ids, identity_ids, identity_names = [], [], []
         for b in rec["boxes"]:
             tid = b["track_id"]
-            iid = track_identity.get(tid) if tid is not None else None
+            iid = b.get("force_iid") or (track_identity.get(tid) if tid is not None else None)
             objects.append("person")
             bboxes.append(b["bbox"])
             confs.append(b["conf"])
@@ -207,7 +237,6 @@ def tag_video_with_identities(
         bank.save()
 
     return object_bboxes
-
 
 # ──────────────────────────────────────────────────────────────────
 # helpers
