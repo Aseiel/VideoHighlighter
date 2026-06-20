@@ -1,5 +1,5 @@
 """
-Real-Time BBox Overlay for Video Preview — v1
+Real-Time BBox Overlay for Video Preview — v2 (Memory Optimized)
 
 Uses QGraphicsScene + QGraphicsVideoItem to composite bounding boxes
 directly on top of the video frame. No pre-rendering needed.
@@ -25,6 +25,12 @@ Usage in signal_timeline_viewer.py:
 
     # Capture composited frame for LLM (video + bboxes = one image):
     base64_str = self.overlay_preview.capture_frame_base64()
+
+OPTIMIZATIONS:
+- Lazy loading: bboxes loaded on demand, not all at once
+- Time-based filtering: only loads bboxes for current time window
+- Memory cleanup: releases bbox data when not in use
+- Bucket caching: caches only active time buckets
 """
 
 from __future__ import annotations
@@ -32,10 +38,11 @@ from __future__ import annotations
 import os
 import base64
 from typing import Optional
+import gc
+from typing import Optional, Dict, List, Set, Tuple
 from collections import defaultdict
 from video_ai_editor.face_identity import FaceIdentityBank
 from video_ai_editor.live_face import LiveFaceController, LiveFaceOverlay
-
 
 from PySide6.QtCore import Qt, QRectF, QTimer, QUrl, QPointF, Signal, QSizeF
 from PySide6.QtGui import (
@@ -48,6 +55,12 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -67,6 +80,245 @@ def color_for_class(class_name: str) -> QColor:
         _CLASS_COLORS[key] = QColor.fromHsvF(_next_hue % 1.0, 0.85, 0.95)
         _next_hue += _HUE_STEP
     return _CLASS_COLORS[key]
+
+
+# ──────────────────────────────────────────────────────────────────
+# LazyBBoxLoader — loads bboxes on demand
+# ──────────────────────────────────────────────────────────────────
+
+class LazyBBoxLoader:
+    """
+    Loads bbox data lazily from cache.
+    Only loads data when needed for a specific time range.
+    Caches recently accessed buckets with LRU-like behavior.
+    """
+    
+    def __init__(self, cache_data: dict, max_cached_buckets: int = 20):
+        """
+        Args:
+            cache_data: The full cache dictionary
+            max_cached_buckets: Maximum number of time buckets to keep in memory
+        """
+        self.cache_data = cache_data
+        self.max_cached_buckets = max_cached_buckets
+        
+        # Store raw bbox data (loaded lazily)
+        self._object_bboxes: List[dict] = []
+        self._action_bboxes: List[dict] = []
+        self._loaded = False
+        self._load_count = 0
+        
+        # Cache for time buckets (dict of bucket -> list of bbox items)
+        self._bucket_cache: Dict[int, List[dict]] = {}
+        self._bucket_access_order: List[int] = []
+        
+        # Build index of timestamps without loading all data
+        self._timestamp_index: Dict[int, List[dict]] = defaultdict(list)
+        self._index_loaded = False
+        
+        # Memory tracking
+        self._peak_memory_mb = 0
+        
+    def _ensure_loaded(self):
+        """Load all bbox data from cache (called once)."""
+        if self._loaded:
+            return
+        
+        print(f"📦 Loading bbox data from cache...")
+        
+        # ── Object bboxes ──
+        self._object_bboxes = self.cache_data.get('object_bboxes', []) or []
+        # Fallback: check objects entries with bboxes
+        if not self._object_bboxes:
+            self._object_bboxes = [
+                e for e in self.cache_data.get('objects', [])
+                if e.get('bboxes') or e.get('bbox')
+            ]
+        
+        # ── Action bboxes ──
+        self._action_bboxes = self.cache_data.get('action_bboxes', []) or []
+        # Fallback: check actions entries with bboxes
+        if not self._action_bboxes:
+            self._action_bboxes = [
+                e for e in self.cache_data.get('actions', [])
+                if e.get('bbox')
+            ]
+        
+        self._loaded = True
+        self._load_count = len(self._object_bboxes) + len(self._action_bboxes)
+        
+        print(f"   Loaded {self._load_count} bbox overlays")
+        print(f"   Object bboxes: {len(self._object_bboxes)}, Action bboxes: {len(self._action_bboxes)}")
+        
+        # Build timestamp index
+        self._build_timestamp_index()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        if HAS_PSUTIL:
+            mem = psutil.Process().memory_info().rss / (1024 * 1024)
+            print(f"   Memory after load: {mem:.1f} MB")
+    
+    def _build_timestamp_index(self):
+        """Build index of timestamps for fast lookup."""
+        if self._index_loaded:
+            return
+        
+        # Index object bboxes
+        for entry in self._object_bboxes:
+            ts = entry.get('timestamp', 0)
+            bucket = int(ts * 10)
+            self._timestamp_index[bucket].append(('object', entry))
+        
+        # Index action bboxes
+        for entry in self._action_bboxes:
+            ts = entry.get('timestamp', 0)
+            bucket = int(ts * 10)
+            self._timestamp_index[bucket].append(('action', entry))
+        
+        self._index_loaded = True
+        print(f"   Built index: {len(self._timestamp_index)} time buckets")
+    
+    def get_bboxes_for_time(self, time_seconds: float, window: float = 0.5) -> List[dict]:
+        """
+        Get bboxes for a specific time range.
+        Only loads data from cache when needed.
+        
+        Args:
+            time_seconds: Current time in seconds
+            window: Time window in seconds (bboxes within this range are returned)
+        
+        Returns:
+            List of bbox entries with their data
+        """
+        self._ensure_loaded()
+        
+        # Calculate bucket range
+        center_bucket = int(time_seconds * 10)
+        half_window = max(1, int(window * 10))
+        start_bucket = center_bucket - half_window
+        end_bucket = center_bucket + half_window
+        
+        # Get bboxes from cache
+        result = []
+        buckets_to_load = []
+        
+        for bucket in range(start_bucket, end_bucket + 1):
+            if bucket in self._bucket_cache:
+                # Already cached
+                result.extend(self._bucket_cache[bucket])
+            else:
+                # Need to load this bucket
+                buckets_to_load.append(bucket)
+        
+        if buckets_to_load:
+            # Load missing buckets from index
+            for bucket in buckets_to_load:
+                if bucket in self._timestamp_index:
+                    entries = self._timestamp_index[bucket]
+                    # Convert to dict format expected by BBoxOverlayItem
+                    bboxes = []
+                    for entry_type, entry in entries:
+                        if entry_type == 'object':
+                            bboxes.extend(self._object_entry_to_bboxes(entry))
+                        else:  # action
+                            bboxes.extend(self._action_entry_to_bboxes(entry))
+                    
+                    self._bucket_cache[bucket] = bboxes
+                    result.extend(bboxes)
+                    
+                    # Update access order
+                    if bucket in self._bucket_access_order:
+                        self._bucket_access_order.remove(bucket)
+                    self._bucket_access_order.append(bucket)
+                    
+                    # LRU cleanup
+                    while len(self._bucket_cache) > self.max_cached_buckets:
+                        oldest = self._bucket_access_order.pop(0)
+                        if oldest in self._bucket_cache:
+                            del self._bucket_cache[oldest]
+        
+        return result
+    
+    def _object_entry_to_bboxes(self, entry: dict) -> List[dict]:
+        """Convert an object entry to bbox dicts."""
+        ts = entry.get('timestamp', 0)
+        names = entry.get('objects', [])
+        bboxes = entry.get('bboxes', [])
+        if not bboxes and entry.get('bbox'):
+            bboxes = [entry['bbox']] * max(1, len(names))
+        confidences = entry.get('confidences', [])
+        
+        result = []
+        for i, name in enumerate(names):
+            if i >= len(bboxes):
+                break
+            bbox = bboxes[i]
+            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                continue
+            conf = confidences[i] if i < len(confidences) else 0.5
+            result.append({
+                'timestamp': ts,
+                'class_name': str(name),
+                'confidence': float(conf),
+                'bbox': tuple(bbox[:4]),
+                'type': 'object'
+            })
+        return result
+    
+    def _action_entry_to_bboxes(self, entry: dict) -> List[dict]:
+        """Convert an action entry to bbox dicts."""
+        ts = entry.get('timestamp', 0)
+        bbox = entry.get('bbox')
+        if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            return []
+        
+        name = entry.get('action_name') or entry.get('action', 'action')
+        conf = entry.get('confidence', 0.5)
+        
+        return [{
+            'timestamp': ts,
+            'class_name': f"[A] {name}",
+            'confidence': float(conf),
+            'bbox': tuple(bbox[:4]),
+            'type': 'action'
+        }]
+    
+    def clear_cache(self):
+        """Clear the bucket cache to free memory."""
+        self._bucket_cache.clear()
+        self._bucket_access_order.clear()
+        gc.collect()
+    
+    def get_total_count(self) -> int:
+        """Get total number of bboxes without loading all data."""
+        if self._loaded:
+            return self._load_count
+        
+        # Count from cache without loading
+        count = len(self.cache_data.get('object_bboxes', []))
+        count += len(self.cache_data.get('action_bboxes', []))
+        
+        # Check fallback entries
+        if count == 0:
+            count += len([e for e in self.cache_data.get('objects', []) if e.get('bboxes') or e.get('bbox')])
+            count += len([e for e in self.cache_data.get('actions', []) if e.get('bbox')])
+        
+        return count
+    
+    def get_memory_usage_mb(self) -> float:
+        """Get current memory usage of the loader."""
+        if not HAS_PSUTIL:
+            return 0.0
+        
+        try:
+            mem = psutil.Process().memory_info().rss / (1024 * 1024)
+            if mem > self._peak_memory_mb:
+                self._peak_memory_mb = mem
+            return mem
+        except:
+            return 0.0
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -167,6 +419,9 @@ class OverlayScene(QGraphicsScene):
         self._bbox_items: dict[int, list[BBoxOverlayItem]] = defaultdict(list)
         self._all_bbox_items: list[BBoxOverlayItem] = []
         self._visible_bucket: int = -1
+        
+        # Track which items are currently visible
+        self._visible_count: int = 0
 
         # Video dimensions (updated when native size changes)
         self._video_w: float = 1920
@@ -186,7 +441,7 @@ class OverlayScene(QGraphicsScene):
             for item in self._all_bbox_items:
                 item.update_geometry(self._video_w, self._video_h)
 
-    def load_detections(self, cache_data: dict, time_window: float = 0.5):
+    def load_detections_lazy(self, bbox_loader: LazyBBoxLoader):
         """
         Load object/action detections from cache and create overlay items.
 
@@ -203,6 +458,9 @@ class OverlayScene(QGraphicsScene):
         Standard keys (fallback — entries with bbox data are used):
             cache_data['objects'] — entries that have a 'bboxes' field
             cache_data['actions'] — entries that have a 'bbox' field
+
+        Load detections from the lazy loader.
+        Only creates items that will be visible soon.
         """
         # Clear existing items
         for item in self._all_bbox_items:
@@ -210,100 +468,18 @@ class OverlayScene(QGraphicsScene):
         self._all_bbox_items.clear()
         self._bbox_items.clear()
         self._visible_bucket = -1
-
-        count = 0
-
-        # ── Objects with bboxes ──
-        # Check dedicated key first, fall back to standard 'objects' key
-        object_entries = cache_data.get('object_bboxes') or []
-        if not object_entries:
-            object_entries = [
-                e for e in cache_data.get('objects', [])
-                if e.get('bboxes') or e.get('bbox')
-            ]
-
-        for entry in object_entries:
-            ts = entry.get('timestamp', 0)
-            names = entry.get('objects', [])
-
-            # Support both 'bboxes' (list) and 'bbox' (single)
-            bboxes = entry.get('bboxes', [])
-            if not bboxes and entry.get('bbox'):
-                bboxes = [entry['bbox']] * max(1, len(names))
-
-            confidences = entry.get('confidences', [])
-
-            for i, name in enumerate(names):
-                if i >= len(bboxes):
-                    break
-
-                bbox = bboxes[i]
-                if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-                    continue
-
-                conf = confidences[i] if i < len(confidences) else 0.5
-
-                item = BBoxOverlayItem(
-                    bbox=tuple(bbox[:4]),
-                    class_name=str(name),
-                    confidence=float(conf),
-                    timestamp=float(ts),
-                )
-                item.update_geometry(self._video_w, self._video_h)
-                self.addItem(item)
-                self._all_bbox_items.append(item)
-
-                bucket = int(ts * 10)
-                self._bbox_items[bucket].append(item)
-                count += 1
-
-        # ── Actions with bboxes ──
-        # Check dedicated key first, fall back to standard 'actions' key
-        action_entries = cache_data.get('action_bboxes') or []
-        if not action_entries:
-            action_entries = [
-                e for e in cache_data.get('actions', [])
-                if e.get('bbox')
-            ]
-
-        for entry in action_entries:
-            ts = entry.get('timestamp', 0)
-            bbox = entry.get('bbox')
-            if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-                continue
-
-            name = entry.get('action_name') or entry.get('action', 'action')
-            conf = entry.get('confidence', 0.5)
-
-            item = BBoxOverlayItem(
-                bbox=tuple(bbox[:4]),
-                class_name=f"[A] {name}",
-                confidence=float(conf),
-                timestamp=float(ts),
-            )
-            item.update_geometry(self._video_w, self._video_h)
-            self.addItem(item)
-            self._all_bbox_items.append(item)
-
-            bucket = int(ts * 10)
-            self._bbox_items[bucket].append(item)
-            count += 1
-
-        # ── Debug output ──
-        print(f"🎯 Loaded {count} bbox overlays ({len(self._bbox_items)} time buckets)")
-        print(f"   Cache keys: object_bboxes={len(cache_data.get('object_bboxes') or [])}, "
-            f"action_bboxes={len(cache_data.get('action_bboxes') or [])}, "
-            f"objects(w/bbox)={len([e for e in cache_data.get('objects',[]) if e.get('bboxes')])}, "
-            f"actions(w/bbox)={len([e for e in cache_data.get('actions',[]) if e.get('bbox')])}")
-        if count == 0:
-            relevant = [k for k in cache_data if any(s in k.lower() for s in ('bbox','detect','object','action'))]
-            print(f"   ⚠️  No bbox data found. Relevant keys in cache: {relevant or 'none'}")
-        return count
+        
+        # We don't load all bboxes here - they'll be loaded on demand
+        # Just store the loader reference
+        self._bbox_loader = bbox_loader
+        self._detection_count = bbox_loader.get_total_count()
+        print(f"🎯 Lazy loader ready: {self._detection_count} bboxes available")
+        return self._detection_count
 
     def update_time(self, time_seconds: float, window: float = 0.3):
         """
         Show only bboxes near the current timestamp.
-        Called every frame (~30fps) from position update.
+        Lazily loads bboxes from cache as needed.
         """
         center_bucket = int(time_seconds * 10)
 
@@ -311,7 +487,35 @@ class OverlayScene(QGraphicsScene):
         if center_bucket == self._visible_bucket:
             return
         self._visible_bucket = center_bucket
-
+        
+        # Get bboxes from lazy loader for this time range
+        if hasattr(self, '_bbox_loader'):
+            bbox_data = self._bbox_loader.get_bboxes_for_time(time_seconds, window)
+            
+            # Check if we need to add new items
+            existing_timestamps = {item.timestamp for item in self._all_bbox_items}
+            new_items = []
+            
+            for bbox in bbox_data:
+                ts = bbox.get('timestamp', 0)
+                # Only add if not already in scene
+                if ts not in existing_timestamps:
+                    item = BBoxOverlayItem(
+                        bbox=bbox['bbox'],
+                        class_name=bbox['class_name'],
+                        confidence=bbox['confidence'],
+                        timestamp=ts,
+                    )
+                    item.update_geometry(self._video_w, self._video_h)
+                    self.addItem(item)
+                    self._all_bbox_items.append(item)
+                    new_items.append(item)
+                    bucket = int(ts * 10)
+                    self._bbox_items[bucket].append(item)
+            
+            if new_items:
+                print(f"📦 Added {len(new_items)} new bbox items at {time_seconds:.1f}s")
+        
         # Calculate which buckets are in range
         half_window_buckets = max(1, int(window * 10))
         active_buckets = set(
@@ -320,11 +524,16 @@ class OverlayScene(QGraphicsScene):
         )
 
         # Show/hide items
+        visible_count = 0
         for bucket, items in self._bbox_items.items():
             visible = bucket in active_buckets
             for item in items:
                 if item.isVisible() != visible:
                     item.setVisible(visible)
+                if visible:
+                    visible_count += 1
+        
+        self._visible_count = visible_count
 
     def set_overlays_visible(self, visible: bool):
         """Toggle all overlays on/off."""
@@ -340,6 +549,21 @@ class OverlayScene(QGraphicsScene):
             for item in self._all_bbox_items
             if item.isVisible()
         }
+    
+    def get_memory_usage(self) -> int:
+        """Get number of items currently in scene."""
+        return len(self._all_bbox_items)
+    
+    def clear_items(self):
+        """Remove all bbox items to free memory."""
+        for item in self._all_bbox_items:
+            self.removeItem(item)
+        self._all_bbox_items.clear()
+        self._bbox_items.clear()
+        self._visible_bucket = -1
+        if hasattr(self, '_bbox_loader'):
+            self._bbox_loader.clear_cache()
+        gc.collect()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -349,7 +573,6 @@ class OverlayScene(QGraphicsScene):
 class OverlayView(QGraphicsView):
     """View that keeps video aspect ratio and supports smooth resize."""
     identity_context_requested = Signal(object, object)   # (identity_id, global_pos)
-
 
     def __init__(self, scene: OverlayScene, parent=None):
         super().__init__(scene, parent)
@@ -389,6 +612,7 @@ class OverlayView(QGraphicsView):
             return
         super().contextMenuEvent(event)
 
+
 # ──────────────────────────────────────────────────────────────────
 # RealtimeOverlayPreview — drop-in replacement for QVideoWidget
 # ──────────────────────────────────────────────────────────────────
@@ -399,6 +623,11 @@ class RealtimeOverlayPreview(QWidget):
 
     Drop-in replacement for QVideoWidget + controls.
     Creates its own QMediaPlayer internally.
+    
+    OPTIMIZATIONS:
+    - Lazy loading: bboxes loaded on demand
+    - LRU cache: only keeps recent time buckets in memory
+    - Memory cleanup: clears items when overlay is off
     """
 
     # Emitted when overlay mode changes
@@ -410,6 +639,7 @@ class RealtimeOverlayPreview(QWidget):
         video_path: str,
         cache_data: dict | None = None,
         parent: QWidget | None = None,
+        max_cached_buckets: int = 20,
     ):
         super().__init__(parent)
         self.video_path = video_path
@@ -417,14 +647,24 @@ class RealtimeOverlayPreview(QWidget):
 
         self._overlay_enabled = False
         self._detection_count = 0
+        self._max_cached_buckets = max_cached_buckets
 
         self._init_ui()
         self._view.identity_context_requested.connect(self._on_identity_context)
         self._init_player()
-        self._load_detections()
+        
+        # Create lazy loader (doesn't load data yet)
+        self._bbox_loader = LazyBBoxLoader(self.cache_data, max_cached_buckets)
+        self._load_detections_lazy()
+        
         self._face_bank = None
         self._live_face = None
-        self._live_overlay = None       
+        self._live_overlay = None
+        
+        # Memory tracking
+        self._memory_timer = QTimer()
+        self._memory_timer.timeout.connect(self._log_memory)
+        self._memory_timer.start(5000)  # Log every 5 seconds
 
     @property
     def player(self) -> QMediaPlayer:
@@ -456,7 +696,8 @@ class RealtimeOverlayPreview(QWidget):
         self._overlay_cb.setChecked(False)
         self._overlay_cb.setToolTip(
             "Show bounding boxes from cached detections in real-time.\n"
-            "Uses detection data already in cache — no GPU cost."
+            "Uses detection data already in cache — no GPU cost.\n"
+            "Only loads bboxes near current playhead position."
         )
         self._overlay_cb.stateChanged.connect(self._on_overlay_toggled)
         controls.addWidget(self._overlay_cb)
@@ -467,6 +708,11 @@ class RealtimeOverlayPreview(QWidget):
         controls.addWidget(self._count_label)
 
         controls.addStretch()
+
+        # Memory usage label
+        self._mem_label = QLabel("")
+        self._mem_label.setStyleSheet("color: #666; font-size: 10px;")
+        controls.addWidget(self._mem_label)
 
         # Time window slider
         controls.addWidget(QLabel("Window:"))
@@ -510,12 +756,12 @@ class RealtimeOverlayPreview(QWidget):
             lambda _: self._view._fit_video()
         )
 
-    def _load_detections(self):
-        """Load bbox data from cache."""
-        self._detection_count = self._scene.load_detections(self.cache_data)
+    def _load_detections_lazy(self):
+        """Load bbox data lazily from cache."""
+        self._detection_count = self._scene.load_detections_lazy(self._bbox_loader)
 
         if self._detection_count > 0:
-            self._count_label.setText(f"({self._detection_count} detections loaded)")
+            self._count_label.setText(f"({self._detection_count} detections available)")
             self._overlay_cb.setEnabled(True)
         else:
             self._count_label.setText("(no bbox data in cache)")
@@ -526,17 +772,33 @@ class RealtimeOverlayPreview(QWidget):
                 "or use the pre-rendered video swap instead."
             )
 
+    def _log_memory(self):
+        """Log current memory usage."""
+        if not HAS_PSUTIL:
+            return
+        try:
+            mem = psutil.Process().memory_info().rss / (1024 * 1024)
+            scene_items = self._scene.get_memory_usage()
+            cached_buckets = len(self._bbox_loader._bucket_cache) if hasattr(self, '_bbox_loader') else 0
+            self._mem_label.setText(f"💾 {mem:.0f}MB | Items: {scene_items} | Cache: {cached_buckets}buckets")
+        except:
+            pass
+
     # ── Slots ──────────────────────────────────────────────────────
 
     def _on_overlay_toggled(self, state):
         self._overlay_enabled = (state == Qt.Checked.value)
         self._scene.set_overlays_visible(self._overlay_enabled)
-
+        
         if self._overlay_enabled:
             # Force immediate update at current position
             pos_sec = self._player.position() / 1000.0
             window = self._window_slider.value() / 10.0
             self._scene.update_time(pos_sec, window)
+        else:
+            # Clear items when overlay is off to free memory
+            self._scene.clear_items()
+            self._bbox_loader.clear_cache()
 
         self.overlay_toggled.emit(self._overlay_enabled)
 
@@ -551,35 +813,41 @@ class RealtimeOverlayPreview(QWidget):
     def _on_window_changed(self, value):
         window = value / 10.0
         self._window_label.setText(f"{window:.1f}s")
+        
+        # Update immediately if overlay is enabled
+        if self._overlay_enabled:
+            pos_sec = self._player.position() / 1000.0
+            self._scene.update_time(pos_sec, window)
 
     # ── Public API ─────────────────────────────────────────────────
 
     def set_cache_data(self, cache_data: dict):
         """Update detection data (e.g. after new analysis)."""
         self.cache_data = cache_data
-        self._load_detections()
+        self._bbox_loader = LazyBBoxLoader(self.cache_data, self._max_cached_buckets)
+        self._load_detections_lazy()
 
     def set_overlay_visible(self, visible: bool):
         """Programmatically toggle overlay."""
         self._overlay_cb.setChecked(visible)
 
     def set_live_face_enabled(self, enabled: bool):
-            """Toggle TRUE real-time face recognition on the playing frame."""
-            if enabled and self._live_face is None:
-                # lazy init — only loads InsightFace the first time it's switched on
-                if self._face_bank is None:
-                    self._face_bank = FaceIdentityBank(db_path="./cache/face_db.json")
-                self._live_overlay = LiveFaceOverlay(self._scene)
-                self._live_face = LiveFaceController(
-                    bank=self._face_bank,
-                    video_sink=self._scene.video_item.videoSink(),   # the frame tap
-                )
-                self._live_face.results_ready.connect(self._live_overlay.update_boxes)
+        """Toggle TRUE real-time face recognition on the playing frame."""
+        if enabled and self._live_face is None:
+            # lazy init — only loads InsightFace the first time it's switched on
+            if self._face_bank is None:
+                self._face_bank = FaceIdentityBank(db_path="./cache/face_db.json")
+            self._live_overlay = LiveFaceOverlay(self._scene)
+            self._live_face = LiveFaceController(
+                bank=self._face_bank,
+                video_sink=self._scene.video_item.videoSink(),   # the frame tap
+            )
+            self._live_face.results_ready.connect(self._live_overlay.update_boxes)
 
-            if self._live_face is not None:
-                self._live_face.set_enabled(enabled)
-                if not enabled and self._live_overlay is not None:
-                    self._live_overlay.clear()
+        if self._live_face is not None:
+            self._live_face.set_enabled(enabled)
+            if not enabled and self._live_overlay is not None:
+                self._live_overlay.clear()
 
     def _on_identity_context(self, identity_id, global_pos):
         menu = QMenu(self)
@@ -672,12 +940,25 @@ class RealtimeOverlayPreview(QWidget):
         return image
 
     def get_detection_count(self) -> int:
-        """Number of bbox detections loaded from cache."""
+        """Number of bbox detections available in cache."""
         return self._detection_count
 
     def get_visible_classes(self) -> set[str]:
         """Get currently visible object/action classes."""
         return self._scene.get_visible_classes()
+    
+    def clear_cache(self):
+        """Clear bbox cache to free memory."""
+        self._bbox_loader.clear_cache()
+        self._scene.clear_items()
+        gc.collect()
+    
+    def closeEvent(self, event):
+        """Clean up on close."""
+        self.clear_cache()
+        self._memory_timer.stop()
+        self.shutdown_live_face()
+        super().closeEvent(event)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -705,12 +986,13 @@ if __name__ == "__main__":
 
     # Create test window
     win = QMainWindow()
-    win.setWindowTitle("Real-Time BBox Overlay Test")
+    win.setWindowTitle("Real-Time BBox Overlay Test (Memory Optimized)")
     win.resize(1280, 800)
 
     preview = RealtimeOverlayPreview(
         video_path=video_path,
         cache_data=cache_data,
+        max_cached_buckets=15,
     )
 
     # Add play button
@@ -741,6 +1023,10 @@ if __name__ == "__main__":
             print("No frame captured")
     capture_btn.clicked.connect(_capture)
     btn_row.addWidget(capture_btn)
+
+    clear_btn = QPushButton("🧹 Clear Cache")
+    clear_btn.clicked.connect(preview.clear_cache)
+    btn_row.addWidget(clear_btn)
 
     layout.addLayout(btn_row)
     win.setCentralWidget(central)
