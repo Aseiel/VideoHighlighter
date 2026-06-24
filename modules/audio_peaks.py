@@ -1,10 +1,11 @@
-import shutil
 import subprocess
 import tempfile
 import numpy as np
 import wave
 import sys
 from tqdm import tqdm
+
+from modules.app_paths import ffmpeg_exe
 
 def safe_tqdm(*args, **kwargs):
     """
@@ -31,16 +32,15 @@ def safe_tqdm(*args, **kwargs):
 def extract_waveform_data(video_path, num_points=1000):
     """Extract waveform amplitude data for visualization"""
     
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("❌ ffmpeg not found")
-    
+    ffmpeg = ffmpeg_exe()
+
     wav_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    
+
     try:
         # Extract audio
         subprocess.run([
-            "ffmpeg", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
-            "-ar", "44100", "-ac", "1", wav_file, "-y", 
+            ffmpeg, "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+            "-ar", "44100", "-ac", "1", wav_file, "-y",
             "-hide_banner", "-loglevel", "error"
         ], check=True, capture_output=True)
         
@@ -78,21 +78,15 @@ def extract_audio_peaks(video_path, threshold_db=-20, chunk_duration_ms=10, merg
     if cancel_flag and cancel_flag.is_set():
         return []
     
-    # Check if ffmpeg exists
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "❌ ffmpeg not found. Please install it via Chocolatey or download:\n"
-            "   Chocolatey (recommended): https://chocolatey.org/install\n"
-            "   Or download full build: https://www.gyan.dev/ffmpeg/builds/ffmpeg-git-full.7z\n"
-            "   Unpack to C:\\ffmpeg and add C:\\ffmpeg\\bin to PATH\n"
-        )
+    # Resolve ffmpeg (system PATH, else the bundled imageio-ffmpeg binary)
+    ffmpeg = ffmpeg_exe()
 
     wav_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    
+
     try:
         # Run ffmpeg to extract audio
         subprocess.run([
-            "ffmpeg", "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+            ffmpeg, "-i", video_path, "-vn", "-acodec", "pcm_s16le",
             "-ar", "44100", "-ac", "1", wav_file, "-y"
         ], check=True)
 

@@ -58,6 +58,7 @@ jobs:
           --collect-all openvino
           --collect-data whisper
           --collect-data ultralytics
+          --collect-binaries imageio_ffmpeg
           main.py
       - name: Report build size
         run: |
@@ -126,6 +127,7 @@ jobs:
             --collect-all openvino \
             --collect-data whisper \
             --collect-data ultralytics \
+            --collect-binaries imageio_ffmpeg \
             main.py
       - name: Ad-hoc sign the app
         run: |

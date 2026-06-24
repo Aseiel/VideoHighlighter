@@ -32,6 +32,27 @@ def user_data_dir() -> str:
     return _project_root()
 
 
+def ffmpeg_exe() -> str:
+    """Resolve a usable ffmpeg executable.
+
+    Order: system ffmpeg on PATH (what dev typically uses) -> the binary shipped
+    with imageio-ffmpeg (bundled into the exe, so it works when the frozen app has
+    no ffmpeg on PATH) -> bare "ffmpeg" as a last resort. Returns a path/name; the
+    caller may still get FileNotFoundError if nothing is available.
+    """
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            return exe
+    except Exception:
+        pass
+    return "ffmpeg"
+
+
 def config_path(filename: str = "config.yaml") -> str:
     """Resolve a user-editable config file.
 
