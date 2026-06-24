@@ -1213,6 +1213,13 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     expected_processed_frames = total_frames // sample_rate
 
+    # Each action is classified from a SEQUENCE_LENGTH-frame window sampled every
+    # `sample_rate` frames, but the result is otherwise stamped at the *newest*
+    # frame in that window. Shift it back to the window CENTER (in frames) so
+    # markers/highlights line up with the on-screen action instead of lagging
+    # ~half a window (e.g. ~1.5s at SEQUENCE_LENGTH=16, sample_rate=5, 25fps).
+    action_center_back = (SEQUENCE_LENGTH - 1) * sample_rate / 2.0  # frames
+
     video_writer = None
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -1471,8 +1478,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                 np.stack(sequence_buffer, axis=0), axis=0)
 
                             frame_detections = []
-                            use_timestamp_secs = prev_timestamp_secs
-                            use_frame_id = prev_frame_id
+                            # Center the window on the action (see action_center_back)
+                            use_frame_id = max(0, int(prev_frame_id - action_center_back)) if prev_frame_id is not None else prev_frame_id
+                            use_timestamp_secs = use_frame_id / fps if fps else prev_timestamp_secs
                             use_mins, use_secs = divmod(int(use_timestamp_secs), 60)
                             use_timestamp_str = f"{use_mins:02d}:{use_secs:02d}"
 
@@ -1677,8 +1685,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 if len(sequence_buffer) == SEQUENCE_LENGTH:
                     sequence_array = np.expand_dims(np.stack(sequence_buffer, axis=0), axis=0)
 
-                    use_timestamp_secs = prev_timestamp_secs
-                    use_frame_id = prev_frame_id
+                    # Center the window on the action (see action_center_back)
+                    use_frame_id = max(0, int(prev_frame_id - action_center_back)) if prev_frame_id is not None else prev_frame_id
+                    use_timestamp_secs = use_frame_id / fps if fps else prev_timestamp_secs
                     use_mins, use_secs = divmod(int(use_timestamp_secs), 60)
                     use_timestamp_str = f"{use_mins:02d}:{use_secs:02d}"
 

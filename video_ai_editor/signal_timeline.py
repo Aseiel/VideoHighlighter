@@ -194,9 +194,12 @@ class SignalTimelineScene(QGraphicsScene):
             total_width = self.sceneRect().width()
             points_per_pixel = len(self.waveform) / total_width
             
+            n_points = len(self.waveform)
             for i, (min_val, max_val) in enumerate(self.waveform):
-                # Calculate x position based on time, not index
-                time_pos = (i / len(self.waveform)) * self.video_duration
+                # Each point is one of n_points equal bins tiling [0, video_duration];
+                # place it at the bin CENTER (i+0.5) so a transient lands on its real
+                # time instead of up to a full bin (~0.7s) early.
+                time_pos = ((i + 0.5) / n_points) * self.video_duration
                 x = time_pos * self.pixels_per_second
                 
                 # Skip if beyond visible area
