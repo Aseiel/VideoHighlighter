@@ -25,12 +25,11 @@ try:
 except Exception:
     pass
 
-def _resource_path(filename: str) -> str:
-    """Resolve a bundled resource path for both script and PyInstaller exe."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, filename)
+from modules.app_paths import resource_path as _resource_path, config_path
 
-CONFIG_FILE = _resource_path("config.yaml")
+# User-editable config: lives next to the exe when frozen (so saves persist),
+# seeded from the bundled default; just the project-root file when run from source.
+CONFIG_FILE = config_path("config.yaml")
 
 YOLO_OBJECTS_LABELS_FILE = _resource_path("yolo_objects_labels.json")
 KINETICS_400_LABELS_FILE = _resource_path("kinetics_400_labels.json")
@@ -3321,8 +3320,8 @@ class VideoHighlighterGUI(QWidget):
                     video_duration = total_frames / fps if fps else 0
                     cap.release()
                     cfg_data = {}
-                    if os.path.exists("config.yaml"):
-                        with open("config.yaml", "r") as _f:
+                    if os.path.exists(CONFIG_FILE):
+                        with open(CONFIG_FILE, "r", encoding="utf-8") as _f:
                             cfg_data = yaml.safe_load(_f) or {}
                     analysis_params = build_analysis_cache_params(
                         gui_config=config, config=cfg_data,
@@ -3416,8 +3415,8 @@ class VideoHighlighterGUI(QWidget):
             
             # Load config.yaml defaults
             cfg_data = {}
-            if os.path.exists("config.yaml"):
-                with open("config.yaml", "r") as f:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     cfg_data = yaml.safe_load(f) or {}
             
             analysis_params = build_analysis_cache_params(
