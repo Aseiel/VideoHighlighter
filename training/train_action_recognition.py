@@ -2128,6 +2128,9 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, strict=True):
 def validate_classifier(encoder, model, val_loader, device, criterion):
     """Validate model on validation set"""
     model.eval()
+    # Ensure model is on the correct device
+    model = model.to(device)
+    
     total_correct = 0
     total_samples = 0
     running_loss = 0.0
@@ -2137,10 +2140,13 @@ def validate_classifier(encoder, model, val_loader, device, criterion):
     
     with torch.no_grad():
         for frames, labels in val_loader:
+            # Move frames and labels to device
             frames, labels = frames.to(device), labels.to(device)
+            
+            # Encode frames - encoder expects CPU tensors, so move back to CPU temporarily
             feats = encoder.encode(frames.cpu()).to(device)
             
-            # Enhanced model returns (outputs, attention_weights)
+            # Now both model and feats are on the same device
             outputs, attention_weights = model(feats)
             loss = criterion(outputs, labels)
             
