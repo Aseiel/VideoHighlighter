@@ -34,6 +34,7 @@ class VideoLabelerGUI:
         self.fps = 0
         self.current_frame = 0
         self.points = {}
+        self.occluded = set()  # keypoints explicitly marked hidden/inside this frame
         self.current_kp = 0
         self.labeled_frames = []
         self.is_playing = False
@@ -853,6 +854,7 @@ class VideoLabelerGUI:
         # Label actions
         ttk.Label(right_frame, text="📝 Actions", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0,5))
         ttk.Button(right_frame, text="✅ Save Frame", command=self.save_frame, width=15).pack(pady=2)
+        ttk.Button(right_frame, text="🚫 Mark Occluded (H)", command=self.mark_occluded, width=15).pack(pady=2)
         ttk.Button(right_frame, text="↩️ Undo Last", command=self.undo_point, width=15).pack(pady=2)
         ttk.Button(right_frame, text="🗑️ Clear Frame", command=self.clear_frame, width=15).pack(pady=2)
         ttk.Button(right_frame, text="⏭️ Skip Frame", command=self.skip_frame, width=15).pack(pady=2)
@@ -996,6 +998,8 @@ class VideoLabelerGUI:
         self.root.bind_all('<Control-s>', self.save_frame)
         self.root.bind_all('<Control-z>', self.undo_point)
         self.root.bind_all('<Escape>', self.skip_frame)
+        self.root.bind_all('<h>', self.mark_occluded)
+        self.root.bind_all('<H>', self.mark_occluded)
         for i in range(9):  # support up to 9 keypoints via number keys
             self.root.bind_all(f'<Key-{i+1}>', lambda e, idx=i: self.select_keypoint_by_index(idx))
         self.root.bind_all('<t>', lambda e: self.track_with_yolo())
@@ -1091,6 +1095,7 @@ class VideoLabelerGUI:
         self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
         self.current_frame = 0
         self.points = {}
+        self.occluded = set()
         self.labeled_frames = []
         self.tracking_data = {}
         self.tracking_active = False
@@ -1151,8 +1156,9 @@ class VideoLabelerGUI:
 
         name = self.keypoint_names[self.current_kp]
         x, y = event.x, event.y
-        
+
         self.points[name] = (x, y)
+        self.occluded.discard(name)  # placing a position clears any occluded mark
         self.kp_buttons[name]['placed'] = True
         self.kp_buttons[name]['color'].configure(bg='green')
         self.kp_buttons[name]['status'].configure(text='✅', foreground='green')
@@ -1166,15 +1172,37 @@ class VideoLabelerGUI:
         self.slider_update = True
     
     def advance_to_next_keypoint(self):
-        all_placed = all(self.kp_buttons[name]['placed'] for name in self.keypoint_names)
-        if all_placed:
-            self.status_var.set("All keypoints placed! Press 'Save Frame' or Ctrl+S")
+        # A keypoint is "done" if placed OR explicitly marked occluded
+        def done(name):
+            return self.kp_buttons[name]['placed'] or name in self.occluded
+
+        if all(done(name) for name in self.keypoint_names):
+            self.status_var.set("All keypoints placed/occluded! Press 'Save Frame' or Ctrl+S")
             return
-        
+
         for name in self.keypoint_names:
-            if not self.kp_buttons[name]['placed']:
+            if not done(name):
                 self.select_keypoint(name)
                 break
+
+    def mark_occluded(self, event=None):
+        """Mark the selected keypoint as hidden/inside for this frame (visibility 0)
+        instead of placing a position. Interpolation/optical-flow skip it, so no
+        bounding box is invented while the part is occluded."""
+        if not self.keypoint_names or self.current_kp >= len(self.keypoint_names):
+            return "break"
+        name = self.keypoint_names[self.current_kp]
+        self.points.pop(name, None)          # remove any placed position
+        self.occluded.add(name)
+        self.kp_buttons[name]['placed'] = False
+        self.kp_buttons[name]['color'].configure(bg='#663333')
+        self.kp_buttons[name]['status'].configure(text='🚫', foreground='#cc7777')
+        self.status_var.set(f"🚫 {name}: occluded / inside (no box this frame)")
+        self.advance_to_next_keypoint()
+        self.slider_update = False
+        self.show_frame(self.current_frame)
+        self.slider_update = True
+        return "break"
     
     def show_frame(self, frame_idx, update_slider=True):
         if not self.cap:
@@ -1231,10 +1259,10 @@ class VideoLabelerGUI:
                                   (coords[0]+15, coords[1]-10), 
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
-        # Show currently selected keypoint
+        # Show currently selected keypoint (skip the prompt if it's occluded)
         if self.current_kp < len(self.keypoint_names):
             name = self.keypoint_names[self.current_kp]
-            if not self.kp_buttons[name]['placed']:
+            if not self.kp_buttons[name]['placed'] and name not in self.occluded:
                 cv2.line(frame, (display_w//2 - 30, display_h//2), 
                         (display_w//2 + 30, display_h//2), self.colors[name], 2)
                 cv2.line(frame, (display_w//2, display_h//2 - 30), 
@@ -1359,26 +1387,27 @@ class VideoLabelerGUI:
         if not self.cap:
             return "break"
         
-        if not self.points:
+        if not self.points and not self.occluded:
             # Check if there are tracked points for this frame
             existing_frame = None
             for labeled in self.labeled_frames:
                 if labeled['frame'] == self.current_frame:
                     existing_frame = labeled
                     break
-            
+
             if existing_frame:
                 self.status_var.set(f"ℹ️ Frame {self.current_frame} already has {len(existing_frame['points'])} points")
                 return "break"
             else:
-                messagebox.showwarning("No Points", "Please place at least one keypoint before saving.")
+                messagebox.showwarning("No Points", "Place a keypoint or mark one occluded before saving.")
                 return "break"
-        
-        # Save the frame with points
+
+        # Save the frame with points (+ any occluded keypoints, exported as visibility 0)
         frame_data = {
             'frame': self.current_frame,
             'timestamp': self.current_frame / self.fps,
             'points': self.points.copy(),
+            'occluded': sorted(self.occluded),
             'manual': True,
             'tracked': False
         }
@@ -1406,14 +1435,15 @@ class VideoLabelerGUI:
         
         # Clear points
         self.points = {}
+        self.occluded = set()
         for name in self.keypoint_names:
             self.kp_buttons[name]['placed'] = False
             self.kp_buttons[name]['color'].configure(bg='gray')
             self.kp_buttons[name]['status'].configure(text='⬜', foreground='gray')
-        
+
         if self.keypoint_names:
             self.select_keypoint(self.keypoint_names[0])
-        
+
         if self.is_playing:
             self.next_frame()
         else:
@@ -1445,12 +1475,13 @@ class VideoLabelerGUI:
                 return
         
         self.points = {}
+        self.occluded = set()
         self.labeled_frames = []
         for name in self.keypoint_names:
             self.kp_buttons[name]['placed'] = False
             self.kp_buttons[name]['color'].configure(bg='gray')
             self.kp_buttons[name]['status'].configure(text='⬜', foreground='gray')
-        
+
         self.clear_saved_progress()
         
         if self.keypoint_names:
@@ -1478,6 +1509,7 @@ class VideoLabelerGUI:
 
     def skip_frame(self, event=None):
         self.points = {}
+        self.occluded = set()
         for name in self.keypoint_names:
             self.kp_buttons[name]['placed'] = False
             self.kp_buttons[name]['color'].configure(bg='gray')
@@ -1611,11 +1643,16 @@ class VideoLabelerGUI:
             if end['frame'] - start['frame'] <= 1:
                 continue
             
+            # Don't interpolate keypoints marked occluded in either anchor
+            skip = set(start.get('occluded', [])) | set(end.get('occluded', []))
+
             for frame in range(start['frame'] + 1, end['frame']):
                 t = (frame - start['frame']) / (end['frame'] - start['frame'])
                 interpolated_points = {}
-                
+
                 for kp_name in self.keypoint_names:
+                    if kp_name in skip:
+                        continue
                     if kp_name in start['points'] and kp_name in end['points']:
                         p1 = start['points'][kp_name]
                         p2 = end['points'][kp_name]
@@ -1704,12 +1741,17 @@ class VideoLabelerGUI:
                                 f"(frames {fa}-{fb})")
             self.root.update()
 
+            # Fully skip only keypoints occluded in BOTH anchors. If occluded at
+            # just one end, it's still tracked from the visible end and dropped on
+            # loss — so the visible approach keeps a box and it vanishes when gone.
+            skip = set(a.get('occluded', [])) & set(b.get('occluded', []))
+
             if fb - fa > MAX_SEGMENT:
-                seg = self._linear_segment(fa, fb, a['points'], b['points'])
+                seg = self._linear_segment(fa, fb, a['points'], b['points'], skip)
                 method = 'linear_far'
             else:
                 seg = self._optical_flow_segment(fa, fb, a['points'], b['points'],
-                                                 scale, vid_w, vid_h)
+                                                 scale, vid_w, vid_h, skip)
                 method = 'optical_flow'
 
             for fi, pts in seg.items():
@@ -1739,29 +1781,34 @@ class VideoLabelerGUI:
         self.slider_update = True
         return True
 
-    def _linear_segment(self, fa, fb, A, B):
-        """Plain linear interpolation between two anchors (display-space points)."""
+    def _linear_segment(self, fa, fb, A, B, skip=None):
+        """Plain linear interpolation between two anchors (display-space points).
+        Keypoints in `skip` (occluded in an anchor) are omitted -> visibility 0."""
+        skip = skip or set()
         out = {}
         span = fb - fa
         for fi in range(fa + 1, fb):
             t = (fi - fa) / span
             pts = {}
             for k in self.keypoint_names:
+                if k in skip:
+                    continue
+                # Only interpolate a point present at BOTH anchors. If it's at just
+                # one end it's entering/leaving -> drop it (label disappears) rather
+                # than carrying a stale position across the gap.
                 if k in A and k in B:
                     pts[k] = (int(round(A[k][0] + t * (B[k][0] - A[k][0]))),
                               int(round(A[k][1] + t * (B[k][1] - A[k][1]))))
-                elif k in A:
-                    pts[k] = (int(A[k][0]), int(A[k][1]))
-                elif k in B:
-                    pts[k] = (int(B[k][0]), int(B[k][1]))
             if pts:
                 out[fi] = pts
         return out
 
-    def _optical_flow_segment(self, fa, fb, A, B, scale, vid_w, vid_h):
+    def _optical_flow_segment(self, fa, fb, A, B, scale, vid_w, vid_h, skip=None):
         """Bidirectional LK optical flow between anchors A (frame fa) and B (frame fb).
         Points come in/out in DISPLAY space; tracking runs in native video pixels.
+        Keypoints in `skip` (occluded in an anchor) are omitted -> visibility 0.
         Returns {frame_idx: {kp: (x, y)}} for the intermediate frames."""
+        skip = skip or set()
         # Buffer grayscale frames for the whole segment (sequential read = fast)
         grays = []
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, fa)
@@ -1771,7 +1818,7 @@ class VideoLabelerGUI:
                 break
             grays.append(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY))
         if len(grays) < (fb - fa + 1):
-            return self._linear_segment(fa, fb, A, B)  # couldn't read full segment
+            return self._linear_segment(fa, fb, A, B, skip)  # couldn't read full segment
 
         n = fb - fa  # number of steps
         lk = dict(winSize=(21, 21), maxLevel=3,
@@ -1780,8 +1827,12 @@ class VideoLabelerGUI:
         def to_video(pt):
             return [pt[0] / scale, pt[1] / scale]
 
-        kps_f = [k for k in self.keypoint_names if k in A]
-        kps_b = [k for k in self.keypoint_names if k in B]
+        # Forward/backward must agree within this many native pixels, else the
+        # point is treated as occluded/drifted and dropped.
+        fb_thresh = max(20.0, 0.02 * max(vid_w, vid_h))
+
+        kps_f = [k for k in self.keypoint_names if k in A and k not in skip]
+        kps_b = [k for k in self.keypoint_names if k in B and k not in skip]
 
         # --- Forward track from anchor A ---
         fwd, fwd_ok = {}, {}
@@ -1824,24 +1875,25 @@ class VideoLabelerGUI:
             t = (fi - fa) / float(n)
             pts = {}
             for k in self.keypoint_names:
+                if k in skip:
+                    continue
                 f_ok = fwd_ok.get(fi, {}).get(k, False)
                 b_ok = bwd_ok.get(fi, {}).get(k, False)
                 if f_ok and b_ok:
                     fx, fy = fwd[fi][k]; bx, by = bwd[fi][k]
+                    # If forward (from A) and backward (from B) disagree a lot, the
+                    # point is unreliable — each drifted into an occlusion — so drop
+                    # it (the label disappears) instead of averaging to a wrong spot.
+                    if (fx - bx) ** 2 + (fy - by) ** 2 > fb_thresh * fb_thresh:
+                        continue
                     vx, vy = (1 - t) * fx + t * bx, (1 - t) * fy + t * by
                 elif f_ok:
                     vx, vy = fwd[fi][k]
                 elif b_ok:
                     vx, vy = bwd[fi][k]
                 else:
-                    # Both flows lost this point -> linear fallback (display space)
-                    if k in A and k in B:
-                        pts[k] = (int(round(A[k][0] + t * (B[k][0] - A[k][0]))),
-                                  int(round(A[k][1] + t * (B[k][1] - A[k][1]))))
-                    elif k in A:
-                        pts[k] = (int(A[k][0]), int(A[k][1]))
-                    elif k in B:
-                        pts[k] = (int(B[k][0]), int(B[k][1]))
+                    # Tracker lost this point on both sides -> it left / went
+                    # occluded -> drop it so the label disappears.
                     continue
                 pts[k] = (int(round(vx * scale)), int(round(vy * scale)))  # back to display
             if pts:
