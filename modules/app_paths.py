@@ -32,6 +32,20 @@ def user_data_dir() -> str:
     return _project_root()
 
 
+def data_file(name: str) -> str:
+    """Resolve a data/model file that may ship bundled but can be overridden by
+    dropping a file of the same name next to the executable (or in the project
+    root when run from source). The user copy wins; otherwise the bundled copy.
+
+    This lets users swap in a retrained model on a packaged exe without rebuilding.
+    From source both locations are the project root, so behaviour is unchanged.
+    """
+    user = os.path.join(user_data_dir(), name)
+    if os.path.exists(user):
+        return user
+    return resource_path(name)
+
+
 def ffmpeg_exe() -> str:
     """Resolve a usable ffmpeg executable.
 
