@@ -21,6 +21,7 @@ from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_an
 from modules.video_cutter import cut_video
 from modules.auto_segments import build_auto_segments
 from modules.device_utils import resolve_yolo_device
+from modules.app_paths import ffmpeg_exe
 
 
 
@@ -314,7 +315,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
     try:
         # --- Load config defaults (from config.yaml) ---
         config = {}
-        cfg_path = "config.yaml"
+        from modules.app_paths import config_path
+        cfg_path = config_path("config.yaml")
         if os.path.exists(cfg_path):
             try:
                 check_cancellation(cancel_flag, log, "config loading")
@@ -438,16 +440,17 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 check_cancellation(cancel_flag, log, "video trimming")
                 
                 # Use FFmpeg to trim the video (fast, no re-encoding)
+                ffmpeg = ffmpeg_exe()
                 log(f"   Using FFmpeg to extract range...")
                 subprocess.run([
-                    "ffmpeg", "-y", "-v", "error",
+                    ffmpeg, "-y", "-v", "error",
                     "-ss", str(RANGE_START),
                     "-to", str(RANGE_END),
                     "-i", video_path,
                     "-c", "copy",  # Copy streams without re-encoding for speed
                     temp_trimmed_video
                 ], check=True)
-                
+
                 log(f"✅ Video trimmed to: {temp_trimmed_video}")
                 processed_video_path = temp_trimmed_video
                 
@@ -466,7 +469,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 try:
                     # Fallback: re-encode if copy fails
                     subprocess.run([
-                        "ffmpeg", "-y", "-v", "error",
+                        ffmpeg_exe(), "-y", "-v", "error",
                         "-ss", str(RANGE_START),
                         "-to", str(RANGE_END),
                         "-i", video_path,
@@ -475,7 +478,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"✅ Video trimmed (re-encoded) to: {temp_trimmed_video}")
                     processed_video_path = temp_trimmed_video
                     video_duration = range_duration
-                    
+
                     # Update video info
                     cap = cv2.VideoCapture(processed_video_path)
                     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -485,6 +488,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 except Exception as e2:
                     log(f"❌ Failed to trim video: {e2}")
                     return None
+            except (FileNotFoundError, OSError) as e:
+                # ffmpeg missing/unresolvable — would otherwise crash the pipeline
+                # thread uncaught (silent failure in the windowed exe -> empty timeline)
+                log(f"❌ ffmpeg not found for trimming ({e}). Install ffmpeg or ensure "
+                    f"imageio-ffmpeg is bundled. Cannot process time range.")
+                return None
             except RuntimeError:
                 return None
         else:
@@ -798,7 +807,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             if waveform_data is None:
                 try:
                     from modules.audio_peaks import extract_waveform_data
-                    waveform_data = extract_waveform_data(processed_video_path, num_points=1000)
+                    # Scale resolution with duration so bins stay ~0.25s (tight
+                    # waveform/preview alignment) instead of a fixed 1000 points
+                    # that become ~1.4s bins on long videos. Capped for draw perf.
+                    _wf_points = min(12000, max(2000, int(video_duration * 4)))
+                    waveform_data = extract_waveform_data(processed_video_path, num_points=_wf_points)
                     log("✅ Waveform computed (was missing in cache)")
                 except Exception as e:
                     log(f"⚠️ Failed to compute waveform: {e}")
@@ -810,7 +823,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             # Always try to compute waveform for the timeline viewer
             try:
                 from modules.audio_peaks import extract_waveform_data
-                waveform_data = extract_waveform_data(processed_video_path, num_points=1000)
+                # Scale resolution with duration so bins stay ~0.25s (tight
+                # waveform/preview alignment) instead of a fixed 1000 points that
+                # become ~1.4s bins on long videos. Capped for scene-draw perf.
+                _wf_points = min(12000, max(2000, int(video_duration * 4)))
+                waveform_data = extract_waveform_data(processed_video_path, num_points=_wf_points)
             except Exception as e:
                 log(f"⚠️ Waveform extraction failed: {e}")
                 waveform_data = None
@@ -1950,7 +1967,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 OUTPUT_FILE_CLEAN = os.path.join(output_dir, output_filename_clean)
                 
                 log(f"🎬 Running FFmpeg concatenation to: {OUTPUT_FILE_CLEAN}")
-                subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+                subprocess.run([ffmpeg_exe(), "-y", "-v", "error", "-f", "concat", "-safe", "0",
                                 "-i", concat_file_normalized, "-c", "copy", OUTPUT_FILE_CLEAN], check=True)
                 
                 # Update OUTPUT_FILE to the cleaned version
