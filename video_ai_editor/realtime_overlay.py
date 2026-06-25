@@ -82,6 +82,15 @@ def color_for_class(class_name: str) -> QColor:
     return _CLASS_COLORS[key]
 
 
+def action_abbrev(name: str) -> str:
+    """Short code from an action name: initials of its words, e.g.
+    'jump' -> 'J', 'high five' -> 'HF', 'sit down' -> 'SD'."""
+    words = [w for w in str(name).replace('_', ' ').split() if w]
+    if not words:
+        return "?"
+    return "".join(w[0] for w in words).upper()[:3]
+
+
 # ──────────────────────────────────────────────────────────────────
 # LazyBBoxLoader — loads bboxes on demand
 # ──────────────────────────────────────────────────────────────────
@@ -279,7 +288,7 @@ class LazyBBoxLoader:
         
         return [{
             'timestamp': ts,
-            'class_name': f"[A] {name}",
+            'class_name': f"[{action_abbrev(name)}] {name}",
             'confidence': float(conf),
             'bbox': tuple(bbox[:4]),
             'type': 'action'
@@ -383,13 +392,40 @@ class BBoxOverlayItem(QGraphicsRectItem):
         ph = h * video_height
         self.setRect(px, py, pw, ph)
 
-        # Position label at top of box
+        # Scale the label font with the video resolution. The scene is video-sized
+        # (e.g. 1920x1080) and gets downscaled to fit the small preview, so a fixed
+        # point-size font shrinks to nothing — and worse on higher-res videos.
+        # Sizing it relative to video height keeps labels readable and consistent
+        # across resolutions.
+        font = self._label.font()
+        font.setPixelSize(max(16, int(video_height * 0.035)))
+        self._label.setFont(font)
+
+        # Cache geometry so the scene can de-overlap labels without recomputing.
         label_rect = self._label.boundingRect()
-        self._label.setPos(px + 2, py - label_rect.height() - 1)
-        self._label_bg.setRect(
-            px, py - label_rect.height() - 2,
-            label_rect.width() + 6, label_rect.height() + 2,
-        )
+        self._px = px
+        self._py = py
+        self._ph = ph
+        self._label_w = label_rect.width()
+        self._label_h = label_rect.height()
+        self._set_label_top(self.default_label_top())
+
+    def default_label_top(self) -> float:
+        """Default label top: just above the box."""
+        return self._py - self._label_h - 1
+
+    def below_label_top(self) -> float:
+        """Label top when placed below the box (used near the top edge)."""
+        return self._py + self._ph + 1
+
+    def _set_label_top(self, top: float):
+        """Position the label/background at scene y = top."""
+        self._label.setPos(self._px + 2, top)
+        self._label_bg.setRect(self._px, top - 1, self._label_w + 6, self._label_h + 2)
+
+    def label_rect_at(self, top: float) -> QRectF:
+        """Background rect of the label in scene coords at the given top y."""
+        return QRectF(self._px, top - 1, self._label_w + 6, self._label_h + 2)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -440,6 +476,7 @@ class OverlayScene(QGraphicsScene):
             # Recompute all bbox geometries
             for item in self._all_bbox_items:
                 item.update_geometry(self._video_w, self._video_h)
+            self._resolve_label_overlaps()
 
     def load_detections_lazy(self, bbox_loader: LazyBBoxLoader):
         """
@@ -532,8 +569,38 @@ class OverlayScene(QGraphicsScene):
                     item.setVisible(visible)
                 if visible:
                     visible_count += 1
-        
+
         self._visible_count = visible_count
+
+        # Stack any overlapping labels so they don't cover each other
+        self._resolve_label_overlaps()
+
+    def _resolve_label_overlaps(self):
+        """Nudge overlapping labels so close boxes don't bury each other's labels.
+        Greedy: place left-to-right/top-down, stack a colliding label upward by its
+        own height; if that runs off the top of the frame, stack it downward (below
+        the box) instead."""
+        visible = [it for it in self._all_bbox_items
+                   if it.isVisible() and hasattr(it, "_label_h")]
+        placed: list[QRectF] = []
+        step = lambda it: it._label_h + 2
+
+        def _stack(it, start_top, direction):
+            top = start_top
+            rect = it.label_rect_at(top)
+            guard = 0
+            while guard < 40 and any(rect.intersects(r) for r in placed):
+                top += direction * step(it)
+                rect = it.label_rect_at(top)
+                guard += 1
+            return top, rect
+
+        for it in sorted(visible, key=lambda i: (i._px, i._py)):
+            top, rect = _stack(it, it.default_label_top(), -1)   # upward
+            if top < 0:                                          # off the top edge
+                top, rect = _stack(it, it.below_label_top(), +1) # downward instead
+            it._set_label_top(top)
+            placed.append(rect)
 
     def set_overlays_visible(self, visible: bool):
         """Toggle all overlays on/off."""
