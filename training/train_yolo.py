@@ -116,9 +116,11 @@ class YOLOKeypointDatasetBuilder:
         x_min, y_min = points.min(axis=0)
         x_max, y_max = points.max(axis=0)
         
-        # Add padding (20%)
-        pad_x = (x_max - x_min) * 0.2
-        pad_y = (y_max - y_min) * 0.2
+        # Add padding: 20% of the keypoint spread, but at least an absolute minimum
+        # (5% of the frame) so collinear/sparse keypoints (e.g. one point directly
+        # above another) still yield a non-degenerate box instead of a zero-area line.
+        pad_x = max((x_max - x_min) * 0.2, img_width * 0.05)
+        pad_y = max((y_max - y_min) * 0.2, img_height * 0.05)
         x1 = max(0, x_min - pad_x)
         y1 = max(0, y_min - pad_y)
         x2 = min(img_width, x_max + pad_x)
@@ -211,6 +213,7 @@ class YOLOKeypointDatasetBuilder:
         stage_lbl.mkdir(parents=True, exist_ok=True)
 
         stems = []
+        seen_stems = set()
         for video_path, frames in tqdm(video_frames.items(), desc="Extracting frames"):
             cap = cv2.VideoCapture(str(video_path))
             if not cap.isOpened():
@@ -237,7 +240,9 @@ class YOLOKeypointDatasetBuilder:
                 cv2.imwrite(str(stage_img / f"{stem}.jpg"), frame)
                 with open(stage_lbl / f"{stem}.txt", 'w') as f:
                     f.write(yolo_label + '\n')
-                stems.append(stem)
+                if stem not in seen_stems:   # same video+frame may appear in >1 label file
+                    seen_stems.add(stem)
+                    stems.append(stem)
 
             cap.release()
 
@@ -303,29 +308,38 @@ class YOLOKeypointTrainer:
     Train YOLOv8-pose on keypoint dataset
     """
     
-    def __init__(self, dataset_yaml, model_size='n', device='cpu'):
+    def __init__(self, dataset_yaml, model_size='n', device='cpu', weights=None):
         """
         Args:
             dataset_yaml: Path to dataset.yaml
             model_size: 'n', 's', 'm', 'l', 'x' (YOLO model sizes)
             device: 'cpu' or 'cuda'
+            weights: optional path to a previous best.pt to warm-start from when
+                     you add more labels over time (incremental training). If None,
+                     starts from the stock yolo11{size}-pose.pt.
         """
         self.dataset_yaml = dataset_yaml
         self.model_size = model_size
         self.device = device
-        
-        # Load pretrained model
-        model_name = f"yolo11{model_size}-pose.pt"
-        print(f"📂 Loading pretrained: {model_name}")
-        self.model = YOLO(model_name)
+        self.best_model_path = None
+
+        if weights and Path(weights).exists():
+            print(f"📂 Warm-starting from previous weights: {weights}")
+            self.model = YOLO(str(weights))
+        else:
+            model_name = f"yolo11{model_size}-pose.pt"
+            print(f"📂 Loading pretrained: {model_name}")
+            self.model = YOLO(model_name)
     
-    def train(self, 
+    def train(self,
               epochs=100,
               imgsz=640,
               batch_size=16,
               lr0=0.001,
               augment=True,
               patience=20,
+              save_period=-1,
+              resume=False,
               project='yolo_keypoint_training',
               name='keypoint_detector'):
         """
@@ -347,7 +361,6 @@ class YOLOKeypointTrainer:
         print(f"   Batch size: {batch_size}")
         print(f"   Device: {self.device}")
         
-        # Train the model
         results = self.model.train(
             data=str(self.dataset_yaml),
             epochs=epochs,
@@ -356,6 +369,8 @@ class YOLOKeypointTrainer:
             lr0=lr0,
             augment=augment,
             patience=patience,
+            save_period=save_period,   # -1 = only last/best; N = also save every N epochs
+            resume=resume,             # continue an interrupted run from its last.pt
             device=self.device,
             project=project,
             name=name,
@@ -369,7 +384,13 @@ class YOLOKeypointTrainer:
             pose=12.0, # Pose loss gain
             kobj=1.0,  # Keypoint objectness loss gain
         )
-        
+
+        # Remember where ultralytics actually wrote best.pt (path varies by run)
+        try:
+            self.best_model_path = Path(self.model.trainer.best)
+        except Exception:
+            self.best_model_path = None
+
         print(f"✅ Training complete!")
         return results
     
@@ -382,13 +403,14 @@ class YOLOKeypointTrainer:
             imgsz: Image size for export
         """
         print(f"📦 Exporting model to {format}...")
-        
-        # Find best model
-        best_model = Path(f"yolo_keypoint_training/keypoint_detector/weights/best.pt")
-        if not best_model.exists():
-            print(f"⚠️ Best model not found at: {best_model}")
+
+        # Use the actual best.pt path captured during train() (its location varies
+        # with project/name and the ultralytics run dir).
+        best_model = getattr(self, "best_model_path", None)
+        if not best_model or not Path(best_model).exists():
+            print(f"⚠️ Best model not found (has training run?). Path: {best_model}")
             return None
-        
+
         model = YOLO(str(best_model))
         exported = model.export(format=format, imgsz=imgsz)
         
@@ -462,13 +484,32 @@ if __name__ == "__main__":
     # ============================================
     # CONFIG — edit these for your setup
     # ============================================
-    KEYPOINT_NAMES = []  # filled from the labeler's exported JSON (see below)
-    LABELS_DIR = "labels"       # folder with the labeler's *_labels.json exports
-    VIDEO_DIR  = "."            # folder containing the source videos
-    OUTPUT_DIR = "yolo_dataset" # where the YOLO dataset gets written
+    # Anchor paths to the project root (train_yolo.py lives in training/) so it
+    # runs the same whether launched from the repo root or from training/.
+    ROOT = Path(__file__).resolve().parent.parent
+    KEYPOINT_NAMES = []                              # filled from the exported JSON
+    LABELS_DIR = str(ROOT / "labels")               # labeler *_labels.json exports
+    VIDEO_DIR  = str(ROOT / "dataset" / "train" / "anal")  # source videos
+    OUTPUT_DIR = str(ROOT / "yolo_dataset")         # where the YOLO dataset is written
     MODEL_SIZE = 'n'            # 'n' fast, 's'/'m' more accurate
     EPOCHS     = 100
-    DEVICE     = 0 if _HAS_CUDA else 'cpu'
+    # Device policy: use NVIDIA CUDA if present, otherwise CPU. An Intel GPU (XPU)
+    # is intentionally NOT used for training — ultralytics has no stable XPU path;
+    # the Intel GPU is for OpenVINO *inference*, not PyTorch training.
+    DEVICE = 0 if _HAS_CUDA else 'cpu'
+    try:
+        import torch as _t
+        if not _HAS_CUDA and hasattr(_t, "xpu") and _t.xpu.is_available():
+            print("ℹ️ Intel GPU detected — training on CPU (Intel GPU is for inference, not training).")
+    except Exception:
+        pass
+
+    # Checkpoints: -1 = keep only last.pt/best.pt; e.g. 25 = also save every 25 epochs
+    SAVE_PERIOD = 25
+    # Incremental: to continue from a previous model after adding more labels, point
+    # this at its best.pt (e.g. ROOT/'yolo_keypoint_training'/.../'weights'/'best.pt').
+    # Empty = train fresh from the stock pose model.
+    RESUME_WEIGHTS = ""
 
     # ============================================
     # STEP 1: Build dataset from JSON labels
@@ -519,7 +560,8 @@ if __name__ == "__main__":
     trainer = YOLOKeypointTrainer(
         dataset_yaml=str(Path(OUTPUT_DIR) / "dataset.yaml"),
         model_size=MODEL_SIZE,
-        device=DEVICE
+        device=DEVICE,
+        weights=RESUME_WEIGHTS or None,
     )
 
     results = trainer.train(
@@ -528,7 +570,8 @@ if __name__ == "__main__":
         batch_size=16,
         lr0=0.001,
         augment=True,
-        patience=20
+        patience=20,
+        save_period=SAVE_PERIOD,
     )
 
     # ============================================
@@ -539,9 +582,9 @@ if __name__ == "__main__":
     # ============================================
     # STEP 4: Test on a video (optional)
     # ============================================
-    best = Path("yolo_keypoint_training/keypoint_detector/weights/best.pt")
+    best = getattr(trainer, "best_model_path", None)
     test_video = next(iter(Path(VIDEO_DIR).glob("*.mp4")), None)
-    if best.exists() and test_video is not None:
+    if best and Path(best).exists() and test_video is not None:
         test_trained_model(
             model_path=str(best),
             test_video_path=str(test_video),
