@@ -25,19 +25,23 @@ class YOLOKeypointDatasetBuilder:
     Convert JSON labels to YOLO keypoint format
     """
     
-    def __init__(self, 
+    def __init__(self,
                  labels_dir,      # Directory with JSON label files
                  video_dir,       # Directory with video files
                  output_dir,      # Where to save YOLO format dataset
-                 keypoint_names,  # List of keypoint names (e.g., ['kp1', 'kp2', 'kp3', 'kp4'])
-                 img_size=640):
-        
+                 keypoint_names,  # List of class/keypoint names
+                 img_size=640,
+                 task="pose",     # "pose" = keypoints, "detect" = one box per labeled point
+                 box_frac=0.12):  # detect-mode box size as a fraction of the frame
+
         self.labels_dir = Path(labels_dir)
         self.video_dir = Path(video_dir)
         self.output_dir = Path(output_dir)
         self.keypoint_names = keypoint_names
         self.num_keypoints = len(keypoint_names)
         self.img_size = img_size
+        self.task = task
+        self.box_frac = float(box_frac)
         
         # Keypoint indices
         self.kp_to_idx = {name: i for i, name in enumerate(keypoint_names)}
@@ -54,13 +58,18 @@ class YOLOKeypointDatasetBuilder:
             d.mkdir(parents=True, exist_ok=True)
 
     def _find_video(self, video_name):
-        """Locate a video file in video_dir by name (with or without extension)."""
+        """Locate a video by name under video_dir (searched recursively, so videos
+        organised in subfolders are still found)."""
+        # direct hit
+        cand = self.video_dir / video_name
+        if cand.exists():
+            return cand
+        # recursive search by name / stem+ext
+        stem = Path(video_name).stem
+        matches = list(self.video_dir.rglob(video_name))
         for ext in ['.mp4', '.avi', '.mov', '.mkv']:
-            for cand in (self.video_dir / video_name,
-                         self.video_dir / f"{Path(video_name).stem}{ext}"):
-                if cand.exists():
-                    return cand
-        return None
+            matches += list(self.video_dir.rglob(f"{stem}{ext}"))
+        return matches[0] if matches else None
     
     def extract_frames_from_video(self, video_path, frame_indices, output_dir):
         """Extract specific frames from video"""
@@ -90,6 +99,27 @@ class YOLOKeypointDatasetBuilder:
         cap.release()
         return extracted
     
+    def convert_to_detect_format(self, frame_info, img_width, img_height):
+        """Object-detection labels: one box per labeled point, each its own class.
+        Each labeled point becomes a fixed-size box centered on it — reuses the
+        existing point labels (and optical-flow/occlusion).
+        Returns 'class_id xc yc w h' lines (normalised), or None if no points."""
+        bw = bh = self.box_frac
+        lines = []
+        for idx, name in enumerate(self.keypoint_names):
+            if name in frame_info.get('points', {}):
+                x, y = frame_info['points'][name]
+                xc = min(max(x / img_width, 0.0), 1.0)
+                yc = min(max(y / img_height, 0.0), 1.0)
+                lines.append(f"{idx} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
+        return "\n".join(lines) if lines else None
+
+    def convert_label(self, frame_info, img_width, img_height):
+        """Dispatch to the right label format for the configured task."""
+        if self.task == "detect":
+            return self.convert_to_detect_format(frame_info, img_width, img_height)
+        return self.convert_to_yolo_format(frame_info, img_width, img_height)
+
     def convert_to_yolo_format(self, frame_info, img_width, img_height):
         """
         Convert keypoint coordinates to YOLO format:
@@ -232,7 +262,7 @@ class YOLOKeypointDatasetBuilder:
                     continue
 
                 h, w = frame.shape[:2]
-                yolo_label = self.convert_to_yolo_format(fi, w, h)
+                yolo_label = self.convert_label(fi, w, h)
                 if yolo_label is None:
                     continue
 
@@ -284,16 +314,26 @@ class YOLOKeypointDatasetBuilder:
         }
 
     def create_dataset_yaml(self):
-        """Create dataset.yaml for YOLO training"""
-        yaml_content = {
-            'path': str(self.output_dir.absolute()),
-            'train': 'images/train',
-            'val': 'images/val',
-            'nc': 1,  # single object class
-            'names': ['object'],
-            'kpt_shape': [self.num_keypoints, 3],  # [num_keypoints, (x, y, visibility)]
-            'flip_idx': list(range(self.num_keypoints))  # identity = no L/R symmetry
-        }
+        """Create dataset.yaml for YOLO training (detect: one class per name;
+        pose: single 'object' class with N keypoints)."""
+        if self.task == "detect":
+            yaml_content = {
+                'path': str(self.output_dir.absolute()),
+                'train': 'images/train',
+                'val': 'images/val',
+                'nc': self.num_keypoints,
+                'names': list(self.keypoint_names),
+            }
+        else:
+            yaml_content = {
+                'path': str(self.output_dir.absolute()),
+                'train': 'images/train',
+                'val': 'images/val',
+                'nc': 1,  # single object class
+                'names': ['object'],
+                'kpt_shape': [self.num_keypoints, 3],  # [num_keypoints, (x, y, visibility)]
+                'flip_idx': list(range(self.num_keypoints))  # identity = no L/R symmetry
+            }
 
         yaml_path = self.output_dir / 'dataset.yaml'
         with open(yaml_path, 'w') as f:
@@ -308,26 +348,27 @@ class YOLOKeypointTrainer:
     Train YOLOv8-pose on keypoint dataset
     """
     
-    def __init__(self, dataset_yaml, model_size='n', device='cpu', weights=None):
+    def __init__(self, dataset_yaml, model_size='n', device='cpu', weights=None, task='pose'):
         """
         Args:
             dataset_yaml: Path to dataset.yaml
             model_size: 'n', 's', 'm', 'l', 'x' (YOLO model sizes)
             device: 'cpu' or 'cuda'
-            weights: optional path to a previous best.pt to warm-start from when
-                     you add more labels over time (incremental training). If None,
-                     starts from the stock yolo11{size}-pose.pt.
+            weights: optional path to a previous best.pt to warm-start from
+            task: 'detect' (object boxes per class) or 'pose' (keypoints)
         """
         self.dataset_yaml = dataset_yaml
         self.model_size = model_size
         self.device = device
+        self.task = task
         self.best_model_path = None
 
+        suffix = "" if task == "detect" else "-pose"
         if weights and Path(weights).exists():
             print(f"📂 Warm-starting from previous weights: {weights}")
             self.model = YOLO(str(weights))
         else:
-            model_name = f"yolo11{model_size}-pose.pt"
+            model_name = f"yolo11{model_size}{suffix}.pt"
             print(f"📂 Loading pretrained: {model_name}")
             self.model = YOLO(model_name)
     
@@ -361,7 +402,7 @@ class YOLOKeypointTrainer:
         print(f"   Batch size: {batch_size}")
         print(f"   Device: {self.device}")
         
-        results = self.model.train(
+        train_kwargs = dict(
             data=str(self.dataset_yaml),
             epochs=epochs,
             imgsz=imgsz,
@@ -377,13 +418,15 @@ class YOLOKeypointTrainer:
             exist_ok=True,
             workers=4,
             verbose=True,
-            # Loss gains (kpt_shape / flip_idx come from dataset.yaml, not here)
             box=7.5,   # Box loss gain
             cls=0.5,   # Class loss gain
             dfl=1.5,   # DFL loss gain
-            pose=12.0, # Pose loss gain
-            kobj=1.0,  # Keypoint objectness loss gain
         )
+        if self.task != "detect":
+            # pose-only loss gains
+            train_kwargs["pose"] = 12.0
+            train_kwargs["kobj"] = 1.0
+        results = self.model.train(**train_kwargs)
 
         # Remember where ultralytics actually wrote best.pt (path varies by run)
         try:
@@ -489,10 +532,14 @@ if __name__ == "__main__":
     ROOT = Path(__file__).resolve().parent.parent
     KEYPOINT_NAMES = []                              # filled from the exported JSON
     LABELS_DIR = str(ROOT / "labels")               # labeler *_labels.json exports
-    VIDEO_DIR  = str(ROOT / "dataset" / "train" / "anal")  # source videos
+    VIDEO_DIR  = str(ROOT / "dataset")              # source videos (searched recursively)
     OUTPUT_DIR = str(ROOT / "yolo_dataset")         # where the YOLO dataset is written
     MODEL_SIZE = 'n'            # 'n' fast, 's'/'m' more accurate
     EPOCHS     = 100
+    # Task: "detect" = object detection (one box per labeled point, each its own
+    # class). "pose" = keypoints.
+    TASK     = "detect"
+    BOX_FRAC = 0.12            # detect-mode box size as a fraction of the frame
     # Device policy: use NVIDIA CUDA if present, otherwise CPU. An Intel GPU (XPU)
     # is intentionally NOT used for training — ultralytics has no stable XPU path;
     # the Intel GPU is for OpenVINO *inference*, not PyTorch training.
@@ -541,8 +588,11 @@ if __name__ == "__main__":
         video_dir=VIDEO_DIR,
         output_dir=OUTPUT_DIR,
         keypoint_names=KEYPOINT_NAMES,
-        img_size=640
+        img_size=640,
+        task=TASK,
+        box_frac=BOX_FRAC,
     )
+    print(f"🧭 Task: {TASK}" + (f" (box {BOX_FRAC:.2f} of frame)" if TASK == "detect" else ""))
 
     stats = builder.build_dataset(train_ratio=0.8)
     if not stats:
@@ -562,6 +612,7 @@ if __name__ == "__main__":
         model_size=MODEL_SIZE,
         device=DEVICE,
         weights=RESUME_WEIGHTS or None,
+        task=TASK,
     )
 
     results = trainer.train(
@@ -573,6 +624,17 @@ if __name__ == "__main__":
         patience=20,
         save_period=SAVE_PERIOD,
     )
+
+    # Save a keypoint-names sidecar next to best.pt so the app knows this model's
+    # detectable classes (the .pt itself doesn't carry the names).
+    if getattr(trainer, "best_model_path", None) and KEYPOINT_NAMES:
+        side = Path(trainer.best_model_path).parent / "keypoint_names.json"
+        try:
+            with open(side, "w", encoding="utf-8") as _f:
+                json.dump({"keypoint_names": KEYPOINT_NAMES}, _f, indent=2)
+            print(f"📝 Saved keypoint names: {side}")
+        except Exception as _e:
+            print(f"⚠️ Could not write keypoint names sidecar: {_e}")
 
     # ============================================
     # STEP 3: Export for deployment

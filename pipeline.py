@@ -76,6 +76,84 @@ def get_video_duration(video_path, log_fn=print):
     cap.release()
     return n / fps_ if fps_ else 0.0
 
+
+def run_keypoint_detection(video_path, model_path, keypoint_names, frame_skip=5,
+                           confidence_threshold=0.25, log=print, cancel_flag=None,
+                           progress_fn=None):
+    """Run a custom YOLO-pose model over a video and turn each detected keypoint
+    into (a) a per-second object detection and (b) an overlay bbox entry — so the
+    custom model's points feed the same scoring + overlay paths
+    as object detection.
+
+    Returns (object_detections {sec: [names]}, object_bboxes [{timestamp, objects,
+    bboxes (normalised x,y,w,h), confidences}]).
+    """
+    from ultralytics import YOLO
+    model = YOLO(str(model_path))
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        log(f"❌ Could not open video for keypoint detection: {video_path}")
+        return {}, []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    total_seconds = max(1, int(total_frames / fps)) if fps else 1
+    box = 0.05  # overlay marker size as a fraction of the frame
+    detections, bboxes = {}, []
+    fi = 0
+    step = max(1, int(frame_skip))
+    last_reported = -1
+    if progress_fn:
+        progress_fn(0, total_seconds, "Object Detection", "Custom keypoints: starting…")
+    while True:
+        if cancel_flag is not None and cancel_flag.is_set():
+            break
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if fi % step == 0:
+            sec_now = int(fi / fps) if fps else 0
+            if progress_fn and sec_now != last_reported:
+                last_reported = sec_now
+                progress_fn(sec_now, total_seconds, "Object Detection",
+                            f"Custom keypoints: {sec_now}/{total_seconds}s")
+            try:
+                r = model(frame, conf=confidence_threshold, verbose=False)[0]
+            except Exception as e:
+                log(f"⚠️ keypoint inference failed at frame {fi}: {e}")
+                fi += 1
+                continue
+            if r.keypoints is not None and r.keypoints.xy is not None:
+                kxy = r.keypoints.xy.cpu().numpy()                      # (inst, kp, 2)
+                kconf = (r.keypoints.conf.cpu().numpy()
+                         if r.keypoints.conf is not None else None)     # (inst, kp)
+                ts = fi / fps
+                sec = int(ts)
+                for inst in range(kxy.shape[0]):
+                    for ki, name in enumerate(keypoint_names):
+                        if ki >= kxy.shape[1]:
+                            break
+                        x, y = float(kxy[inst, ki, 0]), float(kxy[inst, ki, 1])
+                        if x <= 0 and y <= 0:
+                            continue   # keypoint not present this instance
+                        c = float(kconf[inst, ki]) if kconf is not None else 1.0
+                        if c < confidence_threshold:
+                            continue
+                        detections.setdefault(sec, set()).add(name)
+                        bboxes.append({
+                            'timestamp': float(ts),
+                            'objects': [name],
+                            'bboxes': [[max(0.0, x / W - box / 2),
+                                        max(0.0, y / H - box / 2), box, box]],
+                            'confidences': [c],
+                        })
+        fi += 1
+    cap.release()
+    if progress_fn:
+        progress_fn(total_seconds, total_seconds, "Object Detection", "Custom keypoints: done")
+    return {s: sorted(v) for s, v in detections.items()}, bboxes
+
 def _collapse_runs(items, fmt="{val} ×{n}", sep=", "):
     """['a','a','a','b','b'] -> 'a ×3, b ×2' (collapses CONSECUTIVE repeats)."""
     if not items:
@@ -131,7 +209,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                          motion_events, motion_peaks, audio_peaks, source_lang="en",
                          waveform_data=None, keyword_segments_only=False,
                          search_keywords=None, keyword_matches=None, action_bboxes=None,
-                         object_bboxes=None):
+                         object_bboxes=None, action_detections_all=None):
     """
     Collect all analysis results into a structured dictionary for caching.
 
@@ -155,17 +233,26 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                 filtered_transcript_segments.append(segment)
     
     # Ensure action_detections is in a cacheable format
-    actions_for_cache = []
-    for detection in action_detections:
-        if len(detection) >= 5:
-            timestamp, frame_id, action_id, score, action_name = detection[:5]
-            actions_for_cache.append({
-                "timestamp": float(timestamp),
-                "frame_id": int(frame_id),
-                "action_id": int(action_id),
-                "confidence": float(score),
-                "action_name": str(action_name)
-            })
+    def _actions_to_cache(dets):
+        out = []
+        for detection in dets or []:
+            if len(detection) >= 5:
+                timestamp, frame_id, action_id, score, action_name = detection[:5]
+                out.append({
+                    "timestamp": float(timestamp),
+                    "frame_id": int(frame_id),
+                    "action_id": int(action_id),
+                    "confidence": float(score),
+                    "action_name": str(action_name)
+                })
+        return out
+
+    actions_for_cache = _actions_to_cache(action_detections)            # highlight-selected
+    # Full raw detection stream for the timeline "show all" view; falls back to the
+    # selected list if the caller didn't pass it.
+    actions_all_for_cache = _actions_to_cache(
+        action_detections_all if action_detections_all is not None else action_detections
+    )
     
     # Convert numpy arrays/lists to Python native types
     motion_events_clean = [float(t) for t in motion_events]
@@ -196,6 +283,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
             for sec, objs in object_detections.items()
         ],
         "actions": actions_for_cache,
+        "actions_all": actions_all_for_cache,
         "scenes": [
             {"start": float(start), "end": float(end)}
             for start, end in scenes
@@ -900,7 +988,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             
             yolo_type = gui_config.get("yolo_type", "standard")
             
-            if yolo_type == "yolo_world":
+            if "yolo_world" in yolo_type:
                 # YOLO-World: open-vocabulary detection (no OpenVINO support)
                 from ultralytics import YOLOWorld
                 world_pt = f"yolov8{yolo_model_size}-worldv2.pt"
@@ -952,31 +1040,62 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 object_detections = {}
             else:
                 frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME if CLIP_TIME > 0 else 5)
-                
-                # Get bounding box settings
-                draw_object_boxes = gui_config.get("draw_object_boxes", False)
-                object_annotated_path = None
-                if draw_object_boxes:
-                    video_basename = os.path.splitext(os.path.basename(video_path))[0]
-                    temp_folder = os.path.dirname(video_path) or "."
-                    object_annotated_path = os.path.join(temp_folder, f"{video_basename}_objects_annotated.mp4")
-                    log(f"🎨 Object bounding boxes enabled, output: {object_annotated_path}")
+                object_detections, object_bboxes_cache = {}, []
+                custom_only = (yolo_type == "custom")
+                use_custom = "custom" in yolo_type
 
-                # Run detection with cancellation support and bounding boxes
-                object_detections, object_bboxes_cache = run_object_detection_single(
-                    processed_video_path,
-                    yolo_model,
-                    highlight_objects,
-                    log_fn=log_fn,
-                    progress_fn=progress_fn,
-                    frame_skip=frame_skip_for_obj,
-                    cancel_flag=cancel_flag,
-                    draw_boxes=draw_object_boxes,
-                    annotated_output=object_annotated_path,
-                    device=yolo_device,
-                    confidence_threshold=float(gui_config.get("object_confidence", 0.3)),
-                )
+                # --- Custom model (object detector or keypoint model) ---
+                if use_custom:
+                    cm = gui_config.get("yolo_custom_model_path")
+                    if cm and os.path.exists(cm):
+                        try:
+                            from modules.app_paths import custom_keypoint_names
+                            kp_names = custom_keypoint_names() or highlight_objects
+                        except Exception:
+                            kp_names = highlight_objects
+                        log(f"🧩 Custom keypoint model: {os.path.basename(cm)} {kp_names}")
+                        kp_det, kp_bb = run_keypoint_detection(
+                            processed_video_path, cm, kp_names,
+                            frame_skip=frame_skip_for_obj,
+                            confidence_threshold=float(gui_config.get("object_confidence", 0.3)),
+                            log=log, cancel_flag=cancel_flag, progress_fn=progress_fn,
+                        )
+                        for sec, names in kp_det.items():
+                            object_detections.setdefault(sec, [])
+                            object_detections[sec] = sorted(set(object_detections[sec]) | set(names))
+                        object_bboxes_cache += kp_bb
+                        log(f"✅ Custom keypoints: {sum(len(v) for v in kp_det.values())} hits "
+                            f"over {len(kp_det)} seconds")
+                    else:
+                        log(f"⚠️ Custom model path not found: {cm}")
 
+                # --- Standard / YOLO-World object detection (skipped for custom-only) ---
+                if not custom_only:
+                    draw_object_boxes = gui_config.get("draw_object_boxes", False)
+                    object_annotated_path = None
+                    if draw_object_boxes:
+                        video_basename = os.path.splitext(os.path.basename(video_path))[0]
+                        temp_folder = os.path.dirname(video_path) or "."
+                        object_annotated_path = os.path.join(temp_folder, f"{video_basename}_objects_annotated.mp4")
+                        log(f"🎨 Object bounding boxes enabled, output: {object_annotated_path}")
+
+                    std_det, std_bb = run_object_detection_single(
+                        processed_video_path,
+                        yolo_model,
+                        highlight_objects,
+                        log_fn=log_fn,
+                        progress_fn=progress_fn,
+                        frame_skip=frame_skip_for_obj,
+                        cancel_flag=cancel_flag,
+                        draw_boxes=draw_object_boxes,
+                        annotated_output=object_annotated_path,
+                        device=yolo_device,
+                        confidence_threshold=float(gui_config.get("object_confidence", 0.3)),
+                    )
+                    for sec, names in std_det.items():
+                        object_detections.setdefault(sec, [])
+                        object_detections[sec] = sorted(set(object_detections[sec]) | set(names))
+                    object_bboxes_cache += std_bb
 
                 log(f"✅ Object detection complete: {len(object_detections)} seconds with objects")
         else:
@@ -1050,6 +1169,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # --- Action recognition with grouping ---
         interesting_actions = gui_config.get("interesting_actions", [])
         action_bboxes_cache = []
+        all_action_detections = []  # full raw detection stream (for the timeline "show all")
 
         if not using_cache and interesting_actions:
             try:
@@ -1231,6 +1351,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     transcript_segments=transcript_segments,
                     object_detections=object_detections,
                     action_detections=action_detections,
+                    action_detections_all=all_action_detections,
                     scenes=scenes,
                     motion_events=[float(t) for t in motion_events],  # Convert numpy floats
                     motion_peaks=[float(t) for t in motion_peaks],  # Convert numpy floats

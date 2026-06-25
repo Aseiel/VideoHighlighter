@@ -46,6 +46,66 @@ def data_file(name: str) -> str:
     return resource_path(name)
 
 
+def latest_custom_pose_model():
+    """Return the most recent trained custom keypoint model (best.pt), or None.
+
+    Looks in the usual ultralytics output locations under the project, plus a
+    drop-in copy next to the executable / project root named
+    'custom_keypoints.pt'. Lets the GUI/pipeline pick up a freshly trained model
+    without hardcoding a path.
+    """
+    import glob
+    roots = {_project_root(), user_data_dir()}
+    candidates = []
+    for root in roots:
+        # explicit drop-in
+        for name in ("custom_keypoints.pt",):
+            p = os.path.join(root, name)
+            if os.path.exists(p):
+                candidates.append(p)
+        # ultralytics training outputs
+        candidates += glob.glob(os.path.join(root, "**", "weights", "best.pt"), recursive=True)
+        candidates += glob.glob(os.path.join(root, "training", "**", "weights", "best.pt"), recursive=True)
+    candidates = [c for c in candidates if os.path.exists(c)]
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def _read_keypoint_names(path):
+    import json
+    try:
+        if path and os.path.exists(path):
+            data = json.load(open(path, encoding="utf-8"))
+            names = data if isinstance(data, list) else data.get("keypoint_names")
+            return [str(x) for x in (names or []) if str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def custom_keypoint_names():
+    """The custom model's keypoint names (its detectable 'classes').
+    Resolution order: sidecar next to the model -> labeler_keypoints.json ->
+    any exported label JSON's keypoint_names.
+    """
+    import glob
+    model = latest_custom_pose_model()
+    if model:
+        names = _read_keypoint_names(os.path.join(os.path.dirname(model), "keypoint_names.json"))
+        if names:
+            return names
+    for root in {_project_root(), user_data_dir()}:
+        names = _read_keypoint_names(os.path.join(root, "labeler_keypoints.json"))
+        if names:
+            return names
+        for f in glob.glob(os.path.join(root, "labels", "*.json")):
+            names = _read_keypoint_names(f)
+            if names:
+                return names
+    return []
+
+
 def ffmpeg_exe() -> str:
     """Resolve a usable ffmpeg executable.
 

@@ -1150,6 +1150,20 @@ class VideoHighlighterGUI(QWidget):
         self.yolo_type_combo = QComboBox()
         self.yolo_type_combo.addItem("Standard YOLO11 (80 objects, fast, OpenVINO support)", "standard")
         self.yolo_type_combo.addItem("YOLO-World (unlimited objects, no OpenVINO)", "yolo_world")
+
+        # Custom keypoint model (your trained training/train_yolo.py best.pt). Offered
+        # only if one is found. Can run on its own or alongside an object detector.
+        try:
+            from modules.app_paths import latest_custom_pose_model
+            self._custom_pose_model = latest_custom_pose_model()
+        except Exception:
+            self._custom_pose_model = None
+        if self._custom_pose_model:
+            self.yolo_type_combo.addItem("Custom keypoints only (your trained model)", "custom")
+            self.yolo_type_combo.addItem("Standard YOLO11 + Custom keypoints", "standard+custom")
+            self.yolo_type_combo.addItem("YOLO-World + Custom keypoints", "yolo_world+custom")
+            self.yolo_type_combo.setToolTip(f"Custom keypoint model:\n{self._custom_pose_model}")
+
         current_type = advanced_cfg.get("yolo_type", "standard")
         idx_type = self.yolo_type_combo.findData(current_type)
         self.yolo_type_combo.setCurrentIndex(idx_type if idx_type >= 0 else 0)
@@ -1157,21 +1171,30 @@ class VideoHighlighterGUI(QWidget):
         self.yolo_model_combo = QComboBox()
 
         def on_yolo_type_changed(index):
-            yolo_type = self.yolo_type_combo.currentData()
+            yolo_type = self.yolo_type_combo.currentData() or "standard"
             prev_size = self.yolo_model_combo.currentData()
             self.yolo_model_combo.blockSignals(True)
             self.yolo_model_combo.clear()
 
-            if yolo_type == "yolo_world":
+            custom_only = (yolo_type == "custom")
+            use_world = "yolo_world" in yolo_type
+
+            if custom_only:
+                # Size applies to the object detector, which isn't used here
+                self.yolo_model_combo.addItem("(custom model — size N/A)", "n")
+                self.yolo_model_combo.setEnabled(False)
+            elif use_world:
                 self.yolo_model_combo.addItem("Small (~90MB, fastest)", "s")
                 self.yolo_model_combo.addItem("Medium (~140MB, balanced)", "m")
                 self.yolo_model_combo.addItem("Large (~180MB, most accurate)", "l")
+                self.yolo_model_combo.setEnabled(True)
             else:
                 self.yolo_model_combo.addItem("Nano (fastest, lowest accuracy)", "n")
                 self.yolo_model_combo.addItem("Small (fast, good balance)", "s")
                 self.yolo_model_combo.addItem("Medium (balanced)", "m")
                 self.yolo_model_combo.addItem("Large (accurate, slower)", "l")
                 self.yolo_model_combo.addItem("Extra-Large (most accurate, slowest)", "x")
+                self.yolo_model_combo.setEnabled(True)
 
             restore_idx = self.yolo_model_combo.findData(prev_size)
             if restore_idx >= 0:
@@ -1906,6 +1929,7 @@ class VideoHighlighterGUI(QWidget):
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
+            "yolo_custom_model_path": getattr(self, "_custom_pose_model", None),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
@@ -2529,18 +2553,32 @@ class VideoHighlighterGUI(QWidget):
                 return []
 
     def open_object_label_selector(self):
-        """Open label selector populated from yolo_objects_labels.json."""
-        if not os.path.exists(YOLO_OBJECTS_LABELS_FILE):
-            self.append_log(f"⚠️ Label file not found: {YOLO_OBJECTS_LABELS_FILE}")
-            return
+        """Open label selector. For the custom keypoint model this offers your
+        trained class names; for 'mixed' it merges those
+        with the COCO objects; otherwise the standard YOLO objects."""
+        yolo_type = self.yolo_type_combo.currentData() or "standard"
 
-        labels = self.load_labels_from_json(YOLO_OBJECTS_LABELS_FILE)
+        labels = []
+        if "custom" in yolo_type:
+            try:
+                from modules.app_paths import custom_keypoint_names
+                labels = custom_keypoint_names()
+            except Exception:
+                labels = []
+            if not labels:
+                self.append_log("⚠️ No custom keypoint names found (train a model / check labels).")
+
+        if yolo_type != "custom":  # standard or mixed -> include COCO objects
+            if os.path.exists(YOLO_OBJECTS_LABELS_FILE):
+                labels = labels + self.load_labels_from_json(YOLO_OBJECTS_LABELS_FILE)
+
         if not labels:
-            self.append_log("⚠️ No labels found in YOLO labels file")
+            self.append_log("⚠️ No labels available for the selected model.")
             return
 
         current = [s.strip() for s in self.objects_input.text().split(",") if s.strip()]
-        dlg = LabelSelectorDialog("Select Object Labels (YOLO)", labels, current, self)
+        title = "Select Labels (Custom keypoints)" if "custom" in yolo_type else "Select Object Labels (YOLO)"
+        dlg = LabelSelectorDialog(title, labels, current, self)
         if dlg.exec() == QDialog.Accepted:
             selected = dlg.get_selected_labels()
             self.objects_input.setText(", ".join(selected))
@@ -3057,6 +3095,7 @@ class VideoHighlighterGUI(QWidget):
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
+            "yolo_custom_model_path": getattr(self, "_custom_pose_model", None),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
