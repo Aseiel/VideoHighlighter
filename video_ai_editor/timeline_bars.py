@@ -92,7 +92,8 @@ class DraggableTimelineBar(QGraphicsRectItem):
                 if scene.visible_layers.get('waveform', False) and scene.waveform and scene.video_duration > 0:
                     sample_index = int(time * len(scene.waveform) / scene.video_duration)
                     if 0 <= sample_index < len(scene.waveform):
-                        min_val, max_val = scene.waveform[sample_index]
+                        pt = scene.waveform[sample_index]   # (min, max) or (min, max, rms)
+                        min_val, max_val = pt[0], pt[1]
                         amplitude = (abs(min_val) + abs(max_val)) / 2
                         if amplitude > 0.3:
                             start = max(0, time - 1.5)
@@ -129,37 +130,64 @@ class DraggableTimelineBar(QGraphicsRectItem):
     
     def start_drag(self, event):
         import json
+
+        # Coerce any non-JSON-native values (e.g. numpy scalars from analysis
+        # data) so json.dumps can't raise inside this Qt event callback — an
+        # unhandled exception here hard-crashes the app on drag.
+        def _json_safe(o):
+            try:
+                return o.item()          # numpy scalar -> python scalar
+            except Exception:
+                return str(o)
+
+        try:
+            start_t = float(self.bar.start_time)
+            end_t = float(self.bar.end_time)
+            bar_data = {
+                'type': 'timeline_bar',
+                'start_time': start_t,
+                'end_time': end_t,
+                'duration': end_t - start_t,
+                'label': str(self.bar.label),
+                'metadata': self.bar.metadata,
+            }
+            payload = json.dumps(bar_data, default=_json_safe)
+        except Exception as e:
+            print(f"⚠️ Drag serialize failed, skipping drag: {e}")
+            self.mouse_press_pos = None
+            return
+
         mime_data = QMimeData()
-        bar_data = {
-            'type': 'timeline_bar',
-            'start_time': self.bar.start_time,
-            'end_time': self.bar.end_time,
-            'duration': self.bar.end_time - self.bar.start_time,
-            'label': self.bar.label,
-            'metadata': self.bar.metadata
-        }
-        mime_data.setText(json.dumps(bar_data))
+        mime_data.setText(payload)
 
         view = self.scene().views()[0] if self.scene() and self.scene().views() else None
         drag = QDrag(view.viewport() if view else event.widget())
         drag.setMimeData(mime_data)
 
+        # Cap the drag pixmap size. A merged bar can be tens of thousands of px
+        # wide; creating an oversized QPixmap (beyond the backend max, ~32767) can
+        # crash natively with no Python traceback. It's only a visual cue, so a
+        # small fixed-cap pixmap is fine.
         rect = self.rect()
-        pixmap = QPixmap(int(rect.width()), int(rect.height()))
+        pw = max(1, min(int(rect.width()), 300))
+        ph = max(1, min(int(rect.height()), 80))
+        pixmap = QPixmap(pw, ph)
         pixmap.fill(Qt.transparent)
 
         painter = QPainter(pixmap)
         painter.setBrush(self.brush())
         painter.setPen(self.pen())
-        painter.drawRect(0, 0, int(rect.width()) - 1, int(rect.height()) - 1)
+        painter.drawRect(0, 0, pw - 1, ph - 1)
         painter.end()
 
         drag.setPixmap(pixmap)
-        drag.setHotSpot(QPoint(int(rect.width() / 2), int(rect.height() / 2)))
-        drag.exec(Qt.CopyAction)
+        drag.setHotSpot(QPoint(pw // 2, ph // 2))
 
-        self.setCursor(QCursor(Qt.OpenHandCursor))
+        # Reset state BEFORE exec: exec() runs a nested event loop and the drop
+        # may rebuild the scene and delete this item, so touching self afterwards
+        # would be a use-after-free.
         self.mouse_press_pos = None
+        drag.exec(Qt.CopyAction)
     
     def hoverEnterEvent(self, event):
         """Highlight on hover"""
