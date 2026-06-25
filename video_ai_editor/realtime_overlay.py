@@ -46,12 +46,13 @@ from video_ai_editor.live_face import LiveFaceController, LiveFaceOverlay
 
 from PySide6.QtCore import Qt, QRectF, QTimer, QUrl, QPointF, Signal, QSizeF
 from PySide6.QtGui import (
-    QColor, QPen, QBrush, QFont, QPainter, QImage, QTransform,
+    QColor, QPen, QBrush, QFont, QPainter, QImage, QTransform, QAction,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
     QGraphicsRectItem, QGraphicsTextItem, QGraphicsEllipseItem,
     QCheckBox, QLabel, QGroupBox, QComboBox, QSlider, QGraphicsItem, QMenu, QInputDialog,
+    QToolButton,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -294,6 +295,20 @@ class LazyBBoxLoader:
             'type': 'action'
         }]
     
+    def get_all_class_names(self) -> set[str]:
+        """All formatted class names present, matching BBoxOverlayItem.class_name
+        (objects raw, actions prefixed with their abbreviation)."""
+        self._ensure_loaded()
+        names: set[str] = set()
+        for entry in self._object_bboxes:
+            for n in entry.get('objects', []) or []:
+                if n:
+                    names.add(str(n))
+        for entry in self._action_bboxes:
+            name = entry.get('action_name') or entry.get('action', 'action')
+            names.add(f"[{action_abbrev(name)}] {name}")
+        return names
+
     def clear_cache(self):
         """Clear the bucket cache to free memory."""
         self._bucket_cache.clear()
@@ -459,6 +474,10 @@ class OverlayScene(QGraphicsScene):
         # Track which items are currently visible
         self._visible_count: int = 0
 
+        # Per-class filter + last computed active time window (for re-applying)
+        self._hidden_classes: set[str] = set()
+        self._active_buckets: set[int] = set()
+
         # Video dimensions (updated when native size changes)
         self._video_w: float = 1920
         self._video_h: float = 1080
@@ -560,20 +579,32 @@ class OverlayScene(QGraphicsScene):
                     center_bucket + half_window_buckets + 1)
         )
 
-        # Show/hide items
+        # Show/hide items (respecting the per-class filter), then de-overlap labels
+        self._active_buckets = active_buckets
+        self._apply_visibility()
+
+    def _apply_visibility(self):
+        """Show items whose bucket is in the active window and whose class isn't
+        hidden by the filter; then de-overlap the visible labels."""
         visible_count = 0
         for bucket, items in self._bbox_items.items():
-            visible = bucket in active_buckets
+            in_window = bucket in self._active_buckets
             for item in items:
-                if item.isVisible() != visible:
-                    item.setVisible(visible)
-                if visible:
+                vis = in_window and item.class_name not in self._hidden_classes
+                if item.isVisible() != vis:
+                    item.setVisible(vis)
+                if vis:
                     visible_count += 1
-
         self._visible_count = visible_count
-
-        # Stack any overlapping labels so they don't cover each other
         self._resolve_label_overlaps()
+
+    def set_class_hidden(self, class_name: str, hidden: bool):
+        """Toggle whether a detection class is shown in the overlay."""
+        if hidden:
+            self._hidden_classes.add(class_name)
+        else:
+            self._hidden_classes.discard(class_name)
+        self._apply_visibility()
 
     def _resolve_label_overlaps(self):
         """Nudge overlapping labels so close boxes don't bury each other's labels.
@@ -774,6 +805,17 @@ class RealtimeOverlayPreview(QWidget):
         self._count_label.setStyleSheet("color: #888; font-size: 11px;")
         controls.addWidget(self._count_label)
 
+        # Per-class overlay filter (show/hide each detection class)
+        self._filter_btn = QToolButton()
+        self._filter_btn.setText("🔍 Filter")
+        self._filter_btn.setPopupMode(QToolButton.InstantPopup)
+        self._filter_btn.setToolTip("Show/hide individual detection classes on the overlay")
+        self._filter_menu = QMenu(self._filter_btn)
+        self._filter_btn.setMenu(self._filter_menu)
+        self._filter_btn.setEnabled(False)
+        self._filter_actions: dict[str, QAction] = {}
+        controls.addWidget(self._filter_btn)
+
         controls.addStretch()
 
         # Memory usage label
@@ -830,14 +872,49 @@ class RealtimeOverlayPreview(QWidget):
         if self._detection_count > 0:
             self._count_label.setText(f"({self._detection_count} detections available)")
             self._overlay_cb.setEnabled(True)
+            self._build_filter_menu()
         else:
             self._count_label.setText("(no bbox data in cache)")
             self._overlay_cb.setEnabled(False)
+            self._filter_btn.setEnabled(False)
             self._overlay_cb.setToolTip(
                 "No bounding box data found in cache.\n"
                 "Run detection with draw_bboxes=True and bbox saving enabled,\n"
                 "or use the pre-rendered video swap instead."
             )
+
+    def _build_filter_menu(self):
+        """Populate the overlay filter with a checkable item per detection class."""
+        self._filter_menu.clear()
+        self._filter_actions.clear()
+        names = sorted(self._bbox_loader.get_all_class_names())
+        if not names:
+            self._filter_btn.setEnabled(False)
+            return
+
+        show_all = self._filter_menu.addAction("Show all")
+        show_all.triggered.connect(lambda: self._set_all_classes(True))
+        hide_all = self._filter_menu.addAction("Hide all")
+        hide_all.triggered.connect(lambda: self._set_all_classes(False))
+        self._filter_menu.addSeparator()
+
+        for name in names:
+            act = QAction(name, self._filter_menu)
+            act.setCheckable(True)
+            act.setChecked(name not in self._scene._hidden_classes)
+            act.toggled.connect(
+                lambda checked, n=name: self._scene.set_class_hidden(n, not checked)
+            )
+            self._filter_menu.addAction(act)
+            self._filter_actions[name] = act
+
+        self._filter_btn.setEnabled(True)
+
+    def _set_all_classes(self, show: bool):
+        """Check/uncheck every class (each toggle updates the scene filter)."""
+        for act in self._filter_actions.values():
+            if act.isChecked() != show:
+                act.setChecked(show)
 
     def _log_memory(self):
         """Log current memory usage."""
