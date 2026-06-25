@@ -83,6 +83,20 @@ def color_for_class(class_name: str) -> QColor:
     return _CLASS_COLORS[key]
 
 
+def _strip_badge(name: str) -> str:
+    """Drop a leading '[XX] ' abbreviation badge from an overlay label."""
+    s = str(name).strip()
+    if s.startswith('[') and ']' in s:
+        s = s[s.index(']') + 1:].strip()
+    return s
+
+
+def _palette_color(i: int) -> QColor:
+    """Same formula as SignalTimelineScene._color_palette, so overlay colours
+    match the timeline for the same sorted class index."""
+    return QColor.fromHsvF((i * 0.618) % 1.0, 0.85, 0.92)
+
+
 def action_abbrev(name: str) -> str:
     """Short code from an action name: initials of its words, e.g.
     'jump' -> 'J', 'high five' -> 'HF', 'sit down' -> 'SD'."""
@@ -362,6 +376,7 @@ class BBoxOverlayItem(QGraphicsRectItem):
         confidence: float,
         timestamp: float,
         parent: QGraphicsItem | None = None,
+        color: QColor | None = None,
     ):
         super().__init__(parent)
         self.class_name = class_name
@@ -369,7 +384,8 @@ class BBoxOverlayItem(QGraphicsRectItem):
         self.timestamp = timestamp
         self.bbox_norm = bbox  # stored normalised, mapped to scene in update_geometry
 
-        color = color_for_class(class_name)
+        if color is None:
+            color = color_for_class(class_name)
 
         # Box style
         pen = QPen(color, 2.5)
@@ -478,6 +494,9 @@ class OverlayScene(QGraphicsScene):
         self._hidden_classes: set[str] = set()
         self._active_buckets: set[int] = set()
 
+        # class_name -> QColor, mirroring the timeline's palette (built on load)
+        self._class_colors: dict[str, QColor] = {}
+
         # Video dimensions (updated when native size changes)
         self._video_w: float = 1920
         self._video_h: float = 1080
@@ -529,8 +548,28 @@ class OverlayScene(QGraphicsScene):
         # Just store the loader reference
         self._bbox_loader = bbox_loader
         self._detection_count = bbox_loader.get_total_count()
+        self._build_class_colors()
         print(f"🎯 Lazy loader ready: {self._detection_count} bboxes available")
         return self._detection_count
+
+    def _build_class_colors(self):
+        """Assign each class the SAME colour the timeline uses: the timeline
+        palette indexed by the class's sorted position within its group
+        (actions / objects). Keyed by the formatted class_name items carry."""
+        self._class_colors = {}
+        try:
+            names = self._bbox_loader.get_all_class_names()
+        except Exception:
+            return
+        action_disp = sorted({_strip_badge(n).title() for n in names if n.startswith('[')})
+        object_disp = sorted({n.title() for n in names if not n.startswith('[')})
+        action_idx = {d: i for i, d in enumerate(action_disp)}
+        object_idx = {d: i for i, d in enumerate(object_disp)}
+        for n in names:
+            if n.startswith('['):
+                self._class_colors[n] = _palette_color(action_idx.get(_strip_badge(n).title(), 0))
+            else:
+                self._class_colors[n] = _palette_color(object_idx.get(n.title(), 0))
 
     def update_time(self, time_seconds: float, window: float = 0.3):
         """
@@ -561,6 +600,7 @@ class OverlayScene(QGraphicsScene):
                         class_name=bbox['class_name'],
                         confidence=bbox['confidence'],
                         timestamp=ts,
+                        color=self._class_colors.get(bbox['class_name']),
                     )
                     item.update_geometry(self._video_w, self._video_h)
                     self.addItem(item)
