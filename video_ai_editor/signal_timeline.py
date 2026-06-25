@@ -46,7 +46,11 @@ class SignalTimelineScene(QGraphicsScene):
             
         self.layer_height = 40
         self.layer_spacing = 10
-        
+
+        # Actions row source: False = show ALL detections (default), True = only
+        # the subset that was selected into the highlight.
+        self.show_only_highlight_actions = False
+
         # Extract action and object types for better organization
         self.action_types = self._extract_action_types()
         self.object_classes = self._extract_object_classes()
@@ -250,10 +254,49 @@ class SignalTimelineScene(QGraphicsScene):
 
 
 
+    def _actions_list(self):
+        """Action detections for the ACTIONS row. Default = ALL detections;
+        when show_only_highlight_actions is on, just the highlight-selected
+        subset."""
+        if self.show_only_highlight_actions:
+            return self.cache_data.get('actions', [])
+
+        # Show all: prefer the cached full stream...
+        all_actions = self.cache_data.get('actions_all')
+        if all_actions:
+            return all_actions
+
+        # ...else derive from action_bboxes (same source the overlay uses, so the
+        # row matches the boxes and works on existing caches with no re-analysis)...
+        bboxes = self.cache_data.get('action_bboxes')
+        if bboxes:
+            return [
+                {
+                    'timestamp': b.get('timestamp', 0),
+                    'action_name': b.get('action_name') or b.get('action') or 'action',
+                    'confidence': b.get('confidence', 0.5),
+                }
+                for b in bboxes
+            ]
+
+        # ...finally the selected list.
+        return self.cache_data.get('actions', [])
+
+    def set_show_only_highlight_actions(self, value: bool):
+        """Toggle the ACTIONS row between all detections and highlight-only."""
+        value = bool(value)
+        if value == self.show_only_highlight_actions:
+            return
+        self.show_only_highlight_actions = value
+        self.action_types = self._extract_action_types()
+        self.visible_actions = {a: self.visible_actions.get(a, True) for a in self.action_types}
+        self.action_colors = self._color_palette(len(self.action_types), start_hue=100)
+        self.build_timeline()
+
     def _extract_action_types(self):
         """Extract unique action names from cache data"""
         actions = set()
-        for item in self.cache_data.get('actions', []):
+        for item in self._actions_list():
             name = item.get('action_name') or item.get('action') or item.get('class') or 'unknown'
             if isinstance(name, str):
                 actions.add(name.strip().title())
@@ -575,7 +618,7 @@ class SignalTimelineScene(QGraphicsScene):
         
         # Group actions by type
         action_groups = defaultdict(list)
-        for action in self.cache_data.get('actions', []):
+        for action in self._actions_list():
             # Apply confidence filter
             if not self.should_show_action(action):
                 continue
