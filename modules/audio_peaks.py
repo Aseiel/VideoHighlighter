@@ -62,8 +62,11 @@ def extract_waveform_data(video_path, num_points=1000):
             if len(chunk) > 0:
                 max_val = np.max(chunk) / 32768.0  # Normalize to [-1, 1]
                 min_val = np.min(chunk) / 32768.0
-                waveform.append((min_val, max_val))
-        
+                # RMS energy ~ perceived loudness (broadband events like explosions
+                # read hot, not just sharp transients with a high peak).
+                rms = float(np.sqrt(np.mean((chunk.astype(np.float64) / 32768.0) ** 2)))
+                waveform.append((min_val, max_val, rms))
+
         return waveform
         
     finally:

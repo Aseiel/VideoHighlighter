@@ -63,7 +63,9 @@ class WaveformVisualizer:
             for i in range(0, audio.size, step):
                 chunk = audio[i:i + step]
                 if chunk.size:
-                    waveform.append((float(chunk.min()) / 32768.0, float(chunk.max()) / 32768.0))
+                    rms = float(np.sqrt(np.mean((chunk.astype(np.float64) / 32768.0) ** 2)))
+                    waveform.append((float(chunk.min()) / 32768.0,
+                                     float(chunk.max()) / 32768.0, rms))
 
             self.waveform_data = waveform
             print(f"✅ Waveform extracted: {len(waveform)} points, duration={self.duration:.2f}s")

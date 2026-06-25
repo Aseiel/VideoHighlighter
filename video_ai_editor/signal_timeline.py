@@ -195,20 +195,39 @@ class SignalTimelineScene(QGraphicsScene):
             points_per_pixel = len(self.waveform) / total_width
             
             n_points = len(self.waveform)
-            for i, (min_val, max_val) in enumerate(self.waveform):
+
+            # Color by ENERGY (RMS) where available; falls back to peak for old
+            # 2-tuple caches. Normalize against a high PERCENTILE (not the single
+            # loudest bin) so one loud transient (a bell) doesn't flatten the rest
+            # to one colour — spreads quiet->blue, typical->mid, loud->red, with
+            # outliers clipped to red.
+            def _energy(pt):
+                return pt[2] if len(pt) > 2 else (abs(pt[0]) + abs(pt[1])) / 2
+            _sorted_e = sorted(_energy(pt) for pt in self.waveform)
+
+            def _pct(p):
+                if not _sorted_e:
+                    return 0.0
+                return _sorted_e[min(len(_sorted_e) - 1, int(len(_sorted_e) * p))]
+            energy_lo = _pct(0.10)              # floor -> blue
+            energy_rng = max(_pct(0.97) - energy_lo, 1e-6)  # robust ceiling -> red
+
+            for i, pt in enumerate(self.waveform):
+                min_val, max_val = pt[0], pt[1]
                 # Each point is one of n_points equal bins tiling [0, video_duration];
                 # place it at the bin CENTER (i+0.5) so a transient lands on its real
                 # time instead of up to a full bin (~0.7s) early.
                 time_pos = ((i + 0.5) / n_points) * self.video_duration
                 x = time_pos * self.pixels_per_second
-                
+
                 # Skip if beyond visible area
                 if x > total_width:
                     break
-                
-                # Calculate amplitude
-                amplitude = (abs(min_val) + abs(max_val)) / 2
-                amplitude_index = min(255, int(amplitude * 500))
+
+                # Map energy across [floor, ceiling] percentile range, clamped.
+                norm = (_energy(pt) - energy_lo) / energy_rng
+                norm = 0.0 if norm < 0 else (1.0 if norm > 1 else norm)
+                amplitude_index = min(255, int(norm * 255))
               
                 # Get color
                 if self.waveform_colors and amplitude_index < len(self.waveform_colors):
