@@ -106,9 +106,13 @@ class YOLOKeypointDatasetBuilder:
         Returns 'class_id xc yc w h' lines (normalised), or None if no points."""
         bw = bh = self.box_frac
         lines = []
-        for idx, name in enumerate(self.keypoint_names):
-            if name in frame_info.get('points', {}):
-                x, y = frame_info['points'][name]
+        for name, raw in frame_info.get('points', {}).items():
+            if name not in self.keypoint_names:
+                continue
+            idx = self.keypoint_names.index(name)
+            # Support both old [x,y] and new [[x1,y1],[x2,y2]] formats
+            instances = raw if (raw and isinstance(raw[0], list)) else [raw]
+            for x, y in instances:
                 xc = min(max(x / img_width, 0.0), 1.0)
                 yc = min(max(y / img_height, 0.0), 1.0)
                 lines.append(f"{idx} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}")
@@ -191,7 +195,7 @@ class YOLOKeypointDatasetBuilder:
         """
         print("📊 Building YOLO keypoint dataset...")
 
-        label_files = list(self.labels_dir.glob("*.json"))
+        label_files = list(self.labels_dir.rglob("*.json"))
         if not label_files:
             print(f"❌ No JSON files found in {self.labels_dir}")
             return None
@@ -531,7 +535,7 @@ if __name__ == "__main__":
     # runs the same whether launched from the repo root or from training/.
     ROOT = Path(__file__).resolve().parent.parent
     KEYPOINT_NAMES = []                              # filled from the exported JSON
-    LABELS_DIR = str(ROOT / "labels")               # labeler *_labels.json exports
+    LABELS_DIR = str(ROOT / "dataset" / "train" / "labels")  # labeler *_labels.json exports
     VIDEO_DIR  = str(ROOT / "dataset")              # source videos (searched recursively)
     OUTPUT_DIR = str(ROOT / "yolo_dataset")         # where the YOLO dataset is written
     MODEL_SIZE = 'n'            # 'n' fast, 's'/'m' more accurate
@@ -567,7 +571,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     # Use the keypoint names recorded by the labeler (single source of truth)
-    _label_files = sorted(Path(LABELS_DIR).glob("*.json"))
+    _label_files = sorted(Path(LABELS_DIR).rglob("*.json"))
     if _label_files:
         try:
             with open(_label_files[0], 'r', encoding='utf-8') as _f:

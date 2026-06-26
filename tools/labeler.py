@@ -10,8 +10,37 @@ from pathlib import Path
 from collections import defaultdict
 import torch
 
-# NEW: YOLO imports for pose estimation
+# YOLO imports for pose estimation
 from ultralytics import YOLO
+
+def _disp(internal: str) -> str:
+    """Strip the dedup suffix (~2, ~3 …) to get the display/class name."""
+    if '~' in internal:
+        base, _, suf = internal.rpartition('~')
+        if suf.isdigit():
+            return base
+    return internal
+
+
+def _make_internal(display: str, existing: list) -> str:
+    """Return a unique internal key for *display*, suffixing ~2, ~3 … if needed."""
+    if display not in existing:
+        return display
+    n = 2
+    while f"{display}~{n}" in existing:
+        n += 1
+    return f"{display}~{n}"
+
+
+def _pts(val):
+    """Normalise a points-dict value to a list of (x, y) tuples.
+    Handles old single-instance format [x, y] and new [[x1,y1],[x2,y2]]."""
+    if not val:
+        return []
+    if isinstance(val[0], (int, float)):
+        return [tuple(val)]          # old format: [x, y]
+    return [tuple(p) for p in val]  # new format: [[x,y], ...]
+
 
 def natural_sort_key(path):
     """Natural sort key for human-friendly sorting (e.g., 8 before 10)"""
@@ -104,39 +133,48 @@ class VideoLabelerGUI:
     DEFAULT_KEYPOINTS = []  # none shipped in code; defined by the user on first run
 
     def _load_keypoint_names(self):
-        """Load keypoint names from the config file, falling back to defaults."""
+        """Load keypoint names from config, converting duplicate display names to
+        unique internal keys (source_a, source_a~2, source_a~3 …)."""
         try:
             if self.keypoint_config_file.exists():
                 with open(self.keypoint_config_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                names = [str(n).strip() for n in data.get('keypoint_names', []) if str(n).strip()]
-                if names:
-                    return names
+                raw = [str(n).strip() for n in data.get('keypoint_names', []) if str(n).strip()]
+                if raw:
+                    internal = []
+                    for display in raw:
+                        internal.append(_make_internal(display, internal))
+                    return internal
         except Exception as e:
             print(f"⚠️ Could not read {self.keypoint_config_file}: {e}")
         return list(self.DEFAULT_KEYPOINTS)
 
     def _save_keypoint_names(self):
-        """Persist the current keypoint names to the config file."""
+        """Persist display names (strips ~N dedup suffix) to the config file."""
         try:
             with open(self.keypoint_config_file, 'w', encoding='utf-8') as f:
-                json.dump({'keypoint_names': self.keypoint_names}, f, indent=2)
+                json.dump({'keypoint_names': [_disp(n) for n in self.keypoint_names]}, f, indent=2)
         except Exception as e:
             messagebox.showerror("Save Error", f"Could not save keypoint config:\n{e}")
 
     def _rebuild_keypoint_meta(self):
-        """Regenerate display names + evenly-spaced colors for the current keypoints."""
+        """Regenerate display names + colors. Duplicate display names share a color."""
         import colorsys
         self.keypoint_display_names = {}
         self.colors = {}
         self.color_hex = {}
-        n = max(len(self.keypoint_names), 1)
-        for i, name in enumerate(self.keypoint_names):
+        unique_display = list(dict.fromkeys(_disp(n) for n in self.keypoint_names))
+        n = max(len(unique_display), 1)
+        disp_color = {}
+        for i, disp in enumerate(unique_display):
             r, g, b = colorsys.hsv_to_rgb(i / n, 0.85, 1.0)
             R, G, B = int(r * 255), int(g * 255), int(b * 255)
-            self.colors[name] = (B, G, R)  # cv2 uses BGR
-            self.color_hex[name] = f'#{R:02X}{G:02X}{B:02X}'
-            self.keypoint_display_names[name] = name.replace('_', ' ').title()
+            disp_color[disp] = ((B, G, R), f'#{R:02X}{G:02X}{B:02X}')
+        for name in self.keypoint_names:
+            disp = _disp(name)
+            self.colors[name] = disp_color[disp][0]
+            self.color_hex[name] = disp_color[disp][1]
+            self.keypoint_display_names[name] = disp.replace('_', ' ').title()
 
     def _add_keypoint(self):
         """Append a new keypoint with a unique default name; ready to rename."""
@@ -183,11 +221,10 @@ class VideoLabelerGUI:
         if not new:
             self.kp_buttons[old]['name_var'].set(old)  # revert blank
             return
-        if new in self.keypoint_names:
-            self.status_var.set(f"⚠️ '{new}' already exists")
-            self.kp_buttons[old]['name_var'].set(old)
-            return
-        self.keypoint_names[self.keypoint_names.index(old)] = new
+        # Allow duplicate display names — generate a unique internal key
+        new_internal = _make_internal(new, [k for k in self.keypoint_names if k != old])
+        self.keypoint_names[self.keypoint_names.index(old)] = new_internal
+        new = new_internal
         # Migrate points so renaming doesn't orphan existing labels
         for f in self.labeled_frames:
             pts = f.get('points', {})
@@ -820,11 +857,19 @@ class VideoLabelerGUI:
         right_canvas.bind("<Enter>", lambda e: right_canvas.bind_all("<MouseWheel>", _on_right_wheel))
         right_canvas.bind("<Leave>", lambda e: right_canvas.unbind_all("<MouseWheel>"))
         
+        # Current video indicator — always visible, never overwritten by action logs
+        self.current_video_var = tk.StringVar(value="No video loaded")
+        ttk.Label(right_frame, textvariable=self.current_video_var,
+                  font=('Arial', 9, 'bold'), foreground='#1a6fa8',
+                  wraplength=160, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+
+        ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
         # File controls
         ttk.Label(right_frame, text="📁 File", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0,5))
         ttk.Button(right_frame, text="Open Video", command=self.open_video, width=15).pack(pady=2)
         ttk.Button(right_frame, text="Open Folder", command=self.open_folder, width=15).pack(pady=2)
-        
+
         ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
         
         # Keypoint section (select to place, edit name inline, add/remove)
@@ -853,13 +898,15 @@ class VideoLabelerGUI:
         
         # Label actions
         ttk.Label(right_frame, text="📝 Actions", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0,5))
+
         ttk.Button(right_frame, text="✅ Save Frame", command=self.save_frame, width=15).pack(pady=2)
         ttk.Button(right_frame, text="🚫 Mark Occluded (H)", command=self.mark_occluded, width=15).pack(pady=2)
         ttk.Button(right_frame, text="↩️ Undo Last", command=self.undo_point, width=15).pack(pady=2)
         ttk.Button(right_frame, text="🗑️ Clear Frame", command=self.clear_frame, width=15).pack(pady=2)
         ttk.Button(right_frame, text="⏭️ Skip Frame", command=self.skip_frame, width=15).pack(pady=2)
         ttk.Button(right_frame, text="✅ Mark Complete", command=self.mark_current_complete, width=15).pack(pady=2)
-        
+        ttk.Button(right_frame, text="💾 Export Labels", command=self.export_labels, width=15).pack(pady=2)
+
         ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
 
         # Optical Flow tracking (recommended for custom keypoints)
@@ -950,12 +997,6 @@ class VideoLabelerGUI:
         self.progress_label = ttk.Label(right_frame, text="0 / 0 frames")
         self.progress_label.pack()
         
-        ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
-        
-        # Export
-        ttk.Label(right_frame, text="💾 Export", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0,5))
-        ttk.Button(right_frame, text="Export Labels", command=self.export_labels, width=15).pack(pady=2)
-        
         # Status bar
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=10, pady=5)
@@ -991,19 +1032,28 @@ class VideoLabelerGUI:
 
     def bind_shortcuts(self):
         """Bind keyboard shortcuts globally"""
-        self.root.bind_all('<KeyPress-space>', self.on_space_press)
-        self.root.bind_all('<KeyRelease-space>', self.on_space_release)
-        self.root.bind_all('<Right>', self.next_frame)
-        self.root.bind_all('<Left>', self.prev_frame)
+        def _g(fn):
+            """Wrap fn so it is ignored when an Entry/Text widget has focus."""
+            def _wrapped(event):
+                w = self.root.focus_get()
+                if isinstance(w, (tk.Entry, tk.Text, ttk.Entry)):
+                    return
+                return fn(event)
+            return _wrapped
+
+        self.root.bind_all('<KeyPress-space>', _g(self.on_space_press))
+        self.root.bind_all('<KeyRelease-space>', _g(self.on_space_release))
+        self.root.bind_all('<Right>', _g(self.next_frame))
+        self.root.bind_all('<Left>', _g(self.prev_frame))
         self.root.bind_all('<Control-s>', self.save_frame)
         self.root.bind_all('<Control-z>', self.undo_point)
-        self.root.bind_all('<Escape>', self.skip_frame)
-        self.root.bind_all('<h>', self.mark_occluded)
-        self.root.bind_all('<H>', self.mark_occluded)
+        self.root.bind_all('<Escape>', _g(self.skip_frame))
+        self.root.bind_all('<h>', _g(self.mark_occluded))
+        self.root.bind_all('<H>', _g(self.mark_occluded))
         for i in range(9):  # support up to 9 keypoints via number keys
-            self.root.bind_all(f'<Key-{i+1}>', lambda e, idx=i: self.select_keypoint_by_index(idx))
-        self.root.bind_all('<t>', lambda e: self.track_with_yolo())
-        self.root.bind_all('<o>', lambda e: self.optical_flow_track())
+            self.root.bind_all(f'<Key-{i+1}>', _g(lambda e, idx=i: self.select_keypoint_by_index(idx)))
+        self.root.bind_all('<t>', _g(lambda e: self.track_with_yolo()))
+        self.root.bind_all('<o>', _g(lambda e: self.optical_flow_track()))
     
     # ============ KEYPOINT SELECTION ============
     
@@ -1085,7 +1135,10 @@ class VideoLabelerGUI:
     
     def load_video(self, path):
         self.video_path = path
-        self.current_video_exported = False
+        status = self.get_video_status(path)
+        self.current_video_exported = bool(status and status.get('completed', False))
+        if hasattr(self, 'current_video_var'):
+            self.current_video_var.set(f"🎬 {os.path.basename(path)}")
         self.cap = cv2.VideoCapture(path)
         if not self.cap.isOpened():
             messagebox.showerror("Error", f"Could not open video:\n{path}")
@@ -1157,14 +1210,17 @@ class VideoLabelerGUI:
         name = self.keypoint_names[self.current_kp]
         x, y = event.x, event.y
 
-        self.points[name] = (x, y)
-        self.occluded.discard(name)  # placing a position clears any occluded mark
+        if name not in self.points:
+            self.points[name] = []
+        self.points[name].append((x, y))
+        self.occluded.discard(name)
         self.kp_buttons[name]['placed'] = True
         self.kp_buttons[name]['color'].configure(bg='green')
         self.kp_buttons[name]['status'].configure(text='✅', foreground='green')
-        
-        self.status_var.set(f"✅ Placed: {self.keypoint_display_names[name]} at ({x}, {y})")
-        
+
+        self.status_var.set(
+            f"✅ Placed: {self.keypoint_display_names[name]} at ({x}, {y})")
+
         self.advance_to_next_keypoint()
         
         self.slider_update = False
@@ -1172,9 +1228,8 @@ class VideoLabelerGUI:
         self.slider_update = True
     
     def advance_to_next_keypoint(self):
-        # A keypoint is "done" if placed OR explicitly marked occluded
         def done(name):
-            return self.kp_buttons[name]['placed'] or name in self.occluded
+            return bool(self.points.get(name)) or name in self.occluded
 
         if all(done(name) for name in self.keypoint_names):
             self.status_var.set("All keypoints placed/occluded! Press 'Save Frame' or Ctrl+S")
@@ -1226,38 +1281,39 @@ class VideoLabelerGUI:
         frame = cv2.resize(frame, (display_w, display_h))
         
         # Draw current points being placed
-        for name, coords in self.points.items():
+        for name, instances in self.points.items():
             color = self.colors[name]
-            cv2.circle(frame, coords, 14, color, 2)
-            cv2.circle(frame, coords, 10, color, -1)
-            cv2.circle(frame, coords, 12, (255, 255, 255), 1)
-            cv2.putText(frame, name.replace('_', ' ').title(), 
-                    (coords[0]+15, coords[1]-10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        
+            label_base = name.replace('_', ' ').title()
+            for i, coords in enumerate(instances):
+                cv2.circle(frame, coords, 14, color, 2)
+                cv2.circle(frame, coords, 10, color, -1)
+                cv2.circle(frame, coords, 12, (255, 255, 255), 1)
+                lbl = f"{label_base} {i+1}" if len(instances) > 1 else label_base
+                cv2.putText(frame, lbl, (coords[0]+15, coords[1]-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
         # Draw saved frames (manual + tracked)
         for labeled in self.labeled_frames:
             if labeled['frame'] == frame_idx:
-                for name, coords in labeled['points'].items():
-                    color = self.colors[name]
+                for name, raw in labeled['points'].items():
+                    color = self.colors.get(name, (255, 255, 255))
+                    instances = _pts(raw)
                     is_tracked = labeled.get('tracked', False)
-                    is_manual = labeled.get('manual', False)
-                    
-                    if is_tracked:
-                        # Draw tracked points with different style
-                        cv2.circle(frame, coords, 12, color, 2)
-                        cv2.circle(frame, coords, 6, color, -1)
-                        cv2.putText(frame, f"{name} (YOLO)", 
-                                  (coords[0]+15, coords[1]+15), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2)
-                    else:
-                        # Manual points
-                        cv2.circle(frame, coords, 14, color, 2)
-                        cv2.circle(frame, coords, 10, color, -1)
-                        cv2.circle(frame, coords, 12, (255, 255, 255), 1)
-                        cv2.putText(frame, name.replace('_', ' ').title(), 
-                                  (coords[0]+15, coords[1]-10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    label_base = name.replace('_', ' ').title()
+                    for i, coords in enumerate(instances):
+                        lbl = f"{label_base} {i+1}" if len(instances) > 1 else label_base
+                        if is_tracked:
+                            cv2.circle(frame, coords, 12, color, 2)
+                            cv2.circle(frame, coords, 6, color, -1)
+                            cv2.putText(frame, f"{lbl} (T)",
+                                        (coords[0]+15, coords[1]+15),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2)
+                        else:
+                            cv2.circle(frame, coords, 14, color, 2)
+                            cv2.circle(frame, coords, 10, color, -1)
+                            cv2.circle(frame, coords, 12, (255, 255, 255), 1)
+                            cv2.putText(frame, lbl, (coords[0]+15, coords[1]-10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
         # Show currently selected keypoint (skip the prompt if it's occluded)
         if self.current_kp < len(self.keypoint_names):
@@ -1457,12 +1513,18 @@ class VideoLabelerGUI:
     def undo_point(self, event=None):
         if self.points:
             last = list(self.points.keys())[-1]
-            del self.points[last]
-            self.kp_buttons[last]['placed'] = False
-            self.kp_buttons[last]['color'].configure(bg='gray')
-            self.kp_buttons[last]['status'].configure(text='⬜', foreground='gray')
+            self.points[last].pop()
+            count = len(self.points[last])
+            if count == 0:
+                del self.points[last]
+                self.kp_buttons[last]['placed'] = False
+                self.kp_buttons[last]['color'].configure(bg='gray')
+                self.kp_buttons[last]['status'].configure(text='⬜', foreground='gray')
+            else:
+                self.kp_buttons[last]['status'].configure(
+                    text=f'✅×{count}' if count > 1 else '✅', foreground='green')
             self.select_keypoint(last)
-            self.status_var.set(f"↩️ Undo: removed {last}")
+            self.status_var.set(f"↩️ Undo: removed instance of {last} ({count} remaining)")
             self.slider_update = False
             self.show_frame(self.current_frame)
             self.slider_update = True
@@ -1654,16 +1716,18 @@ class VideoLabelerGUI:
                     if kp_name in skip:
                         continue
                     if kp_name in start['points'] and kp_name in end['points']:
-                        p1 = start['points'][kp_name]
-                        p2 = end['points'][kp_name]
-                        interpolated_points[kp_name] = (
-                            int(p1[0] + t * (p2[0] - p1[0])),
-                            int(p1[1] + t * (p2[1] - p1[1]))
-                        )
+                        ia = _pts(start['points'][kp_name])
+                        ib = _pts(end['points'][kp_name])
+                        interp = [(int(p1[0] + t * (p2[0] - p1[0])),
+                                   int(p1[1] + t * (p2[1] - p1[1])))
+                                  for p1, p2 in zip(ia, ib)]
+                        interp += ia[len(ib):]
+                        interp += ib[len(ia):]
+                        interpolated_points[kp_name] = interp
                     elif kp_name in start['points']:
-                        interpolated_points[kp_name] = start['points'][kp_name]
+                        interpolated_points[kp_name] = _pts(start['points'][kp_name])
                     elif kp_name in end['points']:
-                        interpolated_points[kp_name] = end['points'][kp_name]
+                        interpolated_points[kp_name] = _pts(end['points'][kp_name])
                 
                 if interpolated_points:
                     self.labeled_frames.append({
@@ -1797,8 +1861,13 @@ class VideoLabelerGUI:
                 # one end it's entering/leaving -> drop it (label disappears) rather
                 # than carrying a stale position across the gap.
                 if k in A and k in B:
-                    pts[k] = (int(round(A[k][0] + t * (B[k][0] - A[k][0]))),
-                              int(round(A[k][1] + t * (B[k][1] - A[k][1]))))
+                    ia, ib = _pts(A[k]), _pts(B[k])
+                    interp = [(int(round(p1[0] + t * (p2[0] - p1[0]))),
+                               int(round(p1[1] + t * (p2[1] - p1[1]))))
+                              for p1, p2 in zip(ia, ib)]
+                    interp += ia[len(ib):]  # carry extra instances from A
+                    interp += ib[len(ia):]  # carry extra instances from B
+                    pts[k] = interp
             if pts:
                 out[fi] = pts
         return out
@@ -1831,13 +1900,31 @@ class VideoLabelerGUI:
         # point is treated as occluded/drifted and dropped.
         fb_thresh = max(20.0, 0.02 * max(vid_w, vid_h))
 
-        kps_f = [k for k in self.keypoint_names if k in A and k not in skip]
-        kps_b = [k for k in self.keypoint_names if k in B and k not in skip]
+        # Expand multi-instance: "cls" → "cls__0", "cls__1" etc.
+        def _expand(pts_dict):
+            out = {}
+            for k, val in pts_dict.items():
+                for i, pt in enumerate(_pts(val)):
+                    out[f"{k}__{i}"] = pt
+            return out
+
+        def _collapse(pts_dict):
+            out = {}
+            for key, pt in pts_dict.items():
+                name = key.rsplit('__', 1)[0] if '__' in key else key
+                out.setdefault(name, []).append(pt)
+            return out
+
+        A_exp = _expand({k: v for k, v in A.items() if k not in skip})
+        B_exp = _expand({k: v for k, v in B.items() if k not in skip})
+
+        kps_f = list(A_exp.keys())
+        kps_b = list(B_exp.keys())
 
         # --- Forward track from anchor A ---
         fwd, fwd_ok = {}, {}
         if kps_f:
-            p = np.array([to_video(A[k]) for k in kps_f], dtype=np.float32).reshape(-1, 1, 2)
+            p = np.array([to_video(A_exp[k]) for k in kps_f], dtype=np.float32).reshape(-1, 1, 2)
             ok = [True] * len(kps_f)
             for i in range(1, n + 1):
                 p2, st, err = cv2.calcOpticalFlowPyrLK(grays[i - 1], grays[i], p, None, **lk)
@@ -1854,7 +1941,7 @@ class VideoLabelerGUI:
         # --- Backward track from anchor B ---
         bwd, bwd_ok = {}, {}
         if kps_b:
-            p = np.array([to_video(B[k]) for k in kps_b], dtype=np.float32).reshape(-1, 1, 2)
+            p = np.array([to_video(B_exp[k]) for k in kps_b], dtype=np.float32).reshape(-1, 1, 2)
             ok = [True] * len(kps_b)
             for i in range(1, n + 1):
                 idx = n - i
@@ -1869,21 +1956,19 @@ class VideoLabelerGUI:
                 bwd[fa + idx], bwd_ok[fa + idx] = bp, bo
                 p = p2
 
+        # Collect all expanded keys present in either anchor
+        all_exp_keys = set(kps_f) | set(kps_b)
+
         # --- Blend forward + backward, weighted by position between anchors ---
         out = {}
         for fi in range(fa + 1, fb):
             t = (fi - fa) / float(n)
-            pts = {}
-            for k in self.keypoint_names:
-                if k in skip:
-                    continue
+            pts_exp = {}
+            for k in all_exp_keys:
                 f_ok = fwd_ok.get(fi, {}).get(k, False)
                 b_ok = bwd_ok.get(fi, {}).get(k, False)
                 if f_ok and b_ok:
                     fx, fy = fwd[fi][k]; bx, by = bwd[fi][k]
-                    # If forward (from A) and backward (from B) disagree a lot, the
-                    # point is unreliable — each drifted into an occlusion — so drop
-                    # it (the label disappears) instead of averaging to a wrong spot.
                     if (fx - bx) ** 2 + (fy - by) ** 2 > fb_thresh * fb_thresh:
                         continue
                     vx, vy = (1 - t) * fx + t * bx, (1 - t) * fy + t * by
@@ -1892,10 +1977,9 @@ class VideoLabelerGUI:
                 elif b_ok:
                     vx, vy = bwd[fi][k]
                 else:
-                    # Tracker lost this point on both sides -> it left / went
-                    # occluded -> drop it so the label disappears.
                     continue
-                pts[k] = (int(round(vx * scale)), int(round(vy * scale)))  # back to display
+                pts_exp[k] = (int(round(vx * scale)), int(round(vy * scale)))
+            pts = _collapse(pts_exp)
             if pts:
                 out[fi] = pts
         return out
@@ -1965,10 +2049,10 @@ class VideoLabelerGUI:
         else:
             # Adjust points being placed
             name = self.keypoint_names[self.current_kp]
-            if name in self.points:
-                x, y = self.points[name]
-                self.points[name] = (max(0, x + dx), max(0, y + dy))
-                self.status_var.set(f"🔧 Adjusted {name} to {self.points[name]}")
+            if self.points.get(name):
+                x, y = self.points[name][-1]
+                self.points[name][-1] = (max(0, x + dx), max(0, y + dy))
+                self.status_var.set(f"🔧 Adjusted {name} instance {len(self.points[name])} to {self.points[name][-1]}")
                 
                 self.slider_update = False
                 self.show_frame(self.current_frame)
@@ -2138,14 +2222,26 @@ class VideoLabelerGUI:
         
         video_name = os.path.splitext(os.path.basename(self.video_path))[0] if self.video_path else "labels"
         default_filename = f"{video_name}_labels.json"
-        
-        export_path = filedialog.asksaveasfilename(
-            title="Export Labels",
-            defaultextension=".json",
-            initialfile=default_filename,
-            filetypes=[("JSON files", "*.json")]
-        )
-        
+
+        # Auto-save to labels/<action_subfolder>/ derived from the video's parent folder.
+        # Falls back to a save dialog only when the video path is unknown.
+        export_path = None
+        if self.video_path:
+            video_dir = os.path.dirname(os.path.abspath(self.video_path))
+            action_subfolder = os.path.basename(video_dir)
+            project_root = os.path.dirname(video_dir)
+            save_dir = os.path.join(project_root, "labels", action_subfolder)
+            os.makedirs(save_dir, exist_ok=True)
+            export_path = os.path.join(save_dir, default_filename)
+
+        if not export_path:
+            export_path = filedialog.asksaveasfilename(
+                title="Export Labels",
+                defaultextension=".json",
+                initialfile=default_filename,
+                filetypes=[("JSON files", "*.json")]
+            )
+
         if not export_path:
             return False
         
@@ -2160,8 +2256,14 @@ class VideoLabelerGUI:
         export_keyframes = []
         for f in self.labeled_frames:
             fc = dict(f)
-            fc['points'] = {k: [int(round(x * inv_scale)), int(round(y * inv_scale))]
-                            for k, (x, y) in f['points'].items()}
+            # Group by display name (merges source_a + source_a~2 → source_a: [[p1],[p2]])
+            grouped: dict = {}
+            for k, v in f['points'].items():
+                disp = _disp(k)
+                scaled = [[int(round(x * inv_scale)), int(round(y * inv_scale))]
+                          for x, y in _pts(v)]
+                grouped.setdefault(disp, []).extend(scaled)
+            fc['points'] = grouped
             export_keyframes.append(fc)
 
         data = {
@@ -2181,13 +2283,13 @@ class VideoLabelerGUI:
         try:
             with open(export_path, 'w') as f:
                 json.dump(data, f, indent=2)
-            
-            self.status_var.set(f"✅ Exported to: {export_path}")
+
+            print(f"[export] saved → {export_path}")
             self.current_video_exported = True
-            
+
             if self.video_path:
                 self.mark_video_complete(self.video_path)
-                self.status_var.set(f"✅ Exported and marked complete!")
+            self.status_var.set(f"✅ Exported: {export_path}")
             
             if self.video_files and len(self.video_files) > 1:
                 if self.is_playing:

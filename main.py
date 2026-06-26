@@ -10,10 +10,11 @@ import multiprocessing
 
 from PySide6.QtWidgets import (
     QApplication, QCompleter, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QFileDialog, QLineEdit, QSpinBox,
+    QPushButton, QFileDialog, QLineEdit, QSpinBox, QDoubleSpinBox,
     QGroupBox, QTextEdit, QFormLayout, QProgressBar, QCheckBox,
     QComboBox, QTabWidget, QListWidget, QSplitter,
     QDialog, QDialogButtonBox, QAbstractItemView,
+    QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
@@ -1313,6 +1314,173 @@ class VideoHighlighterGUI(QWidget):
         advanced_layout.addWidget(action_box)
 
         # ── Group 4: Bounding Box Visualization ──
+        # ── Group 4: Composition Rules ──
+        comp_box = QGroupBox("Composition Rules")
+        comp_outer = QVBoxLayout()
+
+        comp_info = QLabel(
+            "Compose higher-level actions from the spatial relationships between detected objects. "
+            "Example: if object A appears inside region B a certain number of times, fire action X. "
+            "Each row is one spatial condition; multiple rows with the same Event Name must ALL be "
+            "satisfied together (AND logic). "
+            "Window = how many seconds of frames to smooth over (reduces flicker). "
+            "Persist = how long to keep an object 'alive' after YOLO loses sight of it (handles occlusion). "
+            "Saved to composition_rules.yaml next to the application."
+        )
+        comp_info.setWordWrap(True)
+        comp_info.setStyleSheet("color: #888; font-size: 9pt;")
+        comp_outer.addWidget(comp_info)
+
+        # Table: Event Name | Label | Source | Region | Min | Max | Window | Persist | [Del]
+        self.comp_table = QTableWidget(0, 9)
+        self.comp_table.setHorizontalHeaderLabels([
+            "Event Name", "Display Label", "Source Object", "Region Object",
+            "Min Count", "Max Count", "Window (s)", "Persist (s)", "",
+        ])
+        self.comp_table.horizontalHeader().setToolTip(
+            "Source Object: the object that must appear inside the Region Object\n"
+            "Min/Max Count: how many Source instances must be inside the region\n"
+            "Window: seconds of frames to smooth over (reduces single-frame flicker)\n"
+            "Persist: seconds to keep a source 'alive' after it disappears (handles occlusion)"
+        )
+        self.comp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.comp_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Fixed)
+        self.comp_table.setColumnWidth(8, 32)
+        self.comp_table.setMinimumHeight(160)
+        self.comp_table.setMaximumHeight(280)
+        self.comp_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        comp_outer.addWidget(self.comp_table)
+
+        comp_btn_row = QHBoxLayout()
+        comp_add_btn = QPushButton("+ Add Rule")
+        comp_add_btn.setToolTip("Add a new rule row")
+        comp_save_btn = QPushButton("Save Rules")
+        comp_save_btn.setToolTip("Save composition rules to composition_rules.yaml")
+        comp_btn_row.addWidget(comp_add_btn)
+        comp_btn_row.addStretch()
+        comp_btn_row.addWidget(comp_save_btn)
+        comp_outer.addLayout(comp_btn_row)
+
+        comp_box.setLayout(comp_outer)
+        advanced_layout.addWidget(comp_box)
+
+        # ---- load existing rules into table ----
+        def _comp_load_rules():
+            from modules.app_paths import composition_rules_path, user_data_dir
+            path = composition_rules_path()
+            events = []
+            if path:
+                try:
+                    with open(path, encoding='utf-8') as _f:
+                        events = (yaml.safe_load(_f) or {}).get('events', [])
+                except Exception:
+                    pass
+            self.comp_table.setRowCount(0)
+            for ev in events:
+                for rule in ev.get('rules', []):
+                    _comp_add_table_row(
+                        ev.get('name', ''),
+                        ev.get('label', ev.get('name', '')),
+                        rule.get('source', ''),
+                        rule.get('region', ''),
+                        rule.get('min_count', 1),
+                        rule.get('max_count', 999),
+                        ev.get('window_secs', 0.75),
+                        ev.get('persist_secs', 0.5),
+                    )
+
+        def _comp_add_table_row(ev_name='', ev_label='', source='', region='',
+                                min_c=1, max_c=999, window=0.75, persist=0.5):
+            r = self.comp_table.rowCount()
+            self.comp_table.insertRow(r)
+            self.comp_table.setItem(r, 0, QTableWidgetItem(ev_name))
+            self.comp_table.setItem(r, 1, QTableWidgetItem(ev_label))
+            self.comp_table.setItem(r, 2, QTableWidgetItem(source))
+            self.comp_table.setItem(r, 3, QTableWidgetItem(region))
+
+            min_spin = QSpinBox()
+            min_spin.setRange(0, 99)
+            min_spin.setValue(int(min_c))
+            self.comp_table.setCellWidget(r, 4, min_spin)
+
+            max_spin = QSpinBox()
+            max_spin.setRange(0, 999)
+            max_spin.setValue(int(max_c))
+            self.comp_table.setCellWidget(r, 5, max_spin)
+
+            win_spin = QDoubleSpinBox()
+            win_spin.setRange(0.1, 10.0)
+            win_spin.setSingleStep(0.25)
+            win_spin.setValue(float(window))
+            self.comp_table.setCellWidget(r, 6, win_spin)
+
+            per_spin = QDoubleSpinBox()
+            per_spin.setRange(0.0, 10.0)
+            per_spin.setSingleStep(0.25)
+            per_spin.setValue(float(persist))
+            self.comp_table.setCellWidget(r, 7, per_spin)
+
+            del_btn = QPushButton("✕")
+            del_btn.setFixedWidth(28)
+            del_btn.setStyleSheet("color: #c33; border: none; font-weight: bold;")
+            # Find the row at click-time by locating this button in column 8
+            def _make_del(btn):
+                def _del():
+                    for i in range(self.comp_table.rowCount()):
+                        if self.comp_table.cellWidget(i, 8) is btn:
+                            self.comp_table.removeRow(i)
+                            return
+                return _del
+            del_btn.clicked.connect(_make_del(del_btn))
+            self.comp_table.setCellWidget(r, 8, del_btn)
+
+        def _comp_save_rules():
+            from modules.app_paths import user_data_dir
+            import os as _os
+            # Group rows by event name (preserving order of first appearance)
+            events_ordered = []
+            events_map = {}
+            for r in range(self.comp_table.rowCount()):
+                ev_name  = (self.comp_table.item(r, 0) or QTableWidgetItem()).text().strip()
+                ev_label = (self.comp_table.item(r, 1) or QTableWidgetItem()).text().strip()
+                source   = (self.comp_table.item(r, 2) or QTableWidgetItem()).text().strip()
+                region   = (self.comp_table.item(r, 3) or QTableWidgetItem()).text().strip()
+                min_c    = self.comp_table.cellWidget(r, 4).value()
+                max_c    = self.comp_table.cellWidget(r, 5).value()
+                window   = self.comp_table.cellWidget(r, 6).value()
+                persist  = self.comp_table.cellWidget(r, 7).value()
+                if not ev_name or not source or not region:
+                    continue
+                if ev_name not in events_map:
+                    ev_entry = {
+                        'name': ev_name,
+                        'label': ev_label or ev_name,
+                        'rules': [],
+                        'window_secs': window,
+                        'persist_secs': persist,
+                    }
+                    events_map[ev_name] = ev_entry
+                    events_ordered.append(ev_entry)
+                events_map[ev_name]['rules'].append({
+                    'source': source,
+                    'region': region,
+                    'min_count': min_c,
+                    'max_count': max_c,
+                })
+            out = {'events': events_ordered}
+            save_path = _os.path.join(user_data_dir(), 'composition_rules.yaml')
+            try:
+                with open(save_path, 'w', encoding='utf-8') as _f:
+                    yaml.dump(out, _f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                self.append_log(f"✅ Composition rules saved → {save_path}")
+            except Exception as _e:
+                self.append_log(f"❌ Could not save composition rules: {_e}")
+
+        comp_add_btn.clicked.connect(lambda: _comp_add_table_row())
+        comp_save_btn.clicked.connect(_comp_save_rules)
+        _comp_load_rules()
+
+        # ── Group 5: Bounding Box Visualization ──
         bbox_box = QGroupBox("Bounding Box Visualization")
         bbox_layout = QVBoxLayout()
 
@@ -2553,9 +2721,9 @@ class VideoHighlighterGUI(QWidget):
                 return []
 
     def open_object_label_selector(self):
-        """Open label selector. For the custom keypoint model this offers your
-        trained class names; for 'mixed' it merges those
-        with the COCO objects; otherwise the standard YOLO objects."""
+        """Open label selector. For the custom model this offers your trained
+        class names; for 'mixed' it merges those with the COCO objects;
+        otherwise the standard YOLO objects."""
         yolo_type = self.yolo_type_combo.currentData() or "standard"
 
         labels = []

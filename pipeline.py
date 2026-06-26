@@ -82,8 +82,8 @@ def run_keypoint_detection(video_path, model_path, keypoint_names, frame_skip=5,
                            progress_fn=None):
     """Run a custom YOLO-pose model over a video and turn each detected keypoint
     into (a) a per-second object detection and (b) an overlay bbox entry — so the
-    custom model's points feed the same scoring + overlay paths
-    as object detection.
+    custom model's points feed the same scoring + overlay paths as object
+    detection.
 
     Returns (object_detections {sec: [names]}, object_bboxes [{timestamp, objects,
     bboxes (normalised x,y,w,h), confidences}]).
@@ -1044,28 +1044,42 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 custom_only = (yolo_type == "custom")
                 use_custom = "custom" in yolo_type
 
-                # --- Custom model (object detector or keypoint model) ---
+                # --- Custom model (object detector OR keypoint model) ---
                 if use_custom:
                     cm = gui_config.get("yolo_custom_model_path")
                     if cm and os.path.exists(cm):
-                        try:
-                            from modules.app_paths import custom_keypoint_names
-                            kp_names = custom_keypoint_names() or highlight_objects
-                        except Exception:
-                            kp_names = highlight_objects
-                        log(f"🧩 Custom keypoint model: {os.path.basename(cm)} {kp_names}")
-                        kp_det, kp_bb = run_keypoint_detection(
-                            processed_video_path, cm, kp_names,
-                            frame_skip=frame_skip_for_obj,
-                            confidence_threshold=float(gui_config.get("object_confidence", 0.3)),
-                            log=log, cancel_flag=cancel_flag, progress_fn=progress_fn,
-                        )
-                        for sec, names in kp_det.items():
+                        from ultralytics import YOLO as _YOLO
+                        custom_model = _YOLO(str(cm))
+                        c_conf = float(gui_config.get("object_confidence", 0.3))
+                        if getattr(custom_model, "task", "") == "detect":
+                            # Custom object detector -> standard object detection path
+                            want = highlight_objects or list(custom_model.names.values())
+                            log(f"🧩 Custom object detector: {os.path.basename(cm)} {want}")
+                            c_det, c_bb = run_object_detection_single(
+                                processed_video_path, custom_model, want,
+                                log_fn=log_fn, progress_fn=progress_fn,
+                                frame_skip=frame_skip_for_obj, cancel_flag=cancel_flag,
+                                device=yolo_device, confidence_threshold=c_conf,
+                            )
+                        else:
+                            # Custom keypoint/pose model -> keypoint path
+                            try:
+                                from modules.app_paths import custom_keypoint_names
+                                kp_names = custom_keypoint_names() or highlight_objects
+                            except Exception:
+                                kp_names = highlight_objects
+                            log(f"🧩 Custom keypoint model: {os.path.basename(cm)} {kp_names}")
+                            c_det, c_bb = run_keypoint_detection(
+                                processed_video_path, cm, kp_names,
+                                frame_skip=frame_skip_for_obj, confidence_threshold=c_conf,
+                                log=log, cancel_flag=cancel_flag, progress_fn=progress_fn,
+                            )
+                        for sec, names in c_det.items():
                             object_detections.setdefault(sec, [])
                             object_detections[sec] = sorted(set(object_detections[sec]) | set(names))
-                        object_bboxes_cache += kp_bb
-                        log(f"✅ Custom keypoints: {sum(len(v) for v in kp_det.values())} hits "
-                            f"over {len(kp_det)} seconds")
+                        object_bboxes_cache += c_bb
+                        log(f"✅ Custom model: {sum(len(v) for v in c_det.values())} hits "
+                            f"over {len(c_det)} seconds")
                     else:
                         log(f"⚠️ Custom model path not found: {cm}")
 
@@ -1098,6 +1112,30 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     object_bboxes_cache += std_bb
 
                 log(f"✅ Object detection complete: {len(object_detections)} seconds with objects")
+
+                # --- Composition engine: derive events from spatial relations ---
+                try:
+                    from video_ai_editor.composition_engine import CompositionEngine
+                    from modules.app_paths import composition_rules_path
+                    rules_path = composition_rules_path()
+                    if rules_path and object_bboxes_cache:
+                        engine = CompositionEngine(rules_path)
+                        composed_det, composed_bb = engine.run(object_bboxes_cache)
+                        if composed_det:
+                            for sec, names in composed_det.items():
+                                object_detections.setdefault(sec, [])
+                                object_detections[sec] = sorted(
+                                    set(object_detections[sec]) | set(names)
+                                )
+                            object_bboxes_cache += composed_bb
+                            log(f"✅ Composition engine: "
+                                f"{sum(len(v) for v in composed_det.values())} event-hits "
+                                f"over {len(composed_det)} seconds")
+                        else:
+                            log("ℹ️ Composition engine: no events matched")
+                except Exception as _ce:
+                    log(f"⚠️ Composition engine skipped: {_ce}")
+
         else:
             log("ℹ️ Using cached object detections")
 

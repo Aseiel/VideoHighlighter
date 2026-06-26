@@ -127,6 +127,18 @@ def ffmpeg_exe() -> str:
     return "ffmpeg"
 
 
+def composition_rules_path() -> str | None:
+    """Path to composition_rules.yaml (private, gitignored).
+    Returns None when the file does not exist (engine is skipped)."""
+    for candidate in (
+        os.path.join(user_data_dir(), "composition_rules.yaml"),
+        resource_path("composition_rules.yaml"),
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def config_path(filename: str = "config.yaml") -> str:
     """Resolve a user-editable config file.
 
