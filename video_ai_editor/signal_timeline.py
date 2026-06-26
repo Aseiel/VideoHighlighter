@@ -1,5 +1,6 @@
 from .timeline_bars import TimelineBar, DraggableTimelineBar
 from collections import defaultdict
+import json
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
     QGraphicsLineItem, QApplication, QMenu
@@ -136,8 +137,9 @@ class SignalTimelineScene(QGraphicsScene):
         self._selection_end_time = None    # float seconds
         self._selection_active = False     # True = selection exists and can be dragged
 
+        self.load_filters()
         self.build_timeline()
-    
+
     def generate_waveform_colors(self):
         """Generate color gradient for waveform based on amplitude"""
         colors = []
@@ -409,36 +411,40 @@ class SignalTimelineScene(QGraphicsScene):
         """Set visibility for a specific action"""
         if action_name in self.visible_actions:
             self.visible_actions[action_name] = visible
+            self.save_filters()
             self.build_timeline()
             self.filter_changed.emit({
                 'actions': self.visible_actions.copy(),
                 'objects': self.visible_objects.copy()
             })
-    
+
     def set_object_filter(self, object_name, visible):
         """Set visibility for a specific object"""
         if object_name in self.visible_objects:
             self.visible_objects[object_name] = visible
+            self.save_filters()
             self.build_timeline()
             self.filter_changed.emit({
                 'actions': self.visible_actions.copy(),
                 'objects': self.visible_objects.copy()
             })
-    
+
     def set_all_actions_visible(self, visible):
         """Set all actions visible or hidden"""
         for action in self.visible_actions:
             self.visible_actions[action] = visible
+        self.save_filters()
         self.build_timeline()
         self.filter_changed.emit({
             'actions': self.visible_actions.copy(),
             'objects': self.visible_objects.copy()
         })
-    
+
     def set_all_objects_visible(self, visible):
         """Set all objects visible or hidden"""
         for obj in self.visible_objects:
             self.visible_objects[obj] = visible
+        self.save_filters()
         self.build_timeline()
         self.filter_changed.emit({
             'actions': self.visible_actions.copy(),
@@ -1284,12 +1290,65 @@ class SignalTimelineScene(QGraphicsScene):
     def set_action_confidence_filter(self, min_conf, max_conf=1.0):
         self.min_action_confidence = max(0.0, min(min_conf, 1.0))
         self.max_action_confidence = min(1.0, max(max_conf, 0.0))
+        self.save_filters()
         self.build_timeline()
 
     def set_object_confidence_filter(self, min_conf, max_conf=1.0):
         self.min_object_confidence = max(0.0, min(min_conf, 1.0))
         self.max_object_confidence = min(1.0, max(max_conf, 0.0))
+        self.save_filters()
         self.build_timeline()
+
+    def _filters_path(self):
+        try:
+            from modules.app_paths import user_data_dir
+            import os
+            return os.path.join(user_data_dir(), "timeline_filters.json")
+        except Exception:
+            return None
+
+    def save_filters(self):
+        path = self._filters_path()
+        if not path:
+            return
+        data = {
+            "min_action_confidence": self.min_action_confidence,
+            "max_action_confidence": self.max_action_confidence,
+            "min_object_confidence": self.min_object_confidence,
+            "max_object_confidence": self.max_object_confidence,
+            "visible_actions": self.visible_actions,
+            "visible_objects": self.visible_objects,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"⚠️ Could not save timeline filters: {e}")
+
+    def load_filters(self):
+        path = self._filters_path()
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.min_action_confidence = float(data.get("min_action_confidence", 0.0))
+            self.max_action_confidence = float(data.get("max_action_confidence", 1.0))
+            self.min_object_confidence = float(data.get("min_object_confidence", 0.0))
+            self.max_object_confidence = float(data.get("max_object_confidence", 1.0))
+            # Restore visibility only for types present in the current data
+            saved_actions = data.get("visible_actions", {})
+            for k in self.visible_actions:
+                if k in saved_actions:
+                    self.visible_actions[k] = bool(saved_actions[k])
+            saved_objects = data.get("visible_objects", {})
+            for k in self.visible_objects:
+                if k in saved_objects:
+                    self.visible_objects[k] = bool(saved_objects[k])
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"⚠️ Could not load timeline filters: {e}")
     
     def should_show_action(self, action_data):
         action_name = action_data.get('action_name') or action_data.get('action') or 'Unknown'
