@@ -528,6 +528,12 @@ def test_trained_model(model_path, test_video_path, keypoint_names=None):
 # =============================
 
 if __name__ == "__main__":
+    import argparse
+    _ap = argparse.ArgumentParser()
+    _ap.add_argument("--fresh", action="store_true",
+                     help="Ignore any existing checkpoint and train from scratch")
+    _args = _ap.parse_args()
+
     # ============================================
     # CONFIG — edit these for your setup
     # ============================================
@@ -611,11 +617,26 @@ if __name__ == "__main__":
     # ============================================
     # STEP 2: Train YOLO model
     # ============================================
+    # Auto-resume: look for last.pt from a previous run in the standard output dir.
+    # Pass --fresh to ignore it and train from scratch.
+    _last_pt = Path(ROOT) / "yolo_keypoint_training" / "keypoint_detector" / "weights" / "last.pt"
+    _resume = False
+    _weights = RESUME_WEIGHTS or None
+
+    if not _args.fresh and _last_pt.exists():
+        print(f"🔄 Resuming from checkpoint: {_last_pt}")
+        _weights = str(_last_pt)
+        _resume = True
+    elif _args.fresh:
+        print("🆕 --fresh flag set — starting from scratch.")
+    else:
+        print("🆕 No checkpoint found — starting from scratch.")
+
     trainer = YOLOKeypointTrainer(
         dataset_yaml=str(Path(OUTPUT_DIR) / "dataset.yaml"),
         model_size=MODEL_SIZE,
         device=DEVICE,
-        weights=RESUME_WEIGHTS or None,
+        weights=_weights,
         task=TASK,
     )
 
@@ -627,6 +648,7 @@ if __name__ == "__main__":
         augment=True,
         patience=20,
         save_period=SAVE_PERIOD,
+        resume=_resume,
     )
 
     # Save a keypoint-names sidecar next to best.pt so the app knows this model's
