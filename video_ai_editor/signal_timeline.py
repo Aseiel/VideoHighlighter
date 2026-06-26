@@ -325,6 +325,64 @@ class SignalTimelineScene(QGraphicsScene):
         self.merge_threshold = max(0.0, seconds)
         self.build_timeline()
 
+    # ── Navigation timestamp helpers ────────────────────────────────────────
+    def _nav_timestamps_actions(self):
+        ts = []
+        for item in self._actions_list():
+            if not self.should_show_action(item):
+                continue
+            t = item.get('timestamp') or item.get('start_time') or item.get('time')
+            if t is not None:
+                ts.append(float(t))
+        return ts
+
+    def _nav_timestamps_objects(self):
+        ts = []
+        for item in self.cache_data.get('objects', []):
+            if not self.should_show_object(item):
+                continue
+            t = item.get('timestamp') or item.get('time')
+            if t is not None:
+                ts.append(float(t))
+        return ts
+
+    def _nav_timestamps_scenes(self):
+        ts = []
+        for s in self.cache_data.get('scenes', []):
+            t = s.get('start_time') or s.get('start')
+            if t is not None:
+                ts.append(float(t))
+        return ts
+
+    def _nav_timestamps_motion_events(self):
+        return [float(e.get('time', e.get('timestamp', 0)))
+                for e in self.cache_data.get('motion_events', [])
+                if e.get('time') is not None or e.get('timestamp') is not None]
+
+    def _nav_timestamps_motion_peaks(self):
+        return [float(p) if not isinstance(p, dict) else float(p.get('time', 0))
+                for p in self.cache_data.get('motion_peaks', [])]
+
+    def _nav_timestamps_audio_peaks(self):
+        return [float(p) if not isinstance(p, dict) else float(p.get('time', 0))
+                for p in self.cache_data.get('audio_peaks', [])]
+
+    def _nav_timestamps_highlights(self):
+        ts = []
+        for h in self.cache_data.get('highlights', []):
+            t = h.get('start') or h.get('start_time')
+            if t is not None:
+                ts.append(float(t))
+        return ts
+
+    def _nav_timestamps_transcript(self):
+        ts = []
+        for seg in self.cache_data.get('transcript', {}).get('segments', []):
+            t = seg.get('start')
+            if t is not None:
+                ts.append(float(t))
+        return ts
+
     def _merge_intervals(self, intervals, threshold=None):
         """
         Merge (start, end, metadata) tuples that are within threshold seconds.

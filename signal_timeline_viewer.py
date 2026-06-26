@@ -50,20 +50,41 @@ from video_ai_editor.transcript_panel import TranscriptPanel
 
 
 class SignalLabelPanel(QWidget):
-    """Frozen label column that syncs vertically with the signal timeline"""
+    """Frozen label column that syncs vertically with the signal timeline.
+
+    Each row shows  ◀ LABEL ▶  — clicking the arrows seeks to the
+    previous / next event of that track type.
+    """
+    seek_requested = Signal(float)
+
+    # Tracks that support prev/next navigation and how to pull timestamps
+    _NAVIGABLE = {
+        "ACTIONS":        lambda scene: scene._nav_timestamps_actions(),
+        "OBJECTS":        lambda scene: scene._nav_timestamps_objects(),
+        "SCENES":         lambda scene: scene._nav_timestamps_scenes(),
+        "MOTION EVENTS":  lambda scene: scene._nav_timestamps_motion_events(),
+        "MOTION PEAKS":   lambda scene: scene._nav_timestamps_motion_peaks(),
+        "AUDIO PEAKS":    lambda scene: scene._nav_timestamps_audio_peaks(),
+        "HIGHLIGHTS":     lambda scene: scene._nav_timestamps_highlights(),
+        "TRANSCRIPT":     lambda scene: scene._nav_timestamps_transcript(),
+    }
+
+    _ARROW_W = 14   # px reserved for each arrow
+    _ROW_H   = 20   # hit-test height per label row
 
     def __init__(self, signal_view, parent=None):
         super().__init__(parent)
         self.signal_view = signal_view
-        self.setFixedWidth(110)
+        self.setFixedWidth(150)
         self.setMinimumHeight(100)
-        self._labels = []  # [(name, y_pos), ...]
+        self.setCursor(Qt.ArrowCursor)
+        self._labels = []        # [(name, scene_y), ...]
+        self._hit_rows = []      # [(local_y_top, local_y_bot, name), ...] rebuilt in paintEvent
+        self._current_time_fn = None   # set by the window after construction
 
-        # Sync vertical scroll
         signal_view.verticalScrollBar().valueChanged.connect(self.update)
 
     def refresh_labels(self):
-        """Pull label positions from the scene"""
         scene = self.signal_view.scene()
         if scene and hasattr(scene, 'row_labels'):
             self._labels = list(scene.row_labels)
@@ -72,35 +93,108 @@ class SignalLabelPanel(QWidget):
         self.update()
 
     def paintEvent(self, event):
-        from PySide6.QtGui import QPainter, QColor, QFont
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-
-        # Background
         p.fillRect(self.rect(), QColor(20, 20, 30))
+
+        self._hit_rows = []
 
         if not self._labels:
             p.end()
             return
 
         view = self.signal_view
-        font = QFont("Arial", 9, QFont.Weight.Bold)
-        p.setFont(font)
-        p.setPen(QColor(180, 220, 255))
+        font_lbl = QFont("Arial", 8, QFont.Weight.Bold)
+        font_arr = QFont("Arial", 9)
+        fm_lbl   = QFontMetrics(font_lbl)
 
         for name, scene_y in self._labels:
-            # Map scene Y to view Y, then to this widget's Y
             view_pt = view.mapFromScene(0, scene_y)
             local_y = view_pt.y()
+            mid_y   = local_y + 2   # baseline
 
-            # Draw label centered vertically in the row
-            p.drawText(6, local_y + 2, name)
+            navigable = name in self._NAVIGABLE
+            top  = local_y - self._ROW_H // 2
+            bot  = local_y + self._ROW_H // 2
+            self._hit_rows.append((top, bot, name))
 
-        # Right border line
+            if navigable:
+                # ◀  label  ▶
+                p.setFont(font_arr)
+                p.setPen(QColor(100, 180, 255))
+                p.drawText(2, mid_y, "◀")
+                p.drawText(self.width() - self._ARROW_W, mid_y, "▶")
+
+                p.setFont(font_lbl)
+                p.setPen(QColor(180, 220, 255))
+                avail = self.width() - self._ARROW_W * 2 - 6
+                clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
+                p.drawText(self._ARROW_W + 3, mid_y, clipped)
+            else:
+                p.setFont(font_lbl)
+                p.setPen(QColor(140, 160, 190))
+                avail = self.width() - 8
+                clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
+                p.drawText(6, mid_y, clipped)
+
         p.setPen(QColor(60, 60, 80))
         p.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
-
         p.end()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+
+        x, y = event.position().x(), event.position().y()
+
+        for top, bot, name in self._hit_rows:
+            if top <= y <= bot and name in self._NAVIGABLE:
+                # Decide arrow side
+                if x <= self._ARROW_W + 4:
+                    direction = "prev"
+                elif x >= self.width() - self._ARROW_W - 2:
+                    direction = "next"
+                else:
+                    break
+
+                scene = self.signal_view.scene()
+                if not scene:
+                    break
+                timestamps = self._NAVIGABLE[name](scene)
+                if not timestamps:
+                    break
+
+                current = self._current_time_fn() if self._current_time_fn else 0.0
+                target = self._find_target(timestamps, current, direction)
+                if target is not None:
+                    self.seek_requested.emit(target)
+                return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        x, y = event.position().x(), event.position().y()
+        on_arrow = False
+        for top, bot, name in self._hit_rows:
+            if top <= y <= bot and name in self._NAVIGABLE:
+                if x <= self._ARROW_W + 4 or x >= self.width() - self._ARROW_W - 2:
+                    on_arrow = True
+                    break
+        self.setCursor(Qt.PointingHandCursor if on_arrow else Qt.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    @staticmethod
+    def _find_target(timestamps, current, direction):
+        ts = sorted(timestamps)
+        if direction == "next":
+            for t in ts:
+                if t > current + 0.1:
+                    return t
+        else:
+            for t in reversed(ts):
+                if t < current - 0.1:
+                    return t
+        return None
 
 class SignalTimelineWindow(QMainWindow):
     """Main window for signal timeline viewer with edit timeline and filters"""
@@ -842,6 +936,29 @@ class SignalTimelineWindow(QMainWindow):
             self.total_duration_str = f"{mins:02d}:{secs:02d}"
             self.update_time_display(self.video_player.position())
 
+            # --- SYNC DIAGNOSTIC ---------------------------------------------
+            # The waveform/actions are laid out on a scene of width
+            # (self.video_duration * pixels_per_second), but the playhead tracks
+            # the QMediaPlayer clock. If the player's real duration disagrees with
+            # the cache duration, signals desync. Log both so we can see the gap.
+            if not getattr(self, "_logged_duration_sync", False):
+                self._logged_duration_sync = True
+                player_dur = duration / 1000.0
+                cache_dur = float(getattr(self, "video_duration", 0) or 0)
+                wf_len = len(self.waveform) if getattr(self, "waveform", None) else 0
+                delta = player_dur - cache_dur
+                debug_log(
+                    f"⏱ SYNC: player_duration={player_dur:.3f}s "
+                    f"cache/scene video_duration={cache_dur:.3f}s "
+                    f"delta(player-cache)={delta:+.3f}s waveform_points={wf_len}"
+                )
+                if abs(delta) > 0.3:
+                    debug_log(
+                        f"⚠️ SYNC: duration mismatch {delta:+.3f}s — waveform is "
+                        f"stretched over cache duration while the playhead uses the "
+                        f"player clock, so they will drift by ~{abs(delta):.2f}s by the end."
+                    )
+
     def update_time_display(self, position):
         current_seconds = position // 1000
         mins = current_seconds // 60
@@ -1301,6 +1418,10 @@ class SignalTimelineWindow(QMainWindow):
 
         # Refresh frozen labels whenever the scene rebuilds
         self.signal_scene.timeline_rebuilt.connect(self.label_panel.refresh_labels)
+
+        # Wire navigation arrows
+        self.label_panel._current_time_fn = lambda: self.current_time
+        self.label_panel.seek_requested.connect(self.on_time_clicked)
 
         # Initial label load
         self.label_panel.refresh_labels()
@@ -1911,7 +2032,18 @@ class SignalTimelineWindow(QMainWindow):
 
         merge_group.setLayout(merge_layout)
         layout.addWidget(merge_group)
-        
+
+        # Actions row: show ALL detections (default) vs only highlight-selected
+        self.only_highlight_actions_cb = QCheckBox("Show only highlight actions")
+        self.only_highlight_actions_cb.setChecked(False)
+        self.only_highlight_actions_cb.setToolTip(
+            "Off (default): the ACTIONS row shows every detected action.\n"
+            "On: only the actions selected into the highlight.\n"
+            "(Needs a re-analysis to populate the full list.)"
+        )
+        self.only_highlight_actions_cb.stateChanged.connect(self.on_only_highlight_actions_changed)
+        layout.addWidget(self.only_highlight_actions_cb)
+
         # Playback controls
         playback_group = QGroupBox("Playback")
         playback_layout = QVBoxLayout()
@@ -2104,6 +2236,11 @@ class SignalTimelineWindow(QMainWindow):
         """Actually apply the merge threshold after debounce"""
         if hasattr(self, 'signal_scene') and hasattr(self, '_pending_merge_value'):
             self.signal_scene.set_merge_threshold(self._pending_merge_value)
+
+    def on_only_highlight_actions_changed(self, state):
+        """Toggle the ACTIONS row between all detections and highlight-only."""
+        if hasattr(self, 'signal_scene'):
+            self.signal_scene.set_show_only_highlight_actions(bool(state))
     
     @Slot(float)
     def on_time_clicked(self, time):
