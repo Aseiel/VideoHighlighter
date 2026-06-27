@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QComboBox, QTabWidget, QListWidget, QSplitter,
     QDialog, QDialogButtonBox, QAbstractItemView,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
+    QGridLayout,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
@@ -27,6 +28,7 @@ except Exception:
     pass
 
 from modules.app_paths import resource_path as _resource_path, config_path
+from version import __version__
 
 # User-editable config: lives next to the exe when frozen (so saves persist),
 # seeded from the bundled default; just the project-root file when run from source.
@@ -562,7 +564,7 @@ class RangeSlider(QWidget):
 class VideoHighlighterGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Video Highlighter - Highlights & Subtitles")
+        self.setWindowTitle(f"Video Highlighter v{__version__}")
         screen = QApplication.primaryScreen().availableGeometry()
         w = min(1000, screen.width() - 20)
         h = min(800, screen.height() - 20)
@@ -746,7 +748,7 @@ class VideoHighlighterGUI(QWidget):
         progress_layout.addWidget(self.task_label)
 
         self.progress_group.setLayout(progress_layout)
-        self.progress_group.setVisible(False)
+        self.progress_group.setMaximumHeight(0)  # collapsed by default; avoids layout jump on show
         layout.addWidget(self.progress_group)
 
         # --- Tabs ---
@@ -1124,7 +1126,9 @@ class VideoHighlighterGUI(QWidget):
         visualization_cfg = self.config_data.get("visualization", {})
 
         advanced_tab = QWidget()
-        advanced_layout = QVBoxLayout()
+        # Grid so the small groups sit side by side and use horizontal space
+        # (especially when maximized) instead of one tall scrolling column.
+        advanced_layout = QGridLayout()
 
         # ── Group 1: Motion Recognition ──
         motion_box = QGroupBox("Motion Recognition")
@@ -1137,7 +1141,7 @@ class VideoHighlighterGUI(QWidget):
 
         motion_layout.addRow("Frame skip:", self.frame_skip_spin)
         motion_box.setLayout(motion_layout)
-        advanced_layout.addWidget(motion_box)
+        advanced_layout.addWidget(motion_box, 0, 0)
 
         # ── Group 2: Object Recognition ──
         object_box = QGroupBox("Object Recognition")
@@ -1221,7 +1225,7 @@ class VideoHighlighterGUI(QWidget):
         object_layout.addRow("Confidence threshold:", self.obj_confidence_spin)
 
         object_box.setLayout(object_layout)
-        advanced_layout.addWidget(object_box)
+        advanced_layout.addWidget(object_box, 1, 0)
 
         # ── Group 3: Action Recognition ──
         action_box = QGroupBox("Action Recognition")
@@ -1311,7 +1315,7 @@ class VideoHighlighterGUI(QWidget):
         action_layout.addRow("R3D model variant:", self.r3d_model_combo)
 
         action_box.setLayout(action_layout)
-        advanced_layout.addWidget(action_box)
+        advanced_layout.addWidget(action_box, 1, 1)
 
         # ── Group 4: Bounding Box Visualization ──
         # ── Group 4: Composition Rules ──
@@ -1362,7 +1366,7 @@ class VideoHighlighterGUI(QWidget):
         comp_outer.addLayout(comp_btn_row)
 
         comp_box.setLayout(comp_outer)
-        advanced_layout.addWidget(comp_box)
+        advanced_layout.addWidget(comp_box, 2, 0, 1, 2)
 
         # ---- load existing rules into table ----
         def _comp_load_rules():
@@ -1499,10 +1503,21 @@ class VideoHighlighterGUI(QWidget):
         bbox_layout.addWidget(self.bbox_actions_chk)
 
         bbox_box.setLayout(bbox_layout)
-        advanced_layout.addWidget(bbox_box)
+        advanced_layout.addWidget(bbox_box, 0, 1)
 
-        advanced_layout.addStretch()
-        advanced_tab.setLayout(advanced_layout)
+        # Equal column widths; let the row below the composition table absorb slack
+        advanced_layout.setColumnStretch(0, 1)
+        advanced_layout.setColumnStretch(1, 1)
+        advanced_layout.setRowStretch(3, 1)
+
+        advanced_scroll = QScrollArea()
+        advanced_scroll.setWidgetResizable(True)
+        _adv_container = QWidget()
+        _adv_container.setLayout(advanced_layout)
+        advanced_scroll.setWidget(_adv_container)
+        advanced_tab.setLayout(QVBoxLayout())
+        advanced_tab.layout().setContentsMargins(0, 0, 0, 0)
+        advanced_tab.layout().addWidget(advanced_scroll)
         tabs.addTab(advanced_tab, "Advanced")
 
         content_splitter = QSplitter(Qt.Vertical)
@@ -1518,8 +1533,6 @@ class VideoHighlighterGUI(QWidget):
         tabs.addTab(llm_tab, "🤖 LLM Chat")
 
         # --- Tab 5: Avoid ---
-        from PySide6.QtWidgets import QScrollArea
-
         avoid_tab = QWidget()
         avoid_layout = QVBoxLayout()
 
@@ -2916,7 +2929,7 @@ class VideoHighlighterGUI(QWidget):
         scrollbar.setValue(scrollbar.maximum())
 
     def _show_progress(self, visible=True):
-        self.progress_group.setVisible(visible)
+        self.progress_group.setMaximumHeight(16777215 if visible else 0)
 
     def update_progress(self, current, total, task_name, details=""):
         # Decide which bar based on task_name or status
