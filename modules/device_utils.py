@@ -91,6 +91,28 @@ def detect_best_device(log_fn=print):
         except Exception as e:
             log_fn(f"⚠️ XPU check failed: {e}")
 
+    # ---- Intel GPU via OpenVINO (no torch xpu build needed) -----------------
+    # The frozen exe ships a CPU-only torch, so torch.xpu is unavailable even on
+    # an Arc machine. OpenVINO can still drive the GPU, so probe it directly and
+    # use it for OpenVINO consumers (YOLO OV model + action recognition).
+    try:
+        from openvino import Core
+        _ov_devices = Core().available_devices
+        if any(d == "GPU" or d.startswith("GPU.") for d in _ov_devices):
+            log_fn(f"✅ Intel GPU available via OpenVINO: {_ov_devices}")
+            return DeviceInfo(
+                yolo_pt_device="cpu",
+                yolo_ov_device="cpu",
+                openvino_device="GPU",
+                pytorch_device="cpu",
+                motion_device="cpu",
+                use_openvino_yolo=True,
+                gpu_available=True,
+                backend_name="Intel GPU (OpenVINO)",
+            )
+    except Exception as e:
+        log_fn(f"⚠️ OpenVINO GPU probe failed: {e}")
+
     # ---- CPU fallback -------------------------------------------------------
     log_fn("ℹ️ No GPU found — using CPU")
     return DeviceInfo(

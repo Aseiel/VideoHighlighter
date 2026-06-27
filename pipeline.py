@@ -1234,8 +1234,19 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     enable_r3d = True
                     r3d_half = False  # FP32 on CPU
                 else:  # "auto"
-                    enable_r3d = True  # load_models() auto-detects CUDA
-                    r3d_half = True
+                    # Only enable R3D when CUDA is actually present. On Intel/CPU
+                    # systems R3D can only run on CPU (slow), so we disable it and
+                    # let OpenVINO use the Intel GPU (load_models AUTO → GPU).
+                    from modules.device_utils import detect_best_device
+                    _dev = detect_best_device(log_fn=log)
+                    if _dev.pytorch_device == "cuda":
+                        enable_r3d = True
+                        r3d_half = True
+                        log(f"🎯 Auto backend → CUDA detected, using R3D ({_dev.backend_name})")
+                    else:
+                        enable_r3d = False
+                        r3d_half = False
+                        log(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
 
                 log(f"🎯 Action backend: {action_backend} | R3D model: {r3d_model} | enable_r3d: {enable_r3d}")
 

@@ -38,10 +38,20 @@ except ImportError:
 # =============================
 BASE_DIR = Path(__file__).parent.resolve()
 
-CUSTOM_MAPPING_PATH = BASE_DIR / "intel_finetuned_classifier_3d_mapping.json"
-KINETICS_LABELS_PATH = BASE_DIR / "kinetics_400_labels.json"
-R3D_CUSTOM_MAPPING_PATH = BASE_DIR / "r3d_finetuned_mapping.json"
-R3D_CUSTOM_WEIGHTS_PATH = BASE_DIR / "r3d_finetuned.pth"
+# Custom model + mapping files are resolved via data_file() so a packaged exe
+# picks up a copy dropped next to the executable (swap in a retrained model
+# without rebuilding); falls back to the bundled/source copy. From source this
+# is just the project root, so behaviour is unchanged.
+try:
+    from modules.app_paths import data_file as _data_file
+except Exception:
+    def _data_file(name):
+        return str(BASE_DIR / name)
+
+CUSTOM_MAPPING_PATH = Path(_data_file("intel_finetuned_classifier_3d_mapping.json"))
+KINETICS_LABELS_PATH = Path(_data_file("kinetics_400_labels.json"))
+R3D_CUSTOM_MAPPING_PATH = Path(_data_file("r3d_finetuned_mapping.json"))
+R3D_CUSTOM_WEIGHTS_PATH = Path(_data_file("r3d_finetuned.pth"))
 
 
 CUSTOM_LABELS = None
@@ -813,8 +823,9 @@ def load_models(device="AUTO", openvino_threads=None,
     if encoder_device != selected_device:
         print(f"📌 Note: Encoder running on {encoder_device} (different from requested {selected_device})")
 
-    custom_decoder_xml = BASE_DIR / "action_classifier_3d.xml"
-    custom_decoder_bin = BASE_DIR / "action_classifier_3d.bin"
+    # Custom decoder is user-swappable: resolve next-to-exe first, else bundled.
+    custom_decoder_xml = Path(_data_file("action_classifier_3d.xml"))
+    custom_decoder_bin = Path(_data_file("action_classifier_3d.bin"))
     intel_decoder_xml  = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
     intel_decoder_bin  = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 
@@ -1187,6 +1198,18 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     encoder_engine = AsyncBatchedInferenceEngine(
         compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
+
+    # ---- Single, clear compute-backend label for the progress bar ----
+    # PyTorch/CUDA wins the label when active (it does the heavy inference);
+    # otherwise it's OpenVINO on whichever device the encoder compiled to.
+    if any(str((models_info.get(k) or {}).get('device', '')).startswith('cuda')
+           for k in ('cuda', 'r3d_custom')):
+        _backend_label = "CUDA"
+    elif "GPU" in str(actual_device).upper():
+        _backend_label = "OpenVINO/GPU"
+    else:
+        _backend_label = "OpenVINO/CPU"
+    print(f"🎯 Action recognition backend: {_backend_label}")
 
     # ---- Preprocessing pipeline ----
     preprocess_pool = PreprocessPipeline(num_workers=preprocess_workers)
@@ -1649,24 +1672,13 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     elapsed = current_time - start_time
                     processing_fps = processed_frames / elapsed if elapsed > 0 else 0
                     engine_stats = encoder_engine.get_stats()
-                    _dev_parts = [f"encoder:{actual_device}"]
-                    if models_info.get('custom'):
-                        _dev_parts.append(f"custom:{models_info['custom']['device']}")
-                    if models_info.get('intel'):
-                        _dev_parts.append(f"intel:{models_info['intel']['device']}")
-                    if models_info.get('cuda'):
-                        _dev_parts.append(f"r3d:{models_info['cuda']['device']}")
-                    if models_info.get('r3d_custom'):
-                        _dev_parts.append(f"r3d_custom:{models_info['r3d_custom']['device']}")
                     progress_msg = (
                         f"Frame {processed_frames}/{expected_processed_frames} | "
                         f"Detections: {detection_count} | "
                         f"Processing: {processing_fps:.1f} FPS | "
                         f"Inference: {engine_stats['inference_fps']:.1f} FPS | "
-                        f"Devices: {', '.join(_dev_parts)} | "
+                        f"Backend: {_backend_label} | "
                         f"Models: {action_models}")
-                    if r3d_wrapper:
-                        progress_msg += f" + {r3d_model_name}/CUDA"
                     progress_callback(processed_frames, expected_processed_frames,
                                       "Action Recognition", progress_msg)
                     last_gui_update = current_time
