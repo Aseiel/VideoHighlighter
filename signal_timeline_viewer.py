@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QComboBox, QListWidget, QListWidgetItem, QDialog,
     QDialogButtonBox, QFormLayout, QTabWidget
 )
-from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData, QLoggingCategory
+from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData, QLoggingCategory, QUrl
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QPainter, QFont, QPainterPath, 
     QLinearGradient, QRadialGradient, QCursor, QAction,
@@ -331,25 +331,48 @@ class SignalTimelineWindow(QMainWindow):
         self.preview_window = TimelineWithPreview.launch_preview(self, chat_widget=chat)
 
     def closeEvent(self, event):
-            """Close preview when timeline closes"""
+            """Close preview when timeline closes.
+
+            Important: we deliberately do NOT stop()/destroy the QMediaPlayers
+            here. On a 4K FFmpeg-backed player, stop()/setSource()/destruction
+            synchronously wait on the decoder thread and freeze the main thread
+            for ~30s. Instead we pause decoding + mute audio (both instant). The
+            window is kept alive and reused on the next open (see main.py); the
+            decoders are reaped by the hard-exit at app close.
+            """
             # ── stop the true-live face worker thread cleanly ──
-            # Do this FIRST, before the player/sink it taps is stopped.
+            # Do this FIRST, before the player/sink it taps is paused.
             try:
                 if hasattr(self, 'realtime_preview') and self.realtime_preview:
                     self.realtime_preview.shutdown_live_face()
             except Exception:
                 pass
 
-            # Stop all players to prevent audio playing in background
-            try:
-                if hasattr(self, '_active_player'):
-                    self._active_player.stop()
-                if hasattr(self, 'video_player'):
-                    self.video_player.stop()
-                if hasattr(self, 'realtime_preview') and self.realtime_preview:
-                    self.realtime_preview.player.stop()
-            except Exception:
-                pass
+            # Mute audio (instant) so nothing is audible after close.
+            audio_outputs = []
+            if hasattr(self, 'audio_output') and self.audio_output is not None:
+                audio_outputs.append(self.audio_output)
+            if (hasattr(self, 'realtime_preview') and self.realtime_preview
+                    and getattr(self.realtime_preview, '_audio', None) is not None):
+                audio_outputs.append(self.realtime_preview._audio)
+            for ao in audio_outputs:
+                try:
+                    ao.setMuted(True)
+                except Exception:
+                    pass
+
+            # PAUSE (not stop) each player so paused-but-alive players don't keep
+            # burning CPU on 4K software decode.
+            players = []
+            if hasattr(self, 'video_player'):
+                players.append(self.video_player)
+            if hasattr(self, 'realtime_preview') and self.realtime_preview:
+                players.append(self.realtime_preview.player)
+            for p in players:
+                try:
+                    p.pause()
+                except Exception:
+                    pass
 
             # Stop edit playback timers
             try:

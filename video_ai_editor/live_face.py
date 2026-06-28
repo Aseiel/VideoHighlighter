@@ -238,24 +238,36 @@ class LiveFaceController(QObject):
         self.results_ready.emit(results, w, h)
 
     def shutdown(self):
-        """Stop the worker thread cleanly (call from closeEvent)."""
+        """Stop the worker thread (call from closeEvent).
+
+        We do NOT block waiting for an in-flight InsightFace inference to finish
+        (that's what made close hang). Instead:
+          1. Stop feeding the worker and disconnect its output signal so it can
+             never emit into Qt objects that are being torn down (no crash).
+          2. Set the hard-stop flag + ask its timer to stop on the worker thread.
+          3. quit() and wait only briefly. If an inference is still running, the
+             thread finishes it in the background and exits on its own; the final
+             app exit (os._exit) reaps anything still alive.
+        """
         self._enabled = False
         try:
             self._video_sink.videoFrameChanged.disconnect(self._on_frame)
         except Exception:
             pass
-        # Set the hard-stop flag directly (plain bool write is safe enough across
-        # threads here) so a tick that hasn't started yet returns immediately and
-        # no new InsightFace inference begins.
+        try:
+            self._worker.results_ready.disconnect(self._on_results)
+        except Exception:
+            pass
+
         self._worker._stopped = True
-        # Stop the worker's QTimer ON the worker thread — stopping it from here
-        # (the GUI thread) throws "Timers cannot be stopped from another thread"
-        # and leaves the thread unable to quit, which is what caused the hang.
+        # Stop the worker's QTimer ON the worker thread — stopping it from the GUI
+        # thread throws "Timers cannot be stopped from another thread".
         QMetaObject.invokeMethod(
             self._worker, "stop_processing", Qt.ConnectionType.QueuedConnection
         )
         self._thread.quit()
-        self._thread.wait(2000)
+        # Short, non-blocking-ish wait. Don't sit here for seconds on a 4K frame.
+        self._thread.wait(300)
 
 
 # ──────────────────────────────────────────────────────────────────

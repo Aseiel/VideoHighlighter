@@ -2675,6 +2675,13 @@ class VideoHighlighterGUI(QWidget):
     def closeEvent(self, event):
         self.save_config()
         event.accept()
+        # Hard-kill on main-window close. We can't rely on app.exec() returning:
+        # the timeline viewer window is kept alive (hidden) for reuse, and a
+        # lingering hidden window can stop Qt from quitting. Killing here, the
+        # moment the user closes the main GUI, guarantees the process dies even
+        # if native FFmpeg/onnxruntime threads are stuck (which deadlock the
+        # normal os._exit/ExitProcess path on Windows).
+        _hard_exit(0)
 
     def check_worker_status(self):
         """Periodic check of worker status for UI responsiveness"""
@@ -3614,7 +3621,36 @@ class VideoHighlighterGUI(QWidget):
         
         try:
             from signal_timeline_viewer import SignalTimelineWindow
-            
+
+            # Reuse an existing timeline window for the same video instead of
+            # building a new one. The timeline window pins itself in memory
+            # (it installs an app-wide event filter, and is referenced by the
+            # LLM chat), and its 4K players can't be torn down without blocking,
+            # so creating a fresh one each open leaks ~2.5GB per cycle. Re-show
+            # the existing one when the video matches.
+            existing = getattr(self, 'timeline_window', None)
+            if existing is not None:
+                try:
+                    same_video = (getattr(existing, 'video_path', None) == video_path)
+                    if same_video:
+                        # Un-mute (close() muted the audio outputs) and re-show
+                        for ao_attr, obj in (('audio_output', existing),
+                                             ('_audio', getattr(existing, 'realtime_preview', None))):
+                            ao = getattr(obj, ao_attr, None) if obj is not None else None
+                            if ao is not None:
+                                try:
+                                    ao.setMuted(False)
+                                except Exception:
+                                    pass
+                        existing.show()
+                        existing.raise_()
+                        existing.activateWindow()
+                        self.append_log("📊 Reusing open timeline viewer.")
+                        return
+                except RuntimeError:
+                    # Underlying C++ object was deleted — fall through to recreate
+                    self.timeline_window = None
+
             # Check if cache exists - use the same parameters as in pipeline
             from modules.video_cache import VideoAnalysisCache, build_analysis_cache_params
             
@@ -3701,6 +3737,47 @@ class VideoHighlighterGUI(QWidget):
             import traceback
             self.append_log(traceback.format_exc())
 
+def _hard_exit(exit_code: int = 0):
+    """Terminate the process immediately, bypassing slow/hanging native teardown.
+
+    os._exit() is NOT safe enough on Windows — it calls ExitProcess, which runs
+    DLL detach and tries to terminate threads cleanly. If a native thread is
+    stuck (FFmpeg 4K decoder, onnxruntime/InsightFace mid-inference), ExitProcess
+    deadlocks and the process never dies. TerminateProcess on our own process is
+    the hardest kill available: it terminates every thread immediately with no
+    cleanup, so a stuck decoder/inference thread can't block exit.
+
+    Config is saved in the main window's closeEvent, so nothing is left to
+    persist by the time this runs.
+    """
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        # On Windows, os.kill() with any signal other than CTRL_C_EVENT /
+        # CTRL_BREAK_EVENT unconditionally calls TerminateProcess on our own
+        # process — the hardest kill available, and (unlike a raw ctypes
+        # TerminateProcess call) Python handles the process handle correctly,
+        # so it can't be silently truncated/failed on 64-bit.
+        try:
+            import signal
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            pass
+        # Fallback: raw TerminateProcess with correct 64-bit handle types.
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            kernel32.TerminateProcess(kernel32.GetCurrentProcess(), exit_code & 0xFFFF)
+        except Exception:
+            pass
+    os._exit(exit_code)
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     try:
@@ -3716,4 +3793,8 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     gui = VideoHighlighterGUI()
     gui.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+
+    # Backup hard-exit in case app.exec() does return (main closeEvent already
+    # hard-exits, so this is belt-and-suspenders).
+    _hard_exit(exit_code)
