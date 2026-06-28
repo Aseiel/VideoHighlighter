@@ -479,6 +479,31 @@ class RangeSlider(QWidget):
             self.endChanged.emit(val)
             self.update()
 
+    def setRangeValues(self, start, end):
+        """Set both handles at once.
+
+        setStart()/setEnd() clamp against the *current* opposite handle, so
+        calling them in sequence fails when the whole window moves past the old
+        range (e.g. switching from 'first 5min' to 'last 5min' clamps the new
+        start to the old end). Setting both together avoids that cross-clamp.
+        """
+        start = max(self._min, min(int(start), self._max))
+        end = max(self._min, min(int(end), self._max))
+        if start > end:
+            start, end = end, start
+        if end <= start:
+            end = min(self._max, start + 1)
+        changed_start = (start != self._start)
+        changed_end = (end != self._end)
+        self._start = start
+        self._end = end
+        if changed_start:
+            self.startChanged.emit(start)
+        if changed_end:
+            self.endChanged.emit(end)
+        if changed_start or changed_end:
+            self.update()
+
     def setRange(self, minimum, maximum):
         self._min = minimum
         self._max = maximum
@@ -3140,9 +3165,8 @@ class VideoHighlighterGUI(QWidget):
         else:
             return
         
-        self.range_slider.setStart(start_pct)
-        self.range_slider.setEnd(end_pct)
-        
+        self.range_slider.setRangeValues(start_pct, end_pct)
+
         start_time = int((start_pct / 100) * duration)
         end_time = int((end_pct / 100) * duration)
         self.append_log(f"✅ Preset '{preset_type}': {self.format_time(start_time)} to {self.format_time(end_time)}")
