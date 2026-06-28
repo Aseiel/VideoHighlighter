@@ -1589,6 +1589,16 @@ class SignalTimelineWindow(QMainWindow):
         except Exception as e:
             print(f"⚠️ Could not create transcript dock: {e}")
 
+        # Search dock (hidden by default)
+        try:
+            search_dock = self.create_search_dock()
+            self.addDockWidget(Qt.RightDockWidgetArea, search_dock)
+            search_dock.setVisible(False)
+            if hasattr(self, 'search_toggle_btn'):
+                self.search_toggle_btn.toggled.connect(search_dock.setVisible)
+        except Exception as e:
+            print(f"⚠️ Could not create search dock: {e}")
+
         # Connect render signal
         self.render_finished.connect(self.on_render_finished)
 
@@ -1923,6 +1933,29 @@ class SignalTimelineWindow(QMainWindow):
         
         return controls
 
+    def create_search_dock(self):
+        from PySide6.QtWidgets import QDockWidget
+        from video_ai_editor.search_panel import SearchPanel
+
+        dock = QDockWidget("🔍 Search", self)
+        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        dock.setMinimumWidth(300)
+
+        face_db_path = os.path.join(os.path.dirname(self.video_path), "..", "cache", "face_db.json")
+        face_db_path = os.path.normpath(face_db_path)
+        if not os.path.exists(face_db_path):
+            face_db_path = os.path.join("cache", "face_db.json")
+
+        panel = SearchPanel(
+            cache_data=self.cache_data or {},
+            video_duration=self.video_duration,
+            on_jump=self.on_time_clicked,
+            on_add_clip=lambda s, e: self.edit_scene.add_clip(s, e),
+            face_db_path=face_db_path if os.path.exists(face_db_path) else None,
+        )
+        dock.setWidget(panel)
+        return dock
+
     def create_transcript_dock(self):
         """Create transcript dock — reads from SRT or transcript txt next to video"""
         from PySide6.QtWidgets import QDockWidget
@@ -2135,6 +2168,22 @@ class SignalTimelineWindow(QMainWindow):
             }
         """)
         playback_layout.addWidget(self.transcript_toggle_btn)
+
+        # Search toggle
+        self.search_toggle_btn = QPushButton("🔍 Search")
+        self.search_toggle_btn.setCheckable(True)
+        self.search_toggle_btn.setStyleSheet("""
+            QPushButton {
+                background: #1a1a2e; color: #7a9acd;
+                border: 1px solid #3a3a5a; border-radius: 3px;
+                font-size: 10px; padding: 4px 8px;
+            }
+            QPushButton:checked {
+                background: #1a2a3f; color: #aac0ff;
+                border-color: #4a7fcd;
+            }
+        """)
+        playback_layout.addWidget(self.search_toggle_btn)
 
         self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
         self.follow_playhead_checkbox.setChecked(True)
