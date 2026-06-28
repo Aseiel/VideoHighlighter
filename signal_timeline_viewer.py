@@ -360,6 +360,21 @@ class SignalTimelineWindow(QMainWindow):
             except Exception:
                 pass
 
+            # Stop the realtime preview's periodic memory-logging timer
+            try:
+                if (hasattr(self, 'realtime_preview') and self.realtime_preview
+                        and hasattr(self.realtime_preview, '_memory_timer')):
+                    self.realtime_preview._memory_timer.stop()
+            except Exception:
+                pass
+
+            # Tear down the thumbnail worker + hover popup
+            try:
+                if hasattr(self, 'edit_scene') and self.edit_scene is not None:
+                    self.edit_scene.cleanup()
+            except Exception:
+                pass
+
             if hasattr(self, 'preview_window') and self.preview_window:
                 self.preview_window.close()
 
@@ -674,14 +689,12 @@ class SignalTimelineWindow(QMainWindow):
             if self._precomp_widget:
                 self._precomp_widget.setVisible(False)
 
-            # Sync position — play briefly to force frame render, then restore state
+            # Sync position only — do NOT play+pause to force a frame.
+            # On 4K video a 100ms play burst decodes ~6 frames through QGraphicsScene,
+            # which hangs the main thread. Let the frame arrive naturally on play/seek.
             self._active_player.setPosition(current_pos)
             if was_playing:
                 self._active_player.play()
-            else:
-                # Must play+pause to force QGraphicsVideoItem to render a frame
-                self._active_player.play()
-                QTimer.singleShot(100, self._active_player.pause)
 
             # Refit view after video dimensions are known
             QTimer.singleShot(200, self.realtime_preview._view._fit_video)
@@ -711,11 +724,19 @@ class SignalTimelineWindow(QMainWindow):
                 self.realtime_preview.set_live_face_enabled(False)
 
             # ── Switch to Precomp (annotated video swap) ──
-            self.preview_stack.setCurrentIndex(0)
             self._active_player = self.video_player
 
-            # Ensure shared player outputs to QVideoWidget
-            self.video_player.setVideoOutput(self.video_widget)
+            if hasattr(self, 'vr_mode_checkbox') and self.vr_mode_checkbox.isChecked():
+                if not hasattr(self, '_vr_sink') or self._vr_sink is None:
+                    self._vr_sink = QVideoSink()
+                    self._vr_sink.videoFrameChanged.connect(self._store_vr_frame)
+                self.video_player.setVideoOutput(self._vr_sink)
+                self.preview_stack.setCurrentIndex(self._vr_stack_index)
+                if hasattr(self, '_vr_render_timer'):
+                    self._vr_render_timer.start()
+            else:
+                self.video_player.setVideoOutput(self.video_widget)
+                self.preview_stack.setCurrentIndex(0)
 
             # Show precomp controls
             if self._precomp_widget:
@@ -739,8 +760,18 @@ class SignalTimelineWindow(QMainWindow):
             self.preview_stack.setCurrentIndex(0)
             self._active_player = self.video_player
 
-            # Ensure shared player outputs to QVideoWidget
-            self.video_player.setVideoOutput(self.video_widget)
+            # Restore correct video_player output — if VR mode is on, re-engage the
+            # VR sink; otherwise output to the plain video widget.
+            if hasattr(self, 'vr_mode_checkbox') and self.vr_mode_checkbox.isChecked():
+                if not hasattr(self, '_vr_sink') or self._vr_sink is None:
+                    self._vr_sink = QVideoSink()
+                    self._vr_sink.videoFrameChanged.connect(self._store_vr_frame)
+                self.video_player.setVideoOutput(self._vr_sink)
+                self.preview_stack.setCurrentIndex(self._vr_stack_index)
+                if hasattr(self, '_vr_render_timer'):
+                    self._vr_render_timer.start()
+            else:
+                self.video_player.setVideoOutput(self.video_widget)
 
             # Reset to original video if bbox_manager swapped it
             if self.bbox_manager and self.bbox_manager._current_source != "🎥 Original":
@@ -828,30 +859,50 @@ class SignalTimelineWindow(QMainWindow):
     @Slot(int)
     def _toggle_vr_mode(self, state):
         enabled = bool(state)
-        if enabled:
-            self._pre_vr_stack_index = self.preview_stack.currentIndex()
-            self._latest_vr_frame = None
-            self._vr_sink = QVideoSink()
-            # Store frames without processing — the render timer does the heavy work
-            self._vr_sink.videoFrameChanged.connect(self._store_vr_frame)
-            self.video_player.setVideoOutput(self._vr_sink)
-            self.preview_stack.setCurrentIndex(self._vr_stack_index)
-            if not hasattr(self, '_vr_render_timer'):
-                self._vr_render_timer = QTimer(self)
-                self._vr_render_timer.setInterval(33)  # ~30 fps cap
-                self._vr_render_timer.timeout.connect(self._render_vr_frame)
-            self._vr_render_timer.start()
-        else:
-            if hasattr(self, '_vr_render_timer'):
-                self._vr_render_timer.stop()
-            self.video_player.setVideoOutput(self.video_widget)
-            self.preview_stack.setCurrentIndex(getattr(self, '_pre_vr_stack_index', 0))
-            self._vr_sink = None
-            self._latest_vr_frame = None
 
-        # Also update edit-timeline thumbnails
+        # Detect whether Live overlay is the active mode
+        in_live_mode = (
+            hasattr(self, 'realtime_preview')
+            and self.realtime_preview is not None
+            and self.preview_stack.currentIndex() == 1
+        )
+
+        if in_live_mode:
+            # In Live mode the realtime_preview has its own player outputting to
+            # QGraphicsVideoItem. We must NOT redirect or change the stack — just
+            # crop the view and tell face recognition to use left half.
+            pass
+        else:
+            # Off / Precomp mode: use VR sink → label pipeline
+            if enabled:
+                self._pre_vr_stack_index = self.preview_stack.currentIndex()
+                self._latest_vr_frame = None
+                self._vr_sink = QVideoSink()
+                self._vr_sink.videoFrameChanged.connect(self._store_vr_frame)
+                self.video_player.setVideoOutput(self._vr_sink)
+                self.preview_stack.setCurrentIndex(self._vr_stack_index)
+                if not hasattr(self, '_vr_render_timer'):
+                    self._vr_render_timer = QTimer(self)
+                    self._vr_render_timer.setInterval(33)
+                    self._vr_render_timer.timeout.connect(self._render_vr_frame)
+                self._vr_render_timer.start()
+            else:
+                if hasattr(self, '_vr_render_timer'):
+                    self._vr_render_timer.stop()
+                self.video_player.setVideoOutput(self.video_widget)
+                self.preview_stack.setCurrentIndex(getattr(self, '_pre_vr_stack_index', 0))
+                self._vr_sink = None
+                self._latest_vr_frame = None
+
+        # Always: thumbnails + live overlay view + face controller
         if hasattr(self, 'edit_scene') and self.edit_scene is not None:
             self.edit_scene.set_vr_mode(enabled)
+        if hasattr(self, 'realtime_preview') and self.realtime_preview is not None:
+            self.realtime_preview._view.set_vr_mode(enabled)
+            if self.realtime_preview._live_face is not None:
+                self.realtime_preview._live_face.set_vr_mode(enabled)
+            if self.realtime_preview._live_overlay is not None:
+                self.realtime_preview._live_overlay.set_vr_mode(enabled)
 
     @Slot(QVideoFrame)
     def _store_vr_frame(self, frame: QVideoFrame):

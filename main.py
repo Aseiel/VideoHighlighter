@@ -3712,6 +3712,7 @@ if __name__ == "__main__":
     # On some Windows systems D3D11VA initialisation fails for H.264, causing
     # noisy warnings even though playback still works via software decoding.
     os.environ.setdefault("QT_FFMPEG_DECODING_HWACCEL", "none")
+    os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.ffmpeg=false")
     app = QApplication(sys.argv)
     gui = VideoHighlighterGUI()
     gui.show()

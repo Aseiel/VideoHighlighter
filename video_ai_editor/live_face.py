@@ -39,11 +39,14 @@ sensitive. This targets PySide6 / Qt6. Verify the conversion on your machine
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QObject, QThread, QTimer, QMutex, Signal, Slot, QRectF
+from PySide6.QtCore import (
+    Qt, QObject, QThread, QTimer, QMutex, QMetaObject, Signal, Slot, QRectF,
+)
 from PySide6.QtGui import QImage, QColor, QPen, QBrush, QFont
 from PySide6.QtWidgets import QGraphicsScene, QGraphicsRectItem, QGraphicsSimpleTextItem
 
@@ -71,55 +74,89 @@ def qimage_to_bgr(qimg: QImage) -> Optional[np.ndarray]:
 
 class LiveFaceWorker(QObject):
     """
-    Lives on a worker QThread. Holds the latest submitted frame; on each tick
-    it runs face recognition on that frame (and drops anything older).
+    Lives on a worker QThread. Holds the latest submitted QVideoFrame; on each
+    tick it converts + downsamples + runs face recognition, dropping stale frames.
     """
 
-    # results: list of dicts, plus the frame size they were computed at
     results_ready = Signal(list, int, int)
 
-    def __init__(self, bank, auto_enroll: bool = True, interval_ms: int = 33, learn_threshold=0.55):
+    # Max dimension (width) passed to InsightFace. Larger frames are downsampled
+    # first — InsightFace resizes to 640×640 internally anyway, so running on a
+    # 4K frame just wastes numpy allocation and BGR copy time.
+    MAX_INFERENCE_W = 960
+
+    def __init__(self, bank, auto_enroll: bool = True, interval_ms: int = 500,
+                 learn_threshold: float = 0.55):
         super().__init__()
         self._bank = bank
         self._auto_enroll = auto_enroll
-        self._interval_ms = interval_ms
-        self._latest: Optional[np.ndarray] = None
+        self._interval_ms = interval_ms  # default 500ms — face recog on CPU is slow
+        self._latest_vframe = None       # raw QVideoFrame, converted on worker thread
         self._mutex = QMutex()
         self._timer: Optional[QTimer] = None
         self._busy = False
         self._learn_threshold = learn_threshold
+        self._vr_mode = False
+        self._stopped = False   # hard stop — checked at top of _tick
 
     @Slot()
     def start_processing(self):
-        """Called once the worker is on its thread (connect to QThread.started)."""
         self._timer = QTimer()
         self._timer.timeout.connect(self._tick)
         self._timer.start(self._interval_ms)
 
     @Slot()
     def stop_processing(self):
+        self._stopped = True
         if self._timer:
             self._timer.stop()
 
-    def submit(self, frame_bgr: np.ndarray):
-        """Thread-safe: stash the latest frame, overwriting any unprocessed one."""
-        self._mutex.lock()
-        self._latest = frame_bgr
-        self._mutex.unlock()
-
     @Slot()
     def _tick(self):
-        if self._busy:
-            return  # still chewing the previous frame; skip
+        if self._stopped or self._busy:
+            return
+        return self._do_tick()
+
+    def submit_vframe(self, vframe) -> None:
+        """Thread-safe: stash a raw QVideoFrame, overwriting any unprocessed one."""
         self._mutex.lock()
-        frame = self._latest
-        self._latest = None
+        self._latest_vframe = vframe
         self._mutex.unlock()
-        if frame is None:
+
+    def _do_tick(self):
+        self._mutex.lock()
+        vframe = self._latest_vframe
+        self._latest_vframe = None
+        self._mutex.unlock()
+        if vframe is None:
             return
 
         self._busy = True
         try:
+            # GPU→CPU conversion happens here on the worker thread (not main thread)
+            img = vframe.toImage()
+            if img.isNull():
+                return
+            frame = qimage_to_bgr(img)
+            if frame is None:
+                return
+
+            # For SBS VR video crop to left half before inference — right half is
+            # a duplicate eye view and doubles the work for no extra information.
+            if self._vr_mode:
+                frame = frame[:, : frame.shape[1] // 2]
+
+            # Downsample to MAX_INFERENCE_W so InsightFace doesn't chew through a
+            # 4K BGR array; it resizes to 640px internally anyway.
+            h, w = frame.shape[:2]
+            if w > self.MAX_INFERENCE_W:
+                import cv2
+                scale = self.MAX_INFERENCE_W / w
+                frame = cv2.resize(frame,
+                                   (self.MAX_INFERENCE_W, int(h * scale)),
+                                   interpolation=cv2.INTER_AREA)
+                h, w = frame.shape[:2]
+
             faces = self._bank.detect_faces(frame)
             results = []
             for f in faces:
@@ -129,16 +166,14 @@ class LiveFaceWorker(QObject):
                     iid = self._bank.assign(f["embedding"], thumbnail=thumb,
                                             det_score=f["det_score"])
                 elif iid is not None and sim >= self._learn_threshold and f["det_score"] >= 0.6:
-                    # confident match on a good face → learn this angle
                     self._bank.reinforce(iid, f["embedding"])
                 results.append({
-                    "bbox": f["bbox"],                      # pixel coords in this frame
+                    "bbox": f["bbox"],
                     "identity_id": iid,
                     "name": self._bank.name_for(iid) if iid else None,
                     "sim": float(sim),
                     "det_score": f["det_score"],
                 })
-            h, w = frame.shape[:2]
             self.results_ready.emit(results, w, h)
         except Exception as e:
             print(f"⚠️ LiveFaceWorker error: {e}")
@@ -158,36 +193,45 @@ class LiveFaceController(QObject):
 
     results_ready = Signal(list, int, int)   # forwarded from the worker
 
+    # Minimum seconds between frame submissions to the worker.
+    # Face recognition on CPU is slow — no point sending 60 frames/s.
+    _SUBMIT_INTERVAL = 0.5   # 2 fps cap for inference
+
     def __init__(self, bank, video_sink, auto_enroll: bool = True, parent=None):
         super().__init__(parent)
         self._enabled = False
+        self._last_submit = 0.0
 
         self._worker = LiveFaceWorker(bank, auto_enroll=auto_enroll)
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.start_processing)
-        self._worker.results_ready.connect(self._on_results)   # queued -> UI thread
+        self._worker.results_ready.connect(self._on_results)
         self._thread.start()
 
-        # Tap frames
         self._video_sink = video_sink
         self._video_sink.videoFrameChanged.connect(self._on_frame)
 
     def set_enabled(self, enabled: bool):
-        """Turn the live face pass on/off (e.g. when the mode dropdown changes)."""
         self._enabled = enabled
+
+    def set_vr_mode(self, enabled: bool):
+        """Crop frames to left half before inference (side-by-side VR videos)."""
+        self._worker._vr_mode = enabled
 
     @Slot(object)
     def _on_frame(self, video_frame):
+        """Called at source framerate (up to 60fps). We only forward once per
+        _SUBMIT_INTERVAL and do NOT convert to BGR here — that happens on the
+        worker thread so the main thread is never blocked by GPU→CPU transfers."""
         if not self._enabled:
             return
-        try:
-            img = video_frame.toImage()
-        except Exception:
+        now = time.monotonic()
+        if now - self._last_submit < self._SUBMIT_INTERVAL:
             return
-        bgr = qimage_to_bgr(img)
-        if bgr is not None:
-            self._worker.submit(bgr)
+        self._last_submit = now
+        # Store raw QVideoFrame; conversion to BGR happens on the worker thread
+        self._worker.submit_vframe(video_frame)
 
     @Slot(list, int, int)
     def _on_results(self, results, w, h):
@@ -195,13 +239,23 @@ class LiveFaceController(QObject):
 
     def shutdown(self):
         """Stop the worker thread cleanly (call from closeEvent)."""
+        self._enabled = False
         try:
             self._video_sink.videoFrameChanged.disconnect(self._on_frame)
         except Exception:
             pass
-        QTimer.singleShot(0, self._worker.stop_processing)
+        # Set the hard-stop flag directly (plain bool write is safe enough across
+        # threads here) so a tick that hasn't started yet returns immediately and
+        # no new InsightFace inference begins.
+        self._worker._stopped = True
+        # Stop the worker's QTimer ON the worker thread — stopping it from here
+        # (the GUI thread) throws "Timers cannot be stopped from another thread"
+        # and leaves the thread unable to quit, which is what caused the hang.
+        QMetaObject.invokeMethod(
+            self._worker, "stop_processing", Qt.ConnectionType.QueuedConnection
+        )
         self._thread.quit()
-        self._thread.wait(1000)
+        self._thread.wait(2000)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -235,6 +289,16 @@ class LiveFaceOverlay:
         self._z = z
         self._rects: list[QGraphicsRectItem] = []
         self._labels: list[QGraphicsSimpleTextItem] = []
+        self._vr_mode = False
+
+    def set_vr_mode(self, enabled: bool):
+        """Map boxes into the left half of the scene (SBS VR videos).
+
+        In VR mode the worker runs detection on the left-half frame, so box
+        coords span only the left eye. The scene, however, is full SBS width —
+        scale x against half the scene so boxes land on the visible left half.
+        """
+        self._vr_mode = enabled
 
     def _ensure_pool(self, n: int):
         while len(self._rects) < n:
@@ -261,7 +325,10 @@ class LiveFaceOverlay:
     def update_boxes(self, results, frame_w, frame_h):
         """Redraw the overlay from the latest worker results."""
         scene_rect = self._scene.sceneRect()
-        sx = scene_rect.width() / frame_w if frame_w else 1.0
+        # In VR mode boxes come from the left-half frame, so map them into the
+        # left half of the (full-width SBS) scene.
+        target_w = scene_rect.width() / 2 if self._vr_mode else scene_rect.width()
+        sx = target_w / frame_w if frame_w else 1.0
         sy = scene_rect.height() / frame_h if frame_h else 1.0
 
         self._ensure_pool(len(results))

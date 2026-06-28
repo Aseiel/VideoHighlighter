@@ -98,7 +98,7 @@ def _palette_color(i: int) -> QColor:
 
 
 def action_abbrev(name: str) -> str:
-    """Short code from an action name: initials of its words, e.g.
+    """Short code from a class name: initials of its words, e.g.
     'jump' -> 'J', 'high five' -> 'HF', 'sit down' -> 'SD'."""
     words = [w for w in str(name).replace('_', ' ').split() if w]
     if not words:
@@ -503,18 +503,36 @@ class OverlayScene(QGraphicsScene):
 
         self.video_item.nativeSizeChanged.connect(self._on_native_size_changed)
 
+    # Max scene resolution for the overlay compositor.
+    # The video item is scaled DOWN to this before Qt renders bboxes on top.
+    # Bboxes use normalised [0,1] coords so they map correctly regardless of scale.
+    _MAX_SCENE_W = 1280
+    _MAX_SCENE_H = 720
+
     def _on_native_size_changed(self, size):
         """Update scene rect when video dimensions are known."""
-        if size.width() > 0 and size.height() > 0:
-            self._video_w = size.width()
-            self._video_h = size.height()
-            self.video_item.setSize(size)
-            self.setSceneRect(0, 0, size.width(), size.height())
+        if size.width() <= 0 or size.height() <= 0:
+            return
 
-            # Recompute all bbox geometries
-            for item in self._all_bbox_items:
-                item.update_geometry(self._video_w, self._video_h)
-            self._resolve_label_overlaps()
+        # Keep track of native resolution (used for bbox coord conversion)
+        self._video_w = size.width()
+        self._video_h = size.height()
+
+        # Scale DOWN to _MAX_SCENE dimensions so Qt doesn't composite at 4K.
+        # Bboxes use normalised coords so they scale with the scene automatically.
+        scale = min(1.0,
+                    self._MAX_SCENE_W / size.width(),
+                    self._MAX_SCENE_H / size.height())
+        scene_w = size.width()  * scale
+        scene_h = size.height() * scale
+
+        self.video_item.setSize(QSizeF(scene_w, scene_h))
+        self.setSceneRect(0, 0, scene_w, scene_h)
+
+        # Recompute bbox geometries against the (possibly downscaled) scene size
+        for item in self._all_bbox_items:
+            item.update_geometry(scene_w, scene_h)
+        self._resolve_label_overlaps()
 
     def load_detections_lazy(self, bbox_loader: LazyBBoxLoader):
         """
@@ -602,7 +620,8 @@ class OverlayScene(QGraphicsScene):
                         timestamp=ts,
                         color=self._class_colors.get(bbox['class_name']),
                     )
-                    item.update_geometry(self._video_w, self._video_h)
+                    scene_r = self.sceneRect()
+                    item.update_geometry(scene_r.width(), scene_r.height())
                     self.addItem(item)
                     self._all_bbox_items.append(item)
                     new_items.append(item)
@@ -720,6 +739,12 @@ class OverlayView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setStyleSheet("QGraphicsView { background-color: black; border: none; }")
         self.setMinimumSize(320, 240)
+        self._vr_mode = False
+
+    def set_vr_mode(self, enabled: bool):
+        """Show only the left half of the scene (SBS VR videos)."""
+        self._vr_mode = enabled
+        self._fit_video()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -727,14 +752,18 @@ class OverlayView(QGraphicsView):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # Refit when widget becomes visible (e.g. QStackedWidget page switch)
         QTimer.singleShot(50, self._fit_video)
 
     def _fit_video(self):
         """Fit scene into view maintaining aspect ratio."""
         scene = self.scene()
-        if scene and scene.sceneRect().width() > 0:
-            self.fitInView(scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        if not scene or scene.sceneRect().width() <= 0:
+            return
+        rect = scene.sceneRect()
+        if self._vr_mode:
+            # Show left half only — right eye view is identical for SBS content
+            rect = QRectF(0, 0, rect.width() / 2, rect.height())
+        self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
         
     def contextMenuEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
@@ -1027,6 +1056,10 @@ class RealtimeOverlayPreview(QWidget):
                 video_sink=self._scene.video_item.videoSink(),   # the frame tap
             )
             self._live_face.results_ready.connect(self._live_overlay.update_boxes)
+            # Inherit current VR state (user may have enabled VR before live face)
+            vr = getattr(self._view, "_vr_mode", False)
+            self._live_face.set_vr_mode(vr)
+            self._live_overlay.set_vr_mode(vr)
 
         if self._live_face is not None:
             self._live_face.set_enabled(enabled)
