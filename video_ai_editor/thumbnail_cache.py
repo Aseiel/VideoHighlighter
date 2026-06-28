@@ -50,10 +50,12 @@ class ThumbnailCache(QObject):
         video_path: str,
         cache_dir: str = "./cache/thumbnails",
         mem_limit: int = 300,
+        vr_mode: bool = False,
     ):
         super().__init__()
         self.video_path = str(video_path)
         self.mem_limit = mem_limit
+        self._vr_mode = vr_mode
 
         # Hash includes mtime + size so editing the source file invalidates cache
         self.video_hash = self._compute_video_hash()
@@ -108,6 +110,21 @@ class ThumbnailCache(QObject):
                 self._in_flight.add(key)
                 self._queue.put(key)
         return None
+
+    def set_vr_mode(self, enabled: bool):
+        """Enable/disable VR half-frame crop. Clears memory cache so new frames are extracted."""
+        if self._vr_mode == enabled:
+            return
+        self._vr_mode = enabled
+        with self._lock:
+            self._mem.clear()
+            self._in_flight.clear()
+        # Wipe disk cache so old full-frame (or half-frame) thumbnails are not reused
+        for f in self.disk_dir.glob("*.jpg"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
     def stop(self):
         """Stop the worker thread. Call on app shutdown."""
@@ -188,6 +205,10 @@ class ThumbnailCache(QObject):
             return
 
         h, w = frame.shape[:2]
+        if self._vr_mode:
+            frame = frame[:, : w // 2]
+            w = w // 2
+
         if h != height:
             new_w = max(1, int(round(w * height / h)))
             frame = cv2.resize(frame, (new_w, height), interpolation=cv2.INTER_AREA)

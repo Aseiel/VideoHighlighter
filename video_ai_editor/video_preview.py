@@ -16,9 +16,9 @@ from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QSplitter
 )
 from PySide6.QtCore import Qt, QUrl, Signal, Slot, QTimer, QRect, QEvent
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPixmap
+from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPixmap, QImage
 
 class AnalysisOverlayWidget(QWidget):
     """Floating transparent overlay that draws labels on top of video.
@@ -199,10 +199,11 @@ class VideoPreviewWindow(QMainWindow):
         self.annotated_video_path = annotated_video_path
         self.cache_data = cache_data
         self.current_source = 'original'
-        
+        self._vr_mode = False
+
         self.setWindowTitle(f"Video Preview - {os.path.basename(video_path)}")
         self.setGeometry(200, 200, 800, 600)
-        
+
         self.init_ui()
         self.init_video_player()
         
@@ -215,6 +216,14 @@ class VideoPreviewWindow(QMainWindow):
         self.video_widget = QVideoWidget()
         self.video_widget.setMinimumSize(640, 360)
         layout.addWidget(self.video_widget, 1)
+
+        # VR half-frame display (hidden by default)
+        self._vr_label = QLabel()
+        self._vr_label.setAlignment(Qt.AlignCenter)
+        self._vr_label.setMinimumSize(640, 360)
+        self._vr_label.setStyleSheet("background: black;")
+        self._vr_label.hide()
+        layout.addWidget(self._vr_label, 1)
         
         # ── ADD: Floating overlay for analysis labels ──
         self.analysis_overlay = AnalysisOverlayWidget(self.video_widget)
@@ -268,12 +277,18 @@ class VideoPreviewWindow(QMainWindow):
         self.overlay_checkbox = QCheckBox("Show AI Labels Overlay")
         self.overlay_checkbox.setEnabled(True)  # Always enabled — reads from cache
         self.overlay_checkbox.stateChanged.connect(self.toggle_overlay)
-        
+
+        # VR half-frame toggle
+        self.vr_checkbox = QCheckBox("VR Half-Frame")
+        self.vr_checkbox.setToolTip("Show only the left half of the frame (side-by-side 3D/VR videos)")
+        self.vr_checkbox.stateChanged.connect(self._toggle_vr_mode)
+
         # Sync with timeline checkbox
         self.sync_checkbox = QCheckBox("Sync with Timeline")
         self.sync_checkbox.setChecked(True)
-        
+
         feature_layout.addWidget(self.overlay_checkbox)
+        feature_layout.addWidget(self.vr_checkbox)
         feature_layout.addStretch()
         feature_layout.addWidget(self.sync_checkbox)
         
@@ -386,6 +401,50 @@ class VideoPreviewWindow(QMainWindow):
         }
         self.player.setPlaybackRate(speed_map.get(speed_text, 1.0))
         
+    @Slot(int)
+    def _toggle_vr_mode(self, state):
+        self._vr_mode = (state == Qt.Checked)
+        if self._vr_mode:
+            self._latest_vr_frame = None
+            self._vr_sink = QVideoSink()
+            self._vr_sink.videoFrameChanged.connect(self._store_vr_frame)
+            self.player.setVideoOutput(self._vr_sink)
+            self.video_widget.hide()
+            self._vr_label.show()
+            if not hasattr(self, '_vr_render_timer'):
+                self._vr_render_timer = QTimer(self)
+                self._vr_render_timer.setInterval(33)  # ~30 fps cap
+                self._vr_render_timer.timeout.connect(self._render_vr_frame)
+            self._vr_render_timer.start()
+        else:
+            if hasattr(self, '_vr_render_timer'):
+                self._vr_render_timer.stop()
+            self.player.setVideoOutput(self.video_widget)
+            self._vr_label.hide()
+            self.video_widget.show()
+            self._vr_sink = None
+            self._latest_vr_frame = None
+
+    @Slot(QVideoFrame)
+    def _store_vr_frame(self, frame: QVideoFrame):
+        self._latest_vr_frame = frame
+
+    def _render_vr_frame(self):
+        frame = getattr(self, '_latest_vr_frame', None)
+        if frame is None or not frame.isValid():
+            return
+        self._latest_vr_frame = None
+        img = frame.toImage()
+        if img.isNull():
+            return
+        label_h = self._vr_label.height()
+        half_w = img.width() // 2
+        scale = label_h / img.height() if img.height() > 0 else 1.0
+        target_w = int(half_w * scale)
+        cropped = img.copy(0, 0, half_w, img.height())
+        scaled = cropped.scaled(target_w, label_h, Qt.KeepAspectRatio, Qt.FastTransformation)
+        self._vr_label.setPixmap(QPixmap.fromImage(scaled))
+
     @Slot(int)
     def toggle_overlay(self, state):
         """Toggle analysis labels overlay"""

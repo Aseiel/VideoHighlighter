@@ -3708,6 +3708,10 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     reset_duration_method_cache()
+    # Disable D3D11VA hardware acceleration in Qt multimedia's FFmpeg backend.
+    # On some Windows systems D3D11VA initialisation fails for H.264, causing
+    # noisy warnings even though playback still works via software decoding.
+    os.environ.setdefault("QT_FFMPEG_DECODING_HWACCEL", "none")
     app = QApplication(sys.argv)
     gui = VideoHighlighterGUI()
     gui.show()

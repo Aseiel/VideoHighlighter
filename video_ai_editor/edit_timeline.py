@@ -548,6 +548,12 @@ class EditTimelineScene(QGraphicsScene):
         self.setSceneRect(0, 0, 1000, self.clip_height + 40)
         self.build_timeline()
 
+    def set_vr_mode(self, enabled: bool):
+        """Crop thumbnails to left half for side-by-side VR videos."""
+        if self.thumb_cache is not None:
+            self.thumb_cache.set_vr_mode(enabled)
+        self.update()
+
     # ── cache → repaint relevant clips ──────────────────────────
     def _on_thumb_ready(self, time_seconds, height, pixmap):
         """When a new thumbnail arrives, repaint every clip whose range covers it."""

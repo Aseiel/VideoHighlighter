@@ -22,14 +22,15 @@ from PySide6.QtWidgets import (
     QComboBox, QListWidget, QListWidgetItem, QDialog,
     QDialogButtonBox, QFormLayout, QTabWidget
 )
-from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData
+from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData, QLoggingCategory
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QPainter, QFont, QPainterPath, 
     QLinearGradient, QRadialGradient, QCursor, QAction,
     QPainterPath, QFontMetrics, QDrag, QPixmap
 )
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PySide6.QtMultimediaWidgets import QVideoWidget
+QLoggingCategory.setFilterRules("qt.multimedia.ffmpeg=false")
 import subprocess
 import os
 import xml.etree.ElementTree as ET
@@ -447,6 +448,14 @@ class SignalTimelineWindow(QMainWindow):
         self.video_widget.setStyleSheet("background-color: black; border: 2px solid #3a3a5a;")
         self.preview_stack.addWidget(self.video_widget)  # index 0
 
+        # VR half-frame label (QVideoSink → cropped QLabel); added after realtime widget
+        from PySide6.QtWidgets import QLabel as _QLabel
+        self._vr_label = _QLabel()
+        self._vr_label.setMinimumSize(320, 240)
+        self._vr_label.setAlignment(Qt.AlignCenter)
+        self._vr_label.setStyleSheet("background-color: black; border: 2px solid #3a3a5a;")
+        self._vr_sink = None  # created on demand
+
         # Page 1: Live real-time overlay
         self.realtime_preview = None
         try:
@@ -463,6 +472,7 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ realtime_overlay init failed: {e}")
             import traceback; traceback.print_exc()
 
+        self._vr_stack_index = self.preview_stack.addWidget(self._vr_label)
         self.preview_stack.setCurrentIndex(0)
         video_and_info.addWidget(self.preview_stack)
 
@@ -544,6 +554,14 @@ class SignalTimelineWindow(QMainWindow):
         self.show_detections_checkbox.setChecked(True)
         self.show_detections_checkbox.stateChanged.connect(self._toggle_detection_panel)
         controls_layout.addWidget(self.show_detections_checkbox)
+
+        # VR half-frame checkbox
+        self.vr_mode_checkbox = QCheckBox("VR Half-Frame")
+        self.vr_mode_checkbox.setToolTip(
+            "Show only the left half of the frame (side-by-side 3D / 180° VR videos)"
+        )
+        self.vr_mode_checkbox.stateChanged.connect(self._toggle_vr_mode)
+        controls_layout.addWidget(self.vr_mode_checkbox)
 
         controls_layout.addStretch()
 
@@ -806,6 +824,60 @@ class SignalTimelineWindow(QMainWindow):
             # Save current sizes before hiding
             self._det_panel_saved_sizes = splitter.sizes()
             self.detection_panel.setVisible(False)
+
+    @Slot(int)
+    def _toggle_vr_mode(self, state):
+        enabled = bool(state)
+        if enabled:
+            self._pre_vr_stack_index = self.preview_stack.currentIndex()
+            self._latest_vr_frame = None
+            self._vr_sink = QVideoSink()
+            # Store frames without processing — the render timer does the heavy work
+            self._vr_sink.videoFrameChanged.connect(self._store_vr_frame)
+            self.video_player.setVideoOutput(self._vr_sink)
+            self.preview_stack.setCurrentIndex(self._vr_stack_index)
+            if not hasattr(self, '_vr_render_timer'):
+                self._vr_render_timer = QTimer(self)
+                self._vr_render_timer.setInterval(33)  # ~30 fps cap
+                self._vr_render_timer.timeout.connect(self._render_vr_frame)
+            self._vr_render_timer.start()
+        else:
+            if hasattr(self, '_vr_render_timer'):
+                self._vr_render_timer.stop()
+            self.video_player.setVideoOutput(self.video_widget)
+            self.preview_stack.setCurrentIndex(getattr(self, '_pre_vr_stack_index', 0))
+            self._vr_sink = None
+            self._latest_vr_frame = None
+
+        # Also update edit-timeline thumbnails
+        if hasattr(self, 'edit_scene') and self.edit_scene is not None:
+            self.edit_scene.set_vr_mode(enabled)
+
+    @Slot(QVideoFrame)
+    def _store_vr_frame(self, frame: QVideoFrame):
+        # Just hold a reference — no heavy work here, called at source framerate
+        self._latest_vr_frame = frame
+
+    def _render_vr_frame(self):
+        frame = getattr(self, '_latest_vr_frame', None)
+        if frame is None or not frame.isValid():
+            return
+        self._latest_vr_frame = None  # consume so we don't re-render the same frame
+        from PySide6.QtGui import QImage, QPixmap
+        img = frame.toImage()
+        if img.isNull():
+            return
+        # Crop to left half, then scale down to label size in one step
+        label_w = self._vr_label.width()
+        label_h = self._vr_label.height()
+        half_w = img.width() // 2
+        # Scale factor to fit label height while keeping aspect
+        scale = label_h / img.height() if img.height() > 0 else 1.0
+        target_w = int(half_w * scale)
+        # Crop first (cheap slice), then scale to display size
+        cropped = img.copy(0, 0, half_w, img.height())
+        scaled = cropped.scaled(target_w, label_h, Qt.KeepAspectRatio, Qt.FastTransformation)
+        self._vr_label.setPixmap(QPixmap.fromImage(scaled))
 
     def _update_detection_panel(self, time_seconds):
         """Update detection info panel with actions/objects at current time"""
@@ -3035,7 +3107,7 @@ class SignalTimelineWindow(QMainWindow):
                 n = len(clips)
                 filter_str = "".join(filter_parts) + f"concat=n={n}:v=1:a=1[outv][outa]"
 
-                cmd = ["ffmpeg", "-y"] + inputs + [
+                cmd = ["ffmpeg", "-y", "-hwaccel", "none"] + inputs + [
                     "-filter_complex", filter_str,
                     "-map", "[outv]", "-map", "[outa]",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "18",
