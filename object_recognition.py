@@ -238,7 +238,8 @@ def run_object_detection_single(video_path, model, highlight_objects, log_fn=pri
                                 progress_fn=None, frame_skip=5, cancel_flag=None,
                                 csv_output="object_log.csv", draw_boxes=False,
                                 annotated_output=None, device="cpu",
-                                confidence_threshold=DEFAULT_CONFIDENCE_THRESHOLD):
+                                confidence_threshold=DEFAULT_CONFIDENCE_THRESHOLD,
+                                preview_fn=None):
     """
     Single-threaded object detection with progress tracking and cancellation support.
     Used by the pipeline for integrated processing with a pre-loaded model.
@@ -296,6 +297,7 @@ def run_object_detection_single(video_path, model, highlight_objects, log_fn=pri
     frame_idx = 0
     current_second = -1
     objects_found = 0
+    _last_preview_t = 0.0  # wall-clock throttle for the live preview
 
     try:
         while True:
@@ -346,6 +348,34 @@ def run_object_detection_single(video_path, model, highlight_objects, log_fn=pri
                             video_writer.write(annotated_frame)
                         elif video_writer and draw_boxes:
                             video_writer.write(frame)
+
+                        # ── Live detection preview ──
+                        # Send a downscaled frame + normalised boxes to the GUI.
+                        # Throttled to ~8 fps wall-clock so it never slows
+                        # detection (which is the real bottleneck anyway).
+                        if preview_fn is not None:
+                            now = time.time()
+                            if now - _last_preview_t >= 0.12:
+                                _last_preview_t = now
+                                try:
+                                    fh, fw = frame.shape[:2]
+                                    target_w = 480
+                                    scale = target_w / fw if fw > target_w else 1.0
+                                    small = cv2.resize(
+                                        frame, (int(fw * scale), int(fh * scale)),
+                                        interpolation=cv2.INTER_AREA
+                                    ) if scale != 1.0 else frame.copy()
+                                    boxes = []
+                                    for i, name in enumerate(objs or []):
+                                        if i < len(bbox_data):
+                                            x1, y1, x2, y2, conf = bbox_data[i]
+                                            boxes.append((name,
+                                                          x1 / fw, y1 / fh,
+                                                          (x2 - x1) / fw, (y2 - y1) / fh,
+                                                          float(conf)))
+                                    preview_fn(small, boxes, sec)
+                                except Exception:
+                                    pass
 
                     except Exception as e:
                         log_fn(f"⚠️ Error in object detection at frame {frame_idx}: {e}")

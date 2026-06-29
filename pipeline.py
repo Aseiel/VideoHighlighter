@@ -315,8 +315,9 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
 
     return analysis_data
 
-def run_highlighter(video_path, sample_rate=5, gui_config: dict = None, 
-                    log_fn=print, progress_fn=None, cancel_flag=None):
+def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
+                    log_fn=print, progress_fn=None, cancel_flag=None,
+                    preview_fn=None):
     """
     Process single video or multiple videos for highlight generation.
     
@@ -366,7 +367,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     gui_config=video_gui_config,
                     log_fn=log_fn,
                     progress_fn=progress_fn,
-                    cancel_flag=cancel_flag
+                    cancel_flag=cancel_flag,
+                    preview_fn=preview_fn,
                 )
                 results.append((single_video_path, result))
                 
@@ -1060,6 +1062,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                                 log_fn=log_fn, progress_fn=progress_fn,
                                 frame_skip=frame_skip_for_obj, cancel_flag=cancel_flag,
                                 device=yolo_device, confidence_threshold=c_conf,
+                                preview_fn=preview_fn,
                             )
                         else:
                             # Custom keypoint/pose model -> keypoint path
@@ -1105,6 +1108,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         annotated_output=object_annotated_path,
                         device=yolo_device,
                         confidence_threshold=float(gui_config.get("object_confidence", 0.3)),
+                        preview_fn=preview_fn,
                     )
                     for sec, names in std_det.items():
                         object_detections.setdefault(sec, [])
@@ -1250,6 +1254,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
                 log(f"🎯 Action backend: {action_backend} | R3D model: {r3d_model} | enable_r3d: {enable_r3d}")
 
+                action_models_selection = gui_config.get("action_models", "mixed") or "mixed"
                 all_action_detections, action_bboxes_cache = run_action_detection(
                     video_path=processed_video_path,
                     sample_rate=sample_rate,
@@ -1265,6 +1270,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     enable_r3d=enable_r3d,
                     r3d_model_name=r3d_model,
                     r3d_half=r3d_half,
+                    action_models=action_models_selection,
+                    preview_fn=preview_fn,
                 )
 
                 check_cancellation(cancel_flag, log, "action recognition processing")

@@ -1122,7 +1122,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                          warm_up_seconds=2, include_model_type=False,
                          openvino_threads=None, preprocess_workers=2,
                          enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True,
-                         action_models='mixed'):  # ← NEW PARAMETER
+                         action_models='mixed', preview_fn=None):
     """
     Run action recognition — OPTIMIZED version with R3D/CUDA support.
 
@@ -1198,6 +1198,17 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     encoder_engine = AsyncBatchedInferenceEngine(
         compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
+
+    # ---- Warn if any mapped action refers to a model that didn't load ----
+    if action_to_model:
+        missing_models = set()
+        for key, (action_id, model_type) in action_to_model.items():
+            if models_info.get(model_type) is None:
+                missing_models.add(model_type)
+        if missing_models:
+            print(f"⚠️ WARNING: Some actions are mapped to models that are NOT loaded: "
+                  f"{missing_models}. Those actions will produce 0 detections.")
+            print(f"   → Check that the corresponding model files exist and action_models='{action_models}' is correct.")
 
     # ---- Single, clear compute-backend label for the progress bar ----
     # PyTorch/CUDA wins the label when active (it does the heavy inference);
@@ -1391,6 +1402,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
             writer.writerow(["timestamp_mmss", "frame_id", "action_id", "action_name",
                              "score", "timestamp_seconds", "model_type"])
 
+            _last_preview_t = 0.0  # wall-clock throttle for live preview
             while True:
                 if cancel_flag and cancel_flag.is_set():
                     print("⚠️ Action detection canceled by user.")
@@ -1459,6 +1471,28 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                                interpolation=cv2.INTER_LINEAR)
                     video_writer.write(annotated)
                     draw_time += time.time() - draw_start
+
+                # ── Live detection preview (boxes already burned into the frame) ──
+                if preview_fn is not None:
+                    now = time.time()
+                    if now - _last_preview_t >= 0.12:
+                        _last_preview_t = now
+                        try:
+                            # Reuse the annotated frame if we just built one,
+                            # otherwise draw one just for the preview.
+                            base = annotated if (video_writer and draw_bboxes) else \
+                                draw_detections_with_actions(
+                                    frame, current_tracked_people, current_action_roi,
+                                    list(recent_detections) if len(sequence_buffer) >= SEQUENCE_LENGTH else [],
+                                    current_focus_region)
+                            fh, fw = base.shape[:2]
+                            target_w = 480
+                            sc = target_w / fw if fw > target_w else 1.0
+                            small = cv2.resize(base, (int(fw * sc), int(fh * sc)),
+                                               interpolation=cv2.INTER_AREA) if sc != 1.0 else base.copy()
+                            preview_fn(small, [], int(frame_id / fps))
+                        except Exception:
+                            pass
 
                 # ---- Action recognition (sampled frames) ----
                 if frame_id % sample_rate == 0:

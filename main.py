@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QComboBox, QTabWidget, QListWidget, QSplitter,
     QDialog, QDialogButtonBox, QAbstractItemView,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
-    QGridLayout,
+    QGridLayout, QSlider,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
@@ -333,11 +333,164 @@ class DownloadWorker(QThread):
         """Compatibility alias – matches threading.Event.is_set()"""
         return self._cancelled
     
+class DetectionPreviewWindow(QWidget):
+    """Standalone window showing live detection frames during processing.
+
+    Supports pause (freezes the pipeline) and rewind (scrub back through a ring
+    buffer of recently shown frames).
+    """
+
+    closed = Signal()
+
+    BUFFER_SIZE = 250  # rewind history (~30s at 8 fps); ~125MB of pixmaps
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from collections import deque
+        self.setWindowTitle("🔍 Live Detection Preview")
+        self.setMinimumSize(560, 400)
+        self.resize(720, 540)
+
+        self._frames = deque(maxlen=self.BUFFER_SIZE)  # (pixmap, caption)
+        self._paused = False
+        self._view_index = -1  # -1 = follow live (latest)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        self.image_label = QLabel("Waiting for the detection stage (objects / actions)…")
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setStyleSheet(
+            "QLabel { background:#101018; color:#8890b0; border:1px solid #333; }"
+        )
+        layout.addWidget(self.image_label, 1)
+
+        self.caption = QLabel("")
+        self.caption.setStyleSheet("color:#9aa; font-size:10pt;")
+        self.caption.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.caption)
+
+        # ── Controls: pause/resume, step, scrub slider ──
+        controls = QHBoxLayout()
+        self.pause_btn = QPushButton("⏸ Freeze")
+        self.pause_btn.setFixedWidth(90)
+        self.pause_btn.setToolTip("Freeze the preview to inspect a frame.\n"
+                                  "Processing keeps running in the background.")
+        self.pause_btn.clicked.connect(self._toggle_pause)
+        controls.addWidget(self.pause_btn)
+
+        self.prev_btn = QPushButton("◀")
+        self.prev_btn.setFixedWidth(36)
+        self.prev_btn.clicked.connect(lambda: self._step(-1))
+        controls.addWidget(self.prev_btn)
+
+        self.scrub = QSlider(Qt.Horizontal)
+        self.scrub.setMinimum(0)
+        self.scrub.setMaximum(0)
+        self.scrub.sliderPressed.connect(self._on_scrub_pressed)
+        self.scrub.valueChanged.connect(self._on_scrub_moved)
+        controls.addWidget(self.scrub, 1)
+
+        self.next_btn = QPushButton("▶")
+        self.next_btn.setFixedWidth(36)
+        self.next_btn.clicked.connect(lambda: self._step(1))
+        controls.addWidget(self.next_btn)
+
+        self.live_btn = QPushButton("⏭ Live")
+        self.live_btn.setFixedWidth(70)
+        self.live_btn.setToolTip("Jump back to the live frame and resume following")
+        self.live_btn.clicked.connect(self._go_live)
+        controls.addWidget(self.live_btn)
+
+        layout.addLayout(controls)
+        self._update_controls_enabled()
+
+    # ── public: called from the GUI when a new frame arrives ──
+    def set_frame(self, pixmap, caption=""):
+        # Background processing keeps feeding frames even while frozen.
+        was_full = len(self._frames) == self._frames.maxlen
+        self._frames.append((pixmap, caption))
+        # If frozen and the buffer just dropped its oldest frame, shift the view
+        # index down by one so we keep looking at the SAME content.
+        if self._paused and was_full and self._view_index > 0:
+            self._view_index -= 1
+
+        self.scrub.blockSignals(True)
+        self.scrub.setMaximum(len(self._frames) - 1)
+        self.scrub.setValue(self._view_index if self._paused else len(self._frames) - 1)
+        self.scrub.blockSignals(False)
+
+        if not self._paused:
+            self._view_index = len(self._frames) - 1
+            self._render_current()
+        self._update_controls_enabled()
+
+    # ── internals ──
+    def _render_current(self):
+        if not self._frames:
+            return
+        idx = self._view_index if self._view_index >= 0 else len(self._frames) - 1
+        idx = max(0, min(idx, len(self._frames) - 1))
+        pix, cap = self._frames[idx]
+        self.image_label.setPixmap(
+            pix.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+        live_tag = "  • LIVE" if (not self._paused and idx == len(self._frames) - 1) else \
+                   f"  • frozen {idx + 1}/{len(self._frames)}"
+        self.caption.setText((cap or "") + live_tag)
+
+    def _toggle_pause(self):
+        self._paused = not self._paused
+        self.pause_btn.setText("▶ Resume" if self._paused else "⏸ Freeze")
+        if not self._paused:
+            # Un-freeze → follow live again
+            self._view_index = len(self._frames) - 1
+            self._render_current()
+        self._update_controls_enabled()
+
+    def _on_scrub_pressed(self):
+        # Touching the slider implies you want to review → auto-pause
+        if not self._paused:
+            self._toggle_pause()
+
+    def _on_scrub_moved(self, value):
+        if self._paused:
+            self._view_index = value
+            self._render_current()
+
+    def _step(self, delta):
+        if not self._paused:
+            self._toggle_pause()
+        self._view_index = max(0, min(self._view_index + delta, len(self._frames) - 1))
+        self.scrub.blockSignals(True)
+        self.scrub.setValue(self._view_index)
+        self.scrub.blockSignals(False)
+        self._render_current()
+
+    def _go_live(self):
+        if self._paused:
+            self._toggle_pause()  # resume → follows live
+        else:
+            self._view_index = len(self._frames) - 1
+            self._render_current()
+
+    def _update_controls_enabled(self):
+        has = len(self._frames) > 0
+        self.prev_btn.setEnabled(has)
+        self.next_btn.setEnabled(has)
+        self.scrub.setEnabled(has)
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
+
+
 class Worker(QThread):
     finished = Signal(object)
     progress = Signal(int, int, str, str)
     log = Signal(str)
     cancelled = Signal()
+    preview = Signal(object, object, int)   # frame_bgr (ndarray), boxes (list), sec
 
     def __init__(self, video_path, gui_config=None):
         super().__init__()
@@ -347,6 +500,7 @@ class Worker(QThread):
         self._pause_event = threading.Event()
         self._pause_event.set()  # starts unpaused
         self._is_running = False
+        self.preview_enabled = False
 
     def pause(self):
         self._pause_event.clear()
@@ -373,12 +527,20 @@ class Worker(QThread):
             else:
                 self.log.emit("🚀 Starting video highlighter pipeline...")
 
+            # Gate the preview emit on the live flag, checked per call so the
+            # checkbox works mid-run. (The detector only builds/resizes a frame
+            # ~8x/sec, negligible next to inference.)
+            def preview_gate(frame, boxes, sec):
+                if self.preview_enabled and not self._cancel_flag.is_set():
+                    self.preview.emit(frame, boxes, sec)
+
             output = run_highlighter(
                 self.video_path,
                 gui_config=self.gui_config,
                 log_fn=self.log.emit,
                 progress_fn=pausing_progress,
-                cancel_flag=self._cancel_flag
+                cancel_flag=self._cancel_flag,
+                preview_fn=preview_gate,
             )
 
             if self._cancel_flag.is_set():
@@ -775,6 +937,27 @@ class VideoHighlighterGUI(QWidget):
         self.progress_group.setLayout(progress_layout)
         self.progress_group.setMaximumHeight(0)  # collapsed by default; avoids layout jump on show
         layout.addWidget(self.progress_group)
+
+        # --- Live detection preview (opens a separate window) ---
+        self.live_preview_checkbox = QCheckBox("Live detection preview (separate window)")
+        self.live_preview_checkbox.setToolTip(
+            "Open a window showing frames + detected object boxes live while the\n"
+            "pipeline runs. Throttled and downscaled — does not slow processing."
+        )
+        self.live_preview_checkbox.toggled.connect(self._on_live_preview_toggled)
+        layout.addWidget(self.live_preview_checkbox)
+        self.preview_window = None  # DetectionPreviewWindow, created on demand
+
+        # Force reprocess — the live preview only shows frames while detection
+        # actually runs. If results are cached, detection is skipped and the
+        # preview stays blank. Tick this to ignore the cache and re-run.
+        self.force_reprocess_checkbox = QCheckBox("Force reprocess (ignore cache)")
+        self.force_reprocess_checkbox.setToolTip(
+            "Re-run analysis even if cached results exist.\n"
+            "Required for the live detection preview to show anything on an\n"
+            "already-processed video."
+        )
+        layout.addWidget(self.force_reprocess_checkbox)
 
         # --- Tabs ---
         tabs = QTabWidget()
@@ -2146,6 +2329,7 @@ class VideoHighlighterGUI(QWidget):
             "r3d_model": self.r3d_model_combo.currentData(),
             "action_models": self.action_models_combo.currentData(),
             "object_confidence": self.obj_confidence_spin.value() / 100.0,
+            "force_reprocess": self.force_reprocess_checkbox.isChecked(),
         }
       
         # Add time range if enabled
@@ -3172,6 +3356,88 @@ class VideoHighlighterGUI(QWidget):
         self.append_log(f"✅ Preset '{preset_type}': {self.format_time(start_time)} to {self.format_time(end_time)}")
 
 
+    def _position_preview_window(self):
+        """Place the preview window just to the right of the main GUI."""
+        if self.preview_window is None:
+            return
+        try:
+            g = self.frameGeometry()
+            x = g.x() + g.width() + 8
+            y = g.y()
+            # Keep it on-screen: if it would overflow the screen, clamp.
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                avail = screen.availableGeometry()
+                pw = self.preview_window.width() or 720
+                if x + pw > avail.right():
+                    x = max(avail.left(), avail.right() - pw)
+            self.preview_window.move(x, y)
+        except Exception:
+            pass
+
+    def _on_live_preview_toggled(self, checked):
+        """Open/close the separate preview window. Applies live to a running job."""
+        if checked:
+            if self.preview_window is None:
+                # Top-level window (no parent) so it's freely movable and not
+                # clipped to the main window; we position it ourselves.
+                self.preview_window = DetectionPreviewWindow()
+                self.preview_window.closed.connect(
+                    lambda: self.live_preview_checkbox.setChecked(False)
+                )
+            self._position_preview_window()
+            self.preview_window.show()
+            self.preview_window.raise_()
+            self.preview_window.activateWindow()
+        else:
+            if self.preview_window is not None:
+                self.preview_window.hide()
+        if hasattr(self, 'worker') and self.worker is not None:
+            try:
+                self.worker.preview_enabled = checked
+            except Exception:
+                pass
+
+    @Slot(object, object, int)
+    def on_preview_frame(self, frame_bgr, boxes, sec):
+        """Draw a live detection frame (BGR ndarray + normalised boxes)."""
+        if not self.live_preview_checkbox.isChecked() or self.preview_window is None:
+            return
+        try:
+            from PySide6.QtGui import QImage, QPainter, QPen, QColor, QFont, QPixmap
+            import numpy as np
+
+            # Ensure a contiguous uint8 BGR array, then convert to RGB
+            frame_bgr = np.ascontiguousarray(frame_bgr)
+            h, w = frame_bgr.shape[:2]
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            rgb = np.ascontiguousarray(rgb)
+            qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+            pix = QPixmap.fromImage(qimg)
+
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.Antialiasing)
+            pen = QPen(QColor(0, 230, 90), 2)
+            painter.setFont(QFont("Arial", 9, QFont.Bold))
+            for item in boxes or []:
+                name, nx, ny, nw, nh, conf = item
+                rx, ry, rw, rh = int(nx * w), int(ny * h), int(nw * w), int(nh * h)
+                painter.setPen(pen)
+                painter.drawRect(rx, ry, rw, rh)
+                label = f"{name} {conf:.2f}"
+                painter.fillRect(rx, max(0, ry - 14), 8 + len(label) * 6, 14, QColor(0, 0, 0, 160))
+                painter.setPen(QColor(0, 255, 120))
+                painter.drawText(rx + 3, max(10, ry - 3), label)
+            painter.end()
+
+            n = len(boxes or [])
+            cap = f"t={sec//60:d}:{sec%60:02d}"
+            if n:
+                cap += f"  •  {n} object{'s' if n != 1 else ''}"
+            self.preview_window.set_frame(pix, caption=cap)
+        except Exception as e:
+            print(f"⚠️ preview draw error: {e}")
+
     def run_pipeline(self):
         from pipeline import run_highlighter
         """Start the pipeline processing (UPDATED for multi-file)"""
@@ -3320,6 +3586,7 @@ class VideoHighlighterGUI(QWidget):
             "avoid_method": getattr(self, "_avoid_method", "skip"),
             "avoid_identity_ids": avoid_ids,
             "face_db_path": "./cache/face_db.json",
+            "force_reprocess": self.force_reprocess_checkbox.isChecked(),
         }
 
         # --- Skip highlights logic ---
@@ -3376,10 +3643,12 @@ class VideoHighlighterGUI(QWidget):
 
         # Create and start worker
         self.worker = Worker(video_paths, config)
+        self.worker.preview_enabled = self.live_preview_checkbox.isChecked()
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.update_process_progress)
         self.worker.finished.connect(self.pipeline_done)
         self.worker.cancelled.connect(self.pipeline_cancelled)
+        self.worker.preview.connect(self.on_preview_frame)
         
         # Start status checking timer
         self.status_timer.start(100)  # Check every 100ms
