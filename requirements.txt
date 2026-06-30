@@ -5,7 +5,7 @@ opencv-python
 tqdm
 openai-whisper
 googletrans==4.0.0rc1
-openvino
+openvino==2026.2.1
 ultralytics
 PySide6
 beautifulsoup4

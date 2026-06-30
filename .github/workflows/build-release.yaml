@@ -22,7 +22,7 @@ jobs:
         run: |
           pip install numpy==2.2.6 mkl mkl-include
           pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
-          pip install openvino-dev==2024.6.0
+          pip install openvino==2026.2.1
           pip install -r requirements.txt
           pip install pyinstaller
       - name: Verify key packages
