@@ -231,7 +231,7 @@ class DownloadWorker(QThread):
 
     def __init__(self, url, save_dir, pattern, time_range=None, download_full=True,
                  use_percentages=False, immediate_processing=False, max_concurrent=1,
-                 process_callback=None):
+                 process_callback=None, video_urls=None):
         super().__init__()
         self.url = url
         self.save_dir = save_dir
@@ -242,6 +242,7 @@ class DownloadWorker(QThread):
         self.immediate_processing = immediate_processing
         self.max_concurrent = max_concurrent
         self.process_callback = process_callback      # called after each download if immediate_processing
+        self.video_urls = video_urls                  # explicit selection from the picker (skips scrape)
         self._cancelled = False
         self._is_running = False
         self._download_results = []                   # store all download metadata
@@ -290,6 +291,7 @@ class DownloadWorker(QThread):
                 download_full=self.download_full,
                 use_percentages=self.use_percentages,
                 max_workers=self.max_concurrent,
+                video_urls=self.video_urls,
             )
 
             # Collect downloaded files
@@ -1096,10 +1098,17 @@ class VideoHighlighterGUI(QWidget):
 
         # Download button
         download_btn_layout = QHBoxLayout()
+        self.browse_select_btn = QPushButton("🗂 Browse & Select…")
+        self.browse_select_btn.setStyleSheet("QPushButton { background-color: #6a5acd; color: white; font-weight: bold; padding: 8px; }")
+        self.browse_select_btn.setToolTip("Open a grid of the site's videos (thumbnails) and pick which ones to download")
+        self.browse_select_btn.clicked.connect(self.browse_and_select_videos)
+
         self.download_btn = QPushButton("🌐 Download Videos")
         self.download_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px; }")
-        self.download_btn.clicked.connect(self.start_download)
+        # lambda so the clicked(bool) arg isn't passed as start_download's video_urls
+        self.download_btn.clicked.connect(lambda: self.start_download())
         download_btn_layout.addStretch()
+        download_btn_layout.addWidget(self.browse_select_btn)
         download_btn_layout.addWidget(self.download_btn)
         download_form.addLayout(download_btn_layout)
 
@@ -2042,8 +2051,30 @@ class VideoHighlighterGUI(QWidget):
         if directory:
             self.download_save_dir_input.setText(directory)
 
-    def start_download(self):
-        """Start the download process"""
+    def browse_and_select_videos(self):
+        """Open the thumbnail picker for the listing URL, then download the chosen videos."""
+        url = self.download_url_input.text().strip()
+        pattern = self.download_pattern_input.text().strip() or "/video/"
+        if not url.startswith(("http://", "https://")):
+            self.append_log("⚠️ Enter a listing URL (http:// or https://) first")
+            return
+        try:
+            from video_picker_dialog import VideoPickerDialog
+        except Exception as e:
+            self.append_log(f"❌ Video picker unavailable: {e}")
+            return
+        dlg = VideoPickerDialog(url, pattern=pattern, use_browser="auto", parent=self)
+        if dlg.exec():
+            urls = [e["url"] for e in dlg.selected_entries()]
+            if not urls:
+                self.append_log("No videos selected.")
+                return
+            self.append_log(f"🗂 Selected {len(urls)} video(s) from picker")
+            self.start_download(video_urls=urls)
+
+    def start_download(self, video_urls=None):
+        """Start the download process. If video_urls is given (from the picker),
+        those exact URLs are downloaded instead of scraping the listing."""
         url = self.download_url_input.text().strip()
         save_dir = self.download_save_dir_input.text().strip()
         pattern = self.download_pattern_input.text().strip() or "/video/"
@@ -2267,7 +2298,8 @@ class VideoHighlighterGUI(QWidget):
             use_percentages=use_percentages,
             immediate_processing=immediate_processing,
             max_concurrent=max_concurrent,
-            process_callback=process_video_callback if immediate_processing else None
+            process_callback=process_video_callback if immediate_processing else None,
+            video_urls=video_urls
         )
         
         # Connect signals

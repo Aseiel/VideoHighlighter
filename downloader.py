@@ -972,6 +972,196 @@ def make_absolute_url(url: str, base_url: str) -> Optional[str]:
     except Exception:
         return None
 
+_LISTING_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _make_headless_chrome(log_fn: Callable = print):
+    """Create a headless Chrome driver (webdriver-manager if available)."""
+    opts = Options()
+    for arg in ("--headless=new", "--disable-gpu", "--no-sandbox",
+                "--disable-dev-shm-usage", "--log-level=3"):
+        opts.add_argument(arg)
+    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        from selenium.webdriver.chrome.service import Service
+        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+    except ImportError:
+        return webdriver.Chrome(options=opts)
+
+
+# Image src values that are lazy-load placeholders, not real thumbnails.
+_PLACEHOLDER_IMG = ("1px", "blank", "spacer", "placeholder", "loading", "lazy.")
+# Matches a bare duration badge like "1:48" or "01:48" or "1:02:03".
+_DURATION_RE = re.compile(r'^\d{1,2}:\d{2}(:\d{2})?$')
+
+
+def _img_src_from(tag) -> Optional[str]:
+    """Best-effort real image URL from an <img>, preferring lazy-load data-attrs
+    over a placeholder src (sites set src=1px.png and the real URL in data-src)."""
+    if tag is None:
+        return None
+    candidates = []
+    for attr in ("data-src", "data-original", "data-thumb", "data-lazy",
+                 "data-lazy-src", "data-srcset", "srcset", "src"):
+        v = tag.get(attr)
+        if v:
+            candidates.append(v.split(",")[0].strip().split(" ")[0])
+    for c in candidates:
+        cl = c.lower()
+        if cl.startswith("data:") or any(p in cl for p in _PLACEHOLDER_IMG):
+            continue
+        return c
+    return candidates[0] if candidates else None  # last resort, even if placeholder
+
+
+def _clean_title_candidate(text: Optional[str]) -> str:
+    """Drop junk title candidates: empty, duration badges, generic alt text."""
+    t = (text or "").strip()
+    if not t or _DURATION_RE.match(t):
+        return ""
+    if t.lower() in ("thumb", "thumbnail", "play", "watch", "video"):
+        return ""
+    return t
+
+
+def _parse_video_entries(soup, base_url: str, pattern: str) -> List[Dict]:
+    """Extract [{url, title, thumbnail_url, duration}] from a listing page's soup.
+
+    Cards often have two <a>s with the same href (one wraps the image + duration,
+    one wraps the title). We merge by URL and keep the best title (longest non-junk
+    text across the link's title attr, link text, and img alt), falling back to the
+    URL slug. Thumbnails prefer lazy-load data-attrs over placeholder src.
+    """
+    by_url: Dict[str, Dict] = {}
+    order: List[str] = []
+    for a in soup.find_all("a", href=True):
+        if pattern not in a["href"]:
+            continue
+        full_url = make_absolute_url(a["href"], base_url)
+        if not full_url:
+            continue
+        if full_url not in by_url:
+            by_url[full_url] = {"url": full_url, "title": "",
+                                "thumbnail_url": None, "duration": None}
+            order.append(full_url)
+        entry = by_url[full_url]
+
+        img = a.find("img")
+        card = a.find_parent(["div", "li", "article"])
+        if img is None and card is not None:
+            img = card.find("img")
+        if entry["thumbnail_url"] is None:
+            t = _img_src_from(img)
+            if t:
+                entry["thumbnail_url"] = make_absolute_url(t, base_url)
+
+        # Best title across this link's candidates (longest non-junk wins).
+        for cand in (a.get("title"), a.get_text(strip=True),
+                     img.get("alt") if img is not None else None):
+            cc = _clean_title_candidate(cand)
+            if cc and len(cc) > len(entry["title"]):
+                entry["title"] = cc
+
+    entries: List[Dict] = []
+    for url in order:
+        e = by_url[url]
+        if not e["title"]:
+            # Reuse the existing URL-based extractor; last resort = raw slug.
+            e["title"] = (extract_filename_from_url(url)
+                          or url.rstrip("/").rsplit("/", 1)[-1] or url)
+        e["title"] = e["title"][:200]
+        entries.append(e)
+    return entries
+
+
+def _fetch_listing_html(url: str, log_fn: Callable = print, browser: bool = False,
+                        scroll_rounds: int = 6) -> str:
+    """Return listing-page HTML. browser=True renders with headless Chrome and
+    scrolls to trigger lazy-loaded thumbnails / infinite-scroll content."""
+    if not browser:
+        try:
+            resp = requests.get(url, headers=_LISTING_HEADERS, timeout=30)
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as e:
+            log_fn(f"⚠️ Static fetch failed: {e}")
+            return ""
+    driver = None
+    try:
+        driver = _make_headless_chrome(log_fn)
+        driver.set_page_load_timeout(40)
+        driver.get(url)
+        time.sleep(2)
+        for _ in range(max(0, scroll_rounds)):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.2)
+        return driver.page_source
+    except Exception as e:
+        log_fn(f"❌ Browser fetch failed: {e}")
+        return ""
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+def extract_video_entries(url: str, pattern: str = "/video/", log_fn: Callable = print,
+                          use_browser: str = "auto") -> List[Dict]:
+    """Scrape a listing page into a list of {url, title, thumbnail_url, duration}.
+
+    use_browser: "auto" (static, then Selenium if static found nothing),
+                 "never" (static only), or "always" (Selenium only).
+    """
+    log_fn(f"🌐 Listing: {url}")
+    entries: List[Dict] = []
+
+    if use_browser != "always":
+        html = _fetch_listing_html(url, log_fn, browser=False)
+        if html:
+            entries = _parse_video_entries(BeautifulSoup(html, "html.parser"), url, pattern)
+            log_fn(f"📄 Static HTML: {len(entries)} video(s)")
+
+    if (not entries or use_browser == "always") and use_browser != "never":
+        log_fn("🧭 Rendering with headless browser (scrolling for lazy content)...")
+        html = _fetch_listing_html(url, log_fn, browser=True)
+        if html:
+            entries = _parse_video_entries(BeautifulSoup(html, "html.parser"), url, pattern)
+            log_fn(f"🌐 Rendered: {len(entries)} video(s)")
+
+    return entries
+
+
+def dump_listing_cards(url: str, pattern: str, count: int = 3,
+                       browser: bool = True, log_fn: Callable = print) -> None:
+    """Debug: print the HTML of the first `count` matching cards so the parser can
+    be tuned to a site's markup."""
+    html = _fetch_listing_html(url, log_fn, browser=browser)
+    soup = BeautifulSoup(html, "html.parser")
+    shown = 0
+    for a in soup.find_all("a", href=True):
+        if pattern not in a["href"]:
+            continue
+        card = a.find_parent(["div", "li", "article"]) or a
+        print("\n" + "=" * 70)
+        print(card.prettify()[:2500])
+        shown += 1
+        if shown >= count:
+            break
+    if shown == 0:
+        print("No matching cards found to dump.")
+
+
 def extract_video_links(url: str, pattern: str = "/video/", log_fn: Callable = print) -> List[str]:
     """
     Extract video links from a webpage.
@@ -1660,6 +1850,44 @@ def get_downloaded_videos(directory: str) -> List[str]:
             files.append(os.path.join(directory, fn))
     return sorted(files)
 
+def _run_ytdlp_with_progress(cmd, timeout, log_fn: Callable = print):
+    """Run yt-dlp via Popen and stream its progress (speed / ETA / size) to log_fn
+    live, throttled to ~1/sec. Returns a CompletedProcess-like result (stdout holds
+    the captured output minus our machine-readable progress lines) so the existing
+    downstream parsing keeps working. Expects --newline + --progress-template
+    "DLP|..." to be in cmd.
+    """
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, encoding="utf-8", errors="replace",
+    )
+    killer = threading.Timer(timeout, proc.kill) if timeout else None
+    if killer:
+        killer.start()
+    lines = []
+    last_emit = 0.0
+    try:
+        for line in proc.stdout:
+            s = line.strip()
+            if s.startswith("DLP|"):
+                parts = [p.strip() for p in s.split("|")]
+                if len(parts) >= 4:
+                    pct, speed, eta = parts[1], parts[2], parts[3]
+                    size = parts[4] if len(parts) >= 5 else ""
+                    now = time.time()
+                    if now - last_emit >= 1.0:
+                        last_emit = now
+                        tail = f"  •  {size}" if size and size not in ("NA", "") else ""
+                        log_fn(f"⬇️ {pct}  •  {speed}  •  ETA {eta}{tail}")
+                continue  # don't keep template lines in captured output
+            lines.append(line)
+    finally:
+        proc.wait()
+        if killer:
+            killer.cancel()
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout="".join(lines), stderr="")
+
+
 def download_video(
     url: str,
     save_dir: str,
@@ -1863,6 +2091,11 @@ def download_video(
             "--retries", "10",
             "--fragment-retries", "10",
             "--concurrent-fragments", "4",
+            # Live progress: one machine-readable line per update (speed / ETA / size)
+            "--newline",
+            "--progress-template",
+            "DLP|%(progress._percent_str)s|%(progress._speed_str)s|"
+            "%(progress._eta_str)s|%(progress._total_bytes_str)s",
         ]
         
         if skip_existing:
@@ -1887,9 +2120,9 @@ def download_video(
         log_fn(f"⬇️ Downloading: {url}")
         log_fn(f"📁 Saving to: {save_dir}")
         
-        # 6. Execute download
+        # 6. Execute download (streaming so we can show live speed / ETA)
         t0 = time.time()
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
+        result = _run_ytdlp_with_progress(cmd, timeout=300, log_fn=log_fn)
         metadata["download_time"] = time.time() - t0
         out_text = (result.stdout or "") + "\n" + (result.stderr or "")
         
@@ -2058,16 +2291,21 @@ def download_videos_with_immediate_processing(
     download_full: bool = True,
     use_percentages: bool = False,
     max_workers: int = 1,
-    use_url_filenames: bool = True
+    use_url_filenames: bool = True,
+    video_urls: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
     """
     Sequential downloader with single URL detection.
+
+    If `video_urls` is given (e.g. from the picker dialog), those exact URLs are
+    downloaded and no listing scrape happens.
     """
     os.makedirs(save_dir, exist_ok=True)
     log_fn(f"📁 Save directory: {save_dir}")
-    
-    # Check if this is a direct video URL (contains /preview/ or common video patterns)
-    if "/preview/" in search_url or any(x in search_url for x in ['.mp4', '.m3u8', '/video/']):
+
+    # Check if this is a direct video URL (contains /preview/ or common video patterns).
+    # Skipped when an explicit URL list was provided.
+    if not video_urls and ("/preview/" in search_url or any(x in search_url for x in ['.mp4', '.m3u8', '/video/'])):
         log_fn("🔍 Detected single video URL - using direct download...")
         success, filepath, metadata = download_video(
             search_url,
@@ -2085,12 +2323,16 @@ def download_videos_with_immediate_processing(
         metadata["filepath"] = filepath
         return [metadata] if success else []
     
-    # Rest of the existing code for multiple links...
-    try:
-        video_links = extract_video_links(search_url, pattern, log_fn)
-    except DownloadError as e:
-        log_fn(f"❌ {e}")
-        return []
+    # Use the explicit selection if provided; otherwise scrape the listing.
+    if video_urls:
+        video_links = list(video_urls)
+        log_fn(f"📋 Using {len(video_links)} pre-selected video(s)")
+    else:
+        try:
+            video_links = extract_video_links(search_url, pattern, log_fn)
+        except DownloadError as e:
+            log_fn(f"❌ {e}")
+            return []
     
     total = len(video_links)
     results: List[Dict[str, Any]] = []
