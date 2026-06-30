@@ -74,4 +74,4 @@ This project started as a personal tool to automatically generate subtitles for 
 
 The primary goal remains practical: speed up video analysis, generate highlights, and create accessible subtitles automatically.
 
-![Stars History](assets/star-history-2026423.png)
+![Stars History](assets/star-history-2026630.png)

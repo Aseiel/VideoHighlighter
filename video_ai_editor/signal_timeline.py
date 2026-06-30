@@ -128,6 +128,7 @@ class SignalTimelineScene(QGraphicsScene):
         self.merge_threshold = 0.0
         self.bars = []
         self.row_labels = []
+        self.avoid_ranges = []  # [(start, end)] user-marked ranges excluded from highlights
         self._last_drag_emit = 0  # throttle for time_dragged signal
 
         # Range selection state
@@ -670,6 +671,7 @@ class SignalTimelineScene(QGraphicsScene):
         
         # Draw time markers
         self.draw_time_markers()
+        # (avoid ranges are painted in drawForeground so a repaint can't drop them)
 
         # Restore playhead
         if hasattr(self, 'current_time_seconds'):
@@ -687,6 +689,26 @@ class SignalTimelineScene(QGraphicsScene):
 
         print(f"✅ Timeline rebuilt successfully, final height={height}")
         self.timeline_rebuilt.emit()
+
+    def drawForeground(self, painter, rect):
+        """Paint user-marked avoid ranges on every repaint. Painting (rather than
+        adding scene items) means a partial viewport update on click can never
+        leave them un-drawn, and self.clear() in build_timeline can't remove them."""
+        super().drawForeground(painter, rect)
+        ranges = getattr(self, "avoid_ranges", None)
+        if not ranges:
+            return
+        h = self.sceneRect().height()
+        painter.save()
+        painter.setPen(QPen(QColor(220, 40, 40, 200), 1))
+        painter.setBrush(QColor(220, 40, 40, 55))
+        painter.setFont(QFont("Arial", 9))
+        for start, end in ranges:
+            x = start * self.pixels_per_second
+            w = max(2.0, (end - start) * self.pixels_per_second)
+            painter.drawRect(QRectF(x, 0, w, h))
+            painter.drawText(QPointF(x + 2, 14), "🚫")
+        painter.restore()
 
     def draw_background(self):
         """Draw gradient background with subtle grid"""
@@ -1815,6 +1837,72 @@ class SignalTimelineView(QGraphicsView):
         scene_pos = self.mapToScene(pos)
         return scene.selection_rect_contains(scene_pos)
 
+    # ── avoid-range context menu ───────────────────────────────────────
+    def _avoid_context_menu(self, event):
+        """Right-click menu on a selection: exclude the range from highlights."""
+        scene = self.scene()
+        menu = QMenu(self)
+        act_avoid = menu.addAction("🚫  Avoid this range in highlights")
+        act_clear = menu.addAction("Clear all avoid ranges")
+        if not getattr(scene, "avoid_ranges", None):
+            act_clear.setEnabled(False)
+        chosen = menu.exec(event.globalPosition().toPoint())
+        if chosen is act_avoid:
+            self._add_selection_to_avoid()
+        elif chosen is act_clear and scene is not None:
+            scene.avoid_ranges = []
+            scene.build_timeline()
+
+    def _add_selection_to_avoid(self):
+        scene = self.scene()
+        if scene is None:
+            return
+        t0 = getattr(scene, "_selection_start_time", None)
+        t1 = getattr(scene, "_selection_end_time", None)
+        if t0 is None or t1 is None or abs(t1 - t0) < 0.2:
+            return
+        lo, hi = min(t0, t1), max(t0, t1)
+        ranges = list(getattr(scene, "avoid_ranges", [])) + [(lo, hi)]
+        try:
+            from modules.manual_avoid import merge_overlapping
+            ranges = merge_overlapping(ranges)
+        except Exception:
+            pass
+        scene.avoid_ranges = ranges
+        scene.clear_selection()
+        scene.build_timeline()
+
+    def _avoid_range_at(self, pos):
+        """Index of the avoid range under the cursor, or None."""
+        scene = self.scene()
+        if scene is None or not getattr(scene, "avoid_ranges", None):
+            return None
+        pps = getattr(scene, "pixels_per_second", 0) or 0
+        if pps <= 0:
+            return None
+        t = self.mapToScene(pos).x() / pps
+        for i, (a, b) in enumerate(scene.avoid_ranges):
+            if a <= t <= b:
+                return i
+        return None
+
+    def _avoid_range_menu(self, event, index):
+        """Right-click menu on an existing red avoid range: remove one / clear all."""
+        scene = self.scene()
+        menu = QMenu(self)
+        act_remove = menu.addAction("🗑  Remove this avoid range")
+        act_clear = menu.addAction("Clear all avoid ranges")
+        chosen = menu.exec(event.globalPosition().toPoint())
+        if chosen is act_remove:
+            try:
+                del scene.avoid_ranges[index]
+            except (IndexError, TypeError, AttributeError):
+                pass
+            scene.build_timeline()
+        elif chosen is act_clear:
+            scene.avoid_ranges = []
+            scene.build_timeline()
+
     # ── mouse events ───────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
@@ -1849,6 +1937,18 @@ class SignalTimelineView(QGraphicsView):
                 scene.clear_selection()
             super().mousePressEvent(event)
             return
+
+        # ── 2.5 Right-click: avoid menus (don't pan over selections/ranges) ──
+        if event.button() == Qt.RightButton:
+            hit = self._avoid_range_at(event.pos())
+            if hit is not None:
+                self._avoid_range_menu(event, hit)
+                event.accept()
+                return
+            if self._pos_in_selection(event.pos()):
+                self._avoid_context_menu(event)
+                event.accept()
+                return
 
         # ── 3. Pan ────────────────────────────────────────────────────
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
