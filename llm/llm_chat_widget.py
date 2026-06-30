@@ -129,7 +129,8 @@ class _VisualSearchWorker(QObject):
     def __init__(self, analyzer: VideoSeekAnalyzer, target: str,
                  interval: float = 1.0, max_seeks: int = 100,
                  stop_on_first_match: bool = True,
-                 start_time: float = 0.0):
+                 start_time: float = 0.0,
+                 scene_threshold: float = 8.0):
         super().__init__()
         self.analyzer = analyzer
         self.target = target
@@ -137,6 +138,13 @@ class _VisualSearchWorker(QObject):
         self.max_seeks = max_seeks
         self.stop_on_first_match = stop_on_first_match
         self.start_time = start_time
+        # Content-aware sampling: skip a frame when its mean per-pixel change from
+        # the last *analyzed* frame is below this (0-255 scale). 0 disables it.
+        # Higher = skip more aggressively. This only avoids redundant ~3s vision
+        # encodes on visually-static stretches; it never alters what the model is
+        # asked, and the downscale used for the metric never reaches the model.
+        self.scene_threshold = scene_threshold
+        self._prev_small = None  # downscaled grayscale of the last analyzed frame
         self._cancel_token = CancellationToken()
 
     def cancel(self):
@@ -145,10 +153,12 @@ class _VisualSearchWorker(QObject):
     @Slot()
     def run(self):
         import time
+        import numpy as np
         from collections import defaultdict
-        
+
         stage_totals = defaultdict(list)  # stage_name -> [duration_seconds, ...]
-        
+        n_skipped = 0  # frames skipped by content-aware sampling
+
         try:
             results = []
             num_analyses = min(int(self.analyzer.duration / self.interval) + 1, self.max_seeks)
@@ -173,7 +183,26 @@ class _VisualSearchWorker(QObject):
                 if frame is None:
                     print(f"[t={timestamp:6.1f}s] seek failed")
                     continue
-                
+
+                # ── Content-aware skip: don't re-encode a near-identical frame ──
+                # The vision encoder (~3s) runs on every analyzed frame, so the
+                # biggest win is not analyzing frames that barely changed since the
+                # last one we did analyze. The stride-downscale + grayscale below is
+                # ONLY for this cheap difference metric — the full-resolution frame
+                # is what gets sent to the model, preserving accuracy.
+                scene_diff = -1.0  # -1 = no previous analyzed frame to compare
+                if self.scene_threshold > 0:
+                    small = frame[::8, ::8]
+                    small = small.mean(axis=2).astype('float32') if small.ndim == 3 else small.astype('float32')
+                    if (self._prev_small is not None
+                            and small.shape == self._prev_small.shape):
+                        scene_diff = float(np.abs(small - self._prev_small).mean())
+                        if scene_diff < self.scene_threshold:
+                            n_skipped += 1
+                            print(f"[t={timestamp:6.1f}s] skipped (scene Δ={scene_diff:4.1f} < {self.scene_threshold})")
+                            continue
+                    self._prev_small = small
+
                 # Report frame size — useful to know how big the JPEG is
                 try:
                     h, w = frame.shape[:2]
@@ -192,54 +221,77 @@ class _VisualSearchWorker(QObject):
                     break
                 
                 try:
-                    # ── STAGE 3: LLM query (vision encoder + generation) ──
+                    # ── STAGE 3: presence check (cheap) ──
+                    # Two-phase to keep the common case fast: first a one-word
+                    # YES/NO presence check with a tiny token budget, then a
+                    # descriptive call ONLY on a positive hit. Frames are sent at
+                    # full resolution — this vision model loses accuracy badly when
+                    # downscaled (see VideoSeekAnalyzer.frame_to_base64), so we cut
+                    # generation cost via max_tokens, never via image size.
                     t0 = time.perf_counter()
                     response = self.analyzer.llm.query(
-                        user_message=f"Does this frame contain a {self.target}? Answer with YES or NO, and briefly explain what you see.",
+                        user_message=f"Does this frame contain a {self.target}? Answer with only one word: YES or NO.",
                         frame_base64=frame_b64,
                         system_prompt=LLMModule.SYSTEM_PROMPT_VISUAL_SEARCH,
                         temperature=0.0,
-                        max_tokens=150,
+                        max_tokens=5,
                         cancellation_token=self._cancel_token,
                     )
                     t_llm = time.perf_counter() - t0
                     stage_totals['llm'].append(t_llm)
-                    
-                    # ── STAGE 4: post-processing + signal emit ──
-                    t0 = time.perf_counter()
+
                     response_stripped = response.strip().lower()
                     starts_with_yes = response_stripped.startswith("yes")
-                    
+
+                    # ── STAGE 3b: describe the scene only when the target is present ──
+                    analysis_text = response
+                    t_confirm = 0.0
+                    if starts_with_yes:
+                        t0 = time.perf_counter()
+                        analysis_text = self.analyzer.llm.query(
+                            user_message=f"This frame contains a {self.target}. Briefly describe what you see.",
+                            frame_base64=frame_b64,
+                            system_prompt=LLMModule.SYSTEM_PROMPT_VISUAL_SEARCH,
+                            temperature=0.0,
+                            max_tokens=150,
+                            cancellation_token=self._cancel_token,
+                        )
+                        t_confirm = time.perf_counter() - t0
+                        stage_totals['confirm'].append(t_confirm)
+
+                    # ── STAGE 4: post-processing + signal emit ──
+                    t0 = time.perf_counter()
                     result = {
                         "timestamp": timestamp,
                         "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
-                        "analysis": response,
+                        "analysis": analysis_text,
                         "contains_target": starts_with_yes,
                     }
                     results.append(result)
-                    
+
                     self.frame_analyzed.emit(
-                        timestamp, result["timestamp_str"], response,
+                        timestamp, result["timestamp_str"], analysis_text,
                         result["contains_target"]
                     )
                     t_post = time.perf_counter() - t0
                     stage_totals['post'].append(t_post)
-                    
+
                     t_total = time.perf_counter() - frame_t0
-                    
+
                     # Per-frame log line
                     print(
-                        f"[t={timestamp:6.1f}s] {frame_dims} {b64_kb:5.0f}KB | "
+                        f"[t={timestamp:6.1f}s] {frame_dims} {b64_kb:5.0f}KB Δ={scene_diff:5.1f} | "
                         f"seek={t_seek*1000:6.0f}ms  "
                         f"encode={t_encode*1000:5.0f}ms  "
                         f"llm={t_llm*1000:6.0f}ms  "
+                        f"confirm={t_confirm*1000:6.0f}ms  "
                         f"post={t_post*1000:4.0f}ms  "
                         f"TOTAL={t_total*1000:6.0f}ms "
                         f"({'YES' if starts_with_yes else 'no '})"
                     )
-                    
+
                     if result["contains_target"]:
-                        self.found.emit(timestamp, result["timestamp_str"], response)
+                        self.found.emit(timestamp, result["timestamp_str"], analysis_text)
                         if self.stop_on_first_match:
                             break
                 
@@ -254,7 +306,7 @@ class _VisualSearchWorker(QObject):
                 print("PROFILE SUMMARY")
                 print("="*70)
                 print(f"{'stage':<10} {'count':>5} {'mean':>8} {'median':>8} {'min':>8} {'max':>8} {'total':>8}")
-                for stage in ('seek', 'encode', 'llm', 'post'):
+                for stage in ('seek', 'encode', 'llm', 'confirm', 'post'):
                     vals = stage_totals[stage]
                     if not vals:
                         continue
@@ -267,6 +319,9 @@ class _VisualSearchWorker(QObject):
                     print(f"{stage:<10} {len(vals):>5} {mean_ms:>7.0f}ms {median_ms:>7.0f}ms "
                         f"{min_ms:>7.0f}ms {max_ms:>7.0f}ms {total_s:>7.1f}s")
                 
+                print(f"\nFrames analyzed: {len(stage_totals['llm'])}   "
+                      f"skipped (scene-stable): {n_skipped}")
+
                 # What fraction of time is on the GPU vs everywhere else
                 llm_total = sum(stage_totals['llm'])
                 other_total = sum(sum(stage_totals[s]) for s in ('seek', 'encode', 'post'))
