@@ -1,0 +1,21 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run unit tests
+        # conftest.py shims the heavy ML deps, so this runs in seconds with no
+        # GPU / torch / opencv / openvino install.
+        run: pytest -q

@@ -3637,6 +3637,7 @@ class VideoHighlighterGUI(QWidget):
             "avoid_enabled": self.avoid_face_recognition_chk.isChecked() and bool(avoid_ids),
             "avoid_method": getattr(self, "_avoid_method", "skip"),
             "avoid_identity_ids": avoid_ids,
+            "avoid_manual_ranges": self._get_manual_avoid_ranges(),
             "face_db_path": "./cache/face_db.json",
             "force_reprocess": self.force_reprocess_checkbox.isChecked(),
         }
@@ -3948,6 +3949,17 @@ class VideoHighlighterGUI(QWidget):
             if self.worker.isRunning():
                 self.worker.wait(1000)  # Wait up to 1 second
             self.worker = None
+
+    def _get_manual_avoid_ranges(self):
+        """Manual avoid ranges marked on the timeline (same process, so read them
+        straight off the live timeline window). Safe if it's closed/absent."""
+        tw = getattr(self, "timeline_window", None)
+        if tw is not None and hasattr(tw, "get_avoid_ranges"):
+            try:
+                return tw.get_avoid_ranges()
+            except Exception:
+                pass
+        return []
 
     def open_timeline_viewer(self):
         """Open timeline viewer for the selected video"""

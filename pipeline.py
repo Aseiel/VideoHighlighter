@@ -1455,6 +1455,20 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 forbidden_ranges, forbidden_boxes_by_frame = [], {}
         # ========== END AVOID LOCATE ==========
 
+        # Manual user-marked avoid ranges (drawn on the timeline). Applied as a
+        # "skip" regardless of the face-avoid toggle/method, then merged with any
+        # face-identity ranges so downstream zeroing/subtraction sees one list.
+        try:
+            from modules.manual_avoid import parse_ranges, combine
+            manual_avoid = parse_ranges(gui_config.get("avoid_manual_ranges", []))
+        except Exception as e:
+            log(f"⚠️ Manual avoid parse failed — ignoring manual ranges: {e}")
+            manual_avoid = []
+        if manual_avoid:
+            forbidden_ranges = combine(forbidden_ranges, manual_avoid)
+            log(f"🚫 Avoid: +{len(manual_avoid)} manual range(s) → "
+                f"{len(forbidden_ranges)} forbidden range(s) total")
+
         # 6 Compute scores per second
         progress.update_progress(80, 100, "Pipeline", "Computing scores...")
         check_cancellation(cancel_flag, log, "score computation")
@@ -1643,7 +1657,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 score[i] *= MULTI_SIGNAL_BOOST
 
         # AVOID(skip, soft): discourage picking moments where the avoided person appears
-        if AVOID_ENABLED and AVOID_METHOD in ("skip", "crop_then_skip") and forbidden_ranges:
+        if forbidden_ranges and (manual_avoid or (AVOID_ENABLED and AVOID_METHOD in ("skip", "crop_then_skip"))):
             forbidden_seconds = {s for a, b in forbidden_ranges for s in range(int(a), int(b) + 1)}
             for sec in forbidden_seconds:
                 if 0 <= sec < len(score):
@@ -1803,7 +1817,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         segments.sort(key=lambda x: x[0])
 
         # AVOID(skip, hard): guarantee no forbidden time survives into the cut
-        if AVOID_ENABLED and AVOID_METHOD in ("skip", "crop_then_skip") and forbidden_ranges:
+        if forbidden_ranges and (manual_avoid or (AVOID_ENABLED and AVOID_METHOD in ("skip", "crop_then_skip"))):
             before_n = len(segments)
             segments = subtract_forbidden(segments, forbidden_ranges)
             log(f"🚫 Avoid(skip): {before_n} → {len(segments)} segment(s) after removing forbidden ranges")

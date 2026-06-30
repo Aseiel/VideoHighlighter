@@ -2203,7 +2203,24 @@ class SignalTimelineWindow(QMainWindow):
 
         layer_group.setLayout(layer_layout)
         layout.addWidget(layer_group)
-        
+
+        # Avoid ranges — exclude a dragged-selection range from highlight selection
+        avoid_group = QGroupBox("Avoid in Highlights")
+        avoid_layout = QHBoxLayout()
+        self.avoid_range_btn = QPushButton("🚫 Avoid selected range")
+        self.avoid_range_btn.setToolTip(
+            "Drag-select a range on the timeline, then click to exclude it from "
+            "highlight selection on the next run."
+        )
+        self.avoid_range_btn.clicked.connect(self._avoid_selected_range)
+        avoid_layout.addWidget(self.avoid_range_btn)
+        self.clear_avoid_btn = QPushButton("Clear")
+        self.clear_avoid_btn.setToolTip("Remove all avoid ranges")
+        self.clear_avoid_btn.clicked.connect(self._clear_avoid_ranges)
+        avoid_layout.addWidget(self.clear_avoid_btn)
+        avoid_group.setLayout(avoid_layout)
+        layout.addWidget(avoid_group)
+
         # Merge threshold controls
         merge_group = QGroupBox("Merge Signals")
         merge_layout = QVBoxLayout()
@@ -2430,6 +2447,39 @@ class SignalTimelineWindow(QMainWindow):
         """Toggle visibility of a layer"""
         self.signal_scene.visible_layers[layer_name] = (state == Qt.CheckState.Checked.value)
         self.signal_scene.build_timeline()
+
+    # ---- Avoid ranges -----------------------------------------------------
+    def _avoid_selected_range(self):
+        """Add the current drag-selection to the avoid list and redraw."""
+        scene = self.signal_scene
+        t0 = getattr(scene, "_selection_start_time", None)
+        t1 = getattr(scene, "_selection_end_time", None)
+        if t0 is None or t1 is None or abs(t1 - t0) < 0.2:
+            self.statusBar().showMessage(
+                "Drag-select a range on the timeline first, then click Avoid.", 4000)
+            return
+        lo, hi = min(t0, t1), max(t0, t1)
+        ranges = list(getattr(scene, "avoid_ranges", [])) + [(lo, hi)]
+        try:
+            from modules.manual_avoid import merge_overlapping
+            ranges = merge_overlapping(ranges)
+        except Exception:
+            pass
+        scene.avoid_ranges = ranges
+        scene.clear_selection()
+        scene.build_timeline()
+        self.statusBar().showMessage(
+            f"🚫 Avoiding {lo:.1f}s–{hi:.1f}s — {len(ranges)} range(s) excluded from highlights",
+            5000)
+
+    def _clear_avoid_ranges(self):
+        self.signal_scene.avoid_ranges = []
+        self.signal_scene.build_timeline()
+        self.statusBar().showMessage("Cleared all avoid ranges", 3000)
+
+    def get_avoid_ranges(self):
+        """Used by the main window to feed manual avoid ranges into the pipeline."""
+        return [list(r) for r in getattr(self.signal_scene, "avoid_ranges", [])]
     
     @Slot(int)
     def on_merge_changed(self, value):

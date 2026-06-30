@@ -1,0 +1,5 @@
+# Test-only dependencies. The suite shims heavy ML libs (torch, cv2, openvino,
+# whisper, …) in tests/conftest.py, so running the tests needs only pytest + numpy
+# (~5 MB) rather than the full requirements.txt (~1.9 GB).
+pytest
+numpy
