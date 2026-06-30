@@ -68,6 +68,7 @@ class SignalLabelPanel(QWidget):
         "AUDIO PEAKS":    lambda scene: scene._nav_timestamps_audio_peaks(),
         "HIGHLIGHTS":     lambda scene: scene._nav_timestamps_highlights(),
         "TRANSCRIPT":     lambda scene: scene._nav_timestamps_transcript(),
+        "VISUAL SEARCH":  lambda scene: scene._nav_timestamps_visual_search(),
     }
 
     _ARROW_W = 14   # px reserved for each arrow

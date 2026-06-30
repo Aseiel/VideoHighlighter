@@ -383,6 +383,22 @@ class SignalTimelineScene(QGraphicsScene):
                 ts.append(float(t))
         return ts
 
+    def _nav_timestamps_visual_search(self):
+        """Timestamps of currently-visible visual-search findings (same query +
+        confidence filters as draw_visual_findings_layer, so ◀ ▶ matches the bars)."""
+        ts = []
+        for f in self.visual_findings:
+            query = f.get('query', '').strip()
+            if query and not self.visible_visual_queries.get(query, True):
+                continue
+            conf = f.get('confidence', 0)
+            if conf < self.min_visual_confidence or conf > self.max_visual_confidence:
+                continue
+            t = f.get('timestamp')
+            if t is not None:
+                ts.append(float(t))
+        return ts
+
     def _merge_intervals(self, intervals, threshold=None):
         """
         Merge (start, end, metadata) tuples that are within threshold seconds.

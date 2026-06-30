@@ -506,6 +506,9 @@ class LLMChatWidget(QWidget):
         self._preview_window = None
         self.reasoning_engine = None
         self.reasoning_enabled = True
+        # Found visual-search matches, for ◀ ▶ navigation
+        self._search_results: list[dict] = []
+        self._search_result_idx = -1
         if HAS_TIMELINE_BRIDGE:
             self._timeline_bridge = TimelineBridge()
 
@@ -707,7 +710,27 @@ class LLMChatWidget(QWidget):
         self.stop_search_btn.clicked.connect(self._stop_visual_search)
         self.stop_search_btn.setEnabled(False)
         search_layout.addWidget(self.stop_search_btn)
-        
+
+        # Match navigation: step through found timestamps with arrows
+        self.search_prev_btn = QPushButton("◀")
+        self.search_prev_btn.setFixedWidth(30)
+        self.search_prev_btn.setToolTip("Previous match")
+        self.search_prev_btn.clicked.connect(lambda: self._step_search_result(-1))
+        self.search_prev_btn.setEnabled(False)
+        search_layout.addWidget(self.search_prev_btn)
+
+        self.search_result_label = QLabel("0/0")
+        self.search_result_label.setStyleSheet("color:#999;min-width:36px;")
+        self.search_result_label.setAlignment(Qt.AlignCenter)
+        search_layout.addWidget(self.search_result_label)
+
+        self.search_next_btn = QPushButton("▶")
+        self.search_next_btn.setFixedWidth(30)
+        self.search_next_btn.setToolTip("Next match")
+        self.search_next_btn.clicked.connect(lambda: self._step_search_result(1))
+        self.search_next_btn.setEnabled(False)
+        search_layout.addWidget(self.search_next_btn)
+
         search_group.setLayout(search_layout)
         settings_layout.addWidget(search_group)
         
@@ -1010,6 +1033,9 @@ class LLMChatWidget(QWidget):
         mode_str = "stop on first match" if stop_on_match else "scan entire video"
         start_str = f"{int(start_from)//60}:{int(start_from)%60:02d}"
 
+        # Reset match navigation for this fresh search.
+        self._reset_search_results()
+
         # Generate a unique scan ID and clear any previous findings for this query
         # so the timeline shows fresh results.
         self._current_scan_id = f"scan_{int(_time.time())}"
@@ -1144,8 +1170,45 @@ class LLMChatWidget(QWidget):
         self.search_progress.setText(f"Analyzing frame at {timestamp_str}...")
 
     @Slot(float, str, str)
+    # ---- match navigation (◀ ▶) -------------------------------------------
+    def _reset_search_results(self):
+        self._search_results = []
+        self._search_result_idx = -1
+        self._update_search_nav()
+
+    def _add_search_result(self, timestamp, timestamp_str, analysis):
+        self._search_results.append({
+            "timestamp": timestamp, "timestamp_str": timestamp_str, "analysis": analysis,
+        })
+        self._search_results.sort(key=lambda r: r["timestamp"])
+        if self._search_result_idx < 0:
+            self._search_result_idx = 0
+        self._update_search_nav()
+
+    def _update_search_nav(self):
+        n = len(self._search_results)
+        i = self._search_result_idx
+        self.search_result_label.setText(f"{i + 1}/{n}" if n else "0/0")
+        self.search_prev_btn.setEnabled(n > 0 and i > 0)
+        self.search_next_btn.setEnabled(n > 0 and i < n - 1)
+
+    def _step_search_result(self, delta: int):
+        if not self._search_results:
+            return
+        self._search_result_idx = max(
+            0, min(len(self._search_results) - 1, self._search_result_idx + delta)
+        )
+        r = self._search_results[self._search_result_idx]
+        self._seek_to_timestamp(r["timestamp"])
+        self._append_system(
+            f"➡️ Match {self._search_result_idx + 1}/{len(self._search_results)} "
+            f"at {r['timestamp_str']}"
+        )
+        self._update_search_nav()
+
     def _on_search_found(self, timestamp: float, timestamp_str: str, analysis: str):
         """Handle found target — auto-seek preview and timeline to the found timestamp."""
+        self._add_search_result(timestamp, timestamp_str, analysis)
         self._append_system(
             f"🎯 FOUND at {timestamp_str}!\n"
             f"   {analysis[:150]}..."
@@ -1164,7 +1227,16 @@ class LLMChatWidget(QWidget):
         """Handle search completion — worker is done, safe to seek analyzer."""
         found_results = [r for r in results if r.get("contains_target", False)]
         found_count = len(found_results)
-        
+
+        # Rebuild the authoritative match list for ◀ ▶ navigation.
+        self._search_results = sorted(
+            ({"timestamp": r["timestamp"], "timestamp_str": r["timestamp_str"],
+              "analysis": r.get("analysis", "")} for r in found_results),
+            key=lambda r: r["timestamp"],
+        )
+        self._search_result_idx = 0 if self._search_results else -1
+        self._update_search_nav()
+
         if found_count > 0:
             ts_list = ", ".join(r["timestamp_str"] for r in found_results)
             self._append_system(
