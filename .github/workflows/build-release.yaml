@@ -59,6 +59,15 @@ jobs:
           --collect-data whisper
           --collect-data ultralytics
           --collect-binaries imageio_ffmpeg
+          --hidden-import llm.clip_prefilter
+          --collect-submodules optimum
+          --collect-submodules transformers
+          --collect-data transformers
+          --copy-metadata transformers
+          --copy-metadata tokenizers
+          --copy-metadata huggingface-hub
+          --copy-metadata safetensors
+          --copy-metadata regex
           main.py
       - name: Report build size
         run: |
@@ -128,6 +137,15 @@ jobs:
             --collect-data whisper \
             --collect-data ultralytics \
             --collect-binaries imageio_ffmpeg \
+            --hidden-import llm.clip_prefilter \
+            --collect-submodules optimum \
+            --collect-submodules transformers \
+            --collect-data transformers \
+            --copy-metadata transformers \
+            --copy-metadata tokenizers \
+            --copy-metadata huggingface-hub \
+            --copy-metadata safetensors \
+            --copy-metadata regex \
             main.py
       - name: Ad-hoc sign the app
         run: |

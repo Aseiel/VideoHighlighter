@@ -9,13 +9,13 @@ highlights:
   skip_highlights: false
 scoring:
   scene_points: 0
-  motion_event_points: 3
+  motion_event_points: 0
   motion_peak_points: 0
   audio_peak_points: 0
-  keyword_points: 2
-  transcript_points: 2
-  object_points: 1
-  action_points: 10
+  keyword_points: 0
+  transcript_points: 0
+  object_points: 0
+  action_points: 0
   multi_signal_boost: 1.2
   min_signals_for_boost: 2
 actions:

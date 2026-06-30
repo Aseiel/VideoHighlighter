@@ -36,3 +36,6 @@ selenium
 trio
 trio-websocket
 webdriver-manager
+# Visual search — CLIP prefilter (OpenVINO on Intel GPU). pillow is above.
+transformers
+optimum-intel

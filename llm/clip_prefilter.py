@@ -1,0 +1,213 @@
+"""
+Path D — Step 2: CLIP frame prefilter (OpenVINO, Intel GPU).
+
+A reusable scorer that ranks video frames by how well they match a text query,
+using CLIP on the Intel Arc GPU through OpenVINO (~3-7 ms/frame). It is meant to
+run as a *prefilter*: scan the whole video cheaply, keep the top-K candidate
+timestamps, and let the slow uncensored VLM confirm only those.
+
+CLIP has no safety filter and never refuses — it only computes image<->text
+similarity — which is exactly why it works for content the VLM then confirms.
+
+Standalone usage (test on a real video before any app integration):
+
+    python -m llm.clip_prefilter --video "D:\\movies\\clip.mp4" \
+        --query "your real target wording" --interval 1.0 --topk 30
+
+Watch whether the top-K timestamps actually land on the moments you expect.
+If they do, we wire this into the visual-search worker. If base CLIP is too
+weak for your target, change MODEL_ID to a domain-tuned CLIP — same code path.
+
+Requires:  pip install "optimum[openvino]" pillow opencv-python
+"""
+from __future__ import annotations
+
+import time
+from typing import Optional
+
+
+# clip-vit-base-patch32 is general-purpose: fast and proven on the Arc GPU.
+# Swap for a domain-tuned CLIP later if ranking recall is insufficient.
+MODEL_ID = "openai/clip-vit-base-patch32"
+
+
+class ClipFramePrefilter:
+    """Score BGR frames (OpenCV format) against a text query via OpenVINO CLIP."""
+
+    # Generic negatives so the positive prompt gets a calibrated softmax score
+    # rather than a raw, hard-to-threshold cosine similarity.
+    DEFAULT_NEGATIVES = (
+        "an unrelated scene",
+        "a neutral background",
+        "something else entirely",
+    )
+
+    def __init__(self, model_id: str = MODEL_ID, device: str = "GPU"):
+        self.model_id = model_id
+        self.device = device
+        self._model = None
+        self._processor = None
+        self._labels: Optional[list[str]] = None  # index 0 is always the positive
+
+    @staticmethod
+    def available() -> bool:
+        """True if the OpenVINO CLIP stack is importable."""
+        try:
+            import optimum.intel  # noqa: F401
+            import transformers  # noqa: F401
+            import PIL  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def load(self):
+        """Load CLIP on the requested device, falling back to CPU if the GPU
+        plugin can't take it (so a missing GPU never breaks search outright)."""
+        from optimum.intel import OVModelForZeroShotImageClassification
+        from transformers import CLIPProcessor
+
+        t0 = time.perf_counter()
+        try:
+            self._model = OVModelForZeroShotImageClassification.from_pretrained(
+                self.model_id, export=True, device=self.device,
+            )
+        except Exception as e:
+            print(f"⚠️  CLIP load on device={self.device} failed ({e}); using CPU.")
+            self.device = "CPU"
+            self._model = OVModelForZeroShotImageClassification.from_pretrained(
+                self.model_id, export=True, device="CPU",
+            )
+        self._processor = CLIPProcessor.from_pretrained(self.model_id)
+        print(f"✅ CLIP prefilter ready on {self.device} "
+              f"({time.perf_counter() - t0:.1f}s, {self.model_id})")
+
+    def set_query(self, target: str,
+                  positive_template: str = "a photo of {}",
+                  negatives: Optional[list[str]] = None):
+        """Define what we're searching for. Index 0 of self._labels is the
+        positive prompt; the rest are contrastive negatives for calibration."""
+        positive = positive_template.format(target.strip())
+        negs = list(negatives) if negatives else list(self.DEFAULT_NEGATIVES)
+        self._labels = [positive] + negs
+
+    def is_ready(self) -> bool:
+        return self._model is not None and self._labels is not None
+
+    def score_frames_bgr(self, frames_bgr: list) -> list[float]:
+        """Return P(positive) in [0,1] for each BGR frame. Batched in one call."""
+        import cv2
+        from PIL import Image
+
+        if not self.is_ready():
+            raise RuntimeError("Call load() and set_query() before scoring.")
+
+        images = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+                  for f in frames_bgr]
+        inputs = self._processor(
+            text=self._labels, images=images, return_tensors="pt", padding=True,
+        )
+        outputs = self._model(**inputs)
+        # logits_per_image: [n_images, n_labels]; softmax → prob over labels.
+        probs = outputs.logits_per_image.softmax(dim=1)
+        return [float(row[0]) for row in probs]  # column 0 = positive prompt
+
+    def score_frame_bgr(self, frame_bgr) -> float:
+        return self.score_frames_bgr([frame_bgr])[0]
+
+
+# ---------------------------------------------------------------------------
+# Standalone scan: rank a whole video and print the top-K timestamps.
+# ---------------------------------------------------------------------------
+def scan_video(video_path: str, query: str, interval: float = 1.0,
+               topk: int = 30, batch: int = 16, device: str = "GPU",
+               start: float = 0.0, negatives: Optional[list[str]] = None):
+    import cv2
+
+    pf = ClipFramePrefilter(device=device)
+    pf.load()
+    pf.set_query(query, negatives=negatives)
+    print(f"🔍 Query: '{query}'  (positive prompt: '{pf._labels[0]}')")
+    print(f"   negatives: {pf._labels[1:]}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"❌ Could not open video: {video_path}")
+        return []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total / fps if fps else 0
+    step = max(1, int(round(fps * interval)))
+    start_frame = int(round(start * fps))
+    print(f"📹 {video_path}")
+    print(f"   {duration/60:.1f} min, {fps:.1f} fps, sampling every {interval}s "
+          f"(~{max(0, (total - start_frame)) // step} frames)")
+
+    results = []          # (timestamp, score)
+    buf_frames, buf_ts = [], []
+    t_scan0 = time.perf_counter()
+    n_scored = 0
+    idx = 0
+    # grab() skips decode (cheap); retrieve() decodes only sampled frames.
+    while True:
+        if not cap.grab():
+            break
+        if idx >= start_frame and (idx - start_frame) % step == 0:
+            ok, frame = cap.retrieve()
+            if ok:
+                buf_frames.append(frame)
+                buf_ts.append(idx / fps)
+                if len(buf_frames) >= batch:
+                    for ts, sc in zip(buf_ts, pf.score_frames_bgr(buf_frames)):
+                        results.append((ts, sc))
+                    n_scored += len(buf_frames)
+                    buf_frames, buf_ts = [], []
+        idx += 1
+    if buf_frames:
+        for ts, sc in zip(buf_ts, pf.score_frames_bgr(buf_frames)):
+            results.append((ts, sc))
+        n_scored += len(buf_frames)
+    cap.release()
+
+    elapsed = time.perf_counter() - t_scan0
+    per = (elapsed / n_scored * 1000) if n_scored else 0
+    print(f"\n⏱  Scanned {n_scored} frames in {elapsed:.1f}s "
+          f"({per:.1f} ms/frame incl. decode) on {pf.device}")
+
+    results.sort(key=lambda x: -x[1])
+    print(f"\n--- top {min(topk, len(results))} candidate timestamps ---")
+    for ts, sc in results[:topk]:
+        print(f"   {int(ts)//60:>3d}:{int(ts)%60:02d}  ({ts:7.1f}s)   score={sc:.3f}")
+    return results
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="CLIP prefilter — rank video frames by a query")
+    ap.add_argument("--video", required=True)
+    ap.add_argument("--query", required=True)
+    ap.add_argument("--interval", type=float, default=1.0)
+    ap.add_argument("--topk", type=int, default=30)
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--device", default="GPU")
+    ap.add_argument("--start", type=float, default=0.0)
+    ap.add_argument("--negatives", default=None,
+                    help="comma-separated contrastive negatives. Describe the OTHER "
+                         "things in the video so CLIP discriminates the target act, "
+                         "e.g. \"a closeup of a face,two people talking,a solo scene\"")
+    args = ap.parse_args()
+
+    negatives = None
+    if args.negatives:
+        negatives = [s.strip() for s in args.negatives.split(",") if s.strip()]
+
+    if not ClipFramePrefilter.available():
+        print('❌ Missing deps. pip install "optimum[openvino]" pillow opencv-python')
+        return 1
+    scan_video(args.video, args.query, interval=args.interval, topk=args.topk,
+               batch=args.batch, device=args.device, start=args.start,
+               negatives=negatives)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

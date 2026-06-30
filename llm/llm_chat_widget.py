@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QLineEdit, QComboBox,
     QGroupBox, QFileDialog, QApplication, QCheckBox,
-    QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QDialog, QDialogButtonBox, QDoubleSpinBox, QSpinBox,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QThread, QSettings, QObject
 from PySide6.QtGui import QTextCursor
@@ -130,7 +130,8 @@ class _VisualSearchWorker(QObject):
                  interval: float = 1.0, max_seeks: int = 100,
                  stop_on_first_match: bool = True,
                  start_time: float = 0.0,
-                 scene_threshold: float = 8.0):
+                 scene_threshold: float = 8.0,
+                 mode: str = "llm", top_k: int = 30, clip_device: str = "GPU"):
         super().__init__()
         self.analyzer = analyzer
         self.target = target
@@ -138,6 +139,12 @@ class _VisualSearchWorker(QObject):
         self.max_seeks = max_seeks
         self.stop_on_first_match = stop_on_first_match
         self.start_time = start_time
+        # Engine: "llm" (VLM brute force), "clip" (fast GPU ranker only), or
+        # "clip_llm" (CLIP ranks all frames on the GPU, VLM confirms top_k).
+        self.mode = mode
+        self.top_k = top_k
+        self.clip_device = clip_device
+        self._clip = None  # lazily created ClipFramePrefilter
         # Content-aware sampling: skip a frame when its mean per-pixel change from
         # the last *analyzed* frame is below this (0-255 scale). 0 disables it.
         # Higher = skip more aggressively. This only avoids redundant ~3s vision
@@ -152,189 +159,268 @@ class _VisualSearchWorker(QObject):
 
     @Slot()
     def run(self):
+        """Dispatch to the selected engine. Each path emits finished/error."""
+        try:
+            if self.mode == "clip":
+                self._run_clip()
+            elif self.mode == "clip_llm":
+                self._run_clip_llm()
+            else:
+                self._run_llm()
+        except GenerationCancelled:
+            self.finished.emit([])
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+    # ------------------------------------------------------------------ shared
+    def _vlm_analyze(self, timestamp, frame, stage_totals, scene_diff=-1.0):
+        """Two-phase VLM presence check on one decoded frame. Emits
+        frame_analyzed and returns the result dict (or None if cancelled).
+        Frames go to the model at full resolution — downscaling wrecks accuracy.
+        """
+        import time
+        frame_t0 = time.perf_counter()
+        try:
+            h, w = frame.shape[:2]
+            frame_dims = f"{w}x{h}"
+        except Exception:
+            frame_dims = "?"
+
+        t0 = time.perf_counter()
+        frame_b64 = self.analyzer.frame_to_base64(frame)
+        t_encode = time.perf_counter() - t0
+        stage_totals['encode'].append(t_encode)
+        b64_kb = len(frame_b64) / 1024
+        if self._cancel_token.is_cancelled:
+            return None
+
+        # one-word YES/NO presence check (cheap)
+        t0 = time.perf_counter()
+        response = self.analyzer.llm.query(
+            user_message=f"Does this frame contain a {self.target}? Answer with only one word: YES or NO.",
+            frame_base64=frame_b64,
+            system_prompt=LLMModule.SYSTEM_PROMPT_VISUAL_SEARCH,
+            temperature=0.0, max_tokens=5, cancellation_token=self._cancel_token,
+        )
+        t_llm = time.perf_counter() - t0
+        stage_totals['llm'].append(t_llm)
+        starts_with_yes = response.strip().lower().startswith("yes")
+
+        # describe only on a positive hit
+        analysis_text = response
+        t_confirm = 0.0
+        if starts_with_yes:
+            t0 = time.perf_counter()
+            analysis_text = self.analyzer.llm.query(
+                user_message=f"This frame contains a {self.target}. Briefly describe what you see.",
+                frame_base64=frame_b64,
+                system_prompt=LLMModule.SYSTEM_PROMPT_VISUAL_SEARCH,
+                temperature=0.0, max_tokens=150, cancellation_token=self._cancel_token,
+            )
+            t_confirm = time.perf_counter() - t0
+            stage_totals['confirm'].append(t_confirm)
+
+        result = {
+            "timestamp": timestamp,
+            "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
+            "analysis": analysis_text,
+            "contains_target": starts_with_yes,
+        }
+        self.frame_analyzed.emit(timestamp, result["timestamp_str"],
+                                 analysis_text, starts_with_yes)
+        t_total = time.perf_counter() - frame_t0
+        print(f"[t={timestamp:6.1f}s] {frame_dims} {b64_kb:5.0f}KB Δ={scene_diff:5.1f} | "
+              f"encode={t_encode*1000:5.0f}ms  llm={t_llm*1000:6.0f}ms  "
+              f"confirm={t_confirm*1000:6.0f}ms  TOTAL={t_total*1000:6.0f}ms "
+              f"({'YES' if starts_with_yes else 'no '})")
+        return result
+
+    def _print_summary(self, stage_totals, n_skipped):
+        if not stage_totals.get('llm'):
+            return
+        print("\n" + "=" * 70)
+        print("PROFILE SUMMARY")
+        print("=" * 70)
+        print(f"{'stage':<10} {'count':>5} {'mean':>8} {'median':>8} {'min':>8} {'max':>8} {'total':>8}")
+        for stage in ('encode', 'llm', 'confirm'):
+            vals = stage_totals.get(stage) or []
+            if not vals:
+                continue
+            vs = sorted(vals)
+            print(f"{stage:<10} {len(vals):>5} {sum(vals)/len(vals)*1000:>7.0f}ms "
+                  f"{vs[len(vs)//2]*1000:>7.0f}ms {vs[0]*1000:>7.0f}ms {vs[-1]*1000:>7.0f}ms "
+                  f"{sum(vals):>7.1f}s")
+        print(f"\nFrames analyzed: {len(stage_totals['llm'])}   "
+              f"skipped (scene-stable): {n_skipped}")
+        print("=" * 70 + "\n")
+
+    # ----------------------------------------------------------------- engines
+    def _run_llm(self):
+        """LLM-only: walk every interval frame and ask the VLM (brute force)."""
         import time
         import numpy as np
         from collections import defaultdict
 
-        stage_totals = defaultdict(list)  # stage_name -> [duration_seconds, ...]
-        n_skipped = 0  # frames skipped by content-aware sampling
+        stage_totals = defaultdict(list)
+        n_skipped = 0
+        results = []
+        num = min(int(self.analyzer.duration / self.interval) + 1, self.max_seeks)
+        timestamps = [self.start_time + i * self.interval for i in range(num)]
 
-        try:
-            results = []
-            num_analyses = min(int(self.analyzer.duration / self.interval) + 1, self.max_seeks)
-            timestamps = [self.start_time + i * self.interval for i in range(num_analyses)]
-            
-            for i, timestamp in enumerate(timestamps):
-                if self._cancel_token.is_cancelled:
-                    break
-                if timestamp > self.analyzer.duration + 0.1:
-                    break
-                
-                frame_t0 = time.perf_counter()
-                self.progress.emit(i + 1, len(timestamps), timestamp, f"Analyzing {timestamp:.1f}s")
-                
-                # ── STAGE 1: seek + decode frame ──
-                t0 = time.perf_counter()
-                self.analyzer.current_time = timestamp
-                frame = self.analyzer.seek_to_time(timestamp)
-                t_seek = time.perf_counter() - t0
-                stage_totals['seek'].append(t_seek)
-                
-                if frame is None:
-                    print(f"[t={timestamp:6.1f}s] seek failed")
-                    continue
+        for i, timestamp in enumerate(timestamps):
+            if self._cancel_token.is_cancelled or timestamp > self.analyzer.duration + 0.1:
+                break
+            self.progress.emit(i + 1, len(timestamps), timestamp, f"Analyzing {timestamp:.1f}s")
+            self.analyzer.current_time = timestamp
+            frame = self.analyzer.seek_to_time(timestamp)
+            if frame is None:
+                print(f"[t={timestamp:6.1f}s] seek failed")
+                continue
 
-                # ── Content-aware skip: don't re-encode a near-identical frame ──
-                # The vision encoder (~3s) runs on every analyzed frame, so the
-                # biggest win is not analyzing frames that barely changed since the
-                # last one we did analyze. The stride-downscale + grayscale below is
-                # ONLY for this cheap difference metric — the full-resolution frame
-                # is what gets sent to the model, preserving accuracy.
-                scene_diff = -1.0  # -1 = no previous analyzed frame to compare
-                if self.scene_threshold > 0:
-                    small = frame[::8, ::8]
-                    small = small.mean(axis=2).astype('float32') if small.ndim == 3 else small.astype('float32')
-                    if (self._prev_small is not None
-                            and small.shape == self._prev_small.shape):
-                        scene_diff = float(np.abs(small - self._prev_small).mean())
-                        if scene_diff < self.scene_threshold:
-                            n_skipped += 1
-                            print(f"[t={timestamp:6.1f}s] skipped (scene Δ={scene_diff:4.1f} < {self.scene_threshold})")
-                            continue
-                    self._prev_small = small
-
-                # Report frame size — useful to know how big the JPEG is
-                try:
-                    h, w = frame.shape[:2]
-                    frame_dims = f"{w}x{h}"
-                except Exception:
-                    frame_dims = "?"
-                
-                # ── STAGE 2: encode to base64 JPEG ──
-                t0 = time.perf_counter()
-                frame_b64 = self.analyzer.frame_to_base64(frame)
-                t_encode = time.perf_counter() - t0
-                stage_totals['encode'].append(t_encode)
-                b64_kb = len(frame_b64) / 1024
-                
-                if self._cancel_token.is_cancelled:
-                    break
-                
-                try:
-                    # ── STAGE 3: presence check (cheap) ──
-                    # Two-phase to keep the common case fast: first a one-word
-                    # YES/NO presence check with a tiny token budget, then a
-                    # descriptive call ONLY on a positive hit. Frames are sent at
-                    # full resolution — this vision model loses accuracy badly when
-                    # downscaled (see VideoSeekAnalyzer.frame_to_base64), so we cut
-                    # generation cost via max_tokens, never via image size.
-                    t0 = time.perf_counter()
-                    response = self.analyzer.llm.query(
-                        user_message=f"Does this frame contain a {self.target}? Answer with only one word: YES or NO.",
-                        frame_base64=frame_b64,
-                        system_prompt=LLMModule.SYSTEM_PROMPT_VISUAL_SEARCH,
-                        temperature=0.0,
-                        max_tokens=5,
-                        cancellation_token=self._cancel_token,
-                    )
-                    t_llm = time.perf_counter() - t0
-                    stage_totals['llm'].append(t_llm)
-
-                    response_stripped = response.strip().lower()
-                    starts_with_yes = response_stripped.startswith("yes")
-
-                    # ── STAGE 3b: describe the scene only when the target is present ──
-                    analysis_text = response
-                    t_confirm = 0.0
-                    if starts_with_yes:
-                        t0 = time.perf_counter()
-                        analysis_text = self.analyzer.llm.query(
-                            user_message=f"This frame contains a {self.target}. Briefly describe what you see.",
-                            frame_base64=frame_b64,
-                            system_prompt=LLMModule.SYSTEM_PROMPT_VISUAL_SEARCH,
-                            temperature=0.0,
-                            max_tokens=150,
-                            cancellation_token=self._cancel_token,
-                        )
-                        t_confirm = time.perf_counter() - t0
-                        stage_totals['confirm'].append(t_confirm)
-
-                    # ── STAGE 4: post-processing + signal emit ──
-                    t0 = time.perf_counter()
-                    result = {
-                        "timestamp": timestamp,
-                        "timestamp_str": f"{int(timestamp)//60}:{int(timestamp)%60:02d}",
-                        "analysis": analysis_text,
-                        "contains_target": starts_with_yes,
-                    }
-                    results.append(result)
-
-                    self.frame_analyzed.emit(
-                        timestamp, result["timestamp_str"], analysis_text,
-                        result["contains_target"]
-                    )
-                    t_post = time.perf_counter() - t0
-                    stage_totals['post'].append(t_post)
-
-                    t_total = time.perf_counter() - frame_t0
-
-                    # Per-frame log line
-                    print(
-                        f"[t={timestamp:6.1f}s] {frame_dims} {b64_kb:5.0f}KB Δ={scene_diff:5.1f} | "
-                        f"seek={t_seek*1000:6.0f}ms  "
-                        f"encode={t_encode*1000:5.0f}ms  "
-                        f"llm={t_llm*1000:6.0f}ms  "
-                        f"confirm={t_confirm*1000:6.0f}ms  "
-                        f"post={t_post*1000:4.0f}ms  "
-                        f"TOTAL={t_total*1000:6.0f}ms "
-                        f"({'YES' if starts_with_yes else 'no '})"
-                    )
-
-                    if result["contains_target"]:
-                        self.found.emit(timestamp, result["timestamp_str"], analysis_text)
-                        if self.stop_on_first_match:
-                            break
-                
-                except GenerationCancelled:
-                    break
-                except Exception as e:
-                    print(f"Error at {timestamp:.1f}s: {e}")
-            
-            # ── Aggregate summary ──
-            if stage_totals['llm']:
-                print("\n" + "="*70)
-                print("PROFILE SUMMARY")
-                print("="*70)
-                print(f"{'stage':<10} {'count':>5} {'mean':>8} {'median':>8} {'min':>8} {'max':>8} {'total':>8}")
-                for stage in ('seek', 'encode', 'llm', 'confirm', 'post'):
-                    vals = stage_totals[stage]
-                    if not vals:
+            # content-aware skip (cheap downscaled diff; never sent to the model)
+            scene_diff = -1.0
+            if self.scene_threshold > 0:
+                small = frame[::8, ::8]
+                small = small.mean(axis=2).astype('float32') if small.ndim == 3 else small.astype('float32')
+                if self._prev_small is not None and small.shape == self._prev_small.shape:
+                    scene_diff = float(np.abs(small - self._prev_small).mean())
+                    if scene_diff < self.scene_threshold:
+                        n_skipped += 1
+                        print(f"[t={timestamp:6.1f}s] skipped (scene Δ={scene_diff:4.1f} < {self.scene_threshold})")
                         continue
-                    vals_sorted = sorted(vals)
-                    mean_ms = (sum(vals)/len(vals)) * 1000
-                    median_ms = vals_sorted[len(vals)//2] * 1000
-                    min_ms = vals_sorted[0] * 1000
-                    max_ms = vals_sorted[-1] * 1000
-                    total_s = sum(vals)
-                    print(f"{stage:<10} {len(vals):>5} {mean_ms:>7.0f}ms {median_ms:>7.0f}ms "
-                        f"{min_ms:>7.0f}ms {max_ms:>7.0f}ms {total_s:>7.1f}s")
-                
-                print(f"\nFrames analyzed: {len(stage_totals['llm'])}   "
-                      f"skipped (scene-stable): {n_skipped}")
+                self._prev_small = small
 
-                # What fraction of time is on the GPU vs everywhere else
-                llm_total = sum(stage_totals['llm'])
-                other_total = sum(sum(stage_totals[s]) for s in ('seek', 'encode', 'post'))
-                grand_total = llm_total + other_total
-                if grand_total > 0:
-                    print(f"\nLLM stage : {llm_total:.1f}s ({llm_total/grand_total*100:.0f}%)")
-                    print(f"Other CPU : {other_total:.1f}s ({other_total/grand_total*100:.0f}%)")
-                print("="*70 + "\n")
-            
-            self.finished.emit(results)
-            
+            if self._cancel_token.is_cancelled:
+                break
+            try:
+                result = self._vlm_analyze(timestamp, frame, stage_totals, scene_diff)
+            except GenerationCancelled:
+                break
+            except Exception as e:
+                print(f"Error at {timestamp:.1f}s: {e}")
+                continue
+            if result is None:
+                break
+            results.append(result)
+            if result["contains_target"]:
+                self.found.emit(timestamp, result["timestamp_str"], result["analysis"])
+                if self.stop_on_first_match:
+                    break
+
+        self._print_summary(stage_totals, n_skipped)
+        self.finished.emit(results)
+
+    def _clip_scan(self):
+        """Score every interval frame with CLIP on the GPU. Returns a list of
+        (timestamp, score) sorted by score desc, or None if CLIP is unavailable."""
+        import time
+        try:
+            from .clip_prefilter import ClipFramePrefilter
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(f"CLIP prefilter import failed: {e}")
+            return None
+        if not ClipFramePrefilter.available():
+            self.error.emit('CLIP deps missing — pip install "optimum[openvino]" pillow')
+            return None
+
+        if self._clip is None:
+            self.progress.emit(0, 1, self.start_time,
+                               "Loading CLIP on GPU (first run downloads the model)...")
+            self._clip = ClipFramePrefilter(device=self.clip_device)
+            self._clip.load()
+        self._clip.set_query(self.target)
+
+        num = min(int(self.analyzer.duration / self.interval) + 1, self.max_seeks)
+        timestamps = [self.start_time + i * self.interval for i in range(num)
+                      if self.start_time + i * self.interval <= self.analyzer.duration + 0.1]
+
+        scored, buf_f, buf_t = [], [], []
+        BATCH = 16
+        t0 = time.perf_counter()
+        for i, ts in enumerate(timestamps):
+            if self._cancel_token.is_cancelled:
+                break
+            self.analyzer.current_time = ts
+            frame = self.analyzer.seek_to_time(ts)
+            if frame is None:
+                continue
+            buf_f.append(frame)
+            buf_t.append(ts)
+            if len(buf_f) >= BATCH:
+                for t, s in zip(buf_t, self._clip.score_frames_bgr(buf_f)):
+                    scored.append((t, s))
+                buf_f, buf_t = [], []
+            if i % 10 == 0:
+                self.progress.emit(i + 1, len(timestamps), ts, f"CLIP scan {ts:.0f}s")
+        if buf_f and not self._cancel_token.is_cancelled:
+            for t, s in zip(buf_t, self._clip.score_frames_bgr(buf_f)):
+                scored.append((t, s))
+
+        elapsed = time.perf_counter() - t0
+        print(f"\nCLIP scan: {len(scored)} frames in {elapsed:.1f}s "
+              f"({elapsed/max(1,len(scored))*1000:.1f} ms/frame) on {self._clip.device}")
+        scored.sort(key=lambda x: -x[1])
+        return scored
+
+    def _run_clip(self):
+        """CLIP-only: return the top_k frames ranked by similarity (no VLM)."""
+        scored = self._clip_scan()
+        if scored is None:
+            return
+        top = scored[:self.top_k]
+        print(f"CLIP: top {len(top)} of {len(scored)} frames "
+              f"(scores {top[0][1]:.2f}..{top[-1][1]:.2f})" if top else "CLIP: no frames")
+        results = []
+        for ts, score in sorted(top, key=lambda x: x[0]):  # chronological for playback
+            tstr = f"{int(ts)//60}:{int(ts)%60:02d}"
+            analysis = f"CLIP match (similarity {score:.2f})"
+            results.append({"timestamp": ts, "timestamp_str": tstr,
+                            "analysis": analysis, "contains_target": True,
+                            "clip_score": score})
+            self.frame_analyzed.emit(ts, tstr, analysis, True)
+            self.found.emit(ts, tstr, analysis)
+        self.finished.emit(results)
+
+    def _run_clip_llm(self):
+        """CLIP ranks all frames on the GPU; the VLM confirms only the top_k."""
+        from collections import defaultdict
+        scored = self._clip_scan()
+        if scored is None:
+            return
+        candidates = scored[:self.top_k]
+        print(f"CLIP+LLM: confirming top {len(candidates)} candidates with the VLM")
+
+        stage_totals = defaultdict(list)
+        results = []
+        for rank, (ts, score) in enumerate(candidates):  # strongest first
+            if self._cancel_token.is_cancelled:
+                break
+            self.progress.emit(rank + 1, len(candidates), ts,
+                               f"VLM confirm {ts:.0f}s (CLIP {score:.2f})")
+            self.analyzer.current_time = ts
+            frame = self.analyzer.seek_to_time(ts)
+            if frame is None:
+                continue
+            try:
+                result = self._vlm_analyze(ts, frame, stage_totals)
+            except GenerationCancelled:
+                break
+            except Exception as e:
+                print(f"Error at {ts:.1f}s: {e}")
+                continue
+            if result is None:
+                break
+            result["clip_score"] = score
+            results.append(result)
+            if result["contains_target"]:
+                self.found.emit(ts, result["timestamp_str"], result["analysis"])
+                if self.stop_on_first_match:
+                    break
+
+        self._print_summary(stage_totals, 0)
+        self.finished.emit(results)
 
 # Keywords that indicate the user wants visual/frame analysis
 _VISION_KEYWORDS = (
@@ -560,6 +646,44 @@ class LLMChatWidget(QWidget):
         )
         search_layout.addWidget(self.search_interval)
         
+        # Engine selector: CLIP (fast GPU ranker) / LLM (VLM) / CLIP+LLM (funnel)
+        search_layout.addWidget(QLabel("Engine:"))
+        self.search_engine_combo = QComboBox()
+        self.search_engine_combo.addItem("CLIP + LLM", "clip_llm")
+        self.search_engine_combo.addItem("CLIP only", "clip")
+        self.search_engine_combo.addItem("LLM only", "llm")
+        self.search_engine_combo.setToolTip(
+            "CLIP only  : fast GPU similarity ranking; best for broad concepts.\n"
+            "LLM only   : the vision model checks every frame (slow, reasons, uncensored).\n"
+            "CLIP + LLM : CLIP ranks all frames on the GPU, the LLM confirms the top-K."
+        )
+        self.search_engine_combo.currentIndexChanged.connect(self._on_search_engine_changed)
+        search_layout.addWidget(self.search_engine_combo)
+
+        self.search_topk_label = QLabel("Top-K:")
+        search_layout.addWidget(self.search_topk_label)
+        self.search_topk = QSpinBox()
+        self.search_topk.setRange(1, 1000)
+        self.search_topk.setValue(30)
+        self.search_topk.setToolTip(
+            "How many top CLIP candidates to keep (CLIP only) or send to the LLM "
+            "to confirm (CLIP + LLM). Higher = better recall, slower."
+        )
+        search_layout.addWidget(self.search_topk)
+        self.search_topk.valueChanged.connect(self._save_search_prefs)
+
+        # Restore last-used engine + Top-K (first run defaults to CLIP only —
+        # frictionless, needs no connected model).
+        _ss = QSettings(self.SETTINGS_KEY, "LLMChat")
+        _eidx = self.search_engine_combo.findData(_ss.value("search_engine", "clip"))
+        if _eidx >= 0:
+            self.search_engine_combo.setCurrentIndex(_eidx)
+        try:
+            self.search_topk.setValue(int(_ss.value("search_topk", 30)))
+        except (TypeError, ValueError):
+            pass
+        self._on_search_engine_changed()  # sync Top-K visibility to restored engine
+
         # Add "stop on first match" checkbox
         self.stop_on_match_cb = QCheckBox("Stop on find")
         self.stop_on_match_cb.setChecked(True)
@@ -568,7 +692,7 @@ class LLMChatWidget(QWidget):
             "When unchecked, search scans entire video and reports all matches."
         )
         search_layout.addWidget(self.stop_on_match_cb)
-        
+
         self.search_btn = QPushButton("🔍 Search")
         self.search_btn.setStyleSheet(
             "QPushButton{background:#FF9800;color:white;font-weight:bold;padding:6px 12px;border-radius:4px;}"
@@ -797,14 +921,17 @@ class LLMChatWidget(QWidget):
 
     # ------------------------------------------------ Analyzer initialization
 
-    def _init_analyzer(self, video_path: str = None):
-        """Initialize VideoSeekAnalyzer for visual operations."""
+    def _init_analyzer(self, video_path: str = None, require_llm: bool = True):
+        """Initialize VideoSeekAnalyzer for visual operations.
+
+        require_llm=False allows CLIP-only search, which never touches the VLM.
+        """
         path = video_path or self._video_path
         if not path or not os.path.exists(path):
             return False
-        
-        if not self._llm or not self._llm.is_loaded():
-            self._append_system("⚠️ LLM not connected. Visual search requires a connected vision model.")
+
+        if require_llm and (not self._llm or not self._llm.is_loaded()):
+            self._append_system("⚠️ LLM not connected. This engine requires a connected vision model.")
             return False
         
         try:
@@ -820,17 +947,45 @@ class LLMChatWidget(QWidget):
 
     # ------------------------------------------------ Visual search
 
+    def _on_search_engine_changed(self):
+        """Top-K only applies to the CLIP-based engines; hide it for LLM-only."""
+        engine = self.search_engine_combo.currentData()
+        is_clip = engine in ("clip", "clip_llm")
+        self.search_topk_label.setVisible(is_clip)
+        self.search_topk.setVisible(is_clip)
+        self._save_search_prefs()
+
+    def _save_search_prefs(self):
+        """Persist the engine + Top-K so they're remembered next session."""
+        try:
+            s = QSettings(self.SETTINGS_KEY, "LLMChat")
+            s.setValue("search_engine", self.search_engine_combo.currentData())
+            s.setValue("search_topk", self.search_topk.value())
+        except Exception:
+            pass
+
     def _start_visual_search(self):
         """Start visual search for target in video."""
         target = self.search_target.text().strip()
         if not target:
             self._append_system("❌ Please enter something to search for")
             return
-        
+
+        engine = self.search_engine_combo.currentData()  # "clip_llm" | "clip" | "llm"
+        top_k = self.search_topk.value()
+
         if not self._analyzer:
-            if not self._init_analyzer():
+            if not self._init_analyzer(require_llm=(engine != "clip")):
                 self._append_system("❌ Cannot start search: No video loaded or analyzer not ready")
                 return
+
+        # Engines that use the VLM need a live model. The analyzer may have been
+        # created earlier by a CLIP-only run (with no LLM), so sync the current one.
+        if engine != "clip":
+            if not self._llm or not self._llm.is_loaded():
+                self._append_system("⚠️ This engine needs a connected vision model. Connect one, or use CLIP only.")
+                return
+            self._analyzer.llm = self._llm
         
         if self._search_worker_thread and self._search_worker_thread.isRunning():
             # Cancel the previous worker. The QObject+moveToThread pattern
@@ -868,8 +1023,13 @@ class LLMChatWidget(QWidget):
             if hasattr(scene, 'clear_visual_findings'):
                 scene.clear_visual_findings(query=target)
 
-        self._append_system(f"🔍 Starting visual search for '{target}' from {start_str} every {interval}s ({mode_str})...")
-        self.search_progress.setText(f"Searching for '{target}'...")
+        engine_label = {"clip_llm": "CLIP+LLM", "clip": "CLIP", "llm": "LLM"}.get(engine, engine)
+        extra = f", top-{top_k}" if engine in ("clip", "clip_llm") else ""
+        self._append_system(
+            f"🔍 [{engine_label}{extra}] searching for '{target}' from {start_str} "
+            f"every {interval}s ({mode_str})..."
+        )
+        self.search_progress.setText(f"Searching for '{target}' [{engine_label}]...")
         self.search_btn.setEnabled(False)
         self.stop_search_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)  # Also enable main Stop button
@@ -882,6 +1042,8 @@ class LLMChatWidget(QWidget):
             max_seeks=max_seeks,
             stop_on_first_match=stop_on_match,
             start_time=start_from,
+            mode=engine,
+            top_k=top_k,
         )
         self._search_worker.moveToThread(self._search_worker_thread)
 
