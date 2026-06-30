@@ -599,11 +599,35 @@ class LLMChatWidget(QWidget):
         self.mmproj_path_input.setText(settings.value("last_mmproj_path", ""))
 
 
-        # Row 4: context indicator + Load Cache + Show Context
+        # Row 4: context indicator + reasoning controls + Load Cache + Show Context.
+        # The reasoning toggle/buttons share this row (rather than a dedicated row
+        # of their own) so the compact LLM panel doesn't overflow and clip its
+        # lower controls below the panel's action bar when there's no context.
         row4 = QHBoxLayout()
         self.context_label = QLabel("No video context")
         self.context_label.setStyleSheet("color:#f44336;font-size:9pt;font-weight:bold;")
         row4.addWidget(self.context_label)
+
+        self.reasoning_checkbox = QCheckBox("Enable reasoning")
+        self.reasoning_checkbox.setChecked(True)
+        self.reasoning_checkbox.setToolTip(
+            "When enabled, the LLM will infer relationships between detected objects and actions\n"
+            "Examples: 'Person is punching person', 'Person drinking from cup', 'Multiple people talking'"
+        )
+        row4.addWidget(self.reasoning_checkbox)
+
+        self.reasoning_stats_btn = QPushButton("📊 Stats")
+        self.reasoning_stats_btn.setFixedWidth(60)
+        self.reasoning_stats_btn.setToolTip("Show reasoning statistics")
+        self.reasoning_stats_btn.clicked.connect(self._show_reasoning_stats)
+        row4.addWidget(self.reasoning_stats_btn)
+
+        self.reasoning_save_btn = QPushButton("💾 Save")
+        self.reasoning_save_btn.setFixedWidth(60)
+        self.reasoning_save_btn.setToolTip("Save inferred facts to cache")
+        self.reasoning_save_btn.clicked.connect(self._save_reasoning_facts)
+        row4.addWidget(self.reasoning_save_btn)
+
         row4.addStretch()
 
         self.load_cache_btn = QPushButton("Load Cache")
@@ -739,31 +763,6 @@ class LLMChatWidget(QWidget):
         self.search_progress.setStyleSheet("color:#2196F3;font-style:italic;font-size:9pt;")
         settings_layout.addWidget(self.search_progress)
         
-        # ===== Reasoning controls (plain row — no group box, to save height) =====
-        reasoning_layout = QHBoxLayout()
-        self.reasoning_checkbox = QCheckBox("Enable reasoning")
-        self.reasoning_checkbox.setChecked(True)
-        self.reasoning_checkbox.setToolTip(
-            "When enabled, the LLM will infer relationships between detected objects and actions\n"
-            "Examples: 'Person is punching person', 'Person drinking from cup', 'Multiple people talking'"
-        )
-        reasoning_layout.addWidget(self.reasoning_checkbox)
-
-        self.reasoning_stats_btn = QPushButton("📊 Stats")
-        self.reasoning_stats_btn.setFixedWidth(60)
-        self.reasoning_stats_btn.setToolTip("Show reasoning statistics")
-        self.reasoning_stats_btn.clicked.connect(self._show_reasoning_stats)
-        reasoning_layout.addWidget(self.reasoning_stats_btn)
-
-        self.reasoning_save_btn = QPushButton("💾 Save")
-        self.reasoning_save_btn.setFixedWidth(60)
-        self.reasoning_save_btn.setToolTip("Save inferred facts to cache")
-        self.reasoning_save_btn.clicked.connect(self._save_reasoning_facts)
-        reasoning_layout.addWidget(self.reasoning_save_btn)
-
-        reasoning_layout.addStretch()
-        settings_layout.addLayout(reasoning_layout)
-
         settings_group.setLayout(settings_layout)
         if self._compact:
             settings_group.setMaximumHeight(450)
