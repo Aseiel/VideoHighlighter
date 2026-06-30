@@ -82,6 +82,7 @@ class SignalLabelPanel(QWidget):
         self.setCursor(Qt.ArrowCursor)
         self._labels = []        # [(name, scene_y), ...]
         self._hit_rows = []      # [(local_y_top, local_y_bot, name), ...] rebuilt in paintEvent
+        self._navigable_active = set()  # nav tracks that currently have events
         self._current_time_fn = None   # set by the window after construction
 
         signal_view.verticalScrollBar().valueChanged.connect(self.update)
@@ -90,8 +91,18 @@ class SignalLabelPanel(QWidget):
         scene = self.signal_view.scene()
         if scene and hasattr(scene, 'row_labels'):
             self._labels = list(scene.row_labels)
+            # Only treat a track as navigable if it actually has events to jump
+            # between — otherwise the ◀ ▶ arrows would do nothing.
+            self._navigable_active = set()
+            for name, fn in self._NAVIGABLE.items():
+                try:
+                    if fn(scene):
+                        self._navigable_active.add(name)
+                except Exception:
+                    pass
         else:
             self._labels = []
+            self._navigable_active = set()
         self.update()
 
     def paintEvent(self, event):
@@ -115,7 +126,7 @@ class SignalLabelPanel(QWidget):
             local_y = view_pt.y()
             mid_y   = local_y + 2   # baseline
 
-            navigable = name in self._NAVIGABLE
+            navigable = name in self._navigable_active
             top  = local_y - self._ROW_H // 2
             bot  = local_y + self._ROW_H // 2
             self._hit_rows.append((top, bot, name))
@@ -150,7 +161,7 @@ class SignalLabelPanel(QWidget):
         x, y = event.position().x(), event.position().y()
 
         for top, bot, name in self._hit_rows:
-            if top <= y <= bot and name in self._NAVIGABLE:
+            if top <= y <= bot and name in self._navigable_active:
                 # Decide arrow side
                 if x <= self._ARROW_W + 4:
                     direction = "prev"
@@ -178,7 +189,7 @@ class SignalLabelPanel(QWidget):
         x, y = event.position().x(), event.position().y()
         on_arrow = False
         for top, bot, name in self._hit_rows:
-            if top <= y <= bot and name in self._NAVIGABLE:
+            if top <= y <= bot and name in self._navigable_active:
                 if x <= self._ARROW_W + 4 or x >= self.width() - self._ARROW_W - 2:
                     on_arrow = True
                     break
@@ -2169,16 +2180,27 @@ class SignalTimelineWindow(QMainWindow):
         layer_layout = QVBoxLayout()
         
         self.layer_checkboxes = {}
+        any_hidden = False
         for layer_name in self.signal_scene.visible_layers.keys():
             display_name = layer_name.replace('_', ' ').title()
+            has_data = self.signal_scene.layer_has_data(layer_name)
             checkbox = QCheckBox(display_name)
-            checkbox.setChecked(True)
+            # Start empty signal types unchecked + hidden to reduce clutter.
+            # setChecked runs before the connect below, so it won't fire toggle_layer.
+            checkbox.setChecked(has_data)
+            if not has_data:
+                self.signal_scene.visible_layers[layer_name] = False
+                checkbox.setToolTip("No detections for this signal type")
+                any_hidden = True
             checkbox.stateChanged.connect(
                 lambda state, name=layer_name: self.toggle_layer(name, state)
             )
             layer_layout.addWidget(checkbox)
             self.layer_checkboxes[layer_name] = checkbox
-        
+
+        if any_hidden:
+            self.signal_scene.build_timeline()
+
         layer_group.setLayout(layer_layout)
         layout.addWidget(layer_group)
         

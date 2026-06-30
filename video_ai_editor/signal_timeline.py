@@ -368,9 +368,23 @@ class SignalTimelineScene(QGraphicsScene):
                 for p in self.cache_data.get('audio_peaks', [])]
 
     def _nav_timestamps_highlights(self):
+        # Mirror draw_highlights_layer's sources + formats (pipeline writes
+        # 'highlight_segments'; segments may be dicts or [start, end, score]).
+        segments = (
+            self.cache_data.get('highlight_segments')
+            or self.cache_data.get('final_segments')
+            or self.cache_data.get('highlights')
+            or self.cache_data.get('analysis', {}).get('final_segments')
+            or []
+        )
         ts = []
-        for h in self.cache_data.get('highlights', []):
-            t = h.get('start') or h.get('start_time')
+        for seg in segments:
+            if isinstance(seg, dict):
+                t = seg.get('start', seg.get('start_time'))
+            elif isinstance(seg, (list, tuple)) and len(seg) >= 1:
+                t = seg[0]
+            else:
+                continue
             if t is not None:
                 ts.append(float(t))
         return ts
@@ -382,6 +396,29 @@ class SignalTimelineScene(QGraphicsScene):
             if t is not None:
                 ts.append(float(t))
         return ts
+
+    def layer_has_data(self, key: str) -> bool:
+        """Whether a layer currently has anything to show. Used to start its
+        visibility toggle unchecked when the signal type produced no detections."""
+        if key == 'waveform':
+            return bool(self.waveform)
+        nav = {
+            'actions': self._nav_timestamps_actions,
+            'objects': self._nav_timestamps_objects,
+            'scenes': self._nav_timestamps_scenes,
+            'motion_events': self._nav_timestamps_motion_events,
+            'motion_peaks': self._nav_timestamps_motion_peaks,
+            'audio_peaks': self._nav_timestamps_audio_peaks,
+            'highlights': self._nav_timestamps_highlights,
+            'transcript': self._nav_timestamps_transcript,
+            'visual_search': self._nav_timestamps_visual_search,
+        }.get(key)
+        if nav is None:
+            return True  # unknown layer → leave it visible
+        try:
+            return bool(nav())
+        except Exception:
+            return True
 
     def _nav_timestamps_visual_search(self):
         """Timestamps of currently-visible visual-search findings (same query +
