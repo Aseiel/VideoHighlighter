@@ -756,7 +756,6 @@ class VideoHighlighterGUI(QWidget):
         w = min(1000, screen.width() - 20)
         h = min(800, screen.height() - 20)
         self.resize(w, h)
-        self.setMaximumHeight(screen.height())
         self.move(screen.x() + (screen.width() - w) // 2, screen.y())
 
         
@@ -914,6 +913,29 @@ class VideoHighlighterGUI(QWidget):
             if os.path.exists(first_path):
                 self.update_video_duration(first_path)
 
+        # --- Live detection preview (opens a separate window) ---
+        # Added before the progress group so that expanding the progress bars
+        # (when the pipeline starts) does not push these controls off-screen.
+        self.live_preview_checkbox = QCheckBox("Live detection preview (separate window)")
+        self.live_preview_checkbox.setToolTip(
+            "Open a window showing frames + detected object boxes live while the\n"
+            "pipeline runs. Throttled and downscaled — does not slow processing."
+        )
+        self.live_preview_checkbox.toggled.connect(self._on_live_preview_toggled)
+        layout.addWidget(self.live_preview_checkbox)
+        self.preview_window = None  # DetectionPreviewWindow, created on demand
+
+        # Force reprocess — the live preview only shows frames while detection
+        # actually runs. If results are cached, detection is skipped and the
+        # preview stays blank. Tick this to ignore the cache and re-run.
+        self.force_reprocess_checkbox = QCheckBox("Force reprocess (ignore cache)")
+        self.force_reprocess_checkbox.setToolTip(
+            "Re-run analysis even if cached results exist.\n"
+            "Required for the live detection preview to show anything on an\n"
+            "already-processed video."
+        )
+        layout.addWidget(self.force_reprocess_checkbox)
+
         # --- Progress Section (hidden when idle) ---
         self.progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout()
@@ -935,29 +957,12 @@ class VideoHighlighterGUI(QWidget):
         progress_layout.addWidget(self.task_label)
 
         self.progress_group.setLayout(progress_layout)
-        self.progress_group.setMaximumHeight(0)  # collapsed by default; avoids layout jump on show
+        # Hidden when idle — the progress box only appears while a download or
+        # pipeline runs. The Basic/Advanced tabs use side-by-side layouts, so the
+        # tabs+log splitter has room to shrink when this box appears instead of
+        # pushing the Run/Cancel row and log box off the bottom of the window.
+        self.progress_group.setVisible(False)
         layout.addWidget(self.progress_group)
-
-        # --- Live detection preview (opens a separate window) ---
-        self.live_preview_checkbox = QCheckBox("Live detection preview (separate window)")
-        self.live_preview_checkbox.setToolTip(
-            "Open a window showing frames + detected object boxes live while the\n"
-            "pipeline runs. Throttled and downscaled — does not slow processing."
-        )
-        self.live_preview_checkbox.toggled.connect(self._on_live_preview_toggled)
-        layout.addWidget(self.live_preview_checkbox)
-        self.preview_window = None  # DetectionPreviewWindow, created on demand
-
-        # Force reprocess — the live preview only shows frames while detection
-        # actually runs. If results are cached, detection is skipped and the
-        # preview stays blank. Tick this to ignore the cache and re-run.
-        self.force_reprocess_checkbox = QCheckBox("Force reprocess (ignore cache)")
-        self.force_reprocess_checkbox.setToolTip(
-            "Re-run analysis even if cached results exist.\n"
-            "Required for the live detection preview to show anything on an\n"
-            "already-processed video."
-        )
-        layout.addWidget(self.force_reprocess_checkbox)
 
         # --- Tabs ---
         tabs = QTabWidget()
@@ -1117,7 +1122,10 @@ class VideoHighlighterGUI(QWidget):
 
         # --- Tab 1: Basic Settings ---
         basic_tab = QWidget()
-        basic_layout = QVBoxLayout()
+        # Grid so the two tall groups (Scoring Points / Duration) sit side by side
+        # and use horizontal space instead of stacking into one tall column that
+        # overflows the window. Mirrors the Advanced tab layout.
+        basic_layout = QGridLayout()
 
         # ── Group 1: Scoring Points ──
         points_box = QGroupBox("Scoring Points")
@@ -1157,7 +1165,7 @@ class VideoHighlighterGUI(QWidget):
         points_layout.addRow("Action points:", self.spin_action)
 
         points_box.setLayout(points_layout)
-        basic_layout.addWidget(points_box)
+        basic_layout.addWidget(points_box, 0, 0, Qt.AlignTop)
 
         # ── Group 2: Duration & Cutting ──
         duration_box = QGroupBox("Duration && Cutting")
@@ -1212,7 +1220,7 @@ class VideoHighlighterGUI(QWidget):
         duration_layout.addWidget(self.auto_seg_group)
 
         duration_box.setLayout(duration_layout)
-        basic_layout.addWidget(duration_box)
+        basic_layout.addWidget(duration_box, 0, 1, Qt.AlignTop)
 
         # ── Connect clip_time spinner to show/hide auto-seg controls ──
         def on_clip_time_changed(value):
@@ -1242,7 +1250,7 @@ class VideoHighlighterGUI(QWidget):
         self.load_objects_btn.setToolTip("Load labels from yolo_objects_labels.json")
         self.load_objects_btn.clicked.connect(self.open_object_label_selector)
         obj_layout.addWidget(self.load_objects_btn)
-        basic_layout.addLayout(obj_layout)
+        basic_layout.addLayout(obj_layout, 1, 0, 1, 2)
 
         # Action keywords
         action_kw_layout = QHBoxLayout()
@@ -1254,17 +1262,22 @@ class VideoHighlighterGUI(QWidget):
         self.load_actions_btn.setToolTip("Load labels from kinetics_400_labels.json (or custom Intel model)")
         self.load_actions_btn.clicked.connect(self.open_action_label_selector)
         action_kw_layout.addWidget(self.load_actions_btn)
-        basic_layout.addLayout(action_kw_layout)
+        basic_layout.addLayout(action_kw_layout, 2, 0, 1, 2)
 
         # Conditional action scoring checkbox
         self.actions_require_objects_chk = QCheckBox("Only score actions when objects detected")
         self.actions_require_objects_chk.setChecked(self.config_data.get("actions", {}).get("require_objects", False))
         self.actions_require_objects_chk.setToolTip("Actions will only add points if objects are also detected in that timeframe")
-        basic_layout.addWidget(self.actions_require_objects_chk)
+        basic_layout.addWidget(self.actions_require_objects_chk, 3, 0, 1, 2)
 
         self.skip_highlights_chk = QCheckBox("Skip highlights")
         self.skip_highlights_chk.setChecked(highlights_cfg.get("skip_highlights", False))
-        basic_layout.addWidget(self.skip_highlights_chk)
+        basic_layout.addWidget(self.skip_highlights_chk, 4, 0, 1, 2)
+
+        # Equal-width columns; trailing stretch row keeps groups packed at the top.
+        basic_layout.setColumnStretch(0, 1)
+        basic_layout.setColumnStretch(1, 1)
+        basic_layout.setRowStretch(5, 1)
 
         basic_tab.setLayout(basic_layout)
         tabs.addTab(basic_tab, "Basic Settings")
@@ -3145,7 +3158,14 @@ class VideoHighlighterGUI(QWidget):
         scrollbar.setValue(scrollbar.maximum())
 
     def _show_progress(self, visible=True):
-        self.progress_group.setMaximumHeight(16777215 if visible else 0)
+        # Show/hide the whole progress box. Hidden when idle so it doesn't sit
+        # there empty; the tabs+log splitter above absorbs the size change.
+        # The bars are made visible again by update_download/process_progress().
+        self.progress_group.setVisible(visible)
+        if not visible:
+            self.download_progress_bar.setVisible(False)
+            self.process_progress_bar.setVisible(False)
+            self.task_label.setText("Ready")
 
     def update_progress(self, current, total, task_name, details=""):
         # Decide which bar based on task_name or status
