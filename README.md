@@ -22,11 +22,18 @@ Optional GUI for easy interaction.
 
 ![VideoHighlighter](assets/Highlighter.png)
 ![Transcript Subtitles](assets/Transcript_Subtitles.png)
-![Transcript Subtitles](assets/TimelineViewer.png)
+
+## Timeline Viewer
+![Timeline Viewer](assets/TimelineViewer.png)
+
+## Visual Search
 ![Visual Search](assets/VisualSearch.png)
+
+## Action Recognition
 ![Action Recognition](assets/power_rangers_actions_annotated.gif)
 
-
+## Workflow Stages
+![Workflow Stages](assets/workflow_stages.png)
 
 Setup & Installation
 1. Python & FFmpeg
