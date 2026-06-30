@@ -30,6 +30,8 @@ jobs:
           python -c "import torch; print('Torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
           python -c "import openvino; import os; lib_dir = os.path.join(os.path.dirname(openvino.__file__), 'libs'); files = os.listdir(lib_dir); print('OpenVINO libs:', len(files), 'files,', round(sum(os.path.getsize(os.path.join(lib_dir,f)) for f in files)/1e6), 'MB')"
           python -c "import numpy; numpy.show_config()"
+      - name: Pre-convert CLIP to OpenVINO IR
+        run: python -m tools.export_clip_ov
       - name: Build EXE
         run: >
           pyinstaller --name "VideoHighlighter"
@@ -107,6 +109,8 @@ jobs:
           ls "$OV_LIBS"
       - name: Clear PyInstaller cache
         run: rm -rf ~/Library/Application\ Support/pyinstaller
+      - name: Pre-convert CLIP to OpenVINO IR
+        run: python -m tools.export_clip_ov
       - name: Build APP
         run: |
           pyinstaller --name "VideoHighlighter" \
