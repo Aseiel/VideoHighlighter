@@ -524,8 +524,10 @@ class LLMChatWidget(QWidget):
         # --- Settings group ---
         settings_group = QGroupBox("LLM Settings")
         settings_layout = QVBoxLayout()
+        settings_layout.setSpacing(4)
+        settings_layout.setContentsMargins(6, 6, 6, 6)
 
-        # Row 1: backend + model
+        # Row 1: backend + model + connect + status (one row to save height)
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Backend:"))
         self.backend_combo = QComboBox()
@@ -544,6 +546,19 @@ class LLMChatWidget(QWidget):
         self.refresh_btn.setFixedWidth(60)
         self.refresh_btn.clicked.connect(self._refresh_models)
         row1.addWidget(self.refresh_btn)
+
+        # Connect + status share this row (was a separate row) to save vertical space
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setStyleSheet(
+            "QPushButton{background:#4CAF50;color:white;font-weight:bold;padding:6px 16px;}"
+        )
+        self.connect_btn.clicked.connect(self._connect_llm)
+        row1.addWidget(self.connect_btn)
+
+        self.status_label = QLabel("Not connected")
+        self.status_label.setStyleSheet("color:#999;font-style:italic;")
+        row1.addWidget(self.status_label)
+        row1.addStretch()
         settings_layout.addLayout(row1)
 
         # Row 2: GGUF path (hidden by default)
@@ -580,21 +595,6 @@ class LLMChatWidget(QWidget):
         self.gguf_path_input.setText(settings.value("last_gguf_path", ""))
         self.mmproj_path_input.setText(settings.value("last_mmproj_path", ""))
 
-
-        # Row 3: connect + status
-        row3 = QHBoxLayout()
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.setStyleSheet(
-            "QPushButton{background:#4CAF50;color:white;font-weight:bold;padding:6px 16px;}"
-        )
-        self.connect_btn.clicked.connect(self._connect_llm)
-        row3.addWidget(self.connect_btn)
-
-        self.status_label = QLabel("Not connected")
-        self.status_label.setStyleSheet("color:#999;font-style:italic;")
-        row3.addWidget(self.status_label)
-        row3.addStretch()
-        settings_layout.addLayout(row3)
 
         # Row 4: context indicator + Load Cache + Show Context
         row4 = QHBoxLayout()
@@ -716,10 +716,8 @@ class LLMChatWidget(QWidget):
         self.search_progress.setStyleSheet("color:#2196F3;font-style:italic;font-size:9pt;")
         settings_layout.addWidget(self.search_progress)
         
-        # ===== Reasoning controls =====
-        reasoning_group = QGroupBox("Reasoning Engine")
+        # ===== Reasoning controls (plain row — no group box, to save height) =====
         reasoning_layout = QHBoxLayout()
-        
         self.reasoning_checkbox = QCheckBox("Enable reasoning")
         self.reasoning_checkbox.setChecked(True)
         self.reasoning_checkbox.setToolTip(
@@ -727,22 +725,21 @@ class LLMChatWidget(QWidget):
             "Examples: 'Person is punching person', 'Person drinking from cup', 'Multiple people talking'"
         )
         reasoning_layout.addWidget(self.reasoning_checkbox)
-        
+
         self.reasoning_stats_btn = QPushButton("📊 Stats")
         self.reasoning_stats_btn.setFixedWidth(60)
         self.reasoning_stats_btn.setToolTip("Show reasoning statistics")
         self.reasoning_stats_btn.clicked.connect(self._show_reasoning_stats)
         reasoning_layout.addWidget(self.reasoning_stats_btn)
-        
+
         self.reasoning_save_btn = QPushButton("💾 Save")
         self.reasoning_save_btn.setFixedWidth(60)
         self.reasoning_save_btn.setToolTip("Save inferred facts to cache")
         self.reasoning_save_btn.clicked.connect(self._save_reasoning_facts)
         reasoning_layout.addWidget(self.reasoning_save_btn)
-        
+
         reasoning_layout.addStretch()
-        reasoning_group.setLayout(reasoning_layout)
-        settings_layout.addWidget(reasoning_group)
+        settings_layout.addLayout(reasoning_layout)
 
         settings_group.setLayout(settings_layout)
         if self._compact:

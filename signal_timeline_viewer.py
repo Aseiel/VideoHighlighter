@@ -297,7 +297,6 @@ class SignalTimelineWindow(QMainWindow):
         w = min(1600, screen.width() - 20)
         h = min(1000, screen.height() - 20)
         self.resize(w, h)
-        self.setMaximumHeight(screen.height())
         self.move(screen.x() + (screen.width() - w) // 2, screen.y())
         
         # Make window semi-transparent
