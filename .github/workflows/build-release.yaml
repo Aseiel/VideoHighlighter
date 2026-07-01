@@ -63,6 +63,8 @@ jobs:
           --collect-data ultralytics
           --collect-binaries imageio_ffmpeg
           --hidden-import llm.clip_prefilter
+          --additional-hooks-dir packaging/pyinstaller-hooks
+          --exclude-module nncf
           --collect-submodules optimum
           --collect-submodules transformers
           --collect-data transformers
@@ -97,6 +99,11 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pyinstaller
+      - name: Pre-convert CLIP to OpenVINO IR
+        # Must run before the libtbb removal below — the export imports openvino,
+        # which needs libtbb.12.dylib at runtime; that lib is stripped afterwards
+        # only for the frozen bundle.
+        run: python -m tools.export_clip_ov
       - name: Fix OpenVINO problematic libraries
         run: |
           OV_LIBS=$(python -c "import openvino; import os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs'))")
@@ -109,8 +116,6 @@ jobs:
           ls "$OV_LIBS"
       - name: Clear PyInstaller cache
         run: rm -rf ~/Library/Application\ Support/pyinstaller
-      - name: Pre-convert CLIP to OpenVINO IR
-        run: python -m tools.export_clip_ov
       - name: Build APP
         run: |
           pyinstaller --name "VideoHighlighter" \
@@ -144,6 +149,8 @@ jobs:
             --collect-data ultralytics \
             --collect-binaries imageio_ffmpeg \
             --hidden-import llm.clip_prefilter \
+            --additional-hooks-dir packaging/pyinstaller-hooks \
+            --exclude-module nncf \
             --collect-submodules optimum \
             --collect-submodules transformers \
             --collect-data transformers \

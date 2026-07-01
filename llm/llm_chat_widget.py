@@ -172,7 +172,13 @@ class _VisualSearchWorker(QObject):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self.error.emit(str(e))
+            # The windowed exe has no console, so the printed traceback is
+            # invisible — put the origin (deepest frames) in the chat message.
+            frames = traceback.extract_tb(e.__traceback__)[-3:]
+            where = " < ".join(
+                f"{os.path.basename(f.filename)}:{f.lineno}" for f in reversed(frames)
+            )
+            self.error.emit(f"{e} [at {where}]")
 
     # ------------------------------------------------------------------ shared
     def _vlm_analyze(self, timestamp, frame, stage_totals, scene_diff=-1.0):
