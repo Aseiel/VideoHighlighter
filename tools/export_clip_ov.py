@@ -2,7 +2,7 @@
 
 Run this once at build time (CI does it before PyInstaller). It exports both the
 model and its processor into ``models/<BUNDLED_OV_DIRNAME>/`` so the packaged app
-can load with ``export=False`` — avoiding the runtime torch source introspection
+can load with ``export=False`` -- avoiding the runtime torch source introspection
 that fails in a frozen exe with "could not get source code".
 
     python -m tools.export_clip_ov
@@ -31,13 +31,13 @@ def main() -> int:
 
     xml = os.path.join(args.out, "openvino_model.xml")
     if os.path.isfile(xml) and not args.force:
-        print(f"✅ IR already present, skipping: {xml}")
+        print(f"[export_clip_ov] IR already present, skipping: {xml}")
         return 0
 
     from optimum.intel import OVModelForZeroShotImageClassification
     from transformers import CLIPProcessor
 
-    print(f"⏳ Exporting {args.model_id} → {args.out} (OpenVINO IR)...")
+    print(f"[export_clip_ov] Exporting {args.model_id} -> {args.out} (OpenVINO IR)...")
     os.makedirs(args.out, exist_ok=True)
     model = OVModelForZeroShotImageClassification.from_pretrained(
         args.model_id, export=True,
@@ -47,7 +47,7 @@ def main() -> int:
     CLIPProcessor.from_pretrained(args.model_id).save_pretrained(args.out)
 
     assert os.path.isfile(xml), f"export produced no {xml}"
-    print(f"✅ Done: {args.out}")
+    print(f"[export_clip_ov] Done: {args.out}")
     return 0
 
 
