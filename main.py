@@ -1,8 +1,17 @@
+import os
+import sys
+
+# Capture every print/warning/traceback from the very first import: the
+# packaged exe is --windowed (no stdout), so modules/debug_console tees all
+# output into debug.log next to the exe and can mirror it to a live console
+# window. Must run before the heavy imports below — some of them print
+# warnings worth keeping.
+from modules import debug_console
+debug_console.install()
+
 import cv2
 import json
-import os
 import subprocess
-import sys
 import threading
 import time
 import yaml
@@ -1854,6 +1863,16 @@ class VideoHighlighterGUI(QWidget):
         ctrl_layout.addWidget(self.cancel_btn)
         ctrl_layout.addWidget(self.keep_temp_chk)
         ctrl_layout.addWidget(self.timeline_btn)
+        self.debug_console_chk = QCheckBox("Debug log")
+        self.debug_console_chk.setChecked(debug_console.is_console_visible())
+        self.debug_console_chk.setToolTip(
+            "Open a live window mirroring all app output\n"
+            "(recent output is replayed, so it works after an error too).\n"
+            f"Everything is always saved to:\n{debug_console.log_file_path()}"
+        )
+        self.debug_console_chk.toggled.connect(debug_console.set_console_visible)
+        debug_console.register_checkbox(self.debug_console_chk)
+        ctrl_layout.addWidget(self.debug_console_chk)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.run_btn)
         layout.addLayout(ctrl_layout)
@@ -4148,6 +4167,9 @@ if __name__ == "__main__":
     os.environ.setdefault("QT_FFMPEG_DECODING_HWACCEL", "none")
     os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.ffmpeg=false")
     app = QApplication(sys.argv)
+    # Reopen the live debug-log window if it was on last session (needs the
+    # QApplication, hence here and not earlier).
+    debug_console.restore_console_preference()
     gui = VideoHighlighterGUI()
     gui.show()
     exit_code = app.exec()

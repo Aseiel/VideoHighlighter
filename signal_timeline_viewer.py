@@ -1842,9 +1842,28 @@ class SignalTimelineWindow(QMainWindow):
         # Current time display
         self.time_label = QLabel("No time selected")
         self.time_label.setStyleSheet("color: #ff8080; font-family: Consolas; font-weight: bold;")
-        
+
         layout.addWidget(self.time_label)
-        
+
+        # Live debug-log toggle (same switch as the main GUI's checkbox —
+        # all logic lives in modules.debug_console).
+        try:
+            from modules import debug_console as _dbg
+        except Exception:
+            _dbg = None
+        if _dbg is not None:
+            self.debug_log_chk = QCheckBox("Debug log")
+            self.debug_log_chk.setChecked(_dbg.is_console_visible())
+            self.debug_log_chk.setStyleSheet("color: #c0d0ff;")
+            self.debug_log_chk.setToolTip(
+                "Open a live window mirroring all app output\n"
+                "(recent output is replayed, so it works after an error too).\n"
+                f"Everything is always saved to:\n{_dbg.log_file_path()}"
+            )
+            self.debug_log_chk.toggled.connect(_dbg.set_console_visible)
+            _dbg.register_checkbox(self.debug_log_chk)
+            layout.addWidget(self.debug_log_chk)
+
         return bar
     
     def create_filter_controls(self):
