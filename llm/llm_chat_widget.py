@@ -327,8 +327,9 @@ class _VisualSearchWorker(QObject):
         except Exception as e:
             self.error.emit(f"CLIP prefilter import failed: {e}")
             return None
-        if not ClipFramePrefilter.available():
-            self.error.emit('CLIP deps missing — pip install "optimum[openvino]" pillow')
+        reason = ClipFramePrefilter.import_error()
+        if reason is not None:
+            self.error.emit(f"CLIP unavailable — {reason}")
             return None
 
         if self._clip is None:
