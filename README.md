@@ -35,30 +35,26 @@ Optional GUI for easy interaction.
 ## Workflow Stages
 ![Workflow Stages](assets/workflow_stages.png)
 
-Setup & Installation
-1. Python & FFmpeg
-FFmpeg must be installed and available in your system PATH.
+## Installation
 
-Check FFmpeg installation:
-ffmpeg -version
+### Windows (recommended)
+Download the latest `.exe` from [Releases](link) — no Python or dependencies required.
 
-2. Install Python Dependencies
-pip install -r requirements.txt
+### Linux / Building from Source
+1. **Python & FFmpeg**
+   FFmpeg must be installed and available in your system PATH.
 
-Dependencies include:
-numpy, torch, opencv-python, tqdm, ffmpeg-python, openai-whisper, googletrans, openvino-dev
-For YOLO object detection: ultralytics
-For GUI: PySide6
-
-3. Download Models
-The code will automatically download YOLO models on first run.
-
-Usage
+## Usage
 Linux: python main.py 
 Windows: run Videohighlighter.exe
+Mac: I think not working, will fix it one day. DMG file is still generated
+
+## Discord
+VideoHighlighter occasionally has feelings about your footage. When it does:
+[Join the Discord](https://discord.gg/cUPJqPAMmm) and yell in #support, I'm usually around.
 
 
-Notes
+## Notes
 
 OpenAI Whisper is MIT licensed — freely usable.
 
@@ -67,17 +63,14 @@ Google Translate API is optional. If using unofficial libraries (googletrans), n
 This project does not include any paid API keys. Users must provide their own if using official services.
 
 
-
-License
+## License
 
 This repository is released under the GNU Affero General Public License v3.0 (AGPLv3). You are free to use, modify, and distribute the code, provided that any modified versions, including those offered over a network, make their complete source code available under the same license.
 
 
-Project Background
+## Project Background
 
 This project started as a personal tool to automatically generate subtitles for videos, for my young 7 years old son. Over time, it evolved into a highlights generator for movies, sports, and personal videos.
-
-⚠️ Note: Development may be slow, minimal or none in the future, due to time constraints and family responsibilities. Contributions and improvements from the community are welcome!
 
 The primary goal remains practical: speed up video analysis, generate highlights, and create accessible subtitles automatically.
 
