@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
+import sys
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -24,6 +26,11 @@ from queue import Empty, Queue
 import cv2
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
+
+try:
+    from modules.app_paths import ffmpeg_exe
+except Exception:  # pragma: no cover - fall back to OpenCV-only extraction
+    ffmpeg_exe = None
 
 
 # Quantize hover times to 100ms buckets so we don't extract near-duplicate frames
@@ -51,6 +58,7 @@ class ThumbnailCache(QObject):
         cache_dir: str = "./cache/thumbnails",
         mem_limit: int = 300,
         vr_mode: bool = False,
+        n_workers: int = 3,
     ):
         super().__init__()
         self.video_path = str(video_path)
@@ -75,10 +83,23 @@ class ThumbnailCache(QObject):
         # for cross-thread signal emissions, so the slot runs on the main thread.
         self._image_ready.connect(self._on_image_ready, Qt.QueuedConnection)
 
-        self._worker = threading.Thread(
-            target=self._worker_loop, daemon=True, name="ThumbnailWorker"
-        )
-        self._worker.start()
+        # ffmpeg is the fast path (scaled/cropped decode); OpenCV is the fallback.
+        self._ffmpeg = ffmpeg_exe() if ffmpeg_exe is not None else None
+        # Self-disables after the first hwaccel failure so we don't keep paying
+        # for a doomed GPU attempt on systems where it isn't usable.
+        self._use_hwaccel = True
+
+        # Multiple workers: each ffmpeg extraction is independent (its own fast
+        # seek), so high-res VR filmstrips fill in parallel instead of crawling
+        # through one thread.
+        self._workers = []
+        for i in range(max(1, n_workers)):
+            t = threading.Thread(
+                target=self._worker_loop, daemon=True,
+                name=f"ThumbnailWorker-{i}",
+            )
+            t.start()
+            self._workers.append(t)
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -156,76 +177,144 @@ class ThumbnailCache(QObject):
         return hashlib.md5(sig.encode("utf-8")).hexdigest()[:16]
 
     def _worker_loop(self):
-        """Background thread: pull keys, sort by time, extract frames."""
-        cap = None
-        try:
-            while not self._stopped:
-                # Block for the first key
-                try:
-                    first = self._queue.get(timeout=0.5)
-                except Empty:
-                    continue
+        """Background thread: pull one key at a time and extract it.
 
-                # Drain everything else that's already waiting, then sort by time.
-                # Forward seeks are much cheaper than backward seeks.
-                batch = [first]
-                try:
-                    while True:
-                        batch.append(self._queue.get_nowait())
-                except Empty:
-                    pass
-                batch.sort(key=lambda k: k[0])  # by time_ms
+        Each extraction is an independent ffmpeg fast-seek, so several workers
+        can run at once without sharing a VideoCapture — this is what keeps high
+        resolution VR filmstrips from serializing every full-res decode through a
+        single thread.
+        """
+        while not self._stopped:
+            try:
+                key = self._queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if self._stopped:
+                break
+            try:
+                self._extract_one(key)
+            except Exception as e:
+                with self._lock:
+                    self._in_flight.discard(key)
+                print(f"⚠️ ThumbnailCache extract failed: {e}")
 
-                # Lazy-open capture once
-                if cap is None:
-                    cap = cv2.VideoCapture(self.video_path)
-                    if not cap.isOpened():
-                        print(f"⚠️ ThumbnailCache: cannot open {self.video_path}")
-                        return
+    def _extract_one(self, key):
+        """Extract, persist, and emit a single thumbnail.
 
-                for key in batch:
-                    if self._stopped:
-                        break
-                    self._extract_one(cap, key)
-        finally:
-            if cap is not None:
-                cap.release()
-
-    def _extract_one(self, cap, key):
-        """Extract, persist, and emit a single thumbnail."""
+        Fast path: ffmpeg decodes a single keyframe already scaled (and VR
+        cropped) to the tiny target size, writing straight to the disk cache.
+        Fallback: OpenCV full-frame decode + resize, used only when ffmpeg is
+        unavailable or fails for this frame.
+        """
         time_ms, height = key
+        out_path = self._disk_path(key)
 
-        cap.set(cv2.CAP_PROP_POS_MSEC, time_ms)
-        ok, frame = cap.read()
+        frame = None
+        if self._extract_via_ffmpeg(time_ms, height, out_path):
+            frame = cv2.imread(str(out_path))
+
+        if frame is None:
+            frame = self._extract_via_opencv(time_ms, height)
+            if frame is not None:
+                try:
+                    cv2.imwrite(
+                        str(out_path), frame,
+                        [cv2.IMWRITE_JPEG_QUALITY, 60],
+                    )
+                except Exception as e:
+                    print(f"⚠️ ThumbnailCache disk write failed: {e}")
 
         with self._lock:
             self._in_flight.discard(key)
 
-        if not ok or frame is None:
+        if frame is None:
             return
+
+        h, w = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        self._image_ready.emit(time_ms, height, qimg)
+
+    def _extract_via_ffmpeg(self, time_ms: int, height: int, out_path: Path) -> bool:
+        """Decode one frame with ffmpeg, scaled (and VR-cropped) to `height`.
+
+        Input seeking (-ss before -i) makes ffmpeg jump to the nearest keyframe
+        and decode ~one frame instead of a whole GOP — the key win on very high
+        resolution VR footage. The crop/scale run inside the decode filter, so a
+        full 8K frame is never handed back to Python.
+        """
+        if not self._ffmpeg:
+            return False
+
+        seconds = max(0.0, time_ms / 1000.0)
+        if self._vr_mode:
+            # Crop the left eye first, then scale — half the pixels to scale.
+            vf = f"crop=iw/2:ih:0:0,scale=-2:{height}"
+        else:
+            vf = f"scale=-2:{height}"
+
+        # Try hardware-accelerated decode first; if it ever fails, remember that
+        # and stick to software decode for the rest of the session.
+        attempts = [True, False] if self._use_hwaccel else [False]
+        for use_hw in attempts:
+            cmd = [self._ffmpeg, "-nostdin", "-v", "error"]
+            if use_hw:
+                cmd += ["-hwaccel", "auto"]
+            cmd += [
+                "-ss", f"{seconds:.3f}",
+                "-i", self.video_path,
+                "-frames:v", "1",
+                "-vf", vf,
+                "-q:v", "5",
+                "-y", str(out_path),
+            ]
+            if self._run_ffmpeg(cmd) and out_path.exists():
+                return True
+            if use_hw:
+                # hwaccel path failed — don't pay for it again this session.
+                self._use_hwaccel = False
+
+        return False
+
+    def _run_ffmpeg(self, cmd: list) -> bool:
+        creationflags = 0
+        if sys.platform.startswith("win"):
+            # Keep console windows from flashing for every extraction.
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            r = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+                creationflags=creationflags,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _extract_via_opencv(self, time_ms: int, height: int):
+        """Fallback: full-frame decode + resize (slow on VR, but always works)."""
+        cap = cv2.VideoCapture(self.video_path)
+        if not cap.isOpened():
+            return None
+        try:
+            cap.set(cv2.CAP_PROP_POS_MSEC, time_ms)
+            ok, frame = cap.read()
+        finally:
+            cap.release()
+
+        if not ok or frame is None:
+            return None
 
         h, w = frame.shape[:2]
         if self._vr_mode:
             frame = frame[:, : w // 2]
             w = w // 2
-
         if h != height:
             new_w = max(1, int(round(w * height / h)))
             frame = cv2.resize(frame, (new_w, height), interpolation=cv2.INTER_AREA)
-            h, w = frame.shape[:2]
-
-        try:
-            cv2.imwrite(
-                str(self._disk_path(key)),
-                frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 60],  # ← lowered from 80
-            )
-        except Exception as e:
-            print(f"⚠️ ThumbnailCache disk write failed: {e}")
-
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
-        self._image_ready.emit(time_ms, height, qimg)
+        return frame
 
     def prefetch_range(self, start_time: float, end_time: float,
                     height_px: int, n_slots: int):
