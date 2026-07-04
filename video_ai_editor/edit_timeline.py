@@ -15,7 +15,7 @@ from PySide6.QtGui import (
 from .timeline_bars import TimelineBar
 
 # ── thumbnail / hover modules ─────────────────────────────────────
-from .thumbnail_cache import ThumbnailCache
+from .thumbnail_cache import ThumbnailCache, PRIORITY_HOVER
 from .hover_preview import HoverPreview
 from .filmstrip_painter import paint_filmstrip
 
@@ -464,7 +464,9 @@ class EditClipItem(QGraphicsRectItem):
                 if (hasattr(scene, '_hover_preview')
                         and scene._hover_preview is not None
                         and getattr(scene, 'thumb_cache', None) is not None):
-                    pix = scene.thumb_cache.request(source_time, HOVER_PREVIEW_HEIGHT)
+                    pix = scene.thumb_cache.request(
+                        source_time, HOVER_PREVIEW_HEIGHT, priority=PRIORITY_HOVER
+                    )
                     scene._hover_preview.show_at(
                         event.screenPos(),
                         pix,
@@ -813,22 +815,14 @@ class EditTimelineScene(QGraphicsScene):
             duration = end - start
             width = max(60, duration * self.pixels_per_second)
 
-            color = self.get_clip_color(i)
+            previous_color = self.clip_items[-1].color if self.clip_items else None
+            color = self.get_clip_color(i, previous_color=previous_color)
             # Added missing 'i' parameter for index
             clip_item = EditClipItem(start, end, y_pos, self.clip_height, color, i)
             clip_item.setRect(0, 0, width, self.clip_height)
             clip_item.setPos(current_x, y_pos)
             self.addItem(clip_item)
             self.clip_items.append(clip_item)
-
-            # ── prefetch this clip's filmstrip ─────────────────────
-            if self.thumb_cache is not None:
-                aspect = 16 / 9
-                target_slot_w = max(40, int(self.clip_height * aspect))
-                n_slots = max(1, int(width // target_slot_w))
-                self.thumb_cache.prefetch_range(
-                    start, end, self.clip_height, n_slots
-                )
 
             clip_item.update_label()
             current_x += width + self.clip_spacing
@@ -837,11 +831,56 @@ class EditTimelineScene(QGraphicsScene):
         total_width = max(1000, current_x + 20)
         self.setSceneRect(0, 0, total_width, self.clip_height + 40)
 
+        # Prefetch filmstrip thumbnails for the clips near the viewport rather
+        # than every clip up front — the worker threads should spend their time
+        # on what the user can actually see. Scrolling re-runs this (wired to the
+        # view's scrollbar in SignalTimelineWindow).
+        self.prefetch_visible()
+
         # Restore active clip overlay if playing
         if self.active_clip_index >= 0 and self.active_clip_index < len(self.clip_items):
             self._active_overlay = None
             self._progress_line = None
             self._create_active_overlay()
+
+    def prefetch_visible(self):
+        """Queue filmstrip thumbnails for the clips in (or near) the viewport.
+
+        Called on scene rebuild and on horizontal scroll. Anything on screen is
+        also requested at higher priority by paint(); this just warms the clips
+        just off the edges so they're ready by the time you scroll to them.
+        Prefetch requests sit behind on-screen ones (see PRIORITY_PREFETCH).
+        """
+        if self.thumb_cache is None or not self.clip_items:
+            return
+
+        # Visible scene rect from the attached view, widened by one viewport
+        # width on each side. If there's no view yet (or the mapping fails),
+        # fall back to prefetching everything so behaviour never regresses.
+        visible = None
+        views = self.views()
+        if views:
+            view = views[0]
+            visible = view.mapToScene(view.viewport().rect()).boundingRect()
+
+        if visible is not None:
+            margin = max(visible.width(), 1.0)
+            lo = visible.left() - margin
+            hi = visible.right() + margin
+        else:
+            lo, hi = float("-inf"), float("inf")
+
+        aspect = 16 / 9
+        target_slot_w = max(40, int(self.clip_height * aspect))
+        for item in self.clip_items:
+            box = item.sceneBoundingRect()
+            if box.right() < lo or box.left() > hi:
+                continue
+            width = item.rect().width()
+            n_slots = max(1, int(width // target_slot_w))
+            self.thumb_cache.prefetch_range(
+                item.start_time, item.end_time, self.clip_height, n_slots
+            )
 
     def draw_time_ruler(self):
         """Draw time ruler showing accumulated edit duration (gap-aware)."""
@@ -907,9 +946,10 @@ class EditTimelineScene(QGraphicsScene):
 
             t += minor
 
-    def get_clip_color(self, index):
+    def get_clip_color(self, index, previous_color=None):
         """Stable color per clip based on (start, end) — survives reorders
-        and app restarts."""
+        and app restarts. If two adjacent clips hash to the same color, move the
+        later clip to the next palette entry so equal colors are not side by side."""
         colors = [
             QColor(100, 150, 255, 220),  # Blue
             QColor(100, 255, 100, 220),  # Green
@@ -922,8 +962,13 @@ class EditTimelineScene(QGraphicsScene):
             start, end = self.clips[index]
             key = f"{round(start, 2)}_{round(end, 2)}".encode()
             color_idx = int(hashlib.md5(key).hexdigest(), 16) % len(colors)
+            if previous_color is not None and colors[color_idx] == previous_color:
+                color_idx = (color_idx + 1) % len(colors)
             return colors[color_idx]
-        return colors[index % len(colors)]
+        color_idx = index % len(colors)
+        if previous_color is not None and colors[color_idx] == previous_color:
+            color_idx = (color_idx + 1) % len(colors)
+        return colors[color_idx]
     
     def add_clip(self, start_time, end_time):
         """Add a new clip to the timeline"""

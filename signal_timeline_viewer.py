@@ -1635,7 +1635,13 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_scene.clip_trimmed.connect(self.on_clip_trimmed)
         self.edit_scene.clip_reordered.connect(self.on_clip_reordered)
 
-        
+        # Re-prioritise thumbnail extraction toward whatever scrolls into view,
+        # so the visible filmstrip fills first instead of waiting on off-screen clips.
+        self.edit_view.horizontalScrollBar().valueChanged.connect(
+            lambda _=None: self.edit_scene.prefetch_visible()
+        )
+
+
         edit_layout.addWidget(QLabel("Edit Timeline (Select clips and press Delete)"))
         edit_layout.addWidget(self.edit_view)
         
