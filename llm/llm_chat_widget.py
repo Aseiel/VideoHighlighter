@@ -990,6 +990,41 @@ class LLMChatWidget(QWidget):
         except Exception:
             pass
 
+    def _search_thread_running(self) -> bool:
+        """Whether the visual-search worker thread is alive and running.
+
+        The QThread is deleteLater'd when it finishes (finished→deleteLater), so
+        the Python attribute can outlive its C++ object. Touching .isRunning() on
+        that dead wrapper raises RuntimeError ('Internal C++ object already
+        deleted') — which is exactly the crash on a second search. Treat that as
+        'not running' and drop the stale refs so the next run starts clean."""
+        t = self._search_worker_thread
+        if t is None:
+            return False
+        try:
+            return t.isRunning()
+        except RuntimeError:
+            self._search_worker_thread = None
+            self._search_worker = None
+            return False
+
+    def _llm_thread_running(self) -> bool:
+        """Whether the LLM chat worker thread is alive and running.
+
+        Same lifecycle trap as _search_thread_running: the QThread is
+        deleteLater'd on finish, so its Python wrapper can outlive the C++
+        object and .isRunning() then raises. Treat that as 'not running' and
+        drop the stale refs."""
+        t = self._worker_thread
+        if t is None:
+            return False
+        try:
+            return t.isRunning()
+        except RuntimeError:
+            self._worker_thread = None
+            self._worker = None
+            return False
+
     def _start_visual_search(self):
         """Start visual search for target in video."""
         target = self.search_target.text().strip()
@@ -1013,7 +1048,7 @@ class LLMChatWidget(QWidget):
                 return
             self._analyzer.llm = self._llm
         
-        if self._search_worker_thread and self._search_worker_thread.isRunning():
+        if self._search_thread_running():
             # Cancel the previous worker. The QObject+moveToThread pattern
             # handles cleanup via the finished→deleteLater chain — old worker
             # finishes its current frame, emits finished, thread quits, both
@@ -1094,7 +1129,7 @@ class LLMChatWidget(QWidget):
 
     def _stop_visual_search(self):
         """Stop ongoing visual search."""
-        if self._search_worker_thread and self._search_worker_thread.isRunning():
+        if self._search_thread_running():
             self._search_worker.cancel()
             self._append_system(
                 "⏹ Stop requested — will stop after current frame finishes.\n"
@@ -1273,7 +1308,7 @@ class LLMChatWidget(QWidget):
         self.search_btn.setEnabled(True)
         self.stop_search_btn.setEnabled(False)
         # Disable main stop button too (unless a chat query is still running)
-        if not (self._worker_thread and self._worker_thread.isRunning()):
+        if not self._llm_thread_running():
             self.stop_btn.setEnabled(False)
 
     @Slot(str)
@@ -1283,7 +1318,7 @@ class LLMChatWidget(QWidget):
         self.search_progress.setText("Search failed")
         self.search_btn.setEnabled(True)
         self.stop_search_btn.setEnabled(False)
-        if not (self._worker_thread and self._worker_thread.isRunning()):
+        if not self._llm_thread_running():
             self.stop_btn.setEnabled(False)
 
     def _seek_to_timestamp(self, seconds: float):
@@ -1746,7 +1781,7 @@ class LLMChatWidget(QWidget):
         if not self._llm or not self._llm.is_loaded():
             self._append_system("Not connected. Click 'Connect' first.")
             return
-        if self._worker_thread and self._worker_thread.isRunning():
+        if self._llm_thread_running():
             self._append_system("Still generating... please wait.")
             return
         
@@ -2047,11 +2082,11 @@ class LLMChatWidget(QWidget):
         Stop takes effect after the current frame finishes processing.
         """
         stopped_something = False
-        if self._worker_thread and self._worker_thread.isRunning():
+        if self._llm_thread_running():
             if self._worker:
                 self._worker.cancel()
             stopped_something = True
-        if self._search_worker_thread and self._search_worker_thread.isRunning():
+        if self._search_thread_running():
             if self._search_worker:
                 self._search_worker.cancel()
             self.search_btn.setEnabled(True)
@@ -2161,18 +2196,16 @@ class LLMChatWidget(QWidget):
         naturally before the worker can emit finished.
         """
         # LLM worker
-        if self._worker:
+        if self._llm_thread_running():
             self._worker.cancel()
-        if self._worker_thread and self._worker_thread.isRunning():
             if not self._worker_thread.wait(5000):
                 print("⚠️ LLM thread did not stop in time, terminating")
                 self._worker_thread.terminate()
                 self._worker_thread.wait(2000)
 
         # Visual search worker
-        if self._search_worker:
+        if self._search_thread_running():
             self._search_worker.cancel()
-        if self._search_worker_thread and self._search_worker_thread.isRunning():
             if not self._search_worker_thread.wait(5000):
                 print("⚠️ Search thread did not stop in time, terminating")
                 self._search_worker_thread.terminate()
