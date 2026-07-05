@@ -37,7 +37,7 @@ except Exception:
     pass
 
 from modules.app_paths import resource_path as _resource_path, config_path
-from version import __version__
+from version import __version__, __edition__
 
 # User-editable config: lives next to the exe when frozen (so saves persist),
 # seeded from the bundled default; just the project-root file when run from source.
@@ -326,15 +326,17 @@ class DownloadWorker(QThread):
             self._is_running = False
 
     def cancel(self):
-        """Request cancellation – called from GUI"""
+        """Request cancellation – called from GUI.
+
+        Non-blocking: just trip the flag and return. run() unwinds and emits
+        cancelled/finished, which drive the UI cleanup. (Previously this called
+        self.wait()/terminate() on the GUI thread, which froze the UI and — on
+        timeout — killed the thread before it could emit its signals, leaving the
+        Download button stuck disabled. force_download_cleanup is the safety net
+        for a worker genuinely stuck in a non-cancellable subprocess.)"""
         if self._is_running:
             self.log.emit("⏹️ Cancellation requested - stopping download...")
             self._cancelled = True
-            # Give some time for graceful stop
-            if not self.wait(5000):
-                self.log.emit("⚠️ Thread did not stop gracefully → forcing termination")
-                self.terminate()
-                self.wait()
 
     def is_cancelled(self):
         """Public method used by downloader module to check cancellation"""
@@ -762,7 +764,7 @@ class RangeSlider(QWidget):
 class VideoHighlighterGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Video Highlighter v{__version__}")
+        self.setWindowTitle(f"Video Highlighter v{__version__} {__edition__}")
         screen = QApplication.primaryScreen().availableGeometry()
         w = min(1000, screen.width() - 20)
         h = min(800, screen.height() - 20)
@@ -1379,6 +1381,12 @@ class VideoHighlighterGUI(QWidget):
         self.frame_skip_spin.setToolTip("Analyze every Nth frame for motion detection (higher = faster, less precise)")
 
         motion_layout.addRow("Frame skip:", self.frame_skip_spin)
+        self.vr_mode_chk = QCheckBox("VR side-by-side optimization")
+        self.vr_mode_chk.setChecked(bool(advanced_cfg.get("vr_mode", False)))
+        self.vr_mode_chk.setToolTip(
+            "Run visual analysis on the left half only for side-by-side VR/3D videos."
+        )
+        motion_layout.addRow("", self.vr_mode_chk)
         motion_box.setLayout(motion_layout)
         advanced_layout.addWidget(motion_box, 0, 0)
 
@@ -1392,21 +1400,10 @@ class VideoHighlighterGUI(QWidget):
         self.obj_frame_skip_spin.setToolTip("Analyze every Nth frame for object detection (higher = faster, less precise)")
 
         self.yolo_type_combo = QComboBox()
-        self.yolo_type_combo.addItem("Standard YOLO11 (80 objects, fast, OpenVINO support)", "standard")
-        self.yolo_type_combo.addItem("YOLO-World (unlimited objects, no OpenVINO)", "yolo_world")
+        self.yolo_type_combo.addItem("Standard YOLOX (80 objects, fast, OpenVINO support)", "standard")
 
-        # Custom keypoint model (your trained training/train_yolo.py best.pt). Offered
-        # only if one is found. Can run on its own or alongside an object detector.
-        try:
-            from modules.app_paths import latest_custom_pose_model
-            self._custom_pose_model = latest_custom_pose_model()
-        except Exception:
-            self._custom_pose_model = None
-        if self._custom_pose_model:
-            self.yolo_type_combo.addItem("Custom keypoints only (your trained model)", "custom")
-            self.yolo_type_combo.addItem("Standard YOLO11 + Custom keypoints", "standard+custom")
-            self.yolo_type_combo.addItem("YOLO-World + Custom keypoints", "yolo_world+custom")
-            self.yolo_type_combo.setToolTip(f"Custom keypoint model:\n{self._custom_pose_model}")
+        # Pro v1 keeps pose/keypoints disabled until a permissive backend lands.
+        self._custom_pose_model = None
 
         current_type = advanced_cfg.get("yolo_type", "standard")
         idx_type = self.yolo_type_combo.findData(current_type)
@@ -1421,17 +1418,11 @@ class VideoHighlighterGUI(QWidget):
             self.yolo_model_combo.clear()
 
             custom_only = (yolo_type == "custom")
-            use_world = "yolo_world" in yolo_type
 
             if custom_only:
                 # Size applies to the object detector, which isn't used here
                 self.yolo_model_combo.addItem("(custom model — size N/A)", "n")
                 self.yolo_model_combo.setEnabled(False)
-            elif use_world:
-                self.yolo_model_combo.addItem("Small (~90MB, fastest)", "s")
-                self.yolo_model_combo.addItem("Medium (~140MB, balanced)", "m")
-                self.yolo_model_combo.addItem("Large (~180MB, most accurate)", "l")
-                self.yolo_model_combo.setEnabled(True)
             else:
                 self.yolo_model_combo.addItem("Nano (fastest, lowest accuracy)", "n")
                 self.yolo_model_combo.addItem("Small (fast, good balance)", "s")
@@ -1459,8 +1450,8 @@ class VideoHighlighterGUI(QWidget):
         self.obj_confidence_spin.setToolTip("Minimum confidence threshold for object detection (lower = more detections, more false positives)")
 
         object_layout.addRow("Frame skip:", self.obj_frame_skip_spin)
-        object_layout.addRow("YOLO type:", self.yolo_type_combo)
-        object_layout.addRow("YOLO model size:", self.yolo_model_combo)
+        object_layout.addRow("Detector type:", self.yolo_type_combo)
+        object_layout.addRow("Detector model size:", self.yolo_model_combo)
         object_layout.addRow("Confidence threshold:", self.obj_confidence_spin)
 
         object_box.setLayout(object_layout)
@@ -2379,6 +2370,7 @@ class VideoHighlighterGUI(QWidget):
             "target_lang": self.subtitle_target_lang.currentText(),
             "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
+            "vr_mode": self.vr_mode_chk.isChecked(),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
@@ -2923,6 +2915,7 @@ class VideoHighlighterGUI(QWidget):
             },
             "advanced": {
                 "frame_skip": int(self.frame_skip_spin.value()),
+                "vr_mode": self.vr_mode_chk.isChecked(),
                 "object_frame_skip": int(self.obj_frame_skip_spin.value()),
                 "sample_rate": int(self.sample_rate_spin.value()),
                 "yolo_type": self.yolo_type_combo.currentData(),
@@ -3736,8 +3729,9 @@ class VideoHighlighterGUI(QWidget):
             self.task_label.setText("⏹️ Cancelling download...")
             self.cancel_btn.setEnabled(False)
             self.cancel_btn.setText("Cancelling...")
-            self.download_worker.cancel()
-            QTimer.singleShot(10000, self.force_download_cleanup)
+            worker = self.download_worker
+            worker.cancel()
+            QTimer.singleShot(10000, lambda: self.force_download_cleanup(worker))
             return
         
         # Check if pipeline is running
@@ -3777,13 +3771,21 @@ class VideoHighlighterGUI(QWidget):
         self.run_btn.setStyleSheet("QPushButton { background-color: #ff8c00; color: white; font-weight: bold; padding: 8px; }")
         self.run_btn.setEnabled(True)  # keep enabled for pause
 
-    def force_download_cleanup(self):
-        """Force cleanup if download worker doesn't stop gracefully"""
-        if hasattr(self, 'download_worker') and self.download_worker and self.download_worker.isRunning():
+    def force_download_cleanup(self, worker=None):
+        """Safety net (fires ~10s after a cancel request) in case the worker
+        never emitted its finished/cancelled signal — e.g. it's stuck in a
+        non-cancellable subprocess. Runs download_cleanup() unconditionally so
+        the Download button always comes back."""
+        worker = worker or getattr(self, 'download_worker', None)
+        # A newer download may have replaced this worker in the meantime; don't
+        # touch it — the new download owns the UI now.
+        if worker is not getattr(self, 'download_worker', None):
+            return
+        if worker and worker.isRunning():
             self.append_log("⚠️ Forcing download termination...")
-            self.download_worker.terminate()
-            self.download_worker.wait(3000)
-            self.download_cleanup()
+            worker.terminate()
+            worker.wait(3000)
+        self.download_cleanup()
 
     def force_worker_cleanup(self):
         """Force cleanup if worker doesn't stop gracefully"""

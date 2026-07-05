@@ -1850,20 +1850,75 @@ def get_downloaded_videos(directory: str) -> List[str]:
             files.append(os.path.join(directory, fn))
     return sorted(files)
 
-def _run_ytdlp_with_progress(cmd, timeout, log_fn: Callable = print):
+def _flag_is_cancelled(flag) -> bool:
+    """True if a cancel flag has been tripped. Accepts either a threading.Event
+    (`is_set()`) or a worker object exposing `is_cancelled()`. None => never."""
+    if flag is None:
+        return False
+    try:
+        if hasattr(flag, "is_cancelled") and flag.is_cancelled():
+            return True
+        if hasattr(flag, "is_set") and flag.is_set():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _terminate_tree(proc) -> None:
+    """Kill a subprocess *and its children*. yt-dlp spawns ffmpeg (for
+    --download-sections, HLS, and muxing); ffmpeg inherits our stdout pipe, so
+    killing only yt-dlp leaves the pipe open and hangs the progress reader. On
+    Windows we use `taskkill /T` to take down the whole tree."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, check=False,
+            )
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _run_ytdlp_with_progress(cmd, timeout, log_fn: Callable = print, cancel_flag=None):
     """Run yt-dlp via Popen and stream its progress (speed / ETA / size) to log_fn
     live, throttled to ~1/sec. Returns a CompletedProcess-like result (stdout holds
     the captured output minus our machine-readable progress lines) so the existing
     downstream parsing keeps working. Expects --newline + --progress-template
     "DLP|..." to be in cmd.
+
+    If cancel_flag is provided, a watcher thread kills yt-dlp as soon as the flag
+    trips (works even if the download stalls and stops emitting lines). The result
+    carries a `.cancelled` attribute so the caller can skip fallback stages.
     """
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1, encoding="utf-8", errors="replace",
     )
-    killer = threading.Timer(timeout, proc.kill) if timeout else None
+    killer = threading.Timer(timeout, lambda: _terminate_tree(proc)) if timeout else None
     if killer:
         killer.start()
+
+    cancelled = threading.Event()
+    watcher = None
+    if cancel_flag is not None:
+        def _watch():
+            while proc.poll() is None:
+                if _flag_is_cancelled(cancel_flag):
+                    cancelled.set()
+                    _terminate_tree(proc)
+                    return
+                time.sleep(0.3)
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
+
     lines = []
     last_emit = 0.0
     try:
@@ -1885,7 +1940,11 @@ def _run_ytdlp_with_progress(cmd, timeout, log_fn: Callable = print):
         proc.wait()
         if killer:
             killer.cancel()
-    return subprocess.CompletedProcess(cmd, proc.returncode, stdout="".join(lines), stderr="")
+        if watcher:
+            watcher.join(timeout=1)
+    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout="".join(lines), stderr="")
+    result.cancelled = cancelled.is_set()
+    return result
 
 
 def download_video(
@@ -1899,7 +1958,8 @@ def download_video(
     video_index: int = 0,
     total_videos: int = 1,
     skip_existing: bool = True,
-    use_url_filename: bool = True
+    use_url_filename: bool = True,
+    cancel_flag=None
 ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
     def is_suspicious_duration(d: Optional[float]) -> bool:
         return d is None or d <= 0 or d < 5
@@ -2122,8 +2182,15 @@ def download_video(
         
         # 6. Execute download (streaming so we can show live speed / ETA)
         t0 = time.time()
-        result = _run_ytdlp_with_progress(cmd, timeout=300, log_fn=log_fn)
+        result = _run_ytdlp_with_progress(cmd, timeout=300, log_fn=log_fn, cancel_flag=cancel_flag)
         metadata["download_time"] = time.time() - t0
+
+        # User cancelled mid-download: don't fall through to fallback stages.
+        if getattr(result, "cancelled", False) or _flag_is_cancelled(cancel_flag):
+            log_fn("⏹️ Download cancelled by user")
+            metadata["cancelled"] = True
+            return False, None, metadata
+
         out_text = (result.stdout or "") + "\n" + (result.stderr or "")
         
         # Check if yt-dlp reported "already exists"
@@ -2163,6 +2230,11 @@ def download_video(
                     if line.strip():
                         log_fn(f"   {line.strip()}")
 
+            if _flag_is_cancelled(cancel_flag):
+                log_fn("⏹️ Download cancelled by user")
+                metadata["cancelled"] = True
+                return False, None, metadata
+
             # Fallback 1: simpler yt-dlp format
             log_fn("🔄 Fallback 1: simpler yt-dlp format...")
             fallback_cmd = [
@@ -2180,6 +2252,10 @@ def download_video(
             if fr.returncode == 0:
                 log_fn("✅ Fallback 1 succeeded!")
                 result = fr
+            elif _flag_is_cancelled(cancel_flag):
+                log_fn("⏹️ Download cancelled by user")
+                metadata["cancelled"] = True
+                return False, None, metadata
             else:
                 # Fallback 2: browser extracts URL, yt-dlp/ffmpeg downloads it
                 log_fn("🔄 Fallback 2: browser-based URL extraction...")
@@ -2317,7 +2393,8 @@ def download_videos_with_immediate_processing(
             process_callback=process_callback,
             video_index=1,
             total_videos=1,
-            use_url_filename=use_url_filenames
+            use_url_filename=use_url_filenames,
+            cancel_flag=cancel_flag
         )
         metadata["success"] = success
         metadata["filepath"] = filepath
@@ -2338,14 +2415,10 @@ def download_videos_with_immediate_processing(
     results: List[Dict[str, Any]] = []
     
     for idx, link in enumerate(video_links, start=1):
-        if cancel_flag:
-            if hasattr(cancel_flag, "is_cancelled") and cancel_flag.is_cancelled():
-                log_fn("⏹️ Download cancelled by user")
-                break
-            if hasattr(cancel_flag, "is_set") and cancel_flag.is_set():
-                log_fn("⏹️ Download cancelled by user")
-                break
-        
+        if _flag_is_cancelled(cancel_flag):
+            log_fn("⏹️ Download cancelled by user")
+            break
+
         if progress_fn:
             progress_fn(idx - 1, total, "Downloading Videos", f"Video {idx}/{total}")
         
@@ -2362,9 +2435,17 @@ def download_videos_with_immediate_processing(
             process_callback=process_callback,
             video_index=idx,
             total_videos=total,
-            use_url_filename=use_url_filenames
+            use_url_filename=use_url_filenames,
+            cancel_flag=cancel_flag
         )
-        
+
+        if metadata.get("cancelled"):
+            log_fn("⏹️ Download cancelled by user")
+            metadata["success"] = success
+            metadata["filepath"] = filepath
+            results.append(metadata)
+            break
+
         metadata["success"] = success
         metadata["filepath"] = filepath
         results.append(metadata)
