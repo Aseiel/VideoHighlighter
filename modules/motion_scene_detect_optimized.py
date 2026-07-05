@@ -6,6 +6,8 @@ from tqdm import tqdm
 import queue
 import threading
 
+from modules.video_regions import crop_frame_for_analysis, normalize_analysis_region
+
 def detect_scenes_motion_optimized(video_path,
                                scene_threshold=50.0,
                                motion_threshold=25.0,
@@ -19,7 +21,9 @@ def detect_scenes_motion_optimized(video_path,
                                debug=True,
                                batch_size=8,
                                prefetch_frames=16,
-                               cancel_flag=None):  # Added cancellation support
+                               cancel_flag=None,
+                               progress_callback=None,
+                               analysis_region=None):  # Added cancellation support
     """
     Hybrid approach combining speed optimizations with accurate motion detection:
     - Fast GPU batching for initial processing
@@ -34,9 +38,30 @@ def detect_scenes_motion_optimized(video_path,
     
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    video_duration = total_frames / fps
+    if not fps or fps <= 0:
+        fps = 30.0  # OpenCV can't always read fps (VR/8K/variable-fps); assume 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    video_duration = (total_frames / fps) if total_frames > 0 else 0.0
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 8)
+
+    # Sampled-frame total for the GUI progress bar. 0 => unknown, which happens a
+    # lot on VR/8K/streamed files where OpenCV can't report a frame count; in that
+    # case we emit an indeterminate ("busy") update so the UI still shows activity
+    # instead of a dead 0%. sampled_done is a monotonic counter of frames analysed.
+    sampled_total = max(1, total_frames // frame_skip) if total_frames > 0 else 0
+    sampled_done = 0
+
+    def _report_progress():
+        if not progress_callback:
+            return
+        if sampled_total:
+            done = min(sampled_done, sampled_total)
+            progress_callback(done, sampled_total, "Motion Detection",
+                              f"Analyzed {done}/{sampled_total} sampled frames")
+        else:
+            progress_callback(sampled_done, 0, "Motion Detection",
+                              f"Analyzed {sampled_done} sampled frames")
+    analysis_region = normalize_analysis_region(analysis_region)
     
     scenes = []
     motion_events = []
@@ -70,6 +95,8 @@ def detect_scenes_motion_optimized(video_path,
                 break
                 
             if frame_idx % frame_skip == 0:
+                frame = crop_frame_for_analysis(frame, analysis_region)
+
                 # Downscale on CPU to reduce GPU memory usage
                 if downscale_factor > 1:
                     height, width = frame.shape[:2]
@@ -221,7 +248,10 @@ def detect_scenes_motion_optimized(video_path,
         loader_thread.start()
 
         pbar = tqdm(total=total_frames // frame_skip, desc="Hybrid processing")
-        
+
+        # Show the step on the GUI immediately (before the first batch completes).
+        _report_progress()
+
         frame_buffer = []
         processed_frames = []
         
@@ -280,7 +310,9 @@ def detect_scenes_motion_optimized(video_path,
                         processed_frames = processed_frames[-100:]
                     
                     pbar.update(len(batch_results))
-                    
+                    sampled_done += len(batch_results)
+                    _report_progress()
+
             except queue.Empty:
                 # Check if we should continue waiting or if cancelled
                 if cancel_flag and cancel_flag.is_set():
@@ -319,6 +351,10 @@ def detect_scenes_motion_optimized(video_path,
                         motion_events.append(frame_idx / fps)
             
             pbar.update(len(batch_results))
+            sampled_done += len(batch_results)
+            if sampled_total:
+                sampled_done = sampled_total  # final batch → report 100%
+            _report_progress()
         
         # Final scene only if not cancelled
         if not (cancel_flag and cancel_flag.is_set()):
