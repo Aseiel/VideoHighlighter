@@ -24,11 +24,11 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData, QLoggingCategory, QUrl
 from PySide6.QtGui import (
-    QColor, QPen, QBrush, QPainter, QFont, QPainterPath, 
+    QColor, QPen, QBrush, QPainter, QFont, QPainterPath,
     QLinearGradient, QRadialGradient, QCursor, QAction,
     QPainterPath, QFontMetrics, QDrag, QPixmap
 )
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 QLoggingCategory.setFilterRules("qt.multimedia.ffmpeg=false")
 import subprocess
@@ -48,6 +48,7 @@ from video_ai_editor.signal_timeline import SignalTimelineScene, SignalTimelineV
 from video_ai_editor.edit_timeline import EditTimelineScene
 from video_ai_editor.filter_dialogs import FilterDialog, ConfidenceFilterDialog
 from video_ai_editor.transcript_panel import TranscriptPanel
+from video_ai_editor.vr_video_view import VRVideoView
 
 
 class SignalLabelPanel(QWidget):
@@ -325,6 +326,11 @@ class SignalTimelineWindow(QMainWindow):
         # bbox_manager is created inside create_video_preview_dock()
         # — no need to create it again here
 
+        # Deliver extracted waveforms to the GUI thread (cross-thread queued
+        # signal). Without this connection the extraction thread's result was
+        # silently dropped and the waveform never appeared.
+        self.waveform_ready.connect(self._on_waveform_ready)
+
         # Start background extraction if we don't have cached waveform
         if not self.waveform or len(self.waveform) == 0:
             debug_log(f"  ⚠️ No cached waveform or empty waveform, starting extraction...")
@@ -491,19 +497,18 @@ class SignalTimelineWindow(QMainWindow):
         # -- Left: stacked video widget --
         self.preview_stack = QStackedWidget()
 
-        # Page 0: Plain QVideoWidget (Off + Precomp modes)
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumSize(320, 240)
-        self.video_widget.setStyleSheet("background-color: black; border: 2px solid #3a3a5a;")
-        self.preview_stack.addWidget(self.video_widget)  # index 0
-
-        # VR half-frame label (QVideoSink → cropped QLabel); added after realtime widget
-        from PySide6.QtWidgets import QLabel as _QLabel
-        self._vr_label = _QLabel()
-        self._vr_label.setMinimumSize(320, 240)
-        self._vr_label.setAlignment(Qt.AlignCenter)
-        self._vr_label.setStyleSheet("background-color: black; border: 2px solid #3a3a5a;")
-        self._vr_sink = None  # created on demand
+        # Page 0: single persistent GPU video surface (QML VideoOutput) used for
+        # BOTH normal and VR (Off + Precomp modes). VR is just a left-eye crop
+        # toggled on this same surface (video_view.set_vr_mode) — no surface is
+        # ever created or destroyed. That's deliberate: a QQuickWidget owns a D3D
+        # swapchain that RTSS/MSI-Afterburner paints its OSD onto, and it does NOT
+        # release that swapchain promptly, so any second surface (or a
+        # create/destroy per VR toggle) makes the OSD appear twice. One persistent
+        # surface == one swapchain == one OSD, on the video.
+        self.video_view = VRVideoView()
+        self.video_view.setMinimumSize(320, 240)
+        self.video_view.set_vr_mode(False)   # full-frame until VR is enabled
+        self.preview_stack.addWidget(self.video_view)  # index 0
 
         # Page 1: Live real-time overlay
         self.realtime_preview = None
@@ -521,7 +526,6 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ realtime_overlay init failed: {e}")
             import traceback; traceback.print_exc()
 
-        self._vr_stack_index = self.preview_stack.addWidget(self._vr_label)
         self.preview_stack.setCurrentIndex(0)
         video_and_info.addWidget(self.preview_stack)
 
@@ -553,7 +557,8 @@ class SignalTimelineWindow(QMainWindow):
         self.video_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.video_player.setAudioOutput(self.audio_output)
-        self.video_player.setVideoOutput(self.video_widget)
+        self.video_player.setVideoOutput(self.video_view.video_output)
+        self.video_view.attach_player(self.video_player)  # crop tracks real resolution
         self.video_player.setSource(QUrl.fromLocalFile(self.video_path))
         self.audio_output.setVolume(0.8)
 
@@ -760,17 +765,12 @@ class SignalTimelineWindow(QMainWindow):
             # ── Switch to Precomp (annotated video swap) ──
             self._active_player = self.video_player
 
-            if hasattr(self, 'vr_mode_checkbox') and self.vr_mode_checkbox.isChecked():
-                if not hasattr(self, '_vr_sink') or self._vr_sink is None:
-                    self._vr_sink = QVideoSink()
-                    self._vr_sink.videoFrameChanged.connect(self._store_vr_frame)
-                self.video_player.setVideoOutput(self._vr_sink)
-                self.preview_stack.setCurrentIndex(self._vr_stack_index)
-                if hasattr(self, '_vr_render_timer'):
-                    self._vr_render_timer.start()
-            else:
-                self.video_player.setVideoOutput(self.video_widget)
-                self.preview_stack.setCurrentIndex(0)
+            # Single persistent surface — just route the player to it and set the
+            # crop from the VR checkbox. No surface swap → RTSS keeps one OSD.
+            self.video_player.setVideoOutput(self.video_view.video_output)
+            self.preview_stack.setCurrentIndex(0)
+            vr_on = hasattr(self, 'vr_mode_checkbox') and self.vr_mode_checkbox.isChecked()
+            self.video_view.set_vr_mode(vr_on)
 
             # Show precomp controls
             if self._precomp_widget:
@@ -794,18 +794,11 @@ class SignalTimelineWindow(QMainWindow):
             self.preview_stack.setCurrentIndex(0)
             self._active_player = self.video_player
 
-            # Restore correct video_player output — if VR mode is on, re-engage the
-            # VR sink; otherwise output to the plain video widget.
-            if hasattr(self, 'vr_mode_checkbox') and self.vr_mode_checkbox.isChecked():
-                if not hasattr(self, '_vr_sink') or self._vr_sink is None:
-                    self._vr_sink = QVideoSink()
-                    self._vr_sink.videoFrameChanged.connect(self._store_vr_frame)
-                self.video_player.setVideoOutput(self._vr_sink)
-                self.preview_stack.setCurrentIndex(self._vr_stack_index)
-                if hasattr(self, '_vr_render_timer'):
-                    self._vr_render_timer.start()
-            else:
-                self.video_player.setVideoOutput(self.video_widget)
+            # Single persistent surface — route the player to it and set the crop
+            # from the VR checkbox. No surface swap → RTSS keeps one OSD.
+            self.video_player.setVideoOutput(self.video_view.video_output)
+            vr_on = hasattr(self, 'vr_mode_checkbox') and self.vr_mode_checkbox.isChecked()
+            self.video_view.set_vr_mode(vr_on)
 
             # Reset to original video if bbox_manager swapped it
             if self.bbox_manager and self.bbox_manager._current_source != "🎥 Original":
@@ -894,41 +887,14 @@ class SignalTimelineWindow(QMainWindow):
     def _toggle_vr_mode(self, state):
         enabled = bool(state)
 
-        # Detect whether Live overlay is the active mode
-        in_live_mode = (
-            hasattr(self, 'realtime_preview')
-            and self.realtime_preview is not None
-            and self.preview_stack.currentIndex() == 1
-        )
+        # Off / Precomp play through the single persistent surface, so VR is just
+        # a crop toggle on that same surface — no widget/stack/swapchain change,
+        # which is what keeps RTSS drawing exactly one OSD. In Live mode the
+        # realtime widget has its own surface; setting the crop on the (hidden)
+        # main surface too is harmless.
+        self.video_view.set_vr_mode(enabled)
 
-        if in_live_mode:
-            # In Live mode the realtime_preview has its own player outputting to
-            # QGraphicsVideoItem. We must NOT redirect or change the stack — just
-            # crop the view and tell face recognition to use left half.
-            pass
-        else:
-            # Off / Precomp mode: use VR sink → label pipeline
-            if enabled:
-                self._pre_vr_stack_index = self.preview_stack.currentIndex()
-                self._latest_vr_frame = None
-                self._vr_sink = QVideoSink()
-                self._vr_sink.videoFrameChanged.connect(self._store_vr_frame)
-                self.video_player.setVideoOutput(self._vr_sink)
-                self.preview_stack.setCurrentIndex(self._vr_stack_index)
-                if not hasattr(self, '_vr_render_timer'):
-                    self._vr_render_timer = QTimer(self)
-                    self._vr_render_timer.setInterval(33)
-                    self._vr_render_timer.timeout.connect(self._render_vr_frame)
-                self._vr_render_timer.start()
-            else:
-                if hasattr(self, '_vr_render_timer'):
-                    self._vr_render_timer.stop()
-                self.video_player.setVideoOutput(self.video_widget)
-                self.preview_stack.setCurrentIndex(getattr(self, '_pre_vr_stack_index', 0))
-                self._vr_sink = None
-                self._latest_vr_frame = None
-
-        # Always: thumbnails + live overlay view + face controller
+        # Thumbnails + live overlay view + face controller follow the same flag.
         if hasattr(self, 'edit_scene') and self.edit_scene is not None:
             self.edit_scene.set_vr_mode(enabled)
         if hasattr(self, 'realtime_preview') and self.realtime_preview is not None:
@@ -937,32 +903,6 @@ class SignalTimelineWindow(QMainWindow):
                 self.realtime_preview._live_face.set_vr_mode(enabled)
             if self.realtime_preview._live_overlay is not None:
                 self.realtime_preview._live_overlay.set_vr_mode(enabled)
-
-    @Slot(QVideoFrame)
-    def _store_vr_frame(self, frame: QVideoFrame):
-        # Just hold a reference — no heavy work here, called at source framerate
-        self._latest_vr_frame = frame
-
-    def _render_vr_frame(self):
-        frame = getattr(self, '_latest_vr_frame', None)
-        if frame is None or not frame.isValid():
-            return
-        self._latest_vr_frame = None  # consume so we don't re-render the same frame
-        from PySide6.QtGui import QImage, QPixmap
-        img = frame.toImage()
-        if img.isNull():
-            return
-        # Crop to left half, then scale down to label size in one step
-        label_w = self._vr_label.width()
-        label_h = self._vr_label.height()
-        half_w = img.width() // 2
-        # Scale factor to fit label height while keeping aspect
-        scale = label_h / img.height() if img.height() > 0 else 1.0
-        target_w = int(half_w * scale)
-        # Crop first (cheap slice), then scale to display size
-        cropped = img.copy(0, 0, half_w, img.height())
-        scaled = cropped.scaled(target_w, label_h, Qt.KeepAspectRatio, Qt.FastTransformation)
-        self._vr_label.setPixmap(QPixmap.fromImage(scaled))
 
     def _update_detection_panel(self, time_seconds):
         """Update detection info panel with actions/objects at current time"""
@@ -1204,18 +1144,20 @@ class SignalTimelineWindow(QMainWindow):
             else:
                 print(f"✅ [thread] extract_waveform() returned list len={len(data)} first={data[0] if data else None}")
                 self.waveform_ready.emit(data)
-
-            def apply():
-                print("🧵 [ui] apply() called")
-                if data is None:
-                    self.statusBar().showMessage("Failed to extract waveform (None)", 6000)
-                else:
-                    self.update_waveform_data(data)
-
-            QTimer.singleShot(0, apply)
+            # NOTE: do NOT use QTimer.singleShot here — this runs in a plain
+            # Python thread with no Qt event loop, so the timer never fires.
+            # Delivery happens via the waveform_ready queued connection.
 
         thread = threading.Thread(target=extract_waveform, daemon=True)
         thread.start()
+
+    def _on_waveform_ready(self, data):
+        """GUI-thread slot for waveform_ready (queued from the worker thread)."""
+        print(f"🧵 [ui] waveform_ready received ({len(data) if data else 0} points)")
+        if data is None:
+            self.statusBar().showMessage("Failed to extract waveform (None)", 6000)
+        else:
+            self.update_waveform_data(data)
 
     def update_waveform_data(self, waveform_data):
         print(f"🧩 update_waveform_data() called with {len(waveform_data) if waveform_data else 0} points")
@@ -1461,9 +1403,10 @@ class SignalTimelineWindow(QMainWindow):
                 "sample_rate": 5,
                 "action_use_person_detection": True,
                 "action_max_people": 2,
-                "yolo_model_size": "n",
-                "yolo_pt_path": "yolo11n.pt",
-                "openvino_model_folder": "yolo11n_openvino_model/",
+                "detector_type": "standard",
+                "yolox_model_xml": "",
+                "yolox_class_names_file": "yolo_objects_labels.json",
+                "yolox_device": "GPU",
                 "use_time_range": False,
                 "range_start": 0,
                 "range_end": None,
@@ -2443,7 +2386,7 @@ class SignalTimelineWindow(QMainWindow):
     @Slot(int)
     def toggle_follow_playhead(self, state):
         """Toggle whether the timeline auto-scrolls to follow the playhead"""
-        follow = (state == Qt.Checked)
+        follow = bool(state)
         if hasattr(self, 'signal_view'):
             self.signal_view.follow_playhead = follow
         self.statusBar().showMessage(f"Follow playhead: {'ON' if follow else 'OFF'}", 2000)
