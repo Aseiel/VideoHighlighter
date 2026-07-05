@@ -16,8 +16,9 @@ This module does NOT track people between frames — that's the tracker's job
 face is visible); track_id carries that identity through frames where the face
 is hidden (back turned, too small, profile).
 
-Backbone: InsightFace `buffalo_l` (SCRFD detector + ArcFace recogniser, 512-d
-normalised embeddings). On Intel hardware you can pass the OpenVINO provider.
+Backbone: OpenCV Zoo YuNet (face detector, MIT) + SFace (recogniser, 128-d
+embeddings). Both are permissive / commercial-OK and bundled under ./models —
+no insightface dependency. Runs on CPU via OpenCV DNN.
 
 Typical use (in an analysis pass):
     bank = FaceIdentityBank(db_path="./cache/face_db.json")
@@ -34,14 +35,15 @@ Naming (from the GUI, e.g. right-click -> "This is Tomek"):
     bank.name_identity(identity_id, "Tomek")
     bank.save()
 
-NOTE on threading: InsightFace's model is not guaranteed thread-safe. Use one
+NOTE on threading: the OpenCV DNN models are not guaranteed thread-safe. Use one
 bank instance per worker thread, or serialise calls. `assign()` itself is
 guarded by a lock so the registry stays consistent.
 
 Install:
-    pip install insightface onnxruntime          # CPU
-    pip install insightface onnxruntime-gpu       # NVIDIA
-    pip install insightface onnxruntime-openvino  # Intel (OpenVINO provider)
+    pip install opencv-python        # YuNet + SFace ship in OpenCV DNN (>=4.5.4)
+Model files (bundled under ./models, both permissive / commercial-OK):
+    face_detection_yunet_2023mar.onnx     (MIT)
+    face_recognition_sface_2021dec.onnx   (OpenCV Zoo)
 """
 
 from __future__ import annotations
@@ -60,11 +62,16 @@ import numpy as np
 # Defaults
 # ──────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL = "buffalo_l"        # SCRFD detector + ArcFace recogniser
-DEFAULT_SIM_THRESHOLD = 0.45       # cosine sim; tune on YOUR footage (0.35–0.55)
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+DEFAULT_DET_MODEL = os.path.join(_MODELS_DIR, "face_detection_yunet_2023mar.onnx")
+DEFAULT_REC_MODEL = os.path.join(_MODELS_DIR, "face_recognition_sface_2021dec.onnx")
+
+DEFAULT_MODEL = "yunet_sface"      # YuNet detector + SFace recogniser (OpenCV Zoo)
+DEFAULT_SIM_THRESHOLD = 0.363      # SFace cosine sim; tune on YOUR footage (0.30–0.45)
 DEFAULT_MAX_GALLERY = 8            # embeddings kept per identity (different angles)
-DEFAULT_DET_SIZE = (640, 640)
-EMBED_DIM = 512
+DEFAULT_DET_SIZE = (640, 640)      # YuNet initial input size (reset per frame)
+DEFAULT_DET_SCORE = 0.6            # YuNet detection confidence threshold
+EMBED_DIM = 128
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -103,17 +110,21 @@ class FaceIdentityBank:
         self.sim_threshold = float(sim_threshold)
         self.max_gallery = int(max_gallery)
         self.model_name = model_name
-        self.providers = providers
+        self.providers = providers        # kept for API compat; OpenCV DNN = CPU
         self.det_size = det_size
         self.ctx_id = ctx_id
+        self.det_model = DEFAULT_DET_MODEL
+        self.rec_model = DEFAULT_REC_MODEL
+        self.det_score = DEFAULT_DET_SCORE
 
         # Registry: list of identity dicts
-        #   {"id": str, "name": str|None, "embeddings": np.ndarray(N,512),
+        #   {"id": str, "name": str|None, "embeddings": np.ndarray(N,128),
         #    "thumb": str|None (base64 jpeg), "count": int}
         self.identities: list[dict] = []
         self._id_index: dict[str, dict] = {}
 
-        self._app = None                  # InsightFace, lazy-loaded
+        self._detector = None             # YuNet, lazy-loaded
+        self._recognizer = None           # SFace, lazy-loaded
         self._lock = threading.Lock()
 
         if db_path and os.path.exists(db_path):
@@ -121,43 +132,28 @@ class FaceIdentityBank:
 
     # ── model lifecycle ───────────────────────────────────────────
 
-    def _ensure_app(self):
-            """Lazy-load the InsightFace model on first use."""
-            if self._app is not None:
-                return self._app
+    def _ensure_models(self):
+        """Lazy-load the YuNet detector + SFace recogniser on first use."""
+        if self._detector is not None and self._recognizer is not None:
+            return
 
-            try:
-                from insightface.app import FaceAnalysis
-            except ImportError as e:
-                raise ImportError(
-                    "insightface is required for face recognition.\n"
-                    "  pip install insightface onnxruntime           (CPU)\n"
-                    "  pip install insightface onnxruntime-gpu        (NVIDIA)\n"
-                    "  pip install insightface onnxruntime-openvino   (Intel)"
-                ) from e
+        import cv2
 
-            providers = self.providers
-            if not providers:
-                # auto-pick: prefer Intel GPU via OpenVINO, then CUDA, then CPU
-                try:
-                    import onnxruntime as ort
-                    avail = set(ort.get_available_providers())
-                except Exception:
-                    avail = set()
-                if "OpenVINOExecutionProvider" in avail:
-                    providers = [("OpenVINOExecutionProvider", {"device_type": "GPU"}),
-                                "CPUExecutionProvider"]
-                elif "CUDAExecutionProvider" in avail:
-                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                else:
-                    providers = ["CPUExecutionProvider"]
+        for path, what in ((self.det_model, "YuNet detector"),
+                           (self.rec_model, "SFace recogniser")):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"{what} model not found: {path}\n"
+                    "Expected the bundled OpenCV Zoo model under video_ai_editor/models/."
+                )
 
-            app = FaceAnalysis(name=self.model_name, providers=providers)
-            app.prepare(ctx_id=self.ctx_id, det_size=self.det_size)
-            self._app = app
-            print(f"✅ FaceIdentityBank: loaded '{self.model_name}' "
-                f"(providers={providers}, ctx_id={self.ctx_id})")
-            return self._app
+        # YuNet: (model, config, input_size, score_thr, nms_thr, top_k)
+        self._detector = cv2.FaceDetectorYN.create(
+            self.det_model, "", self.det_size,
+            self.det_score, 0.3, 5000,
+        )
+        self._recognizer = cv2.FaceRecognizerSF.create(self.rec_model, "")
+        print("✅ FaceIdentityBank: loaded YuNet + SFace (CPU, OpenCV DNN)")
 
     # ── detection ─────────────────────────────────────────────────
 
@@ -169,25 +165,38 @@ class FaceIdentityBank:
         best_face_for_box(). Do not run it per person — it's a whole-frame pass.
 
         Returns list of dicts:
-            {"bbox": (x1,y1,x2,y2),       # pixel coords
-             "embedding": np.ndarray(512), # L2-normalised
+            {"bbox": (x1,y1,x2,y2),        # pixel coords
+             "embedding": np.ndarray(128),  # L2-normalised (SFace)
              "det_score": float,
-             "kps": list|None}            # 5 facial keypoints
+             "kps": list|None}             # 5 facial keypoints
         """
-        app = self._ensure_app()
-        out: list[dict] = []
+        if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0:
+            return []
 
-        for f in app.get(frame_bgr):
-            emb = getattr(f, "normed_embedding", None)
-            if emb is None:
-                raw = np.asarray(f.embedding, dtype=np.float32)
-                emb = raw / (np.linalg.norm(raw) + 1e-9)
+        self._ensure_models()
+
+        h, w = frame_bgr.shape[:2]
+        # YuNet requires the declared input size to match the frame it's given.
+        self._detector.setInputSize((int(w), int(h)))
+        _, faces = self._detector.detect(frame_bgr)
+        if faces is None:
+            return []
+
+        out: list[dict] = []
+        for row in faces:
+            x, y, bw, bh = row[0], row[1], row[2], row[3]
+            score = float(row[14])
+            # SFace needs the raw YuNet row (bbox + 5 landmarks) to align the crop.
+            aligned = self._recognizer.alignCrop(frame_bgr, row)
+            feat = self._recognizer.feature(aligned)          # (1,128) float32
+            emb = np.asarray(feat, dtype=np.float32).ravel()
+            emb = emb / (np.linalg.norm(emb) + 1e-9)          # L2-normalise for cosine
+            kps = [[float(row[4 + 2 * i]), float(row[5 + 2 * i])] for i in range(5)]
             out.append({
-                "bbox": tuple(int(v) for v in f.bbox),
-                "embedding": np.asarray(emb, dtype=np.float32),
-                "det_score": float(getattr(f, "det_score", 0.0)),
-                "kps": (np.asarray(f.kps).tolist()
-                        if getattr(f, "kps", None) is not None else None),
+                "bbox": (int(x), int(y), int(x + bw), int(y + bh)),
+                "embedding": emb,
+                "det_score": score,
+                "kps": kps,
             })
         return out
 
@@ -454,11 +463,16 @@ class FaceIdentityBank:
 
             self.identities = []
             self._id_index = {}
+            dropped = 0
             for rec in data.get("identities", []):
                 emb = np.asarray(rec.get("embeddings", []), dtype=np.float32)
                 if emb.ndim == 1 and emb.size == EMBED_DIM:
                     emb = emb[None, :]
-                if emb.ndim != 2:
+                # Drop galleries from a different backbone (e.g. old 512-d
+                # InsightFace DBs): those embeddings aren't comparable to SFace.
+                if emb.ndim != 2 or (emb.shape[0] and emb.shape[1] != EMBED_DIM):
+                    if emb.size:
+                        dropped += 1
                     emb = np.empty((0, EMBED_DIM), dtype=np.float32)
                 ident = {
                     "id": rec["id"],
@@ -471,8 +485,14 @@ class FaceIdentityBank:
                 self.identities.append(ident)
                 self._id_index[ident["id"]] = ident
 
-            # Respect a saved threshold unless the caller overrode it explicitly
-            if "sim_threshold" in data:
+            if dropped:
+                print(f"⚠️ FaceIdentityBank: {dropped} identity gallery(ies) came from a "
+                      f"different face model and were cleared — re-enroll those faces.")
+
+            # Respect a saved threshold only if it came from the same backbone;
+            # an old InsightFace threshold (0.45) is wrong for SFace cosine.
+            saved_model = data.get("model_name")
+            if "sim_threshold" in data and (saved_model is None or saved_model == self.model_name):
                 self.sim_threshold = float(data["sim_threshold"])
 
             print(f"✅ FaceIdentityBank: loaded {len(self.identities)} identities ← {path}")
