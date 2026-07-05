@@ -996,15 +996,8 @@ class VideoHighlighterGUI(QWidget):
         url_layout.addWidget(self.download_url_input)
         download_form.addLayout(url_layout)
 
-        # Pattern input
-        pattern_layout = QHBoxLayout()
-        pattern_layout.addWidget(QLabel("Link pattern:"))
-        self.download_pattern_input = QLineEdit()
-        self.download_pattern_input.setText(self.config_data.get("download", {}).get("link_pattern", "/video/"))
-        self.download_pattern_input.setPlaceholderText("/video/")
-        self.download_pattern_input.setToolTip("Pattern to match in video links (e.g., /video/, /watch/)")
-        pattern_layout.addWidget(self.download_pattern_input)
-        download_form.addLayout(pattern_layout)
+        # Link pattern is auto-detected from the listing page (see
+        # downloader.detect_link_pattern), so there's no manual field.
 
         # Save directory
         save_dir_layout = QHBoxLayout()
@@ -2064,7 +2057,6 @@ class VideoHighlighterGUI(QWidget):
     def browse_and_select_videos(self):
         """Open the thumbnail picker for the listing URL, then download the chosen videos."""
         url = self.download_url_input.text().strip()
-        pattern = self.download_pattern_input.text().strip() or "/video/"
         if not url.startswith(("http://", "https://")):
             self.append_log("⚠️ Enter a listing URL (http:// or https://) first")
             return
@@ -2073,7 +2065,7 @@ class VideoHighlighterGUI(QWidget):
         except Exception as e:
             self.append_log(f"❌ Video picker unavailable: {e}")
             return
-        dlg = VideoPickerDialog(url, pattern=pattern, use_browser="auto", parent=self)
+        dlg = VideoPickerDialog(url, pattern="auto", use_browser="auto", parent=self)
         if dlg.exec():
             urls = [e["url"] for e in dlg.selected_entries()]
             if not urls:
@@ -2087,8 +2079,8 @@ class VideoHighlighterGUI(QWidget):
         those exact URLs are downloaded instead of scraping the listing."""
         url = self.download_url_input.text().strip()
         save_dir = self.download_save_dir_input.text().strip()
-        pattern = self.download_pattern_input.text().strip() or "/video/"
-        
+        pattern = "auto"  # link pattern is auto-detected from the listing page
+
         # Get immediate processing settings
         immediate_processing = self.immediate_processing_chk.isChecked()
         max_concurrent = self.concurrent_spinbox.value() if immediate_processing else 1
@@ -2147,7 +2139,7 @@ class VideoHighlighterGUI(QWidget):
         self.append_log("=== Starting Video Download ===")
         self.append_log(f"🌐 URL: {url}")
         self.append_log(f"📁 Save directory: {save_dir}")
-        self.append_log(f"🔍 Pattern: {pattern}")
+        self.append_log("🔍 Link pattern: auto-detect")
         
         if immediate_processing:
             self.append_log(f"⚡ Mode: Immediate processing after each download")
@@ -2852,7 +2844,6 @@ class VideoHighlighterGUI(QWidget):
             "video": {"paths": self.get_file_list()},
             "download": {
                 "last_url": self.download_url_input.text().strip(),
-                "link_pattern": self.download_pattern_input.text().strip() or "/video/",
                 "save_dir": self.download_save_dir_input.text().strip(),
                 "auto_add": self.auto_add_downloaded_chk.isChecked(),
                 "auto_process": self.auto_process_chk.isChecked(),
