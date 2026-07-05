@@ -1116,27 +1116,107 @@ def _fetch_listing_html(url: str, log_fn: Callable = print, browser: bool = Fals
                 pass
 
 
-def extract_video_entries(url: str, pattern: str = "/video/", log_fn: Callable = print,
+# Path tokens that typically mark an individual video-detail page on tube-style
+# sites, ordered most- to least-specific (used to break count ties).
+_VIDEO_LINK_CANDIDATES = [
+    "/video/", "/videos/", "/watch/", "/watch", "/embed/", "/v/",
+    "/scene/", "/scenes/", "/movie/", "/movies/", "/clip/", "/clips/",
+    "/view/", "/play/", "/media/", "/porn/", "/gallery/",
+]
+
+# First-path-segments that are navigation/taxonomy, not individual videos — used
+# to reject the generic fallback guess.
+_NAV_SEGMENTS = {
+    "search", "tag", "tags", "category", "categories", "channel", "channels",
+    "model", "models", "pornstar", "pornstars", "studio", "studios", "album",
+    "albums", "photo", "photos", "page", "login", "signup", "register", "upload",
+    "live", "best", "popular", "latest", "top", "new", "trending", "home",
+    "about", "contact", "terms", "privacy", "dmca", "help", "faq", "c", "s",
+    # common language prefixes
+    "pl", "en", "de", "fr", "es", "it", "ru", "pt", "nl", "jp", "cn", "tr",
+}
+
+
+def detect_link_pattern(soup, base_url: str, log_fn: Callable = print) -> Optional[str]:
+    """Guess the URL substring that identifies individual video pages on a listing.
+
+    Counts same-site <a href> links against known video-path candidates and returns
+    the best-supported one. Falls back to the most common non-nav first path
+    segment, or None if the page has nothing list-like.
+    """
+    try:
+        host = urllib.parse.urlparse(base_url).netloc.lower()
+    except Exception:
+        host = ""
+    counts = Counter()
+    seg_counts = Counter()
+    for a in soup.find_all("a", href=True):
+        full = make_absolute_url(a["href"], base_url)
+        if not full:
+            continue
+        p = urllib.parse.urlparse(full)
+        if p.netloc and host and p.netloc.lower() != host:
+            continue  # same-site links only
+        path = p.path.lower()
+        for pat in _VIDEO_LINK_CANDIDATES:
+            if pat in path:
+                counts[pat] += 1
+        segs = [s for s in path.split("/") if s]
+        if segs:
+            seg_counts[segs[0]] += 1
+
+    if counts:
+        best = max(counts, key=lambda k: (counts[k], -_VIDEO_LINK_CANDIDATES.index(k)))
+        log_fn(f"🔎 Auto-detected link pattern: {best} ({counts[best]} link(s))")
+        return best
+
+    # Generic fallback: the most common first path segment that isn't nav/taxonomy.
+    for seg, n in seg_counts.most_common(10):
+        if len(seg) >= 2 and seg not in _NAV_SEGMENTS and n >= 5:
+            pat = f"/{seg}/"
+            log_fn(f"🔎 Auto-detected link pattern (generic): {pat} ({n} link(s))")
+            return pat
+
+    log_fn("⚠️ Could not auto-detect a link pattern; falling back to /video/")
+    return None
+
+
+def _resolve_pattern(pattern: Optional[str], soup, base_url: str,
+                     log_fn: Callable = print) -> str:
+    """Return an explicit pattern, auto-detecting from `soup` when caller passed
+    None or 'auto'. Always yields a usable substring (defaults to /video/)."""
+    if pattern and pattern != "auto":
+        return pattern
+    return detect_link_pattern(soup, base_url, log_fn) or "/video/"
+
+
+def extract_video_entries(url: str, pattern: Optional[str] = None, log_fn: Callable = print,
                           use_browser: str = "auto") -> List[Dict]:
     """Scrape a listing page into a list of {url, title, thumbnail_url, duration}.
 
+    pattern: substring that video links contain; None/"auto" auto-detects it.
     use_browser: "auto" (static, then Selenium if static found nothing),
                  "never" (static only), or "always" (Selenium only).
     """
     log_fn(f"🌐 Listing: {url}")
     entries: List[Dict] = []
 
+    def _parse(html: str) -> List[Dict]:
+        soup = BeautifulSoup(html, "html.parser")
+        pat = _resolve_pattern(pattern, soup, url, log_fn)
+        return _parse_video_entries(soup, url, pat)
+
     if use_browser != "always":
         html = _fetch_listing_html(url, log_fn, browser=False)
         if html:
-            entries = _parse_video_entries(BeautifulSoup(html, "html.parser"), url, pattern)
+            entries = _parse(html)
             log_fn(f"📄 Static HTML: {len(entries)} video(s)")
 
     if (not entries or use_browser == "always") and use_browser != "never":
         log_fn("🧭 Rendering with headless browser (scrolling for lazy content)...")
         html = _fetch_listing_html(url, log_fn, browser=True)
         if html:
-            entries = _parse_video_entries(BeautifulSoup(html, "html.parser"), url, pattern)
+            entries = _parse(html)
             log_fn(f"🌐 Rendered: {len(entries)} video(s)")
 
     return entries
@@ -1162,9 +1242,10 @@ def dump_listing_cards(url: str, pattern: str, count: int = 3,
         print("No matching cards found to dump.")
 
 
-def extract_video_links(url: str, pattern: str = "/video/", log_fn: Callable = print) -> List[str]:
+def extract_video_links(url: str, pattern: Optional[str] = None, log_fn: Callable = print) -> List[str]:
     """
     Extract video links from a webpage.
+    pattern: substring that video links contain; None/"auto" auto-detects it.
     NOTE: Duration extraction on listing pages is often meaningless; we no longer do it here.
     """
     log_fn(f"🌐 Fetching page: {url}")
@@ -1182,6 +1263,7 @@ def extract_video_links(url: str, pattern: str = "/video/", log_fn: Callable = p
     except requests.RequestException as e:
         raise DownloadError(f"Failed to fetch page: {e}")
     soup = BeautifulSoup(response.text, "html.parser")
+    pattern = _resolve_pattern(pattern, soup, url, log_fn)
     video_links: List[str] = []
     # Strategy 1: <a> tags with pattern
     for a in soup.find_all("a", href=True):
@@ -2358,7 +2440,7 @@ def download_video(
 def download_videos_with_immediate_processing(
     search_url: str,
     save_dir: str,
-    pattern: str = "/video/",
+    pattern: Optional[str] = "auto",
     log_fn: Callable = print,
     progress_fn: Optional[Callable] = None,
     process_callback: Optional[Callable] = None,
