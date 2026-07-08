@@ -70,18 +70,14 @@ def get_tracked_py_files(repo_root: Path) -> set[str]:
     return set(_run_git_ls_files(repo_root, "*.py"))
 
 
-def _is_third_party(name: str, repo_root: Path) -> bool:
+def _is_third_party(name: str, search_path: list[str]) -> bool:
     """True if `name` resolves to an installed distribution somewhere on
-    sys.path OTHER than repo_root (KTD2 collision guard). Uses PathFinder
-    directly against a filtered path list rather than mutating global
-    sys.path/sys.modules, so this has no side effects on caller state and
-    is not affected by whatever already imported this process's own
-    package (which would otherwise self-collide when repo_root differs
-    from the real project root, e.g. under a temp-directory test)."""
-    resolved_root = repo_root.resolve()
-    search_path = [
-        p for p in sys.path if p and Path(p).resolve() != resolved_root
-    ]
+    `search_path`. Uses PathFinder directly against a caller-filtered path
+    list rather than mutating global sys.path/sys.modules, so this has no
+    side effects on caller state and is not affected by whatever already
+    imported this process's own package (which would otherwise self-collide
+    when the checked repo differs from the real project root, e.g. under a
+    temp-directory test)."""
     try:
         spec = PathFinder.find_spec(name, path=search_path)
     except (ImportError, ValueError):
@@ -103,7 +99,9 @@ def enumerate_local_roots(repo_root: Path) -> set[str]:
         elif entry.is_dir():
             if any(entry.rglob("*.py")):
                 roots.add(entry.name)
-    return {name for name in roots if not _is_third_party(name, repo_root)}
+    resolved_root = repo_root.resolve()
+    search_path = [p for p in sys.path if p and Path(p).resolve() != resolved_root]
+    return {name for name in roots if not _is_third_party(name, search_path)}
 
 
 def _relative_package_path(importing_file: str, level: int, module: str | None) -> str:
@@ -186,7 +184,7 @@ _SCOPE_TRANSPARENT = (ast.Try, ast.If, ast.While, ast.For, ast.AsyncFor, ast.Wit
 
 def _collect_top_level_names(stmts: list[ast.stmt]) -> set[str]:
     """Names bound at module level: def/class names, plain assignment
-    targets, and names bound by import statements (KTD4). Recurses into
+    targets, and names bound by import statements. Recurses into
     module-level control flow (try/if/while/for/with) since those don't
     introduce a new scope in Python, but never into a function/class body."""
     names: set[str] = set()
@@ -223,26 +221,37 @@ def _file_candidates(path: str) -> tuple[str, str]:
 
 
 def resolve_and_verify(
-    local_imports: list[LocalImport], tracked_files: set[str], repo_root: Path
+    local_imports: list[LocalImport],
+    tracked_files: set[str],
+    repo_root: Path,
+    parsed_trees: dict[str, ast.AST] | None = None,
 ) -> list[Violation]:
     """Resolve each local import and verify it against `tracked_files`
     (git-tracked-ness) and, for named symbols, the target's own top-level
     bindings. For `from X import Y`, Y may be either a submodule of X or a
     symbol defined in X itself -- both are tried, matching how Python's
-    import system actually resolves `from package import name`."""
+    import system actually resolves `from package import name`.
+
+    `parsed_trees` lets a caller that already parsed a tracked file (e.g.
+    `run_check`, which parses every tracked file once to extract its
+    imports) share that tree instead of this function re-parsing it from
+    disk when the same file is also a symbol-import target."""
     violations: list[Violation] = []
+    parsed_trees = parsed_trees or {}
     top_level_cache: dict[str, set[str] | None] = {}
 
     def top_level_names(tracked_path: str) -> set[str] | None:
         if tracked_path in top_level_cache:
             return top_level_cache[tracked_path]
-        full = repo_root / tracked_path
-        try:
-            source = full.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=tracked_path)
-        except (OSError, SyntaxError):
-            top_level_cache[tracked_path] = None
-            return None
+        tree = parsed_trees.get(tracked_path)
+        if tree is None:
+            full = repo_root / tracked_path
+            try:
+                source = full.read_text(encoding="utf-8")
+                tree = ast.parse(source, filename=tracked_path)
+            except (OSError, SyntaxError):
+                top_level_cache[tracked_path] = None
+                return None
         names = _collect_top_level_names(tree.body)
         top_level_cache[tracked_path] = names
         return names
@@ -330,6 +339,7 @@ def run_check(repo_root: Path) -> list[Violation]:
     local_roots = enumerate_local_roots(repo_root)
 
     all_imports: list[LocalImport] = []
+    parsed_trees: dict[str, ast.AST] = {}
     for tracked_path in sorted(tracked_files):
         full = repo_root / tracked_path
         try:
@@ -337,9 +347,10 @@ def run_check(repo_root: Path) -> list[Violation]:
             tree = ast.parse(source, filename=tracked_path)
         except (OSError, SyntaxError):
             continue
+        parsed_trees[tracked_path] = tree
         all_imports.extend(extract_local_imports(tree, tracked_path, local_roots))
 
-    return resolve_and_verify(all_imports, tracked_files, repo_root)
+    return resolve_and_verify(all_imports, tracked_files, repo_root, parsed_trees)
 
 
 def _resolve_repo_root() -> Path:

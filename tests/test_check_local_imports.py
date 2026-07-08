@@ -121,6 +121,16 @@ def _make_repo(tmp_path: Path, layout: dict[str, str]) -> Path:
     return tmp_path
 
 
+def _init_git_repo(repo: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init"],
+        cwd=repo,
+        check=True,
+    )
+
+
 def test_enumerate_local_roots_finds_root_files_and_packages(tmp_path):
     # Deliberately fictional names -- this repo's own real top-level names
     # (pipeline, modules, ...) are already on sys.path via how pytest
@@ -334,13 +344,7 @@ def test_run_check_clean_fixture_tree_reports_no_violations(tmp_path):
             "gadgets/foo.py": "def bar():\n    pass\n",
         },
     )
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    subprocess.run(
-        ["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init"],
-        cwd=repo,
-        check=True,
-    )
+    _init_git_repo(repo)
     assert run_check(repo) == []
 
 
@@ -354,13 +358,7 @@ def test_run_check_flags_untracked_target(tmp_path):
             "gadgets/__init__.py": "",  # registers `gadgets` as a local root
         },
     )
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    subprocess.run(
-        ["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init"],
-        cwd=repo,
-        check=True,
-    )
+    _init_git_repo(repo)
     violations = run_check(repo)
     assert len(violations) == 1
     assert violations[0].kind == "untracked-or-missing-file"
@@ -369,16 +367,6 @@ def test_run_check_flags_untracked_target(tmp_path):
 # ---------------------------------------------------------------------------
 # U4: CLI exit-code behavior
 # ---------------------------------------------------------------------------
-
-
-def _init_git_repo(repo: Path) -> None:
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    subprocess.run(
-        ["git", "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init"],
-        cwd=repo,
-        check=True,
-    )
 
 
 def _run_cli(repo: Path) -> subprocess.CompletedProcess:
