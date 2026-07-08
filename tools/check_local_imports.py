@@ -47,22 +47,46 @@ class Violation:
         return f"{self.importing_file}:{self.lineno} -- {self.kind} -- {self.detail}"
 
 
-def _run_git_ls_files(repo_root: Path, pattern: str) -> list[str]:
+_GIT_TIMEOUT_SECONDS = 30
+
+
+def _run_git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
+    """Run a git subcommand, translating process-level failures (missing
+    binary, timeout) into GitError. Does NOT check the return code -- a
+    non-zero exit is a normal outcome for some callers (e.g. "not a git
+    repo") and is handled by each call site with its own message."""
     try:
-        result = subprocess.run(
-            ["git", "ls-files", pattern],
-            cwd=repo_root,
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
             capture_output=True,
-            text=True,
+            # Explicit UTF-8, not text=True's locale-based decoding: git
+            # writes tracked (non-quoted, via core.quotepath=false) paths as
+            # UTF-8 regardless of platform, but the OS locale encoding can
+            # differ (e.g. cp1252 on Windows) -- decoding non-ASCII output
+            # with the wrong codec silently corrupts filenames instead of
+            # raising, so paths would mismatch tracked_files elsewhere.
+            encoding="utf-8",
+            timeout=_GIT_TIMEOUT_SECONDS,
         )
     except FileNotFoundError as exc:
         raise GitError("git not found -- is git installed and on PATH?") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"'git {' '.join(args)}' timed out after {_GIT_TIMEOUT_SECONDS}s") from exc
+
+
+def _run_git_ls_files(repo_root: Path, pattern: str) -> list[str]:
+    # `-c core.quotepath=false -z`: without these, git C-quotes/octal-escapes
+    # any tracked path containing a non-ASCII byte (e.g. "caf\303\251/foo.py"
+    # instead of "café/foo.py"), which would never match the real
+    # repo-relative path this checker joins against repo_root elsewhere.
+    result = _run_git(["-c", "core.quotepath=false", "ls-files", "-z", pattern], cwd=repo_root)
     if result.returncode != 0:
         raise GitError(
             f"'git ls-files {pattern}' failed in {repo_root} "
             f"(not a git repository?): {result.stderr.strip()}"
         )
-    return [line for line in result.stdout.splitlines() if line]
+    return [line for line in result.stdout.split("\0") if line]
 
 
 def get_tracked_py_files(repo_root: Path) -> set[str]:
@@ -249,7 +273,7 @@ def resolve_and_verify(
             try:
                 source = full.read_text(encoding="utf-8")
                 tree = ast.parse(source, filename=tracked_path)
-            except (OSError, SyntaxError):
+            except (OSError, SyntaxError, UnicodeDecodeError):
                 top_level_cache[tracked_path] = None
                 return None
         names = _collect_top_level_names(tree.body)
@@ -299,22 +323,36 @@ def resolve_and_verify(
                 )
             continue
 
+        # A plain module (resolved via its `.py` form, not `/__init__.py`) can
+        # never have real submodules -- Python only attempts a submodule
+        # import when the parent is an actual package. Without this guard, a
+        # coincidental sibling directory sharing the module's stem (e.g. a
+        # tracked `modules/foo.py` alongside an unrelated `modules/foo/bar.py`)
+        # would make `from modules.foo import bar` look valid here even
+        # though it raises ImportError at real runtime.
+        package_is_plain_module = package_file is not None and package_file == f"{imp.package_path}.py"
+
         for symbol in imp.symbols or ():
             submodule_candidate = f"{imp.package_path}/{symbol}"
-            if resolved_file(submodule_candidate) is not None:
+            if not package_is_plain_module and resolved_file(submodule_candidate) is not None:
                 continue  # valid submodule import (e.g. `from modules import debug_console`)
 
             if package_file is not None:
                 names = top_level_names(package_file)
                 if names is None or symbol in names:
                     continue  # valid symbol import, or target unparseable (not this checker's failure mode)
+                submodule_note = (
+                    f"'{package_file}' is a plain module and cannot have submodules"
+                    if package_is_plain_module
+                    else f"and '{submodule_candidate}.py' is not a tracked submodule either"
+                )
                 violations.append(
                     Violation(
                         kind="undefined-symbol",
                         importing_file=imp.importing_file,
                         lineno=imp.lineno,
                         detail=f"'{symbol}' is not defined at module scope in '{package_file}', "
-                        f"and '{submodule_candidate}.py' is not a tracked submodule either",
+                        f"{submodule_note}",
                     )
                 )
                 continue
@@ -345,7 +383,7 @@ def run_check(repo_root: Path) -> list[Violation]:
         try:
             source = full.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=tracked_path)
-        except (OSError, SyntaxError):
+        except (OSError, SyntaxError, UnicodeDecodeError):
             continue
         parsed_trees[tracked_path] = tree
         all_imports.extend(extract_local_imports(tree, tracked_path, local_roots))
@@ -354,14 +392,7 @@ def run_check(repo_root: Path) -> list[Violation]:
 
 
 def _resolve_repo_root() -> Path:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise GitError("git not found -- is git installed and on PATH?") from exc
+    result = _run_git(["rev-parse", "--show-toplevel"])
     if result.returncode != 0:
         raise GitError(f"not a git repository: {result.stderr.strip()}")
     return Path(result.stdout.strip())

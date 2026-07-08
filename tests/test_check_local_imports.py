@@ -208,6 +208,18 @@ def test_resolve_and_verify_no_violation_when_target_tracked_and_exists(tmp_path
     assert violations == []
 
 
+def test_resolve_and_verify_no_violation_for_plain_module_import(tmp_path):
+    # kind="module" (a plain `import modules.foo`, no symbols) success path --
+    # distinct from the "from"-kind case above, which is what
+    # _local_import(..., symbols=(...)) actually constructs.
+    repo = _make_repo(tmp_path, {"modules/foo.py": "x = 1\n"})
+    tracked = {"modules/foo.py"}
+    imp = _local_import("modules/foo")
+    assert imp.kind == "module"
+    violations = resolve_and_verify([imp], tracked, repo)
+    assert violations == []
+
+
 def test_untracked_or_missing_violation_when_file_absent_from_disk(tmp_path):
     repo = tmp_path
     tracked: set[str] = set()
@@ -328,6 +340,28 @@ def test_conditionally_defined_top_level_name_resolves(tmp_path):
     assert violations == []
 
 
+def test_plain_module_cannot_have_submodules_even_if_sibling_dir_matches(tmp_path):
+    # A tracked plain module `modules/foo.py` coexisting with an unrelated
+    # same-stem directory `modules/foo/bar.py` must NOT make
+    # `from modules.foo import bar` look valid: Python only attempts a
+    # submodule import when the parent is an actual package, and a plain
+    # module can never have real submodules. At real runtime this raises
+    # ImportError; the checker must flag it as undefined-symbol, not pass it.
+    repo = _make_repo(
+        tmp_path,
+        {
+            "modules/foo.py": "x = 1\n",
+            "modules/foo/bar.py": "bar = 42\n",
+        },
+    )
+    tracked = {"modules/foo.py", "modules/foo/bar.py"}
+    imp = _local_import("modules/foo", symbols=("bar",))
+    violations = resolve_and_verify([imp], tracked, repo)
+    assert len(violations) == 1
+    assert violations[0].kind == "undefined-symbol"
+    assert "plain module" in violations[0].detail
+
+
 # ---------------------------------------------------------------------------
 # run_check integration (fixture-tree level, not the real repo)
 # ---------------------------------------------------------------------------
@@ -362,6 +396,47 @@ def test_run_check_flags_untracked_target(tmp_path):
     violations = run_check(repo)
     assert len(violations) == 1
     assert violations[0].kind == "untracked-or-missing-file"
+
+
+def test_run_check_skips_non_utf8_file_instead_of_crashing(tmp_path):
+    # A tracked .py file with invalid UTF-8 bytes (plausible on this
+    # Windows-developed project, e.g. via an editor's default "ANSI" save)
+    # must be skipped like any other unparseable file, not raise
+    # UnicodeDecodeError out of run_check() and crash the whole checker.
+    repo = _make_repo(
+        tmp_path,
+        {
+            "app.py": "from gadgets.foo import bar\n",
+            "gadgets/foo.py": "def bar():\n    pass\n",
+        },
+    )
+    (repo / "bad_encoding.py").write_bytes(b"x = 1  # latin1 byte: \xe9\n")
+    _init_git_repo(repo)
+    violations = run_check(repo)  # must not raise
+    assert violations == []
+
+
+def test_run_check_handles_non_ascii_tracked_filename(tmp_path):
+    # git C-quotes/octal-escapes non-ASCII tracked paths by default
+    # (core.quotepath=true); without countering that, get_tracked_py_files
+    # would return a quoted string that never matches the real path,
+    # silently dropping the file from analysis. Built from a single shared
+    # variable (rather than two separately-typed literals) so the test can't
+    # spuriously fail from unrelated Unicode normalization (NFC/NFD) drift
+    # between two occurrences of the same accented character.
+    module_stem = "caf" + "é"  # "café", explicit NFC codepoint
+    rel_path = f"gadgets/{module_stem}.py"
+    repo = _make_repo(
+        tmp_path,
+        {
+            rel_path: "def bar():\n    pass\n",
+            "app.py": f"from gadgets.{module_stem} import bar\n",
+        },
+    )
+    _init_git_repo(repo)
+    tracked = get_tracked_py_files(repo)
+    assert rel_path in tracked
+    assert run_check(repo) == []
 
 
 # ---------------------------------------------------------------------------
@@ -404,4 +479,11 @@ def test_cli_exits_one_on_violation(tmp_path):
     _init_git_repo(repo)
     result = _run_cli(repo)
     assert result.returncode == 1
-    assert "untracked-or-missing-file" in result.stdout
+
+
+def test_cli_exits_one_with_clear_message_outside_a_git_repo(tmp_path):
+    # main()'s `except GitError` branch -- no git init this time.
+    result = _run_cli(tmp_path)
+    assert result.returncode == 1
+    assert "check_local_imports:" in result.stdout
+    assert "not a git repository" in result.stdout.lower()
