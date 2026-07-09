@@ -214,7 +214,8 @@ class SignalTimelineWindow(QMainWindow):
     """Main window for signal timeline viewer with edit timeline and filters"""
     waveform_ready = Signal(object)
     render_finished = Signal(bool, str)
-    
+    render_progress = Signal(int)
+
     def __init__(self, video_path, cache_data=None):
         debug_log(f"SignalTimelineWindow.__init__ CALLED with video_path={video_path}")
         debug_log(f"  cache_data provided: {cache_data is not None}")
@@ -1678,8 +1679,9 @@ class SignalTimelineWindow(QMainWindow):
         except Exception as e:
             print(f"⚠️ Could not create search dock: {e}")
 
-        # Connect render signal
+        # Connect render signals
         self.render_finished.connect(self.on_render_finished)
+        self.render_progress.connect(self.on_render_progress)
 
         # Apply dark theme
         self.apply_dark_theme()
@@ -3331,9 +3333,9 @@ class SignalTimelineWindow(QMainWindow):
         if not output_path:
             return
 
-        self.statusBar().showMessage("🎬 Rendering highlight video...")
+        self.statusBar().showMessage("🎬 Rendering highlight video…")
         self.render_highlight_btn.setEnabled(False)
-        self.render_highlight_btn.setText("⏳ Rendering...")
+        self.render_highlight_btn.setText("⏳ Rendering… 0%")
 
         # Store for the callback
         self._render_output_path = output_path
@@ -3342,45 +3344,216 @@ class SignalTimelineWindow(QMainWindow):
         import threading
 
         def render():
-            try:
-                filter_parts = []
-                inputs = []
+            from modules.app_paths import ffmpeg_exe
+            import tempfile
 
-                for i, (start, end) in enumerate(clips):
-                    duration = end - start
-                    inputs.extend(["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", self.video_path])
-                    filter_parts.append(f"[{i}:v][{i}:a]")
+            def _parse_ffmpeg_time(ts):
+                # ffmpeg -progress emits out_time=HH:MM:SS.microseconds
+                try:
+                    h, m, s = ts.split(":")
+                    return int(h) * 3600 + int(m) * 60 + float(s)
+                except Exception:
+                    return None
 
-                n = len(clips)
-                filter_str = "".join(filter_parts) + f"concat=n={n}:v=1:a=1[outv][outa]"
+            total_dur = sum(e - s for s, e in clips) or 0.0
 
-                cmd = ["ffmpeg", "-y", "-hwaccel", "none"] + inputs + [
-                    "-filter_complex", filter_str,
-                    "-map", "[outv]", "-map", "[outa]",
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                    "-c:a", "aac", "-b:a", "192k",
-                    output_path
-                ]
+            inputs = []
+            filter_parts = []
+            for i, (start, end) in enumerate(clips):
+                duration = end - start
+                inputs.extend(["-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
+                               "-i", self.video_path])
+                filter_parts.append(f"[{i}:v][{i}:a]")
+            n = len(clips)
+            # Normalize to 8-bit yuv420p after concat: VR sources are often
+            # 10-bit HEVC, which several encoders (and 8-bit libx264 builds)
+            # reject with "pixel format unsupported".
+            filter_str = ("".join(filter_parts) +
+                          f"concat=n={n}:v=1:a=1[cv][outa];[cv]format=yuv420p[outv]")
 
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            # Prefer a GPU encoder (huge win at VR resolutions); try each
+            # available one in turn and fall through to CPU libx264 last.
+            attempts = self._encoder_chain()
 
-                if result.returncode == 0 and os.path.exists(output_path):
-                    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-                    total_dur = sum(e - s for s, e in clips)
-                    msg = (f"✅ Highlight video rendered!\n\n"
-                           f"File: {os.path.basename(output_path)}\n"
-                           f"Clips: {len(clips)}\n"
-                           f"Duration: {total_dur:.1f}s\n"
-                           f"Size: {size_mb:.1f} MB")
-                    self.render_finished.emit(True, msg)
-                else:
-                    err = result.stderr[-500:] if result.stderr else "Unknown error"
-                    self.render_finished.emit(False, f"FFmpeg error:\n{err}")
+            last_err = "Unknown error"
+            for enc, vargs in attempts:
+                cmd = [ffmpeg_exe(), "-y", "-hide_banner", "-nostats",
+                       "-progress", "pipe:1"] + inputs + [
+                       "-filter_complex", filter_str,
+                       "-map", "[outv]", "-map", "[outa]"] + vargs + [
+                       "-c:a", "aac", "-b:a", "192k",
+                       output_path]
+                try:
+                    self.render_progress.emit(0)
+                    with tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                                errors="replace") as errf:
+                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                                stderr=errf, text=True)
+                        for line in proc.stdout:
+                            line = line.strip()
+                            if line.startswith("out_time="):
+                                secs = _parse_ffmpeg_time(line.split("=", 1)[1])
+                                if total_dur > 0 and secs is not None:
+                                    pct = int(min(99, max(0, secs / total_dur * 100)))
+                                    self.render_progress.emit(pct)
+                            elif line == "progress=end":
+                                self.render_progress.emit(100)
+                        proc.wait()
 
-            except Exception as e:
-                self.render_finished.emit(False, str(e))
+                        if proc.returncode == 0 and os.path.exists(output_path):
+                            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                            msg = (f"✅ Highlight video rendered!\n\n"
+                                   f"File: {os.path.basename(output_path)}\n"
+                                   f"Clips: {len(clips)}\n"
+                                   f"Duration: {total_dur:.1f}s\n"
+                                   f"Size: {size_mb:.1f} MB\n"
+                                   f"Encoder: {enc}")
+                            self.render_finished.emit(True, msg)
+                            return
+
+                        errf.seek(0)
+                        last_err = (errf.read() or "").strip()[-2000:] or "Unknown error"
+                        print(f"⚠️ Render with {enc} failed (rc={proc.returncode}); "
+                              + ("falling back to next encoder…"
+                                 if (enc, vargs) != attempts[-1] else "no fallback left"))
+                        print("   cmd: " + " ".join(str(c) for c in cmd))
+                        print("   ffmpeg stderr tail:\n" + last_err[-1200:])
+                except Exception as e:
+                    last_err = str(e)
+
+            self.render_finished.emit(False, f"FFmpeg error:\n{last_err}")
 
         threading.Thread(target=render, daemon=True).start()
+
+    def _probe_video_size(self):
+        """(width, height) of the source video, cached. Used to choose H.264
+        (≤4096px) vs HEVC (VR / >4096px) encoders. Tries ffprobe, then cv2;
+        returns (0, 0) if neither works (caller then assumes normal H.264)."""
+        if hasattr(self, '_video_size'):
+            return self._video_size
+        w = h = 0
+        try:
+            from modules.app_paths import ffmpeg_exe
+            fp = ffmpeg_exe()
+            base = os.path.basename(fp)
+            probe = fp
+            if 'ffmpeg' in base.lower():
+                cand = os.path.join(os.path.dirname(fp),
+                                    base.lower().replace('ffmpeg', 'ffprobe'))
+                probe = cand if os.path.exists(cand) else 'ffprobe'
+            out = subprocess.run(
+                [probe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height",
+                 "-of", "csv=p=0:s=x", self.video_path],
+                capture_output=True, text=True, timeout=15)
+            parts = (out.stdout or "").strip().split("x")
+            if len(parts) >= 2:
+                w, h = int(parts[0]), int(parts[1])
+        except Exception as e:
+            print(f"⚠️ ffprobe size probe failed: {e}")
+        if not (w and h):
+            try:
+                import cv2
+                cap = cv2.VideoCapture(self.video_path)
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+            except Exception:
+                pass
+        self._video_size = (w, h)
+        return self._video_size
+
+    def _encoder_chain(self):
+        """Ordered list of (name, ffmpeg-args) video encoders to try, hardware
+        first, always ending with CPU libx264. Probed once and cached.
+
+        H.264 hardware encoders (nvenc/qsv/amf) top out at 4096px, but VR
+        frames are wider, so for high-res sources we use HEVC encoders (which
+        reach 8192px and are what VR players expect). `-encoders` only reports
+        what ffmpeg was *built* with, not whether the GPU is present, so
+        render() tries each in turn and falls through on runtime failure — an
+        Intel-only box skips nvenc and lands on QuickSync, etc. libx264
+        (software, ≤8192px once pixel format is normalized) is the universal
+        last resort."""
+        if hasattr(self, '_enc_chain'):
+            return self._enc_chain
+        from modules.app_paths import ffmpeg_exe
+        encoders_text = ""
+        try:
+            out = subprocess.run([ffmpeg_exe(), "-hide_banner", "-encoders"],
+                                 capture_output=True, text=True, timeout=15)
+            encoders_text = (out.stdout or "") + (out.stderr or "")
+        except Exception as e:
+            print(f"⚠️ Could not probe ffmpeg encoders: {e}")
+
+        w, h = self._probe_video_size()
+        hi_res = max(w, h) > 4096
+        if hi_res:
+            candidates = [
+                ("hevc_nvenc", ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc",
+                                "vbr", "-cq", "22", "-b:v", "0",
+                                "-tag:v", "hvc1"]),                     # NVIDIA
+                ("hevc_qsv", ["-c:v", "hevc_qsv", "-preset", "faster",
+                              "-global_quality", "22", "-tag:v", "hvc1"]),  # Intel
+                ("hevc_amf", ["-c:v", "hevc_amf", "-quality", "balanced",
+                              "-rc", "cqp", "-qp_i", "22", "-qp_p", "22",
+                              "-tag:v", "hvc1"]),                       # AMD
+            ]
+        else:
+            candidates = [
+                ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p5", "-rc",
+                                "vbr", "-cq", "20", "-b:v", "0"]),      # NVIDIA
+                ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "faster",
+                              "-global_quality", "20"]),                # Intel QuickSync
+                ("h264_amf", ["-c:v", "h264_amf", "-quality", "balanced",
+                              "-rc", "cqp", "-qp_i", "20", "-qp_p", "20"]),  # AMD
+            ]
+        present = [(n, a) for (n, a) in candidates if n in encoders_text]
+        # device_utils told us the real GPU vendor, so only that vendor's
+        # encoder can actually run — keep just it (+ CPU fallback) instead of
+        # wasting ~10s each probing other vendors' encoders that aren't there.
+        # When the vendor is unknown (CPU-only, or an AMD box, which
+        # device_utils can't detect) keep the full list so h264_amf/hevc_amf
+        # still gets a chance.
+        vendor = self._preferred_gpu_vendor()
+        if vendor:
+            key = {'nvidia': 'nvenc', 'intel': 'qsv', 'amd': 'amf'}[vendor]
+            present = [item for item in present if key in item[0]]
+        chain = present + [("libx264",
+                            ["-c:v", "libx264", "-preset", "fast", "-crf", "18"])]
+        print(f"🎬 Source {w}x{h} ({'HEVC' if hi_res else 'H.264'}), "
+              f"GPU={vendor or 'unknown'} → encoder chain: "
+              f"{', '.join(n for n, _ in chain)}")
+        self._enc_chain = chain
+        return self._enc_chain
+
+    def _preferred_gpu_vendor(self):
+        """'nvidia' | 'intel' | None — the machine's GPU vendor from
+        modules.device_utils.detect_best_device(). Used to order the encoder
+        chain so the real hardware is tried first. Returns None on CPU-only or
+        if detection fails (device_utils does not detect AMD, so an AMD box
+        reports None and simply falls through to h264_amf/hevc_amf in order)."""
+        if hasattr(self, '_gpu_vendor'):
+            return self._gpu_vendor
+        vendor = None
+        try:
+            from modules.device_utils import detect_best_device
+            info = detect_best_device(log_fn=lambda *a, **k: None)
+            name = (getattr(info, 'backend_name', '') or '').lower()
+            if 'cuda' in name or 'nvidia' in name:
+                vendor = 'nvidia'
+            elif 'intel' in name or 'xpu' in name:
+                vendor = 'intel'
+        except Exception as e:
+            print(f"⚠️ device_utils GPU probe failed: {e}")
+        self._gpu_vendor = vendor
+        return self._gpu_vendor
+
+    @Slot(int)
+    def on_render_progress(self, pct):
+        """Live render progress (0–100) from the ffmpeg worker thread."""
+        self.render_highlight_btn.setText(f"⏳ Rendering… {pct}%")
+        self.statusBar().showMessage(f"🎬 Rendering highlight video… {pct}%")
 
     @Slot(bool, str)
     def on_render_finished(self, success, message):
