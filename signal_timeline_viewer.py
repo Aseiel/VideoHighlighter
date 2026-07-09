@@ -3425,129 +3425,16 @@ class SignalTimelineWindow(QMainWindow):
 
         threading.Thread(target=render, daemon=True).start()
 
-    def _probe_video_size(self):
-        """(width, height) of the source video, cached. Used to choose H.264
-        (≤4096px) vs HEVC (VR / >4096px) encoders. Tries ffprobe, then cv2;
-        returns (0, 0) if neither works (caller then assumes normal H.264)."""
-        if hasattr(self, '_video_size'):
-            return self._video_size
-        w = h = 0
-        try:
-            from modules.app_paths import ffmpeg_exe
-            fp = ffmpeg_exe()
-            base = os.path.basename(fp)
-            probe = fp
-            if 'ffmpeg' in base.lower():
-                cand = os.path.join(os.path.dirname(fp),
-                                    base.lower().replace('ffmpeg', 'ffprobe'))
-                probe = cand if os.path.exists(cand) else 'ffprobe'
-            out = subprocess.run(
-                [probe, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=width,height",
-                 "-of", "csv=p=0:s=x", self.video_path],
-                capture_output=True, text=True, timeout=15)
-            parts = (out.stdout or "").strip().split("x")
-            if len(parts) >= 2:
-                w, h = int(parts[0]), int(parts[1])
-        except Exception as e:
-            print(f"⚠️ ffprobe size probe failed: {e}")
-        if not (w and h):
-            try:
-                import cv2
-                cap = cv2.VideoCapture(self.video_path)
-                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                cap.release()
-            except Exception:
-                pass
-        self._video_size = (w, h)
-        return self._video_size
-
     def _encoder_chain(self):
-        """Ordered list of (name, ffmpeg-args) video encoders to try, hardware
-        first, always ending with CPU libx264. Probed once and cached.
-
-        H.264 hardware encoders (nvenc/qsv/amf) top out at 4096px, but VR
-        frames are wider, so for high-res sources we use HEVC encoders (which
-        reach 8192px and are what VR players expect). `-encoders` only reports
-        what ffmpeg was *built* with, not whether the GPU is present, so
-        render() tries each in turn and falls through on runtime failure — an
-        Intel-only box skips nvenc and lands on QuickSync, etc. libx264
-        (software, ≤8192px once pixel format is normalized) is the universal
-        last resort."""
+        """Video-encoder fallback chain for the render, delegated to the shared
+        modules.encoder_select helper (also used by the pipeline) so the codec
+        decision — GPU vendor via device_utils, HEVC-for-VR by resolution,
+        libx264 fallback — lives in one place. Cached per window."""
         if hasattr(self, '_enc_chain'):
             return self._enc_chain
-        from modules.app_paths import ffmpeg_exe
-        encoders_text = ""
-        try:
-            out = subprocess.run([ffmpeg_exe(), "-hide_banner", "-encoders"],
-                                 capture_output=True, text=True, timeout=15)
-            encoders_text = (out.stdout or "") + (out.stderr or "")
-        except Exception as e:
-            print(f"⚠️ Could not probe ffmpeg encoders: {e}")
-
-        w, h = self._probe_video_size()
-        hi_res = max(w, h) > 4096
-        if hi_res:
-            candidates = [
-                ("hevc_nvenc", ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc",
-                                "vbr", "-cq", "22", "-b:v", "0",
-                                "-tag:v", "hvc1"]),                     # NVIDIA
-                ("hevc_qsv", ["-c:v", "hevc_qsv", "-preset", "faster",
-                              "-global_quality", "22", "-tag:v", "hvc1"]),  # Intel
-                ("hevc_amf", ["-c:v", "hevc_amf", "-quality", "balanced",
-                              "-rc", "cqp", "-qp_i", "22", "-qp_p", "22",
-                              "-tag:v", "hvc1"]),                       # AMD
-            ]
-        else:
-            candidates = [
-                ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p5", "-rc",
-                                "vbr", "-cq", "20", "-b:v", "0"]),      # NVIDIA
-                ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "faster",
-                              "-global_quality", "20"]),                # Intel QuickSync
-                ("h264_amf", ["-c:v", "h264_amf", "-quality", "balanced",
-                              "-rc", "cqp", "-qp_i", "20", "-qp_p", "20"]),  # AMD
-            ]
-        present = [(n, a) for (n, a) in candidates if n in encoders_text]
-        # device_utils told us the real GPU vendor, so only that vendor's
-        # encoder can actually run — keep just it (+ CPU fallback) instead of
-        # wasting ~10s each probing other vendors' encoders that aren't there.
-        # When the vendor is unknown (CPU-only, or an AMD box, which
-        # device_utils can't detect) keep the full list so h264_amf/hevc_amf
-        # still gets a chance.
-        vendor = self._preferred_gpu_vendor()
-        if vendor:
-            key = {'nvidia': 'nvenc', 'intel': 'qsv', 'amd': 'amf'}[vendor]
-            present = [item for item in present if key in item[0]]
-        chain = present + [("libx264",
-                            ["-c:v", "libx264", "-preset", "fast", "-crf", "18"])]
-        print(f"🎬 Source {w}x{h} ({'HEVC' if hi_res else 'H.264'}), "
-              f"GPU={vendor or 'unknown'} → encoder chain: "
-              f"{', '.join(n for n, _ in chain)}")
-        self._enc_chain = chain
+        from modules.encoder_select import encoder_chain
+        self._enc_chain = encoder_chain(self.video_path)
         return self._enc_chain
-
-    def _preferred_gpu_vendor(self):
-        """'nvidia' | 'intel' | None — the machine's GPU vendor from
-        modules.device_utils.detect_best_device(). Used to order the encoder
-        chain so the real hardware is tried first. Returns None on CPU-only or
-        if detection fails (device_utils does not detect AMD, so an AMD box
-        reports None and simply falls through to h264_amf/hevc_amf in order)."""
-        if hasattr(self, '_gpu_vendor'):
-            return self._gpu_vendor
-        vendor = None
-        try:
-            from modules.device_utils import detect_best_device
-            info = detect_best_device(log_fn=lambda *a, **k: None)
-            name = (getattr(info, 'backend_name', '') or '').lower()
-            if 'cuda' in name or 'nvidia' in name:
-                vendor = 'nvidia'
-            elif 'intel' in name or 'xpu' in name:
-                vendor = 'intel'
-        except Exception as e:
-            print(f"⚠️ device_utils GPU probe failed: {e}")
-        self._gpu_vendor = vendor
-        return self._gpu_vendor
 
     @Slot(int)
     def on_render_progress(self, pct):
