@@ -536,6 +536,9 @@ class EditTimelineScene(QGraphicsScene):
 
         # Load initial highlights if available
         self.load_initial_clips()
+        # Snapshot of what was loaded, so we can tell on close whether the user
+        # actually edited the timeline (and thus whether to auto-save it).
+        self._saved_clips_snapshot = list(self.clips)
 
         self.active_clip_index = -1
         self.active_progress = 0.0
@@ -698,11 +701,23 @@ class EditTimelineScene(QGraphicsScene):
 
             if success:
                 print(f"✅ Saved {len(self.clips)} clips to cache")
+                self._saved_clips_snapshot = list(self.clips)
                 return True
             return False
         except Exception as e:
             print(f"❌ Failed to save clips to cache: {e}")
             return False
+
+    def has_unsaved_edits(self):
+        """True if the current clips differ from what was last loaded or saved.
+        Used to auto-save on close only when the user actually changed the edit
+        (avoids churning highlight history with untouched sample/loaded clips)."""
+        def norm(clips):
+            return [(round(float(s), 3), round(float(e), 3)) for s, e in clips]
+        try:
+            return norm(self.clips) != norm(getattr(self, '_saved_clips_snapshot', []))
+        except Exception:
+            return True  # when in doubt, prefer saving over losing work
 
     def keyPressEvent(self, event):
         """Handle key presses for deleting and cutting clips"""

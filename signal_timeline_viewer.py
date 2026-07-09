@@ -408,6 +408,18 @@ class SignalTimelineWindow(QMainWindow):
             except Exception:
                 pass
 
+            # Auto-save the edit timeline so manual clip edits aren't lost on
+            # close. Only writes when the user actually changed the clips.
+            try:
+                if (hasattr(self, 'edit_scene') and self.edit_scene is not None
+                        and self.edit_scene.clips
+                        and self.edit_scene.has_unsaved_edits()):
+                    if self.edit_scene.save_clips_to_cache():
+                        print(f"💾 Auto-saved {len(self.edit_scene.clips)} edit "
+                              f"clips on close")
+            except Exception as e:
+                print(f"⚠️ Edit autosave on close failed: {e}")
+
             # Tear down the thumbnail worker + hover popup
             try:
                 if hasattr(self, 'edit_scene') and self.edit_scene is not None:
