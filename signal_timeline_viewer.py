@@ -2527,11 +2527,12 @@ class SignalTimelineWindow(QMainWindow):
     
     @Slot(float)
     def on_time_clicked(self, time):
-        # Pause edit playback if running, but DON'T destroy state
-        if hasattr(self, '_edit_playlist') and self._edit_playlist:
-            if not getattr(self, '_edit_paused', True):
-                self._pause_edit_playback()
-        
+        # Clicking the signal timeline hands control back to the main video
+        # timeline: if an edit was playing/paused, leave edit-playback mode so
+        # the next Space plays the video from here instead of resuming the edit.
+        if getattr(self, '_edit_playback_active', False):
+            self._leave_edit_playback()
+
         self.current_time = max(0, min(self.video_duration, time))
         self.signal_scene.current_time_seconds = self.current_time
         self.signal_scene.set_current_time(self.current_time)
@@ -2557,6 +2558,29 @@ class SignalTimelineWindow(QMainWindow):
             self._edit_clip_timer.stop()
         if hasattr(self, '_edit_progress_timer'):
             self._edit_progress_timer.stop()
+
+    def _leave_edit_playback(self):
+        """Exit edit-timeline playback without moving the playhead.
+
+        Used when the user clicks the signal timeline mid-edit: control returns
+        to the main video timeline (Space then plays the video from the click),
+        instead of resuming the edit playlist. Unlike stop_edit_playback() this
+        keeps current_time where it is; unlike _pause_edit_playback() it clears
+        the edit sentinel so Space routes to toggle_video_playback()."""
+        if hasattr(self, '_edit_clip_timer') and self._edit_clip_timer.isActive():
+            self._edit_clip_timer.stop()
+        if hasattr(self, '_edit_progress_timer') and self._edit_progress_timer.isActive():
+            self._edit_progress_timer.stop()
+        if hasattr(self, 'edit_scene'):
+            self.edit_scene.clear_active_clip()
+        self._edit_playback_active = False
+        self._edit_paused = False
+        self._single_clip_playing = False
+        self._edit_playlist_index = 0
+        self._active_player.pause()
+        self.play_edit_btn.setText("▶ Play Edit")
+        if hasattr(self, 'play_btn'):
+            self.play_btn.setText("▶ Play")
 
     def _get_active_audio_output(self):
         """Return the QAudioOutput attached to whichever player is currently active."""
