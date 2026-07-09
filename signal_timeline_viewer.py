@@ -1204,6 +1204,10 @@ class SignalTimelineWindow(QMainWindow):
             if not findings or not hasattr(self, 'signal_scene'):
                 return
             self.signal_scene.add_visual_findings(findings)
+            # Auto-enable the Visual Search signal now that it has data. Its
+            # checkbox starts unchecked/hidden when the UI was built before any
+            # findings existed, so surface the freshly-added results.
+            self._enable_layer('visual_search')
             if save:
                 self.save_visual_findings_to_cache()
             if hasattr(self, 'label_panel'):
@@ -1211,6 +1215,27 @@ class SignalTimelineWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"🔍 Added {len(findings)} visual finding(s) to timeline", 3000
             )
+
+    def _resolve_video_hash(self):
+        """Return the video hash for the current video, caching it into
+        cache_data. Falls back to computing it from the video file when the
+        loaded/provided cache_data lacks a 'video_hash' key (e.g. minimal or
+        caller-supplied cache_data). Returns None if it can't be determined."""
+        video_hash = self.cache_data.get('video_hash') if self.cache_data else None
+        if video_hash:
+            return video_hash
+        try:
+            if self.video_path and os.path.exists(self.video_path):
+                from modules.video_cache import VideoAnalysisCache
+                cache = self.cache or VideoAnalysisCache()
+                video_hash = cache._get_video_hash(self.video_path)
+                if self.cache_data is None:
+                    self.cache_data = {}
+                self.cache_data['video_hash'] = video_hash
+                return video_hash
+        except Exception as e:
+            print(f"⚠️ Could not compute video_hash from file: {e}")
+        return None
 
     def save_visual_findings_to_cache(self):
         """Persist visual_findings to the on-disk cache file."""
@@ -1229,19 +1254,27 @@ class SignalTimelineWindow(QMainWindow):
                 print("⚠️ Cache directory not found, findings not persisted")
                 return False
 
-            video_hash = self.cache_data.get('video_hash')
+            video_hash = self._resolve_video_hash()
             if not video_hash:
                 print("⚠️ No video_hash in cache_data, cannot save findings")
                 return False
 
             matching = list(cache_dir.glob(f"{video_hash}*.cache.json"))
-            if not matching:
-                print(f"⚠️ No cache file found for hash {video_hash[:16]}...")
-                return False
+            if matching:
+                cache_file = matching[0]
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    disk_data = json.load(f)
+            else:
+                # No analysis cache exists yet (e.g. visual search run without a
+                # prior full analysis). Seed a legacy <hash>.cache.json so the
+                # findings survive a restart; load_cache_data() will pick it up.
+                print(f"ℹ️ No cache file for hash {video_hash[:16]}..., creating one")
+                cache_file = cache_dir / f"{video_hash}.cache.json"
+                disk_data = dict(self.cache_data)
+                disk_data.setdefault('video_path', str(self.video_path))
+                disk_data['video_hash'] = video_hash
+                disk_data['cache_complete'] = True
 
-            cache_file = matching[0]
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                disk_data = json.load(f)
             disk_data['visual_findings'] = findings
             with open(cache_file, 'w', encoding='utf-8') as f:
                 json.dump(disk_data, f)
@@ -1271,7 +1304,7 @@ class SignalTimelineWindow(QMainWindow):
                 print("⚠️ Cache directory not found, waveform not persisted")
                 return
 
-            video_hash = self.cache_data.get('video_hash')
+            video_hash = self._resolve_video_hash()
             if not video_hash:
                 print("⚠️ No video_hash in cache_data, cannot save waveform to disk")
                 return
@@ -2415,6 +2448,21 @@ class SignalTimelineWindow(QMainWindow):
         """Toggle visibility of a layer"""
         self.signal_scene.visible_layers[layer_name] = (state == Qt.CheckState.Checked.value)
         self.signal_scene.build_timeline()
+
+    def _enable_layer(self, layer_name, rebuild=True):
+        """Programmatically make a layer visible and sync its checkbox. Used
+        when a signal gains data after the UI was built (e.g. visual search
+        findings arriving post-processing)."""
+        self.signal_scene.visible_layers[layer_name] = True
+        checkbox = getattr(self, 'layer_checkboxes', {}).get(layer_name)
+        if checkbox is not None and not checkbox.isChecked():
+            # blockSignals so we don't double-trigger toggle_layer/build_timeline
+            checkbox.blockSignals(True)
+            checkbox.setChecked(True)
+            checkbox.setToolTip("")
+            checkbox.blockSignals(False)
+        if rebuild:
+            self.signal_scene.build_timeline()
 
     # ---- Avoid ranges -----------------------------------------------------
     def _avoid_selected_range(self):
