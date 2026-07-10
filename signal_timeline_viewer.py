@@ -2702,6 +2702,11 @@ class SignalTimelineWindow(QMainWindow):
             start, end = self.edit_scene.clips[found]
             self.edit_scene.set_active_clip(found)
 
+            # Clicking a clip in the EDIT timeline is deliberate repositioning of
+            # edit playback, so remember it as the resume point (unlike signal-
+            # timeline clicks, which hand control back to the source video).
+            self._edit_resume_pos = self.current_time
+
             if is_playing:
                 # Reroute the live playback so this clip plays through to its
                 # end, then continues with the next clip in the timeline.
@@ -3129,18 +3134,51 @@ class SignalTimelineWindow(QMainWindow):
         """Handle filter changes from the scene"""
         self.update_filter_summary()
     
+    def _edit_resume_target(self, clips):
+        """Where 'Play Edit' should resume from.
+
+        Uses _edit_resume_pos — the point where edit playback last stopped,
+        tracked independently of the main playhead so playing the source
+        timeline in between does NOT move it. When there's no stored position
+        (never played, finished, or Stopped) it starts at the first clip.
+
+        - Position inside a clip  → resume that clip mid-way
+        - Position before a clip  → start that clip from its beginning
+        - Position past all clips → wrap back to the first clip
+
+        Returns (start_index, start_pos_in_source_seconds).
+        """
+        t = getattr(self, '_edit_resume_pos', None)
+        if t is None:
+            return 0, clips[0][0]
+        for i, (start, end) in enumerate(clips):
+            if start <= t < end:
+                return i, t
+            if t < start:
+                return i, start
+        return 0, clips[0][0]
+
     def play_edit_timeline(self):
-        """Play all clips in the edit timeline sequentially"""
+        """Play all clips in the edit timeline sequentially.
+
+        Resumes from where edit playback last stopped (see _edit_resume_target)
+        instead of always restarting at clip 0 — so playing the source timeline
+        in between doesn't lose your place. Use Stop (⏹) to reset to the start.
+        """
         clips = self.edit_scene.get_clip_times()
         if not clips:
             self.statusBar().showMessage("⚠️ No clips in edit timeline", 2000)
             return
 
+        start_index, start_pos = self._edit_resume_target(clips)
+
         self._edit_paused = False
         self._edit_playback_active = True   # sentinel instead of snapshot
-        self._edit_playlist_index = 0
+        self._edit_playlist_index = start_index
+        self._edit_start_pos = start_pos    # consumed by the first _play_next_edit_clip
         self.play_edit_btn.setText("⏸ Pause")
-        self.statusBar().showMessage(f"▶ Playing edit timeline: {len(clips)} clips", 3000)
+        remaining = len(clips) - start_index
+        self.statusBar().showMessage(f"▶ Playing edit timeline: {remaining} clip(s)", 3000)
         self._play_next_edit_clip()
 
     def toggle_edit_playback(self):
@@ -3220,13 +3258,22 @@ class SignalTimelineWindow(QMainWindow):
             self._edit_playback_active = False
             self._edit_playlist_index = 0
             self._edit_paused = False
+            self._edit_resume_pos = None   # finished → next Play Edit starts over
             self.play_edit_btn.setText("▶ Play Edit")
             if hasattr(self, '_edit_progress_timer'):
                 self._edit_progress_timer.stop()
             return
 
         start, end = clips[self._edit_playlist_index]
-        duration = end - start
+
+        # Honor a one-shot resume position for the first clip of this run, so
+        # Play Edit can start mid-clip from the playhead. Cleared immediately so
+        # subsequent clips play in full.
+        resume_pos = getattr(self, '_edit_start_pos', None)
+        self._edit_start_pos = None
+        play_pos = resume_pos if (resume_pos is not None and start <= resume_pos < end) else start
+
+        duration = end - play_pos
         self._edit_playlist_index += 1
 
         clip_num = self._edit_playlist_index
@@ -3237,12 +3284,12 @@ class SignalTimelineWindow(QMainWindow):
         )
 
         # Seek and play
-        self.current_time = start
-        self.signal_scene.set_current_time(start)
+        self.current_time = play_pos
+        self.signal_scene.set_current_time(play_pos)
         if hasattr(self, 'signal_view'):
-            self.signal_view.ensure_time_visible(start)
+            self.signal_view.ensure_time_visible(play_pos)
 
-        self._active_player.setPosition(int(start * 1000))
+        self._active_player.setPosition(int(play_pos * 1000))
         self._active_player.play()
 
         # Highlight active clip in edit timeline
@@ -3289,6 +3336,11 @@ class SignalTimelineWindow(QMainWindow):
         progress = max(0.0, min(1.0, (current - start) / duration))
         self.edit_scene.set_active_progress(progress)
 
+        # Remember how far edit playback got, so a later Play Edit resumes here
+        # even if the main playhead was moved (e.g. by playing the source
+        # timeline) in between. Independent of self.current_time by design.
+        self._edit_resume_pos = current
+
     def stop_edit_playback(self):
         """Stop edit timeline playback"""
         if hasattr(self, '_edit_clip_timer'):
@@ -3298,9 +3350,10 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_scene.clear_active_clip()
         self._edit_playlist_index = 0
         self._edit_paused = False
+        self._edit_resume_pos = None   # Stop resets edit playback to the start
         self.play_edit_btn.setText("▶ Play Edit")
         self._active_player.pause()
-        
+
         # Reset to beginning
         self.current_time = 0
         self._active_player.setPosition(0)
