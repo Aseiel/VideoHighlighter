@@ -1541,6 +1541,8 @@ class SignalTimelineWindow(QMainWindow):
         # Connect signals
         self.signal_scene.time_clicked.connect(self.on_time_clicked)
         self.signal_scene.add_to_edit_requested.connect(self.on_add_to_edit_requested)
+        self.signal_scene.add_clip_to_edit_requested.connect(self.on_add_clip_to_edit)
+        self.signal_scene.add_clips_to_edit_requested.connect(self.on_add_clips_to_edit)
         self.signal_scene.filter_changed.connect(self.on_filter_changed)
         
         # Preview follows drag
@@ -2649,9 +2651,27 @@ class SignalTimelineWindow(QMainWindow):
         start, end = self.find_signal_region_around(time)
         self.edit_scene.add_clip_from_selection(start, end)
         self.update_edit_duration()
-        
+
         self.statusBar().showMessage(f"Added clip: {start:.1f}s to {end:.1f}s", 2000)
-    
+
+    @Slot(float, float)
+    def on_add_clip_to_edit(self, start, end):
+        """Add one precise clip from a bar's right-click menu (append to end)."""
+        self.edit_scene.add_clip(float(start), float(end))
+        self.update_edit_duration()
+        self.statusBar().showMessage(f"Added clip: {start:.1f}s to {end:.1f}s", 2000)
+
+    @Slot(list)
+    def on_add_clips_to_edit(self, clips):
+        """Add every clip in a bar's row (same query/layer) to the edit timeline."""
+        added = 0
+        for start, end in clips:
+            self.edit_scene.add_clip(float(start), float(end))
+            added += 1
+        self.update_edit_duration()
+        plural = "s" if added != 1 else ""
+        self.statusBar().showMessage(f"Added {added} clip{plural} to edit timeline", 2500)
+
     @Slot(float)
     def on_edit_time_clicked(self, time):
         """Handle click on edit timeline — seek to source time"""

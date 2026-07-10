@@ -197,7 +197,7 @@ class DraggableTimelineBar(QGraphicsRectItem):
         
         # Show tooltip
         duration = self.bar.end_time - self.bar.start_time
-        self.setToolTip(f"Drag to add to edit timeline\n{self.bar.label}\n{self.bar.start_time:.1f}s - {self.bar.end_time:.1f}s\nDuration: {duration:.1f}s")
+        self.setToolTip(f"Drag to place • Right-click to add (this / all in row)\n{self.bar.label}\n{self.bar.start_time:.1f}s - {self.bar.end_time:.1f}s\nDuration: {duration:.1f}s")
         
         super().hoverEnterEvent(event)
     

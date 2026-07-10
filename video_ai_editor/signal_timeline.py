@@ -17,6 +17,8 @@ class SignalTimelineScene(QGraphicsScene):
     time_clicked = Signal(float)
     time_dragged = Signal(float)
     add_to_edit_requested = Signal(float)
+    add_clip_to_edit_requested = Signal(float, float)   # precise (start, end) from a bar's right-click menu
+    add_clips_to_edit_requested = Signal(list)          # batch [(start, end), ...] — "add all in this row"
     filter_changed = Signal(dict)
     waveform_clicked = Signal(float, float, float)
     timeline_rebuilt = Signal()  # fired after build_timeline finishes
@@ -1837,6 +1839,51 @@ class SignalTimelineView(QGraphicsView):
         scene_pos = self.mapToScene(pos)
         return scene.selection_rect_contains(scene_pos)
 
+    def _bar_at(self, pos):
+        """The DraggableTimelineBar under view pos (walking parent chain), or None."""
+        item = self.itemAt(pos)
+        while item is not None:
+            if isinstance(item, DraggableTimelineBar):
+                return item
+            item = item.parentItem()
+        return None
+
+    # ── bar context menu ───────────────────────────────────────────────
+    def _bar_context_menu(self, event, bar_item):
+        """Right-click a signal bar: add this clip — or every clip in its row
+        (same query/layer) — to the edit timeline. Complements drag-and-drop
+        (precise placement) with a fast append + bulk-add path."""
+        scene = self.scene()
+        if scene is None:
+            return
+        bar = bar_item.bar
+        start, end = float(bar.start_time), float(bar.end_time)
+
+        # All bars sharing this bar's row (same y) belong to the same query /
+        # layer. Row is a universal group key: it works for visual-search
+        # queries, actions, objects, scenes, etc. regardless of what metadata
+        # each layer happens to attach. Dedupe + sort into (start, end) pairs.
+        row_clips = sorted({
+            (float(b.start_time), float(b.end_time))
+            for b in getattr(scene, "bars", [])
+            if abs(b.y_position - bar.y_position) < 0.5
+        })
+
+        meta = bar.metadata or {}
+        group_name = meta.get("query") or meta.get("type") or "row"
+
+        menu = QMenu(self)
+        act_one = menu.addAction("➕  Add this clip to edit timeline")
+        act_all = None
+        if len(row_clips) > 1:
+            act_all = menu.addAction(f"➕  Add all “{group_name}” clips  ({len(row_clips)})")
+
+        chosen = menu.exec(event.globalPosition().toPoint())
+        if chosen is act_one:
+            scene.add_clip_to_edit_requested.emit(start, end)
+        elif act_all is not None and chosen is act_all:
+            scene.add_clips_to_edit_requested.emit(row_clips)
+
     # ── avoid-range context menu ───────────────────────────────────────
     def _avoid_context_menu(self, event):
         """Right-click menu on a selection: exclude the range from highlights."""
@@ -1947,6 +1994,11 @@ class SignalTimelineView(QGraphicsView):
                 return
             if self._pos_in_selection(event.pos()):
                 self._avoid_context_menu(event)
+                event.accept()
+                return
+            bar_item = self._bar_at(event.pos())
+            if bar_item is not None:
+                self._bar_context_menu(event, bar_item)
                 event.accept()
                 return
 
