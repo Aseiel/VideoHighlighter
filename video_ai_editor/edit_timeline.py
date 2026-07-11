@@ -1238,6 +1238,19 @@ class EditTimelineScene(QGraphicsScene):
         x = pos.x() + rect.width() * self.active_progress
         self._progress_line.setLine(x, pos.y(), x, pos.y() + rect.height())
 
+    def active_playhead_x(self):
+        """Scene x of the progress line inside the active clip, or None.
+
+        Used to auto-scroll the edit view so the playing clip stays visible.
+        """
+        idx = self.active_clip_index
+        if idx < 0 or idx >= len(self.clip_items):
+            return None
+        item = self.clip_items[idx]
+        rect = item.rect()
+        pos = item.pos()
+        return pos.x() + rect.width() * self.active_progress
+
     def _remove_active_overlay(self):
         """Remove overlay and progress line"""
         try:

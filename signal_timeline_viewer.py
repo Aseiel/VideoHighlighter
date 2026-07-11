@@ -3294,6 +3294,7 @@ class SignalTimelineWindow(QMainWindow):
 
         # Highlight active clip in edit timeline
         self.edit_scene.set_active_clip(self._edit_playlist_index - 1)
+        self._follow_edit_playhead()
 
         # Progress update timer (~30fps)
         if hasattr(self, '_edit_progress_timer'):
@@ -3310,6 +3311,39 @@ class SignalTimelineWindow(QMainWindow):
         self._edit_clip_timer.setSingleShot(True)
         self._edit_clip_timer.timeout.connect(self._play_next_edit_clip)
         self._edit_clip_timer.start(int(duration * 1000))
+
+    def _follow_edit_playhead(self):
+        """Auto-scroll the edit timeline to keep the active clip's playhead visible.
+
+        Honors the same "Follow Playhead" toggle used for the source timeline
+        (on by default), so Play Edit follows the playhead without extra setup.
+        """
+        if not hasattr(self, 'edit_view') or not hasattr(self, 'edit_scene'):
+            return
+        # Single toggle drives both timelines; skip if the user turned it off.
+        if hasattr(self, 'signal_view') and not getattr(self.signal_view, 'follow_playhead', True):
+            return
+
+        x = self.edit_scene.active_playhead_x()
+        if x is None:
+            return
+
+        view = self.edit_view
+        vp = view.viewport().rect()
+        left = view.mapToScene(vp.topLeft()).x()
+        right = view.mapToScene(vp.topRight()).x()
+        width = right - left
+        if width <= 0:
+            return
+
+        rel = (x - left) / width
+        # Inside comfort zone → leave the scroll position alone
+        if 0.10 <= rel <= 0.85:
+            return
+
+        # Keep the playhead ~35% from the left, matching the source timeline
+        center_y = view.mapToScene(vp.center()).y()
+        view.centerOn(x + width * 0.15, center_y)
 
     def _update_edit_progress(self):
         """Update progress line in active edit clip"""
@@ -3335,6 +3369,7 @@ class SignalTimelineWindow(QMainWindow):
         
         progress = max(0.0, min(1.0, (current - start) / duration))
         self.edit_scene.set_active_progress(progress)
+        self._follow_edit_playhead()
 
         # Remember how far edit playback got, so a later Play Edit resumes here
         # even if the main playhead was moved (e.g. by playing the source
