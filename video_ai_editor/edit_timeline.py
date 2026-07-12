@@ -737,6 +737,16 @@ class EditTimelineScene(QGraphicsScene):
         if not selected_items:
             return
 
+        # The clip under the cursor is about to be destroyed, so its
+        # hoverLeaveEvent will never fire. Dismiss the floating hover preview
+        # (and cut indicator) now, otherwise the frameless, click-through popup
+        # is orphaned on screen with no way to close it. The context-menu delete
+        # path does the same before removing a clip.
+        self._hover_source_time = None
+        self._hide_cut_indicator()
+        if getattr(self, '_hover_preview', None) is not None:
+            self._hover_preview.hide_preview()
+
         indices_to_remove = sorted(
             (self.clip_items.index(item) for item in selected_items),
             reverse=True
