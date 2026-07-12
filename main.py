@@ -3188,9 +3188,23 @@ class VideoHighlighterGUI(QWidget):
             return
 
         # --- GUI thread only below ---
-        self.log_output.append(text)
+        # Insert through a standalone cursor rather than QTextEdit.append(),
+        # which moves the widget's own cursor and clears the user's selection —
+        # that made text impossible to select/copy while logs were streaming.
+        from PySide6.QtGui import QTextCursor
         scrollbar = self.log_output.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+
+        cursor = QTextCursor(self.log_output.document())
+        cursor.movePosition(QTextCursor.End)
+        if not self.log_output.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertText(text)
+
+        # Only follow the tail if the user was already at the bottom; don't yank
+        # them down (and away from a selection) while they scroll back through it.
+        if at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
 
     def _show_progress(self, visible=True):
         # Show/hide the whole progress box. Hidden when idle so it doesn't sit

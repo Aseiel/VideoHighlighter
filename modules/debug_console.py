@@ -249,8 +249,12 @@ def _create_window():
         def append_chunk(self, text: str):
             sb = self.verticalScrollBar()
             follow = sb.value() >= sb.maximum() - 4  # keep following the tail
-            self.moveCursor(QTextCursor.End)
-            self.insertPlainText(text)
+            # Insert via a standalone cursor, not moveCursor()/insertPlainText,
+            # which move the widget's own cursor and clear the user's selection —
+            # otherwise you can't select/copy while the log is streaming.
+            cursor = QTextCursor(self.document())
+            cursor.movePosition(QTextCursor.End)
+            cursor.insertText(text)
             if follow:
                 sb.setValue(sb.maximum())
 
