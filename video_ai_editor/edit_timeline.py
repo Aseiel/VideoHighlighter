@@ -174,22 +174,45 @@ class EditClipItem(QGraphicsRectItem):
             event.accept()
             return
 
-        # 2. Normal left-click: select + seek
+        # 2. Left-click: multi-select (Ctrl/Shift) or single-select + seek
         if event.button() == Qt.LeftButton:
-            # Clear other selections if shift/ctrl not pressed
-            if not (event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier)):
-                if scene:
-                    for item in scene.selectedItems():
-                        if item != self:
-                            item.setSelected(False)
+            mods = event.modifiers()
+            my_index = self._get_current_index()
+
+            # Ctrl+click → toggle this clip, keep the rest of the selection.
+            # No drag / no seek: this is a pure selection gesture for bulk ops.
+            if mods & Qt.ControlModifier:
+                self.setSelected(not self.isSelected())
+                if scene is not None:
+                    scene._selection_anchor_index = my_index
+                event.accept()
+                return
+
+            # Shift+click → select the contiguous range from the anchor to here.
+            if mods & Qt.ShiftModifier:
+                if scene is not None and hasattr(scene, 'select_clip_range'):
+                    anchor = getattr(scene, '_selection_anchor_index', my_index)
+                    scene.select_clip_range(anchor, my_index)
+                else:
+                    self.setSelected(True)
+                event.accept()
+                return
+
+            # Plain click → single-select (clear others) + prepare drag + seek.
+            if scene:
+                for item in scene.selectedItems():
+                    if item != self:
+                        item.setSelected(False)
 
             self.setSelected(True)
-            
+            if scene is not None:
+                scene._selection_anchor_index = my_index
+
             # Store the initial drag position in scene coordinates
             self.drag_start_pos = event.scenePos()
             self.original_pos = self.pos()  # Store original item position
             self.setCursor(QCursor(Qt.ClosedHandCursor))
-            
+
             # Seek to the source time at the click position
             local_x = event.pos().x()
             width = self.rect().width()
@@ -198,10 +221,10 @@ class EditClipItem(QGraphicsRectItem):
                 source_time = self.start_time + progress * (self.end_time - self.start_time)
                 if scene and hasattr(scene, 'time_clicked'):
                     scene.time_clicked.emit(source_time)
-            
+
             event.accept()  # Accept the event to ensure we get move events
             return
-        
+
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -263,7 +286,18 @@ class EditClipItem(QGraphicsRectItem):
                 # Reset drag state
                 self.original_pos = None
                 self.drag_start_pos = None
-                
+
+                event.accept()
+                return
+
+            # Left-button release that wasn't a drag = a selection click
+            # (plain / Ctrl / Shift). Selection was already applied in
+            # mousePressEvent — swallow the release so QGraphicsItem's default
+            # mouseReleaseEvent doesn't re-run select-on-release and clobber it
+            # (that was toggling Ctrl+clicks back off and collapsing Shift ranges
+            # down to the single clicked clip).
+            if event.button() == Qt.LeftButton:
+                self.setCursor(QCursor(Qt.OpenHandCursor))
                 event.accept()
                 return
 
@@ -550,6 +584,9 @@ class EditTimelineScene(QGraphicsScene):
         self._cut_line = None
         self._hover_source_time = None
 
+        # Anchor clip for Shift+click range selection (see select_clip_range).
+        self._selection_anchor_index = -1
+
         self.setSceneRect(0, 0, 1000, self.clip_height + 40)
         self.build_timeline()
 
@@ -591,9 +628,10 @@ class EditTimelineScene(QGraphicsScene):
             time = pos.x() / self.pixels_per_second
             self.time_clicked.emit(time)
 
-            # If Ctrl is pressed, also request to add to edit timeline
-            if event.modifiers() & Qt.ControlModifier:
-                self.add_to_edit_requested.emit(time)
+        # NOTE: no add_to_edit_requested here — that signal belongs to the
+        # SIGNAL timeline (SignalTimelineScene). Emitting it on the EDIT timeline
+        # was copy-paste leftover that raised AttributeError on Ctrl+click of the
+        # background (and "add to edit" is meaningless on the edit timeline).
 
         super().mousePressEvent(event)
 
@@ -720,9 +758,12 @@ class EditTimelineScene(QGraphicsScene):
             return True  # when in doubt, prefer saving over losing work
 
     def keyPressEvent(self, event):
-        """Handle key presses for deleting and cutting clips"""
+        """Handle key presses for deleting, selecting, and cutting clips"""
         if event.key() == Qt.Key_Delete or event.key() == Qt.Key_Backspace:
             self.remove_selected_clips()
+            event.accept()
+        elif event.key() == Qt.Key_A and (event.modifiers() & Qt.ControlModifier):
+            self.select_all_clips()
             event.accept()
         elif event.key() == Qt.Key_C:
             if self._hover_source_time is not None:
@@ -730,6 +771,28 @@ class EditTimelineScene(QGraphicsScene):
             event.accept()
         else:
             super().keyPressEvent(event)
+
+    def select_all_clips(self):
+        """Select every clip (Ctrl+A) so the next Delete removes them all."""
+        for item in self.clip_items:
+            item.setSelected(True)
+        if self.clip_items:
+            self._selection_anchor_index = 0
+
+    def select_clip_range(self, anchor_index, target_index):
+        """Select the contiguous run of clips between two indices (Shift+click).
+
+        Replaces the current selection with [min..max] inclusive, matching the
+        range-select behaviour of a file list. Indices are clamped to valid
+        range; the anchor is left where it was so further Shift+clicks extend
+        from the same origin."""
+        n = len(self.clip_items)
+        if n == 0:
+            return
+        a = anchor_index if 0 <= anchor_index < n else target_index
+        lo, hi = sorted((max(0, min(a, n - 1)), max(0, min(target_index, n - 1))))
+        for i, item in enumerate(self.clip_items):
+            item.setSelected(lo <= i <= hi)
 
     def remove_selected_clips(self):
         selected_items = [item for item in self.items()

@@ -1835,7 +1835,7 @@ class SignalTimelineWindow(QMainWindow):
         instructions = QLabel(
             "🖱️ Drag signal bars → edit timeline  "
             "•  Left-drag background → highlight range, then drag range → edit timeline  "
-            "•  Select clip + Delete to remove"
+            "•  Ctrl+click / Shift+click / Ctrl+A to multi-select, then Delete to remove"
         )
         instructions.setStyleSheet("color: #a0ffa0; font-style: italic; font-size: 11px; padding: 4px; background: rgba(0, 100, 0, 40); border-radius: 4px;")
         layout.addWidget(instructions)
