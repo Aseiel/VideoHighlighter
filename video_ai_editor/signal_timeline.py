@@ -1573,7 +1573,26 @@ class SignalTimelineScene(QGraphicsScene):
         self.cache_data['visual_findings'] = self.visual_findings
 
         if rebuild:
-            self.build_timeline()
+            # Debounced: a live scan pushes findings one-at-a-time (see
+            # llm_chat_widget._on_frame_analyzed). Rebuilding synchronously per
+            # hit redraws the whole scene — including the waveform point-by-point
+            # — hundreds of times. Coalesce bursts into a single rebuild instead.
+            self._schedule_rebuild()
+
+    def _schedule_rebuild(self, delay_ms: int = 150):
+        """Coalesce rapid rebuild requests into one build_timeline().
+
+        Each call restarts a single-shot timer, so a burst of streaming updates
+        (e.g. 200 visual-search hits arriving back-to-back) triggers just one
+        repaint after the burst settles, rather than one per update. A lone call
+        still rebuilds after the short delay — imperceptible for one-off adds."""
+        timer = getattr(self, '_rebuild_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self.build_timeline)
+            self._rebuild_timer = timer
+        timer.start(delay_ms)  # restart → debounce
 
     def clear_visual_findings(self, query: str | None = None,
                               scan_id: str | None = None,

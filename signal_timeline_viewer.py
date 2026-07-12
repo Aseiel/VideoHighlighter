@@ -1220,7 +1220,11 @@ class SignalTimelineWindow(QMainWindow):
             # Auto-enable the Visual Search signal now that it has data. Its
             # checkbox starts unchecked/hidden when the UI was built before any
             # findings existed, so surface the freshly-added results.
-            self._enable_layer('visual_search')
+            # rebuild=False: add_visual_findings already scheduled a (debounced)
+            # rebuild that will pick up this visibility flag — a second
+            # synchronous rebuild here would defeat the coalescing and repaint
+            # the whole waveform again on every streamed hit.
+            self._enable_layer('visual_search', rebuild=False)
             if save:
                 self.save_visual_findings_to_cache()
             if hasattr(self, 'label_panel'):
