@@ -792,24 +792,12 @@ class EditTimelineScene(QGraphicsScene):
                         print(f"✅ Loaded {len(self.clips)} highlight segments from cache history")
                         return
 
-            # 3. Last resort — sample clips.
-            print("⚠️ No cached highlights found, creating sample clips")
-            if self.video_duration > 30:
-                for start_ratio, end_ratio in [(0.1, 0.2), (0.3, 0.4), (0.7, 0.8)]:
-                    start = self.video_duration * start_ratio
-                    end = self.video_duration * end_ratio
-                    duration = end - start
-                    if duration > 15:
-                        end = start + 15
-                    elif duration < 3:
-                        end = start + 3
-                    if end <= self.video_duration:
-                        self.clips.append((start, end))
-            else:
-                start = max(0, self.video_duration / 4)
-                end = min(self.video_duration, self.video_duration * 3 / 4)
-                if end - start >= 3:
-                    self.clips.append((start, end))
+            # 3. Nothing to load — start empty. We intentionally do NOT fabricate
+            # sample/placeholder clips here: a pro NLE opens to an empty timeline,
+            # and invented clips read as clutter (or a bug) and risk being
+            # exported by accident. build_timeline() shows an empty-state hint
+            # instead. (Real runs use final_segments; standalone uses history.)
+            print("ℹ️ No highlights to load — edit timeline starts empty")
 
     def build_timeline(self):
         """Build the edit timeline visualization"""
@@ -831,6 +819,21 @@ class EditTimelineScene(QGraphicsScene):
 
         # Time ruler — now uses correct sceneRect
         self.draw_time_ruler()
+
+        # Empty-state hint — we no longer fabricate sample clips (see
+        # load_initial_clips), so guide the user instead of showing a blank bar.
+        if not self.clips:
+            hint = self.addText(
+                "No clips yet — drag a segment from the signal timeline above, "
+                "or use 'Add Clip' to start your edit.",
+                QFont("Arial", 11)
+            )
+            hint.setDefaultTextColor(QColor(150, 160, 190))
+            hint_rect = hint.boundingRect()
+            hint.setPos(
+                (self.sceneRect().width() - hint_rect.width()) / 2,
+                (self.sceneRect().height() - hint_rect.height()) / 2,
+            )
 
         # Clips
         current_x = 20
