@@ -843,8 +843,14 @@ class LLMChatWidget(QWidget):
         if video_path and os.path.exists(video_path):
             self._init_analyzer()
         
-        # Initialize reasoning engine if enabled
+        # Initialize reasoning engine if enabled. set_analysis_data() can be
+        # called twice for the same cache (widget auto-load, then the timeline
+        # feeding its own copy), so skip re-announcing identical stats.
         if hasattr(self, 'reasoning_checkbox') and self.reasoning_checkbox.isChecked():
+            sig = self._analysis_signature(data)
+            if sig == getattr(self, '_reasoning_sig', None):
+                return
+            self._reasoning_sig = sig
             try:
                 from .llm_reasoning import ReasoningLLMIntegration
                 llm = self._llm if (self._llm and self._llm.is_loaded()) else None
@@ -862,6 +868,23 @@ class LLMChatWidget(QWidget):
             except Exception as e:
                 self._append_system(f"⚠️ Could not initialize reasoning: {e}")
                 self.reasoning_engine = None
+
+    @staticmethod
+    def _analysis_signature(data: dict) -> tuple:
+        """Lightweight fingerprint of a cache's contents, used to suppress
+        duplicate reasoning-init messages when the same data is fed twice."""
+        if not isinstance(data, dict):
+            return (0, 0, 0, 0, 0)
+        t_data = data.get("transcript", {})
+        n_trans = len(t_data.get("segments", [])) if isinstance(t_data, dict) else 0
+        meta = data.get("video_metadata", {})
+        return (
+            int(meta.get("duration", 0) or 0),
+            len(data.get("objects", [])),
+            len(data.get("actions", [])),
+            n_trans,
+            len(data.get("scenes", [])),
+        )
 
     def set_preview_window(self, preview):
         """Connect to a VideoPreviewWindow for seek sync."""
@@ -2165,6 +2188,12 @@ class LLMChatWidget(QWidget):
     def _append_html(self, html: str):
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.End)
+        # Start each fragment in its own block. Otherwise Qt's insertHtml()
+        # merges consecutive block elements into the trailing block, so status
+        # messages render as one run-together wall of text. length() == 1 means
+        # the current block is empty, so we don't add a leading blank line.
+        if cursor.block().length() > 1:
+            cursor.insertBlock()
         cursor.insertHtml(html)
         self.chat_display.setTextCursor(cursor)
         self.chat_display.ensureCursorVisible()
