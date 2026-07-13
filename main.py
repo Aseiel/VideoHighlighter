@@ -39,6 +39,12 @@ except Exception:
 from modules.app_paths import resource_path as _resource_path, config_path
 from version import __version__, __edition__
 
+# --- Contact / support details shown in the About tab ---
+SUPPORT_EMAIL = "przkreft@gmail.com"
+WEBSITE_URL = "https://aseiel.github.io/VideoHighlighter-site/"
+DISCORD_URL = "https://discord.gg/cUPJqPAMmm"
+REPO_URL = "https://github.com/Aseiel/VideoHighlighter"
+
 # User-editable config: lives next to the exe when frozen (so saves persist),
 # seeded from the bundled default; just the project-root file when run from source.
 CONFIG_FILE = config_path("config.yaml")
@@ -1820,6 +1826,9 @@ class VideoHighlighterGUI(QWidget):
         avoid_tab.setLayout(avoid_layout)
         tabs.addTab(avoid_tab, "🚫 Avoid")
 
+        # --- Tab: About & Contact ---
+        tabs.addTab(self._build_about_tab(), "ℹ️ About")
+
         # Defer first populate until after __init__ finishes (so log_output exists)
         QTimer.singleShot(0, self.refresh_avoid_list)
 
@@ -1897,6 +1906,94 @@ class VideoHighlighterGUI(QWidget):
 
         # Setup auto-complete for label inputs
         self.setup_label_completers()
+
+    # --- About / Contact tab ---
+    def _build_about_tab(self):
+        """A read-only About & Contact panel: version, support links, licensing."""
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        outer_layout.addWidget(scroll)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        scroll.setWidget(content)
+
+        # Header
+        title = QLabel(f"🎬 Video Highlighter ({__edition__})")
+        title.setStyleSheet("font-size: 16pt; font-weight: bold;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(f"Version {__version__} — free & open source (AGPLv3)")
+        subtitle.setStyleSheet("color: #888;")
+        subtitle.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(subtitle)
+
+        # --- Upgrade to Pro ---
+        pro_group = QGroupBox("VideoHighlighter Pro")
+        pro_layout = QVBoxLayout(pro_group)
+        pro_line = QLabel(
+            "You're running the free, open-source edition. "
+            "<b>Pro</b> adds faster detection backends and extra features, "
+            "and supports continued development.<br>"
+            f'👉 <a href="{WEBSITE_URL}">Learn more / Get Pro</a>'
+        )
+        pro_line.setOpenExternalLinks(True)
+        pro_line.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        pro_line.setWordWrap(True)
+        pro_layout.addWidget(pro_line)
+        layout.addWidget(pro_group)
+
+        # --- Contact & support ---
+        support_group = QGroupBox("Contact & Support")
+        support_layout = QVBoxLayout(support_group)
+        intro = QLabel("Need help, found a bug, or have a feature request? Reach us here:")
+        intro.setWordWrap(True)
+        support_layout.addWidget(intro)
+
+        links = QLabel(
+            f'📧 Email: <a href="mailto:{SUPPORT_EMAIL}?subject=VideoHighlighter%20support">{SUPPORT_EMAIL}</a><br>'
+            f'💬 Discord: <a href="{DISCORD_URL}">{DISCORD_URL}</a><br>'
+            f'🌐 Website: <a href="{WEBSITE_URL}">{WEBSITE_URL}</a><br>'
+            f'⭐ Source code: <a href="{REPO_URL}">{REPO_URL}</a>'
+        )
+        links.setOpenExternalLinks(True)
+        links.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        links.setWordWrap(True)
+        support_layout.addWidget(links)
+
+        tip = QLabel(
+            "💡 When reporting a bug, please include your OS and the debug log "
+            "(toggle “Debug log” next to Run) — it speeds up diagnosis."
+        )
+        tip.setStyleSheet("color: #888; font-size: 9pt;")
+        tip.setWordWrap(True)
+        support_layout.addWidget(tip)
+        layout.addWidget(support_group)
+
+        # --- Legal ---
+        legal_group = QGroupBox("Legal")
+        legal_layout = QVBoxLayout(legal_group)
+        legal = QLabel(
+            "© 2026 Przemysław Kreft and contributors.<br>"
+            "VideoHighlighter is free software licensed under the "
+            f'<a href="{REPO_URL}/blob/main/LICENSE">GNU AGPLv3</a>. '
+            f'Contributions are accepted under a <a href="{REPO_URL}/blob/main/CLA.md">CLA</a>.<br>'
+            "Includes third-party components (e.g. PySide6, FFmpeg) under their "
+            "respective licenses."
+        )
+        legal.setOpenExternalLinks(True)
+        legal.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        legal.setWordWrap(True)
+        legal_layout.addWidget(legal)
+        layout.addWidget(legal_group)
+
+        layout.addStretch()
+        return outer
 
     # --- Avoid methods ---
     def _get_face_bank(self):
