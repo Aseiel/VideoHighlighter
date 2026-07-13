@@ -820,14 +820,20 @@ class RealtimeOverlayPreview(QWidget):
         self._view.identity_context_requested.connect(self._on_identity_context)
         self._init_player()
         
-        # Create lazy loader (doesn't load data yet)
-        self._bbox_loader = LazyBBoxLoader(self.cache_data, max_cached_buckets)
-        self._load_detections_lazy()
-        
         self._face_bank = None
         self._live_face = None
         self._live_overlay = None
-        
+        # True while the mode combo is on "Live (real-time)". Real-time inference
+        # only runs when this AND the overlay checkbox are both on, so unchecking
+        # the checkbox pauses processing without leaving Live mode.
+        self._live_face_mode = False
+        # Submenu handle for the live 'Facial recognition' filter group.
+        self._face_filter_menu: QMenu | None = None
+
+        # Create lazy loader (doesn't load data yet)
+        self._bbox_loader = LazyBBoxLoader(self.cache_data, max_cached_buckets)
+        self._load_detections_lazy()
+
         # Memory tracking
         self._memory_timer = QTimer()
         self._memory_timer.timeout.connect(self._log_memory)
@@ -941,46 +947,154 @@ class RealtimeOverlayPreview(QWidget):
         if self._detection_count > 0:
             self._count_label.setText(f"({self._detection_count} detections available)")
             self._overlay_cb.setEnabled(True)
-            self._build_filter_menu()
         else:
             self._count_label.setText("(no bbox data in cache)")
-            self._overlay_cb.setEnabled(False)
-            self._filter_btn.setEnabled(False)
+            # Don't force-disable here — real-time mode re-enables the checkbox
+            # even with an empty cache (see set_live_face_enabled).
+            if not self._live_face_mode:
+                self._overlay_cb.setEnabled(False)
             self._overlay_cb.setToolTip(
                 "No bounding box data found in cache.\n"
                 "Run detection with draw_bboxes=True and bbox saving enabled,\n"
                 "or use the pre-rendered video swap instead."
             )
 
+        # Always build the filter — it now also hosts the live 'Facial recognition'
+        # group, which is available in real-time mode regardless of cached data.
+        self._build_filter_menu()
+
     def _build_filter_menu(self):
-        """Populate the overlay filter with a checkable item per detection class."""
+        """Populate the overlay filter, grouped by detection source so each
+        detected thing can be shown/hidden individually:
+
+            🧊 Object recognition   → cached object classes
+            🎬 Action recognition   → cached action classes
+            🙂 Facial recognition   → recognised faces (live, from the face bank)
+
+        Object/action groups come from the cache and are fixed for the clip.
+        The facial group is rebuilt each time it opens, because faces are
+        recognised live and identities appear / get named as playback runs.
+        """
         self._filter_menu.clear()
         self._filter_actions.clear()
-        names = sorted(self._bbox_loader.get_all_class_names())
-        if not names:
-            self._filter_btn.setEnabled(False)
-            return
+        self._face_filter_menu = None
 
-        show_all = self._filter_menu.addAction("Show all")
-        show_all.triggered.connect(lambda: self._set_all_classes(True))
-        hide_all = self._filter_menu.addAction("Hide all")
-        hide_all.triggered.connect(lambda: self._set_all_classes(False))
-        self._filter_menu.addSeparator()
+        names = sorted(self._bbox_loader.get_all_class_names())
+        # Actions carry a '[AB] ' badge prefix (see _action_entry_to_bboxes);
+        # everything else is an object class.
+        object_names = [n for n in names if not n.startswith('[')]
+        action_names = [n for n in names if n.startswith('[')]
+
+        if object_names:
+            self._add_class_group("🧊 Object recognition", object_names)
+        if action_names:
+            self._add_class_group("🎬 Action recognition", action_names)
+
+        # Facial recognition is always offered — it's driven by the live face
+        # worker, not the cache. Rebuilt on open so newly seen faces show up.
+        self._face_filter_menu = self._filter_menu.addMenu("🙂 Facial recognition")
+        self._face_filter_menu.aboutToShow.connect(self._rebuild_face_filter)
+
+        if self._filter_actions:
+            self._filter_menu.addSeparator()
+            show_all = self._filter_menu.addAction("Show all classes")
+            show_all.triggered.connect(lambda: self._set_all_classes(True))
+            hide_all = self._filter_menu.addAction("Hide all classes")
+            hide_all.triggered.connect(lambda: self._set_all_classes(False))
+
+        # Reachable whenever there are cached classes or real-time faces are live.
+        self._filter_btn.setEnabled(bool(self._filter_actions) or self._live_face_mode)
+
+    def _add_class_group(self, title: str, names: list[str]):
+        """Add one category submenu of per-class show/hide toggles.
+
+        `names` are the raw class_name keys the scene filters on; the badge
+        prefix is stripped for display only.
+        """
+        sub = self._filter_menu.addMenu(title)
+        group_actions: list[QAction] = []
+
+        show_all = sub.addAction("Show all")
+        hide_all = sub.addAction("Hide all")
+        sub.addSeparator()
 
         for name in names:
-            act = QAction(name, self._filter_menu)
+            act = QAction(_strip_badge(name), sub)
             act.setCheckable(True)
             act.setChecked(name not in self._scene._hidden_classes)
             act.toggled.connect(
                 lambda checked, n=name: self._scene.set_class_hidden(n, not checked)
             )
-            self._filter_menu.addAction(act)
+            sub.addAction(act)
             self._filter_actions[name] = act
+            group_actions.append(act)
 
-        self._filter_btn.setEnabled(True)
+        show_all.triggered.connect(
+            lambda: [a.setChecked(True) for a in group_actions if not a.isChecked()]
+        )
+        hide_all.triggered.connect(
+            lambda: [a.setChecked(False) for a in group_actions if a.isChecked()]
+        )
+
+    def _rebuild_face_filter(self):
+        """(Re)populate the facial-recognition submenu from the face bank.
+
+        Faces are recognised live, so this runs each time the submenu opens.
+        Each identity (named or auto-enrolled) gets its own show/hide toggle.
+        """
+        menu = self._face_filter_menu
+        if menu is None:
+            return
+        menu.clear()
+
+        if self._face_bank is None:
+            act = menu.addAction("Select “Live (real-time)” to recognise faces")
+            act.setEnabled(False)
+            return
+
+        identities = self._face_bank.all_identities()
+        if not identities:
+            act = menu.addAction("(no faces recognised yet)")
+            act.setEnabled(False)
+            return
+
+        face_actions: list[QAction] = []
+        show_all = menu.addAction("Show all")
+        hide_all = menu.addAction("Hide all")
+        menu.addSeparator()
+
+        for ident in identities:
+            iid = ident["id"]
+            disp = ident.get("name") or f"Person {iid[:8]}"
+            act = QAction(disp, menu)
+            act.setCheckable(True)
+            act.setChecked(not self._is_identity_hidden(iid))
+            act.toggled.connect(
+                lambda checked, _id=iid: self._set_identity_hidden(_id, not checked)
+            )
+            menu.addAction(act)
+            face_actions.append(act)
+
+        show_all.triggered.connect(
+            lambda: [a.setChecked(True) for a in face_actions if not a.isChecked()]
+        )
+        hide_all.triggered.connect(
+            lambda: [a.setChecked(False) for a in face_actions if a.isChecked()]
+        )
+
+    def _is_identity_hidden(self, identity_id: str) -> bool:
+        return (
+            self._live_overlay is not None
+            and identity_id in self._live_overlay.hidden_ids
+        )
+
+    def _set_identity_hidden(self, identity_id: str, hidden: bool):
+        """Show/hide one recognised face on the live overlay."""
+        if self._live_overlay is not None:
+            self._live_overlay.set_identity_hidden(identity_id, hidden)
 
     def _set_all_classes(self, show: bool):
-        """Check/uncheck every class (each toggle updates the scene filter)."""
+        """Check/uncheck every object/action class (each toggle updates the filter)."""
         for act in self._filter_actions.values():
             if act.isChecked() != show:
                 act.setChecked(show)
@@ -1012,6 +1126,10 @@ class RealtimeOverlayPreview(QWidget):
             # Clear items when overlay is off to free memory
             self._scene.clear_items()
             self._bbox_loader.clear_cache()
+
+        # In real-time mode the same checkbox gates the face-recognition worker,
+        # so unchecking it actually stops processing (not just hides cached boxes).
+        self._apply_live_face_state()
 
         self.overlay_toggled.emit(self._overlay_enabled)
 
@@ -1045,8 +1163,44 @@ class RealtimeOverlayPreview(QWidget):
         self._overlay_cb.setChecked(visible)
 
     def set_live_face_enabled(self, enabled: bool):
-        """Toggle TRUE real-time face recognition on the playing frame."""
-        if enabled and self._live_face is None:
+        """Enter/leave TRUE real-time face-recognition mode.
+
+        This only records the *mode* — the '🎯 Live BBox Overlay' checkbox is the
+        actual on/off switch for inference, so the user can pause processing
+        without leaving Live mode. Entering real-time mode makes the checkbox
+        usable even with no cached bbox data and switches it on so recognition
+        starts immediately.
+        """
+        self._live_face_mode = enabled
+
+        if enabled:
+            # Real-time needs no cached detections — make the checkbox usable even
+            # with an empty cache, then switch it on so inference starts. The
+            # filter button is also enabled so the live 'Facial recognition' group
+            # is reachable even when there's no cached object/action data.
+            self._overlay_cb.setEnabled(True)
+            self._filter_btn.setEnabled(True)
+            if self._overlay_cb.isChecked():
+                self._apply_live_face_state()
+            else:
+                self._overlay_cb.setChecked(True)  # fires _on_overlay_toggled → _apply_live_face_state
+        else:
+            # Leaving real-time: stop inference and restore the checkbox's and
+            # filter button's enabled-state (which depend on cached data).
+            self._apply_live_face_state()
+            self._overlay_cb.setEnabled(self._detection_count > 0)
+            self._filter_btn.setEnabled(bool(self._filter_actions))
+
+    def _apply_live_face_state(self):
+        """Start or stop the real-time face worker from the current mode + checkbox.
+
+        Inference runs only when Live (real-time) mode is selected AND the overlay
+        checkbox is on. The worker (and InsightFace) is created lazily the first
+        time both are true.
+        """
+        want = self._live_face_mode and self._overlay_enabled
+
+        if want and self._live_face is None:
             # lazy init — only loads InsightFace the first time it's switched on
             if self._face_bank is None:
                 self._face_bank = FaceIdentityBank(db_path="./cache/face_db.json")
@@ -1062,8 +1216,8 @@ class RealtimeOverlayPreview(QWidget):
             self._live_overlay.set_vr_mode(vr)
 
         if self._live_face is not None:
-            self._live_face.set_enabled(enabled)
-            if not enabled and self._live_overlay is not None:
+            self._live_face.set_enabled(want)
+            if not want and self._live_overlay is not None:
                 self._live_overlay.clear()
 
     def _on_identity_context(self, identity_id, global_pos):
