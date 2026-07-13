@@ -302,6 +302,20 @@ class LiveFaceOverlay:
         self._rects: list[QGraphicsRectItem] = []
         self._labels: list[QGraphicsSimpleTextItem] = []
         self._vr_mode = False
+        # identity_ids the user has hidden via the overlay filter
+        self._hidden_ids: set[str] = set()
+
+    @property
+    def hidden_ids(self) -> set[str]:
+        return self._hidden_ids
+
+    def set_identity_hidden(self, identity_id: str, hidden: bool):
+        """Show/hide one recognised identity on the overlay. Takes effect on the
+        next results frame (and immediately for boxes already on screen)."""
+        if hidden:
+            self._hidden_ids.add(identity_id)
+        else:
+            self._hidden_ids.discard(identity_id)
 
     def set_vr_mode(self, enabled: bool):
         """Map boxes into the left half of the scene (SBS VR videos).
@@ -336,6 +350,9 @@ class LiveFaceOverlay:
     @Slot(list, int, int)
     def update_boxes(self, results, frame_w, frame_h):
         """Redraw the overlay from the latest worker results."""
+        # Drop identities the user hid via the 'Facial recognition' filter.
+        if self._hidden_ids:
+            results = [r for r in results if r.get("identity_id") not in self._hidden_ids]
         scene_rect = self._scene.sceneRect()
         # In VR mode boxes come from the left-half frame, so map them into the
         # left half of the (full-width SBS) scene.
