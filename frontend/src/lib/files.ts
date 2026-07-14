@@ -24,6 +24,17 @@ export async function pickVideos(): Promise<string[]> {
   return Array.isArray(selected) ? selected : [selected]
 }
 
+/** Pick a folder (download destination). Returns null if cancelled. */
+export async function pickDirectory(): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt("Paste a destination folder path:") || null
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const selected = await open({ directory: true, multiple: false })
+  if (!selected) return null
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected
+}
+
 export function basename(p: string): string {
   return p.split(/[\\/]/).pop() ?? p
 }

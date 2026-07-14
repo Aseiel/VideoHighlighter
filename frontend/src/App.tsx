@@ -8,35 +8,42 @@ import {
   Play,
   Square,
   Sparkles,
+  MonitorPlay,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Checkbox } from "@/components/ui/checkbox"
 import { Progress } from "@/components/ui/progress"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Toaster } from "@/components/ui/sonner"
 import { toast } from "sonner"
-import { NumberField } from "@/components/NumberField"
 import { useTheme } from "@/lib/theme"
 import { pickVideos, basename } from "@/lib/files"
 import { DEFAULT_CONFIG, toGuiConfig, totalPoints } from "@/lib/config"
 import type { HighlighterConfig } from "@/lib/config"
 import {
   startRun,
+  startDownload,
   cancelRun,
   openEventSocket,
   getHealth,
+  getLabels,
+  openEditor,
   type RunEvent,
 } from "@/lib/api"
+import { BasicTab } from "@/components/tabs/BasicTab"
+import { TranscriptTab } from "@/components/tabs/TranscriptTab"
+import { AdvancedTab } from "@/components/tabs/AdvancedTab"
+import { AvoidTab } from "@/components/tabs/AvoidTab"
+import { LlmChatTab } from "@/components/tabs/LlmChatTab"
+import {
+  DownloadTab,
+  DEFAULT_DOWNLOAD,
+  type DownloadSettings,
+} from "@/components/tabs/DownloadTab"
 
 type LogLine = { text: string; kind: "info" | "err" | "ok" }
 
@@ -45,6 +52,10 @@ export default function App() {
   const [videos, setVideos] = useState<string[]>([])
   const [output, setOutput] = useState("highlight.mp4")
   const [cfg, setCfg] = useState<HighlighterConfig>(DEFAULT_CONFIG)
+  const [dl, setDl] = useState<DownloadSettings>(DEFAULT_DOWNLOAD)
+  const [avoidIds, setAvoidIds] = useState<string[]>([])
+  const [objectLabels, setObjectLabels] = useState<string[]>([])
+  const [actionLabels, setActionLabels] = useState<string[]>([])
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState(0)
   const [task, setTask] = useState("")
@@ -52,6 +63,9 @@ export default function App() {
   const [online, setOnline] = useState<boolean | null>(null)
   const wsRef = useRef<WebSocket | null>(null)
   const logEndRef = useRef<HTMLDivElement | null>(null)
+  // Read inside WS callbacks, which close over the mount-time value otherwise.
+  const dlRef = useRef(dl)
+  dlRef.current = dl
 
   const set = <K extends keyof HighlighterConfig>(k: K, v: HighlighterConfig[K]) =>
     setCfg((c) => ({ ...c, [k]: v }))
@@ -75,6 +89,12 @@ export default function App() {
     }
   }, [])
 
+  // Label vocabularies for the detection autocomplete.
+  useEffect(() => {
+    void getLabels("objects").then(setObjectLabels)
+    void getLabels("actions").then(setActionLabels)
+  }, [])
+
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [log])
@@ -85,7 +105,7 @@ export default function App() {
   const handleEvent = (e: RunEvent) => {
     switch (e.type) {
       case "started":
-        appendLog("=== Pipeline started ===", "ok")
+        appendLog("=== Started ===", "ok")
         break
       case "log":
         appendLog(e.message)
@@ -94,17 +114,23 @@ export default function App() {
         if (e.total > 0) setProgress(Math.round((e.current / e.total) * 100))
         setTask(e.detail ? `${e.task} — ${e.detail}` : e.task)
         break
+      case "downloaded":
+        if (dlRef.current.autoAdd && e.paths.length) {
+          setVideos((v) => [...new Set([...v, ...e.paths])])
+          appendLog(`➕ Added ${e.paths.length} downloaded video(s)`, "ok")
+        }
+        break
       case "finished":
         appendLog(`✔ Finished: ${e.output || "(no output)"}`, "ok")
-        toast.success("Highlight generation complete")
+        toast.success("Done")
         break
       case "cancelled":
         appendLog("⏹ Cancelled", "err")
-        toast("Run cancelled")
+        toast("Cancelled")
         break
       case "error":
         appendLog(`✖ ${e.message}`, "err")
-        toast.error("Pipeline error")
+        toast.error("Error — see log")
         break
       case "done":
         setRunning(false)
@@ -115,24 +141,43 @@ export default function App() {
     }
   }
 
+  /** Open the events socket and give it a tick to connect before work starts. */
+  const beginRun = async () => {
+    setLog([])
+    setProgress(0)
+    setRunning(true)
+    wsRef.current = openEventSocket(handleEvent)
+    await new Promise((r) => setTimeout(r, 150))
+  }
+
+  const failRun = (msg: string) => {
+    appendLog(`✖ ${msg}`, "err")
+    toast.error(msg)
+    setRunning(false)
+    wsRef.current?.close()
+  }
+
   const onRun = async () => {
     if (!videos.length) return toast.error("Add at least one video")
     if (totalPoints(cfg) === 0 && !cfg.skip_highlights)
       return toast.error("Set at least one scoring point")
 
-    setLog([])
-    setProgress(0)
-    setRunning(true)
-    wsRef.current = openEventSocket(handleEvent)
-    // Give the socket a tick to connect before the run emits events.
-    await new Promise((r) => setTimeout(r, 150))
-    const res = await startRun(videos, toGuiConfig(cfg, output, videos))
-    if (!res.ok) {
-      appendLog(`✖ ${res.error}`, "err")
-      toast.error(res.error ?? "Failed to start")
-      setRunning(false)
-      wsRef.current?.close()
-    }
+    await beginRun()
+    const res = await startRun(videos, toGuiConfig(cfg, output, videos, avoidIds))
+    if (!res.ok) failRun(res.error ?? "Failed to start")
+  }
+
+  const onDownload = async () => {
+    await beginRun()
+    const res = await startDownload({
+      url: dl.url,
+      save_dir: dl.saveDir,
+      download_full: dl.downloadFull,
+      time_range_start: dl.rangeStart,
+      time_range_end: dl.rangeEnd,
+      concurrent: dl.concurrent,
+    })
+    if (!res.ok) failRun(res.error ?? "Failed to start download")
   }
 
   const onCancel = async () => {
@@ -143,6 +188,12 @@ export default function App() {
   const addVideos = async () => {
     const picked = await pickVideos()
     if (picked.length) setVideos((v) => [...new Set([...v, ...picked])])
+  }
+
+  const launchEditor = async () => {
+    const res = await openEditor(videos[0])
+    if (res.ok) toast.success("Opening Timeline Viewer…")
+    else toast.error(res.error ?? "Could not open the editor")
   }
 
   return (
@@ -173,9 +224,19 @@ export default function App() {
             </p>
           </div>
         </div>
-        <Button variant="ghost" size="icon" onClick={toggle} title="Toggle theme">
-          {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={launchEditor}
+            title="Open the native timeline viewer / editor"
+          >
+            <MonitorPlay className="size-4" /> Timeline Viewer
+          </Button>
+          <Button variant="ghost" size="icon" onClick={toggle} title="Toggle theme">
+            {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
+          </Button>
+        </div>
       </header>
 
       {/* Input videos */}
@@ -233,90 +294,46 @@ export default function App() {
         </CardContent>
       </Card>
 
-      {/* Settings grid */}
-      <div className="grid min-w-0 gap-5 md:grid-cols-2 [&>*]:min-w-0">
-        <Card>
-          <CardHeader className="flex-row items-center justify-between space-y-0">
-            <CardTitle className="text-sm font-medium">Scoring Points</CardTitle>
-            <Badge variant={totalPoints(cfg) ? "default" : "secondary"}>
-              total {totalPoints(cfg)}
-            </Badge>
-          </CardHeader>
-          <CardContent className="space-y-2.5">
-            <NumberField label="Scene" value={cfg.scene_points} onChange={(v) => set("scene_points", v)} />
-            <NumberField label="Motion event" value={cfg.motion_event_points} onChange={(v) => set("motion_event_points", v)} />
-            <NumberField label="Motion peak" value={cfg.motion_peak_points} onChange={(v) => set("motion_peak_points", v)} />
-            <NumberField label="Audio peak" value={cfg.audio_peak_points} onChange={(v) => set("audio_peak_points", v)} />
-            <NumberField label="Object" value={cfg.object_points} onChange={(v) => set("object_points", v)} />
-            <NumberField label="Action" value={cfg.action_points} onChange={(v) => set("action_points", v)} />
-          </CardContent>
-        </Card>
+      {/* Tabs */}
+      <Tabs defaultValue="basic" className="min-w-0">
+        <TabsList>
+          <TabsTrigger value="download">Download</TabsTrigger>
+          <TabsTrigger value="basic">Basic</TabsTrigger>
+          <TabsTrigger value="transcript">Transcript</TabsTrigger>
+          <TabsTrigger value="advanced">Advanced</TabsTrigger>
+          <TabsTrigger value="llm">LLM Chat</TabsTrigger>
+          <TabsTrigger value="avoid">Avoid</TabsTrigger>
+        </TabsList>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm font-medium">Duration &amp; Cutting</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2.5">
-            <NumberField label="Max highlight duration" hint="(s)" value={cfg.max_duration} onChange={(v) => set("max_duration", v)} />
-            <NumberField label="Exact duration" hint="(0=off)" value={cfg.exact_duration} onChange={(v) => set("exact_duration", v)} />
-            <NumberField label="Clip time" hint="(0=auto)" value={cfg.clip_time} onChange={(v) => set("clip_time", v)} />
-            <Separator className="my-1" />
-            <NumberField label="Auto min clip" hint="(s)" value={cfg.auto_min_clip} step={0.5} onChange={(v) => set("auto_min_clip", v)} />
-            <NumberField label="Auto max clip" hint="(s)" value={cfg.auto_max_clip} step={0.5} onChange={(v) => set("auto_max_clip", v)} />
-            <NumberField label="Merge gap" hint="(s)" value={cfg.auto_merge_gap} step={0.5} onChange={(v) => set("auto_merge_gap", v)} />
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Detection targets */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm font-medium">Detection Targets</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="grid min-w-0 grid-cols-[4.5rem_minmax(0,1fr)] items-center gap-3">
-            <Label className="text-sm text-muted-foreground">Objects</Label>
-            <Input
-              value={cfg.highlight_objects}
-              onChange={(e) => set("highlight_objects", e.target.value)}
-              placeholder="person, sports ball, dog"
-              className="h-8 w-full"
-            />
-          </div>
-          <div className="grid min-w-0 grid-cols-[4.5rem_minmax(0,1fr)] items-center gap-3">
-            <Label className="text-sm text-muted-foreground">Actions</Label>
-            <Input
-              value={cfg.interesting_actions}
-              onChange={(e) => set("interesting_actions", e.target.value)}
-              placeholder="high jump, high kick, archery"
-              className="h-8 w-full"
-            />
-          </div>
-          <div className="flex flex-wrap gap-5 pt-1">
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={cfg.actions_require_objects}
-                onCheckedChange={(v) => set("actions_require_objects", Boolean(v))}
-              />
-              Only score actions when objects detected
-            </label>
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={cfg.keep_temp}
-                onCheckedChange={(v) => set("keep_temp", Boolean(v))}
-              />
-              Keep temp clips
-            </label>
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={cfg.force_reprocess}
-                onCheckedChange={(v) => set("force_reprocess", Boolean(v))}
-              />
-              Force reprocess (ignore cache)
-            </label>
-          </div>
-        </CardContent>
-      </Card>
+        <TabsContent value="download" className="mt-4">
+          <DownloadTab
+            settings={dl}
+            onChange={setDl}
+            onDownload={onDownload}
+            running={running}
+          />
+        </TabsContent>
+        <TabsContent value="basic" className="mt-4">
+          <BasicTab
+            cfg={cfg}
+            set={set}
+            objectLabels={objectLabels}
+            actionLabels={actionLabels}
+          />
+        </TabsContent>
+        <TabsContent value="transcript" className="mt-4">
+          <TranscriptTab cfg={cfg} set={set} />
+        </TabsContent>
+        <TabsContent value="advanced" className="mt-4">
+          <AdvancedTab cfg={cfg} set={set} />
+        </TabsContent>
+        <TabsContent value="llm" className="mt-4">
+          <LlmChatTab videoPath={videos[0]} />
+        </TabsContent>
+        <TabsContent value="avoid" className="mt-4">
+          <AvoidTab cfg={cfg} set={set} onAvoidIdsChange={setAvoidIds} />
+        </TabsContent>
+      </Tabs>
 
       {/* Run bar */}
       <div className="flex items-center gap-4">
