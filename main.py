@@ -4338,7 +4338,30 @@ if __name__ == "__main__":
     # noisy warnings even though playback still works via software decoding.
     os.environ.setdefault("QT_FFMPEG_DECODING_HWACCEL", "none")
     os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.ffmpeg=false")
+
+    # Give Windows an explicit AppUserModelID so the taskbar groups this app
+    # under our own icon instead of the generic python.exe host. Must run
+    # before any window is created.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "VideoHighlighter.App"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+
+    # Application-wide window/taskbar icon (falls back silently if missing).
+    try:
+        from PySide6.QtGui import QIcon
+        _icon_path = _resource_path(os.path.join("assets", "app_icon.ico"))
+        if os.path.exists(_icon_path):
+            app.setWindowIcon(QIcon(_icon_path))
+    except Exception:
+        pass
+
     # Reopen the live debug-log window if it was on last session (needs the
     # QApplication, hence here and not earlier).
     debug_console.restore_console_preference()
