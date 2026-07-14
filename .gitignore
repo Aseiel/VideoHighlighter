@@ -4,3 +4,17 @@ debug.log
 debug.prev.log
 
 __pycache__/
+
+# --- Web frontend (Vite + React + Tauri) ---
+frontend/node_modules/
+frontend/dist/
+frontend/dev-out.log
+frontend/dev-err.log
+frontend/app-shot.png
+
+# Rust build output
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+
+# The PyInstaller-built sidecar binary is a build artifact, not source.
+frontend/src-tauri/binaries/
