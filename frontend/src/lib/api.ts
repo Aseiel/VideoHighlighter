@@ -14,6 +14,7 @@ export type RunEvent =
   | { type: "progress"; current: number; total: number; task: string; detail: string }
   | { type: "finished"; output: string }
   | { type: "downloaded"; paths: string[] }
+  | { type: "faces_scanned"; count: number }
   | { type: "cancelled" }
   | { type: "error"; message: string; traceback?: string }
   | { type: "done" }
@@ -21,7 +22,84 @@ export type RunEvent =
 export interface HealthResponse {
   status: string
   running: boolean
+  paused: boolean
   run_id: string | null
+}
+
+export async function pauseRun(): Promise<{ ok: boolean }> {
+  const res = await fetch(`${SIDECAR_BASE}/pause`, { method: "POST" })
+  return res.json()
+}
+
+export async function resumeRun(): Promise<{ ok: boolean }> {
+  const res = await fetch(`${SIDECAR_BASE}/resume`, { method: "POST" })
+  return res.json()
+}
+
+/** Lifetime analyzed-video counter (same stats file as the Qt GUI). */
+export async function getStats(): Promise<{ ok: boolean; analyzed: number }> {
+  const res = await fetch(`${SIDECAR_BASE}/stats`)
+  return res.json()
+}
+
+/** config.yaml — shared with the Qt app. */
+export async function getConfigFile(): Promise<{
+  ok: boolean
+  config: Record<string, any>
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/config`)
+  return res.json()
+}
+
+export async function saveConfigFile(
+  config: Record<string, unknown>,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/config`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config }),
+  })
+  return res.json()
+}
+
+/** Duration in seconds via the pipeline's ffprobe helper. */
+export async function getVideoInfo(
+  path: string,
+): Promise<{ ok: boolean; duration: number }> {
+  const res = await fetch(
+    `${SIDECAR_BASE}/video-info?path=${encodeURIComponent(path)}`,
+  )
+  return res.json()
+}
+
+export interface CompRule {
+  name: string
+  label: string
+  source: string
+  region: string
+  min_count: number
+  max_count: number
+  window_secs: number
+  persist_secs: number
+}
+
+export async function getCompositionRules(): Promise<{
+  ok: boolean
+  rules: CompRule[]
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/composition-rules`)
+  return res.json()
+}
+
+export async function saveCompositionRules(
+  rules: CompRule[],
+): Promise<{ ok: boolean; error?: string; events?: number }> {
+  const res = await fetch(`${SIDECAR_BASE}/composition-rules`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rules }),
+  })
+  return res.json()
 }
 
 export async function getHealth(): Promise<HealthResponse> {
@@ -75,15 +153,61 @@ export interface FaceIdentity {
   label: string
   avoid: boolean
   count: number
+  thumb: string
 }
 
 /** Identities from the shared face bank (named in the native Timeline Viewer). */
 export async function getFaces(): Promise<{
   ok: boolean
   identities: FaceIdentity[]
+  named?: number
+  avoided?: number
   error?: string
 }> {
   const res = await fetch(`${SIDECAR_BASE}/faces`)
+  return res.json()
+}
+
+export async function removeFace(id: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`${SIDECAR_BASE}/faces/remove`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  })
+  return res.json()
+}
+
+export async function nameFace(
+  id: string,
+  name: string,
+): Promise<{ ok: boolean; merged_into?: string; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/faces/name`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, name }),
+  })
+  return res.json()
+}
+
+export async function clearFaces(
+  keepNamed: boolean,
+): Promise<{ ok: boolean; remaining?: number; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/faces/clear`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ keep_named: keepNamed }),
+  })
+  return res.json()
+}
+
+export async function scanFaces(
+  videoPath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/faces/scan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ video_path: videoPath }),
+  })
   return res.json()
 }
 
@@ -99,14 +223,30 @@ export async function setFaceAvoid(
   return res.json()
 }
 
-/** Label vocabulary for the object/action autocomplete. */
-export async function getLabels(
-  kind: "objects" | "actions",
+/** Object vocabulary; source depends on the configured detector type. */
+export async function getObjectLabels(yoloType = "standard"): Promise<string[]> {
+  try {
+    const res = await fetch(
+      `${SIDECAR_BASE}/labels/objects?yolo_type=${encodeURIComponent(yoloType)}`,
+    )
+    return (await res.json()).labels ?? []
+  } catch {
+    return []
+  }
+}
+
+/** Action vocabulary; depends on backend + model selection. */
+export async function getActionLabels(
+  backend = "auto",
+  models = "intel_only",
 ): Promise<string[]> {
   try {
-    const res = await fetch(`${SIDECAR_BASE}/labels/${kind}`)
-    const data = await res.json()
-    return data.labels ?? []
+    const res = await fetch(
+      `${SIDECAR_BASE}/labels/actions?backend=${encodeURIComponent(
+        backend,
+      )}&models=${encodeURIComponent(models)}`,
+    )
+    return (await res.json()).labels ?? []
   } catch {
     return []
   }

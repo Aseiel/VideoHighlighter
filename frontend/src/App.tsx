@@ -6,9 +6,11 @@ import {
   Plus,
   Trash2,
   Play,
+  Pause,
   Square,
   Sparkles,
   MonitorPlay,
+  TrendingUp,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -22,18 +24,32 @@ import { Toaster } from "@/components/ui/sonner"
 import { toast } from "sonner"
 import { useTheme } from "@/lib/theme"
 import { pickVideos, basename } from "@/lib/files"
-import { DEFAULT_CONFIG, toGuiConfig, totalPoints } from "@/lib/config"
+import {
+  DEFAULT_CONFIG,
+  toGuiConfig,
+  totalPoints,
+  fromConfigFile,
+  toConfigFile,
+} from "@/lib/config"
 import type { HighlighterConfig } from "@/lib/config"
 import {
   startRun,
   startDownload,
   cancelRun,
+  pauseRun,
+  resumeRun,
   openEventSocket,
   getHealth,
-  getLabels,
+  getStats,
+  getObjectLabels,
+  getActionLabels,
+  getConfigFile,
+  saveConfigFile,
+  getVideoInfo,
   openEditor,
   type RunEvent,
 } from "@/lib/api"
+import { TimeRange, DEFAULT_TIME_RANGE, type TimeRangeState } from "@/components/TimeRange"
 import { BasicTab } from "@/components/tabs/BasicTab"
 import { TranscriptTab } from "@/components/tabs/TranscriptTab"
 import { AdvancedTab } from "@/components/tabs/AdvancedTab"
@@ -56,11 +72,18 @@ export default function App() {
   const [avoidIds, setAvoidIds] = useState<string[]>([])
   const [objectLabels, setObjectLabels] = useState<string[]>([])
   const [actionLabels, setActionLabels] = useState<string[]>([])
+  const [timeRange, setTimeRange] = useState<TimeRangeState>(DEFAULT_TIME_RANGE)
+  const [duration, setDuration] = useState(0)
   const [running, setRunning] = useState(false)
+  const [paused, setPaused] = useState(false)
   const [progress, setProgress] = useState(0)
   const [task, setTask] = useState("")
   const [log, setLog] = useState<LogLine[]>([])
   const [online, setOnline] = useState<boolean | null>(null)
+  const [analyzed, setAnalyzed] = useState<number | null>(null)
+  const [sessionCount, setSessionCount] = useState(0)
+  const [faceRefresh, setFaceRefresh] = useState(0)
+  const [loaded, setLoaded] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const logEndRef = useRef<HTMLDivElement | null>(null)
   // Read inside WS callbacks, which close over the mount-time value otherwise.
@@ -79,6 +102,7 @@ export default function App() {
           if (!alive) return
           setOnline(true)
           setRunning(h.running)
+          setPaused(h.paused)
         })
         .catch(() => alive && setOnline(false))
     check()
@@ -89,11 +113,87 @@ export default function App() {
     }
   }, [])
 
-  // Label vocabularies for the detection autocomplete.
+  // Restore settings from config.yaml — the same file the Qt GUI reads/writes.
   useEffect(() => {
-    void getLabels("objects").then(setObjectLabels)
-    void getLabels("actions").then(setActionLabels)
+    void (async () => {
+      const res = await getConfigFile()
+      if (res.ok) {
+        setCfg((c) => ({ ...c, ...fromConfigFile(res.config) }))
+        const h = res.config.highlights ?? {}
+        setTimeRange({
+          enabled: Boolean(h.use_time_range),
+          startPct: h.range_start_pct ?? 0,
+          endPct: h.range_end_pct ?? 100,
+        })
+        if (h.output) setOutput(h.output)
+        const paths: string[] = res.config.video?.paths ?? []
+        if (paths.length) setVideos(paths)
+        const d = res.config.download ?? {}
+        setDl((s) => ({
+          ...s,
+          url: d.last_url ?? s.url,
+          saveDir: d.save_dir ?? s.saveDir,
+          downloadFull: d.download_full ?? s.downloadFull,
+          rangeStart: d.time_range_start ?? s.rangeStart,
+          rangeEnd: d.time_range_end ?? s.rangeEnd,
+          concurrent: d.concurrent_downloads ?? s.concurrent,
+          autoAdd: d.auto_add ?? s.autoAdd,
+        }))
+      }
+      setLoaded(true)
+    })()
   }, [])
+
+  // Persist settings whenever they settle, mirroring the Qt app's save-on-close.
+  // Debounced so typing doesn't thrash the file; gated on `loaded` so we never
+  // write defaults over a real config before it has been read.
+  useEffect(() => {
+    if (!loaded) return
+    const id = setTimeout(() => {
+      void saveConfigFile(
+        toConfigFile(cfg, {
+          videoPaths: videos,
+          output,
+          timeRange,
+          download: {
+            last_url: dl.url,
+            save_dir: dl.saveDir,
+            auto_add: dl.autoAdd,
+            download_full: dl.downloadFull,
+            time_range_start: dl.rangeStart,
+            time_range_end: dl.rangeEnd,
+            concurrent_downloads: dl.concurrent,
+          },
+        }),
+      )
+    }, 800)
+    return () => clearTimeout(id)
+  }, [cfg, videos, output, timeRange, dl, loaded])
+
+  // Label vocabularies depend on the detector/backend selection, same as Qt.
+  useEffect(() => {
+    void getObjectLabels(cfg.yolo_type).then(setObjectLabels)
+  }, [cfg.yolo_type])
+
+  useEffect(() => {
+    void getActionLabels(cfg.action_backend, cfg.action_models).then(setActionLabels)
+  }, [cfg.action_backend, cfg.action_models])
+
+  // Real duration for the first video drives the time-range slider.
+  useEffect(() => {
+    if (!videos.length) {
+      setDuration(0)
+      return
+    }
+    void getVideoInfo(videos[0]).then((r) =>
+      setDuration(r.ok ? r.duration : 0),
+    )
+  }, [videos])
+
+  // Lifetime analyzed counter (shared stats file with the Qt GUI).
+  useEffect(() => {
+    void getStats().then((r) => r.ok && setAnalyzed(r.analyzed))
+  }, [sessionCount])
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -120,8 +220,13 @@ export default function App() {
           appendLog(`➕ Added ${e.paths.length} downloaded video(s)`, "ok")
         }
         break
+      case "faces_scanned":
+        appendLog(`👤 Found ${e.count} identities`, "ok")
+        setFaceRefresh((n) => n + 1)
+        break
       case "finished":
         appendLog(`✔ Finished: ${e.output || "(no output)"}`, "ok")
+        setSessionCount((n) => n + 1)
         toast.success("Done")
         break
       case "cancelled":
@@ -163,8 +268,25 @@ export default function App() {
       return toast.error("Set at least one scoring point")
 
     await beginRun()
-    const res = await startRun(videos, toGuiConfig(cfg, output, videos, avoidIds))
+    const res = await startRun(
+      videos,
+      toGuiConfig(cfg, output, videos, { avoidIds, timeRange, duration }),
+    )
     if (!res.ok) failRun(res.error ?? "Failed to start")
+  }
+
+  /** Run -> Pause -> Resume, matching the Qt toggle_run tri-state. */
+  const onToggleRun = async () => {
+    if (!running) return onRun()
+    if (paused) {
+      await resumeRun()
+      setPaused(false)
+      appendLog("▶ Resumed")
+    } else {
+      await pauseRun()
+      setPaused(true)
+      appendLog("⏸ Pipeline paused")
+    }
   }
 
   const onDownload = async () => {
@@ -225,6 +347,18 @@ export default function App() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {analyzed !== null && (
+            <span
+              className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              title="Videos successfully analyzed. Lifetime total persists across sessions."
+            >
+              <TrendingUp className="size-3.5" />
+              <span className="tabular-nums">
+                {analyzed} analyzed
+                {sessionCount > 0 && ` (session: ${sessionCount})`}
+              </span>
+            </span>
+          )}
           <Button
             variant="outline"
             size="sm"
@@ -244,14 +378,15 @@ export default function App() {
         <CardHeader className="flex-row items-center justify-between space-y-0">
           <CardTitle className="text-sm font-medium">Input Videos</CardTitle>
           <div className="flex gap-2">
-            <Button size="sm" variant="secondary" onClick={addVideos}>
+            {/* Inputs lock during a run, same as the Qt GUI. */}
+            <Button size="sm" variant="secondary" onClick={addVideos} disabled={running}>
               <Plus className="size-4" /> Add
             </Button>
             <Button
               size="sm"
               variant="ghost"
               onClick={() => setVideos([])}
-              disabled={!videos.length}
+              disabled={!videos.length || running}
             >
               <Trash2 className="size-4" /> Clear
             </Button>
@@ -273,7 +408,8 @@ export default function App() {
                     {basename(v)}
                   </span>
                   <button
-                    className="text-muted-foreground hover:text-destructive"
+                    className="text-muted-foreground hover:text-destructive disabled:opacity-40"
+                    disabled={running}
                     onClick={() => setVideos((l) => l.filter((x) => x !== v))}
                   >
                     <Trash2 className="size-3.5" />
@@ -288,11 +424,14 @@ export default function App() {
             <Input
               value={output}
               onChange={(e) => setOutput(e.target.value)}
+              disabled={running}
               className="h-8 w-full"
             />
           </div>
         </CardContent>
       </Card>
+
+      <TimeRange state={timeRange} onChange={setTimeRange} duration={duration} />
 
       {/* Tabs */}
       <Tabs defaultValue="basic" className="min-w-0">
@@ -331,23 +470,47 @@ export default function App() {
           <LlmChatTab videoPath={videos[0]} />
         </TabsContent>
         <TabsContent value="avoid" className="mt-4">
-          <AvoidTab cfg={cfg} set={set} onAvoidIdsChange={setAvoidIds} />
+          <AvoidTab
+            cfg={cfg}
+            set={set}
+            onAvoidIdsChange={setAvoidIds}
+            videoPath={videos[0]}
+            running={running}
+            refreshKey={faceRefresh}
+          />
         </TabsContent>
       </Tabs>
 
-      {/* Run bar */}
+      {/* Run bar — Run / Pause / Resume tri-state, with Cancel alongside. */}
       <div className="flex items-center gap-4">
-        {running ? (
+        <Button
+          onClick={onToggleRun}
+          disabled={online === false}
+          className={
+            running
+              ? paused
+                ? "gap-2 bg-primary text-primary-foreground hover:opacity-90"
+                : "gap-2 bg-[#ff8c00] text-white hover:opacity-90"
+              : "gap-2 bg-[color:var(--success)] text-white hover:opacity-90"
+          }
+        >
+          {!running ? (
+            <>
+              <Sparkles className="size-4" /> Run Highlighter
+            </>
+          ) : paused ? (
+            <>
+              <Play className="size-4" /> Resume
+            </>
+          ) : (
+            <>
+              <Pause className="size-4" /> Pause
+            </>
+          )}
+        </Button>
+        {running && (
           <Button variant="destructive" onClick={onCancel} className="gap-2">
             <Square className="size-4" /> Cancel
-          </Button>
-        ) : (
-          <Button
-            onClick={onRun}
-            disabled={online === false}
-            className="gap-2 bg-[color:var(--success)] text-white hover:opacity-90"
-          >
-            <Sparkles className="size-4" /> Run Highlighter
           </Button>
         )}
         <div className="flex-1">

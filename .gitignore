@@ -27,4 +27,9 @@ object_log.csv
 yolo11n.pt
 yolo11n_openvino_model/
 highlight.mp4
+analysis_stats.json
+
+# User's own composition rules — app_paths.composition_rules_path() documents
+# this as private/gitignored, but it was never actually listed here.
+composition_rules.yaml
 .gstack/

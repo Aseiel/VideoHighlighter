@@ -78,6 +78,10 @@ class RunManager:
         self._lock = threading.Lock()
         self.run_id: Optional[str] = None
         self.cancel_flag = threading.Event()
+        # Set = running. Cleared = paused; the progress callback blocks on it,
+        # same gate the Qt Worker uses.
+        self.pause_event = threading.Event()
+        self.pause_event.set()
         self.thread: Optional[threading.Thread] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.subscribers: set["asyncio.Queue[dict]"] = set()
@@ -85,6 +89,22 @@ class RunManager:
     @property
     def is_running(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
+
+    @property
+    def is_paused(self) -> bool:
+        return not self.pause_event.is_set()
+
+    def pause(self) -> bool:
+        if self.is_running and not self.is_paused:
+            self.pause_event.clear()
+            return True
+        return False
+
+    def resume(self) -> bool:
+        if self.is_running and self.is_paused:
+            self.pause_event.set()
+            return True
+        return False
 
     def subscribe(self) -> "asyncio.Queue[dict]":
         q: "asyncio.Queue[dict]" = asyncio.Queue()
@@ -117,6 +137,8 @@ class RunManager:
                 raise RuntimeError("A pipeline run is already in progress")
             self.run_id = uuid.uuid4().hex
             self.cancel_flag = threading.Event()
+            self.pause_event = threading.Event()
+            self.pause_event.set()
             self.loop = loop
             self.thread = threading.Thread(
                 target=self._run, args=(video_paths, gui_config), daemon=True
@@ -127,6 +149,9 @@ class RunManager:
     def cancel(self) -> bool:
         if self.is_running:
             self.cancel_flag.set()
+            # Release the pause gate too: a paused worker is parked in
+            # pause_event.wait() and would never observe the cancel otherwise.
+            self.pause_event.set()
             return True
         return False
 
@@ -139,6 +164,11 @@ class RunManager:
             self._emit({"type": "log", "message": str(msg)})
 
         def progress_fn(cur: int, tot: int, task: str, det: str = "") -> None:
+            # Blocks the worker thread while paused, then drops the update if a
+            # cancel landed meanwhile — mirrors main.py's pausing_progress.
+            self.pause_event.wait()
+            if self.cancel_flag.is_set():
+                return
             self._emit({
                 "type": "progress",
                 "current": cur, "total": tot, "task": task, "detail": det,
@@ -175,7 +205,37 @@ class RunRequest(BaseModel):
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "running": manager.is_running, "run_id": manager.run_id}
+    return {
+        "status": "ok",
+        "running": manager.is_running,
+        "paused": manager.is_paused,
+        "run_id": manager.run_id,
+    }
+
+
+@app.post("/pause")
+async def pause_run() -> dict:
+    return {"ok": manager.pause()}
+
+
+@app.post("/resume")
+async def resume_run() -> dict:
+    return {"ok": manager.resume()}
+
+
+@app.get("/stats")
+async def stats() -> dict:
+    """Lifetime count of analyzed videos — the Qt GUI's counter, same file."""
+    try:
+        from modules import analysis_stats
+
+        return {
+            "ok": True,
+            "analyzed": analysis_stats.get_analyzed_count(),
+            "path": analysis_stats.stats_path(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "analyzed": 0}
 
 
 @app.post("/run")
@@ -196,6 +256,152 @@ async def start_run(req: RunRequest) -> dict:
 @app.post("/cancel")
 async def cancel_run() -> dict:
     return {"ok": manager.cancel()}
+
+
+# ── Config persistence ────────────────────────────────────────────────────
+# Reads/writes the same config.yaml the Qt GUI uses, so settings carry across
+# both UIs. Shape mirrors main.py's save_config().
+
+
+@app.get("/config")
+async def get_config() -> dict:
+    import yaml
+    from modules.app_paths import config_path
+
+    try:
+        path = config_path()
+        if not os.path.exists(path):
+            return {"ok": True, "config": {}}
+        with open(path, encoding="utf-8") as fh:
+            return {"ok": True, "config": yaml.safe_load(fh) or {}}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "config": {}}
+
+
+class ConfigRequest(BaseModel):
+    config: dict
+
+
+@app.post("/config")
+async def save_config(req: ConfigRequest) -> dict:
+    """Merge-write config.yaml. Merging (rather than replacing) preserves keys
+    the web UI doesn't own yet, e.g. ui.suppress_no_cache_warning."""
+    import yaml
+    from modules.app_paths import config_path
+
+    try:
+        path = config_path()
+        existing: dict = {}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                existing = yaml.safe_load(fh) or {}
+        for section, values in (req.config or {}).items():
+            if isinstance(values, dict) and isinstance(existing.get(section), dict):
+                existing[section].update(values)
+            else:
+                existing[section] = values
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.dump(existing, fh, sort_keys=False, allow_unicode=True)
+        return {"ok": True, "path": path}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+# ── Composition rules ─────────────────────────────────────────────────────
+# Flat rows in the UI <-> the grouped {events: [{name, label, rules: [...]}]}
+# shape composition_rules.yaml uses. Grouping/ungrouping mirrors main.py's
+# _comp_save_rules / _comp_load_rules.
+
+
+@app.get("/composition-rules")
+async def get_composition_rules() -> dict:
+    import yaml
+    from modules.app_paths import composition_rules_path
+
+    try:
+        path = composition_rules_path()
+        rows: list[dict] = []
+        if path and os.path.exists(path):
+            with open(path, encoding="utf-8") as fh:
+                events = (yaml.safe_load(fh) or {}).get("events", [])
+            for ev in events:
+                for rule in ev.get("rules", []):
+                    rows.append({
+                        "name": ev.get("name", ""),
+                        "label": ev.get("label", ev.get("name", "")),
+                        "source": rule.get("source", ""),
+                        "region": rule.get("region", ""),
+                        "min_count": rule.get("min_count", 1),
+                        "max_count": rule.get("max_count", 999),
+                        "window_secs": ev.get("window_secs", 0.75),
+                        "persist_secs": ev.get("persist_secs", 0.5),
+                    })
+        return {"ok": True, "rules": rows}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "rules": []}
+
+
+class CompRulesRequest(BaseModel):
+    rules: list[dict]
+
+
+@app.post("/composition-rules")
+async def save_composition_rules(req: CompRulesRequest) -> dict:
+    import yaml
+    from modules.app_paths import user_data_dir
+
+    try:
+        events_ordered: list[dict] = []
+        events_map: dict[str, dict] = {}
+        for row in req.rules:
+            name = str(row.get("name", "")).strip()
+            source = str(row.get("source", "")).strip()
+            region = str(row.get("region", "")).strip()
+            # Same validation as the Qt table: incomplete rows are dropped.
+            if not name or not source or not region:
+                continue
+            if name not in events_map:
+                entry = {
+                    "name": name,
+                    "label": str(row.get("label") or name).strip(),
+                    "rules": [],
+                    "window_secs": float(row.get("window_secs", 0.75)),
+                    "persist_secs": float(row.get("persist_secs", 0.5)),
+                }
+                events_map[name] = entry
+                events_ordered.append(entry)
+            events_map[name]["rules"].append({
+                "source": source,
+                "region": region,
+                "min_count": int(row.get("min_count", 1)),
+                "max_count": int(row.get("max_count", 999)),
+            })
+        path = os.path.join(user_data_dir(), "composition_rules.yaml")
+        with open(path, "w", encoding="utf-8") as fh:
+            yaml.dump({"events": events_ordered}, fh, allow_unicode=True,
+                      sort_keys=False, default_flow_style=False)
+        return {"ok": True, "path": path, "events": len(events_ordered)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+# ── Video probing ─────────────────────────────────────────────────────────
+
+
+@app.get("/video-info")
+async def video_info(path: str) -> dict:
+    """Duration/fps for a video, so the UI can show a real time-range slider.
+    Uses the pipeline's own ffprobe-based helper (cv2's frame count is unreliable
+    on VFR footage)."""
+    try:
+        if not os.path.exists(path):
+            return {"ok": False, "error": "file not found"}
+        from pipeline import get_video_duration
+
+        duration = await asyncio.to_thread(get_video_duration, path, lambda *_: None)
+        return {"ok": True, "duration": float(duration or 0)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
 
 
 # ── Download ──────────────────────────────────────────────────────────────
@@ -306,19 +512,64 @@ def _load_label_json(path: str) -> list[str]:
         return []
 
 
-@app.get("/labels/{kind}")
-async def get_labels(kind: str) -> dict:
-    """kind: 'objects' | 'actions'. Returns the label vocabulary for autocomplete."""
+@app.get("/labels/objects")
+async def get_object_labels(yolo_type: str = "standard") -> dict:
+    """Object vocabulary. Mirrors open_object_label_selector: the source depends
+    on the detector type (standard COCO vs custom keypoints vs both)."""
+    from modules.app_paths import custom_keypoint_names, data_file
+
+    try:
+        coco = _load_label_json(data_file("yolo_objects_labels.json"))
+        if yolo_type == "custom":
+            return {"ok": True, "labels": custom_keypoint_names(), "source": "custom"}
+        if yolo_type == "mixed":
+            return {"ok": True, "labels": custom_keypoint_names() + coco,
+                    "source": "mixed"}
+        return {"ok": True, "labels": coco, "source": "standard"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "labels": []}
+
+
+@app.get("/labels/actions")
+async def get_action_labels(backend: str = "auto", models: str = "intel_only") -> dict:
+    """Action vocabulary. Mirrors open_action_label_selector, including the
+    r3d_* backends forcing intel_only and the mixed mode's [custom]/[intel]
+    disambiguation suffixes for labels present in both sets."""
     from modules.app_paths import data_file
 
-    files = {
-        "objects": "yolo_objects_labels.json",
-        "actions": "kinetics_400_labels.json",
-    }
-    name = files.get(kind)
-    if not name:
-        return {"ok": False, "error": f"unknown label kind: {kind}", "labels": []}
-    return {"ok": True, "labels": _load_label_json(data_file(name))}
+    try:
+        if backend in ("r3d_cuda", "r3d_cpu"):
+            models = "intel_only"
+
+        intel = _load_label_json(data_file("kinetics_400_labels.json"))
+        custom_ov = _load_label_json(
+            data_file("intel_finetuned_classifier_3d_mapping.json"))
+        r3d_custom = _load_label_json(data_file("r3d_finetuned_mapping.json"))
+
+        if models == "custom_only":
+            return {"ok": True, "labels": custom_ov}
+        if models == "r3d_custom_only":
+            return {"ok": True, "labels": r3d_custom}
+        if models == "mixed":
+            custom = custom_ov or r3d_custom
+            shared = set(custom) & set(intel)
+            labels = [f"{c} [custom]" if c in shared else c for c in custom]
+            labels += [f"{i} [intel]" if i in shared else i
+                       for i in intel if i not in set(custom) or i in shared]
+            return {"ok": True, "labels": labels, "shared": len(shared)}
+        return {"ok": True, "labels": intel}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "labels": []}
+
+
+@app.get("/labels/{kind}")
+async def get_labels(kind: str) -> dict:
+    """Back-compat shim for the simple object/action label fetch."""
+    if kind == "objects":
+        return await get_object_labels()
+    if kind == "actions":
+        return await get_action_labels()
+    return {"ok": False, "error": f"unknown label kind: {kind}", "labels": []}
 
 
 # ── Face bank (Avoid tab) ─────────────────────────────────────────────────
@@ -337,21 +588,140 @@ def _face_bank():
 @app.get("/faces")
 async def list_faces() -> dict:
     """Identities from the shared face bank, as shown in the Qt Avoid tab.
-    Names/avoid flags are set in the native Timeline Viewer."""
+    Sorted unnamed-last then by descending sighting count, matching
+    refresh_avoid_list. `thumb` is base64 JPEG, rendered as-is by the UI."""
     try:
         bank = _face_bank()
         idents = []
         for ident in bank.all_identities():
+            ident_id = ident.get("id")
             idents.append({
-                "id": ident.get("id"),
+                "id": ident_id,
                 "name": ident.get("name") or "",
-                "label": bank.name_for(ident.get("id")),
+                "label": bank.name_for(ident_id),
                 "avoid": bool(ident.get("avoid", False)),
                 "count": ident.get("count", 0),
+                "thumb": ident.get("thumb") or "",
             })
-        return {"ok": True, "identities": idents}
+        idents.sort(key=lambda i: (not i["name"], -i["count"]))
+        return {
+            "ok": True,
+            "identities": idents,
+            "named": sum(1 for i in idents if i["name"]),
+            "avoided": sum(1 for i in idents if i["avoid"]),
+        }
     except Exception as exc:  # noqa: BLE001 — face stack is optional
         return {"ok": False, "error": str(exc), "identities": []}
+
+
+class IdentityRequest(BaseModel):
+    id: str
+
+
+@app.post("/faces/remove")
+async def remove_face(req: IdentityRequest) -> dict:
+    try:
+        bank = _face_bank()
+        removed = bank.remove(req.id)
+        if removed:
+            bank.save()
+        return {"ok": removed}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class NameRequest(BaseModel):
+    id: str
+    name: str
+
+
+@app.post("/faces/name")
+async def name_face(req: NameRequest) -> dict:
+    """Name an identity. If the name already belongs to someone else, merge into
+    them rather than creating a duplicate — same rule as the Timeline Viewer."""
+    try:
+        bank = _face_bank()
+        target = req.name.strip()
+        if not target:
+            return {"ok": False, "error": "empty name"}
+        for ident in bank.all_identities():
+            if ident.get("id") != req.id and (ident.get("name") or "") == target:
+                bank.merge_identities(ident["id"], req.id)
+                bank.save()
+                return {"ok": True, "merged_into": ident["id"]}
+        bank.name_identity(req.id, target)
+        bank.save()
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class ClearFacesRequest(BaseModel):
+    keep_named: bool = True
+
+
+@app.post("/faces/clear")
+async def clear_faces(req: ClearFacesRequest) -> dict:
+    """keep_named mirrors the Qt 'Keep named / avoided' vs 'Clear everything'."""
+    try:
+        bank = _face_bank()
+        bank.clear(keep_named=req.keep_named)
+        bank.save()
+        return {"ok": True, "remaining": len(bank.all_identities())}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class ScanRequest(BaseModel):
+    video_path: str
+
+
+@app.post("/faces/scan")
+async def scan_faces(req: ScanRequest) -> dict:
+    """Offline face pass over a video to populate the bank, mirroring
+    FaceScanWorker. tag_entries caches per-frame tagging so the pipeline's avoid
+    step reuses this work instead of re-running recognition."""
+    if not os.path.exists(req.video_path):
+        return {"ok": False, "error": "video not found"}
+    if manager.is_running:
+        return {"ok": False, "error": "A run is already in progress"}
+    try:
+        manager.loop = asyncio.get_running_loop()
+        manager.run_id = uuid.uuid4().hex
+        manager.cancel_flag = threading.Event()
+        manager.pause_event = threading.Event()
+        manager.pause_event.set()
+
+        def _scan() -> None:
+            def log_fn(msg: Any) -> None:
+                manager._emit({"type": "log", "message": str(msg)})
+
+            try:
+                manager._emit({"type": "started", "run_id": manager.run_id})
+                from video_ai_editor.face_identity import FaceIdentityBank
+                from modules.compute_forbidden import build_tracking_model, tag_entries
+
+                bank = FaceIdentityBank(db_path=FACE_DB_PATH)
+                yolo_model = build_tracking_model("n")
+                tag_entries(
+                    req.video_path, bank, yolo_model, model_size="n",
+                    face_every=15, vid_stride=3, save_bank=True, log_fn=log_fn,
+                )
+                manager._emit({"type": "faces_scanned",
+                               "count": len(bank.all_identities())})
+                manager._emit({"type": "finished",
+                               "output": f"{len(bank.all_identities())} identities"})
+            except Exception as exc:  # noqa: BLE001
+                manager._emit({"type": "error", "message": str(exc),
+                               "traceback": traceback.format_exc()})
+            finally:
+                manager._emit({"type": "done"})
+
+        manager.thread = threading.Thread(target=_scan, daemon=True)
+        manager.thread.start()
+        return {"ok": True, "run_id": manager.run_id}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
 
 
 class AvoidRequest(BaseModel):
