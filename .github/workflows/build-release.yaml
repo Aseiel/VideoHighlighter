@@ -79,12 +79,12 @@ jobs:
           $size = (Get-ChildItem -Recurse ./dist/VideoHighlighter | Measure-Object -Property Length -Sum).Sum / 1GB
           Write-Host "Build size: $([math]::Round($size, 2)) GB"
       - name: Create archive
-        run: 7z a -t7z -mx=9 -v1900m VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z ./dist/VideoHighlighter
+        run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z" ./dist/VideoHighlighter
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-build
-          path: VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z*
+          path: "VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z*"
 
   build-mac:
     runs-on: macos-latest
