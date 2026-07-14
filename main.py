@@ -1399,16 +1399,50 @@ class VideoHighlighterGUI(QWidget):
         self.obj_frame_skip_spin.setToolTip("Analyze every Nth frame for object detection (higher = faster, less precise)")
 
         self.yolo_type_combo = QComboBox()
-        self.yolo_type_combo.addItem("Standard YOLOX (80 objects, fast, OpenVINO support)", "standard")
+        self.yolo_type_combo.addItem("Standard YOLO (80 objects)", "standard")
+        self.yolo_type_combo.addItem("Custom (my trained model)", "custom")
 
         # Pro v1 keeps pose/keypoints disabled until a permissive backend lands.
         self._custom_pose_model = None
+        # User-selected custom object detector (.pt/.onnx), loaded natively by
+        # ultralytics. Empty = use the standard model.
+        self._custom_object_model = advanced_cfg.get("yolo_custom_model_path", "") or ""
 
         current_type = advanced_cfg.get("yolo_type", "standard")
         idx_type = self.yolo_type_combo.findData(current_type)
         self.yolo_type_combo.setCurrentIndex(idx_type if idx_type >= 0 else 0)
 
         self.yolo_model_combo = QComboBox()
+
+        # Custom-model path picker (shown only when "Custom" is selected).
+        self.custom_obj_model_edit = QLineEdit()
+        self.custom_obj_model_edit.setReadOnly(True)
+        self.custom_obj_model_edit.setPlaceholderText("(no model chosen)")
+        self.custom_obj_model_edit.setText(self._custom_object_model)
+        browse_obj_btn = QPushButton("Browse…")
+        clear_obj_btn = QPushButton("Clear")
+        _custom_obj_row = QHBoxLayout()
+        _custom_obj_row.setContentsMargins(0, 0, 0, 0)
+        _custom_obj_row.addWidget(self.custom_obj_model_edit, 1)
+        _custom_obj_row.addWidget(browse_obj_btn)
+        _custom_obj_row.addWidget(clear_obj_btn)
+        self.custom_obj_model_widget = QWidget()
+        self.custom_obj_model_widget.setLayout(_custom_obj_row)
+
+        def _browse_custom_obj():
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select custom object model", self._custom_object_model or "",
+                "YOLO models (*.pt *.onnx);;All files (*)")
+            if path:
+                self._custom_object_model = path
+                self.custom_obj_model_edit.setText(path)
+
+        def _clear_custom_obj():
+            self._custom_object_model = ""
+            self.custom_obj_model_edit.clear()
+
+        browse_obj_btn.clicked.connect(_browse_custom_obj)
+        clear_obj_btn.clicked.connect(_clear_custom_obj)
 
         def on_yolo_type_changed(index):
             yolo_type = self.yolo_type_combo.currentData() or "standard"
@@ -1419,7 +1453,7 @@ class VideoHighlighterGUI(QWidget):
             custom_only = (yolo_type == "custom")
 
             if custom_only:
-                # Size applies to the object detector, which isn't used here
+                # Size applies to the standard detector, which isn't used here
                 self.yolo_model_combo.addItem("(custom model — size N/A)", "n")
                 self.yolo_model_combo.setEnabled(False)
             else:
@@ -1434,6 +1468,9 @@ class VideoHighlighterGUI(QWidget):
             if restore_idx >= 0:
                 self.yolo_model_combo.setCurrentIndex(restore_idx)
             self.yolo_model_combo.blockSignals(False)
+
+            # Only expose the custom-model picker in custom mode.
+            self.custom_obj_model_widget.setVisible(custom_only)
 
         self.yolo_type_combo.currentIndexChanged.connect(on_yolo_type_changed)
 
@@ -1451,7 +1488,11 @@ class VideoHighlighterGUI(QWidget):
         object_layout.addRow("Frame skip:", self.obj_frame_skip_spin)
         object_layout.addRow("Detector type:", self.yolo_type_combo)
         object_layout.addRow("Detector model size:", self.yolo_model_combo)
+        object_layout.addRow("Custom model:", self.custom_obj_model_widget)
         object_layout.addRow("Confidence threshold:", self.obj_confidence_spin)
+        # Reflect the initial detector type (hide picker unless custom).
+        self.custom_obj_model_widget.setVisible(
+            (self.yolo_type_combo.currentData() or "standard") == "custom")
 
         object_box.setLayout(object_layout)
         advanced_layout.addWidget(object_box, 1, 0)
@@ -2463,7 +2504,7 @@ class VideoHighlighterGUI(QWidget):
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_custom_model_path": getattr(self, "_custom_pose_model", None),
+            "yolo_custom_model_path": (getattr(self, "_custom_object_model", "") or None) or getattr(self, "_custom_pose_model", None),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
@@ -3008,6 +3049,7 @@ class VideoHighlighterGUI(QWidget):
                 "sample_rate": int(self.sample_rate_spin.value()),
                 "yolo_type": self.yolo_type_combo.currentData(),
                 "yolo_model_size": self.yolo_model_combo.currentData(),
+                "yolo_custom_model_path": getattr(self, "_custom_object_model", "") or "",
                 "action_backend": self.action_backend_combo.currentData(),
                 "r3d_model": self.r3d_model_combo.currentData(),
                 "action_models": self.action_models_combo.currentData(),
@@ -3739,7 +3781,7 @@ class VideoHighlighterGUI(QWidget):
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.yolo_type_combo.currentData(),
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_custom_model_path": getattr(self, "_custom_pose_model", None),
+            "yolo_custom_model_path": (getattr(self, "_custom_object_model", "") or None) or getattr(self, "_custom_pose_model", None),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
