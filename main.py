@@ -3987,7 +3987,7 @@ class VideoHighlighterGUI(QWidget):
                 
                 # Check for additional files
                 base_name = os.path.splitext(output_file)[0]
-                srt_file = f"{base_name}_{self.target_lang_combo.currentText()}.srt"
+                srt_file = f"{base_name}_{self.subtitle_target_lang.currentText()}.srt"
                 transcript_file = f"{base_name}_transcript.txt"
                 
                 if os.path.exists(srt_file): 
