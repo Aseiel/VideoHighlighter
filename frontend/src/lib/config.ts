@@ -49,10 +49,34 @@ export const DEFAULT_CONFIG: HighlighterConfig = {
   force_reprocess: false,
 }
 
+/** Directory of a path, using whichever separator the path uses. */
+function dirname(p: string): string {
+  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"))
+  return i === -1 ? "" : p.slice(0, i)
+}
+
+/**
+ * Resolve the output_file the pipeline should write, matching main.py:
+ * a single video writes next to its source; multiple videos pass the base name
+ * through and the pipeline appends '_highlight' per file.
+ */
+export function resolveOutputFile(
+  videoPaths: string[],
+  outputBase: string,
+): string {
+  const base = outputBase || "highlight.mp4"
+  if (videoPaths.length === 1) {
+    const dir = dirname(videoPaths[0])
+    return dir ? `${dir}/${base}` : base
+  }
+  return base
+}
+
 /** Convert the form model into the exact dict pipeline.run_highlighter expects. */
 export function toGuiConfig(
   c: HighlighterConfig,
   outputBase: string,
+  videoPaths: string[] = [],
 ): Record<string, unknown> {
   const objects = c.highlight_objects
     .split(",")
@@ -80,7 +104,7 @@ export function toGuiConfig(
     multi_signal_boost: 1.2,
     min_signals_for_boost: 2,
     keep_temp: c.keep_temp,
-    output_file: outputBase || "highlight.mp4",
+    output_file: resolveOutputFile(videoPaths, outputBase),
     highlight_objects: objects.length ? objects : null,
     interesting_actions: actions.length ? actions : null,
     actions_require_objects: c.actions_require_objects,

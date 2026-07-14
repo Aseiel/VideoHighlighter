@@ -18,3 +18,4 @@ frontend/src-tauri/gen/
 
 # The PyInstaller-built sidecar binary is a build artifact, not source.
 frontend/src-tauri/binaries/
+.gstack/

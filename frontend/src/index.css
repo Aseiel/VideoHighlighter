@@ -107,10 +107,13 @@
   body,
   #root {
     height: 100%;
+    width: 100%;
   }
   body {
     @apply bg-background text-foreground;
     margin: 0;
     font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+    /* Long log lines / wide inputs must never push the layout sideways. */
+    overflow-x: hidden;
   }
 }

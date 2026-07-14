@@ -126,7 +126,7 @@ export default function App() {
     wsRef.current = openEventSocket(handleEvent)
     // Give the socket a tick to connect before the run emits events.
     await new Promise((r) => setTimeout(r, 150))
-    const res = await startRun(videos, toGuiConfig(cfg, output))
+    const res = await startRun(videos, toGuiConfig(cfg, output, videos))
     if (!res.ok) {
       appendLog(`✖ ${res.error}`, "err")
       toast.error(res.error ?? "Failed to start")
@@ -146,7 +146,7 @@ export default function App() {
   }
 
   return (
-    <div className="mx-auto flex min-h-screen max-w-5xl flex-col gap-5 p-6">
+    <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col gap-5 p-6">
       {/* Header */}
       <header className="flex items-center justify-between">
         <div className="flex items-center gap-3">
@@ -222,19 +222,19 @@ export default function App() {
             </ul>
           )}
           <Separator className="my-4" />
-          <div className="grid grid-cols-[auto_1fr] items-center gap-3">
+          <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
             <Label className="text-sm text-muted-foreground">Output name</Label>
             <Input
               value={output}
               onChange={(e) => setOutput(e.target.value)}
-              className="h-8"
+              className="h-8 w-full"
             />
           </div>
         </CardContent>
       </Card>
 
       {/* Settings grid */}
-      <div className="grid gap-5 md:grid-cols-2">
+      <div className="grid min-w-0 gap-5 md:grid-cols-2 [&>*]:min-w-0">
         <Card>
           <CardHeader className="flex-row items-center justify-between space-y-0">
             <CardTitle className="text-sm font-medium">Scoring Points</CardTitle>
@@ -274,22 +274,22 @@ export default function App() {
           <CardTitle className="text-sm font-medium">Detection Targets</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          <div className="grid grid-cols-[auto_1fr] items-center gap-3">
+          <div className="grid min-w-0 grid-cols-[4.5rem_minmax(0,1fr)] items-center gap-3">
             <Label className="text-sm text-muted-foreground">Objects</Label>
             <Input
               value={cfg.highlight_objects}
               onChange={(e) => set("highlight_objects", e.target.value)}
               placeholder="person, sports ball, dog"
-              className="h-8"
+              className="h-8 w-full"
             />
           </div>
-          <div className="grid grid-cols-[auto_1fr] items-center gap-3">
+          <div className="grid min-w-0 grid-cols-[4.5rem_minmax(0,1fr)] items-center gap-3">
             <Label className="text-sm text-muted-foreground">Actions</Label>
             <Input
               value={cfg.interesting_actions}
               onChange={(e) => set("interesting_actions", e.target.value)}
               placeholder="high jump, high kick, archery"
-              className="h-8"
+              className="h-8 w-full"
             />
           </div>
           <div className="flex flex-wrap gap-5 pt-1">
