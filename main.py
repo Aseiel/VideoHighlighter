@@ -30,6 +30,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+from modules import analysis_stats
 
 try:
     import openvino  # registers OpenVINO's DLL dir on Windows
@@ -1866,6 +1867,15 @@ class VideoHighlighterGUI(QWidget):
         self.debug_console_chk.toggled.connect(debug_console.set_console_visible)
         debug_console.register_checkbox(self.debug_console_chk)
         ctrl_layout.addWidget(self.debug_console_chk)
+        self.session_analyzed_count = 0
+        self.analyzed_counter_label = QLabel()
+        self.analyzed_counter_label.setStyleSheet("color: #2196F3; font-weight: bold;")
+        self.analyzed_counter_label.setToolTip(
+            "Videos successfully analyzed by the pipeline.\n"
+            f"Lifetime total persists in:\n{analysis_stats.stats_path()}"
+        )
+        self.update_analyzed_counter()
+        ctrl_layout.addWidget(self.analyzed_counter_label)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.run_btn)
         layout.addLayout(ctrl_layout)
@@ -3898,6 +3908,13 @@ class VideoHighlighterGUI(QWidget):
             self.pipeline_cleanup()
             self._show_progress(False)
 
+    def update_analyzed_counter(self):
+        """Refresh the analyzed-videos counter label (lifetime + this session)."""
+        total = analysis_stats.get_analyzed_count()
+        self.analyzed_counter_label.setText(
+            f"📈 Analyzed videos: {total} (session: {self.session_analyzed_count})"
+        )
+
     def pipeline_done(self, output_file):
         """Handle pipeline completion"""
         self.status_timer.stop()
@@ -3978,6 +3995,15 @@ class VideoHighlighterGUI(QWidget):
                 if os.path.exists(transcript_file): 
                     self.append_log(f"📄 Transcript file: {transcript_file}")
                 
+            newly_analyzed = len(highlight_files) if isinstance(output_file, list) else 1
+            if newly_analyzed:
+                self.session_analyzed_count += newly_analyzed
+                total_analyzed = analysis_stats.increment_analyzed(newly_analyzed)
+                self.update_analyzed_counter()
+                self.append_log(
+                    f"📈 Analyzed videos: +{newly_analyzed} this run — lifetime total: {total_analyzed}"
+                )
+
             self.task_label.setText("✅ Complete!")
             self.task_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
         elif not was_cancelled:
