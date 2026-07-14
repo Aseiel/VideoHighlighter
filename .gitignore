@@ -18,4 +18,13 @@ frontend/src-tauri/gen/
 
 # The PyInstaller-built sidecar binary is a build artifact, not source.
 frontend/src-tauri/binaries/
+
+# --- Pipeline runtime artifacts ---
+# Written next to the project when a run executes: the analysis cache, the
+# per-run object log, and YOLO weights ultralytics auto-downloads on first use.
+cache/
+object_log.csv
+yolo11n.pt
+yolo11n_openvino_model/
+highlight.mp4
 .gstack/
