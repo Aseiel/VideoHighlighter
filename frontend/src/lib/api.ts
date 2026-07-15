@@ -15,6 +15,8 @@ export type RunEvent =
   | { type: "finished"; output: string }
   | { type: "downloaded"; paths: string[] }
   | { type: "faces_scanned"; count: number }
+  | { type: "vision_hit"; timestamp: number; analysis: string }
+  | { type: "vision_results"; results: VisionResult[] }
   | {
       type: "preview"
       jpeg: string
@@ -314,6 +316,46 @@ export async function getLlmBackends(): Promise<{
   error?: string
 }> {
   const res = await fetch(`${SIDECAR_BASE}/llm/backends`)
+  return res.json()
+}
+
+export interface VisionResult {
+  timestamp: number
+  score: number
+  thumb: string
+  analysis: string
+}
+
+export async function getClipStatus(): Promise<{
+  ok: boolean
+  available: boolean
+  error?: string | null
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/llm/clip-status`)
+  return res.json()
+}
+
+export interface VisionSearchOptions {
+  video_path: string
+  query: string
+  mode: "clip" | "clip_llm" | "llm"
+  interval: number
+  top_k: number
+  threshold: number
+  clip_device: string
+  backend: string
+  model: string
+}
+
+/** Find moments matching a query. Streams progress/results on the run socket. */
+export async function visionSearch(
+  opts: VisionSearchOptions,
+): Promise<{ ok: boolean; run_id?: string; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/llm/vision-search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+  })
   return res.json()
 }
 

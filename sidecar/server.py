@@ -843,6 +843,51 @@ async def llm_backends() -> dict:
         return {"ok": False, "error": str(exc), "backends": [], "ollama_models": []}
 
 
+@app.get("/llm/clip-status")
+async def clip_status() -> dict:
+    """Whether the OpenVINO CLIP stack imports; names the failing module if not."""
+    try:
+        from llm.clip_prefilter import ClipFramePrefilter
+
+        err = ClipFramePrefilter.import_error()
+        return {"ok": True, "available": err is None, "error": err}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": True, "available": False, "error": str(exc)}
+
+
+class VisionSearchRequest(BaseModel):
+    video_path: str
+    query: str
+    # clip = CLIP ranker only; clip_llm = CLIP then VLM confirms; llm = VLM only.
+    mode: str = "clip"
+    interval: float = 1.0
+    top_k: int = 30
+    threshold: float = 0.5
+    clip_device: str = "GPU"
+    backend: str = "ollama"
+    model: str = "llava"
+
+
+@app.post("/llm/vision-search")
+async def vision_search(req: VisionSearchRequest) -> dict:
+    """Find moments matching a text query. Runs in the worker process and
+    streams progress/results over the run socket."""
+    if not os.path.exists(req.video_path):
+        return {"ok": False, "error": "video not found"}
+    if not req.query.strip():
+        return {"ok": False, "error": "empty query"}
+    try:
+        loop = asyncio.get_running_loop()
+        run_id = manager.start_job(
+            {"kind": "vision_search", **req.model_dump()}, loop
+        )
+        return {"ok": True, "run_id": run_id}
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 class ChatRequest(BaseModel):
     backend: str
     model: str
@@ -942,6 +987,15 @@ async def ws_events(ws: WebSocket) -> None:
 
 
 def main() -> None:
+    # The engine prints emoji; a Windows console defaults to cp1252 and the
+    # first such print would raise UnicodeEncodeError. Same reason worker.py
+    # reconfigures its stdio.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(description="VideoHighlighter FastAPI sidecar")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8756)

@@ -63,7 +63,9 @@ import { TranscriptTab } from "@/components/tabs/TranscriptTab"
 import { AdvancedTab } from "@/components/tabs/AdvancedTab"
 import { AvoidTab } from "@/components/tabs/AvoidTab"
 import { LlmChatTab } from "@/components/tabs/LlmChatTab"
+import { VisionSearchTab } from "@/components/tabs/VisionSearchTab"
 import { AboutTab } from "@/components/tabs/AboutTab"
+import type { VisionResult } from "@/lib/api"
 import {
   DownloadTab,
   DEFAULT_DOWNLOAD,
@@ -96,6 +98,10 @@ export default function App() {
   const [loaded, setLoaded] = useState(false)
   const [livePreview, setLivePreview] = useState(false)
   const [frames, setFrames] = useState<PreviewFrame[]>([])
+  // Shared by the LLM Chat and Visual Search tabs.
+  const [llmBackend, setLlmBackend] = useState("")
+  const [llmModel, setLlmModel] = useState("")
+  const [visionResults, setVisionResults] = useState<VisionResult[]>([])
   const wsRef = useRef<WebSocket | null>(null)
   const logEndRef = useRef<HTMLDivElement | null>(null)
   // Read inside WS callbacks, which close over the mount-time value otherwise.
@@ -266,6 +272,12 @@ export default function App() {
           const next = [...f, { jpeg: e.jpeg, boxes: e.boxes, sec: e.sec }]
           return next.length > MAX_FRAMES ? next.slice(-MAX_FRAMES) : next
         })
+        break
+      case "vision_hit":
+        appendLog(`🔎 match at ${e.timestamp.toFixed(1)}s`, "ok")
+        break
+      case "vision_results":
+        setVisionResults(e.results)
         break
       case "finished":
         appendLog(`✔ Finished: ${e.output || "(no output)"}`, "ok")
@@ -506,6 +518,7 @@ export default function App() {
           <TabsTrigger value="transcript">Transcript</TabsTrigger>
           <TabsTrigger value="advanced">Advanced</TabsTrigger>
           <TabsTrigger value="llm">LLM Chat</TabsTrigger>
+          <TabsTrigger value="search">Visual Search</TabsTrigger>
           <TabsTrigger value="avoid">Avoid</TabsTrigger>
           <TabsTrigger value="about">About</TabsTrigger>
         </TabsList>
@@ -534,7 +547,26 @@ export default function App() {
           <AdvancedTab cfg={cfg} set={set} />
         </TabsContent>
         <TabsContent value="llm" className="mt-4">
-          <LlmChatTab videoPath={videos[0]} />
+          <LlmChatTab
+            videoPath={videos[0]}
+            backend={llmBackend}
+            model={llmModel}
+            onBackendChange={setLlmBackend}
+            onModelChange={setLlmModel}
+          />
+        </TabsContent>
+        <TabsContent value="search" className="mt-4">
+          <VisionSearchTab
+            videoPath={videos[0]}
+            backend={llmBackend || "ollama"}
+            model={llmModel || "llava"}
+            running={running}
+            results={visionResults}
+            onStart={async () => {
+              setVisionResults([])
+              await beginRun()
+            }}
+          />
         </TabsContent>
         <TabsContent value="avoid" className="mt-4">
           <AvoidTab

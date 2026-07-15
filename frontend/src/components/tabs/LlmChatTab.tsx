@@ -12,15 +12,26 @@ import { basename } from "@/lib/files"
 interface Props {
   /** First selected video — its cached analysis becomes the chat context. */
   videoPath?: string
+  /** Lifted so Visual Search uses the same backend/model selection. */
+  backend: string
+  model: string
+  onBackendChange: (v: string) => void
+  onModelChange: (v: string) => void
 }
 
 type Msg = { role: "user" | "assistant"; text: string }
 
-export function LlmChatTab({ videoPath }: Props) {
+export function LlmChatTab({
+  videoPath,
+  backend,
+  model,
+  onBackendChange,
+  onModelChange,
+}: Props) {
   const [backends, setBackends] = useState<string[]>([])
   const [models, setModels] = useState<string[]>([])
-  const [backend, setBackend] = useState("")
-  const [model, setModel] = useState("")
+  const setBackend = onBackendChange
+  const setModel = onModelChange
   const [msgs, setMsgs] = useState<Msg[]>([])
   const [input, setInput] = useState("")
   const [busy, setBusy] = useState(false)
