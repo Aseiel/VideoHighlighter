@@ -35,6 +35,10 @@ def cut_video(video_path, start_time, end_time, output_path):
             print(f"Clip saved: {output_path} [{enc}]")
             return
         last_err = (result.stderr or "").strip()[-500:] or "unknown error"
-        print(f"⚠️ cut_video {enc} failed (rc={result.returncode}); "
+        # Include ffmpeg's own message: the return code alone (e.g. QSV's
+        # 0xB1B1B1AB) tells you nothing, and when the whole chain fails this is
+        # the only clue the user ever sees.
+        first_line = last_err.splitlines()[0] if last_err.splitlines() else last_err
+        print(f"⚠️ cut_video {enc} failed (rc={result.returncode}): {first_line}; "
               + ("trying next encoder" if enc != "libx264" else "no fallback left"))
     raise RuntimeError(f"cut_video failed for {output_path}: {last_err}")
