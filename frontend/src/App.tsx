@@ -103,6 +103,10 @@ export default function App() {
   const [frames, setFrames] = useState<PreviewFrame[]>([])
   // Output dock starts closed: settings need the room until there's a run.
   const [logOpen, setLogOpen] = useState(false)
+  // Set when the engine says it reused cached detections — the one case where
+  // the preview legitimately has nothing to show, so the panel can say so
+  // instead of waiting forever.
+  const [usedCache, setUsedCache] = useState(false)
   // Shared by the LLM Chat and Visual Search tabs.
   const [llmBackend, setLlmBackend] = useState("")
   const [llmModel, setLlmModel] = useState("")
@@ -257,6 +261,10 @@ export default function App() {
         break
       case "log":
         appendLog(e.message)
+        // The engine announces when it skips detection in favour of the cache.
+        if (/using cached (object|action) detections/i.test(e.message)) {
+          setUsedCache(true)
+        }
         break
       case "progress":
         if (e.total > 0) setProgress(Math.round((e.current / e.total) * 100))
@@ -310,6 +318,7 @@ export default function App() {
   const beginRun = async () => {
     setLog([])
     setFrames([])
+    setUsedCache(false)
     setProgress(0)
     setRunning(true)
     // Starting a run is exactly when the output matters.
@@ -498,7 +507,19 @@ export default function App() {
         <label className="flex items-center gap-2 text-sm">
           <Checkbox
             checked={livePreview}
-            onCheckedChange={(v) => setLivePreview(Boolean(v))}
+            onCheckedChange={(v) => {
+              const on = Boolean(v)
+              setLivePreview(on)
+              // Frames only exist while detection is actually running. On an
+              // already-analysed video the pipeline serves cached detections and
+              // never calls preview_fn, so the panel would sit on "Waiting for
+              // the detection stage" forever. Asking to watch detection means
+              // asking for detection to happen.
+              if (on && !cfg.force_reprocess) {
+                set("force_reprocess", true)
+                toast("Force reprocess turned on so there are frames to show")
+              }
+            }}
           />
           Live detection preview
         </label>
@@ -509,15 +530,15 @@ export default function App() {
           />
           Force reprocess (ignore cache)
         </label>
-        {livePreview && !cfg.force_reprocess && (
-          <span className="text-xs text-muted-foreground">
-            On an already-analysed video, detection is skipped and the preview
-            stays blank — tick Force reprocess to see frames.
-          </span>
-        )}
       </div>
 
-      {livePreview && <DetectionPreview frames={frames} />}
+      {livePreview && (
+        <DetectionPreview
+          frames={frames}
+          running={running}
+          cached={usedCache}
+        />
+      )}
 
       {/* Tabs */}
       <Tabs defaultValue="basic" className="min-w-0">

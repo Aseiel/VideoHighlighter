@@ -15,12 +15,16 @@ const MAX_FRAMES = 250
 
 interface Props {
   frames: PreviewFrame[]
+  /** A run is in progress. */
+  running?: boolean
+  /** The engine reported it reused cached detections, so no frames are coming. */
+  cached?: boolean
 }
 
 const fmt = (s: number) =>
   `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`
 
-export function DetectionPreview({ frames }: Props) {
+export function DetectionPreview({ frames, running, cached }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const [frozen, setFrozen] = useState(false)
   // -1 = follow live.
@@ -76,9 +80,25 @@ export function DetectionPreview({ frames }: Props) {
           {view ? (
             <canvas ref={canvasRef} className="max-h-[420px] w-full object-contain" />
           ) : (
-            <p className="p-8 text-center text-sm text-[#8890b0]">
-              Waiting for the detection stage (objects / actions)…
-            </p>
+            // Never a bare "Waiting…" that can't resolve: the cache case
+            // produces no frames at all, so say that rather than spin forever.
+            <div className="max-w-md p-8 text-center text-sm text-[#8890b0]">
+              {cached ? (
+                <>
+                  <p className="text-foreground">
+                    This video was already analysed, so detection was skipped.
+                  </p>
+                  <p className="mt-1">
+                    There are no frames to show. Tick “Force reprocess (ignore
+                    cache)” and run again to watch detection happen.
+                  </p>
+                </>
+              ) : running ? (
+                <p>Waiting for the detection stage (objects / actions)…</p>
+              ) : (
+                <p>Frames appear here while a run is detecting objects or actions.</p>
+              )}
+            </div>
           )}
         </div>
 
