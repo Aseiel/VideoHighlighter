@@ -597,18 +597,14 @@ export default function App() {
         </div>
       </main>
 
-      {/* Log dock — collapsible so the settings get the room when it's idle,
-          but it's docked, not a card floating at the end of a document. */}
-      {logOpen && (
+      {/* Log dock: collapsible, and it only claims height when it has something
+          to show. An empty panel holding 180px hostage is worse than no panel. */}
+      {logOpen && log.length > 0 && (
         <div className="shrink-0 border-t bg-card/40">
           <div className="mx-auto w-full max-w-5xl">
             <ScrollArea className="h-44 px-5 py-3">
               <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed">
-                {log.length === 0 ? (
-                  <span className="text-muted-foreground">
-                    Output from the engine appears here once a run starts.
-                  </span>
-                ) : (
+                {(
                   log.map((l, i) => (
                     <div
                       key={i}
@@ -722,7 +718,14 @@ export default function App() {
               size="sm"
               variant="ghost"
               onClick={() => setLogOpen((v) => !v)}
-              title={logOpen ? "Hide the output panel" : "Show the output panel"}
+              disabled={!log.length}
+              title={
+                !log.length
+                  ? "No output yet"
+                  : logOpen
+                  ? "Hide the output panel"
+                  : "Show the output panel"
+              }
               className="gap-1.5"
             >
               {logOpen ? (
@@ -731,6 +734,9 @@ export default function App() {
                 <ChevronUp className="size-3.5" />
               )}
               Output
+              {log.length > 0 && (
+                <span className="tabular-nums opacity-60">{log.length}</span>
+              )}
             </Button>
             {analyzed !== null && (
               <span
