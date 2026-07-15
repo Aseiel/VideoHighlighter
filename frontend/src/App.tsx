@@ -376,9 +376,16 @@ export default function App() {
   }
 
   const launchEditor = async () => {
+    if (!videos.length) return toast.error("Add a video first")
+    // The viewer is a separate Qt process and takes ~10s to appear, so say so —
+    // otherwise the click looks like it did nothing.
+    toast("Opening Timeline Viewer — it takes a few seconds to appear…")
+    appendLog(`📊 Opening Timeline Viewer for ${basename(videos[0])}…`)
     const res = await openEditor(videos[0])
-    if (res.ok) toast.success("Opening Timeline Viewer…")
-    else toast.error(res.error ?? "Could not open the editor")
+    if (!res.ok) {
+      toast.error(res.error ?? "Could not open the Timeline Viewer")
+      appendLog(`✖ ${res.error}`, "err")
+    }
   }
 
   return (
@@ -426,7 +433,12 @@ export default function App() {
             variant="outline"
             size="sm"
             onClick={launchEditor}
-            title="Open the native timeline viewer / editor"
+            disabled={!videos.length}
+            title={
+              videos.length
+                ? "Open the native Timeline Viewer for the first video"
+                : "Add a video first"
+            }
           >
             <MonitorPlay className="size-4" /> Timeline Viewer
           </Button>
@@ -496,17 +508,28 @@ export default function App() {
 
       <TimeRange state={timeRange} onChange={setTimeRange} duration={duration} />
 
-      <label className="flex items-center gap-2 text-sm">
-        <Checkbox
-          checked={livePreview}
-          onCheckedChange={(v) => setLivePreview(Boolean(v))}
-        />
-        Live detection preview
-        <span className="text-xs text-muted-foreground">
-          — shows frames + detected boxes while the pipeline runs. Needs Force
-          reprocess on an already-cached video, since detection is skipped otherwise.
-        </span>
-      </label>
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-2">
+        <label className="flex items-center gap-2 text-sm">
+          <Checkbox
+            checked={livePreview}
+            onCheckedChange={(v) => setLivePreview(Boolean(v))}
+          />
+          Live detection preview
+        </label>
+        <label className="flex items-center gap-2 text-sm">
+          <Checkbox
+            checked={cfg.force_reprocess}
+            onCheckedChange={(v) => set("force_reprocess", Boolean(v))}
+          />
+          Force reprocess (ignore cache)
+        </label>
+        {livePreview && !cfg.force_reprocess && (
+          <span className="text-xs text-muted-foreground">
+            On an already-analysed video, detection is skipped and the preview
+            stays blank — tick Force reprocess to see frames.
+          </span>
+        )}
+      </div>
 
       {livePreview && <DetectionPreview frames={frames} />}
 

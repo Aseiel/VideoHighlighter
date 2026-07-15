@@ -934,29 +934,47 @@ class EditorRequest(BaseModel):
 
 @app.post("/open-editor")
 async def open_editor(req: EditorRequest) -> dict:
-    """Launch the existing PySide6 app (Timeline Viewer / video editor).
+    """Open the native Timeline Viewer for a video.
 
-    The realtime preview, overlays and VR view stay native Qt — this just starts
-    main.py as its own process so the web UI can hand off to it.
+    Launches signal_timeline_viewer directly (it has a standalone entry point
+    that builds its own QApplication and loads the analysis cache itself), NOT
+    main.py — starting main.py would open the whole Qt application, which is a
+    confusing second copy of the app rather than the viewer the user asked for.
+
+    The viewer is a separate process, so it can't be driven in-process the way
+    main.py does it; ranges marked there reach us through the shared store in
+    modules.manual_avoid.
     """
     import subprocess
     import sys as _sys
 
-    root = _ROOT
-    main_py = os.path.join(root, "main.py")
-    if not os.path.exists(main_py):
-        return {"ok": False, "error": "main.py not found"}
+    if not req.video_path:
+        return {"ok": False, "error": "No video selected. Add a video first."}
+    if not os.path.exists(req.video_path):
+        return {"ok": False, "error": f"Video not found: {req.video_path}"}
+
     try:
         if getattr(_sys, "frozen", False):
-            # Packaged: the Qt app ships as its own executable next to ours.
-            exe = os.path.join(os.path.dirname(_sys.executable),
-                               "VideoHighlighter.exe")
-            if not os.path.exists(exe):
-                return {"ok": False, "error": "Qt app executable not found"}
-            cmd = [exe]
-        else:
-            cmd = [_sys.executable, main_py]
-        subprocess.Popen(cmd, cwd=root, close_fds=True)
+            # The packaged Qt exe is main.py, which ignores argv entirely — there
+            # is no way to ask it for just the viewer yet. Say so rather than
+            # launching the whole application and calling it a Timeline Viewer.
+            return {
+                "ok": False,
+                "error": ("The Timeline Viewer isn't available in the packaged "
+                          "build yet. Run from source to use it."),
+            }
+        viewer = os.path.join(_ROOT, "signal_timeline_viewer.py")
+        if not os.path.exists(viewer):
+            return {"ok": False, "error": "signal_timeline_viewer.py not found"}
+        cmd = [_sys.executable, viewer, req.video_path]
+
+        # Detach: the viewer must outlive this request, and on Windows a child
+        # sharing our console would die with us.
+        creationflags = 0
+        if _sys.platform == "win32":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED_PROCESS
+        subprocess.Popen(cmd, cwd=_ROOT, close_fds=True,
+                         creationflags=creationflags)
         return {"ok": True}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}

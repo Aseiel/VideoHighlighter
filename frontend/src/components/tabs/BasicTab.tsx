@@ -110,13 +110,8 @@ export function BasicTab({ cfg, set, objectLabels, actionLabels }: Props) {
               />
               Keep temp clips
             </label>
-            <label className="flex items-center gap-2 text-sm">
-              <Checkbox
-                checked={cfg.force_reprocess}
-                onCheckedChange={(v) => set("force_reprocess", Boolean(v))}
-              />
-              Force reprocess (ignore cache)
-            </label>
+            {/* Force reprocess lives on the main screen next to Live preview,
+                where the Qt app puts it and where it's actually needed. */}
             <label className="flex items-center gap-2 text-sm">
               <Checkbox
                 checked={cfg.skip_highlights}

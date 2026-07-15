@@ -186,7 +186,10 @@ export function AvoidTab({
               <Button
                 size="sm"
                 variant="outline"
+                disabled={!videoPath}
                 onClick={async () => {
+                  // Separate Qt process; it takes a few seconds to show up.
+                  toast("Opening Timeline Viewer — it takes a few seconds…")
                   const res = await openEditor(videoPath)
                   if (!res.ok) toast.error(res.error ?? "Could not open editor")
                 }}
