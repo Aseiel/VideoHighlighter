@@ -4,14 +4,48 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Release version (e.g. 0.4.6)'
-        required: true
+        description: 'Override version (blank = use version.py, e.g. "0.8.2")'
+        required: false
+        default: ''
 
 permissions:
   contents: write
 
 jobs:
+  # Single source of truth for the release version. Defaults to version.py so
+  # the release always matches what the app reports about itself; the manual
+  # input can still override it. Gates the build jobs, so a forgotten bump
+  # fails here in seconds instead of after an hour of PyInstaller.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.compute.outputs.slug }}        # e.g. 0.8.2
+    steps:
+      - uses: actions/checkout@v4
+      - id: compute
+        env:
+          OVERRIDE: ${{ github.event.inputs.release_version }}
+        run: |
+          RAW="$OVERRIDE"
+          if [ -z "$RAW" ]; then
+            RAW=$(python3 -c "import version; print(version.__version__)")
+          fi
+          echo "slug=${RAW// /-}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${RAW// /-}"
+      - name: Refuse to re-release an existing version
+        # checkout is shallow and fetches no tags, so ask the remote directly
+        # rather than looking for a local ref that is never there.
+        env:
+          SLUG: ${{ steps.compute.outputs.slug }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$SLUG" >/dev/null 2>&1; then
+            echo "::error::Tag $SLUG already exists. Bump __version__ in version.py and commit before releasing."
+            exit 1
+          fi
+          echo "Tag $SLUG is free."
+
   build-windows:
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,14 +113,15 @@ jobs:
           $size = (Get-ChildItem -Recurse ./dist/VideoHighlighter | Measure-Object -Property Length -Sum).Sum / 1GB
           Write-Host "Build size: $([math]::Round($size, 2)) GB"
       - name: Create archive
-        run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z" ./dist/VideoHighlighter
+        run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z" ./dist/VideoHighlighter
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-build
-          path: "VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z*"
+          path: "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z*"
 
   build-mac:
+    needs: version
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -171,16 +206,16 @@ jobs:
             --window-size 600 400 \
             --icon "VideoHighlighter.app" 150 200 \
             --app-drop-link 450 200 \
-            "VideoHighlighter-${{ github.event.inputs.release_version }}.dmg" \
+            "VideoHighlighter-${{ needs.version.outputs.slug }}.dmg" \
             "dist/VideoHighlighter.app"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: mac-build
-          path: VideoHighlighter-${{ github.event.inputs.release_version }}.dmg
+          path: VideoHighlighter-${{ needs.version.outputs.slug }}.dmg
 
   release:
-    needs: [build-windows, build-mac]
+    needs: [version, build-windows, build-mac]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -188,8 +223,8 @@ jobs:
       - name: Create GitHub Release
         uses: ncipollo/release-action@v1
         with:
-          tag: ${{ github.event.inputs.release_version }}
-          name: VideoHighlighter ${{ github.event.inputs.release_version }}
+          tag: ${{ needs.version.outputs.slug }}
+          name: VideoHighlighter ${{ needs.version.outputs.slug }}
           draft: true
           artifacts: "windows-build/*,mac-build/*"
           token: ${{ secrets.GITHUB_TOKEN }}
