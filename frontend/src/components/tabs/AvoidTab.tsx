@@ -21,6 +21,7 @@ import {
   nameFace,
   clearFaces,
   scanFaces,
+  saveAvoidRanges,
   openEditor,
   type FaceIdentity,
 } from "@/lib/api"
@@ -35,7 +36,13 @@ interface Props {
   running: boolean
   /** Bumped by App when a faces_scanned event arrives, to trigger a refresh. */
   refreshKey?: number
+  /** Ranges marked in the native Timeline Viewer, via the shared store. */
+  avoidRanges: [number, number][]
+  onAvoidRangesChange: () => void
 }
+
+const fmtT = (s: number) =>
+  `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`
 
 export function AvoidTab({
   cfg,
@@ -44,6 +51,8 @@ export function AvoidTab({
   videoPath,
   running,
   refreshKey,
+  avoidRanges,
+  onAvoidRangesChange,
 }: Props) {
   const [faces, setFaces] = useState<FaceIdentity[]>([])
   const [loading, setLoading] = useState(false)
@@ -230,6 +239,53 @@ export function AvoidTab({
             {faces.length} people · {namedCount} named · {avoidCount} avoided
           </p>
         )}
+
+        {/* Time ranges marked in the native Timeline Viewer. They're stored per
+            video, so they apply to runs started here too. */}
+        <div className="space-y-2 border-t pt-3">
+          <div className="flex items-center justify-between">
+            <p className="text-sm font-medium">
+              Avoided time ranges
+              {avoidRanges.length > 0 && (
+                <span className="ml-2 text-xs font-normal text-muted-foreground">
+                  {avoidRanges.length} range(s)
+                </span>
+              )}
+            </p>
+            {avoidRanges.length > 0 && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={async () => {
+                  if (!videoPath) return
+                  const res = await saveAvoidRanges(videoPath, [])
+                  if (!res.ok) return toast.error(res.error ?? "Could not clear")
+                  onAvoidRangesChange()
+                  toast.success("Cleared avoided ranges")
+                }}
+              >
+                Clear all
+              </Button>
+            )}
+          </div>
+          {avoidRanges.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              None. Drag-select a span in the Timeline Viewer and click “Avoid
+              selected range” — it will show up here and apply to your runs.
+            </p>
+          ) : (
+            <ul className="flex flex-wrap gap-2">
+              {avoidRanges.map(([a, b], i) => (
+                <li
+                  key={i}
+                  className="rounded-md bg-muted px-2 py-1 text-xs tabular-nums"
+                >
+                  {fmtT(a)} – {fmtT(b)}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </CardContent>
 
       <Dialog open={clearOpen} onOpenChange={setClearOpen}>

@@ -47,6 +47,7 @@ import {
   getConfigFile,
   saveConfigFile,
   getVideoInfo,
+  getAvoidRanges,
   openEditor,
   type RunEvent,
 } from "@/lib/api"
@@ -78,6 +79,7 @@ export default function App() {
   const [cfg, setCfg] = useState<HighlighterConfig>(DEFAULT_CONFIG)
   const [dl, setDl] = useState<DownloadSettings>(DEFAULT_DOWNLOAD)
   const [avoidIds, setAvoidIds] = useState<string[]>([])
+  const [avoidRanges, setAvoidRanges] = useState<[number, number][]>([])
   const [objectLabels, setObjectLabels] = useState<string[]>([])
   const [actionLabels, setActionLabels] = useState<string[]>([])
   const [timeRange, setTimeRange] = useState<TimeRangeState>(DEFAULT_TIME_RANGE)
@@ -200,6 +202,26 @@ export default function App() {
     )
   }, [videos])
 
+  /** Ranges the user marked in the native Timeline Viewer, via the shared store.
+   *  Refreshed on video change and whenever the window regains focus, so ranges
+   *  marked in the viewer land here without a manual reload. */
+  const refreshAvoidRanges = () => {
+    if (!videos.length) {
+      setAvoidRanges([])
+      return
+    }
+    void getAvoidRanges(videos[0]).then((r) =>
+      setAvoidRanges(r.ok ? r.ranges : []),
+    )
+  }
+
+  useEffect(() => {
+    refreshAvoidRanges()
+    window.addEventListener("focus", refreshAvoidRanges)
+    return () => window.removeEventListener("focus", refreshAvoidRanges)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videos])
+
   // Lifetime analyzed counter (shared stats file with the Qt GUI).
   useEffect(() => {
     void getStats().then((r) => r.ok && setAnalyzed(r.analyzed))
@@ -292,7 +314,12 @@ export default function App() {
     await beginRun()
     const res = await startRun(
       videos,
-      toGuiConfig(cfg, output, videos, { avoidIds, timeRange, duration }),
+      toGuiConfig(cfg, output, videos, {
+        avoidIds,
+        avoidRanges,
+        timeRange,
+        duration,
+      }),
     )
     if (!res.ok) failRun(res.error ?? "Failed to start")
   }
@@ -517,6 +544,8 @@ export default function App() {
             videoPath={videos[0]}
             running={running}
             refreshKey={faceRefresh}
+            avoidRanges={avoidRanges}
+            onAvoidRangesChange={refreshAvoidRanges}
           />
         </TabsContent>
         <TabsContent value="about" className="mt-4">

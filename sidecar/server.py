@@ -748,6 +748,33 @@ async def clear_faces(req: ClearFacesRequest) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+@app.get("/avoid-ranges")
+async def get_avoid_ranges(path: str) -> dict:
+    """Manual avoid ranges marked for a video in the Timeline Viewer."""
+    try:
+        from modules.manual_avoid import load_ranges
+
+        return {"ok": True, "ranges": [[a, b] for a, b in load_ranges(path)]}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "ranges": []}
+
+
+class AvoidRangesRequest(BaseModel):
+    video_path: str
+    ranges: list[list[float]]
+
+
+@app.post("/avoid-ranges")
+async def set_avoid_ranges(req: AvoidRangesRequest) -> dict:
+    try:
+        from modules.manual_avoid import save_ranges
+
+        save_ranges(req.video_path, [tuple(r) for r in req.ranges])
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 class ScanRequest(BaseModel):
     video_path: str
 

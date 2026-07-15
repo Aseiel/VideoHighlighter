@@ -336,6 +336,28 @@ export async function llmChat(
   return res.json()
 }
 
+/** Manual avoid ranges marked for a video in the Timeline Viewer. */
+export async function getAvoidRanges(
+  path: string,
+): Promise<{ ok: boolean; ranges: [number, number][] }> {
+  const res = await fetch(
+    `${SIDECAR_BASE}/avoid-ranges?path=${encodeURIComponent(path)}`,
+  )
+  return res.json()
+}
+
+export async function saveAvoidRanges(
+  videoPath: string,
+  ranges: [number, number][],
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/avoid-ranges`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ video_path: videoPath, ranges }),
+  })
+  return res.json()
+}
+
 /** Hand off to the native Qt app (Timeline Viewer / realtime editor). */
 export async function openEditor(
   videoPath?: string,

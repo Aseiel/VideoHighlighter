@@ -4142,14 +4142,24 @@ class VideoHighlighterGUI(QWidget):
             self.worker = None
 
     def _get_manual_avoid_ranges(self):
-        """Manual avoid ranges marked on the timeline (same process, so read them
-        straight off the live timeline window). Safe if it's closed/absent."""
+        """Manual avoid ranges marked on the timeline.
+
+        Prefer the live window (same process, always current). Fall back to the
+        shared store so ranges still apply after the viewer is closed, or when
+        they were marked in an earlier session. Safe if neither exists."""
         tw = getattr(self, "timeline_window", None)
         if tw is not None and hasattr(tw, "get_avoid_ranges"):
             try:
                 return tw.get_avoid_ranges()
             except Exception:
                 pass
+        try:
+            from modules.manual_avoid import load_ranges
+            paths = self.get_file_list()
+            if paths:
+                return [list(r) for r in load_ranges(paths[0])]
+        except Exception:
+            pass
         return []
 
     def open_timeline_viewer(self):
