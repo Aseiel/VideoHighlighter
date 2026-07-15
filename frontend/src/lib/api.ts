@@ -191,6 +191,16 @@ export async function getAbout(): Promise<AboutInfo> {
   return res.json()
 }
 
+/** Show debug.log in the file manager (the file you attach to a bug report). */
+export async function revealLog(): Promise<{
+  ok: boolean
+  path?: string
+  error?: string
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/reveal-log`, { method: "POST" })
+  return res.json()
+}
+
 /** Scrape + download videos. Emits events on the same socket as a run. */
 export async function startDownload(
   opts: DownloadOptions,

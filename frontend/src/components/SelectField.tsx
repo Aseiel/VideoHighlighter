@@ -22,12 +22,14 @@ export function SelectField({ label, value, options, onChange, disabled }: Props
     typeof o === "string" ? { value: o, label: o } : o,
   )
   return (
-    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_14rem] items-center gap-3">
-      <Label className="min-w-0 truncate text-sm font-normal text-muted-foreground">
+    // Same reasoning as NumberField: the control sits by its label, capped so a
+    // long option string can't stretch the row.
+    <div className="flex min-w-0 items-center gap-3">
+      <Label className="min-w-0 flex-1 truncate text-sm font-normal text-muted-foreground">
         {label}
       </Label>
       <Select value={value} onValueChange={onChange} disabled={disabled}>
-        <SelectTrigger className="h-8 w-full">
+        <SelectTrigger className="h-7 w-56 shrink-0">
           <SelectValue />
         </SelectTrigger>
         <SelectContent>

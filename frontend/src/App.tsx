@@ -10,7 +10,9 @@ import {
   Square,
   Sparkles,
   MonitorPlay,
-  TrendingUp,
+  FileText,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -49,6 +51,7 @@ import {
   getVideoInfo,
   getAvoidRanges,
   openEditor,
+  revealLog,
   type RunEvent,
 } from "@/lib/api"
 import { TimeRange, DEFAULT_TIME_RANGE, type TimeRangeState } from "@/components/TimeRange"
@@ -98,6 +101,8 @@ export default function App() {
   const [loaded, setLoaded] = useState(false)
   const [livePreview, setLivePreview] = useState(false)
   const [frames, setFrames] = useState<PreviewFrame[]>([])
+  // Output dock starts closed: settings need the room until there's a run.
+  const [logOpen, setLogOpen] = useState(false)
   // Shared by the LLM Chat and Visual Search tabs.
   const [llmBackend, setLlmBackend] = useState("")
   const [llmModel, setLlmModel] = useState("")
@@ -307,6 +312,8 @@ export default function App() {
     setFrames([])
     setProgress(0)
     setRunning(true)
+    // Starting a run is exactly when the output matters.
+    setLogOpen(true)
     wsRef.current = openEventSocket(handleEvent)
     await new Promise((r) => setTimeout(r, 150))
   }
@@ -389,64 +396,43 @@ export default function App() {
   }
 
   return (
-    <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col gap-5 p-6">
+    // App shell: fixed header, one scrolling column, pinned action bar. A tool
+    // window shouldn't scroll as a document -- the primary action and the log
+    // have to stay reachable no matter how long the settings get.
+    <div className="flex h-screen flex-col overflow-hidden">
       {/* Header */}
-      <header className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="grid size-10 place-items-center rounded-xl bg-primary/15 text-primary">
-            <Film className="size-5" />
+      <header className="flex shrink-0 items-center justify-between border-b px-5 py-2.5">
+        <div className="flex items-center gap-2.5">
+          <div className="grid size-7 place-items-center rounded bg-primary/15 text-primary">
+            <Film className="size-4" />
           </div>
-          <div>
-            <h1 className="text-lg font-semibold tracking-tight">
-              Video Highlighter
-            </h1>
-            <p className="text-xs text-muted-foreground">
-              Engine{" "}
-              <span
-                className={
-                  online === null
-                    ? "text-muted-foreground"
-                    : online
-                    ? "text-[color:var(--success)]"
-                    : "text-destructive"
-                }
-              >
-                {online === null ? "…" : online ? "online" : "offline"}
-              </span>
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {analyzed !== null && (
-            <span
-              className="flex items-center gap-1.5 text-xs text-muted-foreground"
-              title="Videos successfully analyzed. Lifetime total persists across sessions."
-            >
-              <TrendingUp className="size-3.5" />
-              <span className="tabular-nums">
-                {analyzed} analyzed
-                {sessionCount > 0 && ` (session: ${sessionCount})`}
-              </span>
-            </span>
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={launchEditor}
-            disabled={!videos.length}
-            title={
-              videos.length
-                ? "Open the native Timeline Viewer for the first video"
-                : "Add a video first"
-            }
+          <h1 className="text-sm font-semibold tracking-tight">
+            Video Highlighter
+          </h1>
+          <span
+            className="flex items-center gap-1.5 text-xs text-muted-foreground"
+            title={online ? "The Python engine is reachable" : "The Python engine is not responding"}
           >
-            <MonitorPlay className="size-4" /> Timeline Viewer
-          </Button>
-          <Button variant="ghost" size="icon" onClick={toggle} title="Toggle theme">
-            {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
-          </Button>
+            <span
+              className={`size-1.5 rounded-full ${
+                online === null
+                  ? "bg-muted-foreground"
+                  : online
+                  ? "bg-[color:var(--success)]"
+                  : "bg-destructive"
+              }`}
+            />
+            {online === null ? "connecting" : online ? "engine ready" : "engine offline"}
+          </span>
         </div>
+        <Button variant="ghost" size="icon" onClick={toggle} title="Toggle theme">
+          {theme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
+        </Button>
       </header>
+
+      {/* The only scrolling region. */}
+      <main className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 p-5">
 
       {/* Input videos */}
       <Card>
@@ -608,84 +594,158 @@ export default function App() {
         </TabsContent>
       </Tabs>
 
-      {/* Run bar — Run / Pause / Resume tri-state, with Cancel alongside. */}
-      <div className="flex items-center gap-4">
-        <Button
-          onClick={onToggleRun}
-          disabled={online === false}
-          className={
-            running
-              ? paused
-                ? "gap-2 bg-primary text-primary-foreground hover:opacity-90"
-                : "gap-2 bg-[#ff8c00] text-white hover:opacity-90"
-              : "gap-2 bg-[color:var(--success)] text-white hover:opacity-90"
-          }
-        >
-          {!running ? (
-            <>
-              <Sparkles className="size-4" /> Run Highlighter
-            </>
-          ) : paused ? (
-            <>
-              <Play className="size-4" /> Resume
-            </>
-          ) : (
-            <>
-              <Pause className="size-4" /> Pause
-            </>
-          )}
-        </Button>
-        {running && (
-          <Button variant="destructive" onClick={onCancel} className="gap-2">
-            <Square className="size-4" /> Cancel
-          </Button>
-        )}
-        <div className="flex-1">
-          <div className="mb-1 flex justify-between text-xs text-muted-foreground">
-            <span>{task || (running ? "Working…" : "Idle")}</span>
-            <span className="tabular-nums">{progress}%</span>
-          </div>
-          <Progress value={progress} />
         </div>
-      </div>
+      </main>
 
-      {/* Log */}
-      <Card className="flex min-h-0 flex-1 flex-col">
-        <CardHeader className="py-3">
-          <CardTitle className="flex items-center gap-2 text-sm font-medium">
-            <Play className="size-3.5" /> Log Output
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="min-h-0 flex-1 p-0">
-          <ScrollArea className="h-64 px-4 pb-4">
-            <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed">
-              {log.length === 0 ? (
-                <span className="text-muted-foreground">
-                  Logs from the engine will appear here…
-                </span>
+      {/* Log dock — collapsible so the settings get the room when it's idle,
+          but it's docked, not a card floating at the end of a document. */}
+      {logOpen && (
+        <div className="shrink-0 border-t bg-card/40">
+          <div className="mx-auto w-full max-w-5xl">
+            <ScrollArea className="h-44 px-5 py-3">
+              <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed">
+                {log.length === 0 ? (
+                  <span className="text-muted-foreground">
+                    Output from the engine appears here once a run starts.
+                  </span>
+                ) : (
+                  log.map((l, i) => (
+                    <div
+                      key={i}
+                      className={
+                        l.kind === "err"
+                          ? "text-destructive"
+                          : l.kind === "ok"
+                          ? "text-[color:var(--success)]"
+                          : "text-muted-foreground"
+                      }
+                    >
+                      {l.text}
+                    </div>
+                  ))
+                )}
+                <div ref={logEndRef} />
+              </pre>
+            </ScrollArea>
+          </div>
+        </div>
+      )}
+
+      {/* Action bar — pinned. Everything the Qt bottom bar has: Cancel, keep
+          temp, Timeline Viewer, debug log, the analyzed counter, and Run. */}
+      <footer className="shrink-0 border-t bg-card/60 px-5 py-2.5">
+        <div className="mx-auto flex w-full max-w-5xl items-center gap-3">
+          <Button
+            size="sm"
+            onClick={onToggleRun}
+            disabled={online === false}
+            className={
+              running
+                ? paused
+                  ? "gap-1.5 bg-primary text-primary-foreground hover:opacity-90"
+                  : "gap-1.5 bg-[color:var(--warning)] text-black hover:opacity-90"
+                : "gap-1.5 bg-[color:var(--success)] text-black hover:opacity-90"
+            }
+          >
+            {!running ? (
+              <>
+                <Sparkles className="size-3.5" /> Run Highlighter
+              </>
+            ) : paused ? (
+              <>
+                <Play className="size-3.5" /> Resume
+              </>
+            ) : (
+              <>
+                <Pause className="size-3.5" /> Pause
+              </>
+            )}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={onCancel}
+            disabled={!running}
+            className="gap-1.5 text-destructive hover:text-destructive disabled:opacity-40"
+          >
+            <Square className="size-3.5" /> Cancel
+          </Button>
+
+          {/* Progress owns the middle: it's the only thing that changes while a
+              run is going, so it gets the space rather than a row of buttons. */}
+          <div className="min-w-0 flex-1">
+            <div className="mb-1 flex justify-between gap-3 text-[11px] text-muted-foreground">
+              <span className="truncate">{task || (running ? "Working…" : "Idle")}</span>
+              <span className="tabular-nums">{progress}%</span>
+            </div>
+            <Progress value={progress} className="h-1" />
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1">
+            <label
+              className="flex cursor-pointer items-center gap-1.5 px-1 text-xs text-muted-foreground"
+              title="Keep the intermediate clips instead of deleting them after the merge"
+            >
+              <Checkbox
+                checked={cfg.keep_temp}
+                onCheckedChange={(v) => set("keep_temp", Boolean(v))}
+              />
+              Keep temp
+            </label>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={launchEditor}
+              disabled={!videos.length}
+              title={
+                videos.length
+                  ? "Open the native Timeline Viewer for the first video"
+                  : "Add a video first"
+              }
+              className="gap-1.5"
+            >
+              <MonitorPlay className="size-3.5" /> Timeline
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={async () => {
+                const res = await revealLog()
+                if (!res.ok) toast.error(res.error ?? "No log to show")
+              }}
+              title="Show debug.log in the file manager"
+              className="gap-1.5"
+            >
+              <FileText className="size-3.5" /> Log file
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => setLogOpen((v) => !v)}
+              title={logOpen ? "Hide the output panel" : "Show the output panel"}
+              className="gap-1.5"
+            >
+              {logOpen ? (
+                <ChevronDown className="size-3.5" />
               ) : (
-                log.map((l, i) => (
-                  <div
-                    key={i}
-                    className={
-                      l.kind === "err"
-                        ? "text-destructive"
-                        : l.kind === "ok"
-                        ? "text-[color:var(--success)]"
-                        : ""
-                    }
-                  >
-                    {l.text}
-                  </div>
-                ))
+                <ChevronUp className="size-3.5" />
               )}
-              <div ref={logEndRef} />
-            </pre>
-          </ScrollArea>
-        </CardContent>
-      </Card>
+              Output
+            </Button>
+            {analyzed !== null && (
+              <span
+                className="ml-1 border-l pl-2.5 text-xs tabular-nums text-muted-foreground"
+                title="Videos successfully analyzed. The lifetime total persists across sessions."
+              >
+                {analyzed} analyzed
+                {sessionCount > 0 && ` · ${sessionCount} this run`}
+              </span>
+            )}
+          </div>
+        </div>
+      </footer>
 
-      <Toaster richColors position="bottom-right" />
+      <Toaster richColors position="top-right" />
     </div>
   )
 }

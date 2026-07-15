@@ -1,11 +1,20 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/* Self-hosted, not a CDN: this is an offline desktop app. Inter Tight has real
+   character at UI sizes where system-ui just reads as "no typeface was chosen";
+   JetBrains Mono carries the log panel, which is the screen's densest text. */
+@import "@fontsource-variable/inter-tight";
+@import "@fontsource-variable/jetbrains-mono";
+
 @custom-variant dark (&:is(.dark *));
 
 /* Design tokens — dark-first, blue/amber accents matching the app icon. */
 :root {
-  --radius: 0.65rem;
+  /* 6px, not the shadcn 10px default: a tool window wants crisp corners.
+     Uniform bubbly radius on every surface is the giveaway of an untouched
+     component-library install. */
+  --radius: 0.375rem;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -25,6 +34,7 @@
   --input: oklch(0.922 0 0);
   --ring: oklch(0.58 0.2 255);
   --success: oklch(0.7 0.17 150);
+  --warning: oklch(0.75 0.16 70);
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
   --sidebar-primary: oklch(0.58 0.2 255);
@@ -55,6 +65,7 @@
   --input: oklch(1 0 0 / 12%);
   --ring: oklch(0.64 0.19 255);
   --success: oklch(0.72 0.17 150);
+  --warning: oklch(0.78 0.15 70);
   --sidebar: oklch(0.2 0.012 265);
   --sidebar-foreground: oklch(0.95 0 0);
   --sidebar-primary: oklch(0.64 0.19 255);
@@ -86,6 +97,7 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-success: var(--success);
+  --color-warning: var(--warning);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -99,6 +111,11 @@
   --color-sidebar-ring: var(--sidebar-ring);
 }
 
+@theme inline {
+  --font-sans: "Inter Tight Variable", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
@@ -106,14 +123,24 @@
   html,
   body,
   #root {
+    /* The app is a fixed window, not a scrolling page: the shell owns the
+       height and only the middle column scrolls, so the action bar and log stay
+       put instead of drifting below the fold. */
     height: 100%;
     width: 100%;
+    overflow: hidden;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply bg-background text-foreground font-sans;
     margin: 0;
-    font-family: system-ui, "Segoe UI", Roboto, sans-serif;
-    /* Long log lines / wide inputs must never push the layout sideways. */
-    overflow-x: hidden;
+    font-synthesis-weight: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Numbers that change in place (progress, counters, spinners) must not make
+     the layout jitter as digits swap width. */
+  input[type="number"],
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
   }
 }
