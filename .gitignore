@@ -3,4 +3,8 @@
 debug.log
 debug.prev.log
 
+# User-imported custom object detectors ("Import model…" in the Advanced tab
+# copies them here). Weights are large and belong to the user, not the repo.
+models/custom/
+
 __pycache__/
