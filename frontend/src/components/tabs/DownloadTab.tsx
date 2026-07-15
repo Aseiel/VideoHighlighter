@@ -1,5 +1,5 @@
 import { useState } from "react"
-import { Download, FolderOpen } from "lucide-react"
+import { Download, FolderOpen, LayoutGrid } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { NumberField } from "@/components/NumberField"
 import { pickDirectory, isTauri } from "@/lib/files"
+import { VideoPickerDialog } from "@/components/VideoPickerDialog"
 import { toast } from "sonner"
 
 export interface DownloadSettings {
@@ -33,14 +34,23 @@ interface Props {
   settings: DownloadSettings
   onChange: (s: DownloadSettings) => void
   onDownload: () => void
+  /** Download only these exact URLs, picked from the listing grid. */
+  onDownloadUrls: (urls: string[]) => void
   running: boolean
 }
 
 const fmt = (s: number) =>
   `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`
 
-export function DownloadTab({ settings, onChange, onDownload, running }: Props) {
+export function DownloadTab({
+  settings,
+  onChange,
+  onDownload,
+  onDownloadUrls,
+  running,
+}: Props) {
   const [picking, setPicking] = useState(false)
+  const [pickerOpen, setPickerOpen] = useState(false)
   const set = <K extends keyof DownloadSettings>(
     k: K,
     v: DownloadSettings[K],
@@ -136,21 +146,45 @@ export function DownloadTab({ settings, onChange, onDownload, running }: Props) 
           Add downloaded videos to the input list
         </label>
 
-        <Button
-          onClick={() => {
-            if (!settings.url.trim()) return toast.error("Enter a page URL")
-            if (!settings.saveDir.trim()) return toast.error("Choose a save folder")
-            onDownload()
-          }}
-          disabled={running}
-          className="gap-2"
-        >
-          <Download className="size-4" />
-          {running ? "Working…" : "Download Videos"}
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (!settings.url.trim()) return toast.error("Enter a page URL")
+              if (!settings.saveDir.trim())
+                return toast.error("Choose a save folder")
+              setPickerOpen(true)
+            }}
+            disabled={running}
+            className="gap-2"
+          >
+            <LayoutGrid className="size-4" /> Browse &amp; Select…
+          </Button>
+          <Button
+            onClick={() => {
+              if (!settings.url.trim()) return toast.error("Enter a page URL")
+              if (!settings.saveDir.trim())
+                return toast.error("Choose a save folder")
+              onDownload()
+            }}
+            disabled={running}
+            className="gap-2"
+          >
+            <Download className="size-4" />
+            {running ? "Working…" : "Download Videos"}
+          </Button>
+        </div>
         <p className="text-xs text-muted-foreground">
-          Progress and log output appear in the panel below. Requires yt-dlp.
+          Browse &amp; Select opens a grid of the page's videos so you can pick
+          individually. Progress and log output appear below. Requires yt-dlp.
         </p>
+
+        <VideoPickerDialog
+          open={pickerOpen}
+          onOpenChange={setPickerOpen}
+          url={settings.url}
+          onPick={onDownloadUrls}
+        />
       </CardContent>
     </Card>
   )

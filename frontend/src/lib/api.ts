@@ -149,6 +149,44 @@ export interface DownloadOptions {
   time_range_start: number
   time_range_end: number
   concurrent: number
+  /** Exact URLs from the picker; when set, no listing scrape happens. */
+  video_urls?: string[]
+}
+
+export interface ListingEntry {
+  url: string
+  title?: string
+  thumbnail_url?: string
+  duration?: string | number
+}
+
+/** Scrape a listing page into pickable entries (the Browse & Select grid). */
+export async function browseListing(
+  url: string,
+  useBrowser = "auto",
+): Promise<{ ok: boolean; entries: ListingEntry[]; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/browse-listing`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url, pattern: "auto", use_browser: useBrowser }),
+  })
+  return res.json()
+}
+
+export interface AboutInfo {
+  ok: boolean
+  version: string
+  edition: string
+  support_email: string
+  website: string
+  discord: string
+  repo: string
+  log_path: string
+}
+
+export async function getAbout(): Promise<AboutInfo> {
+  const res = await fetch(`${SIDECAR_BASE}/about`)
+  return res.json()
 }
 
 /** Scrape + download videos. Emits events on the same socket as a run. */

@@ -62,6 +62,7 @@ import { TranscriptTab } from "@/components/tabs/TranscriptTab"
 import { AdvancedTab } from "@/components/tabs/AdvancedTab"
 import { AvoidTab } from "@/components/tabs/AvoidTab"
 import { LlmChatTab } from "@/components/tabs/LlmChatTab"
+import { AboutTab } from "@/components/tabs/AboutTab"
 import {
   DownloadTab,
   DEFAULT_DOWNLOAD,
@@ -310,7 +311,8 @@ export default function App() {
     }
   }
 
-  const onDownload = async () => {
+  /** urls set = download exactly those (from the picker); otherwise scrape. */
+  const onDownload = async (urls?: string[]) => {
     await beginRun()
     const res = await startDownload({
       url: dl.url,
@@ -319,6 +321,7 @@ export default function App() {
       time_range_start: dl.rangeStart,
       time_range_end: dl.rangeEnd,
       concurrent: dl.concurrent,
+      ...(urls?.length ? { video_urls: urls } : {}),
     })
     if (!res.ok) failRun(res.error ?? "Failed to start download")
   }
@@ -477,13 +480,15 @@ export default function App() {
           <TabsTrigger value="advanced">Advanced</TabsTrigger>
           <TabsTrigger value="llm">LLM Chat</TabsTrigger>
           <TabsTrigger value="avoid">Avoid</TabsTrigger>
+          <TabsTrigger value="about">About</TabsTrigger>
         </TabsList>
 
         <TabsContent value="download" className="mt-4">
           <DownloadTab
             settings={dl}
             onChange={setDl}
-            onDownload={onDownload}
+            onDownload={() => onDownload()}
+            onDownloadUrls={(urls) => onDownload(urls)}
             running={running}
           />
         </TabsContent>
@@ -513,6 +518,9 @@ export default function App() {
             running={running}
             refreshKey={faceRefresh}
           />
+        </TabsContent>
+        <TabsContent value="about" className="mt-4">
+          <AboutTab />
         </TabsContent>
       </Tabs>
 

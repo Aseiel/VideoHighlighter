@@ -106,6 +106,7 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
                 time_range=job.get("time_range"),
                 download_full=job.get("download_full", True),
                 max_workers=job.get("concurrent", 1),
+                video_urls=job.get("video_urls"),
             )
             paths = [r.get("filepath") for r in (results or []) if r.get("filepath")]
             if cancel_evt.is_set():

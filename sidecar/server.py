@@ -466,6 +466,63 @@ class DownloadRequest(BaseModel):
     time_range_start: int = 0
     time_range_end: int = 300
     concurrent: int = 1
+    # When given (from the picker), these exact URLs are fetched and no listing
+    # scrape happens — same as the Qt picker's start_download(video_urls=...).
+    video_urls: list[str] | None = None
+
+
+class BrowseRequest(BaseModel):
+    url: str
+    pattern: str | None = "auto"
+    use_browser: str = "auto"
+
+
+@app.post("/browse-listing")
+async def browse_listing(req: BrowseRequest) -> dict:
+    """Scrape a listing page into pickable entries — the data behind the Qt
+    'Browse & Select…' thumbnail grid."""
+    if not req.url.strip().startswith(("http://", "https://")):
+        return {"ok": False, "error": "URL must start with http:// or https://",
+                "entries": []}
+    try:
+        from downloader import extract_video_entries
+
+        entries = await asyncio.to_thread(
+            extract_video_entries, req.url, req.pattern, lambda *_: None,
+            req.use_browser,
+        )
+        return {"ok": True, "entries": entries or []}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc), "entries": []}
+
+
+@app.get("/about")
+async def about() -> dict:
+    """Version/links for the About panel (mirrors _build_about_tab)."""
+    try:
+        from version import __version__, __edition__
+
+        return {
+            "ok": True,
+            "version": __version__,
+            "edition": __edition__,
+            "support_email": "przkreft@gmail.com",
+            "website": "https://videohighlighter.com",
+            "discord": "https://discord.gg/cUPJqPAMmm",
+            "repo": "https://github.com/Aseiel/VideoHighlighter",
+            "log_path": _debug_log_path(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+def _debug_log_path() -> str:
+    try:
+        from modules import debug_console
+
+        return debug_console.log_file_path()
+    except Exception:
+        return ""
 
 
 @app.post("/download")
@@ -486,6 +543,7 @@ async def start_download(req: DownloadRequest) -> dict:
                     else (float(req.time_range_start), float(req.time_range_end))
                 ),
                 "concurrent": max(1, req.concurrent),
+                "video_urls": req.video_urls or None,
             },
             loop,
         )
