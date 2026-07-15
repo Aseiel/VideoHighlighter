@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import multiprocessing as mp
 import os
 import sys
 import threading
@@ -41,6 +42,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from sidecar import worker
 
 
 @asynccontextmanager
@@ -77,18 +80,23 @@ class RunManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.run_id: Optional[str] = None
-        self.cancel_flag = threading.Event()
-        # Set = running. Cleared = paused; the progress callback blocks on it,
-        # same gate the Qt Worker uses.
-        self.pause_event = threading.Event()
+        # Cross-process primitives, recreated per job.
+        self.cancel_flag = mp.get_context("spawn").Event()
+        # Set = running. Cleared = paused; the child's progress callback blocks
+        # on it, the same gate the Qt Worker uses.
+        self.pause_event = mp.get_context("spawn").Event()
         self.pause_event.set()
+        self.preview_flag = None
+        self.proc: Optional[mp.process.BaseProcess] = None
         self.thread: Optional[threading.Thread] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.subscribers: set["asyncio.Queue[dict]"] = set()
+        # Live detection preview. Toggleable mid-run, like the Qt checkbox.
+        self.preview_enabled = False
 
     @property
     def is_running(self) -> bool:
-        return self.thread is not None and self.thread.is_alive()
+        return self.proc is not None and self.proc.is_alive()
 
     @property
     def is_paused(self) -> bool:
@@ -130,21 +138,82 @@ class RunManager:
             # Loop is gone (server shutting down) — drop the event.
             pass
 
-    def start(self, video_paths: list[str], gui_config: dict,
-              loop: asyncio.AbstractEventLoop) -> str:
+    def start_job(self, job: dict, loop: asyncio.AbstractEventLoop) -> str:
+        """Spawn the job in a child process and pump its events to subscribers."""
         with self._lock:
             if self.is_running:
-                raise RuntimeError("A pipeline run is already in progress")
+                raise RuntimeError("A run is already in progress")
             self.run_id = uuid.uuid4().hex
-            self.cancel_flag = threading.Event()
-            self.pause_event = threading.Event()
-            self.pause_event.set()
+            job = {**job, "run_id": self.run_id}
             self.loop = loop
+
+            ctx = mp.get_context("spawn")
+            self.cancel_flag = ctx.Event()
+            self.pause_event = ctx.Event()
+            self.pause_event.set()
+            self.preview_flag = ctx.Value("b", 1 if self.preview_enabled else 0)
+
+            parent_conn, child_conn = ctx.Pipe(duplex=False)
+            self.proc = ctx.Process(
+                target=worker.run_job,
+                args=(child_conn, job, self.cancel_flag, self.pause_event,
+                      self.preview_flag),
+                daemon=True,
+            )
+            self.proc.start()
+            child_conn.close()  # parent keeps only the read end
+
             self.thread = threading.Thread(
-                target=self._run, args=(video_paths, gui_config), daemon=True
+                target=self._pump, args=(parent_conn,), daemon=True
             )
             self.thread.start()
             return self.run_id
+
+    def _pump(self, conn) -> None:
+        """Relay child events until it finishes, and notice if it dies."""
+        saw_done = False
+        try:
+            while True:
+                if not conn.poll(0.5):
+                    # No data: only bail once the child is truly gone.
+                    if self.proc is not None and not self.proc.is_alive():
+                        break
+                    continue
+                try:
+                    event = conn.recv()
+                except EOFError:
+                    break
+                if event.get("type") == "done":
+                    saw_done = True
+                self._emit(event)
+                if saw_done:
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if self.proc is not None:
+                self.proc.join(timeout=5)
+            # A child that vanished without a `done` was killed or crashed — most
+            # likely torch's native runtime faulting on teardown. Report it rather
+            # than leaving the UI stuck on "running".
+            if not saw_done:
+                code = self.proc.exitcode if self.proc else None
+                if self.cancel_flag.is_set():
+                    self._emit({"type": "cancelled"})
+                else:
+                    self._emit({
+                        "type": "error",
+                        "message": (
+                            f"The processing engine stopped unexpectedly "
+                            f"(exit code {code}). The run was not completed."
+                        ),
+                    })
+                self._emit({"type": "done"})
+            self.proc = None
 
     def cancel(self) -> bool:
         if self.is_running:
@@ -155,44 +224,10 @@ class RunManager:
             return True
         return False
 
-    def _run(self, video_paths: list[str], gui_config: dict) -> None:
-        # Import lazily: keeps server import cheap and defers the heavy ML import
-        # cost until an actual run starts.
-        from pipeline import run_highlighter
-
-        def log_fn(msg: Any) -> None:
-            self._emit({"type": "log", "message": str(msg)})
-
-        def progress_fn(cur: int, tot: int, task: str, det: str = "") -> None:
-            # Blocks the worker thread while paused, then drops the update if a
-            # cancel landed meanwhile — mirrors main.py's pausing_progress.
-            self.pause_event.wait()
-            if self.cancel_flag.is_set():
-                return
-            self._emit({
-                "type": "progress",
-                "current": cur, "total": tot, "task": task, "detail": det,
-            })
-
-        try:
-            self._emit({"type": "started", "run_id": self.run_id})
-            output = run_highlighter(
-                video_paths if len(video_paths) > 1 else video_paths[0],
-                gui_config=gui_config,
-                log_fn=log_fn,
-                progress_fn=progress_fn,
-                cancel_flag=self.cancel_flag,
-                preview_fn=None,  # live preview stays in the native Qt editor
-            )
-            if self.cancel_flag.is_set():
-                self._emit({"type": "cancelled"})
-            else:
-                self._emit({"type": "finished", "output": output or ""})
-        except Exception as exc:  # noqa: BLE001 — surface everything to the UI
-            self._emit({"type": "error", "message": str(exc),
-                        "traceback": traceback.format_exc()})
-        finally:
-            self._emit({"type": "done"})
+    def set_preview(self, enabled: bool) -> None:
+        self.preview_enabled = enabled
+        if self.preview_flag is not None:
+            self.preview_flag.value = 1 if enabled else 0
 
 
 manager = RunManager()
@@ -211,6 +246,17 @@ async def health() -> dict:
         "paused": manager.is_paused,
         "run_id": manager.run_id,
     }
+
+
+class PreviewRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/preview")
+async def set_preview(req: PreviewRequest) -> dict:
+    """Toggle the live detection preview. Takes effect mid-run."""
+    manager.set_preview(req.enabled)
+    return {"ok": True, "enabled": manager.preview_enabled}
 
 
 @app.post("/pause")
@@ -247,7 +293,11 @@ async def start_run(req: RunRequest) -> dict:
         return {"ok": False, "error": f"Video file(s) not found: {missing}"}
     try:
         loop = asyncio.get_running_loop()
-        run_id = manager.start(list(req.video_paths), dict(req.config), loop)
+        run_id = manager.start_job(
+            {"kind": "run", "video_paths": list(req.video_paths),
+             "config": dict(req.config)},
+            loop,
+        )
         return {"ok": True, "run_id": run_id}
     except RuntimeError as exc:
         return {"ok": False, "error": str(exc)}
@@ -418,62 +468,30 @@ class DownloadRequest(BaseModel):
     concurrent: int = 1
 
 
-def _run_download(req: DownloadRequest) -> None:
-    from downloader import download_videos_with_immediate_processing
-
-    def log_fn(msg: Any) -> None:
-        manager._emit({"type": "log", "message": str(msg)})
-
-    def progress_fn(cur: int, tot: int, task: str = "Download", det: str = "") -> None:
-        manager._emit({
-            "type": "progress",
-            "current": cur, "total": tot, "task": task, "detail": det,
-        })
-
-    try:
-        manager._emit({"type": "started", "run_id": manager.run_id})
-        results = download_videos_with_immediate_processing(
-            search_url=req.url,
-            save_dir=req.save_dir,
-            pattern=req.pattern or "auto",
-            log_fn=log_fn,
-            progress_fn=progress_fn,
-            cancel_flag=manager.cancel_flag,
-            time_range=(
-                None if req.download_full
-                else (float(req.time_range_start), float(req.time_range_end))
-            ),
-            download_full=req.download_full,
-            max_workers=max(1, req.concurrent),
-        )
-        paths = [r.get("filepath") for r in (results or []) if r.get("filepath")]
-        if manager.cancel_flag.is_set():
-            manager._emit({"type": "cancelled"})
-        else:
-            manager._emit({"type": "downloaded", "paths": paths})
-            manager._emit({"type": "finished", "output": f"{len(paths)} file(s)"})
-    except Exception as exc:  # noqa: BLE001
-        manager._emit({"type": "error", "message": str(exc),
-                       "traceback": traceback.format_exc()})
-    finally:
-        manager._emit({"type": "done"})
-
-
 @app.post("/download")
 async def start_download(req: DownloadRequest) -> dict:
     if not req.url.strip():
         return {"ok": False, "error": "No URL provided"}
-    if manager.is_running:
-        return {"ok": False, "error": "A run is already in progress"}
     try:
-        manager.loop = asyncio.get_running_loop()
-        manager.run_id = uuid.uuid4().hex
-        manager.cancel_flag = threading.Event()
-        manager.thread = threading.Thread(
-            target=_run_download, args=(req,), daemon=True
+        loop = asyncio.get_running_loop()
+        run_id = manager.start_job(
+            {
+                "kind": "download",
+                "url": req.url,
+                "save_dir": req.save_dir,
+                "pattern": req.pattern,
+                "download_full": req.download_full,
+                "time_range": (
+                    None if req.download_full
+                    else (float(req.time_range_start), float(req.time_range_end))
+                ),
+                "concurrent": max(1, req.concurrent),
+            },
+            loop,
         )
-        manager.thread.start()
-        return {"ok": True, "run_id": manager.run_id}
+        return {"ok": True, "run_id": run_id}
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
 
@@ -683,43 +701,16 @@ async def scan_faces(req: ScanRequest) -> dict:
     step reuses this work instead of re-running recognition."""
     if not os.path.exists(req.video_path):
         return {"ok": False, "error": "video not found"}
-    if manager.is_running:
-        return {"ok": False, "error": "A run is already in progress"}
     try:
-        manager.loop = asyncio.get_running_loop()
-        manager.run_id = uuid.uuid4().hex
-        manager.cancel_flag = threading.Event()
-        manager.pause_event = threading.Event()
-        manager.pause_event.set()
-
-        def _scan() -> None:
-            def log_fn(msg: Any) -> None:
-                manager._emit({"type": "log", "message": str(msg)})
-
-            try:
-                manager._emit({"type": "started", "run_id": manager.run_id})
-                from video_ai_editor.face_identity import FaceIdentityBank
-                from modules.compute_forbidden import build_tracking_model, tag_entries
-
-                bank = FaceIdentityBank(db_path=FACE_DB_PATH)
-                yolo_model = build_tracking_model("n")
-                tag_entries(
-                    req.video_path, bank, yolo_model, model_size="n",
-                    face_every=15, vid_stride=3, save_bank=True, log_fn=log_fn,
-                )
-                manager._emit({"type": "faces_scanned",
-                               "count": len(bank.all_identities())})
-                manager._emit({"type": "finished",
-                               "output": f"{len(bank.all_identities())} identities"})
-            except Exception as exc:  # noqa: BLE001
-                manager._emit({"type": "error", "message": str(exc),
-                               "traceback": traceback.format_exc()})
-            finally:
-                manager._emit({"type": "done"})
-
-        manager.thread = threading.Thread(target=_scan, daemon=True)
-        manager.thread.start()
-        return {"ok": True, "run_id": manager.run_id}
+        loop = asyncio.get_running_loop()
+        run_id = manager.start_job(
+            {"kind": "scan_faces", "video_path": req.video_path,
+             "face_db_path": FACE_DB_PATH},
+            loop,
+        )
+        return {"ok": True, "run_id": run_id}
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
 
@@ -876,4 +867,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Required before any spawn on Windows / frozen builds: without it the child
+    # re-executes the server instead of the worker entry point.
+    mp.freeze_support()
     main()

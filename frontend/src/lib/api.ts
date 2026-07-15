@@ -15,6 +15,12 @@ export type RunEvent =
   | { type: "finished"; output: string }
   | { type: "downloaded"; paths: string[] }
   | { type: "faces_scanned"; count: number }
+  | {
+      type: "preview"
+      jpeg: string
+      boxes: { name: string; x: number; y: number; w: number; h: number; conf: number }[]
+      sec: number
+    }
   | { type: "cancelled" }
   | { type: "error"; message: string; traceback?: string }
   | { type: "done" }
@@ -24,6 +30,16 @@ export interface HealthResponse {
   running: boolean
   paused: boolean
   run_id: string | null
+}
+
+/** Toggle the live detection preview stream; takes effect mid-run. */
+export async function setPreview(enabled: boolean): Promise<{ ok: boolean }> {
+  const res = await fetch(`${SIDECAR_BASE}/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  })
+  return res.json()
 }
 
 export async function pauseRun(): Promise<{ ok: boolean }> {

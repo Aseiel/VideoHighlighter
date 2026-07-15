@@ -14,6 +14,7 @@ import {
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Progress } from "@/components/ui/progress"
@@ -50,6 +51,12 @@ import {
   type RunEvent,
 } from "@/lib/api"
 import { TimeRange, DEFAULT_TIME_RANGE, type TimeRangeState } from "@/components/TimeRange"
+import {
+  DetectionPreview,
+  MAX_FRAMES,
+  type PreviewFrame,
+} from "@/components/DetectionPreview"
+import { setPreview } from "@/lib/api"
 import { BasicTab } from "@/components/tabs/BasicTab"
 import { TranscriptTab } from "@/components/tabs/TranscriptTab"
 import { AdvancedTab } from "@/components/tabs/AdvancedTab"
@@ -84,6 +91,8 @@ export default function App() {
   const [sessionCount, setSessionCount] = useState(0)
   const [faceRefresh, setFaceRefresh] = useState(0)
   const [loaded, setLoaded] = useState(false)
+  const [livePreview, setLivePreview] = useState(false)
+  const [frames, setFrames] = useState<PreviewFrame[]>([])
   const wsRef = useRef<WebSocket | null>(null)
   const logEndRef = useRef<HTMLDivElement | null>(null)
   // Read inside WS callbacks, which close over the mount-time value otherwise.
@@ -195,6 +204,11 @@ export default function App() {
     void getStats().then((r) => r.ok && setAnalyzed(r.analyzed))
   }, [sessionCount])
 
+  // Preview toggle applies mid-run, matching the Qt checkbox.
+  useEffect(() => {
+    void setPreview(livePreview)
+  }, [livePreview])
+
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [log])
@@ -224,6 +238,12 @@ export default function App() {
         appendLog(`👤 Found ${e.count} identities`, "ok")
         setFaceRefresh((n) => n + 1)
         break
+      case "preview":
+        setFrames((f) => {
+          const next = [...f, { jpeg: e.jpeg, boxes: e.boxes, sec: e.sec }]
+          return next.length > MAX_FRAMES ? next.slice(-MAX_FRAMES) : next
+        })
+        break
       case "finished":
         appendLog(`✔ Finished: ${e.output || "(no output)"}`, "ok")
         setSessionCount((n) => n + 1)
@@ -249,6 +269,7 @@ export default function App() {
   /** Open the events socket and give it a tick to connect before work starts. */
   const beginRun = async () => {
     setLog([])
+    setFrames([])
     setProgress(0)
     setRunning(true)
     wsRef.current = openEventSocket(handleEvent)
@@ -432,6 +453,20 @@ export default function App() {
       </Card>
 
       <TimeRange state={timeRange} onChange={setTimeRange} duration={duration} />
+
+      <label className="flex items-center gap-2 text-sm">
+        <Checkbox
+          checked={livePreview}
+          onCheckedChange={(v) => setLivePreview(Boolean(v))}
+        />
+        Live detection preview
+        <span className="text-xs text-muted-foreground">
+          — shows frames + detected boxes while the pipeline runs. Needs Force
+          reprocess on an already-cached video, since detection is skipped otherwise.
+        </span>
+      </label>
+
+      {livePreview && <DetectionPreview frames={frames} />}
 
       {/* Tabs */}
       <Tabs defaultValue="basic" className="min-w-0">
