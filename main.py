@@ -4372,6 +4372,21 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    # `--timeline <video>` opens just the Signal Timeline viewer for one video
+    # instead of the full GUI. The packaged build is a single exe, so this is how
+    # another process (the web UI's sidecar) asks for the viewer — without it,
+    # the only way in was to launch the whole application.
+    if "--timeline" in sys.argv:
+        idx = sys.argv.index("--timeline")
+        video = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else ""
+        if not video or not os.path.exists(video):
+            print(f"--timeline needs an existing video path (got {video!r})")
+            _hard_exit(2)
+        from signal_timeline_viewer import SignalTimelineWindow
+        win = SignalTimelineWindow(video)
+        win.show()
+        _hard_exit(app.exec())
+
     # Reopen the live debug-log window if it was on last session (needs the
     # QApplication, hence here and not earlier).
     debug_console.restore_console_preference()

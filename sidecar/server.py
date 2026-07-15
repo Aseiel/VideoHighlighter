@@ -955,18 +955,18 @@ async def open_editor(req: EditorRequest) -> dict:
 
     try:
         if getattr(_sys, "frozen", False):
-            # The packaged Qt exe is main.py, which ignores argv entirely — there
-            # is no way to ask it for just the viewer yet. Say so rather than
-            # launching the whole application and calling it a Timeline Viewer.
-            return {
-                "ok": False,
-                "error": ("The Timeline Viewer isn't available in the packaged "
-                          "build yet. Run from source to use it."),
-            }
-        viewer = os.path.join(_ROOT, "signal_timeline_viewer.py")
-        if not os.path.exists(viewer):
-            return {"ok": False, "error": "signal_timeline_viewer.py not found"}
-        cmd = [_sys.executable, viewer, req.video_path]
+            # The packaged Qt app is a single exe; `--timeline <video>` asks it
+            # for just the viewer rather than the whole GUI (see main.py).
+            exe = os.path.join(os.path.dirname(_sys.executable),
+                               "VideoHighlighter.exe")
+            if not os.path.exists(exe):
+                return {"ok": False, "error": "Qt app executable not found"}
+            cmd = [exe, "--timeline", req.video_path]
+        else:
+            viewer = os.path.join(_ROOT, "signal_timeline_viewer.py")
+            if not os.path.exists(viewer):
+                return {"ok": False, "error": "signal_timeline_viewer.py not found"}
+            cmd = [_sys.executable, viewer, req.video_path]
 
         # Detach: the viewer must outlive this request, and on Windows a child
         # sharing our console would die with us.
