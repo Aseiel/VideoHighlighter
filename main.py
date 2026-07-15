@@ -1401,6 +1401,11 @@ class VideoHighlighterGUI(QWidget):
         self.yolo_type_combo = QComboBox()
         self.yolo_type_combo.addItem("Standard YOLO (80 objects)", "standard")
         self.yolo_type_combo.addItem("Custom (my trained model)", "custom")
+        self.yolo_type_combo.addItem("Mixed (standard YOLO + my model)", "custom_mixed")
+        self.yolo_type_combo.setToolTip(
+            "Standard — the 80 COCO objects\n"
+            "Custom — only the model you trained\n"
+            "Mixed — both detectors, results merged")
 
         # Pro v1 keeps pose/keypoints disabled until a permissive backend lands.
         self._custom_pose_model = None
@@ -1450,7 +1455,10 @@ class VideoHighlighterGUI(QWidget):
             self.yolo_model_combo.blockSignals(True)
             self.yolo_model_combo.clear()
 
+            # Mixed still runs the standard detector, so the size stays live;
+            # only custom-only makes it moot.
             custom_only = (yolo_type == "custom")
+            use_custom = "custom" in yolo_type
 
             if custom_only:
                 # Size applies to the standard detector, which isn't used here
@@ -1469,8 +1477,8 @@ class VideoHighlighterGUI(QWidget):
                 self.yolo_model_combo.setCurrentIndex(restore_idx)
             self.yolo_model_combo.blockSignals(False)
 
-            # Only expose the custom-model picker in custom mode.
-            self.custom_obj_model_widget.setVisible(custom_only)
+            # Expose the custom-model picker in custom and mixed modes.
+            self.custom_obj_model_widget.setVisible(use_custom)
 
         self.yolo_type_combo.currentIndexChanged.connect(on_yolo_type_changed)
 
@@ -1490,9 +1498,9 @@ class VideoHighlighterGUI(QWidget):
         object_layout.addRow("Detector model size:", self.yolo_model_combo)
         object_layout.addRow("Custom model:", self.custom_obj_model_widget)
         object_layout.addRow("Confidence threshold:", self.obj_confidence_spin)
-        # Reflect the initial detector type (hide picker unless custom).
+        # Reflect the initial detector type (hide picker unless custom/mixed).
         self.custom_obj_model_widget.setVisible(
-            (self.yolo_type_combo.currentData() or "standard") == "custom")
+            "custom" in (self.yolo_type_combo.currentData() or "standard"))
 
         object_box.setLayout(object_layout)
         advanced_layout.addWidget(object_box, 1, 0)
@@ -3136,6 +3144,23 @@ class VideoHighlighterGUI(QWidget):
                 self.append_log(f"❌ Failed to load labels from {filepath}: {e}")
                 return []
 
+    def custom_object_class_names(self):
+        """Class names of the selected custom object detector, read from the
+        model's own metadata. Empty for keypoint/pose models and when no model
+        is chosen — callers fall back to the pose sidecars."""
+        path = getattr(self, "_custom_object_model", "") or ""
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            from ultralytics import YOLO
+            model = YOLO(str(path))
+            if getattr(model, "task", "") != "detect":
+                return []
+            return [str(n) for n in model.names.values()]
+        except Exception as e:
+            self.append_log(f"⚠️ Could not read classes from custom model: {e}")
+            return []
+
     def open_object_label_selector(self):
         """Open label selector. For the custom model this offers your trained
         class names; for 'mixed' it merges those with the COCO objects;
@@ -3144,13 +3169,17 @@ class VideoHighlighterGUI(QWidget):
 
         labels = []
         if "custom" in yolo_type:
-            try:
-                from modules.app_paths import custom_keypoint_names
-                labels = custom_keypoint_names()
-            except Exception:
-                labels = []
+            # A custom *detector* carries its class names in the model itself;
+            # only fall back to the pose sidecars when it's a keypoint model.
+            labels = self.custom_object_class_names()
             if not labels:
-                self.append_log("⚠️ No custom keypoint names found (train a model / check labels).")
+                try:
+                    from modules.app_paths import custom_keypoint_names
+                    labels = custom_keypoint_names()
+                except Exception:
+                    labels = []
+            if not labels:
+                self.append_log("⚠️ No custom class names found (choose a model / check labels).")
 
         if yolo_type != "custom":  # standard or mixed -> include COCO objects
             if os.path.exists(YOLO_OBJECTS_LABELS_FILE):
@@ -3161,7 +3190,9 @@ class VideoHighlighterGUI(QWidget):
             return
 
         current = [s.strip() for s in self.objects_input.text().split(",") if s.strip()]
-        title = "Select Labels (Custom keypoints)" if "custom" in yolo_type else "Select Object Labels (YOLO)"
+        title = ("Select Object Labels (custom + YOLO)" if yolo_type == "custom_mixed"
+                 else "Select Labels (custom model)" if yolo_type == "custom"
+                 else "Select Object Labels (YOLO)")
         dlg = LabelSelectorDialog(title, labels, current, self)
         if dlg.exec() == QDialog.Accepted:
             selected = dlg.get_selected_labels()
