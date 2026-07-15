@@ -144,7 +144,11 @@ class _VisualSearchWorker(QObject):
         self.mode = mode
         self.top_k = top_k
         self.clip_device = clip_device
-        self._clip = None  # lazily created ClipFramePrefilter
+        self._clip = None  # lazily created ClipEmbedder
+        self._clip_labels = None      # embedded [positive, *negatives] for this query
+        self._clip_memo = None        # ClipFrameIndex: frame embeddings, reused across scans
+        self._clip_memo_path = None
+        self._clip_memo_added = 0     # frames encoded this scan (vs served from memo)
         # Content-aware sampling: skip a frame when its mean per-pixel change from
         # the last *analyzed* frame is below this (0-255 scale). 0 disables it.
         # Higher = skip more aggressively. This only avoids redundant ~3s vision
@@ -324,6 +328,7 @@ class _VisualSearchWorker(QObject):
         import time
         try:
             from .clip_prefilter import ClipFramePrefilter
+            from .clip_index import ClipEmbedder
         except Exception as e:
             self.error.emit(f"CLIP prefilter import failed: {e}")
             return None
@@ -335,41 +340,150 @@ class _VisualSearchWorker(QObject):
         if self._clip is None:
             self.progress.emit(0, 1, self.start_time,
                                "Loading CLIP on GPU (first run downloads the model)...")
-            self._clip = ClipFramePrefilter(device=self.clip_device)
+            self._clip = ClipEmbedder(device=self.clip_device)
             self._clip.load()
         self._clip.set_query(self.target)
 
-        num = min(int(self.analyzer.duration / self.interval) + 1, self.max_seeks)
-        timestamps = [self.start_time + i * self.interval for i in range(num)
-                      if self.start_time + i * self.interval <= self.analyzer.duration + 0.1]
+        # Embed the query once, then score frames by dot product against it.
+        # The frames themselves are memoised across scans (see _clip_memo), so a
+        # reworded search re-encodes nothing it has already seen.
+        self._clip_labels = self._clip.embed_query_labels()
+        self._open_clip_memo()
 
-        scored, buf_f, buf_t = [], [], []
+        timestamps = self._clip_timestamps()
+
+        scored = []
         BATCH = 16
         t0 = time.perf_counter()
-        for i, ts in enumerate(timestamps):
+
+        def grab(missing):
+            # Seeks are per-frame, so only the memo's misses cost anything.
+            pairs = []
+            for ts in missing:
+                if self._cancel_token.is_cancelled:
+                    break
+                self.analyzer.current_time = ts
+                frame = self.analyzer.seek_to_time(ts)
+                if frame is not None:
+                    pairs.append((ts, frame))
+            return pairs
+
+        for c in range(0, len(timestamps), BATCH):
             if self._cancel_token.is_cancelled:
                 break
-            self.analyzer.current_time = ts
-            frame = self.analyzer.seek_to_time(ts)
-            if frame is None:
-                continue
-            buf_f.append(frame)
-            buf_t.append(ts)
-            if len(buf_f) >= BATCH:
-                for t, s in zip(buf_t, self._clip.score_frames_bgr(buf_f)):
-                    scored.append((t, s))
-                buf_f, buf_t = [], []
-            if i % 10 == 0:
-                self.progress.emit(i + 1, len(timestamps), ts, f"CLIP scan {ts:.0f}s")
-        if buf_f and not self._cancel_token.is_cancelled:
-            for t, s in zip(buf_t, self._clip.score_frames_bgr(buf_f)):
-                scored.append((t, s))
+            chunk = timestamps[c:c + BATCH]
+            batch, _ = self._embed_and_score(chunk, grab)
+            for ts in chunk:
+                if ts in batch:
+                    scored.append((ts, batch[ts]))
+            self.progress.emit(min(c + BATCH, len(timestamps)), len(timestamps),
+                               chunk[-1], f"CLIP scan {chunk[-1]:.0f}s")
 
         elapsed = time.perf_counter() - t0
+        encoded = self._clip_memo_added
         print(f"\nCLIP scan: {len(scored)} frames in {elapsed:.1f}s "
-              f"({elapsed/max(1,len(scored))*1000:.1f} ms/frame) on {self._clip.device}")
+              f"({elapsed/max(1,len(scored))*1000:.1f} ms/frame) on {self._clip.device} "
+              f"— {len(scored) - encoded} from memo, {encoded} newly encoded")
+        self._save_clip_memo()
         scored.sort(key=lambda x: -x[1])
         return scored
+
+    # -- embedding memo ---------------------------------------------------
+
+    def _clip_timestamps(self):
+        """Sample on a fixed lattice: multiples of `interval` measured from zero,
+        starting at the first one at/after start_time.
+
+        NOT `start_time + i*interval`. start_time follows wherever the user last
+        clicked the timeline, so that grid shifts by a fractional offset every
+        search — 12.37, 12.87, ... shares no timestamp with 0.0, 0.5, ... The
+        memo is keyed by timestamp, so it would hit nothing and re-encode the
+        whole video every time. A lattice also means a coarser interval reuses a
+        finer interval's frames, since its timestamps are a subset.
+        """
+        import math
+
+        step = self.interval
+        if step <= 0:
+            return []
+        first = int(math.ceil((self.start_time - 1e-6) / step))
+        limit = self.analyzer.duration + 0.1
+        out = []
+        for i in range(first, first + self.max_seeks):
+            # Round at the source so keys are exact, not float-drifted.
+            ts = round(i * step, 3)
+            if ts > limit:
+                break
+            out.append(ts)
+        return out
+
+    def _open_clip_memo(self):
+        """Load this video's embedding memo (or start an empty one).
+
+        Keyed per timestamp, not per scan: a cancelled search still banks what
+        it encoded, and the next query pays only for gaps.
+        """
+        from .clip_index import open_memo
+
+        self._clip_memo_added = 0     # per scan, not cumulative
+        if self._clip_memo is not None:
+            return
+        try:
+            self._clip_memo, self._clip_memo_path = open_memo(
+                self.analyzer.video_path, self._clip.model_id,
+            )
+        except Exception as e:
+            # A memo is an optimisation; never let it break search.
+            print(f"⚠️  CLIP memo unavailable ({e}); scanning without it")
+            self._clip_memo, self._clip_memo_path = None, None
+
+    def _save_clip_memo(self):
+        # `is None`, not truthiness: ClipFrameIndex has __len__, so an empty
+        # memo is falsy even though it's a perfectly good object.
+        if (self._clip_memo is None or self._clip_memo_path is None
+                or not self._clip_memo_added):
+            return
+        try:
+            self._clip_memo.save(self._clip_memo_path)
+            print(f"🧠 CLIP memo: saved {len(self._clip_memo)} frames")
+        except Exception as e:
+            print(f"⚠️  CLIP memo: could not save ({e})")
+
+    def _embed_and_score(self, timestamps, grab):
+        """Score `timestamps`, encoding only the ones the memo doesn't hold.
+
+        `grab(missing)` returns [(ts, frame_bgr)] for the timestamps it could
+        decode, or None if its extraction path is unusable. Returns
+        (scores_by_ts, grab_failed).
+        """
+        from .clip_index import score_embeddings
+
+        memo = self._clip_memo
+        if memo is None:      # memo unavailable: encode everything, cache nothing
+            pairs = grab(list(timestamps))
+            if pairs is None:
+                return {}, True
+            if not pairs:
+                return {}, False
+            embs = self._clip.embed_frames_bgr([f for _, f in pairs])
+            scores = score_embeddings(embs, self._clip_labels, self._clip.logit_scale)
+            return {ts: float(s) for (ts, _), s in zip(pairs, scores)}, False
+
+        _, _, missing = memo.lookup(timestamps)
+        if missing:
+            pairs = grab(missing)
+            if pairs is None:
+                return {}, True
+            if pairs:
+                embs = self._clip.embed_frames_bgr([f for _, f in pairs])
+                self._clip_memo_added += memo.extend([ts for ts, _ in pairs], embs)
+
+        rows, positions, _ = memo.lookup(timestamps)
+        if not rows:
+            return {}, False
+        scores = score_embeddings(memo.embeddings[rows], self._clip_labels,
+                                  self._clip.logit_scale)
+        return {timestamps[p]: float(s) for p, s in zip(positions, scores)}, False
 
     def _run_clip(self):
         """CLIP-only: return the top_k frames ranked by similarity (no VLM)."""
