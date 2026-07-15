@@ -1973,9 +1973,6 @@ class VideoHighlighterGUI(QWidget):
         # Initialize the UI state
         self.on_download_full_toggle(self.download_full_chk.isChecked())
 
-        # Setup auto-complete for label inputs
-        self.setup_label_completers()
-
     # --- About / Contact tab ---
     def _build_about_tab(self):
         """A read-only About & Contact panel: version, support links, licensing."""
@@ -3307,19 +3304,22 @@ class VideoHighlighterGUI(QWidget):
                 completer.setMaxVisibleItems(10)
                 self.objects_input.setCompleter(completer)
 
-        self.update_actions_completer()
-        self.action_backend_combo.currentIndexChanged.connect(self.update_actions_completer)
-
     def update_actions_completer(self):
-        """Update actions auto-complete labels based on selected backend and action models."""
-        self.actions_input.setCompleter(None)
+        """Update actions auto-complete labels based on selected backend and action models.
 
+        Called from several places that can fire in one cascade (a backend change
+        repopulates the model combo, which re-emits currentIndexChanged), so it
+        no-ops when the selection resolves to the labels already installed."""
         backend = self.action_backend_combo.currentData()
         action_models = self.action_models_combo.currentData()
 
         # R3D-only always uses Kinetics-400
         if backend in ("r3d_cuda", "r3d_cpu"):
             action_models = "intel_only"
+
+        if action_models == getattr(self, "_actions_completer_models", -1):
+            return
+        self._actions_completer_models = action_models
 
         action_labels = []
         source = None
@@ -3362,8 +3362,9 @@ class VideoHighlighterGUI(QWidget):
             completer = MultiCompleter(action_labels, self)
             completer.setMaxVisibleItems(10)
             self.actions_input.setCompleter(completer)
-            if hasattr(self, 'log_output'):
-                self.append_log(f"🔤 Actions auto-complete: {source}")
+            print(f"🔤 Actions auto-complete: {source}")
+        else:
+            self.actions_input.setCompleter(None)
 
     @Slot(str)
     def append_log(self, text: str):
