@@ -270,6 +270,28 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
             if cancel_evt.is_set():
                 emit({"type": "cancelled"})
             else:
+                # Lifetime analyzed counter. main.py does this in its own
+                # pipeline_done handler, so a run driven from anywhere else --
+                # like the web UI -- never counted and the total sat at 0 no
+                # matter how many videos you processed. Same rule as
+                # main.py:4040: one per produced highlight, or 1 for a single
+                # video. A stats file that can't be written must not fail a run
+                # that already succeeded.
+                try:
+                    from modules import analysis_stats
+
+                    # Batch mode returns [(input_path, output_or_None), ...], so
+                    # count the ones that actually produced a highlight -- len()
+                    # would happily count the failures too.
+                    if isinstance(output, list):
+                        n = sum(1 for entry in output if entry and entry[1])
+                    else:
+                        n = 1 if output else 0
+                    if n:
+                        total = analysis_stats.increment_analyzed(n)
+                        log_fn(f"📈 Analyzed videos: +{n} this run — lifetime total: {total}")
+                except Exception as exc:  # noqa: BLE001
+                    log_fn(f"⚠️ could not update the analyzed counter: {exc}")
                 emit({"type": "finished", "output": output or ""})
 
         elif kind == "download":
