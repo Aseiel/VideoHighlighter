@@ -2,6 +2,7 @@
 # project root at every launch)
 debug.log
 debug.prev.log
+timeline_debug.log
 
 __pycache__/
 
