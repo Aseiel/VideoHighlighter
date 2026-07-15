@@ -834,7 +834,11 @@ class LLMChatWidget(QWidget):
 
         # Add "stop on first match" checkbox
         self.stop_on_match_cb = QCheckBox("Stop on find")
-        self.stop_on_match_cb.setChecked(True)
+        # Off by default: a full scan reports every match and, since frame
+        # embeddings are memoised, it also leaves the video fully indexed — so
+        # every later search on it is instant. Stopping early saves time once
+        # and forfeits that.
+        self.stop_on_match_cb.setChecked(False)
         self.stop_on_match_cb.setToolTip(
             "When checked, search stops and seeks to the first match.\n"
             "When unchecked, search scans entire video and reports all matches."
