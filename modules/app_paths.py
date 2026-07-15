@@ -106,6 +106,71 @@ def custom_keypoint_names():
     return []
 
 
+def object_models_dir() -> str:
+    """Managed folder for custom object detectors, auto-discovered in the
+    Advanced tab. Sits next to the executable when frozen so imported models
+    survive a restart; the project root when running from source."""
+    return os.path.join(user_data_dir(), "models", "custom")
+
+
+_OBJECT_MODEL_NAMES_CACHE: dict = {}
+
+
+def object_model_names(path: str) -> list:
+    """Class names a detector reports for itself, or [] if it is not an object
+    detector or cannot be read.
+
+    Cached per (path, mtime): this loads the model, which is slow enough that
+    re-reading it every time the combo rebuilds is noticeable.
+    """
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return []
+    if key in _OBJECT_MODEL_NAMES_CACHE:
+        return _OBJECT_MODEL_NAMES_CACHE[key]
+    names = []
+    try:
+        from ultralytics import YOLO
+        model = YOLO(str(path))
+        if getattr(model, "task", "") == "detect":
+            names = [str(n) for n in model.names.values()]
+    except Exception as e:
+        print(f"⚠️ could not read classes from {os.path.basename(path)}: {e}")
+    _OBJECT_MODEL_NAMES_CACHE[key] = names
+    return names
+
+
+def discover_object_models() -> list:
+    """List custom object detectors under models/custom/, newest first, each with
+    the class names read from the model itself.
+
+    Returns [{"path": str, "name": str, "classes": list[str]}]. Empty when the
+    folder is absent or holds no detectors — callers then offer only the standard
+    option. Keypoint/pose models are skipped: they run a different code path and
+    get their names from custom_keypoint_names().
+    """
+    import glob
+    d = object_models_dir()
+    if not os.path.isdir(d):
+        return []
+    paths = []
+    for ext in ("*.pt", "*.onnx"):
+        paths.extend(glob.glob(os.path.join(d, ext)))
+    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    out = []
+    for p in paths:
+        classes = object_model_names(p)
+        if not classes:
+            continue
+        out.append({
+            "path": p,
+            "name": os.path.splitext(os.path.basename(p))[0],
+            "classes": classes,
+        })
+    return out
+
+
 def ffmpeg_exe() -> str:
     """Resolve a usable ffmpeg executable.
 

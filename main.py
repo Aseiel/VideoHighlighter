@@ -1400,57 +1400,80 @@ class VideoHighlighterGUI(QWidget):
 
         self.yolo_type_combo = QComboBox()
         self.yolo_type_combo.addItem("Standard YOLO (80 objects)", "standard")
-        self.yolo_type_combo.addItem("Custom (my trained model)", "custom")
-        self.yolo_type_combo.addItem("Mixed (standard YOLO + my model)", "custom_mixed")
-        self.yolo_type_combo.setToolTip(
-            "Standard — the 80 COCO objects\n"
-            "Custom — only the model you trained\n"
-            "Mixed — both detectors, results merged")
 
         # Pro v1 keeps pose/keypoints disabled until a permissive backend lands.
         self._custom_pose_model = None
-        # User-selected custom object detector (.pt/.onnx), loaded natively by
-        # ultralytics. Empty = use the standard model.
-        self._custom_object_model = advanced_cfg.get("yolo_custom_model_path", "") or ""
-
-        current_type = advanced_cfg.get("yolo_type", "standard")
-        idx_type = self.yolo_type_combo.findData(current_type)
-        self.yolo_type_combo.setCurrentIndex(idx_type if idx_type >= 0 else 0)
 
         self.yolo_model_combo = QComboBox()
 
-        # Custom-model path picker (shown only when "Custom" is selected).
-        self.custom_obj_model_edit = QLineEdit()
-        self.custom_obj_model_edit.setReadOnly(True)
-        self.custom_obj_model_edit.setPlaceholderText("(no model chosen)")
-        self.custom_obj_model_edit.setText(self._custom_object_model)
-        browse_obj_btn = QPushButton("Browse…")
-        clear_obj_btn = QPushButton("Clear")
-        _custom_obj_row = QHBoxLayout()
-        _custom_obj_row.setContentsMargins(0, 0, 0, 0)
-        _custom_obj_row.addWidget(self.custom_obj_model_edit, 1)
-        _custom_obj_row.addWidget(browse_obj_btn)
-        _custom_obj_row.addWidget(clear_obj_btn)
-        self.custom_obj_model_widget = QWidget()
-        self.custom_obj_model_widget.setLayout(_custom_obj_row)
+        # Object model selector: standard COCO / Custom / Mixed, auto-discovered
+        # from models/custom/. Loaded natively by ultralytics; class names come
+        # from each model's own metadata.
+        self.object_model_combo = QComboBox()
+        self.object_model_combo.setToolTip(
+            "Standard — the 80 COCO objects\n"
+            "Custom — a model you trained (auto-detected from models/custom/)\n"
+            "Mixed — standard YOLO + your custom model together")
 
-        def _browse_custom_obj():
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Select custom object model", self._custom_object_model or "",
+        import_obj_btn = QPushButton("Import model…")
+        import_obj_btn.setToolTip("Copy a trained model (.pt / .onnx) into models/custom/")
+        obj_model_row = QHBoxLayout()
+        obj_model_row.setContentsMargins(0, 0, 0, 0)
+        obj_model_row.addWidget(self.object_model_combo, 1)
+        obj_model_row.addWidget(import_obj_btn)
+        self.object_model_widget = QWidget()
+        self.object_model_widget.setLayout(obj_model_row)
+
+        def _populate_object_models(select_type=None, select_path=""):
+            """Rebuild the combo from discovery. Each entry's data is
+            (yolo_type, path), matching what the pipeline consumes."""
+            from modules.app_paths import discover_object_models
+            self.object_model_combo.blockSignals(True)
+            self.object_model_combo.clear()
+            self.object_model_combo.addItem("Standard YOLO (80 objects)", ("standard", ""))
+            models = []
+            try:
+                models = discover_object_models()
+            except Exception as e:
+                print(f"⚠️ object model discovery failed: {e}")
+            for m in models:
+                n = len(m["classes"])
+                self.object_model_combo.addItem(
+                    f"Custom — {m['name']} ({n} classes)", ("custom", m["path"]))
+            for m in models:
+                n = len(m["classes"])
+                self.object_model_combo.addItem(
+                    f"Mixed — standard + {m['name']} (80 + {n})", ("custom_mixed", m["path"]))
+
+            # Restore selection by (type, path); fall back to standard.
+            target = (select_type or "standard", select_path or "")
+            idx = next((i for i in range(self.object_model_combo.count())
+                        if self.object_model_combo.itemData(i) == target), 0)
+            self.object_model_combo.setCurrentIndex(idx)
+            self.object_model_combo.blockSignals(False)
+
+        def _import_object_model():
+            from modules.app_paths import object_models_dir
+            src, _ = QFileDialog.getOpenFileName(
+                self, "Import object detector model", "",
                 "YOLO models (*.pt *.onnx);;All files (*)")
-            if path:
-                self._custom_object_model = path
-                self.custom_obj_model_edit.setText(path)
+            if not src:
+                return
+            dst_dir = object_models_dir()
+            try:
+                os.makedirs(dst_dir, exist_ok=True)
+                import shutil
+                dst = os.path.join(dst_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                _populate_object_models(select_type="custom", select_path=dst)
+                self.append_log(f"✅ Imported object model: {os.path.basename(dst)}")
+            except Exception as e:
+                self.append_log(f"⚠️ Object model import failed: {e}")
 
-        def _clear_custom_obj():
-            self._custom_object_model = ""
-            self.custom_obj_model_edit.clear()
+        import_obj_btn.clicked.connect(_import_object_model)
 
-        browse_obj_btn.clicked.connect(_browse_custom_obj)
-        clear_obj_btn.clicked.connect(_clear_custom_obj)
-
-        def on_yolo_type_changed(index):
-            yolo_type = self.yolo_type_combo.currentData() or "standard"
+        def on_object_model_changed(index=0):
+            yolo_type = self.object_detector_choice()[0]
             prev_size = self.yolo_model_combo.currentData()
             self.yolo_model_combo.blockSignals(True)
             self.yolo_model_combo.clear()
@@ -1458,7 +1481,6 @@ class VideoHighlighterGUI(QWidget):
             # Mixed still runs the standard detector, so the size stays live;
             # only custom-only makes it moot.
             custom_only = (yolo_type == "custom")
-            use_custom = "custom" in yolo_type
 
             if custom_only:
                 # Size applies to the standard detector, which isn't used here
@@ -1477,13 +1499,14 @@ class VideoHighlighterGUI(QWidget):
                 self.yolo_model_combo.setCurrentIndex(restore_idx)
             self.yolo_model_combo.blockSignals(False)
 
-            # Expose the custom-model picker in custom and mixed modes.
-            self.custom_obj_model_widget.setVisible(use_custom)
-
-        self.yolo_type_combo.currentIndexChanged.connect(on_yolo_type_changed)
+        _populate_object_models(
+            select_type=advanced_cfg.get("yolo_type", "standard"),
+            select_path=advanced_cfg.get("yolo_custom_model_path", "") or "",
+        )
+        self.object_model_combo.currentIndexChanged.connect(on_object_model_changed)
 
         current_model = advanced_cfg.get("yolo_model_size", "n")
-        on_yolo_type_changed(0)
+        on_object_model_changed()
         idx = self.yolo_model_combo.findData(current_model)
         self.yolo_model_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
@@ -1496,11 +1519,8 @@ class VideoHighlighterGUI(QWidget):
         object_layout.addRow("Frame skip:", self.obj_frame_skip_spin)
         object_layout.addRow("Detector type:", self.yolo_type_combo)
         object_layout.addRow("Detector model size:", self.yolo_model_combo)
-        object_layout.addRow("Custom model:", self.custom_obj_model_widget)
+        object_layout.addRow("Object model:", self.object_model_widget)
         object_layout.addRow("Confidence threshold:", self.obj_confidence_spin)
-        # Reflect the initial detector type (hide picker unless custom/mixed).
-        self.custom_obj_model_widget.setVisible(
-            "custom" in (self.yolo_type_combo.currentData() or "standard"))
 
         object_box.setLayout(object_layout)
         advanced_layout.addWidget(object_box, 1, 0)
@@ -2510,9 +2530,9 @@ class VideoHighlighterGUI(QWidget):
             "frame_skip": int(self.frame_skip_spin.value()),
             "vr_mode": self.vr_mode_chk.isChecked(),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
-            "yolo_type": self.yolo_type_combo.currentData(),
+            "yolo_type": self.object_detector_choice()[0],
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_custom_model_path": (getattr(self, "_custom_object_model", "") or None) or getattr(self, "_custom_pose_model", None),
+            "yolo_custom_model_path": self.object_detector_choice()[1] or getattr(self, "_custom_pose_model", None),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
@@ -3055,9 +3075,9 @@ class VideoHighlighterGUI(QWidget):
                 "vr_mode": self.vr_mode_chk.isChecked(),
                 "object_frame_skip": int(self.obj_frame_skip_spin.value()),
                 "sample_rate": int(self.sample_rate_spin.value()),
-                "yolo_type": self.yolo_type_combo.currentData(),
+                "yolo_type": self.object_detector_choice()[0],
                 "yolo_model_size": self.yolo_model_combo.currentData(),
-                "yolo_custom_model_path": getattr(self, "_custom_object_model", "") or "",
+                "yolo_custom_model_path": self.object_detector_choice()[1],
                 "action_backend": self.action_backend_combo.currentData(),
                 "r3d_model": self.r3d_model_combo.currentData(),
                 "action_models": self.action_models_combo.currentData(),
@@ -3144,28 +3164,30 @@ class VideoHighlighterGUI(QWidget):
                 self.append_log(f"❌ Failed to load labels from {filepath}: {e}")
                 return []
 
+    def object_detector_choice(self):
+        """The Advanced tab's object-model selection as (yolo_type, path) —
+        exactly the pair the pipeline consumes. ("standard", "") when nothing
+        custom is selected."""
+        data = self.object_model_combo.currentData()
+        if not data:
+            return ("standard", "")
+        return (data[0] or "standard", data[1] or "")
+
     def custom_object_class_names(self):
         """Class names of the selected custom object detector, read from the
-        model's own metadata. Empty for keypoint/pose models and when no model
-        is chosen — callers fall back to the pose sidecars."""
-        path = getattr(self, "_custom_object_model", "") or ""
+        model's own metadata. Empty for keypoint/pose models and when no custom
+        model is selected — callers fall back to the pose sidecars."""
+        path = self.object_detector_choice()[1]
         if not path or not os.path.exists(path):
             return []
-        try:
-            from ultralytics import YOLO
-            model = YOLO(str(path))
-            if getattr(model, "task", "") != "detect":
-                return []
-            return [str(n) for n in model.names.values()]
-        except Exception as e:
-            self.append_log(f"⚠️ Could not read classes from custom model: {e}")
-            return []
+        from modules.app_paths import object_model_names
+        return object_model_names(path)
 
     def open_object_label_selector(self):
         """Open label selector. For the custom model this offers your trained
         class names; for 'mixed' it merges those with the COCO objects;
         otherwise the standard YOLO objects."""
-        yolo_type = self.yolo_type_combo.currentData() or "standard"
+        yolo_type = self.object_detector_choice()[0]
 
         labels = []
         if "custom" in yolo_type:
@@ -3810,9 +3832,9 @@ class VideoHighlighterGUI(QWidget):
             "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
-            "yolo_type": self.yolo_type_combo.currentData(),
+            "yolo_type": self.object_detector_choice()[0],
             "yolo_model_size": self.yolo_model_combo.currentData(),
-            "yolo_custom_model_path": (getattr(self, "_custom_object_model", "") or None) or getattr(self, "_custom_pose_model", None),
+            "yolo_custom_model_path": self.object_detector_choice()[1] or getattr(self, "_custom_pose_model", None),
             "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
