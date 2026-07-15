@@ -17,8 +17,8 @@ const SIDECAR_PORT: &str = "8756";
 struct SidecarProcess(Mutex<Option<CommandChild>>);
 
 /// Debug builds run the engine straight from the project venv so you don't have
-/// to rebuild the PyInstaller binary on every Python change. Release builds use
-/// the bundled sidecar declared in tauri.conf.json `externalBin`.
+/// to rebuild the PyInstaller binary on every Python change. Release builds run
+/// the bundled PyInstaller build (see below).
 #[cfg(debug_assertions)]
 fn sidecar_command(app: &tauri::AppHandle) -> tauri_plugin_shell::process::Command {
     // cargo runs with CWD = src-tauri/, so the project root is two levels up.
@@ -44,12 +44,30 @@ fn sidecar_command(app: &tauri::AppHandle) -> tauri_plugin_shell::process::Comma
         .current_dir(project_root)
 }
 
+/// Release: run the PyInstaller onedir build shipped under `resources/`.
+///
+/// Not `externalBin`/`.sidecar()`, which take a single file: a onefile build of
+/// this engine unpacks ~2GB of torch/openvino to a temp dir on *every* launch,
+/// adding many seconds to startup. A onedir build is a folder, so it ships as a
+/// bundled resource and we spawn the exe inside it.
 #[cfg(not(debug_assertions))]
 fn sidecar_command(app: &tauri::AppHandle) -> tauri_plugin_shell::process::Command {
+    use tauri::path::BaseDirectory;
+    use tauri::Manager as _;
+
+    let exe = app
+        .path()
+        .resolve("vh-sidecar/vh-sidecar.exe", BaseDirectory::Resource)
+        .expect("bundled vh-sidecar missing from resources");
+    let dir = exe.parent().expect("sidecar exe has no parent").to_path_buf();
+    println!("[vh] sidecar: {}", exe.display());
     app.shell()
-        .sidecar("vh-sidecar")
-        .expect("bundled vh-sidecar binary missing")
+        .command(exe.to_string_lossy().to_string())
         .args(["--port", SIDECAR_PORT])
+        // PyInstaller resolves its bundle relative to the exe, but the engine
+        // also writes cache/ and config.yaml relative to the CWD — keep both
+        // next to the binary rather than wherever the app was launched from.
+        .current_dir(dir)
 }
 
 fn spawn_sidecar(app: &tauri::AppHandle) {

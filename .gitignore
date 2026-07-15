@@ -16,8 +16,10 @@ frontend/app-shot.png
 frontend/src-tauri/target/
 frontend/src-tauri/gen/
 
-# The PyInstaller-built sidecar binary is a build artifact, not source.
+# The PyInstaller-built sidecar is a build artifact, not source.
 frontend/src-tauri/binaries/
+dist-sidecar/
+build-sidecar/
 
 # --- Pipeline runtime artifacts ---
 # Written next to the project when a run executes: the analysis cache, the

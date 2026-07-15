@@ -1,32 +1,73 @@
-# React + TypeScript + Vite
+# Video Highlighter — web UI
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A Tauri v2 desktop app: React + shadcn/ui front end, with the existing Python
+engine running behind it as a FastAPI sidecar.
 
-Currently, two official plugins are available:
-
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```
+frontend/           Vite + React + Tailwind v4 + shadcn/ui   (this directory)
+frontend/src-tauri/ Tauri shell (WebView2); spawns and reaps the sidecar
+sidecar/server.py   FastAPI over the engine; streams log/progress on a WebSocket
+sidecar/worker.py   Runs each job in a child process (see "Why a child process")
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+The engine itself is untouched: the sidecar calls the same
+`pipeline.run_highlighter` the Qt app calls, with `log_fn` / `progress_fn` /
+`cancel_flag` routed to a socket instead of Qt signals. Heavy compute stays in
+Python, so nothing performance-sensitive crosses the webview boundary. The
+native Qt timeline viewer is still used for the video-heavy surfaces — the
+"Timeline Viewer" button launches it.
+
+## Develop
+
+```powershell
+.\dev.ps1
+```
+
+Rust on Windows needs the MSVC toolchain on PATH and `LIB` set. The default
+shell doesn't have it, so `dev.ps1` sources `vcvars64.bat` before running
+`pnpm tauri dev` — without it you get `LNK1104: cannot open file 'msvcrt.lib'`.
+
+In dev the shell runs the sidecar straight from the project venv
+(`.venv/Scripts/python.exe -m sidecar.server`), so Python changes need only a
+restart, not a rebuild. Release builds use the bundled PyInstaller output.
+
+To run the sidecar on its own (useful when debugging the API):
+
+```powershell
+..\.venv\Scripts\python.exe -m sidecar.server --port 8756
+# then http://127.0.0.1:8756/docs
+```
+
+## Build
+
+The sidecar has to be built first — `tauri.conf.json` bundles
+`dist-sidecar/vh-sidecar` as a resource.
+
+```powershell
+# from the project root
+.\.venv\Scripts\python.exe -m PyInstaller packaging/vh-sidecar.spec --noconfirm `
+  --distpath dist-sidecar --workpath build-sidecar
+
+cd frontend
+pnpm tauri build
+```
+
+CI does the same in the `build-web-windows` job of
+`.github/workflows/build-release.yaml`.
+
+### Why a resource, not `externalBin`
+
+Tauri's `externalBin` takes a single file, which would mean a PyInstaller
+*onefile* build — and that unpacks ~2GB of torch/openvino into a temp directory
+on **every** launch. The spec builds *onedir* instead; the folder ships as a
+bundled resource and the Rust shell resolves `vh-sidecar/vh-sidecar.exe` inside
+it via the path resolver.
+
+### Why a child process
+
+torch's native runtime can hard-crash the interpreter (access violation
+`0xc0000005` in `c10.dll`) when a run is cancelled mid-inference. In-process
+that would kill the HTTP server and leave the UI staring at a dead socket, so
+each job runs in a spawned child; if it dies, the parent reports
+"The processing engine stopped unexpectedly" and stays up for the next run.
+`main.py` works around the same class of problem by hard-exiting on close.

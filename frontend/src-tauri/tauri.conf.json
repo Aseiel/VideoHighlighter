@@ -35,6 +35,8 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/vh-sidecar"]
+    "resources": {
+      "../../dist-sidecar/vh-sidecar": "vh-sidecar"
+    }
   }
 }
