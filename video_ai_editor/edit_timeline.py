@@ -878,7 +878,7 @@ class EditTimelineScene(QGraphicsScene):
         self.setSceneRect(0, 0, total_width, self.clip_height + 40)
 
         # Background
-        self.addRect(self.sceneRect(), QPen(Qt.NoPen), QBrush(QColor(30, 30, 40)))
+        self.addRect(self.sceneRect(), QPen(Qt.NoPen), QBrush(QColor(30, 30, 30)))
 
         # Time ruler — now uses correct sceneRect
         self.draw_time_ruler()
@@ -891,7 +891,7 @@ class EditTimelineScene(QGraphicsScene):
                 "or use 'Add Clip' to start your edit.",
                 QFont("Arial", 11)
             )
-            hint.setDefaultTextColor(QColor(150, 160, 190))
+            hint.setDefaultTextColor(QColor(170, 170, 170))
             hint_rect = hint.boundingRect()
             hint.setPos(
                 (self.sceneRect().width() - hint_rect.width()) / 2,
@@ -1285,8 +1285,8 @@ class EditTimelineScene(QGraphicsScene):
         self._active_overlay = self.addRect(
             pos.x() - 3, pos.y() - 3,
             rect.width() + 6, rect.height() + 6,
-            QPen(QColor(80, 180, 255, 200), 3),
-            QBrush(QColor(80, 180, 255, 40))
+            QPen(QColor(47, 129, 247, 200), 3),
+            QBrush(QColor(47, 129, 247, 40))
         )
         self._active_overlay.setZValue(10)
 
