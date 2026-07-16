@@ -604,7 +604,7 @@ class VideoPreviewWindow(QMainWindow):
         """Apply dark theme styling"""
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #1a1a1a;
+                background-color: #141414;
             }
             QVideoWidget {
                 background-color: black;
@@ -631,7 +631,7 @@ class VideoPreviewWindow(QMainWindow):
                 border-radius: 4px;
             }
             QSlider::handle:horizontal {
-                background: #3a5fcd;
+                background: #2f81f7;
                 width: 18px;
                 margin: -5px 0;
                 border-radius: 9px;

@@ -102,7 +102,7 @@ class _FaceCard(QFrame):
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet("""
             QFrame {
-                background: #1a1a1a;
+                background: #141414;
                 border: 1px solid #3a3a3a;
                 border-radius: 6px;
             }

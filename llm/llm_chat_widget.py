@@ -885,7 +885,7 @@ class LLMChatWidget(QWidget):
         
         # Search progress
         self.search_progress = QLabel("")
-        self.search_progress.setStyleSheet("color:#2196F3;font-style:italic;font-size:9pt;")
+        self.search_progress.setStyleSheet("color:#2f81f7;font-style:italic;font-size:9pt;")
         settings_layout.addWidget(self.search_progress)
         
         settings_group.setLayout(settings_layout)
@@ -917,7 +917,7 @@ class LLMChatWidget(QWidget):
 
         self.send_btn = QPushButton("Send")
         self.send_btn.setStyleSheet(
-            "QPushButton{background:#2196F3;color:white;font-weight:bold;"
+            "QPushButton{background:#2f81f7;color:white;font-weight:bold;"
             "padding:8px 20px;border-radius:4px;}"
             "QPushButton:disabled{background:#555;}"
         )
@@ -1818,7 +1818,7 @@ class LLMChatWidget(QWidget):
         mmproj_path = None
 
         self.status_label.setText("Connecting...")
-        self.status_label.setStyleSheet("color:#2196F3;font-style:italic;")
+        self.status_label.setStyleSheet("color:#2f81f7;font-style:italic;")
         self.connect_btn.setEnabled(False)
         QApplication.processEvents()
 

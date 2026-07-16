@@ -106,7 +106,7 @@ class FilterDialog(QDialog):
         # Apply dark theme
         self.setStyleSheet("""
             QDialog {
-                background-color: #1a1a1a;
+                background-color: #141414;
             }
             QListWidget {
                 background-color: #2a2a2a;
@@ -119,7 +119,7 @@ class FilterDialog(QDialog):
                 border-bottom: 1px solid #333333;
             }
             QListWidget::item:selected {
-                background-color: #3a5fcd;
+                background-color: #2f81f7;
             }
             QListWidget::item:hover {
                 background-color: #3a3a3a;
@@ -298,7 +298,7 @@ class ConfidenceFilterDialog(QDialog):
         layout.addWidget(buttons)
 
         self.setStyleSheet("""
-            QDialog { background-color: #1a1a1a; }
+            QDialog { background-color: #141414; }
             QGroupBox {
                 color: #d8d8d8; border: 1px solid #3a3a3a;
                 border-radius: 6px; margin-top: 14px; padding-top: 10px;
@@ -306,7 +306,7 @@ class ConfidenceFilterDialog(QDialog):
             }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
             QSlider::groove:horizontal { height: 8px; background: #3a3a3a; border-radius: 4px; }
-            QSlider::handle:horizontal { background: #3a5fcd; width: 18px; margin: -5px 0; border-radius: 9px; }
+            QSlider::handle:horizontal { background: #2f81f7; width: 18px; margin: -5px 0; border-radius: 9px; }
             QPushButton {
                 background-color: #2a2a2a; color: white;
                 border: 1px solid #4a4a4a; padding: 6px; border-radius: 4px;

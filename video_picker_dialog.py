@@ -147,7 +147,7 @@ class VideoPickerDialog(QDialog):
         root = QVBoxLayout(self)
 
         self.status_label = QLabel("Loading listing…")
-        self.status_label.setStyleSheet("color:#2196F3;font-style:italic;")
+        self.status_label.setStyleSheet("color:#2f81f7;font-style:italic;")
         root.addWidget(self.status_label)
 
         self.scroll = QScrollArea()

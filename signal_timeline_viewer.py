@@ -483,15 +483,15 @@ class SignalTimelineWindow(QMainWindow):
         )
         self.overlay_mode_combo.setStyleSheet("""
             QComboBox {
-                background-color: #1a1a1a; color: #ddd;
+                background-color: #141414; color: #ddd;
                 border: 1px solid #3a3a3a; border-radius: 4px;
                 padding: 4px 8px; min-width: 160px;
             }
             QComboBox:hover { border-color: #5a5a5a; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView {
-                background-color: #1a1a1a; color: #ddd;
-                selection-background-color: #3a5fcd;
+                background-color: #141414; color: #ddd;
+                selection-background-color: #2f81f7;
             }
         """)
         mode_row.addWidget(self.overlay_mode_combo)
@@ -587,7 +587,7 @@ class SignalTimelineWindow(QMainWindow):
         self.play_btn.clicked.connect(self.toggle_video_playback)
         self.play_btn.setStyleSheet("""
             QPushButton {
-                background-color: #3a5fcd; color: white; font-weight: bold;
+                background-color: #2f81f7; color: white; font-weight: bold;
                 padding: 8px 16px; border-radius: 4px; min-width: 80px;
             }
             QPushButton:hover { background-color: #4a6fdd; }
@@ -606,7 +606,7 @@ class SignalTimelineWindow(QMainWindow):
         self.preview_time_label.setStyleSheet("""
             QLabel {
                 color: #a0ffa0; font-family: 'Consolas', monospace;
-                font-weight: bold; padding: 8px; background-color: #1a1a1a;
+                font-weight: bold; padding: 8px; background-color: #141414;
                 border-radius: 4px; min-width: 120px;
                 qproperty-alignment: AlignCenter;
             }
@@ -2071,7 +2071,7 @@ class SignalTimelineWindow(QMainWindow):
         self.filter_dialog_btn.clicked.connect(self.open_filter_dialog)
         self.filter_dialog_btn.setStyleSheet("""
             QPushButton {
-                background-color: #3a5fcd;
+                background-color: #2f81f7;
                 font-weight: bold;
                 padding: 8px;
             }
@@ -2487,13 +2487,13 @@ class SignalTimelineWindow(QMainWindow):
         self.transcript_toggle_btn.setCheckable(True)
         self.transcript_toggle_btn.setStyleSheet("""
             QPushButton {
-                background: #1a1a1a; color: #7a9acd;
+                background: #141414; color: #9a9a9a;
                 border: 1px solid #3a3a3a; border-radius: 3px;
                 font-size: 10px; padding: 4px 8px;
             }
             QPushButton:checked {
                 background: #222222; color: #b5b5b5;
-                border-color: #4a7fcd;
+                border-color: #2f81f7;
             }
         """)
         playback_layout.addWidget(self.transcript_toggle_btn)
@@ -2503,13 +2503,13 @@ class SignalTimelineWindow(QMainWindow):
         self.search_toggle_btn.setCheckable(True)
         self.search_toggle_btn.setStyleSheet("""
             QPushButton {
-                background: #1a1a1a; color: #7a9acd;
+                background: #141414; color: #9a9a9a;
                 border: 1px solid #3a3a3a; border-radius: 3px;
                 font-size: 10px; padding: 4px 8px;
             }
             QPushButton:checked {
                 background: #222222; color: #b5b5b5;
-                border-color: #4a7fcd;
+                border-color: #2f81f7;
             }
         """)
         playback_layout.addWidget(self.search_toggle_btn)
@@ -3792,7 +3792,7 @@ class SignalTimelineWindow(QMainWindow):
                 border: 2px solid #4a4a4a;
             }
             QCheckBox::indicator:checked {
-                background-color: #3a5fcd;
+                background-color: #2f81f7;
                 border: 2px solid #5a7fdd;
             }
             QPushButton {
@@ -3807,7 +3807,7 @@ class SignalTimelineWindow(QMainWindow):
                 background-color: #3a3a3a;
             }
             QPushButton:pressed {
-                background-color: #1a1a1a;
+                background-color: #141414;
             }
             QLabel {
                 color: #d4d4d4;
@@ -3818,7 +3818,7 @@ class SignalTimelineWindow(QMainWindow):
                 border-radius: 4px;
             }
             QSlider::handle:horizontal {
-                background: #3a5fcd;
+                background: #2f81f7;
                 width: 18px;
                 margin: -5px 0;
                 border-radius: 9px;
