@@ -1615,7 +1615,11 @@ class SignalTimelineScene(QGraphicsScene):
             remaining = {f.get('query', '').strip() for f in self.visual_findings}
             remaining.discard('')
             self.visual_queries = sorted(remaining)
-            self.visible_visual_queries = {q: True for q in self.visual_queries}
+            # Keep each survivor's show/hide state — removing one query must not
+            # silently un-hide the others. Default new/unknown queries to visible.
+            self.visible_visual_queries = {
+                q: self.visible_visual_queries.get(q, True) for q in self.visual_queries
+            }
 
         self._rebuild_group_order_for_visual()
         self.cache_data['visual_findings'] = self.visual_findings

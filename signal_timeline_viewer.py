@@ -1221,8 +1221,17 @@ class SignalTimelineWindow(QMainWindow):
                 widget.setParent(None)
         self.visual_query_checkboxes = {}
 
-        for query in getattr(scene, 'visual_queries', []) or []:
+        queries = list(getattr(scene, 'visual_queries', []) or [])
+        if queries:
+            layout.addWidget(self._build_visual_query_header())
+
+        for query in queries:
             count = len(scene.get_visual_findings(query))
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+
             checkbox = QCheckBox(f"{query} ({count})")
             checkbox.setChecked(scene.visible_visual_queries.get(query, True))
             checkbox.setToolTip(f"Show '{query}' bars, and let ◀ ▶ stop on them")
@@ -1230,10 +1239,52 @@ class SignalTimelineWindow(QMainWindow):
             checkbox.stateChanged.connect(
                 lambda state, q=query: self._toggle_visual_query(q, state)
             )
-            layout.addWidget(checkbox)
+            row_layout.addWidget(checkbox)
+            row_layout.addStretch()
+
+            remove = self._mini_button("✕", f"Remove all '{query}' findings")
+            remove.clicked.connect(lambda _=False, q=query: self._remove_visual_query(q))
+            row_layout.addWidget(remove)
+
+            layout.addWidget(row)
             self.visual_query_checkboxes[query] = checkbox
 
         self._apply_visual_query_fold()
+
+    def _mini_button(self, text: str, tooltip: str) -> QPushButton:
+        """A bare, caret-sized button — the app theme's QPushButton is too heavy
+        for an inline control (see the fold caret)."""
+        btn = QPushButton(text)
+        btn.setStyleSheet(
+            "QPushButton{border:none;background:transparent;color:#888;"
+            "padding:0px;margin:0px;font-size:9pt;}"
+            "QPushButton:hover{color:#fff;}"
+        )
+        btn.setFixedSize(18, 16)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(tooltip)
+        return btn
+
+    def _build_visual_query_header(self) -> QWidget:
+        """The 'Show: all / none' quick toggles above the object list — the fast
+        path to 'walk only this one object' (none, then tick it)."""
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 0, 0, 2)
+        hl.setSpacing(6)
+        label = QLabel("Show:")
+        label.setStyleSheet("color:#888;font-size:8pt;")
+        hl.addWidget(label)
+        all_btn = self._mini_button("all", "Show every object")
+        all_btn.setFixedSize(24, 16)
+        all_btn.clicked.connect(lambda: self._set_all_visual_queries(True))
+        hl.addWidget(all_btn)
+        none_btn = self._mini_button("none", "Hide every object")
+        none_btn.setFixedSize(30, 16)
+        none_btn.clicked.connect(lambda: self._set_all_visual_queries(False))
+        hl.addWidget(none_btn)
+        hl.addStretch()
+        return header
 
     def _apply_visual_query_fold(self):
         """Show/hide the object list, and keep the collapsed row honest.
@@ -1275,6 +1326,36 @@ class SignalTimelineWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Showing '{query}'" if visible else f"Hiding '{query}' — ◀ ▶ now skip it",
             2000,
+        )
+
+    def _set_all_visual_queries(self, visible: bool):
+        """Show or hide every object at once. One rebuild, not one per query."""
+        scene = self.signal_scene
+        for query in list(getattr(scene, 'visual_queries', []) or []):
+            scene.set_visual_query_filter(query, visible, rebuild=False)
+        scene.build_timeline()
+        self.refresh_visual_query_checkboxes()   # reflect the new state in the boxes
+        self.statusBar().showMessage(
+            "Showing all objects" if visible else "Hid all objects — ◀ ▶ have nothing to step",
+            2000,
+        )
+
+    def _remove_visual_query(self, query: str):
+        """Delete one object's findings from the timeline and the cache.
+
+        Preserves the other objects' show/hide state (see
+        SignalTimelineScene.clear_visual_findings). Re-searching '{query}'
+        brings it back.
+        """
+        scene = self.signal_scene
+        removed = len(scene.get_visual_findings(query))
+        scene.clear_visual_findings(query=query)      # rebuilds the timeline
+        if hasattr(self, 'save_visual_findings_to_cache'):
+            self.save_visual_findings_to_cache()      # else it returns on reopen
+        self.refresh_visual_query_checkboxes()
+        self.statusBar().showMessage(
+            f"Removed '{query}' ({removed} finding(s)) — re-search to bring it back",
+            3000,
         )
 
     def add_visual_findings(self, findings: list, save: bool = True):
