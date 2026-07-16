@@ -1200,6 +1200,83 @@ class SignalTimelineWindow(QMainWindow):
             print(f"Scene not ready yet, storing waveform data")
             self._pending_waveform_data = waveform_data
 
+    def refresh_visual_query_checkboxes(self):
+        """One checkbox per searched object, under the Visual Search layer.
+
+        The scene already filters both the bars and the ◀ ▶ navigation by
+        visible_visual_queries (see SignalTimelineScene._nav_timestamps_visual_search),
+        and set_visual_query_filter already drives it — this is the control that
+        was missing, which is why the arrows walked every object at once.
+        """
+        box = getattr(self, '_visual_query_box', None)
+        scene = getattr(self, 'signal_scene', None)
+        if box is None or scene is None:
+            return
+
+        layout = box.layout()
+        while layout.count():                       # drop the previous rows
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.visual_query_checkboxes = {}
+
+        for query in getattr(scene, 'visual_queries', []) or []:
+            count = len(scene.get_visual_findings(query))
+            checkbox = QCheckBox(f"{query} ({count})")
+            checkbox.setChecked(scene.visible_visual_queries.get(query, True))
+            checkbox.setToolTip(f"Show '{query}' bars, and let ◀ ▶ stop on them")
+            # setChecked above runs before this connect, so it can't fire the toggle.
+            checkbox.stateChanged.connect(
+                lambda state, q=query: self._toggle_visual_query(q, state)
+            )
+            layout.addWidget(checkbox)
+            self.visual_query_checkboxes[query] = checkbox
+
+        self._apply_visual_query_fold()
+
+    def _apply_visual_query_fold(self):
+        """Show/hide the object list, and keep the collapsed row honest.
+
+        Folding would otherwise hide the filter: with 'dog' unticked and the
+        list collapsed, ◀ ▶ silently skip it and the panel looks broken. So the
+        caret carries the count whenever anything is hidden.
+        """
+        box = getattr(self, '_visual_query_box', None)
+        fold = getattr(self, '_visual_query_fold', None)
+        if box is None or fold is None:
+            return
+        boxes = getattr(self, 'visual_query_checkboxes', {})
+        expanded = getattr(self, '_visual_queries_expanded', True)
+
+        box.setVisible(bool(boxes) and expanded)
+        fold.setVisible(bool(boxes))
+        shown = sum(1 for cb in boxes.values() if cb.isChecked())
+        total = len(boxes)
+        if expanded:
+            fold.setText("▾")
+            fold.setToolTip("Hide the object list")
+        else:
+            # Only advertise a number when it's news — "3/3" is just noise.
+            fold.setText("▸" if shown == total else f"▸ {shown}/{total}")
+            fold.setToolTip(
+                f"Show the object list ({shown} of {total} objects visible)"
+                if shown != total else "Show the object list"
+            )
+
+    def _toggle_visual_query_fold(self):
+        self._visual_queries_expanded = not getattr(self, '_visual_queries_expanded', True)
+        self._apply_visual_query_fold()
+
+    def _toggle_visual_query(self, query: str, state):
+        visible = (state == Qt.CheckState.Checked.value)
+        self.signal_scene.set_visual_query_filter(query, visible)
+        self._apply_visual_query_fold()   # the collapsed caret tracks the count
+        self.statusBar().showMessage(
+            f"Showing '{query}'" if visible else f"Hiding '{query}' — ◀ ▶ now skip it",
+            2000,
+        )
+
     def add_visual_findings(self, findings: list, save: bool = True):
             """
             Public entry point for any scanner (Visual Search panel, LLM bridge, etc.)
@@ -1225,6 +1302,7 @@ class SignalTimelineWindow(QMainWindow):
             # synchronous rebuild here would defeat the coalescing and repaint
             # the whole waveform again on every streamed hit.
             self._enable_layer('visual_search', rebuild=False)
+            self.refresh_visual_query_checkboxes()   # a new object may have appeared
             if save:
                 self.save_visual_findings_to_cache()
             if hasattr(self, 'label_panel'):
@@ -2216,14 +2294,53 @@ class SignalTimelineWindow(QMainWindow):
             checkbox.stateChanged.connect(
                 lambda state, name=layer_name: self.toggle_layer(name, state)
             )
-            layer_layout.addWidget(checkbox)
             self.layer_checkboxes[layer_name] = checkbox
+
+            if layer_name != 'visual_search':
+                layer_layout.addWidget(checkbox)
+                continue
+
+            # Visual Search owns a nested object list, so its row also carries a
+            # fold toggle. The checkbox still means "show the layer"; the caret
+            # only expands the per-object controls.
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            row_layout.addWidget(checkbox)
+            row_layout.addStretch()
+            self._visual_query_fold = QPushButton("▾")
+            # setFlat() isn't enough: the app's theme styles QPushButton with a
+            # background and padding, which turns this into a full-size button.
+            # Override it to a bare caret.
+            self._visual_query_fold.setStyleSheet(
+                "QPushButton{border:none;background:transparent;color:#888;"
+                "padding:0px;margin:0px;font-size:9pt;}"
+                "QPushButton:hover{color:#fff;}"
+            )
+            self._visual_query_fold.setFixedSize(34, 16)   # fits '▸ 2/3' without reflowing
+            self._visual_query_fold.setCursor(Qt.PointingHandCursor)
+            self._visual_query_fold.setVisible(False)   # nothing to fold until a search runs
+            self._visual_query_fold.clicked.connect(self._toggle_visual_query_fold)
+            row_layout.addWidget(self._visual_query_fold)
+            layer_layout.addWidget(row)
+
+            # One checkbox per searched object, nested under the layer.
+            # Populated after each scan — no queries exist when the UI is built.
+            self._visual_queries_expanded = True
+            self._visual_query_box = QWidget()
+            vq_layout = QVBoxLayout(self._visual_query_box)
+            vq_layout.setContentsMargins(18, 0, 0, 0)   # indent: reads as a child of the layer
+            vq_layout.setSpacing(2)
+            self._visual_query_box.setVisible(False)
+            layer_layout.addWidget(self._visual_query_box)
 
         if any_hidden:
             self.signal_scene.build_timeline()
 
         layer_group.setLayout(layer_layout)
         layout.addWidget(layer_group)
+        self.refresh_visual_query_checkboxes()
 
         # Avoid ranges — exclude a dragged-selection range from highlight selection
         avoid_group = QGroupBox("Avoid in Highlights")
