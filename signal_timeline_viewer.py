@@ -312,10 +312,7 @@ class SignalTimelineWindow(QMainWindow):
         h = min(1000, screen.height() - 20)
         self.resize(w, h)
         self.move(screen.x() + (screen.width() - w) // 2, screen.y())
-        
-        # Make window semi-transparent
-        self.setWindowOpacity(0.98)
-        
+
         # Load waveform from cache - store it in instance variable
         self.waveform = self.load_waveform_from_cache()
         debug_log(f"  - waveform loaded: {self.waveform is not None}, length: {len(self.waveform) if self.waveform else 0}")
@@ -486,14 +483,14 @@ class SignalTimelineWindow(QMainWindow):
         )
         self.overlay_mode_combo.setStyleSheet("""
             QComboBox {
-                background-color: #1a1a2a; color: #ddd;
-                border: 1px solid #3a3a5a; border-radius: 4px;
+                background-color: #1a1a1a; color: #ddd;
+                border: 1px solid #3a3a3a; border-radius: 4px;
                 padding: 4px 8px; min-width: 160px;
             }
-            QComboBox:hover { border-color: #5a5a8a; }
+            QComboBox:hover { border-color: #5a5a5a; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView {
-                background-color: #1a1a2a; color: #ddd;
+                background-color: #1a1a1a; color: #ddd;
                 selection-background-color: #3a5fcd;
             }
         """)
@@ -550,9 +547,9 @@ class SignalTimelineWindow(QMainWindow):
         self.detection_panel.setMaximumWidth(280)
         self.detection_panel.setStyleSheet("""
             QLabel {
-                background-color: #0a0a18;
-                color: #d0d8ff;
-                border: 1px solid #3a3a5a;
+                background-color: #0a0a0a;
+                color: #d4d4d4;
+                border: 1px solid #3a3a3a;
                 border-radius: 4px;
                 padding: 8px;
                 font-family: 'Consolas', monospace;
@@ -609,7 +606,7 @@ class SignalTimelineWindow(QMainWindow):
         self.preview_time_label.setStyleSheet("""
             QLabel {
                 color: #a0ffa0; font-family: 'Consolas', monospace;
-                font-weight: bold; padding: 8px; background-color: #1a1a2a;
+                font-weight: bold; padding: 8px; background-color: #1a1a1a;
                 border-radius: 4px; min-width: 120px;
                 qproperty-alignment: AlignCenter;
             }
@@ -1969,7 +1966,7 @@ class SignalTimelineWindow(QMainWindow):
         bar = QFrame()
         bar.setStyleSheet("""
             QFrame {
-                background: #1e1e2c;
+                background: #1e1e1e;
                 border-radius: 6px;
                 padding: 8px;
             }
@@ -1985,7 +1982,7 @@ class SignalTimelineWindow(QMainWindow):
         
         info_text = f"Duration: {duration_mins:02d}:{duration_secs:02d} • Actions: {action_count} • Objects: {object_count}"
         info_label = QLabel(info_text)
-        info_label.setStyleSheet("color: #c0d0ff; font-weight: bold;")
+        info_label.setStyleSheet("color: #c8c8c8; font-weight: bold;")
         
         layout.addWidget(info_label)
         layout.addStretch()
@@ -2015,7 +2012,7 @@ class SignalTimelineWindow(QMainWindow):
         if _dbg is not None:
             self.debug_log_chk = QCheckBox("Debug log")
             self.debug_log_chk.setChecked(_dbg.is_console_visible())
-            self.debug_log_chk.setStyleSheet("color: #c0d0ff;")
+            self.debug_log_chk.setStyleSheet("color: #c8c8c8;")
             self.debug_log_chk.setToolTip(
                 "Open a live window mirroring all app output\n"
                 "(recent output is replayed, so it works after an error too).\n"
@@ -2141,15 +2138,15 @@ class SignalTimelineWindow(QMainWindow):
         self.cut_mode_btn.toggled.connect(self.toggle_cut_mode)
         self.cut_mode_btn.setStyleSheet("""
             QPushButton {
-                background-color: #2a2a44;
-                color: #d0d8ff;
+                background-color: #2a2a2a;
+                color: #d4d4d4;
                 font-weight: bold;
                 padding: 8px 12px;
-                border: 1px solid #4a4a6a;
+                border: 1px solid #4a4a4a;
                 border-radius: 5px;
             }
             QPushButton:hover {
-                background-color: #3a3a5c;
+                background-color: #3a3a3a;
             }
             QPushButton:checked {
                 background-color: #7a2a1a;
@@ -2490,12 +2487,12 @@ class SignalTimelineWindow(QMainWindow):
         self.transcript_toggle_btn.setCheckable(True)
         self.transcript_toggle_btn.setStyleSheet("""
             QPushButton {
-                background: #1a1a2e; color: #7a9acd;
-                border: 1px solid #3a3a5a; border-radius: 3px;
+                background: #1a1a1a; color: #7a9acd;
+                border: 1px solid #3a3a3a; border-radius: 3px;
                 font-size: 10px; padding: 4px 8px;
             }
             QPushButton:checked {
-                background: #1a2a3f; color: #aac0ff;
+                background: #222222; color: #b5b5b5;
                 border-color: #4a7fcd;
             }
         """)
@@ -2506,12 +2503,12 @@ class SignalTimelineWindow(QMainWindow):
         self.search_toggle_btn.setCheckable(True)
         self.search_toggle_btn.setStyleSheet("""
             QPushButton {
-                background: #1a1a2e; color: #7a9acd;
-                border: 1px solid #3a3a5a; border-radius: 3px;
+                background: #1a1a1a; color: #7a9acd;
+                border: 1px solid #3a3a3a; border-radius: 3px;
                 font-size: 10px; padding: 4px 8px;
             }
             QPushButton:checked {
-                background: #1a2a3f; color: #aac0ff;
+                background: #222222; color: #b5b5b5;
                 border-color: #4a7fcd;
             }
         """)
@@ -3769,11 +3766,11 @@ class SignalTimelineWindow(QMainWindow):
         """Apply modern dark theme"""
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #0f0f18;
+                background-color: #0f0f0f;
             }
             QGroupBox {
-                color: #d0e0ff;
-                border: 1px solid #3a3a50;
+                color: #d8d8d8;
+                border: 1px solid #3a3a3a;
                 border-radius: 6px;
                 margin-top: 14px;
                 padding-top: 10px;
@@ -3785,39 +3782,39 @@ class SignalTimelineWindow(QMainWindow):
                 padding: 0 6px;
             }
             QCheckBox {
-                color: #e0e8ff;
+                color: #e4e4e4;
                 spacing: 8px;
             }
             QCheckBox::indicator {
                 width: 18px;
                 height: 18px;
                 border-radius: 3px;
-                border: 2px solid #4a4a6a;
+                border: 2px solid #4a4a4a;
             }
             QCheckBox::indicator:checked {
                 background-color: #3a5fcd;
                 border: 2px solid #5a7fdd;
             }
             QPushButton {
-                background-color: #2a2a44;
+                background-color: #2a2a2a;
                 color: white;
-                border: 1px solid #4a4a6a;
+                border: 1px solid #4a4a4a;
                 padding: 8px;
                 border-radius: 5px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #3a3a5c;
+                background-color: #3a3a3a;
             }
             QPushButton:pressed {
-                background-color: #1a1a34;
+                background-color: #1a1a1a;
             }
             QLabel {
-                color: #d0d8ff;
+                color: #d4d4d4;
             }
             QSlider::groove:horizontal {
                 height: 8px;
-                background: #3a3a5a;
+                background: #3a3a3a;
                 border-radius: 4px;
             }
             QSlider::handle:horizontal {
@@ -3827,12 +3824,12 @@ class SignalTimelineWindow(QMainWindow):
                 border-radius: 9px;
             }
             QDockWidget {
-                color: #d0e0ff;
-                border: 1px solid #3a3a50;
+                color: #d8d8d8;
+                border: 1px solid #3a3a3a;
                 border-radius: 6px;
             }
             QDockWidget::title {
-                background: #2a2a3a;
+                background: #2a2a2a;
                 padding: 6px;
                 border-radius: 4px;
             }

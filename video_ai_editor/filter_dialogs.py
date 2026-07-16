@@ -106,37 +106,37 @@ class FilterDialog(QDialog):
         # Apply dark theme
         self.setStyleSheet("""
             QDialog {
-                background-color: #1a1a2a;
+                background-color: #1a1a1a;
             }
             QListWidget {
-                background-color: #2a2a3a;
+                background-color: #2a2a2a;
                 color: #ffffff;
-                border: 1px solid #444466;
+                border: 1px solid #444444;
                 border-radius: 4px;
             }
             QListWidget::item {
                 padding: 5px;
-                border-bottom: 1px solid #333344;
+                border-bottom: 1px solid #333333;
             }
             QListWidget::item:selected {
                 background-color: #3a5fcd;
             }
             QListWidget::item:hover {
-                background-color: #3a3a5a;
+                background-color: #3a3a3a;
             }
             QLineEdit {
-                background-color: #2a2a3a;
+                background-color: #2a2a2a;
                 color: #ffffff;
-                border: 1px solid #444466;
+                border: 1px solid #444444;
                 border-radius: 4px;
                 padding: 5px;
             }
             QTabWidget::pane {
-                border: 1px solid #444466;
-                background-color: #2a2a3a;
+                border: 1px solid #444444;
+                background-color: #2a2a2a;
             }
             QTabBar::tab {
-                background-color: #3a3a5a;
+                background-color: #3a3a3a;
                 color: #cccccc;
                 padding: 8px 16px;
                 margin-right: 2px;
@@ -298,20 +298,20 @@ class ConfidenceFilterDialog(QDialog):
         layout.addWidget(buttons)
 
         self.setStyleSheet("""
-            QDialog { background-color: #1a1a2a; }
+            QDialog { background-color: #1a1a1a; }
             QGroupBox {
-                color: #d0e0ff; border: 1px solid #3a3a50;
+                color: #d8d8d8; border: 1px solid #3a3a3a;
                 border-radius: 6px; margin-top: 14px; padding-top: 10px;
                 font-weight: bold;
             }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-            QSlider::groove:horizontal { height: 8px; background: #3a3a5a; border-radius: 4px; }
+            QSlider::groove:horizontal { height: 8px; background: #3a3a3a; border-radius: 4px; }
             QSlider::handle:horizontal { background: #3a5fcd; width: 18px; margin: -5px 0; border-radius: 9px; }
             QPushButton {
-                background-color: #2a2a44; color: white;
-                border: 1px solid #4a4a6a; padding: 6px; border-radius: 4px;
+                background-color: #2a2a2a; color: white;
+                border: 1px solid #4a4a4a; padding: 6px; border-radius: 4px;
             }
-            QPushButton:hover { background-color: #3a3a5c; }
+            QPushButton:hover { background-color: #3a3a3a; }
         """)
 
     def on_slider_changed(self):

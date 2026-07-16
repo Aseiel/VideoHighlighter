@@ -407,16 +407,16 @@ class EditClipItem(QGraphicsRectItem):
         menu = QMenu()
         menu.setStyleSheet("""
             QMenu {
-                background-color: #1a1a2a;
-                color: #d0d8ff;
-                border: 1px solid #3a3a5a;
+                background-color: #1a1a1a;
+                color: #d4d4d4;
+                border: 1px solid #3a3a3a;
                 border-radius: 4px;
                 padding: 4px 0;
             }
             QMenu::item { padding: 6px 20px; border-radius: 3px; }
             QMenu::item:selected { background-color: #3a5fcd; }
-            QMenu::item:disabled { color: #555577; }
-            QMenu::separator { height: 1px; background: #3a3a5a; margin: 4px 8px; }
+            QMenu::item:disabled { color: #555555; }
+            QMenu::separator { height: 1px; background: #3a3a3a; margin: 4px 8px; }
         """)
 
         header = menu.addAction(
