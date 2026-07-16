@@ -162,7 +162,7 @@ class TranscriptPanel(QWidget):
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setStyleSheet("""
             QLineEdit {
-                background-color: #1a1a1a;
+                background-color: #141414;
                 color: #e4e4e4;
                 border: 1px solid #3a3a3a;
                 border-radius: 4px;
@@ -170,7 +170,7 @@ class TranscriptPanel(QWidget):
                 font-size: 12px;
             }
             QLineEdit:focus {
-                border-color: #4a7fcd;
+                border-color: #2f81f7;
             }
         """)
         self.search_input.returnPressed.connect(self._next_match)
@@ -221,7 +221,7 @@ class TranscriptPanel(QWidget):
                 color: #60aa60;
             }
             QPushButton:!checked {
-                background: #1a1a1a;
+                background: #141414;
                 color: #666;
                 border-color: #333;
             }
@@ -241,7 +241,7 @@ class TranscriptPanel(QWidget):
                 border-radius: 4px;
             }
             QScrollBar:vertical {
-                background: #1a1a1a;
+                background: #141414;
                 width: 8px;
                 border-radius: 4px;
             }
@@ -278,8 +278,8 @@ class TranscriptPanel(QWidget):
     def _nav_btn_style(self):
         return """
             QPushButton {
-                background-color: #1a1a1a;
-                color: #7a9acd;
+                background-color: #141414;
+                color: #9a9a9a;
                 border: 1px solid #3a3a3a;
                 border-radius: 4px;
                 font-size: 10px;

@@ -94,7 +94,7 @@ class LabelSelectorDialog(QDialog):
         layout.addLayout(quick_layout)
 
         self.selection_label = QLabel("0 selected")
-        self.selection_label.setStyleSheet("font-weight: bold; color: #2196F3;")
+        self.selection_label.setStyleSheet("font-weight: bold; color: #2f81f7;")
         layout.addWidget(self.selection_label)
         self.label_list.itemSelectionChanged.connect(self._update_selection_count)
 
@@ -1114,7 +1114,7 @@ class VideoHighlighterGUI(QWidget):
         self.browse_select_btn.clicked.connect(self.browse_and_select_videos)
 
         self.download_btn = QPushButton("🌐 Download Videos")
-        self.download_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px; }")
+        self.download_btn.setStyleSheet("QPushButton { background-color: #2f81f7; color: white; font-weight: bold; padding: 8px; }")
         # lambda so the clicked(bool) arg isn't passed as start_download's video_urls
         self.download_btn.clicked.connect(lambda: self.start_download())
         download_btn_layout.addStretch()
@@ -1205,7 +1205,7 @@ class VideoHighlighterGUI(QWidget):
 
         # Auto-segmentation info label (always visible, updates dynamically)
         self.auto_seg_info_label = QLabel("")
-        self.auto_seg_info_label.setStyleSheet("color: #2196F3; font-style: italic; padding: 4px;")
+        self.auto_seg_info_label.setStyleSheet("color: #2f81f7; font-style: italic; padding: 4px;")
         self.auto_seg_info_label.setWordWrap(True)
         duration_layout.addWidget(self.auto_seg_info_label)
 
@@ -1873,7 +1873,7 @@ class VideoHighlighterGUI(QWidget):
         self.avoid_scan_btn.clicked.connect(self._on_scan_faces)
         avoid_row.addWidget(self.avoid_scan_btn)
         self.avoid_count_label = QLabel("")
-        self.avoid_count_label.setStyleSheet("color: #2196F3; font-weight: bold;")
+        self.avoid_count_label.setStyleSheet("color: #2f81f7; font-weight: bold;")
         avoid_row.addWidget(self.avoid_count_label)
         avoid_row.addStretch()
         avoid_group_layout.addLayout(avoid_row)
@@ -1910,7 +1910,7 @@ class VideoHighlighterGUI(QWidget):
             "Keep temp clips: ON" if self.keep_temp_chk.isChecked() else "Keep temp clips: OFF"))
 
         self.timeline_btn = QPushButton("📊 Show Timeline Viewer")
-        self.timeline_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px; }")
+        self.timeline_btn.setStyleSheet("QPushButton { background-color: #2f81f7; color: white; font-weight: bold; padding: 8px; }")
         self.timeline_btn.clicked.connect(self.open_timeline_viewer)
 
         self.cancel_btn = QPushButton("Cancel")
@@ -3503,7 +3503,7 @@ class VideoHighlighterGUI(QWidget):
                 self.selection_info_label.setText(
                     f"Selection: {start_pct}% to {end_pct}% ({range_pct}% of video)"
                 )
-                self.selection_info_label.setStyleSheet("color: #2196F3; font-weight: bold; font-size: 10pt;")
+                self.selection_info_label.setStyleSheet("color: #2f81f7; font-weight: bold; font-size: 10pt;")
             else:
                 self.selection_info_label.setText("Selection: Full video")
                 self.selection_info_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 10pt;")
@@ -3525,7 +3525,7 @@ class VideoHighlighterGUI(QWidget):
             self.selection_info_label.setText(
                 f"Selection: {self.format_time(duration)} ({percentage}% of video)"
             )
-            self.selection_info_label.setStyleSheet("color: #2196F3; font-weight: bold; font-size: 10pt;")
+            self.selection_info_label.setStyleSheet("color: #2f81f7; font-weight: bold; font-size: 10pt;")
         else:
             self.selection_info_label.setText("Selection: Full video")
             self.selection_info_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 10pt;")
@@ -3957,7 +3957,7 @@ class VideoHighlighterGUI(QWidget):
         if not self.worker.is_paused():
             self.worker.pause()
             self.run_btn.setText("▶ Resume")
-            self.run_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 8px; }")
+            self.run_btn.setStyleSheet("QPushButton { background-color: #2f81f7; color: white; font-weight: bold; padding: 8px; }")
             self.task_label.setText("⏸ Paused")
             self.task_label.setStyleSheet("color: #ff8c00; font-weight: bold;")
             self.append_log("⏸ Pipeline paused")

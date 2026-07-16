@@ -196,15 +196,15 @@ class AnnotatedVideoManager(QObject):
         self._combo.currentTextChanged.connect(self._on_combo_changed)
         self._combo.setStyleSheet("""
             QComboBox {
-                background-color: #1a1a1a; color: #ddd;
+                background-color: #141414; color: #ddd;
                 border: 1px solid #3a3a3a; border-radius: 4px;
                 padding: 6px 10px; min-width: 160px;
             }
             QComboBox:hover { border-color: #5a5a5a; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView {
-                background-color: #1a1a1a; color: #ddd;
-                selection-background-color: #3a5fcd;
+                background-color: #141414; color: #ddd;
+                selection-background-color: #2f81f7;
             }
         """)
         row1.addWidget(self._combo, 1)

@@ -918,7 +918,7 @@ class RealtimeOverlayPreview(QWidget):
         self.setStyleSheet("""
             QCheckBox { color: #d4d4d4; spacing: 6px; }
             QCheckBox::indicator { width: 16px; height: 16px; }
-            QCheckBox::indicator:checked { background-color: #3a5fcd; border: 2px solid #5a7fdd; border-radius: 3px; }
+            QCheckBox::indicator:checked { background-color: #2f81f7; border: 2px solid #5a7fdd; border-radius: 3px; }
             QCheckBox::indicator:unchecked { border: 2px solid #4a4a4a; border-radius: 3px; }
             QLabel { color: #d4d4d4; }
         """)
