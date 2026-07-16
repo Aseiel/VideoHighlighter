@@ -42,7 +42,7 @@ class TranscriptSegmentWidget(QFrame):
         self.time_label.setFixedWidth(38)
         self.time_label.setAlignment(Qt.AlignTop | Qt.AlignRight)
         self.time_label.setStyleSheet("""
-            color: #5a7faa;
+            color: #aaaaaa;
             font-family: 'Consolas', monospace;
             font-size: 10px;
             font-weight: bold;
@@ -71,7 +71,7 @@ class TranscriptSegmentWidget(QFrame):
             border = "#7aff50"
         elif self._is_active:
             bg = "#222222"
-            border = "#3a7fcd"
+            border = "#2f81f7"
         elif self._is_match:
             bg = "#2a2a10"
             border = "#aaaa30"
@@ -87,7 +87,7 @@ class TranscriptSegmentWidget(QFrame):
             }}
             QFrame#transcriptSegment:hover {{
                 background-color: #242424;
-                border-left: 3px solid #5a8fcd;
+                border-left: 3px solid #2f81f7;
             }}
         """)
 
@@ -197,7 +197,7 @@ class TranscriptPanel(QWidget):
         meta_row = QHBoxLayout()
 
         self.match_label = QLabel("")
-        self.match_label.setStyleSheet("color: #7a9aaa; font-size: 10px; padding: 0 4px;")
+        self.match_label.setStyleSheet("color: #999999; font-size: 10px; padding: 0 4px;")
         meta_row.addWidget(self.match_label)
 
         meta_row.addStretch()
@@ -251,7 +251,7 @@ class TranscriptPanel(QWidget):
                 min-height: 20px;
             }
             QScrollBar::handle:vertical:hover {
-                background: #4a5aaa;
+                background: #2f81f7;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0px;
@@ -355,7 +355,7 @@ class TranscriptPanel(QWidget):
             self.next_btn.setEnabled(False)
         else:
             self.match_label.setText(f"{len(self.segments)} segments")
-            self.match_label.setStyleSheet("color: #7a9aaa; font-size: 10px; padding: 0 4px;")
+            self.match_label.setStyleSheet("color: #999999; font-size: 10px; padding: 0 4px;")
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
 

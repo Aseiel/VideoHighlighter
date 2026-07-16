@@ -466,7 +466,7 @@ class SignalTimelineWindow(QMainWindow):
         mode_row = QHBoxLayout()
 
         mode_label = QLabel("Overlay:")
-        mode_label.setStyleSheet("color: #a0c0ff; font-weight: bold;")
+        mode_label.setStyleSheet("color: #cccccc; font-weight: bold;")
         mode_row.addWidget(mode_label)
 
         self.overlay_mode_combo = QComboBox()
@@ -590,7 +590,7 @@ class SignalTimelineWindow(QMainWindow):
                 background-color: #2f81f7; color: white; font-weight: bold;
                 padding: 8px 16px; border-radius: 4px; min-width: 80px;
             }
-            QPushButton:hover { background-color: #4a6fdd; }
+            QPushButton:hover { background-color: #4a90f5; }
         """)
         controls_layout.addWidget(self.play_btn)
 
@@ -938,7 +938,7 @@ class SignalTimelineWindow(QMainWindow):
         actions.sort(key=lambda x: x[1], reverse=True)
         
         if actions:
-            lines.append('<b style="color: #80b0ff;">━━ ACTIONS ━━</b>')
+            lines.append('<b style="color: #cccccc;">━━ ACTIONS ━━</b>')
             for name, conf, model in actions[:5]:
                 # Confidence bar using block chars
                 bar_len = int(conf * 12)
@@ -1751,8 +1751,8 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_view.viewport().setAcceptDrops(True)
         self.edit_view.setStyleSheet("""
             QGraphicsView {
-                background-color: rgba(30, 30, 40, 200);
-                border: 2px solid rgba(100, 100, 150, 150);
+                background-color: rgba(30, 30, 30, 200);
+                border: 2px solid rgba(90, 90, 90, 150);
                 border-radius: 5px;
             }
         """)
@@ -2059,7 +2059,7 @@ class SignalTimelineWindow(QMainWindow):
         self.confidence_filter_btn.clicked.connect(self.open_confidence_filter)
         self.confidence_filter_btn.setStyleSheet("""
             QPushButton {
-                background-color: #5a3fcd;
+                background-color: #2f81f7;
                 font-weight: bold;
                 padding: 8px;
             }
@@ -2097,7 +2097,7 @@ class SignalTimelineWindow(QMainWindow):
         self.play_edit_btn.clicked.connect(self.toggle_edit_playback)
         self.play_edit_btn.setStyleSheet("""
             QPushButton {
-                background-color: #2a6fcd;
+                background-color: #2f81f7;
                 font-weight: bold;
                 padding: 8px;
                 min-width: 100px;
@@ -3793,7 +3793,7 @@ class SignalTimelineWindow(QMainWindow):
             }
             QCheckBox::indicator:checked {
                 background-color: #2f81f7;
-                border: 2px solid #5a7fdd;
+                border: 2px solid #2f81f7;
             }
             QPushButton {
                 background-color: #2a2a2a;

@@ -860,7 +860,7 @@ class VideoLabelerGUI:
         # Current video indicator — always visible, never overwritten by action logs
         self.current_video_var = tk.StringVar(value="No video loaded")
         ttk.Label(right_frame, textvariable=self.current_video_var,
-                  font=('Arial', 9, 'bold'), foreground='#1a6fa8',
+                  font=('Arial', 9, 'bold'), foreground='#888888',
                   wraplength=160, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
 
         ttk.Separator(right_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)

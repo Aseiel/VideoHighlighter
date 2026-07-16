@@ -246,10 +246,10 @@ class AnnotatedVideoManager(QObject):
         self._gen_objects_btn.clicked.connect(self._on_generate_objects)
         self._gen_objects_btn.setStyleSheet("""
             QPushButton {
-                background-color: #2a4f6f; color: white;
+                background-color: #2f81f7; color: white;
                 font-weight: bold; padding: 6px 10px; border-radius: 4px;
             }
-            QPushButton:hover { background-color: #3a6f9f; }
+            QPushButton:hover { background-color: #4a90f5; }
             QPushButton:disabled { background-color: #333; color: #777; }
         """)
         row2.addWidget(self._gen_objects_btn)
