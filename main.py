@@ -380,7 +380,7 @@ class DetectionPreviewWindow(QWidget):
         self.image_label = QLabel("Waiting for the detection stage (objects / actions)…")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet(
-            "QLabel { background:#101018; color:#8890b0; border:1px solid #333; }"
+            "QLabel { background:#101010; color:#8c8c8c; border:1px solid #333; }"
         )
         layout.addWidget(self.image_label, 1)
 
@@ -1109,7 +1109,7 @@ class VideoHighlighterGUI(QWidget):
         # Download button
         download_btn_layout = QHBoxLayout()
         self.browse_select_btn = QPushButton("🗂 Browse & Select…")
-        self.browse_select_btn.setStyleSheet("QPushButton { background-color: #6a5acd; color: white; font-weight: bold; padding: 8px; }")
+        self.browse_select_btn.setStyleSheet("QPushButton { background-color: #3a3a3a; color: white; font-weight: bold; padding: 8px; }")
         self.browse_select_btn.setToolTip("Open a grid of the site's videos (thumbnails) and pick which ones to download")
         self.browse_select_btn.clicked.connect(self.browse_and_select_videos)
 

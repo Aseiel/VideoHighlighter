@@ -176,7 +176,7 @@ class AnnotatedVideoManager(QObject):
         grp.setStyleSheet("""
             QGroupBox {
                 font-weight: bold; color: #ccc;
-                border: 1px solid #3a3a5a; border-radius: 4px;
+                border: 1px solid #3a3a3a; border-radius: 4px;
                 margin-top: 6px; padding-top: 14px;
             }
             QGroupBox::title {
@@ -196,14 +196,14 @@ class AnnotatedVideoManager(QObject):
         self._combo.currentTextChanged.connect(self._on_combo_changed)
         self._combo.setStyleSheet("""
             QComboBox {
-                background-color: #1a1a2a; color: #ddd;
-                border: 1px solid #3a3a5a; border-radius: 4px;
+                background-color: #1a1a1a; color: #ddd;
+                border: 1px solid #3a3a3a; border-radius: 4px;
                 padding: 6px 10px; min-width: 160px;
             }
-            QComboBox:hover { border-color: #5a5a8a; }
+            QComboBox:hover { border-color: #5a5a5a; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView {
-                background-color: #1a1a2a; color: #ddd;
+                background-color: #1a1a1a; color: #ddd;
                 selection-background-color: #3a5fcd;
             }
         """)
@@ -215,11 +215,11 @@ class AnnotatedVideoManager(QObject):
         refresh_btn.clicked.connect(self.refresh)
         refresh_btn.setStyleSheet("""
             QPushButton {
-                background-color: #2a2a4a; color: white;
-                border: 1px solid #3a3a5a; border-radius: 4px;
+                background-color: #2a2a2a; color: white;
+                border: 1px solid #3a3a3a; border-radius: 4px;
                 padding: 6px; font-size: 14px;
             }
-            QPushButton:hover { background-color: #3a3a5a; }
+            QPushButton:hover { background-color: #3a3a3a; }
         """)
         row1.addWidget(refresh_btn)
         layout.addLayout(row1)

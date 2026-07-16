@@ -102,11 +102,11 @@ class _FaceCard(QFrame):
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet("""
             QFrame {
-                background: #1a1a2e;
-                border: 1px solid #3a3a5a;
+                background: #1a1a1a;
+                border: 1px solid #3a3a3a;
                 border-radius: 6px;
             }
-            QFrame:hover { border-color: #6688cc; background: #1e2040; }
+            QFrame:hover { border-color: #6688cc; background: #1f1f1f; }
         """)
 
         layout = QVBoxLayout(self)
@@ -122,7 +122,7 @@ class _FaceCard(QFrame):
 
         name_lbl = QLabel(name or "Unknown")
         name_lbl.setAlignment(Qt.AlignCenter)
-        name_lbl.setStyleSheet("color: #c8d0f0; font-size: 10px; border: none; background: transparent;")
+        name_lbl.setStyleSheet("color: #cccccc; font-size: 10px; border: none; background: transparent;")
         name_lbl.setFixedWidth(THUMB_SIZE + 8)
         layout.addWidget(name_lbl, alignment=Qt.AlignHCenter)
 
@@ -142,14 +142,14 @@ class _SegmentRow(QWidget):
         row.setSpacing(4)
 
         lbl = QLabel(f"#{idx+1}  {_fmt(start)} → {_fmt(end)}  ({end-start:.1f}s)")
-        lbl.setStyleSheet("color: #b0b8d8; font-size: 11px;")
+        lbl.setStyleSheet("color: #b4b4b4; font-size: 11px;")
         row.addWidget(lbl, 1)
 
         jump_btn = QPushButton("▶ Jump")
         jump_btn.setFixedWidth(62)
         jump_btn.setStyleSheet(
-            "QPushButton{background:#2a3a5a;color:#aaccff;border:none;border-radius:3px;padding:3px;font-size:10px;}"
-            "QPushButton:hover{background:#3a4a7a;}"
+            "QPushButton{background:#323232;color:#aaccff;border:none;border-radius:3px;padding:3px;font-size:10px;}"
+            "QPushButton:hover{background:#424242;}"
         )
         jump_btn.clicked.connect(lambda _=False, s=start: on_jump(s))
         row.addWidget(jump_btn)
@@ -209,12 +209,12 @@ class SearchPanel(QWidget):
         root.setSpacing(6)
 
         hdr = QLabel("🔍 Search by Person")
-        hdr.setStyleSheet("color: #8899cc; font-size: 12px; font-weight: bold;")
+        hdr.setStyleSheet("color: #909090; font-size: 12px; font-weight: bold;")
         root.addWidget(hdr)
 
         hint = QLabel("Click a face to find all segments where they appear.")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #6070a0; font-size: 10px;")
+        hint.setStyleSheet("color: #686868; font-size: 10px;")
         root.addWidget(hint)
 
         splitter = QSplitter(Qt.Vertical)
@@ -237,7 +237,7 @@ class SearchPanel(QWidget):
         self._no_faces_lbl = QLabel("No tagged identities found.\nRun identity tagging first.")
         self._no_faces_lbl.setWordWrap(True)
         self._no_faces_lbl.setAlignment(Qt.AlignCenter)
-        self._no_faces_lbl.setStyleSheet("color: #606080; font-size: 11px;")
+        self._no_faces_lbl.setStyleSheet("color: #606060; font-size: 11px;")
         self._face_grid_layout.insertWidget(0, self._no_faces_lbl)
 
         face_scroll.setWidget(self._face_grid_widget)
@@ -251,7 +251,7 @@ class SearchPanel(QWidget):
 
         top_row = QHBoxLayout()
         self._results_header = QLabel("Select a person above")
-        self._results_header.setStyleSheet("color: #8090b0; font-size: 11px; font-weight: bold;")
+        self._results_header.setStyleSheet("color: #888888; font-size: 11px; font-weight: bold;")
         top_row.addWidget(self._results_header, 1)
 
         self._add_all_btn = QPushButton("+ Add All to Edit Timeline")
@@ -267,7 +267,7 @@ class SearchPanel(QWidget):
 
         seg_scroll = QScrollArea()
         seg_scroll.setWidgetResizable(True)
-        seg_scroll.setStyleSheet("QScrollArea{border:1px solid #2a2a4a;background:#0d0d1a;}")
+        seg_scroll.setStyleSheet("QScrollArea{border:1px solid #2a2a2a;background:#0d0d0d;}")
 
         self._seg_list_widget = QWidget()
         self._seg_list_layout = QVBoxLayout(self._seg_list_widget)
@@ -277,7 +277,7 @@ class SearchPanel(QWidget):
 
         self._no_results_lbl = QLabel("No segments to show.")
         self._no_results_lbl.setAlignment(Qt.AlignCenter)
-        self._no_results_lbl.setStyleSheet("color: #505070; font-size: 11px;")
+        self._no_results_lbl.setStyleSheet("color: #505050; font-size: 11px;")
         self._seg_list_layout.insertWidget(0, self._no_results_lbl)
 
         seg_scroll.setWidget(self._seg_list_widget)
