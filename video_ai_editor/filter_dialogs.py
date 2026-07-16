@@ -29,7 +29,7 @@ class FilterDialog(QDialog):
         
         # Actions filter controls
         actions_header = QLabel("Filter Actions")
-        actions_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #a0c0ff;")
+        actions_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #cccccc;")
         actions_layout.addWidget(actions_header)
         
         # Search box for actions
@@ -142,7 +142,7 @@ class FilterDialog(QDialog):
                 margin-right: 2px;
             }
             QTabBar::tab:selected {
-                background-color: #4a5fcd;
+                background-color: #2f81f7;
                 color: #ffffff;
             }
         """)
@@ -224,7 +224,7 @@ class ConfidenceFilterDialog(QDialog):
         layout = QVBoxLayout(self)
 
         title = QLabel("Filter by Confidence Level")
-        title.setStyleSheet("font-weight: bold; font-size: 14px; color: #a0c0ff;")
+        title.setStyleSheet("font-weight: bold; font-size: 14px; color: #cccccc;")
         layout.addWidget(title)
 
         desc = QLabel("Adjust minimum confidence separately for actions and objects.")

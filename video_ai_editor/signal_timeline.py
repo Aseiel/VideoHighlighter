@@ -1752,8 +1752,8 @@ class SignalTimelineView(QGraphicsView):
         # Semi-transparent background
         self.setStyleSheet("""
             QGraphicsView {
-                background-color: rgba(18, 18, 24, 200);
-                border: 2px solid rgba(100, 100, 150, 150);
+                background-color: rgba(18, 18, 18, 200);
+                border: 2px solid rgba(90, 90, 90, 150);
                 border-radius: 5px;
             }
         """)

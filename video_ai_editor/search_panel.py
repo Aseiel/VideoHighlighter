@@ -106,7 +106,7 @@ class _FaceCard(QFrame):
                 border: 1px solid #3a3a3a;
                 border-radius: 6px;
             }
-            QFrame:hover { border-color: #6688cc; background: #1f1f1f; }
+            QFrame:hover { border-color: #4a90f5; background: #1f1f1f; }
         """)
 
         layout = QVBoxLayout(self)
@@ -148,7 +148,7 @@ class _SegmentRow(QWidget):
         jump_btn = QPushButton("▶ Jump")
         jump_btn.setFixedWidth(62)
         jump_btn.setStyleSheet(
-            "QPushButton{background:#323232;color:#aaccff;border:none;border-radius:3px;padding:3px;font-size:10px;}"
+            "QPushButton{background:#323232;color:#cccccc;border:none;border-radius:3px;padding:3px;font-size:10px;}"
             "QPushButton:hover{background:#424242;}"
         )
         jump_btn.clicked.connect(lambda _=False, s=start: on_jump(s))

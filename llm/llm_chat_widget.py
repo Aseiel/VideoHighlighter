@@ -2320,7 +2320,7 @@ class LLMChatWidget(QWidget):
         safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         safe = safe.replace("\n", "<br>")
         self._append_html(
-            f'<div style="color:#64B5F6;margin-top:8px;"><b>You:</b></div>'
+            f'<div style="color:#2f81f7;margin-top:8px;"><b>You:</b></div>'
             f'<div style="color:#ccc;margin-left:12px;">{safe}</div><br>'
         )
 
