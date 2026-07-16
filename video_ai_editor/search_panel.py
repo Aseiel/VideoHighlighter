@@ -32,9 +32,9 @@ def _fmt(seconds: float) -> str:
 
 def _placeholder_pixmap(size: int) -> QPixmap:
     pix = QPixmap(size, size)
-    pix.fill(QColor(60, 60, 80))
+    pix.fill(QColor(60, 60, 60))
     p = QPainter(pix)
-    p.setPen(QColor(140, 140, 160))
+    p.setPen(QColor(145, 145, 145))
     p.setFont(QFont("Arial", size // 3))
     p.drawText(pix.rect(), Qt.AlignCenter, "?")
     p.end()

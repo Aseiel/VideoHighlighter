@@ -109,7 +109,7 @@ class SignalLabelPanel(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), QColor(20, 20, 30))
+        p.fillRect(self.rect(), QColor(18, 18, 18))
 
         self._hit_rows = []
 
@@ -135,23 +135,23 @@ class SignalLabelPanel(QWidget):
             if navigable:
                 # ◀  label  ▶
                 p.setFont(font_arr)
-                p.setPen(QColor(100, 180, 255))
+                p.setPen(QColor(47, 129, 247))
                 p.drawText(2, mid_y, "◀")
                 p.drawText(self.width() - self._ARROW_W, mid_y, "▶")
 
                 p.setFont(font_lbl)
-                p.setPen(QColor(180, 220, 255))
+                p.setPen(QColor(90, 160, 250))
                 avail = self.width() - self._ARROW_W * 2 - 6
                 clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
                 p.drawText(self._ARROW_W + 3, mid_y, clipped)
             else:
                 p.setFont(font_lbl)
-                p.setPen(QColor(140, 160, 190))
+                p.setPen(QColor(165, 165, 165))
                 avail = self.width() - 8
                 clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
                 p.drawText(6, mid_y, clipped)
 
-        p.setPen(QColor(60, 60, 80))
+        p.setPen(QColor(60, 60, 60))
         p.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
         p.end()
 
@@ -3004,7 +3004,7 @@ class SignalTimelineWindow(QMainWindow):
         if items:
             last = items[-1]
             original_pen = last.pen()
-            last.setPen(QPen(QColor(100, 230, 255), 3))
+            last.setPen(QPen(QColor(47, 129, 247), 3))
             QTimer.singleShot(400, lambda: self._safe_restore_pen(last, original_pen))
 
     def _safe_restore_pen(self, item, pen):
