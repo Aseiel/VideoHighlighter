@@ -1,6 +1,8 @@
 // Video file picking. Uses the native Tauri dialog when running inside the app,
 // and falls back to nothing outside it (browser dev can't read absolute paths).
 
+import { convertFileSrc } from "@tauri-apps/api/core"
+
 export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
 }
@@ -51,4 +53,14 @@ export async function pickModelFile(): Promise<string | null> {
 
 export function basename(p: string): string {
   return p.split(/[\\/]/).pop() ?? p
+}
+
+/**
+ * A URL the webview can load for a local file, via Tauri's asset protocol.
+ * Returns null in browser dev, where absolute paths aren't reachable — callers
+ * fall back to a placeholder rather than requesting a URL that can't resolve.
+ */
+export function fileSrc(path: string): string | null {
+  if (!isTauri()) return null
+  return convertFileSrc(path)
 }

@@ -54,6 +54,7 @@ import {
   revealLog,
   type RunEvent,
 } from "@/lib/api"
+import { VideoCard } from "@/components/VideoCard"
 import { TimeRange, DEFAULT_TIME_RANGE, type TimeRangeState } from "@/components/TimeRange"
 import {
   DetectionPreview,
@@ -468,25 +469,16 @@ export default function App() {
               No videos added yet
             </p>
           ) : (
-            <ul className="space-y-1">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
               {videos.map((v) => (
-                <li
+                <VideoCard
                   key={v}
-                  className="flex items-center justify-between rounded-md bg-muted/50 px-3 py-1.5 text-sm"
-                >
-                  <span className="truncate" title={v}>
-                    {basename(v)}
-                  </span>
-                  <button
-                    className="text-muted-foreground hover:text-destructive disabled:opacity-40"
-                    disabled={running}
-                    onClick={() => setVideos((l) => l.filter((x) => x !== v))}
-                  >
-                    <Trash2 className="size-3.5" />
-                  </button>
-                </li>
+                  path={v}
+                  disabled={running}
+                  onRemove={() => setVideos((l) => l.filter((x) => x !== v))}
+                />
               ))}
-            </ul>
+            </div>
           )}
           <Separator className="my-4" />
           <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
