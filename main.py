@@ -719,17 +719,17 @@ class RangeSlider(QWidget):
 
         # Full track background
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(60, 60, 80))
+        p.setBrush(QColor(60, 60, 60))
         inset = 8
         p.drawRoundedRect(inset, track_y, self.width() - 2 * inset, track_h, 3, 3)
 
         # Selected range
-        p.setBrush(QColor(33, 150, 243))
+        p.setBrush(QColor(47, 129, 247))
         p.drawRoundedRect(x0, track_y, max(2, x1 - x0), track_h, 3, 3)
 
         # Start handle
-        p.setBrush(QColor(220, 220, 240))
-        p.setPen(QColor(33, 150, 243))
+        p.setBrush(QColor(222, 222, 222))
+        p.setPen(QColor(47, 129, 247))
         p.drawEllipse(x0 - 7, self.height() // 2 - 7, 14, 14)
 
         # End handle

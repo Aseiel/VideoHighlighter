@@ -103,8 +103,8 @@ class HoverPreview(QWidget):
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
         # Card background
-        bg = QColor(15, 15, 25, 240)
-        border = QColor(80, 120, 200, 200)
+        bg = QColor(15, 15, 15, 240)
+        border = QColor(47, 129, 247, 200)
         outer = self.rect().adjusted(0, 0, -1, -1)
         p.setBrush(QBrush(bg))
         p.setPen(QPen(border, 1))
@@ -126,13 +126,13 @@ class HoverPreview(QWidget):
             dy = (thumb_rect.height() - scaled.height()) // 2
             p.drawPixmap(thumb_rect.x() + dx, thumb_rect.y() + dy, scaled)
         else:
-            p.fillRect(thumb_rect, QColor(30, 30, 45))
-            p.setPen(QPen(QColor(140, 140, 160)))
+            p.fillRect(thumb_rect, QColor(30, 30, 30))
+            p.setPen(QPen(QColor(145, 145, 145)))
             p.drawText(thumb_rect, Qt.AlignCenter, "loading…")
 
         # Caption
         if self._caption:
-            p.setPen(QPen(QColor(220, 230, 255)))
+            p.setPen(QPen(QColor(225, 225, 225)))
             cap_rect = QRect(
                 PADDING, PADDING + PREVIEW_HEIGHT,
                 self.width() - 2 * PADDING, CAPTION_H
