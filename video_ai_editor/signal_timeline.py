@@ -192,7 +192,7 @@ class SignalTimelineScene(QGraphicsScene):
         # Draw waveform background
         waveform_y = y_pos
         self.addRect(0, waveform_y, self.sceneRect().width(), height, 
-                    QPen(Qt.NoPen), QBrush(QColor(10, 10, 20, 50)))
+                    QPen(Qt.NoPen), QBrush(QColor(12, 12, 12, 50)))
         
         # Draw waveform label
         self.row_labels.append(("AUDIO WAVEFORM", waveform_y))
@@ -243,7 +243,7 @@ class SignalTimelineScene(QGraphicsScene):
                     color = self.waveform_colors[amplitude_index]
                     color.setAlpha(min(255, color.alpha() + 50))
                 else:
-                    color = QColor(100, 150, 255, 200)
+                    color = QColor(47, 129, 247, 200)
                 
                 # Calculate y positions
                 y_center = waveform_y + height // 2
@@ -715,14 +715,14 @@ class SignalTimelineScene(QGraphicsScene):
     def draw_background(self):
         """Draw gradient background with subtle grid"""
         gradient = QLinearGradient(0, 0, 0, self.sceneRect().height())
-        gradient.setColorAt(0, QColor(20, 20, 30))
-        gradient.setColorAt(1, QColor(40, 40, 50))
+        gradient.setColorAt(0, QColor(20, 20, 20))
+        gradient.setColorAt(1, QColor(32, 32, 32))
         self.addRect(self.sceneRect(), QPen(Qt.PenStyle.NoPen), QBrush(gradient))
         
         # Add subtle grid lines
         for sec in range(0, int(self.video_duration) + 1, 5):
             x = sec * self.pixels_per_second
-            pen = QPen(QColor(45, 45, 55) if sec % 30 else QColor(70, 70, 90), 1)
+            pen = QPen(QColor(45, 45, 45) if sec % 30 else QColor(70, 70, 70), 1)
             self.addLine(x, 0, x, self.sceneRect().height(), pen)
         
     def draw_transcript_layer(self, y_pos):
@@ -1279,9 +1279,9 @@ class SignalTimelineScene(QGraphicsScene):
             
             # Draw vertical line (darker for 30-second intervals)
             if second % 30 == 0:
-                pen = QPen(QColor(100, 100, 150, 150), 1, Qt.PenStyle.SolidLine)
+                pen = QPen(QColor(110, 110, 110, 150), 1, Qt.PenStyle.SolidLine)
             else:
-                pen = QPen(QColor(80, 80, 120, 80), 1, Qt.PenStyle.DashLine)
+                pen = QPen(QColor(95, 95, 95, 80), 1, Qt.PenStyle.DashLine)
             self.addLine(x, 0, x, self.sceneRect().height(), pen)
             
             # Add time label for 30-second intervals
@@ -1336,8 +1336,8 @@ class SignalTimelineScene(QGraphicsScene):
                 and self._selection_rect_item in self.items()):
             self._selection_rect_item.setRect(x0, 0, width, height)
         else:
-            pen   = QPen(QColor(100, 200, 255, 200), 1.5)
-            brush = QBrush(QColor(80, 160, 255, 40))
+            pen   = QPen(QColor(47, 129, 247, 200), 1.5)
+            brush = QBrush(QColor(47, 129, 247, 40))
             self._selection_rect_item = self.addRect(x0, 0, width, height, pen, brush)
             self._selection_rect_item.setZValue(90)
 
@@ -1360,7 +1360,7 @@ class SignalTimelineScene(QGraphicsScene):
             self._selection_label_item.setPos(x0 + 4, 2)
         else:
             self._selection_label_item = self.addText(text, font)
-            self._selection_label_item.setDefaultTextColor(QColor(120, 220, 255))
+            self._selection_label_item.setDefaultTextColor(QColor(90, 160, 250))
             self._selection_label_item.setPos(x0 + 4, 2)
             self._selection_label_item.setZValue(91)
 
@@ -1382,8 +1382,8 @@ class SignalTimelineScene(QGraphicsScene):
         if (self._selection_rect_item is not None
                 and self._selection_rect_item in self.items()):
             # Brighter border, slightly more opaque fill
-            self._selection_rect_item.setPen(QPen(QColor(100, 220, 255, 255), 2))
-            self._selection_rect_item.setBrush(QBrush(QColor(80, 180, 255, 60)))
+            self._selection_rect_item.setPen(QPen(QColor(47, 129, 247, 255), 2))
+            self._selection_rect_item.setBrush(QBrush(QColor(47, 129, 247, 60)))
 
         # Update label to show drag hint
         x0 = min(t0, t1) * self.pixels_per_second
@@ -2230,10 +2230,10 @@ class SignalTimelineView(QGraphicsView):
 
         # Gradient fill — same blue as the selection rect
         grad = QLinearGradient(0, 0, 0, chip_h)
-        grad.setColorAt(0, QColor(120, 200, 255, 220))
-        grad.setColorAt(1, QColor(60,  140, 220, 220))
+        grad.setColorAt(0, QColor(90, 160, 250, 220))
+        grad.setColorAt(1, QColor(47, 129, 247, 220))
         painter.setBrush(QBrush(grad))
-        painter.setPen(QPen(QColor(100, 220, 255), 1.5))
+        painter.setPen(QPen(QColor(47, 129, 247), 1.5))
         painter.drawRoundedRect(1, 1, chip_w - 2, chip_h - 2, 4, 4)
 
         # Duration label
