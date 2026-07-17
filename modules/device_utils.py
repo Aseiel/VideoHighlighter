@@ -92,9 +92,12 @@ def detect_best_device(log_fn=print):
             log_fn(f"⚠️ XPU check failed: {e}")
 
     # ---- Intel GPU via OpenVINO (no torch xpu build needed) -----------------
-    # The frozen exe ships a CPU-only torch, so torch.xpu is unavailable even on
-    # an Arc machine. OpenVINO can still drive the GPU, so probe it directly and
-    # use it for OpenVINO consumers (YOLO OV model + action recognition).
+    # The frozen exe ships a CUDA torch (the release build installs the cu124
+    # wheel). torch.xpu still *exists* on it — the attribute is there in any
+    # build — but reports is_available() False, so the XPU branch above never
+    # fires in the packaged app, even on an Arc machine. OpenVINO can still
+    # drive the GPU, so probe it directly and use it for OpenVINO consumers
+    # (YOLO OV model + action recognition).
     try:
         from openvino import Core
         _ov_devices = Core().available_devices
