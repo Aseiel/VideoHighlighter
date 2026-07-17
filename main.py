@@ -783,6 +783,11 @@ class VideoHighlighterGUI(QWidget):
         self.config_data = self.load_config()
 
         layout = QVBoxLayout()
+        # Breathing room — the window read cramped with Qt's default tight
+        # margins. Generous outer margin + row spacing is the single biggest
+        # lever on how modern it feels.
+        layout.setContentsMargins(20, 16, 20, 12)
+        layout.setSpacing(14)
 
         # Store video duration
         self.current_video_duration = 0
@@ -790,6 +795,8 @@ class VideoHighlighterGUI(QWidget):
         # --- File picker ---
         file_group = QGroupBox("Input Videos")
         file_layout = QVBoxLayout()
+        file_layout.setContentsMargins(14, 12, 14, 12)
+        file_layout.setSpacing(10)
 
         # Buttons row
         btn_layout = QHBoxLayout()
@@ -826,9 +833,6 @@ class VideoHighlighterGUI(QWidget):
         self.output_input = QLineEdit(self.config_data.get("highlights", {}).get("output", "highlight.mp4"))
         out_layout.addWidget(QLabel("Output base name:"))
         out_layout.addWidget(self.output_input)
-        info_label = QLabel("ℹ️ For multiple files, '_highlight' will be appended to each filename")
-        info_label.setStyleSheet("color: #666; font-size: 9pt;")
-        out_layout.addWidget(info_label)
         layout.addLayout(out_layout)
 
         highlights_cfg = self.config_data.get("highlights", {})
@@ -1016,95 +1020,93 @@ class VideoHighlighterGUI(QWidget):
         save_dir_layout.addWidget(self.browse_save_dir_btn)
         download_form.addLayout(save_dir_layout)
 
-        # Time range selection for downloads
-        time_range_group = QGroupBox("Download Time Range (Optional)")
+        # Time range selection for downloads. One mode picker instead of two
+        # overlapping checkboxes — the modes are mutually exclusive.
+        time_range_group = QGroupBox("Download Time Range")
         time_range_layout = QVBoxLayout()
 
-        # Full download checkbox (default: unchecked = download only time range)
-        self.download_full_chk = QCheckBox("Download full video")
-        self.download_full_chk.setChecked(False)  # Default: download only time range
-        self.download_full_chk.setToolTip("When unchecked, only downloads the specified time range")
-        time_range_layout.addWidget(self.download_full_chk)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Download:"))
+        self.download_mode_combo = QComboBox()
+        self.download_mode_combo.addItem("Full video", "full")
+        self.download_mode_combo.addItem("Same range as processing", "same")
+        self.download_mode_combo.addItem("Specific range (seconds)", "specific")
+        self.download_mode_combo.setToolTip(
+            "Full video — download the whole thing.\n"
+            "Same range as processing — reuse the Processing Time Range above.\n"
+            "Specific range — download only the seconds you set below."
+        )
+        mode_row.addWidget(self.download_mode_combo)
+        mode_row.addStretch()
+        time_range_layout.addLayout(mode_row)
 
-        # Time range inputs
+        # Manual seconds range — shown only in "Specific range" mode.
+        self.download_range_widget = QWidget()
+        range_col = QVBoxLayout(self.download_range_widget)
+        range_col.setContentsMargins(0, 0, 0, 0)
         time_input_layout = QHBoxLayout()
         time_input_layout.addWidget(QLabel("Start time (seconds):"))
         self.download_start_input = QSpinBox()
         self.download_start_input.setRange(0, 86400)  # 0 to 24 hours
         self.download_start_input.setValue(0)
-        self.download_start_input.setEnabled(True)  # Enabled by default
         time_input_layout.addWidget(self.download_start_input)
 
         time_input_layout.addWidget(QLabel("End time (seconds):"))
         self.download_end_input = QSpinBox()
         self.download_end_input.setRange(1, 86400)  # 1 second to 24 hours
         self.download_end_input.setValue(300)  # Default: 5 minutes
-        self.download_end_input.setEnabled(True)  # Enabled by default
         time_input_layout.addWidget(self.download_end_input)
+        time_input_layout.addStretch()
+        range_col.addLayout(time_input_layout)
 
-        time_range_layout.addLayout(time_input_layout)
-
-        # Duration label
         self.download_duration_label = QLabel("Duration: 300s (5:00)")
-        time_range_layout.addWidget(self.download_duration_label)
+        range_col.addWidget(self.download_duration_label)
+        time_range_layout.addWidget(self.download_range_widget)
 
         # Connect signals
         self.download_start_input.valueChanged.connect(self.update_download_duration)
         self.download_end_input.valueChanged.connect(self.update_download_duration)
-        self.download_full_chk.toggled.connect(self.on_download_full_toggle)
+        self.download_mode_combo.currentIndexChanged.connect(self.on_download_mode_changed)
 
         time_range_group.setLayout(time_range_layout)
         download_form.addWidget(time_range_group)
-
-        # Download time range options
-        download_time_group = QGroupBox("Download Time Range")
-        download_time_layout = QVBoxLayout()
-
-        # Checkbox to use the same time range as processing
-        self.use_same_time_range_chk = QCheckBox("Use same time range as processing")
-        self.use_same_time_range_chk.setChecked(False)  # Default: download full
-        self.use_same_time_range_chk.setToolTip("When checked, downloads only the time range specified in 'Processing Time Range' section")
-        download_time_layout.addWidget(self.use_same_time_range_chk)
-
-        # Info label
-        download_time_info = QLabel("ℹ️ Unchecked: Download full videos\n   Checked: Download only selected time range")
-        download_time_info.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
-        download_time_layout.addWidget(download_time_info)
-
-        download_time_group.setLayout(download_time_layout)
-        download_form.addWidget(download_time_group)
 
         # Options
         self.auto_add_downloaded_chk = QCheckBox("Automatically add downloaded videos to file list")
         self.auto_add_downloaded_chk.setChecked(self.config_data.get("download", {}).get("auto_add", True))
         download_form.addWidget(self.auto_add_downloaded_chk)
 
-        # Auto-process checkbox
-        self.auto_process_chk = QCheckBox("Automatically start processing after download completes")
-        self.auto_process_chk.setChecked(self.config_data.get("download", {}).get("auto_process", False))
-        self.auto_process_chk.setToolTip("When enabled, the highlighter pipeline will start automatically after videos are downloaded")
-        download_form.addWidget(self.auto_process_chk)
+        # After-download processing: one mode picker instead of two overlapping
+        # (and half-dead) checkboxes.
+        process_row = QHBoxLayout()
+        process_row.addWidget(QLabel("After download:"))
+        self.process_mode_combo = QComboBox()
+        self.process_mode_combo.addItem("Don't process", "none")
+        self.process_mode_combo.addItem("Process each video as it downloads", "immediate")
+        self.process_mode_combo.addItem("Process all after downloads finish", "batch")
+        self.process_mode_combo.setToolTip(
+            "Don't process — just download.\n"
+            "Process each as it downloads — run the pipeline per video, overlapping with remaining downloads.\n"
+            "Process all after downloads finish — download everything first, then run the pipeline over the list."
+        )
+        process_row.addWidget(self.process_mode_combo)
+        process_row.addStretch()
+        download_form.addLayout(process_row)
 
-        # Immediate processing checkbox
-        self.immediate_processing_chk = QCheckBox("Process each video immediately after download")
-        self.immediate_processing_chk.setChecked(self.config_data.get("download", {}).get("immediate_processing", True))
-        self.immediate_processing_chk.setToolTip("Process videos as soon as they're downloaded, instead of waiting for all downloads to complete")
-        download_form.addWidget(self.immediate_processing_chk)
-
-        # Concurrent downloads spinner
+        # Concurrent downloads — only meaningful while processing overlaps
+        # downloads (the "immediate" mode).
         concurrent_layout = QHBoxLayout()
         concurrent_layout.addWidget(QLabel("Concurrent downloads:"))
         self.concurrent_spinbox = QSpinBox()
         self.concurrent_spinbox.setRange(1, 10)
         self.concurrent_spinbox.setValue(self.config_data.get("download", {}).get("concurrent_downloads", 1))
         self.concurrent_spinbox.setToolTip("Number of videos to download simultaneously (higher = faster but more resource intensive)")
-        self.concurrent_spinbox.setEnabled(self.immediate_processing_chk.isChecked())
         concurrent_layout.addWidget(self.concurrent_spinbox)
         concurrent_layout.addStretch()
         download_form.addLayout(concurrent_layout)
 
-        # Connect checkbox to enable/disable spinner
-        self.immediate_processing_chk.toggled.connect(self.concurrent_spinbox.setEnabled)
+        self.process_mode_combo.currentIndexChanged.connect(self.on_process_mode_changed)
+        self.on_process_mode_changed()  # sync spinner enabled state
 
         # Download button
         download_btn_layout = QHBoxLayout()
@@ -1122,17 +1124,6 @@ class VideoHighlighterGUI(QWidget):
         download_btn_layout.addWidget(self.download_btn)
         download_form.addLayout(download_btn_layout)
 
-        # Combine highlights
-        self.auto_combine_chk = QCheckBox("Automatically combine all highlights into one video")
-        self.auto_combine_chk.setChecked(self.config_data.get("download", {}).get("auto_combine", True))
-        self.auto_combine_chk.setToolTip("When enabled, all individual highlights will be combined into one master video")
-        download_form.addWidget(self.auto_combine_chk)
-        
-        # Info label
-        info_label = QLabel("ℹ️ Requires yt-dlp: pip install yt-dlp")
-        info_label.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
-        download_form.addWidget(info_label)
-        
         download_group.setLayout(download_form)
         download_layout.addWidget(download_group)
         download_layout.addStretch()
@@ -1216,24 +1207,21 @@ class VideoHighlighterGUI(QWidget):
         self.spin_auto_min_clip = QSpinBox()
         self.spin_auto_min_clip.setRange(1, 30)
         self.spin_auto_min_clip.setValue(highlights_cfg.get("auto_min_clip", 2))
-        self.spin_auto_min_clip.setSuffix(" s")
         self.spin_auto_min_clip.setToolTip("Shortest clip the auto-cutter will produce")
 
         self.spin_auto_max_clip = QSpinBox()
         self.spin_auto_max_clip.setRange(3, 120)
         self.spin_auto_max_clip.setValue(highlights_cfg.get("auto_max_clip", 30))
-        self.spin_auto_max_clip.setSuffix(" s")
         self.spin_auto_max_clip.setToolTip("Longest single clip before it gets trimmed to the best sub-window")
 
         self.spin_auto_merge_gap = QSpinBox()
         self.spin_auto_merge_gap.setRange(0, 10)
         self.spin_auto_merge_gap.setValue(highlights_cfg.get("auto_merge_gap", 2))
-        self.spin_auto_merge_gap.setSuffix(" s")
         self.spin_auto_merge_gap.setToolTip("Merge interest regions that are within this gap into one clip")
 
-        auto_seg_layout.addRow("Min clip length:", self.spin_auto_min_clip)
-        auto_seg_layout.addRow("Max clip length:", self.spin_auto_max_clip)
-        auto_seg_layout.addRow("Merge gap:", self.spin_auto_merge_gap)
+        auto_seg_layout.addRow("Min clip length (s):", self.spin_auto_min_clip)
+        auto_seg_layout.addRow("Max clip length (s):", self.spin_auto_max_clip)
+        auto_seg_layout.addRow("Merge gap (s):", self.spin_auto_merge_gap)
 
         self.auto_seg_group.setLayout(auto_seg_layout)
         duration_layout.addWidget(self.auto_seg_group)
@@ -1293,10 +1281,17 @@ class VideoHighlighterGUI(QWidget):
         self.skip_highlights_chk.setChecked(highlights_cfg.get("skip_highlights", False))
         basic_layout.addWidget(self.skip_highlights_chk, 4, 0, 1, 2)
 
+        # Combine every processed video's highlights into one master video.
+        # Config key stays under "download" (auto_combine) so saved configs load.
+        self.auto_combine_chk = QCheckBox("Combine highlights from all processed videos into one video")
+        self.auto_combine_chk.setChecked(self.config_data.get("download", {}).get("auto_combine", True))
+        self.auto_combine_chk.setToolTip("When enabled, the highlights from every processed video are merged into a single master video")
+        basic_layout.addWidget(self.auto_combine_chk, 5, 0, 1, 2)
+
         # Equal-width columns; trailing stretch row keeps groups packed at the top.
         basic_layout.setColumnStretch(0, 1)
         basic_layout.setColumnStretch(1, 1)
-        basic_layout.setRowStretch(5, 1)
+        basic_layout.setRowStretch(6, 1)
 
         basic_tab.setLayout(basic_layout)
         tabs.addTab(basic_tab, "Basic Settings")
@@ -1909,7 +1904,7 @@ class VideoHighlighterGUI(QWidget):
         self.keep_temp_chk.clicked.connect(lambda: self.keep_temp_chk.setText(
             "Keep temp clips: ON" if self.keep_temp_chk.isChecked() else "Keep temp clips: OFF"))
 
-        self.timeline_btn = QPushButton("📊 Show Timeline Viewer")
+        self.timeline_btn = QPushButton("Timeline Viewer")
         self.timeline_btn.setStyleSheet("QPushButton { background-color: #2f81f7; color: white; font-weight: bold; padding: 8px; }")
         self.timeline_btn.clicked.connect(self.open_timeline_viewer)
 
@@ -1956,22 +1951,44 @@ class VideoHighlighterGUI(QWidget):
 
         self.setLayout(layout)
 
-        # Load download config
-        download_cfg = self.config_data.get("download", {})
-        self.use_same_time_range_chk.setChecked(download_cfg.get("use_same_time_range", False))
-
         self.setup_label_completers()
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.check_worker_status)
 
         # Load download time range settings (AFTER all widgets are created)
         download_cfg = self.config_data.get("download", {})
-        self.download_full_chk.setChecked(download_cfg.get("download_full", False))
         self.download_start_input.setValue(download_cfg.get("time_range_start", 0))
         self.download_end_input.setValue(download_cfg.get("time_range_end", 300))
 
-        # Initialize the UI state
-        self.on_download_full_toggle(self.download_full_chk.isChecked())
+        # Restore the download mode. Fall back to the old two-checkbox keys so
+        # existing configs keep working: use_same_time_range -> "same",
+        # download_full -> "full", else "specific".
+        mode = download_cfg.get("download_mode")
+        if mode is None:
+            if download_cfg.get("use_same_time_range", False):
+                mode = "same"
+            elif download_cfg.get("download_full", False):
+                mode = "full"
+            else:
+                mode = "full"
+        idx = self.download_mode_combo.findData(mode)
+        self.download_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.on_download_mode_changed()  # sync visibility
+
+        # Restore the after-download processing mode, with fall-back from the old
+        # keys: immediate_processing -> "immediate", auto_process -> "batch",
+        # else "none".
+        pmode = download_cfg.get("process_mode")
+        if pmode is None:
+            if download_cfg.get("immediate_processing", False):
+                pmode = "immediate"
+            elif download_cfg.get("auto_process", False):
+                pmode = "batch"
+            else:
+                pmode = "none"
+        pidx = self.process_mode_combo.findData(pmode)
+        self.process_mode_combo.setCurrentIndex(pidx if pidx >= 0 else 0)
+        self.on_process_mode_changed()  # sync spinner enabled
 
     # --- About / Contact tab ---
     def _build_about_tab(self):
@@ -2244,36 +2261,40 @@ class VideoHighlighterGUI(QWidget):
         save_dir = self.download_save_dir_input.text().strip()
         pattern = "auto"  # link pattern is auto-detected from the listing page
 
-        # Get immediate processing settings
-        immediate_processing = self.immediate_processing_chk.isChecked()
+        # After-download processing mode: none / immediate / batch.
+        process_mode = self.process_mode_combo.currentData()
+        immediate_processing = (process_mode == "immediate")
         max_concurrent = self.concurrent_spinbox.value() if immediate_processing else 1
         
-        # Get time range settings
-        use_same_time_range = self.use_same_time_range_chk.isChecked()
+        # Get time range settings from the download-mode picker.
+        mode = self.download_mode_combo.currentData()
         time_range = None
         use_percentages = False
-        
-        if use_same_time_range:
+        download_full = False
+
+        if mode == "same":
+            # Reuse the processing range. Selecting this mode auto-enables the
+            # processing checkbox (see on_download_mode_changed); guard anyway.
             if not self.use_time_range_chk.isChecked():
-                self.append_log("⚠️ 'Process only specific time range' is not enabled")
-                return
-            
-            # Get percentage values directly from sliders
+                self.use_time_range_chk.setChecked(True)
             start_pct = self.range_slider.start()
             end_pct = self.range_slider.end()
-            
             if end_pct <= start_pct:
                 self.append_log("⚠️ Invalid time range - end must be greater than start")
                 return
-            
             time_range = (float(start_pct), float(end_pct))
-            use_percentages = True  # Use percentages directly!
-            download_full = False
-            
-            # Log the percentage range
+            use_percentages = True
             self.append_log(f"⏱️ Downloading percentage range: {start_pct}% - {end_pct}%")
-            self.append_log(f"   (yt-dlp will handle the percentage conversion automatically)")
-        else:
+        elif mode == "specific":
+            start_s = self.download_start_input.value()
+            end_s = self.download_end_input.value()
+            if end_s <= start_s:
+                self.append_log("⚠️ Invalid range - end must be greater than start")
+                return
+            time_range = (float(start_s), float(end_s))
+            use_percentages = False
+            self.append_log(f"⏱️ Downloading seconds range: {start_s}s - {end_s}s")
+        else:  # "full"
             download_full = True
             self.append_log("📥 Downloading full videos")
         
@@ -2310,12 +2331,8 @@ class VideoHighlighterGUI(QWidget):
         else:
             self.append_log("📦 Mode: Batch download (process all videos at once)")
         
-        if download_full:
-            self.append_log("📥 Downloading: Full videos")
-        else:
-            start_pct, end_pct = time_range
-            self.append_log(f"⏱️ Downloading: Percentage range {start_pct}% - {end_pct}%")
-        
+        # (Range already logged per-mode above.)
+
         self.append_log("")
         
         # UI state changes
@@ -2566,20 +2583,30 @@ class VideoHighlighterGUI(QWidget):
             self.append_log(f"⚠️ {filename} downloaded but processing failed")
 
 
-    def on_download_full_toggle(self, checked):
-        """Enable/disable time range inputs based on full download checkbox"""
-        self.download_start_input.setEnabled(not checked)
-        self.download_end_input.setEnabled(not checked)
-        if checked:
-            self.download_duration_label.setText("Downloading full videos")
-        else:
+    def on_process_mode_changed(self):
+        """Concurrent downloads only matter while processing overlaps downloads
+        (the 'immediate' mode); grey the spinner otherwise."""
+        self.concurrent_spinbox.setEnabled(
+            self.process_mode_combo.currentData() == "immediate"
+        )
+
+    def on_download_mode_changed(self):
+        """Show the seconds inputs only for 'specific', and make 'same' pull in
+        a processing range to reuse (auto-enable 'Process only specific time
+        range' so there's an actual range instead of the whole video)."""
+        mode = self.download_mode_combo.currentData()
+        if hasattr(self, "download_range_widget"):
+            self.download_range_widget.setVisible(mode == "specific")
+        if mode == "same" and not self.use_time_range_chk.isChecked():
+            self.use_time_range_chk.setChecked(True)
+        if mode == "specific":
             self.update_download_duration()
 
     def update_download_duration(self):
-        """Update the duration label for download time range"""
-        if self.download_full_chk.isChecked():
+        """Update the duration label for the specific-range mode."""
+        if self.download_mode_combo.currentData() != "specific":
             return
-        
+
         start = self.download_start_input.value()
         end = self.download_end_input.value()
         
@@ -2612,7 +2639,7 @@ class VideoHighlighterGUI(QWidget):
             self.append_log(f"📊 Successfully downloaded {len(downloaded_files)} videos")
             
             # Check if immediate processing was enabled
-            if self.immediate_processing_chk.isChecked():
+            if self.process_mode_combo.currentData() == "immediate":
                 # Count successful processing
                 if hasattr(self.download_worker, '_download_results'):
                     processed_count = sum(1 for r in self.download_worker._download_results 
@@ -2651,7 +2678,20 @@ class VideoHighlighterGUI(QWidget):
             self.append_log("\n⚠️ === DOWNLOAD COMPLETED WITH NO FILES ===")
             self.task_label.setText("❌ Download Failed")
             self.task_label.setStyleSheet("color: #f44336; font-weight: bold;")
-        
+
+        # Batch mode: downloads are done, now run the pipeline over them. Add the
+        # files to the list first (batch needs them there regardless of the
+        # auto-add toggle), then hand off to the pipeline.
+        if self.process_mode_combo.currentData() == "batch" and downloaded_files:
+            existing = self.get_file_list()
+            for f in downloaded_files:
+                if f not in existing and os.path.exists(f):
+                    self.file_list.addItem(f)
+            if self.file_list.count() > 0:
+                self.append_log("\n▶️ Starting batch processing of downloaded videos...")
+                self.auto_start_pipeline()
+                return
+
         self.download_cleanup()
         self._show_progress(False)
 
@@ -2677,7 +2717,7 @@ class VideoHighlighterGUI(QWidget):
     def download_cleanup(self):
         """Clean up UI state after download completion/cancellation"""
         # Hide progress bar only if not auto-processing
-        if not self.auto_process_chk.isChecked() or self.file_list.count() == 0:
+        if self.process_mode_combo.currentData() != "batch" or self.file_list.count() == 0:
             self.download_progress_bar.setVisible(False)
             # If you're not auto-processing, also hide processing bar
             self.process_progress_bar.setVisible(False)
@@ -2687,12 +2727,12 @@ class VideoHighlighterGUI(QWidget):
         self.download_btn.setEnabled(True)
         
         # Only re-enable cancel if not auto-processing
-        if not self.auto_process_chk.isChecked() or self.file_list.count() == 0:
+        if self.process_mode_combo.currentData() != "batch" or self.file_list.count() == 0:
             self.cancel_btn.setEnabled(False)
             self.cancel_btn.setText("Cancel")
         
         # Reset task label style after 5 seconds (only if not auto-processing)
-        if not self.auto_process_chk.isChecked() or self.file_list.count() == 0:
+        if self.process_mode_combo.currentData() != "batch" or self.file_list.count() == 0:
             QTimer.singleShot(5000, lambda: self.task_label.setStyleSheet("color: #666; font-weight: bold;"))
         
         # Clean up worker
@@ -3009,12 +3049,10 @@ class VideoHighlighterGUI(QWidget):
                 "last_url": self.download_url_input.text().strip(),
                 "save_dir": self.download_save_dir_input.text().strip(),
                 "auto_add": self.auto_add_downloaded_chk.isChecked(),
-                "auto_process": self.auto_process_chk.isChecked(),
                 "auto_combine": self.auto_combine_chk.isChecked(),
-                "use_same_time_range": self.use_same_time_range_chk.isChecked(),
-                "immediate_processing": self.immediate_processing_chk.isChecked(),
+                "download_mode": self.download_mode_combo.currentData(),
+                "process_mode": self.process_mode_combo.currentData(),
                 "concurrent_downloads": self.concurrent_spinbox.value(),
-                "download_full": self.download_full_chk.isChecked(),
                 "time_range_start": self.download_start_input.value(),
                 "time_range_end": self.download_end_input.value(),
             },
@@ -4367,6 +4405,10 @@ if __name__ == "__main__":
     os.environ.setdefault("QT_FFMPEG_DECODING_HWACCEL", "none")
     os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.ffmpeg=false")
     app = QApplication(sys.argv)
+    # Central theme: one graphite + accent stylesheet for all base widgets.
+    # Additive — screens with their own inline styles still override it.
+    from modules.ui import theme as _ui_theme
+    _ui_theme.apply(app)
     # Reopen the live debug-log window if it was on last session (needs the
     # QApplication, hence here and not earlier).
     debug_console.restore_console_preference()
