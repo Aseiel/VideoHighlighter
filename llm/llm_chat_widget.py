@@ -131,7 +131,7 @@ class _VisualSearchWorker(QObject):
                  stop_on_first_match: bool = True,
                  start_time: float = 0.0,
                  scene_threshold: float = 8.0,
-                 mode: str = "llm", top_k: int = 30, clip_device: str = "GPU"):
+                 mode: str = "llm", top_k: int = 30, clip_device: str = "AUTO"):
         super().__init__()
         self.analyzer = analyzer
         self.target = target
@@ -332,7 +332,7 @@ class _VisualSearchWorker(QObject):
         except Exception as e:
             self.error.emit(f"CLIP prefilter import failed: {e}")
             return None
-        reason = ClipFramePrefilter.import_error()
+        reason = ClipFramePrefilter.import_error(self.clip_device)
         if reason is not None:
             self.error.emit(f"CLIP unavailable — {reason}")
             return None
