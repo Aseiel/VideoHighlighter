@@ -37,7 +37,7 @@ try:
 except Exception:
     pass
 
-from modules.app_paths import resource_path as _resource_path, config_path
+from modules.app_paths import resource_path as _resource_path, data_file as _data_file, config_path
 from version import __version__, __edition__
 
 # --- Contact / support details shown in the About tab ---
@@ -52,7 +52,7 @@ CONFIG_FILE = config_path("config.yaml")
 
 YOLO_OBJECTS_LABELS_FILE = _resource_path("yolo_objects_labels.json")
 KINETICS_400_LABELS_FILE = _resource_path("kinetics_400_labels.json")
-INTEL_CUSTOM_LABELS_FILE = _resource_path("intel_finetuned_classifier_3d_mapping.json")
+INTEL_CUSTOM_LABELS_FILE = _data_file("intel_finetuned_classifier_3d_mapping.json")
 R3D_CUSTOM_LABELS_FILE = _resource_path("r3d_finetuned_mapping.json")
 
 class LabelSelectorDialog(QDialog):
@@ -1572,6 +1572,52 @@ class VideoHighlighterGUI(QWidget):
 
         self.action_models_combo = QComboBox()
 
+        import_action_btn = QPushButton("Import model…")
+        import_action_btn.setToolTip(
+            "Copy a trained OpenVINO action decoder (.xml + .bin) into the app's "
+            "custom-model slot. A same-named .json labels file next to it is "
+            "picked up automatically, or you'll be asked to pick one.")
+        action_model_row = QHBoxLayout()
+        action_model_row.addWidget(self.action_models_combo, 1)
+        action_model_row.addWidget(import_action_btn)
+        action_model_widget = QWidget()
+        action_model_widget.setLayout(action_model_row)
+
+        def _import_action_model():
+            from modules.app_paths import import_custom_action_model
+            src, _ = QFileDialog.getOpenFileName(
+                self, "Import custom action decoder", "",
+                "OpenVINO IR (*.xml);;All files (*)")
+            if not src:
+                return
+            labels_src = ""
+            if not os.path.exists(os.path.splitext(src)[0] + ".json"):
+                labels_src, _ = QFileDialog.getOpenFileName(
+                    self, "Labels file for this decoder (idx_to_label JSON)", "",
+                    "JSON (*.json);;All files (*)")
+            try:
+                n_classes = import_custom_action_model(src, labels_src)
+                if n_classes == 0:
+                    print("⚠️ Custom action decoder imported without a labels file "
+                          "— it won't be usable until one is provided")
+                # Fresh re-resolution (not the frozen INTEL_CUSTOM_LABELS_FILE
+                # constant) so the newly imported model shows up immediately,
+                # without requiring an app restart.
+                from modules.app_paths import custom_action_decoder_paths
+                fresh_labels_path = custom_action_decoder_paths()[2]
+                self._custom_ov_count = (
+                    len(self.load_labels_from_json(fresh_labels_path))
+                    if os.path.exists(fresh_labels_path) else 0
+                )
+                on_action_backend_changed(0)
+                idx = self.action_models_combo.findData("custom_only")
+                if idx >= 0:
+                    self.action_models_combo.setCurrentIndex(idx)
+            except Exception as e:
+                print(f"⚠️ action model import failed: {e}")
+
+        import_action_btn.clicked.connect(_import_action_model)
+
         self.r3d_model_combo = QComboBox()
         self.r3d_model_combo.addItem("R3D-18 (fastest)", "r3d_18")
         self.r3d_model_combo.addItem("MC3-18 (mixed convolution)", "mc3_18")
@@ -1632,7 +1678,7 @@ class VideoHighlighterGUI(QWidget):
 
         action_layout.addRow("Frame skip:", self.sample_rate_spin)
         action_layout.addRow("Backend:", self.action_backend_combo)
-        action_layout.addRow("Models:", self.action_models_combo)
+        action_layout.addRow("Models:", action_model_widget)
         action_layout.addRow("R3D model variant:", self.r3d_model_combo)
 
         action_box.setLayout(action_layout)

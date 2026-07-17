@@ -171,6 +171,56 @@ def discover_object_models() -> list:
     return out
 
 
+def custom_action_decoder_paths() -> tuple[str, str, str]:
+    """Fixed install locations for the user's custom fine-tuned OpenVINO action
+    decoder: (xml, bin, labels_json). Same resolve-with-override rule as
+    data_file() — a copy here (written by the Advanced tab's "Import model…"
+    button) overrides the bundled default."""
+    return (
+        data_file("action_classifier_3d.xml"),
+        data_file("action_classifier_3d.bin"),
+        data_file("intel_finetuned_classifier_3d_mapping.json"),
+    )
+
+
+def import_custom_action_model(decoder_xml_src: str, labels_json_src: str = "") -> int:
+    """Install a user-trained OpenVINO action decoder (+ its .bin, + a labels
+    mapping) into the writable user-data location, so it's picked up in place
+    of the bundled default — mirrors object_models_dir()'s import flow, but
+    for the single custom-action-decoder slot (no multi-model discovery here).
+
+    ``labels_json_src`` may be omitted — a same-named ``*.json`` next to
+    ``decoder_xml_src`` is used automatically if present (what the training
+    pipeline writes alongside the decoder).
+
+    Returns the number of classes found in the installed labels file (0 if
+    none), so the caller can report/validate the import.
+    """
+    dst_xml, dst_bin, dst_labels = custom_action_decoder_paths()
+    os.makedirs(os.path.dirname(dst_xml), exist_ok=True)
+    shutil.copy2(decoder_xml_src, dst_xml)
+
+    src_bin = os.path.splitext(decoder_xml_src)[0] + ".bin"
+    if os.path.exists(src_bin):
+        shutil.copy2(src_bin, dst_bin)
+
+    if not labels_json_src:
+        candidate = os.path.splitext(decoder_xml_src)[0] + ".json"
+        if os.path.exists(candidate):
+            labels_json_src = candidate
+
+    n_classes = 0
+    if labels_json_src and os.path.exists(labels_json_src):
+        shutil.copy2(labels_json_src, dst_labels)
+        try:
+            import json
+            with open(dst_labels, "r", encoding="utf-8") as f:
+                n_classes = len(json.load(f).get("idx_to_label", {}))
+        except Exception:
+            pass
+    return n_classes
+
+
 def ffmpeg_exe() -> str:
     """Resolve a usable ffmpeg executable.
 
