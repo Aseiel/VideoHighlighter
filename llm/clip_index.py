@@ -34,7 +34,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from llm.clip_prefilter import ClipFramePrefilter
+from llm.clip_prefilter import ClipFramePrefilter, to_numpy
 
 # Bump when the .npz layout changes in a way old caches can't satisfy.
 # v2: v1 memos were written by a scan whose grid was offset by start_time, so
@@ -93,12 +93,6 @@ class ClipEmbedder(ClipFramePrefilter):
         # CLIP stays correct. (openai/clip-vit-base-patch32 gives 100.0.)
         self._logit_scale: Optional[float] = None
 
-    def _forward(self, texts: Sequence[str], images: Sequence):
-        inputs = self._processor(
-            text=list(texts), images=list(images), return_tensors="pt", padding=True,
-        )
-        return self._model(**inputs)
-
     def _capture_logit_scale(self, out, img_unit: np.ndarray, txt_unit: np.ndarray):
         """logits_per_image = scale * (img . txt) for unit-norm embeddings, so
         the scale falls out of any pass we've already run. Pick the pair with the
@@ -110,7 +104,7 @@ class ClipEmbedder(ClipFramePrefilter):
         denom = float(cos[i, j])
         if abs(denom) < 1e-6:
             return  # degenerate batch; try again on the next one
-        logits = out.logits_per_image.detach().numpy()
+        logits = to_numpy(out.logits_per_image)
         self._logit_scale = float(logits[i, j] / denom)
 
     @property
@@ -135,10 +129,10 @@ class ClipEmbedder(ClipFramePrefilter):
         if self._model is None:
             raise RuntimeError("Call load() first.")
         images = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for f in frames_bgr]
-        out = self._forward([_DUMMY_TEXT], images)
-        img = l2_normalize(out.image_embeds.detach().numpy().astype(np.float32))
+        out = self.infer([_DUMMY_TEXT], images)
+        img = l2_normalize(to_numpy(out.image_embeds).astype(np.float32))
         self._capture_logit_scale(
-            out, img, l2_normalize(out.text_embeds.detach().numpy().astype(np.float32))
+            out, img, l2_normalize(to_numpy(out.text_embeds).astype(np.float32))
         )
         return img
 
@@ -151,10 +145,10 @@ class ClipEmbedder(ClipFramePrefilter):
         dummy = Image.fromarray(
             np.zeros((_DUMMY_IMAGE_SIZE, _DUMMY_IMAGE_SIZE, 3), dtype=np.uint8)
         )
-        out = self._forward(texts, [dummy])
-        txt = l2_normalize(out.text_embeds.detach().numpy().astype(np.float32))
+        out = self.infer(texts, [dummy])
+        txt = l2_normalize(to_numpy(out.text_embeds).astype(np.float32))
         self._capture_logit_scale(
-            out, l2_normalize(out.image_embeds.detach().numpy().astype(np.float32)), txt
+            out, l2_normalize(to_numpy(out.image_embeds).astype(np.float32)), txt
         )
         return txt
 
@@ -346,7 +340,7 @@ def open_memo(video_path: str, model_id: str, cache_path: Optional[str] = None,
 
 
 def build_index(video_path: str, interval: float = 1.0, batch: int = 16,
-                device: str = "GPU", embedder: Optional[ClipEmbedder] = None,
+                device: str = "AUTO", embedder: Optional[ClipEmbedder] = None,
                 progress=None) -> ClipFrameIndex:
     """Sample `video_path` every `interval` seconds and embed each frame once.
 
@@ -409,7 +403,7 @@ def build_index(video_path: str, interval: float = 1.0, batch: int = 16,
 
 
 def load_or_build(video_path: str, cache_path: str, interval: float = 1.0,
-                  device: str = "GPU", **kw) -> ClipFrameIndex:
+                  device: str = "AUTO", **kw) -> ClipFrameIndex:
     """Reuse a cached index when it still fits the video, else build and cache."""
     model_id = kw.pop("model_id", None) or ClipFramePrefilter().model_id
     if os.path.exists(cache_path):
@@ -438,7 +432,9 @@ def main():
                     help="repeatable; each is scored against the same index")
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--topk", type=int, default=20)
-    ap.add_argument("--device", default="GPU")
+    ap.add_argument("--device", default="AUTO",
+                    help="AUTO/GPU (NVIDIA if present, else Intel GPU, else CPU), "
+                         "CUDA, cuda:N, CPU, or any OpenVINO device string")
     ap.add_argument("--cache", default=None, help="path to .npz index cache")
     args = ap.parse_args()
 
