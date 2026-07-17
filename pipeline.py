@@ -432,6 +432,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         EXACT_DURATION = gui_config.get("exact_duration") or config.get("highlights", {}).get("exact_duration", None)
         CLIP_TIME = gui_config.get("clip_time") or config.get("highlights", {}).get("clip_time", 10)
         KEEP_TEMP = gui_config.get("keep_temp", config.get("highlights", {}).get("keep_temp", False))
+        # How the final clips are cut/encoded: "cpu" (libx265/libx264 re-encode,
+        # VR-safe, slow) or "gpu" (hardware re-encode, fast, may not play in some
+        # VR players).
+        RENDER_MODE = gui_config.get("render_mode", config.get("highlights", {}).get("render_mode", "cpu"))
+        if RENDER_MODE not in ("cpu", "gpu"):
+            RENDER_MODE = "cpu"
 
         # Transcript settings
         USE_TRANSCRIPT = gui_config.get("use_transcript", False) and TRANSCRIPT_AVAILABLE
@@ -2103,13 +2109,15 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # Cut and concatenate
         progress.update_progress(90, 100, "Pipeline", "Creating highlight video...")
-        log("🔹 Step 7: Cutting video segments...")
+        _render_mode_label = {"cpu": "CPU re-encode (libx265/264)",
+                              "gpu": "GPU re-encode"}[RENDER_MODE]
+        log(f"🔹 Step 7: Cutting video segments... [{_render_mode_label}]")
         try:
             if len(segments) == 0:
                 log("⚠️ No segments selected — nothing to cut.")
             elif len(segments) == 1:
                 check_cancellation(cancel_flag, log, "video cutting")
-                cut_video(processed_video_path, segments[0][0], segments[0][1], OUTPUT_FILE)
+                cut_video(processed_video_path, segments[0][0], segments[0][1], OUTPUT_FILE, mode=RENDER_MODE)
             else:
                 temp_clips = []
                 # Get the directory of the output file to save temp clips in the same location
@@ -2126,7 +2134,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # Include the directory path for temp files
                     temp_name = os.path.join(output_dir, f"{video_base_name}_temp_clip_{i}.mp4")
                     log(f"  Creating temp clip: {temp_name}")
-                    cut_video(processed_video_path, s, e, temp_name)
+                    cut_video(processed_video_path, s, e, temp_name, mode=RENDER_MODE)
                     
                     # Verify the file was created
                     if not os.path.exists(temp_name):

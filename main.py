@@ -1410,7 +1410,7 @@ class VideoHighlighterGUI(QWidget):
         )
         motion_layout.addRow("", self.vr_mode_chk)
         motion_box.setLayout(motion_layout)
-        advanced_layout.addWidget(motion_box, 0, 0)
+        advanced_layout.addWidget(motion_box, 1, 0)
 
         # ── Group 2: Object Recognition ──
         object_box = QGroupBox("Object Recognition")
@@ -1546,7 +1546,7 @@ class VideoHighlighterGUI(QWidget):
         object_layout.addRow("Confidence threshold:", self.obj_confidence_spin)
 
         object_box.setLayout(object_layout)
-        advanced_layout.addWidget(object_box, 1, 0)
+        advanced_layout.addWidget(object_box, 2, 0)
 
         # ── Group 3: Action Recognition ──
         action_box = QGroupBox("Action Recognition")
@@ -1636,7 +1636,7 @@ class VideoHighlighterGUI(QWidget):
         action_layout.addRow("R3D model variant:", self.r3d_model_combo)
 
         action_box.setLayout(action_layout)
-        advanced_layout.addWidget(action_box, 1, 1)
+        advanced_layout.addWidget(action_box, 2, 1)
 
         # ── Group 4: Bounding Box Visualization ──
         # ── Group 4: Composition Rules ──
@@ -1687,7 +1687,7 @@ class VideoHighlighterGUI(QWidget):
         comp_outer.addLayout(comp_btn_row)
 
         comp_box.setLayout(comp_outer)
-        advanced_layout.addWidget(comp_box, 2, 0, 1, 2)
+        advanced_layout.addWidget(comp_box, 3, 0, 1, 2)
 
         # ---- load existing rules into table ----
         def _comp_load_rules():
@@ -1824,12 +1824,36 @@ class VideoHighlighterGUI(QWidget):
         bbox_layout.addWidget(self.bbox_actions_chk)
 
         bbox_box.setLayout(bbox_layout)
-        advanced_layout.addWidget(bbox_box, 0, 1)
+        advanced_layout.addWidget(bbox_box, 1, 1)
+
+        # ── Group: Video Output ──
+        # How the final highlight is re-encoded. CPU (libx265) is VR-safe but slow;
+        # GPU is fast but its HEVC may not play in some VR players. Placed at the top
+        # of Advanced so it's easy to find when a VR player rejects a render.
+        output_box = QGroupBox("Video Output")
+        output_layout = QFormLayout()
+        self.render_mode_combo = QComboBox()
+        self.render_mode_combo.addItem("CPU x265 (VR-safe, slow)", "cpu")
+        self.render_mode_combo.addItem("GPU (fast, may break VR)", "gpu")
+        self.render_mode_combo.setToolTip(
+            "How the highlight video is encoded:\n"
+            "CPU x265 — re-encode on the CPU with libx265 (HEVC), matching how VR\n"
+            "   sources are authored. VR-safe, but slow at 6K.\n"
+            "GPU — re-encode with the hardware encoder. Fast, but the HEVC output\n"
+            "   may not play in VR players like HereSphere."
+        )
+        _saved_render_mode = highlights_cfg.get("render_mode", "cpu")
+        _rm_idx = self.render_mode_combo.findData(_saved_render_mode)
+        if _rm_idx >= 0:
+            self.render_mode_combo.setCurrentIndex(_rm_idx)
+        output_layout.addRow("Cut / encode:", self.render_mode_combo)
+        output_box.setLayout(output_layout)
+        advanced_layout.addWidget(output_box, 0, 0, 1, 2)
 
         # Equal column widths; let the row below the composition table absorb slack
         advanced_layout.setColumnStretch(0, 1)
         advanced_layout.setColumnStretch(1, 1)
-        advanced_layout.setRowStretch(3, 1)
+        advanced_layout.setRowStretch(4, 1)
 
         advanced_scroll = QScrollArea()
         advanced_scroll.setWidgetResizable(True)
@@ -2558,6 +2582,7 @@ class VideoHighlighterGUI(QWidget):
             "multi_signal_boost": 1.2,
             "min_signals_for_boost": 2,
             "keep_temp": self.keep_temp_chk.isChecked(),
+            "render_mode": self.render_mode_combo.currentData(),
             "highlight_objects": highlight_objects,
             "interesting_actions": interesting_actions,
             "actions_require_objects": self.actions_require_objects_chk.isChecked(),
@@ -3090,6 +3115,7 @@ class VideoHighlighterGUI(QWidget):
                 "max_duration": int(self.spin_max_duration.value()),
                 "exact_duration": int(self.spin_exact_duration.value()),
                 "keep_temp": self.keep_temp_chk.isChecked(),
+                "render_mode": self.render_mode_combo.currentData(),
                 "skip_highlights": self.skip_highlights_chk.isChecked(),
                 "auto_min_clip": int(self.spin_auto_min_clip.value()),
                 "auto_max_clip": int(self.spin_auto_max_clip.value()),
@@ -3896,6 +3922,7 @@ class VideoHighlighterGUI(QWidget):
             "multi_signal_boost": 1.2,
             "min_signals_for_boost": 2,
             "keep_temp": self.keep_temp_chk.isChecked(),
+            "render_mode": self.render_mode_combo.currentData(),
             "output_file": output_file,
             "highlight_objects": highlight_objects,
             "interesting_actions": interesting_actions,
