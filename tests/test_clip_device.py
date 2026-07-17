@@ -148,16 +148,29 @@ def test_device_name_reports_the_gpu(monkeypatch):
 
 @pytest.fixture
 def import_spy(monkeypatch):
-    """Record every module import_error() probes, with optimum-intel absent."""
+    """Record what import_error() probes, on a simulated CUDA-only install:
+    torch/transformers/PIL importable, optimum-intel not.
+
+    Every module import_error touches is answered from here rather than from the
+    ambient environment. That is the point of the fixture, not incidental: the
+    minimal dev env (requirements-dev.txt) has no pillow and conftest doesn't
+    shim it, so a spy that deferred to the real importer passed on a full ML box
+    and failed on a bare one — reporting the absence of pillow as if it were the
+    thing under test.
+    """
     import builtins
+    from unittest.mock import MagicMock
 
     real_import = builtins.__import__
+    stubbed = {"torch", "transformers", "PIL"}
     seen: list[str] = []
 
     def spy(name, *args, **kwargs):
         seen.append(name)
         if name == "optimum.intel":
             raise ImportError("optimum-intel is not installed")
+        if name in stubbed:
+            return MagicMock()
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", spy)
