@@ -30,6 +30,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+from modules.ui import icons as _ui_icons, theme as _ui_theme
 
 try:
     import openvino  # registers OpenVINO's DLL dir on Windows
@@ -970,6 +971,18 @@ class VideoHighlighterGUI(QWidget):
         self.download_progress_bar.setRange(0, 100)
         progress_layout.addWidget(self.download_progress_bar)
 
+        # Batch counter — its own row because the process bar and task_label
+        # below are rewritten by every pipeline stage of the current video.
+        self.batch_progress_bar = QProgressBar()
+        self.batch_progress_bar.setVisible(False)
+        self.batch_progress_bar.setFormat("%v / %m videos")
+        progress_layout.addWidget(self.batch_progress_bar)
+
+        self.batch_label = QLabel()
+        self.batch_label.setVisible(False)
+        self.batch_label.setStyleSheet("color: #666; font-weight: bold;")
+        progress_layout.addWidget(self.batch_label)
+
         self.process_progress_bar = QProgressBar()
         self.process_progress_bar.setVisible(False)
         self.process_progress_bar.setRange(0, 100)
@@ -1108,15 +1121,30 @@ class VideoHighlighterGUI(QWidget):
         self.process_mode_combo.currentIndexChanged.connect(self.on_process_mode_changed)
         self.on_process_mode_changed()  # sync spinner enabled state
 
-        # Download button
+        # Download buttons. The pair is "choose some" vs "take everything", so
+        # the labels say which is which, and only the second gets accent fill.
         download_btn_layout = QHBoxLayout()
-        self.browse_select_btn = QPushButton("🗂 Browse & Select…")
-        self.browse_select_btn.setStyleSheet("QPushButton { background-color: #3a3a3a; color: white; font-weight: bold; padding: 8px; }")
+        self.browse_select_btn = QPushButton("Pick Videos from Page…")
+        self.browse_select_btn.setIcon(_ui_icons.picker())
+        # No inline style: this is a plain secondary button, so it inherits the
+        # theme's default QPushButton and stays in step if the palette changes.
         self.browse_select_btn.setToolTip("Open a grid of the site's videos (thumbnails) and pick which ones to download")
         self.browse_select_btn.clicked.connect(self.browse_and_select_videos)
 
-        self.download_btn = QPushButton("🌐 Download Videos")
-        self.download_btn.setStyleSheet("QPushButton { background-color: #2f81f7; color: white; font-weight: bold; padding: 8px; }")
+        self.download_btn = QPushButton("Download All")
+        self.download_btn.setIcon(_ui_icons.download())
+        self.download_btn.setToolTip("Download every video found on the page, without picking")
+        # Accent fill marks the primary action. The disabled rule matters: this
+        # button is switched off for the whole download, and without it the fill
+        # stays bright blue and keeps inviting clicks that do nothing.
+        _p = _ui_theme.DARK
+        self.download_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {_p.accent}; color: {_p.on_accent};"
+            f" font-weight: bold; padding: 8px; border: none; border-radius: {_p.radius}px; }}"
+            f"QPushButton:hover {{ background-color: {_p.accent_hover}; }}"
+            f"QPushButton:pressed {{ background-color: {_p.accent_press}; }}"
+            f"QPushButton:disabled {{ background-color: {_p.surface}; color: {_p.text_mute}; }}"
+        )
         # lambda so the clicked(bool) arg isn't passed as start_download's video_urls
         self.download_btn.clicked.connect(lambda: self.start_download())
         download_btn_layout.addStretch()
@@ -1823,13 +1851,13 @@ class VideoHighlighterGUI(QWidget):
         self.llm_chat = LLMChatWidget(parent=self)
         llm_layout.addWidget(self.llm_chat)
         llm_tab.setLayout(llm_layout)
-        tabs.addTab(llm_tab, "🤖 LLM Chat")
+        tabs.addTab(llm_tab, "LLM Chat")
 
         # --- Tab 5: Avoid ---
         avoid_tab = QWidget()
         avoid_layout = QVBoxLayout()
 
-        avoid_group = QGroupBox("🚫 Avoid People")
+        avoid_group = QGroupBox("Avoid People")
         avoid_group_layout = QVBoxLayout()
 
         self.avoid_face_recognition_chk = QCheckBox("Enable face recognition")
@@ -1888,10 +1916,10 @@ class VideoHighlighterGUI(QWidget):
         avoid_group.setLayout(avoid_group_layout)
         avoid_layout.addWidget(avoid_group, 1)
         avoid_tab.setLayout(avoid_layout)
-        tabs.addTab(avoid_tab, "🚫 Avoid")
+        tabs.addTab(avoid_tab, "Avoid")
 
         # --- Tab: About & Contact ---
-        tabs.addTab(self._build_about_tab(), "ℹ️ About")
+        tabs.addTab(self._build_about_tab(), "About")
 
         # Defer first populate until after __init__ finishes (so log_output exists)
         QTimer.singleShot(0, self.refresh_avoid_list)
@@ -3445,20 +3473,31 @@ class VideoHighlighterGUI(QWidget):
         if not visible:
             self.download_progress_bar.setVisible(False)
             self.process_progress_bar.setVisible(False)
+            self.hide_batch_progress()
             self.task_label.setText("Ready")
 
-    def update_progress(self, current, total, task_name, details=""):
-        # Decide which bar based on task_name or status
-        if "download" in task_name.lower() or "extract" in task_name.lower():
-            self.update_download_progress(current, total, task_name, details)
+    @Slot(int, int, str, str)
+    def update_pipeline_progress(self, current: int, total: int, task_name: str, details: str = ""):
+        """Split the batch counter off to its own row. Everything else the
+        pipeline emits is a stage of the video currently being worked on."""
+        if task_name.lower().startswith("batch"):
+            self.update_batch_progress(current, total, task_name, details)
         else:
             self.update_process_progress(current, total, task_name, details)
 
-    @Slot(str)
-    def set_download_busy(self, text: str):
-        self.download_progress_bar.setVisible(True)
-        self.download_progress_bar.setRange(0, 0)  # indeterminate
-        self.task_label.setText(text)
+    @Slot(int, int, str, str)
+    def update_batch_progress(self, current: int, total: int, task_name: str, details: str = ""):
+        """Videos finished out of total, kept visible for the whole batch run."""
+        self.batch_progress_bar.setRange(0, max(1, total))
+        self.batch_progress_bar.setValue(max(0, min(current, total)))
+        self.batch_progress_bar.setVisible(True)
+        self.batch_label.setText(f"📦 {details}")
+        self.batch_label.setVisible(True)
+        QApplication.processEvents()
+
+    def hide_batch_progress(self):
+        self.batch_progress_bar.setVisible(False)
+        self.batch_label.setVisible(False)
 
     @Slot(str)
     def set_process_busy(self, text: str):
@@ -3930,6 +3969,9 @@ class VideoHighlighterGUI(QWidget):
         self.process_progress_bar.setRange(0, 100)
         self.process_progress_bar.setValue(0)
         self.download_progress_bar.setVisible(False)
+        # The pipeline reveals this again on the first batch update; a single-file
+        # run must not inherit the last batch's counter.
+        self.hide_batch_progress()
         self.task_label.setText("🚀 Initializing...")
         self.run_btn.setText("⏸ Pause")
         self.run_btn.setStyleSheet("QPushButton { background-color: #ff8c00; color: white; font-weight: bold; padding: 8px; }")
@@ -3946,7 +3988,7 @@ class VideoHighlighterGUI(QWidget):
         self.worker = Worker(video_paths, config)
         self.worker.preview_enabled = self.live_preview_checkbox.isChecked()
         self.worker.log.connect(self.append_log)
-        self.worker.progress.connect(self.update_process_progress)
+        self.worker.progress.connect(self.update_pipeline_progress)
         self.worker.finished.connect(self.pipeline_done)
         self.worker.cancelled.connect(self.pipeline_cancelled)
         self.worker.preview.connect(self.on_preview_frame)
@@ -4407,7 +4449,6 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     # Central theme: one graphite + accent stylesheet for all base widgets.
     # Additive — screens with their own inline styles still override it.
-    from modules.ui import theme as _ui_theme
     _ui_theme.apply(app)
     # Reopen the live debug-log window if it was on last session (needs the
     # QApplication, hence here and not earlier).
