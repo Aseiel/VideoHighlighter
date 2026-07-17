@@ -36,6 +36,8 @@ selenium
 trio
 trio-websocket
 webdriver-manager
-# Visual search — CLIP prefilter (OpenVINO on Intel GPU). pillow is above.
+# Visual search — CLIP prefilter. Two backends, picked at runtime: torch/CUDA on
+# NVIDIA (torch is above; a CPU-only wheel simply never selects it) and OpenVINO
+# on Intel GPU / CPU. pillow is above.
 transformers
-optimum-intel
+optimum-intel  # OpenVINO backend only — the CUDA path does not import it

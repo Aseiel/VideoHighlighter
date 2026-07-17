@@ -1,10 +1,20 @@
 """
-Path D — Step 2: CLIP frame prefilter (OpenVINO, Intel GPU).
+Path D — Step 2: CLIP frame prefilter (NVIDIA CUDA or Intel GPU via OpenVINO).
 
 A reusable scorer that ranks video frames by how well they match a text query,
-using CLIP on the Intel Arc GPU through OpenVINO (~3-7 ms/frame). It is meant to
-run as a *prefilter*: scan the whole video cheaply, keep the top-K candidate
-timestamps, and let the slow uncensored VLM confirm only those.
+using CLIP on the GPU (~3-7 ms/frame). It is meant to run as a *prefilter*: scan
+the whole video cheaply, keep the top-K candidate timestamps, and let the slow
+uncensored VLM confirm only those.
+
+Two backends, same weights and the same output fields, picked automatically:
+
+  - **torch/CUDA** on an NVIDIA GPU. OpenVINO has no NVIDIA plugin, so on those
+    machines the OpenVINO path below silently lands on the CPU — an order of
+    magnitude slower. Hence this backend.
+  - **OpenVINO** on an Intel GPU (and as the CPU fallback everywhere).
+
+Embeddings from the two agree to well under the fp16 the index stores, so a
+cache built on one machine stays valid on the other.
 
 CLIP has no safety filter and never refuses — it only computes image<->text
 similarity — which is exactly why it works for content the VLM then confirms.
@@ -18,7 +28,13 @@ Watch whether the top-K timestamps actually land on the moments you expect.
 If they do, we wire this into the visual-search worker. If base CLIP is too
 weak for your target, change MODEL_ID to a domain-tuned CLIP — same code path.
 
-Requires:  pip install "optimum[openvino]" pillow opencv-python
+Requires:  pip install transformers pillow opencv-python numpy
+           ...plus one backend:
+             NVIDIA — a CUDA torch build (pytorch.org); optimum is not needed
+             Intel/CPU — pip install "optimum[openvino]" optimum-intel
+
+`python -m tools.check_clip_device` reports which backend a machine resolves to,
+proves it agrees with the CPU, and benchmarks it.
 """
 from __future__ import annotations
 
@@ -77,8 +93,93 @@ def _bundled_ov_dir() -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Backend selection
+#
+# Deliberately a local probe rather than modules.device_utils: this module is
+# lazily imported (sometimes inside a frozen exe) and stays self-contained for
+# the same reason _ov_dir_candidates does. detect_best_device() would also drag
+# in an OpenVINO Core probe and its logging just to answer one bool.
+# ---------------------------------------------------------------------------
+
+# Device strings that mean "whichever GPU this machine actually has". "GPU" is
+# included because every existing caller passes it to mean exactly that, and
+# because OpenVINO's "GPU" (= Intel) is a dead end on an NVIDIA box.
+_AUTO_DEVICES = ("AUTO", "GPU")
+
+
+def cuda_device() -> Optional[str]:
+    """The torch device string for a usable NVIDIA GPU, else None.
+
+    Never raises: a torch without CUDA compiled in, or a driver mismatch, means
+    "no CUDA" rather than a broken search.
+    """
+    try:
+        import torch
+    except Exception:
+        return None
+    try:
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            return "cuda:0"
+    except Exception as e:  # noqa: BLE001 — a probe must never break the caller
+        print(f"⚠️  CLIP: CUDA probe failed ({type(e).__name__}: {e})")
+    return None
+
+
+def _device_name(device: str) -> str:
+    """The GPU's marketing name for the log, or the bare device string. Cosmetic
+    only — never let a failed lookup here cost us the GPU."""
+    try:
+        import torch
+
+        return torch.cuda.get_device_name(device)
+    except Exception:  # noqa: BLE001
+        return device
+
+
+def resolve_device(requested: str) -> tuple[str, str]:
+    """Map a requested device onto (backend, device).
+
+    backend is "torch" or "openvino"; device is that backend's own device string.
+
+        "AUTO"/"GPU" -> CUDA if present, else OpenVINO GPU (Intel), else CPU
+        "CUDA"/"cuda:N" -> torch CUDA, falling back to OpenVINO if absent
+        anything else ("CPU", "GPU.1", "NPU", ...) -> OpenVINO, passed through
+    """
+    req = (requested or "AUTO").strip()
+
+    if req.upper() in _AUTO_DEVICES:
+        dev = cuda_device()
+        if dev:
+            return "torch", dev
+        # No NVIDIA: hand OpenVINO the Intel GPU. load() drops to CPU if the
+        # plugin won't take it, so "GPU" stays safe on a machine with neither.
+        return "openvino", "GPU"
+
+    if req.lower().startswith("cuda"):
+        dev = cuda_device()
+        if dev:
+            # Honour an explicit ordinal ("cuda:1"); bare "cuda" -> cuda:0.
+            return "torch", req.lower() if ":" in req else dev
+        print(f"⚠️  CLIP: {req!r} requested but no CUDA device is available; "
+              f"using OpenVINO.")
+        return "openvino", "GPU"
+
+    return "openvino", req
+
+
+def to_numpy(tensor):
+    """Tensor -> numpy, from either backend.
+
+    The CUDA backend's outputs live in GPU memory, where .numpy() raises; the
+    .cpu() hop is a no-op on the OpenVINO backend's already-CPU tensors.
+    """
+    return tensor.detach().cpu().numpy()
+
+
 class ClipFramePrefilter:
-    """Score BGR frames (OpenCV format) against a text query via OpenVINO CLIP."""
+    """Score BGR frames (OpenCV format) against a text query via CLIP,
+    on NVIDIA (torch/CUDA) or Intel/CPU (OpenVINO)."""
 
     # Generic negatives so the positive prompt gets a calibrated softmax score
     # rather than a raw, hard-to-threshold cosine similarity.
@@ -88,24 +189,34 @@ class ClipFramePrefilter:
         "something else entirely",
     )
 
-    def __init__(self, model_id: str = MODEL_ID, device: str = "GPU"):
+    def __init__(self, model_id: str = MODEL_ID, device: str = "AUTO"):
         self.model_id = model_id
+        # Resolved for real in load(); kept as requested until then so a caller
+        # reading .device before load() sees what it asked for.
         self.device = device
+        self.backend: Optional[str] = None   # "torch" | "openvino", set by load()
         self._model = None
         self._processor = None
+        self._dtype = None                   # torch backend only
         self._labels: Optional[list[str]] = None  # index 0 is always the positive
 
     @staticmethod
-    def import_error() -> Optional[str]:
-        """None if the OpenVINO CLIP stack imports cleanly, else a string naming
-        the specific module that failed and the underlying exception.
+    def import_error(device: str = "AUTO") -> Optional[str]:
+        """None if the CLIP stack for `device` imports cleanly, else a string
+        naming the specific module that failed and the underlying exception.
 
         available() only says yes/no, which is useless in the windowed exe where
         the traceback is invisible. This catches *any* Exception (not just
         ImportError) so frozen-build failures show up verbatim — e.g. a missing
         dependency's metadata (PackageNotFoundError, a subclass of ImportError)
-        or 'could not get source code' from a decorator's inspect.getsource."""
-        for mod in ("optimum.intel", "transformers", "PIL"):
+        or 'could not get source code' from a decorator's inspect.getsource.
+
+        Only the backend that would actually be used is checked, so a CUDA-only
+        install without optimum-intel isn't told CLIP is unavailable."""
+        backend, _ = resolve_device(device)
+        mods = (("torch",) if backend == "torch" else ("optimum.intel",)) + \
+               ("transformers", "PIL")
+        for mod in mods:
             try:
                 __import__(mod)
             except Exception as e:  # noqa: BLE001 — report anything, not just ImportError
@@ -113,13 +224,69 @@ class ClipFramePrefilter:
         return None
 
     @staticmethod
-    def available() -> bool:
-        """True if the OpenVINO CLIP stack is importable."""
-        return ClipFramePrefilter.import_error() is None
+    def available(device: str = "AUTO") -> bool:
+        """True if the CLIP stack for `device` is importable."""
+        return ClipFramePrefilter.import_error(device) is None
 
     def load(self):
-        """Load CLIP on the requested device, falling back to CPU if the GPU
-        plugin can't take it (so a missing GPU never breaks search outright)."""
+        """Load CLIP on the best device for what this machine has, falling back
+        a step at a time (CUDA -> Intel GPU -> CPU) so a missing GPU never
+        breaks search outright."""
+        backend, device = resolve_device(self.device)
+        if backend == "torch" and self._load_torch(device):
+            return
+        self._load_openvino("GPU" if backend == "torch" else device)
+
+    def _load_torch(self, device: str) -> bool:
+        """Load CLIP on an NVIDIA GPU via torch. True on success; False means
+        the caller should fall back to OpenVINO (rather than lose search over,
+        say, a GPU that's out of memory).
+
+        Unlike the OpenVINO path this needs the *torch* weights, which are not
+        in the bundled IR — so a first run fetches them to the HF cache. Offline,
+        that fetch fails and we fall back, which is why nothing here is fatal.
+        """
+        import torch
+
+        print(f"🔧 CLIP source: torch weights {self.model_id} -> "
+              f"{device} ({_device_name(device)})")
+        t0 = time.perf_counter()
+        try:
+            # Imported inside the try with everything else: in a frozen exe an
+            # import here can fail on its own (see this module's docstring), and
+            # that must cost us the GPU, not the search.
+            from transformers import CLIPModel, CLIPProcessor
+
+            # fp16 unconditionally, and it costs nothing that survives to the
+            # index: embeddings are L2-normalised in fp32 afterwards and stored
+            # as fp16 either way (measured agreement with fp32: 0.999997).
+            #
+            # Not obvious for pre-Volta cards, which have no Tensor Cores and
+            # run *native* fp16 arithmetic at a fraction of fp32 — the reason to
+            # expect fp16 to lose there. Measured on a GTX 1060 (sm_61) it wins
+            # by 14% anyway: torch keeps fp32 accumulation for fp16 GEMMs, so
+            # the ALU penalty never applies, while ViT-B/32 at these batch sizes
+            # is bandwidth-bound and fp16 halves the traffic. Don't "fix" this
+            # to a capability check without measuring on the card in question.
+            dtype = torch.float16
+            model = CLIPModel.from_pretrained(self.model_id, torch_dtype=dtype)
+            self._model = model.to(device).eval()
+            # The OV export dir carries the processor files, so prefer it and
+            # keep the tokenizer/image config off the network.
+            self._processor = CLIPProcessor.from_pretrained(_bundled_ov_dir() or self.model_id)
+        except Exception as e:  # noqa: BLE001 — OOM, no driver, no network, bad build
+            print(f"⚠️  CLIP load on {device} failed ({type(e).__name__}: {e}); "
+                  f"trying OpenVINO.")
+            self._model = self._processor = None
+            return False
+
+        self.backend, self.device, self._dtype = "torch", device, dtype
+        print(f"✅ CLIP prefilter ready on {device} "
+              f"(torch {str(dtype).replace('torch.', '')}, "
+              f"{time.perf_counter() - t0:.1f}s, {self.model_id})")
+        return True
+
+    def _load_openvino(self, device: str):
         from optimum.intel import OVModelForZeroShotImageClassification
         from transformers import CLIPProcessor
 
@@ -147,17 +314,18 @@ class ClipFramePrefilter:
         t0 = time.perf_counter()
         try:
             self._model = OVModelForZeroShotImageClassification.from_pretrained(
-                src, export=export, device=self.device,
+                src, export=export, device=device,
             )
         except Exception as e:
-            print(f"⚠️  CLIP load on device={self.device} failed ({e}); using CPU.")
-            self.device = "CPU"
+            print(f"⚠️  CLIP load on device={device} failed ({e}); using CPU.")
+            device = "CPU"
             self._model = OVModelForZeroShotImageClassification.from_pretrained(
                 src, export=export, device="CPU",
             )
         self._processor = CLIPProcessor.from_pretrained(src)
-        print(f"✅ CLIP prefilter ready on {self.device} "
-              f"({time.perf_counter() - t0:.1f}s, {'bundled IR' if ov_dir else self.model_id})")
+        self.backend, self.device = "openvino", device
+        print(f"✅ CLIP prefilter ready on {device} (OpenVINO, "
+              f"{time.perf_counter() - t0:.1f}s, {'bundled IR' if ov_dir else self.model_id})")
 
     def set_query(self, target: str,
                   positive_template: str = "a photo of {}",
@@ -171,6 +339,32 @@ class ClipFramePrefilter:
     def is_ready(self) -> bool:
         return self._model is not None and self._labels is not None
 
+    def infer(self, texts, images):
+        """One forward pass -> the model's output object (logits_per_image,
+        image_embeds, text_embeds), whichever backend is loaded.
+
+        The single place that knows a backend's calling convention, so callers
+        (and ClipEmbedder) stay backend-agnostic.
+        """
+        inputs = self._processor(
+            text=list(texts), images=list(images), return_tensors="pt", padding=True,
+        )
+        if self.backend != "torch":
+            return self._model(**inputs)
+
+        import torch
+
+        # Move to the GPU, and match the model's fp16: the processor emits fp32
+        # pixel_values, which a half model rejects outright. Integer tensors
+        # (input_ids, attention_mask) must keep their dtype, hence the split.
+        inputs = {
+            k: (v.to(self.device, dtype=self._dtype) if v.is_floating_point()
+                else v.to(self.device))
+            for k, v in inputs.items()
+        }
+        with torch.inference_mode():
+            return self._model(**inputs)
+
     def score_frames_bgr(self, frames_bgr: list) -> list[float]:
         """Return P(positive) in [0,1] for each BGR frame. Batched in one call."""
         import cv2
@@ -181,12 +375,12 @@ class ClipFramePrefilter:
 
         images = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
                   for f in frames_bgr]
-        inputs = self._processor(
-            text=self._labels, images=images, return_tensors="pt", padding=True,
-        )
-        outputs = self._model(**inputs)
+        outputs = self.infer(self._labels, images)
         # logits_per_image: [n_images, n_labels]; softmax → prob over labels.
-        probs = outputs.logits_per_image.softmax(dim=1)
+        # .float() first: CLIP scales logits by ~100, and fp16 has ~3 decimal
+        # digits up there, so the half softmax quantises scores the caller
+        # thresholds on. Free on the OpenVINO backend, already fp32.
+        probs = outputs.logits_per_image.float().softmax(dim=1)
         return [float(row[0]) for row in probs]  # column 0 = positive prompt
 
     def score_frame_bgr(self, frame_bgr) -> float:
@@ -197,7 +391,7 @@ class ClipFramePrefilter:
 # Standalone scan: rank a whole video and print the top-K timestamps.
 # ---------------------------------------------------------------------------
 def scan_video(video_path: str, query: str, interval: float = 1.0,
-               topk: int = 30, batch: int = 16, device: str = "GPU",
+               topk: int = 30, batch: int = 16, device: str = "AUTO",
                start: float = 0.0, negatives: Optional[list[str]] = None):
     import cv2
 
@@ -266,7 +460,9 @@ def main():
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--topk", type=int, default=30)
     ap.add_argument("--batch", type=int, default=16)
-    ap.add_argument("--device", default="GPU")
+    ap.add_argument("--device", default="AUTO",
+                    help="AUTO/GPU (NVIDIA if present, else Intel GPU, else CPU), "
+                         "CUDA, cuda:N, CPU, or any OpenVINO device string")
     ap.add_argument("--start", type=float, default=0.0)
     ap.add_argument("--negatives", default=None,
                     help="comma-separated contrastive negatives. Describe the OTHER "
@@ -278,8 +474,11 @@ def main():
     if args.negatives:
         negatives = [s.strip() for s in args.negatives.split(",") if s.strip()]
 
-    if not ClipFramePrefilter.available():
-        print('❌ Missing deps. pip install "optimum[openvino]" pillow opencv-python')
+    reason = ClipFramePrefilter.import_error(args.device)
+    if reason is not None:
+        print(f"❌ CLIP unavailable — {reason}")
+        print('   pip install "optimum[openvino]" pillow opencv-python  (Intel/CPU)')
+        print("   ...or a CUDA torch build from pytorch.org  (NVIDIA)")
         return 1
     scan_video(args.video, args.query, interval=args.interval, topk=args.topk,
                batch=args.batch, device=args.device, start=args.start,
