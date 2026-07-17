@@ -475,11 +475,24 @@ class OverlayScene(QGraphicsScene):
         super().__init__(parent)
         self.setBackgroundBrush(QBrush(QColor(0, 0, 0)))
 
-        # Video item
+        # Video item, wrapped in a clip container so VR left-eye cropping is an
+        # actual scene-graph clip (see set_vr_clip) rather than relying on the
+        # view's fitInView zoom alone — fitInView's KeepAspectRatio can reveal
+        # scene content beyond the requested rect whenever the viewport's aspect
+        # ratio doesn't match the crop's (e.g. an unmaximized/resized window),
+        # which let the right eye bleed into view.
+        self._eye_clip = QGraphicsRectItem()
+        self._eye_clip.setPen(QPen(Qt.PenStyle.NoPen))
+        self._eye_clip.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._eye_clip.setFlag(QGraphicsItem.GraphicsItemFlag.ItemClipsChildrenToShape, True)
+        self.addItem(self._eye_clip)
+        self._vr_clip_enabled = False
+
         self.video_item = QGraphicsVideoItem()
         self.video_item.setZValue(0)
+        self.video_item.setParentItem(self._eye_clip)
         self.video_item.setSize(QSizeF(1920, 1080))  # default until nativeSizeChanged
-        self.addItem(self.video_item)
+        self._eye_clip.setRect(0, 0, 1920, 1080)
         self.setSceneRect(0, 0, 1920, 1080)
 
         # Bbox items indexed by timestamp bucket (100ms buckets)
@@ -527,12 +540,25 @@ class OverlayScene(QGraphicsScene):
         scene_h = size.height() * scale
 
         self.video_item.setSize(QSizeF(scene_w, scene_h))
+        self._apply_eye_clip(scene_w, scene_h)
         self.setSceneRect(0, 0, scene_w, scene_h)
 
         # Recompute bbox geometries against the (possibly downscaled) scene size
         for item in self._all_bbox_items:
             item.update_geometry(scene_w, scene_h)
         self._resolve_label_overlaps()
+
+    def _apply_eye_clip(self, scene_w: float, scene_h: float) -> None:
+        w = scene_w / 2 if self._vr_clip_enabled else scene_w
+        self._eye_clip.setRect(0, 0, w, scene_h)
+
+    def set_vr_clip(self, enabled: bool) -> None:
+        """Hard-clip the video item to its left half (SBS left eye) at the scene
+        level. Independent of the view's zoom/fit transform, so it can't leak
+        the right eye when the view's aspect ratio doesn't match the crop."""
+        self._vr_clip_enabled = enabled
+        size = self.video_item.size()
+        self._apply_eye_clip(size.width(), size.height())
 
     def load_detections_lazy(self, bbox_loader: LazyBBoxLoader):
         """
@@ -744,6 +770,7 @@ class OverlayView(QGraphicsView):
     def set_vr_mode(self, enabled: bool):
         """Show only the left half of the scene (SBS VR videos)."""
         self._vr_mode = enabled
+        self.scene().set_vr_clip(enabled)
         self._fit_video()
 
     def resizeEvent(self, event):
