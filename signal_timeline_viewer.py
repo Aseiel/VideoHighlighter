@@ -516,7 +516,11 @@ class SignalTimelineWindow(QMainWindow):
         # create/destroy per VR toggle) makes the OSD appear twice. One persistent
         # surface == one swapchain == one OSD, on the video.
         self.video_view = VRVideoView()
-        self.video_view.setMinimumSize(320, 240)
+        # Small floor so the left dock can shrink in a non-maximized window
+        # (it shares the vertical band with the timeline; a tall floor here
+        # pushes the bottom LLM dock off-screen). The splitter still gives it a
+        # comfortable size by default.
+        self.video_view.setMinimumSize(240, 135)
         self.video_view.set_vr_mode(False)   # full-frame until VR is enabled
         self.preview_stack.addWidget(self.video_view)  # index 0
 
@@ -588,7 +592,7 @@ class SignalTimelineWindow(QMainWindow):
         self.play_btn.setStyleSheet("""
             QPushButton {
                 background-color: #2f81f7; color: white; font-weight: bold;
-                padding: 8px 16px; border-radius: 4px; min-width: 80px;
+                padding: 4px 8px; border-radius: 4px; min-width: 80px;
             }
             QPushButton:hover { background-color: #4a90f5; }
         """)
@@ -1675,10 +1679,11 @@ class SignalTimelineWindow(QMainWindow):
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(6)
         
-        # Create info bar
-        info_bar = self.create_info_bar()
-        main_layout.addWidget(info_bar)
-        
+        # Stats + selected time go in the status bar (no info-bar row); the
+        # interaction hints become the timeline's tooltip. Recovers that height
+        # for the timeline itself.
+        self._install_status_info()
+
         # Create splitter for main content
         splitter = QSplitter(Qt.Orientation.Vertical)
         
@@ -1692,8 +1697,12 @@ class SignalTimelineWindow(QMainWindow):
         # Create scene with current waveform data (may be empty initially)
         self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration, waveform=self.waveform)
         self.signal_view = SignalTimelineView(self.signal_scene)
-        self.signal_view.setMinimumHeight(400)
+        # Lower floor so the whole top band (preview + timeline + controls) can
+        # compress and leave room for the bottom LLM dock when not maximized.
+        # The splitter default (500) keeps it roomy at normal sizes.
+        self.signal_view.setMinimumHeight(240)
         self.signal_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.signal_view.setToolTip(self.TIMELINE_HINTS)
         
         # Enable drag and drop on the viewport
         self.signal_view.viewport().setAcceptDrops(True)
@@ -1713,7 +1722,6 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self.signal_scene, 'waveform_clicked'):
             self.signal_scene.waveform_clicked.connect(self.on_waveform_clicked)
         
-        signal_layout.addWidget(QLabel("Signal Timeline (Drag items to edit timeline below)"))
 
         # Timeline with frozen label column
         timeline_row = QHBoxLayout()
@@ -1771,6 +1779,7 @@ class SignalTimelineWindow(QMainWindow):
             llm_dock = QDockWidget("LLM Assistant", self)
             llm_dock.setWidget(self.llm_chat)
             self.addDockWidget(Qt.BottomDockWidgetArea, llm_dock)
+            self._llm_dock = llm_dock
         except ImportError:
             pass  # LLM modules not installed
 
@@ -1793,7 +1802,6 @@ class SignalTimelineWindow(QMainWindow):
         )
 
 
-        edit_layout.addWidget(QLabel("Edit Timeline (Select clips and press Delete)"))
         edit_layout.addWidget(self.edit_view)
         
         # Add edit controls
@@ -1849,10 +1857,32 @@ class SignalTimelineWindow(QMainWindow):
         self.apply_dark_theme()
         
         # Status bar
-        self.statusBar().showMessage(f"Video duration: {self.video_duration:.1f}s | Total edit duration: {self.edit_scene.get_total_duration():.1f}s")
+        self._update_status()
         
         # Install event filter to handle global key events
         QApplication.instance().installEventFilter(self)
+
+    def showEvent(self, event):
+        # Balance the LLM dock only once the window is actually shown, so
+        # self.height() is the real size (a singleShot from __init__ fires before
+        # the first show and reads the pre-layout height, which starved the dock).
+        super().showEvent(event)
+        if not getattr(self, "_dock_balanced", False):
+            self._dock_balanced = True
+            QTimer.singleShot(0, self._balance_bottom_dock)
+
+    def _balance_bottom_dock(self):
+        """Give the LLM dock enough height for a usable chat. Lowering the
+        top-band floors lets it fit; this forces the split so the conversation
+        area isn't crushed by the settings + search rows above it."""
+        dock = getattr(self, "_llm_dock", None)
+        if dock is None or not dock.isVisible():
+            return
+        target = max(360, int(self.height() * 0.40))
+        try:
+            self.resizeDocks([dock], [target], Qt.Orientation.Vertical)
+        except Exception:
+            pass
 
     def capture_current_frame_base64(self) -> str | None:
         """
@@ -1961,69 +1991,41 @@ class SignalTimelineWindow(QMainWindow):
 
         return super().eventFilter(obj, event)
     
-    def create_info_bar(self):
-        """Create information bar with video stats"""
-        bar = QFrame()
-        bar.setStyleSheet("""
-            QFrame {
-                background: #1e1e1e;
-                border-radius: 6px;
-                padding: 8px;
-            }
-        """)
-        
-        layout = QHBoxLayout(bar)
-        
-        # Video info
-        duration_mins = int(self.video_duration // 60)
-        duration_secs = int(self.video_duration % 60)
-        action_count = len(self.action_types)
-        object_count = len(self.object_classes)
-        
-        info_text = f"Duration: {duration_mins:02d}:{duration_secs:02d} • Actions: {action_count} • Objects: {object_count}"
-        info_label = QLabel(info_text)
-        info_label.setStyleSheet("color: #c8c8c8; font-weight: bold;")
-        
-        layout.addWidget(info_label)
-        layout.addStretch()
-        
-        # Drag and delete instructions
-        instructions = QLabel(
-            "🖱️ Drag signal bars → edit timeline  "
-            "•  Left-drag background → highlight range, then drag range → edit timeline  "
-            "•  Ctrl+click / Shift+click / Ctrl+A to multi-select, then Delete to remove"
-        )
-        instructions.setStyleSheet("color: #a0ffa0; font-style: italic; font-size: 11px; padding: 4px; background: rgba(0, 100, 0, 40); border-radius: 4px;")
-        layout.addWidget(instructions)
-        layout.addStretch()
-        
-        # Current time display
+    # Interaction hints, shown as the signal timeline's tooltip rather than a
+    # permanent bar — they're learn-once, and the bar cost a row of height.
+    TIMELINE_HINTS = (
+        "Drag signal bars → edit timeline\n"
+        "Left-drag background → highlight range, then drag range → edit timeline\n"
+        "Ctrl+click / Shift+click / Ctrl+A to multi-select, then Delete to remove"
+    )
+
+    def _install_status_info(self):
+        """Video stats + selected time live in the status bar.
+
+        Replaces the old info bar: its duration already duplicated the status
+        bar, its hints are now the timeline's tooltip, and its "Debug log" box
+        was a synced duplicate of the main GUI's (modules.debug_console keeps
+        them in step, so the one in the main window still drives it).
+        """
         self.time_label = QLabel("No time selected")
         self.time_label.setStyleSheet("color: #ff8080; font-family: Consolas; font-weight: bold;")
+        self.statusBar().addPermanentWidget(self.time_label)
 
-        layout.addWidget(self.time_label)
-
-        # Live debug-log toggle (same switch as the main GUI's checkbox —
-        # all logic lives in modules.debug_console).
+    def _update_status(self):
+        """One status line: video stats + current edit length. The old info bar
+        and the existing status message each showed duration; this merges them
+        so Actions/Objects aren't lost to whoever calls showMessage last."""
+        mins, secs = int(self.video_duration // 60), int(self.video_duration % 60)
         try:
-            from modules import debug_console as _dbg
+            edit_len = self.edit_scene.get_total_duration()
         except Exception:
-            _dbg = None
-        if _dbg is not None:
-            self.debug_log_chk = QCheckBox("Debug log")
-            self.debug_log_chk.setChecked(_dbg.is_console_visible())
-            self.debug_log_chk.setStyleSheet("color: #c8c8c8;")
-            self.debug_log_chk.setToolTip(
-                "Open a live window mirroring all app output\n"
-                "(recent output is replayed, so it works after an error too).\n"
-                f"Everything is always saved to:\n{_dbg.log_file_path()}"
-            )
-            self.debug_log_chk.toggled.connect(_dbg.set_console_visible)
-            _dbg.register_checkbox(self.debug_log_chk)
-            layout.addWidget(self.debug_log_chk)
+            edit_len = 0.0
+        self.statusBar().showMessage(
+            f"Duration: {mins:02d}:{secs:02d} • Actions: {len(self.action_types)} • "
+            f"Objects: {len(self.object_classes)} | Edit: {edit_len:.1f}s"
+        )
 
-        return bar
-    
+
     def create_filter_controls(self):
         """Create filter controls for the dock widget"""
         filter_group = QGroupBox("Filters")
@@ -2054,29 +2056,23 @@ class SignalTimelineWindow(QMainWindow):
         quick_filter_layout.addWidget(hide_all_btn)
         filter_layout.addLayout(quick_filter_layout)
         
-        # Confidence filter button
-        self.confidence_filter_btn = QPushButton("🎚️ Confidence Filter...")
+        # Confidence + Advanced filter buttons — side by side, compact, to keep
+        # the Controls dock short (a tall dock forces the whole window past the
+        # screen bottom, hiding the LLM chat behind the taskbar).
+        _filt_style = "QPushButton { background-color: #2f81f7; padding: 4px 6px; }"
+        filter_btn_row = QHBoxLayout()
+        self.confidence_filter_btn = QPushButton("Confidence…")
+        self.confidence_filter_btn.setToolTip("Set minimum confidence for actions/objects")
         self.confidence_filter_btn.clicked.connect(self.open_confidence_filter)
-        self.confidence_filter_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2f81f7;
-                font-weight: bold;
-                padding: 8px;
-            }
-        """)
-        filter_layout.addWidget(self.confidence_filter_btn)
-        
-        # Advanced filters button
-        self.filter_dialog_btn = QPushButton("🎛️ Advanced Filters...")
+        self.confidence_filter_btn.setStyleSheet(_filt_style)
+        filter_btn_row.addWidget(self.confidence_filter_btn)
+
+        self.filter_dialog_btn = QPushButton("Advanced…")
+        self.filter_dialog_btn.setToolTip("Advanced per-type filters")
         self.filter_dialog_btn.clicked.connect(self.open_filter_dialog)
-        self.filter_dialog_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2f81f7;
-                font-weight: bold;
-                padding: 8px;
-            }
-        """)
-        filter_layout.addWidget(self.filter_dialog_btn)
+        self.filter_dialog_btn.setStyleSheet(_filt_style)
+        filter_btn_row.addWidget(self.filter_dialog_btn)
+        filter_layout.addLayout(filter_btn_row)
         
         # Current filters display
         self.current_filters_label = QLabel("")
@@ -2099,7 +2095,7 @@ class SignalTimelineWindow(QMainWindow):
             QPushButton {
                 background-color: #2f81f7;
                 font-weight: bold;
-                padding: 8px;
+                padding: 4px 8px;
                 min-width: 100px;
             }
         """)
@@ -2112,7 +2108,7 @@ class SignalTimelineWindow(QMainWindow):
             QPushButton {
                 background-color: #8a2a2a;
                 font-weight: bold;
-                padding: 8px;
+                padding: 4px 8px;
             }
         """)
         layout.addWidget(self.stop_edit_btn)
@@ -2141,7 +2137,7 @@ class SignalTimelineWindow(QMainWindow):
                 background-color: #2a2a2a;
                 color: #d4d4d4;
                 font-weight: bold;
-                padding: 8px 12px;
+                padding: 4px 8px;
                 border: 1px solid #4a4a4a;
                 border-radius: 5px;
             }
@@ -2183,7 +2179,7 @@ class SignalTimelineWindow(QMainWindow):
             QPushButton {
                 background-color: #2a7a2a;
                 font-weight: bold;
-                padding: 8px;
+                padding: 4px 8px;
             }
         """)
         self.render_highlight_btn.setToolTip("Render edit timeline clips into a single highlight video file")
@@ -2524,10 +2520,26 @@ class SignalTimelineWindow(QMainWindow):
         
         playback_group.setLayout(playback_layout)
 
-        layout.addWidget(playback_group)     
+        layout.addWidget(playback_group)
         layout.addStretch()
-        
-        dock.setWidget(controls_widget)
+
+        # Scroll the controls instead of letting them set the dock's minimum
+        # height. Set directly, this column's ~600px of groups forced the whole
+        # top band that tall, which pushed the window past the screen bottom and
+        # hid the LLM chat behind the taskbar. Scrolling drops the floor to
+        # nothing, so the window can actually fit the screen.
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QScrollArea.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setWidget(controls_widget)
+
+        # The scroll area removes the height floor (the point), but it also drops
+        # the width floor the content used to provide — without this the dock
+        # collapses to a sliver and the labels get clipped. Same pattern as the
+        # Search/Transcript docks.
+        dock.setMinimumWidth(260)
+        dock.setWidget(controls_scroll)
         return dock
     
     def open_confidence_filter(self):
@@ -3223,7 +3235,7 @@ class SignalTimelineWindow(QMainWindow):
         """Update edit duration display"""
         total_duration = self.edit_scene.get_total_duration()
         self.edit_duration_label.setText(f"Edit duration: {total_duration:.1f}s")
-        self.statusBar().showMessage(f"Video duration: {self.video_duration:.1f}s | Total edit duration: {total_duration:.1f}s")
+        self._update_status()
     
     def find_signal_region_around(self, time):
         """Find meaningful region around clicked time, respecting filters"""
@@ -3799,7 +3811,7 @@ class SignalTimelineWindow(QMainWindow):
                 background-color: #2a2a2a;
                 color: white;
                 border: 1px solid #4a4a4a;
-                padding: 8px;
+                padding: 4px 8px;
                 border-radius: 5px;
                 font-weight: bold;
             }

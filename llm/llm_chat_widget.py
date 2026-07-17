@@ -847,14 +847,14 @@ class LLMChatWidget(QWidget):
 
         self.search_btn = QPushButton("🔍 Search")
         self.search_btn.setStyleSheet(
-            "QPushButton{background:#FF9800;color:white;font-weight:bold;padding:6px 12px;border-radius:4px;}"
+            "QPushButton{background:#FF9800;color:white;font-weight:bold;padding:4px 10px;border-radius:4px;}"
         )
         self.search_btn.clicked.connect(self._start_visual_search)
         search_layout.addWidget(self.search_btn)
         
         self.stop_search_btn = QPushButton("⏹ Stop")
         self.stop_search_btn.setStyleSheet(
-            "QPushButton{background:#c62828;color:white;font-weight:bold;padding:6px 12px;border-radius:4px;}"
+            "QPushButton{background:#c62828;color:white;font-weight:bold;padding:4px 10px;border-radius:4px;}"
         )
         self.stop_search_btn.clicked.connect(self._stop_visual_search)
         self.stop_search_btn.setEnabled(False)
@@ -899,7 +899,7 @@ class LLMChatWidget(QWidget):
         self.chat_display.setStyleSheet(
             "QTextEdit{background:#1e1e1e;color:#ddd;"
             "font-family:'Segoe UI','SF Pro',sans-serif;font-size:10pt;"
-            "border:1px solid #333;border-radius:4px;padding:8px;}"
+            "border:1px solid #333;border-radius:4px;padding:6px;}"
         )
         self.chat_display.setMinimumHeight(150 if self._compact else 250)
         root.addWidget(self.chat_display, stretch=1)
@@ -909,7 +909,7 @@ class LLMChatWidget(QWidget):
         self.input_field = QLineEdit()
         self.input_field.setPlaceholderText("Ask about the video analysis or search visually...")
         self.input_field.setStyleSheet(
-            "QLineEdit{padding:8px;font-size:10pt;border:1px solid #555;border-radius:4px;}"
+            "QLineEdit{padding:4px 8px;font-size:10pt;border:1px solid #555;border-radius:4px;}"
         )
         self.input_field.returnPressed.connect(self._send_message)
         self.input_field.setEnabled(False)
@@ -918,7 +918,7 @@ class LLMChatWidget(QWidget):
         self.send_btn = QPushButton("Send")
         self.send_btn.setStyleSheet(
             "QPushButton{background:#2f81f7;color:white;font-weight:bold;"
-            "padding:8px 20px;border-radius:4px;}"
+            "padding:4px 14px;border-radius:4px;}"
             "QPushButton:disabled{background:#555;}"
         )
         self.send_btn.clicked.connect(self._send_message)
@@ -928,7 +928,7 @@ class LLMChatWidget(QWidget):
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setStyleSheet(
             "QPushButton{background:#c62828;color:white;font-weight:bold;"
-            "padding:8px 16px;border-radius:4px;}"
+            "padding:4px 12px;border-radius:4px;}"
             "QPushButton:disabled{background:#555;}"
         )
         self.stop_btn.clicked.connect(self._stop_generation)
