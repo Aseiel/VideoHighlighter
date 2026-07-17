@@ -24,6 +24,12 @@ import subprocess
 from modules.app_paths import ffmpeg_exe
 
 _LIBX264 = ("libx264", ["-c:v", "libx264", "-preset", "fast", "-crf", "18"])
+# CPU HEVC for high-res/VR. libx265 output matches how these VR sources are
+# authored (x265, Main profile, hev1), which VR players like HereSphere accept
+# — unlike the hardware HEVC encoders, whose bitstreams they reject. Slow, but
+# the price of guaranteed VR playback.
+_LIBX265 = ("libx265", ["-c:v", "libx265", "-preset", "fast", "-crf", "18",
+                        "-tag:v", "hev1"])
 
 _UNSET = object()
 _vendor_cache = _UNSET
@@ -108,19 +114,33 @@ def probe_video_size(video_path, ffmpeg=None):
     return (w, h)
 
 
-def encoder_chain(video_path, ffmpeg=None):
+def encoder_chain(video_path, ffmpeg=None, mode="gpu"):
     """Ordered list of (name, [ffmpeg video args]) to try, hardware first,
-    always ending with CPU libx264. Cached per video path.
+    always ending with a CPU fallback. Cached per (video path, mode).
+
+    `mode`:
+      - "gpu" (default): hardware first (nvenc/qsv/amf), CPU libx264 fallback.
+        Fast, but the hardware HEVC bitstreams are rejected by some VR players.
+      - "cpu": CPU only — libx265 for high-res/VR (matches how VR sources are
+        authored, so VR players accept it), libx264 otherwise. Slow but safe.
 
     HEVC is used for high-res/VR sources (>4096px, what VR players expect);
     H.264 otherwise. When the GPU vendor is known only that vendor's encoder
     is kept (+ libx264); when unknown (CPU-only / AMD) the full candidate list
     is kept so h264_amf/hevc_amf still gets a chance."""
-    if video_path in _chain_cache:
-        return _chain_cache[video_path]
-    text = _available_encoders(ffmpeg)
+    cache_key = (video_path, mode)
+    if cache_key in _chain_cache:
+        return _chain_cache[cache_key]
     w, h = probe_video_size(video_path, ffmpeg)
     hi_res = max(w, h) > 4096
+    if mode == "cpu":
+        chain = [_LIBX265] if hi_res else [_LIBX264]
+        print(f"[encoder_select] {os.path.basename(video_path)} {w}x{h} "
+              f"({'HEVC' if hi_res else 'H.264'}), mode=cpu -> "
+              f"{', '.join(n for n, _ in chain)}")
+        _chain_cache[cache_key] = chain
+        return chain
+    text = _available_encoders(ffmpeg)
     if hi_res:
         candidates = [
             ("hevc_nvenc", ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc",
@@ -148,5 +168,5 @@ def encoder_chain(video_path, ffmpeg=None):
     print(f"[encoder_select] {os.path.basename(video_path)} {w}x{h} "
           f"({'HEVC' if hi_res else 'H.264'}), GPU={vendor or 'unknown'} -> "
           f"{', '.join(n for n, _ in chain)}")
-    _chain_cache[video_path] = chain
+    _chain_cache[cache_key] = chain
     return chain

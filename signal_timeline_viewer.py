@@ -2173,6 +2173,26 @@ class SignalTimelineWindow(QMainWindow):
         layout.addWidget(self.save_cache_btn)
         layout.addWidget(self.export_btn)
         
+        # Video output mode (CPU/GPU), shared with the main GUI via config.
+        # Hardware HEVC is rejected by some VR players; CPU libx265 is VR-safe.
+        self.render_mode_combo = QComboBox()
+        self.render_mode_combo.addItem("Video: CPU x265 (VR-safe, slow)", "cpu")
+        self.render_mode_combo.addItem("Video: GPU (fast, may break VR)", "gpu")
+        self.render_mode_combo.setToolTip(
+            "How the highlight video is encoded:\n"
+            "CPU x265 — re-encode on the CPU with libx265 (HEVC), matching how VR\n"
+            "   sources are authored. VR-safe, but slow at 6K.\n"
+            "GPU — re-encode with the hardware encoder. Fast, but the HEVC output\n"
+            "   may not play in VR players like HereSphere."
+        )
+        _tl_rm = self._load_render_mode_default()
+        _tl_i = self.render_mode_combo.findData(_tl_rm)
+        if _tl_i >= 0:
+            self.render_mode_combo.setCurrentIndex(_tl_i)
+        self.render_mode_combo.currentIndexChanged.connect(
+            lambda: self._save_render_mode(self.render_mode_combo.currentData()))
+        layout.addWidget(self.render_mode_combo)
+
         self.render_highlight_btn = QPushButton("🎬 Render Highlight Video")
         self.render_highlight_btn.clicked.connect(self.on_render_highlight_clicked)
         self.render_highlight_btn.setStyleSheet("""
@@ -2184,7 +2204,7 @@ class SignalTimelineWindow(QMainWindow):
         """)
         self.render_highlight_btn.setToolTip("Render edit timeline clips into a single highlight video file")
         layout.addWidget(self.render_highlight_btn)
-        
+
         layout.addStretch()
 
         layout.addWidget(self.edit_duration_label)
@@ -3656,9 +3676,11 @@ class SignalTimelineWindow(QMainWindow):
         self.render_highlight_btn.setEnabled(False)
         self.render_highlight_btn.setText("⏳ Rendering… 0%")
 
-        # Store for the callback
+        # Store for the callback. Read the combo on the main thread; the worker
+        # thread must not touch Qt widgets.
         self._render_output_path = output_path
         self._render_clips = clips
+        self._render_mode = self.render_mode_combo.currentData() or "cpu"
 
         import threading
 
@@ -3744,15 +3766,55 @@ class SignalTimelineWindow(QMainWindow):
 
         threading.Thread(target=render, daemon=True).start()
 
+    def _load_render_mode_default(self):
+        """Default video-output mode, read from the shared config.yaml
+        (highlights.render_mode) so the timeline viewer agrees with the main
+        GUI's Advanced-tab setting. Falls back to 'cpu' (VR-safe)."""
+        try:
+            import yaml
+            from modules.app_paths import config_path
+            with open(config_path("config.yaml"), "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            mode = (cfg.get("highlights", {}) or {}).get("render_mode", "cpu")
+            return mode if mode in ("cpu", "gpu") else "cpu"
+        except Exception:
+            return "cpu"
+
+    def _save_render_mode(self, mode):
+        """Persist the chosen video-output mode back to config.yaml so it
+        sticks and stays in sync with the main GUI. Best-effort."""
+        if mode not in ("cpu", "gpu"):
+            return
+        try:
+            import yaml
+            from modules.app_paths import config_path
+            p = config_path("config.yaml")
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                cfg = {}
+            cfg.setdefault("highlights", {})["render_mode"] = mode
+            with open(p, "w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+        except Exception as e:
+            print(f"⚠️ [timeline] could not persist render_mode: {e}")
+
     def _encoder_chain(self):
         """Video-encoder fallback chain for the render, delegated to the shared
         modules.encoder_select helper (also used by the pipeline) so the codec
         decision — GPU vendor via device_utils, HEVC-for-VR by resolution,
-        libx264 fallback — lives in one place. Cached per window."""
-        if hasattr(self, '_enc_chain'):
+        libx264 fallback — lives in one place. Cached per (window, mode).
+
+        Uses the mode chosen via the Video output combo ('cpu'/'gpu'), captured
+        on the main thread into self._render_mode before the worker starts."""
+        mode = getattr(self, "_render_mode", None) or (
+            self.render_mode_combo.currentData() if hasattr(self, "render_mode_combo") else "cpu")
+        if getattr(self, "_enc_chain_mode", None) == mode and hasattr(self, "_enc_chain"):
             return self._enc_chain
         from modules.encoder_select import encoder_chain
-        self._enc_chain = encoder_chain(self.video_path)
+        self._enc_chain = encoder_chain(self.video_path, mode=mode)
+        self._enc_chain_mode = mode
         return self._enc_chain
 
     @Slot(int)
