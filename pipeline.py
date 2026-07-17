@@ -349,10 +349,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log_fn("⏹️ Batch processing cancelled")
                 break
             
-            # Update batch progress
-            batch_progress = int((idx - 1) / total_videos * 100)
-            progress.update_progress(batch_progress, 100, "Batch Processing", 
-                                   f"Video {idx}/{total_videos}")
+            # Videos finished so far, not a percentage — the GUI gives this its
+            # own row, so it survives the per-stage updates the video below emits.
+            failed = sum(1 for _, r in results if r is None)
+            detail = f"Video {idx}/{total_videos}: {os.path.basename(single_video_path)}"
+            if failed:
+                detail += f" ({failed} failed)"
+            progress.update_progress(idx - 1, total_videos, "Batch Processing", detail)
             
             # Auto-generate output filename
             video_gui_config = gui_config.copy() if gui_config else {}
@@ -391,8 +394,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             status = "✅" if output_path else "❌"
             log_fn(f"  {status} {os.path.basename(input_path)}")
         
-        progress.update_progress(100, 100, "Batch Processing", 
-                               f"Complete: {successful}/{total_videos}")
+        progress.update_progress(len(results), total_videos, "Batch Processing",
+                               f"Complete: {successful}/{total_videos} succeeded")
         return results
     
     # ========== SINGLE FILE PROCESSING ==========
