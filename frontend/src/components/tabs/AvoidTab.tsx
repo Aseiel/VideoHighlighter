@@ -3,6 +3,7 @@ import { RefreshCw, UserX, ExternalLink, ScanFace, Trash2, X } from "lucide-reac
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
+import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import {
   Dialog,
@@ -44,6 +45,20 @@ interface Props {
 const fmtT = (s: number) =>
   `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`
 
+/** "1:30" or "90" -> seconds; null if it isn't either. Mirrors the formats
+ *  manual_avoid._parse_time_token accepts, so what the field takes matches
+ *  what the engine stores. */
+const parseTime = (raw: string): number | null => {
+  const t = raw.trim()
+  if (!t) return null
+  const parts = t.split(":")
+  if (parts.length > 2) return null
+  const nums = parts.map(Number)
+  if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null
+  const secs = parts.length === 2 ? nums[0] * 60 + nums[1] : nums[0]
+  return secs < 0 ? null : secs
+}
+
 export function AvoidTab({
   cfg,
   set,
@@ -58,6 +73,28 @@ export function AvoidTab({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [clearOpen, setClearOpen] = useState(false)
+  // Manual range entry — "1:30" or "90" both work (parsed server-side).
+  const [rangeStart, setRangeStart] = useState("")
+  const [rangeEnd, setRangeEnd] = useState("")
+
+  /** Persist `next` and refresh; the engine merges overlaps and validates. */
+  const writeRanges = async (next: [number, number][], okMsg: string) => {
+    if (!videoPath) return
+    const res = await saveAvoidRanges(videoPath, next)
+    if (!res.ok) return toast.error(res.error ?? "Could not save ranges")
+    onAvoidRangesChange()
+    toast.success(okMsg)
+  }
+
+  const addRange = async () => {
+    const a = parseTime(rangeStart)
+    const b = parseTime(rangeEnd)
+    if (a === null || b === null) return toast.error("Use mm:ss or seconds")
+    if (b <= a) return toast.error("End must be after start")
+    await writeRanges([...avoidRanges, [a, b]], "Added avoided range")
+    setRangeStart("")
+    setRangeEnd("")
+  }
 
   const refresh = async () => {
     setLoading(true)
@@ -259,13 +296,7 @@ export function AvoidTab({
               <Button
                 size="sm"
                 variant="ghost"
-                onClick={async () => {
-                  if (!videoPath) return
-                  const res = await saveAvoidRanges(videoPath, [])
-                  if (!res.ok) return toast.error(res.error ?? "Could not clear")
-                  onAvoidRangesChange()
-                  toast.success("Cleared avoided ranges")
-                }}
+                onClick={() => writeRanges([], "Cleared avoided ranges")}
               >
                 Clear all
               </Button>
@@ -273,21 +304,64 @@ export function AvoidTab({
           </div>
           {avoidRanges.length === 0 ? (
             <p className="text-xs text-muted-foreground">
-              None. Drag-select a span in the Timeline Viewer and click “Avoid
-              selected range” — it will show up here and apply to your runs.
+              None yet. Add one below, or drag-select a span in the Timeline
+              Viewer — either way it applies to your runs.
             </p>
           ) : (
             <ul className="flex flex-wrap gap-2">
               {avoidRanges.map(([a, b], i) => (
                 <li
                   key={i}
-                  className="rounded-md bg-muted px-2 py-1 text-xs tabular-nums"
+                  className="flex items-center gap-1.5 rounded-md bg-muted px-2 py-1 text-xs tabular-nums"
                 >
                   {fmtT(a)} – {fmtT(b)}
+                  <button
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() =>
+                      writeRanges(
+                        avoidRanges.filter((_, j) => j !== i),
+                        "Removed avoided range",
+                      )
+                    }
+                    title="Remove this range"
+                  >
+                    <X className="size-3" />
+                  </button>
                 </li>
               ))}
             </ul>
           )}
+
+          <div className="flex items-end gap-2">
+            <Input
+              value={rangeStart}
+              onChange={(e) => setRangeStart(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addRange()}
+              placeholder="1:30"
+              aria-label="Range start"
+              disabled={!videoPath}
+              className="h-8 w-24 text-xs tabular-nums"
+            />
+            <span className="pb-1.5 text-xs text-muted-foreground">to</span>
+            <Input
+              value={rangeEnd}
+              onChange={(e) => setRangeEnd(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addRange()}
+              placeholder="2:00"
+              aria-label="Range end"
+              disabled={!videoPath}
+              className="h-8 w-24 text-xs tabular-nums"
+            />
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={addRange}
+              disabled={!videoPath || !rangeStart || !rangeEnd}
+              title={videoPath ? "Avoid this span" : "Add a video first"}
+            >
+              Add
+            </Button>
+          </div>
         </div>
       </CardContent>
 

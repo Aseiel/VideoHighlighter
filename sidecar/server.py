@@ -525,6 +525,23 @@ def _debug_log_path() -> str:
         return ""
 
 
+def _reveal(path: str) -> dict:
+    """Select `path` in the OS file manager."""
+    import subprocess
+
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            # No portable "select the file" on Linux — open the folder.
+            subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        return {"ok": True, "path": path}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 @app.post("/reveal-log")
 async def reveal_log() -> dict:
     """Show the debug log in the file manager.
@@ -533,21 +550,29 @@ async def reveal_log() -> dict:
     has no meaning here — the web UI already streams the run log. What it can't
     give you is the file itself (the thing you attach to a bug report), so this
     reveals it instead of pretending to port the window."""
-    import subprocess
-
     path = _debug_log_path()
     if not path or not os.path.exists(path):
         return {"ok": False, "error": "No debug log yet — run something first."}
-    try:
-        if sys.platform == "win32":
-            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
-        else:
-            subprocess.Popen(["xdg-open", os.path.dirname(path)])
-        return {"ok": True, "path": path}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)}
+    return _reveal(path)
+
+
+class RevealOutputRequest(BaseModel):
+    path: str
+
+
+@app.post("/reveal-output")
+async def reveal_output(req: RevealOutputRequest) -> dict:
+    """Show a finished highlight video in the file manager.
+
+    The run's `finished` event carries the output path but the web UI had no way
+    to act on it — the browser can't open a local folder, so without this the
+    video you just made is only reachable by hunting for it by hand."""
+    path = (req.path or "").strip()
+    if not path:
+        return {"ok": False, "error": "No output path given."}
+    if not os.path.exists(path):
+        return {"ok": False, "error": f"Output no longer exists: {path}"}
+    return _reveal(path)
 
 
 @app.post("/download")

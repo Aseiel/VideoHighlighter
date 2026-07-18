@@ -27,6 +27,24 @@ def _install_path() -> None:
         sys.path.insert(0, root)
 
 
+def _cache_hit_kind(text: str) -> str | None:
+    """Return "object"/"action" if `text` is the engine's cache-hit log line.
+
+    Derived from pipeline.CACHE_HIT_LOG so a reworded log line can't silently
+    stop the UI from reporting cache hits. Importing pipeline drags in torch, so
+    this is imported lazily and falls back to the known wording if that fails --
+    a missed cache notice is a cosmetic bug, not a reason to kill the run.
+    """
+    try:
+        from pipeline import CACHE_HIT_LOG
+    except Exception:
+        CACHE_HIT_LOG = "ℹ️ Using cached {kind} detections"
+    for kind in ("object", "action"):
+        if CACHE_HIT_LOG.format(kind=kind) in text:
+            return kind
+    return None
+
+
 def _force_utf8_stdio() -> None:
     """Stop emoji in library prints from killing the child.
 
@@ -218,7 +236,15 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
             pass
 
     def log_fn(msg: Any) -> None:
-        emit({"type": "log", "message": str(msg)})
+        text = str(msg)
+        emit({"type": "log", "message": text})
+        # The engine has no structured channel for "detection was skipped, the
+        # cache had it" — it only says so in a log line. The UI needs it to
+        # explain an empty preview, so translate it into a real event here
+        # rather than making the client parse log prose.
+        kind = _cache_hit_kind(text)
+        if kind:
+            emit({"type": "cache_used", "kind": kind})
 
     def progress_fn(cur: int, tot: int, task: str, det: str = "") -> None:
         pause_evt.wait()

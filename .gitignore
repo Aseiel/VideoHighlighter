@@ -36,3 +36,4 @@ analysis_stats.json
 # this as private/gitignored, but it was never actually listed here.
 composition_rules.yaml
 .gstack/
+timeline_filters.json

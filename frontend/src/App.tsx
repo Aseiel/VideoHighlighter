@@ -11,6 +11,7 @@ import {
   Sparkles,
   MonitorPlay,
   FileText,
+  FolderOpen,
   ChevronDown,
   ChevronUp,
 } from "lucide-react"
@@ -52,6 +53,7 @@ import {
   getAvoidRanges,
   openEditor,
   revealLog,
+  revealOutput,
   type RunEvent,
 } from "@/lib/api"
 import { VideoCard } from "@/components/VideoCard"
@@ -108,6 +110,9 @@ export default function App() {
   // the preview legitimately has nothing to show, so the panel can say so
   // instead of waiting forever.
   const [usedCache, setUsedCache] = useState(false)
+  // Last finished run's output file, so the user can jump to the video they
+  // just made instead of hunting for it.
+  const [lastOutput, setLastOutput] = useState("")
   // Shared by the LLM Chat and Visual Search tabs.
   const [llmBackend, setLlmBackend] = useState("")
   const [llmModel, setLlmModel] = useState("")
@@ -262,10 +267,9 @@ export default function App() {
         break
       case "log":
         appendLog(e.message)
-        // The engine announces when it skips detection in favour of the cache.
-        if (/using cached (object|action) detections/i.test(e.message)) {
-          setUsedCache(true)
-        }
+        break
+      case "cache_used":
+        setUsedCache(true)
         break
       case "progress":
         if (e.total > 0) setProgress(Math.round((e.current / e.total) * 100))
@@ -296,6 +300,9 @@ export default function App() {
       case "finished":
         appendLog(`✔ Finished: ${e.output || "(no output)"}`, "ok")
         setSessionCount((n) => n + 1)
+        // Downloads and face scans reuse this event for a summary ("3 file(s)"),
+        // so only keep an output that's actually a file we can reveal.
+        if (/\.[a-z0-9]{2,4}$/i.test(e.output)) setLastOutput(e.output)
         toast.success("Done")
         break
       case "cancelled":
@@ -715,6 +722,20 @@ export default function App() {
             >
               <MonitorPlay className="size-3.5" /> Timeline
             </Button>
+            {lastOutput && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={async () => {
+                  const res = await revealOutput(lastOutput)
+                  if (!res.ok) toast.error(res.error ?? "Could not show output")
+                }}
+                title={`Show ${lastOutput} in the file manager`}
+                className="gap-1.5"
+              >
+                <FolderOpen className="size-3.5" /> Show output
+              </Button>
+            )}
             <Button
               size="sm"
               variant="ghost"

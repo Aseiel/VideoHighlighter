@@ -15,6 +15,9 @@ export type RunEvent =
   | { type: "finished"; output: string }
   | { type: "downloaded"; paths: string[] }
   | { type: "faces_scanned"; count: number }
+  /** Detection was skipped because cached results were reused, so no preview
+   *  frames will arrive for that stage. */
+  | { type: "cache_used"; kind: "object" | "action" }
   | { type: "vision_hit"; timestamp: number; analysis: string }
   | { type: "vision_results"; results: VisionResult[] }
   | {
@@ -198,6 +201,20 @@ export async function revealLog(): Promise<{
   error?: string
 }> {
   const res = await fetch(`${SIDECAR_BASE}/reveal-log`, { method: "POST" })
+  return res.json()
+}
+
+/** Show a finished highlight video in the file manager. */
+export async function revealOutput(path: string): Promise<{
+  ok: boolean
+  path?: string
+  error?: string
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/reveal-output`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  })
   return res.json()
 }
 

@@ -108,6 +108,29 @@ a = Analysis(
     noarchive=False,
 )
 
+# Drop torch's vendored third-party license texts.
+#
+# torch ships its transitive vendors' licenses nested ~9 levels deep (kineto ->
+# dynolog -> prometheus-cpp -> civetweb -> duktape). Harmless in the onedir
+# build, but the MSI bundler builds paths as
+# `...\src-tauri\..\..\dist-sidecar\...` -- unresolved, with the `..\..` still
+# in the string -- and WiX 3.14 doesn't opt into long paths, so anything over
+# MAX_PATH (260) makes `light.exe` fail with LGHT0103 "cannot find the file".
+# The deepest are 280 chars, so the MSI can't build while they're bundled.
+#
+# They're license texts inside .dist-info metadata that nothing imports; torch's
+# own LICENSE/NOTICE at the dist-info root are shallow and stay. Filter by depth
+# rather than name so a future torch that vendors something new stays buildable.
+_LICENSE_DIR = os.path.join("licenses", "third_party")
+
+
+def _is_deep_vendored_license(dest: str) -> bool:
+    return ".dist-info" in dest and _LICENSE_DIR in dest
+
+
+a.datas = [entry for entry in a.datas
+           if not _is_deep_vendored_license(entry[0])]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
