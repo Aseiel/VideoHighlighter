@@ -1501,6 +1501,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         KEYWORD_POINTS = gui_config.get("keyword_points", config.get("keyword_points", 2))
         BEGINNING_POINTS = gui_config.get("beginning_points", config.get("beginning_points", 0))
         ENDING_POINTS = gui_config.get("ending_points", config.get("ending_points", 0))
+        BEGINNING_SECONDS = gui_config.get("beginning_seconds", config.get("beginning_seconds", 60))
+        ENDING_SECONDS = gui_config.get("ending_seconds", config.get("ending_seconds", 120))
         MULTI_SIGNAL_BOOST = gui_config.get("multi_signal_boost", config.get("multi_signal_boost", 1.2))
         MIN_SIGNALS_FOR_BOOST = gui_config.get("min_signals_for_boost", config.get("min_signals_for_boost", 2))
         OBJECT_POINTS = gui_config.get("object_points", config.get("object_points", 10))
@@ -1637,9 +1639,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         log(f"✅ Object detection summary: {total_detections} detections")
 
         # Beginning & ending boost
-        for i in range(min(int(video_duration), 60)):
+        for i in range(min(int(video_duration), BEGINNING_SECONDS)):
             beginning_score[i] += BEGINNING_POINTS
-        for i in range(max(0, int(video_duration) - 120), int(video_duration)):
+        for i in range(max(0, int(video_duration) - ENDING_SECONDS), int(video_duration)):
             ending_score[i] += ENDING_POINTS
 
         # Sum signals

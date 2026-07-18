@@ -1194,10 +1194,16 @@ class VideoHighlighterGUI(QWidget):
         self.spin_action.setToolTip("Points when a configured action is recognized (e.g. punching, jumping, dancing)")
 
         self.spin_beginning_points = QSpinBox(); self.spin_beginning_points.setRange(0,100); self.spin_beginning_points.setValue(scoring_cfg.get("beginning_points", 0))
-        self.spin_beginning_points.setToolTip("Points added to every second in the first 60s of the video — raise to make the intro more likely to be picked as a highlight, 0 to score it like anything else")
+        self.spin_beginning_points.setToolTip("Points added to every second in the intro window (length set below) — raise to make the intro more likely to be picked as a highlight, 0 to score it like anything else")
+
+        self.spin_beginning_seconds = QSpinBox(); self.spin_beginning_seconds.setRange(0,3600); self.spin_beginning_seconds.setSuffix(" s"); self.spin_beginning_seconds.setValue(scoring_cfg.get("beginning_seconds", 60))
+        self.spin_beginning_seconds.setToolTip("How many seconds from the start of the video count as the intro window for Intro points")
 
         self.spin_ending_points = QSpinBox(); self.spin_ending_points.setRange(0,100); self.spin_ending_points.setValue(scoring_cfg.get("ending_points", 0))
-        self.spin_ending_points.setToolTip("Points added to every second in the last 120s of the video — raise to make the outro more likely to be picked as a highlight, 0 to score it like anything else")
+        self.spin_ending_points.setToolTip("Points added to every second in the outro window (length set below) — raise to make the outro more likely to be picked as a highlight, 0 to score it like anything else")
+
+        self.spin_ending_seconds = QSpinBox(); self.spin_ending_seconds.setRange(0,3600); self.spin_ending_seconds.setSuffix(" s"); self.spin_ending_seconds.setValue(scoring_cfg.get("ending_seconds", 120))
+        self.spin_ending_seconds.setToolTip("How many seconds before the end of the video count as the outro window for Outro points")
 
         points_layout.addRow("Scene points:", self.spin_scene_points)
         points_layout.addRow("Motion event points:", self.spin_motion_event_points)
@@ -1207,8 +1213,10 @@ class VideoHighlighterGUI(QWidget):
         points_layout.addRow("Transcript points (all words):", self.spin_transcript_points)
         points_layout.addRow("Object points:", self.spin_object)
         points_layout.addRow("Action points:", self.spin_action)
-        points_layout.addRow("Intro points (first 60s):", self.spin_beginning_points)
-        points_layout.addRow("Outro points (last 120s):", self.spin_ending_points)
+        points_layout.addRow("Intro points:", self.spin_beginning_points)
+        points_layout.addRow("Intro window:", self.spin_beginning_seconds)
+        points_layout.addRow("Outro points:", self.spin_ending_points)
+        points_layout.addRow("Outro window:", self.spin_ending_seconds)
 
         points_box.setLayout(points_layout)
         basic_layout.addWidget(points_box, 0, 0, Qt.AlignTop)
@@ -2674,6 +2682,8 @@ class VideoHighlighterGUI(QWidget):
             "transcript_points": int(self.spin_transcript_points.value()),
             "beginning_points": int(self.spin_beginning_points.value()),
             "ending_points": int(self.spin_ending_points.value()),
+            "beginning_seconds": int(self.spin_beginning_seconds.value()),
+            "ending_seconds": int(self.spin_ending_seconds.value()),
             "object_points": int(self.spin_object.value()),
             "action_points": int(self.spin_action.value()),
             "clip_time": int(self.spin_clip_time.value()),
@@ -3235,6 +3245,8 @@ class VideoHighlighterGUI(QWidget):
                 "action_points": int(self.spin_action.value()),
                 "beginning_points": int(self.spin_beginning_points.value()),
                 "ending_points": int(self.spin_ending_points.value()),
+                "beginning_seconds": int(self.spin_beginning_seconds.value()),
+                "ending_seconds": int(self.spin_ending_seconds.value()),
                 "multi_signal_boost": 1.2,
                 "min_signals_for_boost": 2,
             },
@@ -4016,6 +4028,8 @@ class VideoHighlighterGUI(QWidget):
             "transcript_points": int(self.spin_transcript_points.value()),
             "beginning_points": int(self.spin_beginning_points.value()),
             "ending_points": int(self.spin_ending_points.value()),
+            "beginning_seconds": int(self.spin_beginning_seconds.value()),
+            "ending_seconds": int(self.spin_ending_seconds.value()),
             "object_points": int(self.spin_object.value()),
             "action_points": int(self.spin_action.value()),
             "clip_time": int(self.spin_clip_time.value()),
