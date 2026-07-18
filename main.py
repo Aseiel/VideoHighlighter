@@ -1632,14 +1632,28 @@ class VideoHighlighterGUI(QWidget):
                 on_action_backend_changed(0)
                 idx = self.action_models_combo.findData(select_mode)
                 if idx < 0 and n_classes:
-                    # The mode isn't offered under the current Backend (e.g. an R3D
-                    # model imported while Backend is set to OpenVINO). Switch to
-                    # "Auto" — the superset that lists every model and picks the
-                    # device at runtime — so the just-imported model becomes usable
-                    # without the user hunting through the Backend dropdown. Setting
-                    # the combo fires on_action_backend_changed, which rebuilds the
-                    # models list, so re-query the index afterward.
-                    ab_idx = self.action_backend_combo.findData("auto")
+                    # The mode isn't offered under the current Backend, so switch to
+                    # one that enables the just-imported model — preferring GPU —
+                    # instead of leaving the user to hunt through the dropdown:
+                    #   • R3D custom needs an R3D backend. "Auto" would *disable* R3D
+                    #     on a non-CUDA machine (see pipeline.py), which would make
+                    #     r3d_custom_only fail to load — so pick r3d_cuda when an
+                    #     NVIDIA GPU is present, else r3d_cpu (slow, but it runs).
+                    #   • OpenVINO custom → "Auto" (lists it, and uses the Intel
+                    #     GPU / CPU at runtime).
+                    if select_mode == "r3d_custom_only":
+                        try:
+                            from modules.device_utils import detect_best_device
+                            has_cuda = detect_best_device(
+                                log_fn=lambda *a, **k: None).pytorch_device == "cuda"
+                        except Exception:
+                            has_cuda = False
+                        target_backend = "r3d_cuda" if has_cuda else "r3d_cpu"
+                    else:
+                        target_backend = "auto"
+                    # Setting the combo fires on_action_backend_changed, which
+                    # rebuilds the models list, so re-query the index afterward.
+                    ab_idx = self.action_backend_combo.findData(target_backend)
                     if ab_idx >= 0:
                         self.action_backend_combo.setCurrentIndex(ab_idx)
                         idx = self.action_models_combo.findData(select_mode)
