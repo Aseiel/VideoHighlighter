@@ -221,6 +221,54 @@ def import_custom_action_model(decoder_xml_src: str, labels_json_src: str = "") 
     return n_classes
 
 
+def r3d_custom_action_paths() -> tuple[str, str]:
+    """Fixed install locations for the user's custom fine-tuned R3D (PyTorch)
+    action model: (weights_pth, mapping_json). Same resolve-with-override rule
+    as data_file()."""
+    return (
+        data_file("r3d_finetuned.pth"),
+        data_file("r3d_finetuned_mapping.json"),
+    )
+
+
+def import_r3d_action_model(weights_pth_src: str, mapping_json_src: str = "") -> tuple[int, str]:
+    """Install a user-trained R3D (PyTorch) action model (+ its mapping JSON)
+    into the writable user-data location, alongside import_custom_action_model()
+    but for the R3D slot.
+
+    Unlike the OpenVINO decoder, the mapping JSON is effectively required — it
+    carries both the class labels (``idx_to_label``) and the
+    ``metadata.model_variant`` (r3d_18 / mc3_18 / r2plus1d_18) the loader needs
+    to rebuild the right architecture before loading the weights. A same-named
+    ``*.json`` next to the ``.pth`` is used automatically if present.
+
+    Returns ``(num_classes, model_variant)`` — ``model_variant`` is ``""`` when
+    the mapping omits it, in which case the loader falls back to the UI's
+    "R3D model variant" dropdown selection.
+    """
+    dst_pth, dst_mapping = r3d_custom_action_paths()
+    os.makedirs(os.path.dirname(dst_pth), exist_ok=True)
+    shutil.copy2(weights_pth_src, dst_pth)
+
+    if not mapping_json_src:
+        candidate = os.path.splitext(weights_pth_src)[0] + ".json"
+        if os.path.exists(candidate):
+            mapping_json_src = candidate
+
+    n_classes, variant = 0, ""
+    if mapping_json_src and os.path.exists(mapping_json_src):
+        shutil.copy2(mapping_json_src, dst_mapping)
+        try:
+            import json
+            with open(dst_mapping, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            n_classes = len(data.get("idx_to_label", {}))
+            variant = (data.get("metadata") or {}).get("model_variant", "") or ""
+        except Exception:
+            pass
+    return n_classes, variant
+
+
 def ffmpeg_exe() -> str:
     """Resolve a usable ffmpeg executable.
 

@@ -53,7 +53,7 @@ CONFIG_FILE = config_path("config.yaml")
 YOLO_OBJECTS_LABELS_FILE = _resource_path("yolo_objects_labels.json")
 KINETICS_400_LABELS_FILE = _resource_path("kinetics_400_labels.json")
 INTEL_CUSTOM_LABELS_FILE = _data_file("intel_finetuned_classifier_3d_mapping.json")
-R3D_CUSTOM_LABELS_FILE = _resource_path("r3d_finetuned_mapping.json")
+R3D_CUSTOM_LABELS_FILE = _data_file("r3d_finetuned_mapping.json")
 
 class LabelSelectorDialog(QDialog):
     """Dialog with search/filter and multi-select for labels."""
@@ -1574,9 +1574,11 @@ class VideoHighlighterGUI(QWidget):
 
         import_action_btn = QPushButton("Import model…")
         import_action_btn.setToolTip(
-            "Copy a trained OpenVINO action decoder (.xml + .bin) into the app's "
-            "custom-model slot. A same-named .json labels file next to it is "
-            "picked up automatically, or you'll be asked to pick one.")
+            "Copy a trained custom action model into the app's custom-model slot:\n"
+            "  • OpenVINO decoder (.xml + .bin)\n"
+            "  • R3D fine-tuned weights (.pth)\n"
+            "A same-named .json (labels / mapping) next to it is picked up "
+            "automatically, or you'll be asked to pick one.")
         action_model_row = QHBoxLayout()
         action_model_row.addWidget(self.action_models_combo, 1)
         action_model_row.addWidget(import_action_btn)
@@ -1584,35 +1586,59 @@ class VideoHighlighterGUI(QWidget):
         action_model_widget.setLayout(action_model_row)
 
         def _import_action_model():
-            from modules.app_paths import import_custom_action_model
             src, _ = QFileDialog.getOpenFileName(
-                self, "Import custom action decoder", "",
-                "OpenVINO IR (*.xml);;All files (*)")
+                self, "Import custom action model", "",
+                "Action models (*.xml *.pth);;OpenVINO IR (*.xml);;"
+                "R3D weights (*.pth);;All files (*)")
             if not src:
                 return
+            is_r3d = src.lower().endswith(".pth")
             labels_src = ""
             if not os.path.exists(os.path.splitext(src)[0] + ".json"):
+                prompt = ("R3D mapping file (idx_to_label + metadata JSON)" if is_r3d
+                          else "Labels file for this decoder (idx_to_label JSON)")
                 labels_src, _ = QFileDialog.getOpenFileName(
-                    self, "Labels file for this decoder (idx_to_label JSON)", "",
-                    "JSON (*.json);;All files (*)")
+                    self, prompt, "", "JSON (*.json);;All files (*)")
             try:
-                n_classes = import_custom_action_model(src, labels_src)
-                if n_classes == 0:
-                    print("⚠️ Custom action decoder imported without a labels file "
-                          "— it won't be usable until one is provided")
-                # Fresh re-resolution (not the frozen INTEL_CUSTOM_LABELS_FILE
-                # constant) so the newly imported model shows up immediately,
+                # Fresh re-resolution (not the frozen *_LABELS_FILE constants) so
+                # the newly imported model's class count shows up immediately,
                 # without requiring an app restart.
-                from modules.app_paths import custom_action_decoder_paths
-                fresh_labels_path = custom_action_decoder_paths()[2]
-                self._custom_ov_count = (
-                    len(self.load_labels_from_json(fresh_labels_path))
-                    if os.path.exists(fresh_labels_path) else 0
-                )
+                if is_r3d:
+                    from modules.app_paths import (
+                        import_r3d_action_model, r3d_custom_action_paths)
+                    n_classes, variant = import_r3d_action_model(src, labels_src)
+                    if n_classes == 0:
+                        print("⚠️ R3D model imported without a mapping file — it won't "
+                              "be usable until one is provided")
+                    elif not variant:
+                        print("⚠️ R3D mapping has no model_variant — the loader will use "
+                              "the 'R3D model variant' dropdown selection")
+                    fresh = r3d_custom_action_paths()[1]
+                    self._r3d_custom_count = (
+                        len(self.load_labels_from_json(fresh)) if os.path.exists(fresh) else 0)
+                    select_mode = "r3d_custom_only"
+                else:
+                    from modules.app_paths import (
+                        import_custom_action_model, custom_action_decoder_paths)
+                    n_classes = import_custom_action_model(src, labels_src)
+                    if n_classes == 0:
+                        print("⚠️ Custom action decoder imported without a labels file "
+                              "— it won't be usable until one is provided")
+                    fresh = custom_action_decoder_paths()[2]
+                    self._custom_ov_count = (
+                        len(self.load_labels_from_json(fresh)) if os.path.exists(fresh) else 0)
+                    select_mode = "custom_only"
+
                 on_action_backend_changed(0)
-                idx = self.action_models_combo.findData("custom_only")
+                idx = self.action_models_combo.findData(select_mode)
                 if idx >= 0:
                     self.action_models_combo.setCurrentIndex(idx)
+                elif n_classes:
+                    # The mode isn't offered under the current backend (e.g. an R3D
+                    # model imported while Backend is set to OpenVINO). It's installed
+                    # — just switch Backend to Auto/R3D to select it.
+                    print(f"ℹ️ Imported model isn't available under the current backend; "
+                          f"switch Backend to see '{select_mode}'.")
             except Exception as e:
                 print(f"⚠️ action model import failed: {e}")
 
