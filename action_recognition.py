@@ -708,8 +708,8 @@ class PreprocessPipeline:
     def __init__(self, num_workers=2):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
 
-    def submit(self, frame, input_shape, roi=None):
-        return self.executor.submit(preprocess_frame, frame, input_shape, roi)
+    def submit(self, frame, input_shape, roi=None, imagenet_norm=False):
+        return self.executor.submit(preprocess_frame, frame, input_shape, roi, imagenet_norm)
 
     def shutdown(self):
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -970,11 +970,23 @@ def load_models(device="AUTO", openvino_threads=None,
 # =============================
 # Preprocess frame with ROI support (for OpenVINO encoder)
 # =============================
-def preprocess_frame(frame, input_shape, roi=None):
+def preprocess_frame(frame, input_shape, roi=None, imagenet_norm=False):
+    """Letterbox a BGR frame to the encoder input.
+
+    ``imagenet_norm`` — when True, convert BGR→RGB, scale to [0,1], and apply
+    ImageNet mean/std, matching how the custom OpenVINO decoders were trained
+    (model_training/intel/model.py). The Intel Kinetics-400 decoder was NOT
+    trained that way — it expects the encoder's native raw-BGR 0-255 input — so
+    this is only enabled by the caller when the shared encoder feeds a custom
+    decoder and NOT the Intel one (see run_action_detection). Default False
+    preserves the raw-0-255 behaviour for every existing caller.
+    """
     frame_to_process = frame
     if roi is not None:
         x1, y1, x2, y2 = roi
         frame_to_process = frame[y1:y2, x1:x2]
+    if imagenet_norm:
+        frame_to_process = cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)
 
     N, C, H, W = input_shape
     h, w = frame_to_process.shape[:2]
@@ -999,6 +1011,10 @@ def preprocess_frame(frame, input_shape, roi=None):
 
     frame_padded = np.ascontiguousarray(frame_padded.transpose(2, 0, 1))
     result = np.expand_dims(frame_padded, axis=0).astype(np.float32)
+    if imagenet_norm:
+        mean = np.array([0.485, 0.456, 0.406], np.float32).reshape(1, 3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225], np.float32).reshape(1, 3, 1, 1)
+        result = (result / 255.0 - mean) / std
     return result
 
 
@@ -1199,6 +1215,18 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     encoder_engine = AsyncBatchedInferenceEngine(
         compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
 
+    # The shared OpenVINO encoder feeds the custom and Intel decoders the SAME
+    # embedding. The custom decoder wants ImageNet-normalised encoder input (its
+    # training convention); the Intel Kinetics-400 decoder wants raw BGR 0-255.
+    # They can't both be satisfied from one encoder pass, so only normalise when
+    # a custom decoder is loaded and the Intel one is NOT (i.e. custom-only). In
+    # mixed mode the encoder stays raw so the Intel path is never broken; the
+    # custom head is then slightly off (documented trade-off, avoids a second
+    # encoder pass over the whole video).
+    enc_imagenet = bool(models_info.get('custom')) and not models_info.get('intel')
+    if enc_imagenet:
+        print("✓ Encoder input: ImageNet-normalised (custom decoder training convention)")
+
     # ---- Warn if any mapped action refers to a model that didn't load ----
     if action_to_model:
         missing_models = set()
@@ -1344,7 +1372,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
             preprocess_start = time.time()
             processed_frame = preprocess_frame(
                 warm_up_frame, encoder_input.shape,
-                roi=current_action_roi if use_person_detection else None)
+                roi=current_action_roi if use_person_detection else None,
+                imagenet_norm=enc_imagenet)
             preprocess_time += time.time() - preprocess_start
 
             inference_start = time.time()
@@ -1509,13 +1538,15 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                         preprocess_start = time.time()
                         processed_frame = preprocess_frame(
                             frame, encoder_input.shape,
-                            roi=current_action_roi if use_person_detection else None)
+                            roi=current_action_roi if use_person_detection else None,
+                            imagenet_norm=enc_imagenet)
                         preprocess_time += time.time() - preprocess_start
 
                     # Submit NEXT frame's preprocess now (overlapped)
                     pending_preprocess_future = preprocess_pool.submit(
                         frame, encoder_input.shape,
-                        roi=current_action_roi if use_person_detection else None)
+                        roi=current_action_roi if use_person_detection else None,
+                        imagenet_norm=enc_imagenet)
 
                     inference_start = time.time()
                     req = encoder_engine.infer_async(processed_frame)
