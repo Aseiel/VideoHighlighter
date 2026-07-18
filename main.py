@@ -1193,6 +1193,12 @@ class VideoHighlighterGUI(QWidget):
         self.spin_action = QSpinBox(); self.spin_action.setRange(0,1000); self.spin_action.setValue(scoring_cfg.get("action_points", 10))
         self.spin_action.setToolTip("Points when a configured action is recognized (e.g. punching, jumping, dancing)")
 
+        self.spin_beginning_points = QSpinBox(); self.spin_beginning_points.setRange(0,100); self.spin_beginning_points.setValue(scoring_cfg.get("beginning_points", 0))
+        self.spin_beginning_points.setToolTip("Points added to every second in the first 60s of the video — raise to make the intro more likely to be picked as a highlight, 0 to score it like anything else")
+
+        self.spin_ending_points = QSpinBox(); self.spin_ending_points.setRange(0,100); self.spin_ending_points.setValue(scoring_cfg.get("ending_points", 0))
+        self.spin_ending_points.setToolTip("Points added to every second in the last 120s of the video — raise to make the outro more likely to be picked as a highlight, 0 to score it like anything else")
+
         points_layout.addRow("Scene points:", self.spin_scene_points)
         points_layout.addRow("Motion event points:", self.spin_motion_event_points)
         points_layout.addRow("Motion peak points:", self.spin_motion_peak)
@@ -1201,6 +1207,8 @@ class VideoHighlighterGUI(QWidget):
         points_layout.addRow("Transcript points (all words):", self.spin_transcript_points)
         points_layout.addRow("Object points:", self.spin_object)
         points_layout.addRow("Action points:", self.spin_action)
+        points_layout.addRow("Intro points (first 60s):", self.spin_beginning_points)
+        points_layout.addRow("Outro points (last 120s):", self.spin_ending_points)
 
         points_box.setLayout(points_layout)
         basic_layout.addWidget(points_box, 0, 0, Qt.AlignTop)
@@ -2664,8 +2672,8 @@ class VideoHighlighterGUI(QWidget):
             "audio_peak_points": int(self.spin_audio_peak.value()),
             "keyword_points": int(self.spin_keyword_points.value()),
             "transcript_points": int(self.spin_transcript_points.value()),
-            "beginning_points": 0,
-            "ending_points": 0,
+            "beginning_points": int(self.spin_beginning_points.value()),
+            "ending_points": int(self.spin_ending_points.value()),
             "object_points": int(self.spin_object.value()),
             "action_points": int(self.spin_action.value()),
             "clip_time": int(self.spin_clip_time.value()),
@@ -3225,6 +3233,8 @@ class VideoHighlighterGUI(QWidget):
                 "transcript_points": int(self.spin_transcript_points.value()),
                 "object_points": int(self.spin_object.value()),
                 "action_points": int(self.spin_action.value()),
+                "beginning_points": int(self.spin_beginning_points.value()),
+                "ending_points": int(self.spin_ending_points.value()),
                 "multi_signal_boost": 1.2,
                 "min_signals_for_boost": 2,
             },
@@ -3935,8 +3945,8 @@ class VideoHighlighterGUI(QWidget):
         keyword_points = int(self.spin_keyword_points.value()) if use_transcript else 0
         transcript_points = int(self.spin_transcript_points.value()) if use_transcript else 0
         
-        beginning_points = 0  # Not configurable in GUI
-        ending_points = 0     # Not configurable in GUI
+        beginning_points = int(self.spin_beginning_points.value())
+        ending_points = int(self.spin_ending_points.value())
         
         total_points = (scene_points + motion_event_points + motion_peak_points + 
                        audio_peak_points + keyword_points + transcript_points + 
@@ -4004,8 +4014,8 @@ class VideoHighlighterGUI(QWidget):
             "audio_peak_points": int(self.spin_audio_peak.value()),
             "keyword_points": int(self.spin_keyword_points.value()),
             "transcript_points": int(self.spin_transcript_points.value()),
-            "beginning_points": 0,
-            "ending_points": 0,
+            "beginning_points": int(self.spin_beginning_points.value()),
+            "ending_points": int(self.spin_ending_points.value()),
             "object_points": int(self.spin_object.value()),
             "action_points": int(self.spin_action.value()),
             "clip_time": int(self.spin_clip_time.value()),
