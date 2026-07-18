@@ -24,6 +24,11 @@ from modules.device_utils import resolve_yolo_device
 from modules.app_paths import ffmpeg_exe
 
 
+# Emitted when detection is skipped because cached results were reused. The
+# sidecar matches this line to tell the web UI no preview frames are coming
+# (sidecar/worker.py), so the wording is a contract, not just prose — change it
+# here and the worker follows.
+CACHE_HIT_LOG = "ℹ️ Using cached {kind} detections"
 
 # Keep warnings about CUDA quiet
 warnings.filterwarnings("ignore", message="torch.cuda")
@@ -317,7 +322,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
 
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log_fn=print, progress_fn=None, cancel_flag=None,
-                    preview_fn=None):
+                    preview_fn=None, timeline_fn=None):
     """
     Process single video or multiple videos for highlight generation.
     
@@ -328,7 +333,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         log_fn: Logging function
         progress_fn: Progress callback function
         cancel_flag: Threading event for cancellation
-    
+        timeline_fn: Optional callback(video_path, analysis_data) used to open
+            the timeline viewer. The GUI passes one that marshals to the Qt main
+            thread; when omitted (CLI/sidecar) the viewer is opened inline.
+
     Returns:
         str (single output path) or list of tuples [(input_path, output_path), ...]
     """
@@ -369,6 +377,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     progress_fn=progress_fn,
                     cancel_flag=cancel_flag,
                     preview_fn=preview_fn,
+                    timeline_fn=timeline_fn,
                 )
                 results.append((single_video_path, result))
                 
@@ -1141,7 +1150,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"⚠️ Composition engine skipped: {_ce}")
 
         else:
-            log("ℹ️ Using cached object detections")
+            log(CACHE_HIT_LOG.format(kind="object"))
 
         print("Detections per second:", len(object_detections))
 
@@ -1378,7 +1387,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log(f"Full error: {traceback.format_exc()}")
                 action_detections = []
         elif using_cache:
-            log("ℹ️ Using cached action detections")
+            log(CACHE_HIT_LOG.format(kind="action"))
             # action_detections already loaded from cache - ensure it's in 5-element format
             if action_detections and len(action_detections) > 0:
                 first_det = action_detections[0]
@@ -2258,9 +2267,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # ========== TIMELINE VISUALIZATION ==========
         if gui_config.get("create_timeline_viewer", False):
             try:
-                from signal_timeline_viewer import show_timeline_viewer
                 log("🎨 Launching Signal Timeline Viewer...")
-                
+
                 # Create analysis_data if not already created for cache
                 if 'analysis_data' not in locals() or analysis_data is None:
                     analysis_data = collect_analysis_data(
@@ -2282,15 +2290,19 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # so avoided-person splits are preserved) instead of letting it
                 # reload a stale highlight-history entry.
                 analysis_data['final_segments'] = [[float(s), float(e)] for s, e in segments]
-                
-                # Launch in separate thread/process so it doesn't block
-                import threading
-                timeline_thread = threading.Thread(
-                    target=show_timeline_viewer,
-                    args=(processed_video_path, analysis_data),
-                    daemon=True
-                )
-                timeline_thread.start()
+
+                # Hand the request to the GUI instead of building the window
+                # here. Qt widgets may only be created on the main thread, and
+                # this runs on the pipeline worker thread. Going through the GUI
+                # also means the viewer goes via the reuse guard in
+                # open_timeline_viewer() rather than constructing a second
+                # window (each one pins ~2.5GB and can't be torn down).
+                if timeline_fn is not None:
+                    timeline_fn(processed_video_path, analysis_data)
+                else:
+                    # No GUI attached (CLI/headless): own the event loop here.
+                    from signal_timeline_viewer import show_timeline_viewer
+                    show_timeline_viewer(processed_video_path, analysis_data)
             except Exception as e:
                 log(f"⚠️ Timeline viewer failed: {e}")
         # ============================================

@@ -511,6 +511,7 @@ class Worker(QThread):
     log = Signal(str)
     cancelled = Signal()
     preview = Signal(object, object, int)   # frame_bgr (ndarray), boxes (list), sec
+    timeline_requested = Signal(str, object)  # video_path, analysis_data
 
     def __init__(self, video_path, gui_config=None):
         super().__init__()
@@ -561,6 +562,9 @@ class Worker(QThread):
                 progress_fn=pausing_progress,
                 cancel_flag=self._cancel_flag,
                 preview_fn=preview_gate,
+                # Qt widgets may only be built on the main thread; emitting
+                # hands the request off to the GUI's reuse-aware handler.
+                timeline_fn=lambda path, data: self.timeline_requested.emit(str(path), data),
             )
 
             if self._cancel_flag.is_set():
@@ -3868,6 +3872,7 @@ class VideoHighlighterGUI(QWidget):
         self.worker.finished.connect(self.pipeline_done)
         self.worker.cancelled.connect(self.pipeline_cancelled)
         self.worker.preview.connect(self.on_preview_frame)
+        self.worker.timeline_requested.connect(self.on_timeline_requested)
         
         # Start status checking timer
         self.status_timer.start(100)  # Check every 100ms
@@ -4161,6 +4166,39 @@ class VideoHighlighterGUI(QWidget):
         except Exception:
             pass
         return []
+
+    def on_timeline_requested(self, video_path, analysis_data):
+        """Open the timeline viewer at the pipeline's request.
+
+        Runs on the main thread (the worker emits timeline_requested), so it is
+        safe to build Qt widgets here. Reuses an already-open window for the same
+        video rather than constructing a second one — each SignalTimelineWindow
+        pins itself in memory and can't be torn down, so a fresh one per run
+        leaks ~2.5GB. See open_timeline_viewer() for the same guard.
+        """
+        try:
+            existing = getattr(self, 'timeline_window', None)
+            if existing is not None:
+                try:
+                    if getattr(existing, 'video_path', None) == video_path:
+                        existing.show()
+                        existing.raise_()
+                        existing.activateWindow()
+                        self.append_log("📊 Reusing open timeline viewer.")
+                        return
+                except RuntimeError:
+                    # Underlying C++ object was deleted — fall through.
+                    self.timeline_window = None
+
+            from signal_timeline_viewer import SignalTimelineWindow
+            self.append_log(f"📊 Opening timeline viewer for: {os.path.basename(video_path)}")
+            self.timeline_window = SignalTimelineWindow(video_path, analysis_data)
+            self.timeline_window.show()
+            self.llm_chat.set_timeline_window(self.timeline_window)
+            self.llm_chat.set_video_path(video_path)
+            self.llm_chat.load_cache_for_video(video_path)
+        except Exception as e:
+            self.append_log(f"❌ Failed to open timeline viewer: {e}")
 
     def open_timeline_viewer(self):
         """Open timeline viewer for the selected video"""
