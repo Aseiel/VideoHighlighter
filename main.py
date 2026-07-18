@@ -1631,14 +1631,20 @@ class VideoHighlighterGUI(QWidget):
 
                 on_action_backend_changed(0)
                 idx = self.action_models_combo.findData(select_mode)
+                if idx < 0 and n_classes:
+                    # The mode isn't offered under the current Backend (e.g. an R3D
+                    # model imported while Backend is set to OpenVINO). Switch to
+                    # "Auto" — the superset that lists every model and picks the
+                    # device at runtime — so the just-imported model becomes usable
+                    # without the user hunting through the Backend dropdown. Setting
+                    # the combo fires on_action_backend_changed, which rebuilds the
+                    # models list, so re-query the index afterward.
+                    ab_idx = self.action_backend_combo.findData("auto")
+                    if ab_idx >= 0:
+                        self.action_backend_combo.setCurrentIndex(ab_idx)
+                        idx = self.action_models_combo.findData(select_mode)
                 if idx >= 0:
                     self.action_models_combo.setCurrentIndex(idx)
-                elif n_classes:
-                    # The mode isn't offered under the current backend (e.g. an R3D
-                    # model imported while Backend is set to OpenVINO). It's installed
-                    # — just switch Backend to Auto/R3D to select it.
-                    print(f"ℹ️ Imported model isn't available under the current backend; "
-                          f"switch Backend to see '{select_mode}'.")
             except Exception as e:
                 print(f"⚠️ action model import failed: {e}")
 
