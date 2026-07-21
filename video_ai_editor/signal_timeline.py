@@ -3,7 +3,7 @@ from collections import defaultdict
 import json
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
-    QGraphicsLineItem, QApplication, QMenu
+    QGraphicsLineItem, QGraphicsItem, QApplication, QMenu
 )
 from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData
 from PySide6.QtGui import (
@@ -688,6 +688,8 @@ class SignalTimelineScene(QGraphicsScene):
                 scale_factor = width / old_visible_width
                 view.setTransform(old_transform.scale(scale_factor, 1.0))
                 view.horizontalScrollBar().setValue(old_h_scroll)
+                # Zoom changed — re-pick the ruler interval for it.
+                self.draw_time_markers()
 
         print(f"✅ Timeline rebuilt successfully, final height={height}")
         self.timeline_rebuilt.emit()
@@ -1272,27 +1274,94 @@ class SignalTimelineScene(QGraphicsScene):
             text_item.setToolTip(tooltip)
 
             
+    # "Nice" intervals in seconds — labels/gridlines always land on one of these
+    # so the axis stays readable at any zoom level.
+    _NICE_INTERVALS = (
+        1, 2, 5, 10, 15, 30,
+        60, 120, 300, 600, 900, 1800,
+        3600, 7200, 10800, 21600, 43200, 86400,
+    )
+
+    def _nice_interval(self, min_seconds):
+        """Smallest 'nice' interval >= min_seconds (falls back to the largest)."""
+        for iv in self._NICE_INTERVALS:
+            if iv >= min_seconds:
+                return iv
+        return self._NICE_INTERVALS[-1]
+
+    @staticmethod
+    def _format_time_label(second):
+        """H:MM:SS once we're past an hour, MM:SS otherwise."""
+        second = int(second)
+        h, rem = divmod(second, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h:d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
     def draw_time_markers(self):
-        """Draw time markers at regular intervals with improved formatting"""
-        for second in range(0, int(self.video_duration) + 1, 5):
+        """Draw the time ruler. The interval adapts to the *effective* zoom
+        (scene pixels-per-second × the view's horizontal scale) so labels never
+        collide when zoomed out, and the labels ignore the view transform so the
+        horizontal-only zoom can't squish the glyphs together."""
+        # Remove markers from a previous pass (this method is re-run on zoom).
+        # build_timeline's self.clear() may have already deleted the underlying
+        # C++ objects, leaving these refs dangling — hence the guard.
+        for item in getattr(self, "_time_marker_items", []):
+            try:
+                if item.scene() is self:
+                    self.removeItem(item)
+            except RuntimeError:
+                pass  # C++ object already deleted by clear()
+        self._time_marker_items = []
+
+        if self.video_duration <= 0:
+            return
+
+        # Effective on-screen pixels per second = scene scale × view horizontal scale.
+        views = self.views()
+        m11 = views[0].transform().m11() if views else 1.0
+        eff_pps = self.pixels_per_second * (m11 or 1.0)
+        if eff_pps <= 0:
+            return
+
+        # Aim for ~80px between labels and ~12px between minor gridlines.
+        label_iv = self._nice_interval(80.0 / eff_pps)
+        minor_iv = self._nice_interval(12.0 / eff_pps)
+        # Keep minors a clean subdivision of labels, and never denser than labels.
+        if minor_iv >= label_iv:
+            minor_iv = label_iv
+
+        h = self.sceneRect().height()
+        duration = int(self.video_duration)
+
+        # Minor gridlines (skip the ones that coincide with a label line).
+        minor_pen = QPen(QColor(95, 95, 95, 80), 0, Qt.PenStyle.DashLine)
+        minor_pen.setCosmetic(True)  # stay 1px regardless of horizontal zoom
+        second = 0
+        while second <= duration:
+            if second % label_iv != 0:
+                x = second * self.pixels_per_second
+                line = self.addLine(x, 0, x, h, minor_pen)
+                self._time_marker_items.append(line)
+            second += minor_iv
+
+        # Major gridlines + labels.
+        major_pen = QPen(QColor(110, 110, 110, 150), 0, Qt.PenStyle.SolidLine)
+        major_pen.setCosmetic(True)
+        second = 0
+        while second <= duration:
             x = second * self.pixels_per_second
-            
-            # Draw vertical line (darker for 30-second intervals)
-            if second % 30 == 0:
-                pen = QPen(QColor(110, 110, 110, 150), 1, Qt.PenStyle.SolidLine)
-            else:
-                pen = QPen(QColor(95, 95, 95, 80), 1, Qt.PenStyle.DashLine)
-            self.addLine(x, 0, x, self.sceneRect().height(), pen)
-            
-            # Add time label for 30-second intervals
-            if second % 30 == 0:
-                minutes = second // 60
-                secs = second % 60
-                time_label = f"{minutes:02d}:{secs:02d}"
-                
-                text = self.addText(time_label, QFont("Consolas", 9))
-                text.setPos(x + 5, self.sceneRect().height() - 25)
-                text.setDefaultTextColor(QColor(200, 200, 200))
+            line = self.addLine(x, 0, x, h, major_pen)
+            self._time_marker_items.append(line)
+
+            text = self.addText(self._format_time_label(second), QFont("Consolas", 9))
+            text.setDefaultTextColor(QColor(200, 200, 200))
+            # Constant on-screen size + anchored at x so the zoom can't distort it.
+            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            text.setPos(x, h - 22)
+            self._time_marker_items.append(text)
+            second += label_iv
       
     def set_zoom(self, zoom_level):
         """Change zoom level (pixels per second)"""
@@ -1843,6 +1912,13 @@ class SignalTimelineView(QGraphicsView):
             self.scale(1.0 / zoom_factor, 1.0)
 
         self.setTransformationAnchor(old_anchor)
+
+        # Re-pick the ruler interval for the new effective zoom so labels stay
+        # readable and evenly spaced instead of colliding as you zoom out.
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "draw_time_markers"):
+            scene.draw_time_markers()
+
         event.accept()
     
     def _item_is_bar(self, pos) -> bool:
