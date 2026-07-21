@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QFont, QLinearGradient,
-    QFontMetrics, QCursor, QPainter, QDrag, QPixmap
+    QFontMetrics, QCursor, QPainter, QDrag, QPixmap, QPolygonF
 )
 
 class SignalTimelineScene(QGraphicsScene):
@@ -31,6 +31,15 @@ class SignalTimelineScene(QGraphicsScene):
         # Waveform visualization
         self.waveform = waveform or []
         self.waveform_opacity = 0.7
+
+        # Waveform peak navigation — the ◀▶ arrows on the AUDIO WAVEFORM row
+        # jump between local energy maxima whose normalized loudness clears this
+        # sensitivity (0..1, as a fraction of the robust typical→peak range that
+        # the waveform coloring uses). _min_gap collapses one loud passage into a
+        # single stop. Derived live, so it works even when pipeline peak
+        # detection was skipped (audio_peak_points == 0).
+        self.waveform_peak_sensitivity = 0.75
+        self.waveform_peak_min_gap = 1.0
 
         # Always generate colors — they're used by draw_waveform_layer
         # regardless of whether the waveform comes from the constructor
@@ -254,7 +263,23 @@ class SignalTimelineScene(QGraphicsScene):
                 line_width = max(2, self.pixels_per_second / (len(self.waveform) / self.video_duration))
                 pen = QPen(color, min(5, line_width))  # Cap at 5 pixels thick
                 self.addLine(x, y_min, x, y_max, pen)
-        
+
+            # Peak markers — small amber triangles above every peak the AUDIO
+            # WAVEFORM ◀▶ arrows will jump to, so the sensitivity is visible as
+            # you drag its slider.
+            marker_brush = QBrush(QColor(255, 196, 0))
+            marker_pen = QPen(Qt.NoPen)
+            for t in self._waveform_peaks():
+                px = t * self.pixels_per_second
+                if px > total_width:
+                    continue
+                tri = QPolygonF([
+                    QPointF(px - 4, waveform_y + 1),
+                    QPointF(px + 4, waveform_y + 1),
+                    QPointF(px,     waveform_y + 8),
+                ])
+                self.addPolygon(tri, marker_pen, marker_brush)
+
         return y_pos + height + self.layer_spacing
 
 
@@ -328,6 +353,75 @@ class SignalTimelineScene(QGraphicsScene):
         self.merge_threshold = max(0.0, seconds)
         self.build_timeline()
 
+    # ── Waveform peak navigation ────────────────────────────────────────────
+    def _waveform_energy_series(self):
+        """(time, norm_energy) per waveform bin. Normalized against the same
+        robust percentile range the waveform coloring uses (10th → 97th), so a
+        sensitivity of e.g. 0.7 lines up with what the colors show."""
+        wf = self.waveform
+        n = len(wf)
+        if n == 0 or self.video_duration <= 0:
+            return []
+
+        def _energy(pt):
+            return pt[2] if len(pt) > 2 else (abs(pt[0]) + abs(pt[1])) / 2
+
+        energies = [_energy(pt) for pt in wf]
+        s = sorted(energies)
+
+        def _pct(p):
+            return s[min(len(s) - 1, int(len(s) * p))]
+
+        lo = _pct(0.10)
+        rng = max(_pct(0.97) - lo, 1e-6)
+
+        series = []
+        for i, e in enumerate(energies):
+            norm = (e - lo) / rng
+            norm = 0.0 if norm < 0 else (1.0 if norm > 1 else norm)
+            t = ((i + 0.5) / n) * self.video_duration   # bin center (matches draw)
+            series.append((t, norm))
+        return series
+
+    def _waveform_peaks(self):
+        """Peak times in the waveform whose normalized energy clears the
+        sensitivity threshold, after non-maximum suppression so each loud region
+        contributes a single, loudest stop (min_gap seconds apart)."""
+        series = self._waveform_energy_series()
+        if not series:
+            return []
+
+        thr = self.waveform_peak_sensitivity
+        n = len(series)
+
+        # Local maxima above threshold.
+        cands = []
+        for i, (t, norm) in enumerate(series):
+            if norm < thr:
+                continue
+            prev_n = series[i - 1][1] if i > 0 else -1.0
+            next_n = series[i + 1][1] if i < n - 1 else -1.0
+            if norm >= prev_n and norm >= next_n:
+                cands.append((t, norm))
+        if not cands:
+            return []
+
+        # Non-max suppression: loudest first, drop anything within min_gap of a
+        # peak already kept.
+        gap = self.waveform_peak_min_gap
+        cands.sort(key=lambda c: c[1], reverse=True)
+        kept = []
+        for t, _norm in cands:
+            if all(abs(t - kt) > gap for kt in kept):
+                kept.append(t)
+        kept.sort()
+        return kept
+
+    def set_waveform_peak_sensitivity(self, value):
+        """0..1 loudness cutoff for the AUDIO WAVEFORM peak arrows + markers."""
+        self.waveform_peak_sensitivity = max(0.0, min(1.0, float(value)))
+        self.build_timeline()
+
     # ── Navigation timestamp helpers ────────────────────────────────────────
     def _nav_timestamps_actions(self):
         ts = []
@@ -369,6 +463,11 @@ class SignalTimelineScene(QGraphicsScene):
     def _nav_timestamps_audio_peaks(self):
         return [float(p) if not isinstance(p, dict) else float(p.get('time', 0))
                 for p in self.cache_data.get('audio_peaks', [])]
+
+    def _nav_timestamps_waveform_peaks(self):
+        """Peak times the AUDIO WAVEFORM ◀▶ arrows jump between — derived live
+        from the waveform energy at the current sensitivity."""
+        return self._waveform_peaks()
 
     def _nav_timestamps_highlights(self):
         # Mirror draw_highlights_layer's sources + formats (pipeline writes

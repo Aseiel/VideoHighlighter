@@ -61,6 +61,7 @@ class SignalLabelPanel(QWidget):
 
     # Tracks that support prev/next navigation and how to pull timestamps
     _NAVIGABLE = {
+        "AUDIO WAVEFORM": lambda scene: scene._nav_timestamps_waveform_peaks(),
         "ACTIONS":        lambda scene: scene._nav_timestamps_actions(),
         "OBJECTS":        lambda scene: scene._nav_timestamps_objects(),
         "SCENES":         lambda scene: scene._nav_timestamps_scenes(),
@@ -2483,6 +2484,39 @@ class SignalTimelineWindow(QMainWindow):
         merge_group.setLayout(merge_layout)
         layout.addWidget(merge_group)
 
+        # Waveform peak sensitivity — controls the ◀▶ arrows + amber markers on
+        # the AUDIO WAVEFORM row (jump between loud moments).
+        wpeak_group = QGroupBox("Waveform Peaks")
+        wpeak_layout = QVBoxLayout()
+
+        wpeak_row = QHBoxLayout()
+        wpeak_row.addWidget(QLabel("Sensitivity:"))
+
+        self.wpeak_slider = QSlider(Qt.Orientation.Horizontal)
+        self.wpeak_slider.setMinimum(0)
+        self.wpeak_slider.setMaximum(100)   # 0..100 % → sensitivity 0.0..1.0
+        init_pct = int(round(self.signal_scene.waveform_peak_sensitivity * 100))
+        self.wpeak_slider.setValue(init_pct)
+        self.wpeak_slider.setTickInterval(25)
+        self.wpeak_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.wpeak_slider.valueChanged.connect(self.on_wpeak_sensitivity_changed)
+        wpeak_row.addWidget(self.wpeak_slider)
+
+        self.wpeak_value_label = QLabel(f"{init_pct}%")
+        self.wpeak_value_label.setStyleSheet("color: #ffc400; font-weight: bold; min-width: 36px;")
+        wpeak_row.addWidget(self.wpeak_value_label)
+
+        wpeak_layout.addLayout(wpeak_row)
+
+        wpeak_hint = QLabel("Higher = only the loudest moments. Use ◀▶ on the "
+                            "AUDIO WAVEFORM row to jump between them.")
+        wpeak_hint.setStyleSheet("color: #888; font-size: 10px;")
+        wpeak_hint.setWordWrap(True)
+        wpeak_layout.addWidget(wpeak_hint)
+
+        wpeak_group.setLayout(wpeak_layout)
+        layout.addWidget(wpeak_group)
+
         # Actions row: show ALL detections (default) vs only highlight-selected
         self.only_highlight_actions_cb = QCheckBox("Show only highlight actions")
         self.only_highlight_actions_cb.setChecked(False)
@@ -2766,6 +2800,24 @@ class SignalTimelineWindow(QMainWindow):
         """Actually apply the merge threshold after debounce"""
         if hasattr(self, 'signal_scene') and hasattr(self, '_pending_merge_value'):
             self.signal_scene.set_merge_threshold(self._pending_merge_value)
+
+    def on_wpeak_sensitivity_changed(self, value):
+        """Waveform-peak sensitivity slider (0..100 %), debounced so a drag
+        doesn't rebuild the timeline on every step."""
+        self.wpeak_value_label.setText(f"{value}%")
+
+        if not hasattr(self, '_wpeak_timer'):
+            self._wpeak_timer = QTimer()
+            self._wpeak_timer.setSingleShot(True)
+            self._wpeak_timer.timeout.connect(self._apply_wpeak_sensitivity)
+
+        self._pending_wpeak_value = value / 100.0
+        self._wpeak_timer.start(200)   # wait 200ms after last change
+
+    def _apply_wpeak_sensitivity(self):
+        """Apply the waveform-peak sensitivity after debounce."""
+        if hasattr(self, 'signal_scene') and hasattr(self, '_pending_wpeak_value'):
+            self.signal_scene.set_waveform_peak_sensitivity(self._pending_wpeak_value)
 
     def on_only_highlight_actions_changed(self, state):
         """Toggle the ACTIONS row between all detections and highlight-only."""
