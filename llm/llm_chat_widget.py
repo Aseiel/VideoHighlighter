@@ -121,7 +121,7 @@ class _VisualSearchWorker(QObject):
     """
 
     progress = Signal(int, int, float, str)  # current, total, timestamp, preview
-    frame_analyzed = Signal(float, str, str, bool)  # timestamp, timestamp_str, response, contains_target
+    frame_analyzed = Signal(float, str, str, bool, float)  # timestamp, timestamp_str, response, contains_target, score(0-1)
     found = Signal(float, str, str)  # timestamp, timestamp_str, analysis
     finished = Signal(list)  # all results
     error = Signal(str)
@@ -238,8 +238,9 @@ class _VisualSearchWorker(QObject):
             "analysis": analysis_text,
             "contains_target": starts_with_yes,
         }
+        # The VLM answers yes/no, so there is no graded score — 1.0 is honest here.
         self.frame_analyzed.emit(timestamp, result["timestamp_str"],
-                                 analysis_text, starts_with_yes)
+                                 analysis_text, starts_with_yes, 1.0)
         t_total = time.perf_counter() - frame_t0
         print(f"[t={timestamp:6.1f}s] {frame_dims} {b64_kb:5.0f}KB Δ={scene_diff:5.1f} | "
               f"encode={t_encode*1000:5.0f}ms  llm={t_llm*1000:6.0f}ms  "
@@ -500,7 +501,7 @@ class _VisualSearchWorker(QObject):
             results.append({"timestamp": ts, "timestamp_str": tstr,
                             "analysis": analysis, "contains_target": True,
                             "clip_score": score})
-            self.frame_analyzed.emit(ts, tstr, analysis, True)
+            self.frame_analyzed.emit(ts, tstr, analysis, True, float(score))
             self.found.emit(ts, tstr, analysis)
         self.finished.emit(results)
 
@@ -1295,8 +1296,9 @@ class LLMChatWidget(QWidget):
             f"Searching: {current}/{total} ({percent:.1f}%) - {timestamp:.1f}s"
         )
 
-    @Slot(float, str, str, bool)
-    def _on_frame_analyzed(self, timestamp: float, timestamp_str: str, response: str, contains_target: bool):
+    @Slot(float, str, str, bool, float)
+    def _on_frame_analyzed(self, timestamp: float, timestamp_str: str, response: str,
+                           contains_target: bool, score: float = 1.0):
         """Show each frame's YES/NO result in chat and update preview for ALL frames."""
         icon = "✅" if contains_target else "❌"
         short = response[:120] + "..." if len(response) > 120 else response
@@ -1320,7 +1322,10 @@ class LLMChatWidget(QWidget):
             finding = {
                 'timestamp':  timestamp,
                 'query':      self.search_target.text().strip(),
-                'confidence': 1.0,  # YES/NO classification — see notes
+                # The engine's real score (CLIP similarity, 0-1); the VLM's binary
+                # yes/no legitimately reports 1.0. Feeds the timeline's
+                # visual-confidence filter and ranking.
+                'confidence': float(score),
                 'model':      model_name,
                 'scan_id':    getattr(self, '_current_scan_id', ''),
                 'analysis':   (response or '')[:200],
