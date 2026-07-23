@@ -22,11 +22,15 @@ from typing import Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QLineEdit, QComboBox,
-    QGroupBox, QFileDialog, QApplication, QCheckBox,
+    QFileDialog, QApplication, QCheckBox,
     QDialog, QDialogButtonBox, QDoubleSpinBox, QSpinBox,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QThread, QSettings, QObject
 from PySide6.QtGui import QTextCursor
+
+from modules.ui.collapsible import CollapsibleSection
+from modules.ui.theme import DARK as THEME
+from modules.ui import icons as ui_icons
 
 from .llm_module import (
     LLMModule, VideoContextBuilder, get_available_backends, get_ollama_models,
@@ -646,11 +650,11 @@ class LLMChatWidget(QWidget):
         root = QVBoxLayout()
         root.setContentsMargins(4, 4, 4, 4)
 
-        # --- Settings group ---
-        settings_group = QGroupBox("LLM Settings")
+        # --- Settings section (foldable: once connected it's set-and-forget,
+        # so folding it gives its height back to the chat/search below) ---
+        settings_group = CollapsibleSection("LLM Settings", settings_key="llm/settings")
         settings_layout = QVBoxLayout()
         settings_layout.setSpacing(4)
-        settings_layout.setContentsMargins(6, 6, 6, 6)
 
         # Row 1: backend + model + connect + status (one row to save height)
         row1 = QHBoxLayout()
@@ -675,7 +679,7 @@ class LLMChatWidget(QWidget):
         # Connect + status share this row (was a separate row) to save vertical space
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.setStyleSheet(
-            "QPushButton{background:#4CAF50;color:white;font-weight:bold;padding:6px 16px;}"
+            f"QPushButton{{background:{THEME.success};color:white;font-weight:bold;padding:6px 16px;}}"
         )
         self.connect_btn.clicked.connect(self._connect_llm)
         row1.addWidget(self.connect_btn)
@@ -738,13 +742,13 @@ class LLMChatWidget(QWidget):
         )
         row4.addWidget(self.reasoning_checkbox)
 
-        self.reasoning_stats_btn = QPushButton("📊 Stats")
+        self.reasoning_stats_btn = QPushButton("Stats")
         self.reasoning_stats_btn.setFixedWidth(60)
         self.reasoning_stats_btn.setToolTip("Show reasoning statistics")
         self.reasoning_stats_btn.clicked.connect(self._show_reasoning_stats)
         row4.addWidget(self.reasoning_stats_btn)
 
-        self.reasoning_save_btn = QPushButton("💾 Save")
+        self.reasoning_save_btn = QPushButton("Save")
         self.reasoning_save_btn.setFixedWidth(60)
         self.reasoning_save_btn.setToolTip("Save inferred facts to cache")
         self.reasoning_save_btn.clicked.connect(self._save_reasoning_facts)
@@ -764,8 +768,9 @@ class LLMChatWidget(QWidget):
 
         settings_layout.addLayout(row4)
         
-        # Row 5: Visual search controls
-        search_group = QGroupBox("Visual Search")
+        # Visual search — its own foldable section, sibling of the settings
+        # (it used to be nested inside them, so it vanished with them too).
+        search_group = CollapsibleSection("Visual Search", settings_key="llm/visual-search")
         search_layout = QHBoxLayout()
         
         search_layout.addWidget(QLabel("Search for:"))
@@ -846,16 +851,18 @@ class LLMChatWidget(QWidget):
         )
         search_layout.addWidget(self.stop_on_match_cb)
 
-        self.search_btn = QPushButton("🔍 Search")
+        self.search_btn = QPushButton("Search")
+        self.search_btn.setIcon(ui_icons.search())
         self.search_btn.setStyleSheet(
-            "QPushButton{background:#FF9800;color:white;font-weight:bold;padding:4px 10px;border-radius:4px;}"
+            f"QPushButton{{background:{THEME.warning};color:white;font-weight:bold;padding:4px 10px;border-radius:4px;}}"
         )
         self.search_btn.clicked.connect(self._start_visual_search)
         search_layout.addWidget(self.search_btn)
-        
-        self.stop_search_btn = QPushButton("⏹ Stop")
+
+        self.stop_search_btn = QPushButton("Stop")
+        self.stop_search_btn.setIcon(ui_icons.stop())
         self.stop_search_btn.setStyleSheet(
-            "QPushButton{background:#c62828;color:white;font-weight:bold;padding:4px 10px;border-radius:4px;}"
+            "QPushButton{background:#8a2a2a;color:white;font-weight:bold;padding:4px 10px;border-radius:4px;}"
         )
         self.stop_search_btn.clicked.connect(self._stop_visual_search)
         self.stop_search_btn.setEnabled(False)
@@ -881,18 +888,21 @@ class LLMChatWidget(QWidget):
         self.search_next_btn.setEnabled(False)
         search_layout.addWidget(self.search_next_btn)
 
-        search_group.setLayout(search_layout)
-        settings_layout.addWidget(search_group)
-        
-        # Search progress
+        # Search progress lives inside the section, under the controls row
+        search_vbox = QVBoxLayout()
+        search_vbox.setSpacing(4)
+        search_vbox.addLayout(search_layout)
+
         self.search_progress = QLabel("")
         self.search_progress.setStyleSheet("color:#2f81f7;font-style:italic;font-size:9pt;")
-        settings_layout.addWidget(self.search_progress)
-        
-        settings_group.setLayout(settings_layout)
-        if self._compact:
-            settings_group.setMaximumHeight(450)
+        search_vbox.addWidget(self.search_progress)
+
+        search_group.setContentLayout(search_vbox)
+
+        settings_group.setContentLayout(settings_layout)
+        self._settings_section = settings_group
         root.addWidget(settings_group)
+        root.addWidget(search_group)
 
         # --- Chat display ---
         self.chat_display = QTextEdit()
@@ -928,7 +938,7 @@ class LLMChatWidget(QWidget):
 
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setStyleSheet(
-            "QPushButton{background:#c62828;color:white;font-weight:bold;"
+            "QPushButton{background:#8a2a2a;color:white;font-weight:bold;"
             "padding:4px 12px;border-radius:4px;}"
             "QPushButton:disabled{background:#555;}"
         )
@@ -940,7 +950,7 @@ class LLMChatWidget(QWidget):
         self.clear_btn.clicked.connect(self._clear_chat)
         input_layout.addWidget(self.clear_btn)
 
-        self.free_chat_chk = QCheckBox("💬 Free chat")
+        self.free_chat_chk = QCheckBox("Free chat")
         self.free_chat_chk.setToolTip(
             "When checked, the LLM answers freely without being restricted to video data"
         )
@@ -1866,7 +1876,9 @@ class LLMChatWidget(QWidget):
             else:
                 self.status_label.setText(f"Connected: {model}")
                 
-            self.status_label.setStyleSheet("color:#4CAF50;font-weight:bold;")
+            self.status_label.setStyleSheet(f"color:{THEME.success};font-weight:bold;")
+            # Folded section header mirrors the connection state
+            self._settings_section.set_hint(self.status_label.text())
             self.connect_btn.setText("Reconnect")
             self.input_field.setEnabled(True)
             self.send_btn.setEnabled(True)

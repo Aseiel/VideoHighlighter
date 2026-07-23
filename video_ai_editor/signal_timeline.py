@@ -770,6 +770,20 @@ class SignalTimelineScene(QGraphicsScene):
         if self.visible_layers.get('highlights', True):
             current_y = self.draw_highlights_layer(current_y)
         
+        # Alternating lane bands behind every other row, so the tracks read as
+        # lanes instead of floating in open space. Between the flat background
+        # (z=-10) and the row content (z=0).
+        band = QBrush(QColor(255, 255, 255, 7))
+        for i, (_, y) in enumerate(self.row_labels):
+            if i % 2 == 0:
+                continue
+            if i + 1 < len(self.row_labels):
+                band_h = self.row_labels[i + 1][1] - y - self.layer_spacing
+            else:
+                band_h = self.layer_height
+            r = self.addRect(0, y, width, band_h, QPen(Qt.PenStyle.NoPen), band)
+            r.setZValue(-9)
+
         # Draw time markers
         self.draw_time_markers()
         # (avoid ranges are painted in drawForeground so a repaint can't drop them)
@@ -814,18 +828,15 @@ class SignalTimelineScene(QGraphicsScene):
         painter.restore()
 
     def draw_background(self):
-        """Draw gradient background with subtle grid"""
-        gradient = QLinearGradient(0, 0, 0, self.sceneRect().height())
-        gradient.setColorAt(0, QColor(20, 20, 20))
-        gradient.setColorAt(1, QColor(32, 32, 32))
-        self.addRect(self.sceneRect(), QPen(Qt.PenStyle.NoPen), QBrush(gradient))
-        
-        # Add subtle grid lines
-        for sec in range(0, int(self.video_duration) + 1, 5):
-            x = sec * self.pixels_per_second
-            pen = QPen(QColor(45, 45, 45) if sec % 30 else QColor(70, 70, 70), 1)
-            self.addLine(x, 0, x, self.sceneRect().height(), pen)
-        
+        """Flat canvas. The old version stacked a vertical gradient plus its own
+        fixed 5s gridlines on top of draw_time_markers' adaptive grid — two grids
+        at once, and the fixed one turned into stripes when zoomed out. One flat
+        fill here; the ruler owns all gridlines. z=-10 so the lane bands
+        (build_timeline) can sit between the fill and the content."""
+        bg = self.addRect(self.sceneRect(), QPen(Qt.PenStyle.NoPen),
+                          QBrush(QColor(18, 18, 18)))
+        bg.setZValue(-10)
+
     def draw_transcript_layer(self, y_pos):
         """Draw transcript segments with improved labeling"""
         self.row_labels.append(("TRANSCRIPT", y_pos))
@@ -1435,7 +1446,9 @@ class SignalTimelineScene(QGraphicsScene):
         duration = int(self.video_duration)
 
         # Minor gridlines (skip the ones that coincide with a label line).
-        minor_pen = QPen(QColor(95, 95, 95, 80), 0, Qt.PenStyle.DashLine)
+        # Solid faint hairlines — the old dashes added a lot of visual noise
+        # over a dark canvas.
+        minor_pen = QPen(QColor(255, 255, 255, 14), 0, Qt.PenStyle.SolidLine)
         minor_pen.setCosmetic(True)  # stay 1px regardless of horizontal zoom
         second = 0
         while second <= duration:
@@ -1446,7 +1459,7 @@ class SignalTimelineScene(QGraphicsScene):
             second += minor_iv
 
         # Major gridlines + labels.
-        major_pen = QPen(QColor(110, 110, 110, 150), 0, Qt.PenStyle.SolidLine)
+        major_pen = QPen(QColor(255, 255, 255, 34), 0, Qt.PenStyle.SolidLine)
         major_pen.setCosmetic(True)
         second = 0
         while second <= duration:
@@ -1455,7 +1468,7 @@ class SignalTimelineScene(QGraphicsScene):
             self._time_marker_items.append(line)
 
             text = self.addText(self._format_time_label(second), QFont("Consolas", 9))
-            text.setDefaultTextColor(QColor(200, 200, 200))
+            text.setDefaultTextColor(QColor(150, 150, 150))
             # Constant on-screen size + anchored at x so the zoom can't distort it.
             text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
             text.setPos(x, h - 22)
@@ -1478,12 +1491,24 @@ class SignalTimelineScene(QGraphicsScene):
         # Move existing line or create if missing
         if hasattr(self, 'current_time_line') and self.current_time_line in self.items():
             self.current_time_line.setLine(x, 0, x, h)
+            self.current_time_caret.setPos(x, 0)
         else:
-            self.current_time_line = self.addLine(
-                x, 0, x, h,
-                QPen(QColor(255, 60, 60), 2, Qt.PenStyle.DashLine)
-            )
+            # Solid cosmetic hairline + caret cap: the modern editor playhead.
+            # (The old 2px dashed red line read as another gridline.)
+            line_pen = QPen(QColor(255, 70, 70, 230), 0, Qt.PenStyle.SolidLine)
+            line_pen.setCosmetic(True)   # 1px at any horizontal zoom
+            self.current_time_line = self.addLine(x, 0, x, h, line_pen)
             self.current_time_line.setZValue(100)
+
+            # Caret at the top edge. ItemIgnoresTransformations keeps its shape
+            # under the horizontal-only zoom (a plain polygon would smear).
+            caret = QPolygonF([QPointF(-5.0, 0.0), QPointF(5.0, 0.0), QPointF(0.0, 7.0)])
+            self.current_time_caret = self.addPolygon(
+                caret, QPen(Qt.PenStyle.NoPen), QBrush(QColor(255, 70, 70, 230)))
+            self.current_time_caret.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            self.current_time_caret.setZValue(101)
+            self.current_time_caret.setPos(x, 0)
 
     def update_selection_rect(self, start_time: float, end_time: float):
         """

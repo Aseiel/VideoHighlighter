@@ -625,17 +625,6 @@ class VideoPreviewWindow(QMainWindow):
                 color: #e4e4e4;
                 padding: 4px;
             }
-            QSlider::groove:horizontal {
-                height: 8px;
-                background: #3a3a3a;
-                border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: #2f81f7;
-                width: 18px;
-                margin: -5px 0;
-                border-radius: 9px;
-            }
             QLabel {
                 color: #d4d4d4;
             }
