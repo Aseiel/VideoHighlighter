@@ -220,11 +220,14 @@ def build_qss(p: Palette = DARK) -> str:
         border-bottom-color: {p.surface};
     }}
 
-    /* Sliders */
+    /* Sliders. The handle is a true circle: width == groove + 2×|margin|
+       (4 + 5 + 5 = 14) with radius = half. The old 16×18 handle poked 2px
+       past the widget rect in compact rows and got its top/bottom shaved
+       flat. 14px fits inside every slider height Qt hands out. */
     QSlider::groove:horizontal {{ height: 4px; background: {p.border_strong}; border-radius: 2px; }}
     QSlider::sub-page:horizontal {{ background: {p.accent}; border-radius: 2px; }}
     QSlider::handle:horizontal {{
-        background: {p.accent}; width: 16px; margin: -7px 0; border-radius: 8px;
+        background: {p.accent}; width: 14px; margin: -5px 0; border-radius: 7px;
     }}
     QSlider::handle:horizontal:hover {{ background: {p.accent_hover}; }}
 

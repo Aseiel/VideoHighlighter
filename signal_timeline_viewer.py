@@ -16,7 +16,7 @@ from collections import defaultdict
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, 
     QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QLabel,
-    QCheckBox, QGroupBox, QSplitter, QScrollArea,
+    QCheckBox, QSplitter, QScrollArea,
     QFrame, QLineEdit, QSlider, QGraphicsRectItem, QGraphicsTextItem,
     QMessageBox, QDockWidget, QMenu, QGraphicsLineItem,
     QComboBox, QListWidget, QListWidgetItem, QDialog,
@@ -39,6 +39,9 @@ from datetime import datetime, timedelta
 
 
 # modules
+from modules.ui.collapsible import CollapsibleSection
+from modules.ui.theme import DARK as THEME
+from modules.ui import icons as ui_icons
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
 from video_ai_editor.timeline_export import TimelineExporter
@@ -107,6 +110,28 @@ class SignalLabelPanel(QWidget):
             self._navigable_active = set()
         self.update()
 
+    @staticmethod
+    def _draw_chevron(p, cx, cy, direction, color):
+        """A thin ‹ / › chevron centred on (cx, cy). Stroked with a round
+        join/cap so it reads as a light navigation affordance, not a heavy
+        triangle glyph."""
+        hw, hh = 3.0, 4.0
+        path = QPainterPath()
+        if direction == "left":
+            path.moveTo(cx + hw, cy - hh)
+            path.lineTo(cx - hw, cy)
+            path.lineTo(cx + hw, cy + hh)
+        else:
+            path.moveTo(cx - hw, cy - hh)
+            path.lineTo(cx + hw, cy)
+            path.lineTo(cx - hw, cy + hh)
+        pen = QPen(color, 1.6)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
@@ -120,7 +145,6 @@ class SignalLabelPanel(QWidget):
 
         view = self.signal_view
         font_lbl = QFont("Arial", 8, QFont.Weight.Bold)
-        font_arr = QFont("Arial", 9)
         fm_lbl   = QFontMetrics(font_lbl)
 
         for name, scene_y in self._labels:
@@ -134,14 +158,13 @@ class SignalLabelPanel(QWidget):
             self._hit_rows.append((top, bot, name))
 
             if navigable:
-                # ◀  label  ▶
-                p.setFont(font_arr)
-                p.setPen(QColor(47, 129, 247))
-                p.drawText(2, mid_y, "◀")
-                p.drawText(self.width() - self._ARROW_W, mid_y, "▶")
+                # ‹  label  ›  — thin stroked chevrons, not filled triangle
+                # glyphs (those read dated and pulled in whatever Arial shipped).
+                self._draw_chevron(p, 7, local_y, "left", QColor(THEME.accent))
+                self._draw_chevron(p, self.width() - 7, local_y, "right", QColor(THEME.accent))
 
                 p.setFont(font_lbl)
-                p.setPen(QColor(90, 160, 250))
+                p.setPen(QColor(THEME.text))
                 avail = self.width() - self._ARROW_W * 2 - 6
                 clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
                 p.drawText(self._ARROW_W + 3, mid_y, clipped)
@@ -1758,12 +1781,12 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_view.setFixedHeight(120)
         self.edit_view.setAcceptDrops(True)
         self.edit_view.viewport().setAcceptDrops(True)
-        self.edit_view.setStyleSheet("""
-            QGraphicsView {
-                background-color: rgba(30, 30, 30, 200);
-                border: 2px solid rgba(90, 90, 90, 150);
-                border-radius: 5px;
-            }
+        self.edit_view.setStyleSheet(f"""
+            QGraphicsView {{
+                background-color: {THEME.surface};
+                border: 1px solid {THEME.border_strong};
+                border-radius: {THEME.radius}px;
+            }}
         """)
         
         # --- LLM Chat Panel (in timeline) ---
@@ -1829,26 +1852,26 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ Could not create preview dock: {e}")
             # Continue without preview
 
-        # Transcript dock (hidden by default, toggle from View menu)
-        try:
-            transcript_dock = self.create_transcript_dock()
-            self.addDockWidget(Qt.RightDockWidgetArea, transcript_dock)
-            transcript_dock.setVisible(False)
-            # Connect the toggle button that was already added in create_controls_dock
-            if hasattr(self, 'transcript_toggle_btn'):
-                self.transcript_toggle_btn.toggled.connect(transcript_dock.setVisible)
-        except Exception as e:
-            print(f"⚠️ Could not create transcript dock: {e}")
-
-        # Search dock (hidden by default)
+        # Search + Transcript stack behind Controls as tabs of the same right
+        # column (they used to be hidden docks behind toggle buttons, which
+        # cost a second click and hid that they exist at all).
+        self.setTabPosition(Qt.RightDockWidgetArea, QTabWidget.TabPosition.North)
         try:
             search_dock = self.create_search_dock()
             self.addDockWidget(Qt.RightDockWidgetArea, search_dock)
-            search_dock.setVisible(False)
-            if hasattr(self, 'search_toggle_btn'):
-                self.search_toggle_btn.toggled.connect(search_dock.setVisible)
+            self.tabifyDockWidget(controls_dock, search_dock)
         except Exception as e:
             print(f"⚠️ Could not create search dock: {e}")
+
+        try:
+            transcript_dock = self.create_transcript_dock()
+            self.addDockWidget(Qt.RightDockWidgetArea, transcript_dock)
+            self.tabifyDockWidget(controls_dock, transcript_dock)
+        except Exception as e:
+            print(f"⚠️ Could not create transcript dock: {e}")
+
+        # Controls is the working tab; the others wait behind it.
+        controls_dock.raise_()
 
         # Connect render signals
         self.render_finished.connect(self.on_render_finished)
@@ -2029,17 +2052,17 @@ class SignalTimelineWindow(QMainWindow):
 
     def create_filter_controls(self):
         """Create filter controls for the dock widget"""
-        filter_group = QGroupBox("Filters")
+        filter_group = CollapsibleSection("Filters", settings_key="controls/filters")
         filter_layout = QVBoxLayout()
         
         # Filter summary
         self.filter_summary = QLabel("All actions/objects visible")
-        self.filter_summary.setStyleSheet("color: #a0ffa0; font-size: 11px;")
+        self.filter_summary.setStyleSheet(f"color: {THEME.text_dim}; font-size: 11px;")
         filter_layout.addWidget(self.filter_summary)
-        
+
         # Confidence filter display
         self.confidence_label = QLabel(f"Actions: {self.signal_scene.min_action_confidence:.0%} | Objects: {self.signal_scene.min_object_confidence:.0%}")
-        self.confidence_label.setStyleSheet("color: #ffa0a0; font-size: 11px;")
+        self.confidence_label.setStyleSheet(f"color: {THEME.text_dim}; font-size: 11px;")
         filter_layout.addWidget(self.confidence_label)
         
         # Quick filter buttons
@@ -2080,50 +2103,89 @@ class SignalTimelineWindow(QMainWindow):
         self.current_filters_label.setStyleSheet("color: #cccccc; font-size: 10px;")
         self.current_filters_label.setWordWrap(True)
         filter_layout.addWidget(self.current_filters_label)
-        
-        filter_group.setLayout(filter_layout)
+
+        # Lives here (not loose in the dock) because it filters the ACTIONS row.
+        self.only_highlight_actions_cb = QCheckBox("Show only highlight actions")
+        self.only_highlight_actions_cb.setChecked(False)
+        self.only_highlight_actions_cb.setToolTip(
+            "Off (default): the ACTIONS row shows every detected action.\n"
+            "On: only the actions selected into the highlight.\n"
+            "(Needs a re-analysis to populate the full list.)"
+        )
+        self.only_highlight_actions_cb.stateChanged.connect(self.on_only_highlight_actions_changed)
+        filter_layout.addWidget(self.only_highlight_actions_cb)
+
+        filter_group.setContentLayout(filter_layout)
         return filter_group
     
+    @staticmethod
+    def _toolbar_separator():
+        """Thin vertical rule between button groups on the edit toolbar."""
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFixedWidth(1)
+        sep.setStyleSheet(f"background: {THEME.border_strong}; border: none; margin: 4px 2px;")
+        return sep
+
     def create_edit_controls(self):
-        """Create controls for edit timeline"""
+        """Edit toolbar — buttons grouped playback | clip ops | output, with
+        separators, so the row reads as three tools instead of nine buttons."""
         controls = QWidget()
         layout = QHBoxLayout(controls)
-        
-        # Play Edited clip
-        self.play_edit_btn = QPushButton("▶ Play Edit")
+        layout.setSpacing(6)
+        layout.setContentsMargins(4, 2, 4, 2)
+
+        # -- Playback --
+        self.play_edit_btn = QPushButton("Play Edit")
+        self.play_edit_btn.setIcon(ui_icons.play())
         self.play_edit_btn.clicked.connect(self.toggle_edit_playback)
-        self.play_edit_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2f81f7;
-                font-weight: bold;
-                padding: 4px 8px;
-                min-width: 100px;
-            }
+        self.play_edit_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {THEME.accent};
+                color: {THEME.on_accent};
+                font-weight: 600;
+                padding: 5px 14px;
+                min-width: 90px;
+                border: none;
+            }}
+            QPushButton:hover {{ background-color: {THEME.accent_hover}; }}
+            QPushButton:pressed {{ background-color: {THEME.accent_press}; }}
         """)
         self.play_edit_btn.setToolTip("Play all clips in the edit timeline sequentially")
         layout.addWidget(self.play_edit_btn)
-        
-        self.stop_edit_btn = QPushButton("⏹ Stop")
+
+        self.stop_edit_btn = QPushButton("Stop")
+        self.stop_edit_btn.setIcon(ui_icons.stop())
         self.stop_edit_btn.clicked.connect(self.stop_edit_playback)
         self.stop_edit_btn.setStyleSheet("""
             QPushButton {
                 background-color: #8a2a2a;
-                font-weight: bold;
-                padding: 4px 8px;
+                color: white;
+                border: none;
+                font-weight: 600;
+                padding: 5px 12px;
             }
+            QPushButton:hover { background-color: #9c3434; }
+            QPushButton:pressed { background-color: #762222; }
         """)
         layout.addWidget(self.stop_edit_btn)
 
-        # Add clip button
-        self.add_clip_btn = QPushButton("➕ Add Clip at Current Time")
+        layout.addWidget(self._toolbar_separator())
+
+        # -- Clip operations --
+        self.add_clip_btn = QPushButton("Add Clip")
+        self.add_clip_btn.setIcon(ui_icons.plus())
+        self.add_clip_btn.setToolTip("Add a clip at the current playhead time")
         self.add_clip_btn.clicked.connect(self.on_add_clip_clicked)
-        
-        # Remove selected clips button
-        self.remove_clips_btn = QPushButton("🗑️ Delete Selected Clips")
+
+        self.remove_clips_btn = QPushButton("Delete")
+        self.remove_clips_btn.setIcon(ui_icons.trash())
+        self.remove_clips_btn.setToolTip("Delete the selected clips from the edit timeline")
         self.remove_clips_btn.clicked.connect(self.on_remove_clips_clicked)
-        
+
         # Cut Mode toggle
-        self.cut_mode_btn = QPushButton("✂️  Cut Mode")
+        self.cut_mode_btn = QPushButton("Cut Mode")
+        self.cut_mode_btn.setIcon(ui_icons.scissors())
         self.cut_mode_btn.setCheckable(True)
         self.cut_mode_btn.setToolTip(
             "Cut Mode ON:\n"
@@ -2133,44 +2195,35 @@ class SignalTimelineWindow(QMainWindow):
             "Cut Mode OFF: normal drag/select behaviour"
         )
         self.cut_mode_btn.toggled.connect(self.toggle_cut_mode)
-        self.cut_mode_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2a2a2a;
-                color: #d4d4d4;
-                font-weight: bold;
-                padding: 4px 8px;
-                border: 1px solid #4a4a4a;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #3a3a3a;
-            }
-            QPushButton:checked {
+        self.cut_mode_btn.setStyleSheet(f"""
+            QPushButton:checked {{
                 background-color: #7a2a1a;
-                border: 2px solid #ff6040;
+                border: 1px solid #ff6040;
                 color: #ffccaa;
-            }
-            QPushButton:checked:hover {
-                background-color: #8a3a2a;
-            }
+            }}
+            QPushButton:checked:hover {{ background-color: #8a3a2a; }}
         """)
 
-        # Save to cache button - ADD THIS
-        self.save_cache_btn = QPushButton("💾 Save to Cache")
+        # -- Output --
+        self.save_cache_btn = QPushButton("Save")
+        self.save_cache_btn.setIcon(ui_icons.save())
         self.save_cache_btn.clicked.connect(self.on_save_cache_clicked)
         self.save_cache_btn.setToolTip("Save current edit timeline to cache for future use")
-        
-        # Export button
-        self.export_btn = QPushButton("📤 Export Edit")
+
+        self.export_btn = QPushButton("Export")
+        self.export_btn.setIcon(ui_icons.export())
+        self.export_btn.setToolTip("Export the edit timeline")
         self.export_btn.clicked.connect(self.on_export_clicked)
-        
+
         # Duration label
         self.edit_duration_label = QLabel("Edit duration: 0.0s")
-        self.edit_duration_label.setStyleSheet("color: #a0ffa0; font-weight: bold;")
-        
+        self.edit_duration_label.setStyleSheet(
+            f"color: {THEME.success}; font-weight: 600;")
+
         layout.addWidget(self.add_clip_btn)
         layout.addWidget(self.remove_clips_btn)
         layout.addWidget(self.cut_mode_btn)
+        layout.addWidget(self._toolbar_separator())
         layout.addWidget(self.save_cache_btn)
         layout.addWidget(self.export_btn)
         
@@ -2194,7 +2247,8 @@ class SignalTimelineWindow(QMainWindow):
             lambda: self._save_render_mode(self.render_mode_combo.currentData()))
         layout.addWidget(self.render_mode_combo)
 
-        self.render_highlight_btn = QPushButton("🎬 Render Highlight Video")
+        self.render_highlight_btn = QPushButton("Render Highlight Video")
+        self.render_highlight_btn.setIcon(ui_icons.render())
         self.render_highlight_btn.clicked.connect(self.on_render_highlight_clicked)
         self.render_highlight_btn.setStyleSheet("""
             QPushButton {
@@ -2216,7 +2270,7 @@ class SignalTimelineWindow(QMainWindow):
         from PySide6.QtWidgets import QDockWidget
         from video_ai_editor.search_panel import SearchPanel
 
-        dock = QDockWidget("🔍 Search", self)
+        dock = QDockWidget("Search", self)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         dock.setMinimumWidth(300)
 
@@ -2240,7 +2294,7 @@ class SignalTimelineWindow(QMainWindow):
         from PySide6.QtWidgets import QDockWidget
         import os
 
-        dock = QDockWidget("📝 Transcript", self)
+        dock = QDockWidget("Transcript", self)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         dock.setMinimumWidth(260)
 
@@ -2364,13 +2418,14 @@ class SignalTimelineWindow(QMainWindow):
         
         controls_widget = QWidget()
         layout = QVBoxLayout(controls_widget)
-              
+        layout.setSpacing(8)
+
         # ADD FILTER CONTROLS
         filter_controls = self.create_filter_controls()
         layout.addWidget(filter_controls)
-        
+
         # Layer visibility controls
-        layer_group = QGroupBox("Visible Layers")
+        layer_group = CollapsibleSection("Visible Layers", settings_key="controls/layers")
         layer_layout = QVBoxLayout()
         
         self.layer_checkboxes = {}
@@ -2433,14 +2488,16 @@ class SignalTimelineWindow(QMainWindow):
         if any_hidden:
             self.signal_scene.build_timeline()
 
-        layer_group.setLayout(layer_layout)
+        layer_group.setContentLayout(layer_layout)
         layout.addWidget(layer_group)
         self.refresh_visual_query_checkboxes()
 
         # Avoid ranges — exclude a dragged-selection range from highlight selection
-        avoid_group = QGroupBox("Avoid in Highlights")
+        avoid_group = CollapsibleSection(
+            "Avoid in Highlights", expanded=False, settings_key="controls/avoid")
         avoid_layout = QHBoxLayout()
-        self.avoid_range_btn = QPushButton("🚫 Avoid selected range")
+        self.avoid_range_btn = QPushButton("Avoid selected range")
+        self.avoid_range_btn.setIcon(ui_icons.ban())
         self.avoid_range_btn.setToolTip(
             "Drag-select a range on the timeline, then click to exclude it from "
             "highlight selection on the next run."
@@ -2451,11 +2508,12 @@ class SignalTimelineWindow(QMainWindow):
         self.clear_avoid_btn.setToolTip("Remove all avoid ranges")
         self.clear_avoid_btn.clicked.connect(self._clear_avoid_ranges)
         avoid_layout.addWidget(self.clear_avoid_btn)
-        avoid_group.setLayout(avoid_layout)
+        avoid_group.setContentLayout(avoid_layout)
         layout.addWidget(avoid_group)
 
         # Merge threshold controls
-        merge_group = QGroupBox("Merge Signals")
+        merge_group = CollapsibleSection(
+            "Merge Signals", expanded=False, settings_key="controls/merge")
         merge_layout = QVBoxLayout()
 
         merge_row = QHBoxLayout()
@@ -2471,7 +2529,7 @@ class SignalTimelineWindow(QMainWindow):
         merge_row.addWidget(self.merge_slider)
 
         self.merge_value_label = QLabel("Off")
-        self.merge_value_label.setStyleSheet("color: #a0ffa0; font-weight: bold; min-width: 36px;")
+        self.merge_value_label.setStyleSheet(f"color: {THEME.accent}; font-weight: bold; min-width: 36px;")
         merge_row.addWidget(self.merge_value_label)
 
         merge_layout.addLayout(merge_row)
@@ -2481,12 +2539,17 @@ class SignalTimelineWindow(QMainWindow):
         merge_hint.setWordWrap(True)
         merge_layout.addWidget(merge_hint)
 
-        merge_group.setLayout(merge_layout)
+        merge_group.setContentLayout(merge_layout)
+        # Header shows the live value so the folded section still reads at a glance.
+        merge_group.set_hint(self.merge_value_label.text())
+        self.merge_slider.valueChanged.connect(
+            lambda _=None, g=merge_group: g.set_hint(self.merge_value_label.text()))
         layout.addWidget(merge_group)
 
         # Waveform peak sensitivity — controls the ◀▶ arrows + amber markers on
         # the AUDIO WAVEFORM row (jump between loud moments).
-        wpeak_group = QGroupBox("Waveform Peaks")
+        wpeak_group = CollapsibleSection(
+            "Waveform Peaks", expanded=False, settings_key="controls/wpeaks")
         wpeak_layout = QVBoxLayout()
 
         wpeak_row = QHBoxLayout()
@@ -2514,55 +2577,16 @@ class SignalTimelineWindow(QMainWindow):
         wpeak_hint.setWordWrap(True)
         wpeak_layout.addWidget(wpeak_hint)
 
-        wpeak_group.setLayout(wpeak_layout)
+        wpeak_group.setContentLayout(wpeak_layout)
+        wpeak_group.set_hint(self.wpeak_value_label.text())
+        self.wpeak_slider.valueChanged.connect(
+            lambda _=None, g=wpeak_group: g.set_hint(self.wpeak_value_label.text()))
         layout.addWidget(wpeak_group)
 
-        # Actions row: show ALL detections (default) vs only highlight-selected
-        self.only_highlight_actions_cb = QCheckBox("Show only highlight actions")
-        self.only_highlight_actions_cb.setChecked(False)
-        self.only_highlight_actions_cb.setToolTip(
-            "Off (default): the ACTIONS row shows every detected action.\n"
-            "On: only the actions selected into the highlight.\n"
-            "(Needs a re-analysis to populate the full list.)"
-        )
-        self.only_highlight_actions_cb.stateChanged.connect(self.on_only_highlight_actions_changed)
-        layout.addWidget(self.only_highlight_actions_cb)
-
-        # Playback controls
-        playback_group = QGroupBox("Playback")
+        # Playback controls. The old Transcript/Search toggle buttons are gone:
+        # those panels are now tabs on the right dock area (see init_ui).
+        playback_group = CollapsibleSection("Playback", settings_key="controls/playback")
         playback_layout = QVBoxLayout()
-        
-        # Transcript toggle — connected later in init_ui once dock exists
-        self.transcript_toggle_btn = QPushButton("📝 Transcript")
-        self.transcript_toggle_btn.setCheckable(True)
-        self.transcript_toggle_btn.setStyleSheet("""
-            QPushButton {
-                background: #141414; color: #9a9a9a;
-                border: 1px solid #3a3a3a; border-radius: 3px;
-                font-size: 10px; padding: 4px 8px;
-            }
-            QPushButton:checked {
-                background: #222222; color: #b5b5b5;
-                border-color: #2f81f7;
-            }
-        """)
-        playback_layout.addWidget(self.transcript_toggle_btn)
-
-        # Search toggle
-        self.search_toggle_btn = QPushButton("🔍 Search")
-        self.search_toggle_btn.setCheckable(True)
-        self.search_toggle_btn.setStyleSheet("""
-            QPushButton {
-                background: #141414; color: #9a9a9a;
-                border: 1px solid #3a3a3a; border-radius: 3px;
-                font-size: 10px; padding: 4px 8px;
-            }
-            QPushButton:checked {
-                background: #222222; color: #b5b5b5;
-                border-color: #2f81f7;
-            }
-        """)
-        playback_layout.addWidget(self.search_toggle_btn)
 
         self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
         self.follow_playhead_checkbox.setChecked(True)
@@ -2571,8 +2595,8 @@ class SignalTimelineWindow(QMainWindow):
         )
         self.follow_playhead_checkbox.stateChanged.connect(self.toggle_follow_playhead)
         playback_layout.addWidget(self.follow_playhead_checkbox)
-        
-        playback_group.setLayout(playback_layout)
+
+        playback_group.setContentLayout(playback_layout)
 
         layout.addWidget(playback_group)
         layout.addStretch()
@@ -3889,80 +3913,49 @@ class SignalTimelineWindow(QMainWindow):
             QMessageBox.critical(self, "Render Failed", message)
 
     def apply_dark_theme(self):
-        """Apply modern dark theme"""
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #0f0f0f;
-            }
-            QGroupBox {
-                color: #d8d8d8;
-                border: 1px solid #3a3a3a;
-                border-radius: 6px;
-                margin-top: 14px;
-                padding-top: 10px;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-            QCheckBox {
-                color: #e4e4e4;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 3px;
-                border: 2px solid #4a4a4a;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #2f81f7;
-                border: 2px solid #2f81f7;
-            }
-            QPushButton {
-                background-color: #2a2a2a;
-                color: white;
-                border: 1px solid #4a4a4a;
-                padding: 4px 8px;
-                border-radius: 5px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #3a3a3a;
-            }
-            QPushButton:pressed {
-                background-color: #141414;
-            }
-            QLabel {
-                color: #d4d4d4;
-            }
-            QSlider::groove:horizontal {
-                height: 8px;
-                background: #3a3a3a;
-                border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: #2f81f7;
-                width: 18px;
-                margin: -5px 0;
-                border-radius: 9px;
-            }
-            QDockWidget {
-                color: #d8d8d8;
-                border: 1px solid #3a3a3a;
-                border-radius: 6px;
-            }
-            QDockWidget::title {
-                background: #2a2a2a;
-                padding: 6px;
-                border-radius: 4px;
-            }
-            QStatusBar {
-                color: #ffffff;
-                background-color: rgba(40, 40, 50, 180);
-            }
+        """Window-specific chrome on top of the global theme (modules.ui.theme):
+        dock title bars, the right-column dock tabs, splitter handles and the
+        status bar. Base widgets (buttons, checkboxes, sliders, inputs) come
+        from the global stylesheet, so this no longer redefines them — the old
+        per-window copies here had drifted from the theme and gave this window
+        its own grey."""
+        p = THEME
+        self.setStyleSheet(f"""
+            QMainWindow {{ background-color: {p.bg}; }}
+            QMainWindow::separator {{
+                background: {p.bg};
+                width: 4px; height: 4px;
+            }}
+            QMainWindow::separator:hover {{ background: {p.accent}; }}
+
+            QDockWidget {{ color: {p.text_dim}; font-weight: 600; }}
+            QDockWidget::title {{
+                background: {p.surface};
+                padding: 6px 10px;
+                border-radius: {p.radius}px;
+            }}
+
+            /* Dock-area tabs (Controls / Search / Transcript): flat labels
+               with an accent underline on the active one. */
+            QTabBar::tab {{
+                background: transparent;
+                color: {p.text_dim};
+                padding: 6px 14px;
+                border: none;
+                border-bottom: 2px solid transparent;
+            }}
+            QTabBar::tab:hover {{ color: {p.text}; }}
+            QTabBar::tab:selected {{
+                color: {p.text};
+                border-bottom: 2px solid {p.accent};
+            }}
+
+            QStatusBar {{
+                background: {p.surface};
+                color: {p.text_dim};
+                border-top: 1px solid {p.border};
+            }}
+            QStatusBar::item {{ border: none; }}
         """)
 
 
@@ -4020,6 +4013,13 @@ def show_timeline_viewer(video_path, cache_data=None):
     if app is None:
         debug_log("  - Creating new QApplication")
         app = QApplication(sys.argv)
+        # Standalone launch: install the central theme ourselves. (When the
+        # pipeline/main GUI launches us the app already carries it.)
+        try:
+            from modules.ui import theme as _ui_theme
+            _ui_theme.apply(app)
+        except Exception as e:
+            debug_log(f"  ⚠️ Theme apply failed: {e}")
     else:
         debug_log("  - Using existing QApplication")
     
