@@ -1182,7 +1182,9 @@ class VideoHighlighterGUI(QWidget):
         self.spin_audio_peak.setToolTip("Points when audio intensity spikes (e.g. crowd roar, explosions, bells, loud impacts)")
 
         self.spin_keyword_points = QSpinBox(); self.spin_keyword_points.setRange(0,100); self.spin_keyword_points.setValue(scoring_cfg.get("keyword_points", 2))
-        self.spin_keyword_points.setToolTip("Points when a search keyword (configured in Transcript & Subtitles tab) is found in speech")
+        self.spin_keyword_points.setToolTip("Points when a search keyword is found in speech (needs transcript enabled)")
+        # Keyword scoring only works with a transcript — grey it out until then.
+        self.spin_keyword_points.setEnabled(self.config_data.get("transcript", {}).get("enabled", False))
 
         self.spin_transcript_points = QSpinBox(); self.spin_transcript_points.setRange(0,100); self.spin_transcript_points.setValue(scoring_cfg.get("transcript_points", 2))
         self.spin_transcript_points.setToolTip("Points for any moment where speech is detected, regardless of content")
@@ -1327,13 +1329,17 @@ class VideoHighlighterGUI(QWidget):
 
         # Transcript search keywords — moved here from the Transcript tab: it's a
         # common highlight signal (score moments where these words are spoken).
-        # Only takes effect when transcript processing is enabled + run, so it's
-        # safe to leave always-editable here.
+        # Greyed out unless transcript processing is enabled (nothing to search
+        # otherwise); tracks the transcript toggle via on_transcript_toggle.
+        _kw_enabled = self.config_data.get("transcript", {}).get("enabled", False)
         kw_layout = QHBoxLayout()
         self.search_keywords_input = QLineEdit(",".join(self.config_data.get("transcript", {}).get("search_keywords", [])))
         self.search_keywords_input.setPlaceholderText("goal, score, win")
         self.search_keywords_input.setToolTip("Score moments where these spoken words appear (needs transcript enabled)")
-        kw_layout.addWidget(QLabel("Transcript keywords:"))
+        self.search_keywords_input.setEnabled(_kw_enabled)
+        self.search_keywords_label = QLabel("Transcript keywords:")
+        self.search_keywords_label.setEnabled(_kw_enabled)
+        kw_layout.addWidget(self.search_keywords_label)
         kw_layout.addWidget(self.search_keywords_input)
         basic_layout.addLayout(kw_layout, 3, 0, 1, 2)
 
@@ -3339,7 +3345,11 @@ class VideoHighlighterGUI(QWidget):
         """Handle transcript checkbox toggle"""
         self.transcript_source_lang.setEnabled(checked)
         self.transcript_model_combo.setEnabled(checked)
-        # search_keywords_input now lives in Basic Settings and stays editable.
+        # Keyword scoring controls live in Basic Settings but only work with a
+        # transcript, so they grey out with it.
+        self.search_keywords_input.setEnabled(checked)
+        self.search_keywords_label.setEnabled(checked)
+        self.spin_keyword_points.setEnabled(checked)
         self.subtitles_checkbox.setEnabled(checked)
         
         # If transcript is disabled, also disable subtitles
