@@ -66,6 +66,7 @@ def analysis_defaults() -> dict:
         "yolo_type": advanced_cfg.get("yolo_type", "standard") or "standard",
         "whisper_model": transcript_cfg.get("model", "base") or "base",
         "language": transcript_cfg.get("source_lang", "en") or "en",
+        "transcript_enabled": bool(transcript_cfg.get("enabled", False)),
         "search_keywords": list(transcript_cfg.get("search_keywords", []) or []),
         "sample_rate": int(advanced_cfg.get("sample_rate", 5) or 5),
     }
