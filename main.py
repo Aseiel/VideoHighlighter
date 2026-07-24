@@ -1325,27 +1325,39 @@ class VideoHighlighterGUI(QWidget):
         action_kw_layout.addWidget(self.load_actions_btn)
         basic_layout.addLayout(action_kw_layout, 2, 0, 1, 2)
 
+        # Transcript search keywords — moved here from the Transcript tab: it's a
+        # common highlight signal (score moments where these words are spoken).
+        # Only takes effect when transcript processing is enabled + run, so it's
+        # safe to leave always-editable here.
+        kw_layout = QHBoxLayout()
+        self.search_keywords_input = QLineEdit(",".join(self.config_data.get("transcript", {}).get("search_keywords", [])))
+        self.search_keywords_input.setPlaceholderText("goal, score, win")
+        self.search_keywords_input.setToolTip("Score moments where these spoken words appear (needs transcript enabled)")
+        kw_layout.addWidget(QLabel("Transcript keywords:"))
+        kw_layout.addWidget(self.search_keywords_input)
+        basic_layout.addLayout(kw_layout, 3, 0, 1, 2)
+
         # Conditional action scoring checkbox
         self.actions_require_objects_chk = QCheckBox("Only score actions when objects detected")
         self.actions_require_objects_chk.setChecked(self.config_data.get("actions", {}).get("require_objects", False))
         self.actions_require_objects_chk.setToolTip("Actions will only add points if objects are also detected in that timeframe")
-        basic_layout.addWidget(self.actions_require_objects_chk, 3, 0, 1, 2)
+        basic_layout.addWidget(self.actions_require_objects_chk, 4, 0, 1, 2)
 
         self.skip_highlights_chk = QCheckBox("Skip highlights")
         self.skip_highlights_chk.setChecked(highlights_cfg.get("skip_highlights", False))
-        basic_layout.addWidget(self.skip_highlights_chk, 4, 0, 1, 2)
+        basic_layout.addWidget(self.skip_highlights_chk, 5, 0, 1, 2)
 
         # Combine every processed video's highlights into one master video.
         # Config key stays under "download" (auto_combine) so saved configs load.
         self.auto_combine_chk = QCheckBox("Combine highlights from all processed videos into one video")
         self.auto_combine_chk.setChecked(self.config_data.get("download", {}).get("auto_combine", True))
         self.auto_combine_chk.setToolTip("When enabled, the highlights from every processed video are merged into a single master video")
-        basic_layout.addWidget(self.auto_combine_chk, 5, 0, 1, 2)
+        basic_layout.addWidget(self.auto_combine_chk, 6, 0, 1, 2)
 
         # Equal-width columns; trailing stretch row keeps groups packed at the top.
         basic_layout.setColumnStretch(0, 1)
         basic_layout.setColumnStretch(1, 1)
-        basic_layout.setRowStretch(6, 1)
+        basic_layout.setRowStretch(7, 1)
 
         basic_tab.setLayout(basic_layout)
         tabs.addTab(basic_tab, "Basic Settings")
@@ -1377,10 +1389,8 @@ class VideoHighlighterGUI(QWidget):
         self.transcript_model_combo.setEnabled(transcript_cfg.get("enabled", False))
         transcript_form.addRow("Whisper model:", self.transcript_model_combo)
 
-        self.search_keywords_input = QLineEdit(",".join(transcript_cfg.get("search_keywords", [])))
-        self.search_keywords_input.setPlaceholderText("goal, score, win")
-        self.search_keywords_input.setEnabled(transcript_cfg.get("enabled", False))
-        transcript_form.addRow("Search keywords:", self.search_keywords_input)
+        # (Search keywords moved to the Basic Settings tab — a common highlight
+        # signal, editable without opening this tab.)
         transcript_group.setLayout(transcript_form)
         transcript_layout.addWidget(transcript_group)
 
@@ -3329,7 +3339,7 @@ class VideoHighlighterGUI(QWidget):
         """Handle transcript checkbox toggle"""
         self.transcript_source_lang.setEnabled(checked)
         self.transcript_model_combo.setEnabled(checked)
-        self.search_keywords_input.setEnabled(checked)
+        # search_keywords_input now lives in Basic Settings and stays editable.
         self.subtitles_checkbox.setEnabled(checked)
         
         # If transcript is disabled, also disable subtitles
