@@ -341,6 +341,28 @@ class SignalTimelineScene(QGraphicsScene):
                     objs.add(obj.strip().title())
         return sorted(list(objs)) if objs else ['Unknown']
     
+    def reload_cache_data(self, cache_data=None):
+        """Re-ingest cache_data after an on-demand analysis added detections.
+
+        The draw_* layers read `self.cache_data` live, but the derived type
+        lists and their per-type visibility maps are built once in __init__ —
+        so a freshly-run actions/objects pass wouldn't appear until these are
+        recomputed. Rebuild them (preserving any still-relevant visibility
+        choices) and redraw."""
+        if cache_data is not None:
+            self.cache_data = cache_data
+
+        prev_actions = getattr(self, "visible_actions", {})
+        prev_objects = getattr(self, "visible_objects", {})
+
+        self.action_types = self._extract_action_types()
+        self.object_classes = self._extract_object_classes()
+        # Keep prior show/hide for types that persist; default new ones to shown.
+        self.visible_actions = {a: prev_actions.get(a, True) for a in self.action_types}
+        self.visible_objects = {o: prev_objects.get(o, True) for o in self.object_classes}
+
+        self.build_timeline()
+
     def _color_palette(self, count, start_hue=0):
         """Generate a color palette"""
         if count == 0:

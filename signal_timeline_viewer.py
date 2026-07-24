@@ -239,6 +239,10 @@ class SignalTimelineWindow(QMainWindow):
     waveform_ready = Signal(object)
     render_finished = Signal(bool, str)
     render_progress = Signal(int)
+    # On-demand analysis (Analyze section) — emitted from a worker thread, so
+    # the connected slots run on the GUI thread via Qt's queued connection.
+    analysis_progress = Signal(str, float, str)   # kind, fraction 0..1, message
+    analysis_finished = Signal(str, object)       # kind, result dict | Exception
 
     def __init__(self, video_path, cache_data=None):
         debug_log(f"SignalTimelineWindow.__init__ CALLED with video_path={video_path}")
@@ -1865,6 +1869,7 @@ class SignalTimelineWindow(QMainWindow):
 
         try:
             transcript_dock = self.create_transcript_dock()
+            self._transcript_dock = transcript_dock  # kept so a transcript run can refresh it
             self.addDockWidget(Qt.RightDockWidgetArea, transcript_dock)
             self.tabifyDockWidget(controls_dock, transcript_dock)
         except Exception as e:
@@ -1876,6 +1881,8 @@ class SignalTimelineWindow(QMainWindow):
         # Connect render signals
         self.render_finished.connect(self.on_render_finished)
         self.render_progress.connect(self.on_render_progress)
+        self.analysis_progress.connect(self._on_analysis_progress)
+        self.analysis_finished.connect(self._on_analysis_finished)
 
         # Apply dark theme
         self.apply_dark_theme()
@@ -2118,6 +2125,248 @@ class SignalTimelineWindow(QMainWindow):
         filter_group.setContentLayout(filter_layout)
         return filter_group
     
+    # ================= On-demand analysis (Analyze section) =================
+
+    def create_analyze_section(self):
+        """A foldable 'Analyze' section: run action / object / transcript
+        analysis on the loaded video, on demand, and fold the result into the
+        cache. Advanced knobs stay in the main GUI — these buttons run using
+        that GUI's saved settings (read from config.yaml)."""
+        section = CollapsibleSection(
+            "Analyze", expanded=False, settings_key="controls/analyze")
+        lay = QVBoxLayout()
+        lay.setSpacing(8)
+
+        # State for the single-run-at-a-time worker.
+        self._analysis_thread = None
+        self._analysis_cancel = None
+        self._analysis_running = None       # kind of the active run, or None
+        self._analyze_rows = {}             # kind -> {btn, status, label}
+
+        # Objects needs a class list — the one input a button can't avoid.
+        # Prefill from the main GUI's saved list so it's usually one click.
+        try:
+            from modules.analysis_ondemand import analysis_defaults
+            obj_default = ", ".join(analysis_defaults().get("object_list", []))
+        except Exception:
+            obj_default = ""
+
+        lay.addLayout(self._make_analyze_row(
+            "actions", "Actions", "Run action recognition over the whole video"))
+
+        self.analyze_objects_field = QLineEdit(obj_default)
+        self.analyze_objects_field.setPlaceholderText("person, car, dog…")
+        self.analyze_objects_field.setToolTip(
+            "Comma-separated object classes to detect. Prefilled from the main "
+            "window's list; edit per run. Change the model/confidence there.")
+        lay.addLayout(self._make_analyze_row(
+            "objects", "Objects", "Detect the object classes listed above",
+            extra=self.analyze_objects_field))
+
+        lay.addLayout(self._make_analyze_row(
+            "transcript", "Transcript", "Transcribe speech with Whisper"))
+
+        hint = QLabel("Runs one pass on this video and folds it into the cache. "
+                      "Advanced settings live in the main window.")
+        hint.setStyleSheet(f"color: {THEME.text_mute}; font-size: 10px;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        section.setContentLayout(lay)
+        return section
+
+    def _make_analyze_row(self, kind, label, tooltip, extra=None):
+        """One Analyze row: optional input widget, a Run button, a status line."""
+        box = QVBoxLayout()
+        box.setSpacing(3)
+        if extra is not None:
+            box.addWidget(extra)
+
+        row = QHBoxLayout()
+        btn = QPushButton(f"  {label}")
+        btn.setIcon(ui_icons.play())
+        btn.setToolTip(tooltip)
+        btn.clicked.connect(lambda _=False, k=kind: self._toggle_analysis(k))
+        row.addWidget(btn)
+
+        status = QLabel("")
+        status.setStyleSheet(f"color: {THEME.text_dim}; font-size: 10px;")
+        row.addWidget(status, 1)
+        box.addLayout(row)
+
+        self._analyze_rows[kind] = {"btn": btn, "status": status, "label": label}
+        return box
+
+    def _toggle_analysis(self, kind):
+        """Run button doubles as cancel while its own analysis is active."""
+        if self._analysis_running == kind:
+            if self._analysis_cancel is not None:
+                self._analysis_cancel.set()
+            self._analyze_rows[kind]["status"].setText("cancelling…")
+            return
+        if self._analysis_running is not None:
+            self.statusBar().showMessage(
+                "Another analysis is already running — let it finish first.", 3000)
+            return
+        self._start_analysis(kind)
+
+    def _start_analysis(self, kind):
+        import threading
+        from modules.analysis_ondemand import run_actions, run_objects, run_transcript
+
+        cancel = threading.Event()
+        self._analysis_cancel = cancel
+        self._analysis_running = kind
+        self._set_analyze_busy(kind, True)
+        self._analyze_rows[kind]["status"].setText("starting…")
+
+        def progress(current, total, task="", details=""):
+            try:
+                frac = float(current) / float(total) if total else 0.0
+            except Exception:
+                frac = 0.0
+            frac = max(0.0, min(1.0, frac))
+            msg = f"{task}: {details}".strip(" :") if (task or details) else ""
+            self.analysis_progress.emit(kind, frac, msg)
+
+        def work():
+            try:
+                if kind == "actions":
+                    result = run_actions(self.video_path, progress=progress, cancel=cancel)
+                elif kind == "objects":
+                    objs = [s.strip() for s in self.analyze_objects_field.text().split(",") if s.strip()]
+                    result = run_objects(self.video_path, objs, progress=progress, cancel=cancel)
+                else:
+                    result = run_transcript(self.video_path, progress=progress, cancel=cancel)
+                self.analysis_finished.emit(kind, result)
+            except Exception as e:  # includes _Cancelled and ValueError (no classes)
+                self.analysis_finished.emit(kind, e)
+
+        self._analysis_thread = threading.Thread(target=work, daemon=True)
+        self._analysis_thread.start()
+
+    def _set_analyze_busy(self, kind, busy):
+        """While one run is active, its button becomes Cancel and the others
+        disable (heavy GPU work — one at a time)."""
+        for k, row in self._analyze_rows.items():
+            if k == kind:
+                row["btn"].setText("  Cancel" if busy else f"  {row['label']}")
+                row["btn"].setIcon(ui_icons.stop() if busy else ui_icons.play())
+            else:
+                row["btn"].setEnabled(not busy)
+
+    @Slot(str, float, str)
+    def _on_analysis_progress(self, kind, frac, msg):
+        row = self._analyze_rows.get(kind)
+        if not row:
+            return
+        pct = int(frac * 100)
+        row["status"].setText(f"{pct}% · {msg}" if msg else f"{pct}%")
+
+    @Slot(str, object)
+    def _on_analysis_finished(self, kind, result):
+        from modules.analysis_ondemand import _Cancelled
+        self._set_analyze_busy(kind, False)
+        self._analysis_running = None
+        self._analysis_cancel = None
+        row = self._analyze_rows.get(kind)
+
+        if isinstance(result, Exception):
+            if isinstance(result, _Cancelled):
+                if row:
+                    row["status"].setText("cancelled")
+            else:
+                if row:
+                    row["status"].setText("failed — see log")
+                self.statusBar().showMessage(
+                    f"{kind.title()} analysis failed: {str(result)[:80]}", 6000)
+                print(f"❌ {kind} analysis failed: {result}")
+            return
+
+        if kind == "actions":
+            self.cache_data["actions"] = result
+            self.cache_data["actions_all"] = result
+            self._merge_into_cache_file({"actions": result, "actions_all": result})
+            self._enable_layer_and_reload("actions")
+            if row:
+                row["status"].setText(f"✓ {len(result)} detections")
+        elif kind == "objects":
+            self.cache_data["objects"] = result
+            self._merge_into_cache_file({"objects": result})
+            self._enable_layer_and_reload("objects")
+            if row:
+                row["status"].setText(f"✓ {len(result)} seconds")
+        else:  # transcript
+            self.cache_data["transcript"] = result
+            self._merge_into_cache_file({"transcript": result})
+            self._enable_layer_and_reload("transcript")
+            self._refresh_transcript_panel(result.get("segments", []))
+            if row:
+                row["status"].setText(f"✓ {len(result.get('segments', []))} segments")
+
+        # action_types / object_classes may have grown — refresh the status line.
+        self.action_types = self.signal_scene.action_types
+        self.object_classes = self.signal_scene.object_classes
+        self._update_status()
+
+    def _enable_layer_and_reload(self, layer_name):
+        """Re-ingest the enlarged cache and make the new layer visible + checked."""
+        self.signal_scene.visible_layers[layer_name] = True
+        cb = getattr(self, "layer_checkboxes", {}).get(layer_name)
+        if cb is not None and not cb.isChecked():
+            cb.blockSignals(True)
+            cb.setChecked(True)
+            cb.setToolTip("")
+            cb.blockSignals(False)
+        self.signal_scene.reload_cache_data(self.cache_data)  # re-extract + rebuild
+        if hasattr(self, "label_panel"):
+            self.label_panel.refresh_labels()
+
+    def _refresh_transcript_panel(self, segments):
+        """Rebuild the Transcript tab's panel with freshly-run segments."""
+        try:
+            dock = getattr(self, "_transcript_dock", None)
+            if dock is None or not segments:
+                return
+            panel = TranscriptPanel(segments, parent=self)
+            panel.seek_requested.connect(self.on_time_clicked)
+            dock.setWidget(panel)
+            self.transcript_panel = panel
+        except Exception as e:
+            print(f"⚠️ Could not refresh transcript panel: {e}")
+
+    def _merge_into_cache_file(self, patch: dict):
+        """Merge `patch` into the on-disk cache file for this video (mirrors
+        save_waveform_to_cache). Seeds a legacy <hash>.cache.json if none yet."""
+        try:
+            from pathlib import Path
+            import json
+            cache_dir = Path("./cache")
+            if not cache_dir.exists():
+                print("⚠️ Cache dir missing; analysis not persisted")
+                return
+            video_hash = self._resolve_video_hash()
+            if not video_hash:
+                print("⚠️ No video_hash; analysis not persisted")
+                return
+            matching = list(cache_dir.glob(f"{video_hash}*.cache.json"))
+            if matching:
+                cache_file = matching[0]
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    disk = json.load(f)
+            else:
+                cache_file = cache_dir / f"{video_hash}.cache.json"
+                disk = dict(self.cache_data)
+                disk.setdefault("video_path", str(self.video_path))
+                disk["video_hash"] = video_hash
+                disk["cache_complete"] = True
+            disk.update(patch)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(disk, f)
+            print(f"💾 Analysis merged → {cache_file.name}")
+        except Exception as e:
+            print(f"⚠️ Could not persist analysis: {e}")
+
     @staticmethod
     def _toolbar_separator():
         """Thin vertical rule between button groups on the edit toolbar."""
@@ -2423,6 +2672,10 @@ class SignalTimelineWindow(QMainWindow):
         # ADD FILTER CONTROLS
         filter_controls = self.create_filter_controls()
         layout.addWidget(filter_controls)
+
+        # Run analysis on demand (fills the cache without leaving the viewer)
+        analyze_section = self.create_analyze_section()
+        layout.addWidget(analyze_section)
 
         # Layer visibility controls
         layer_group = CollapsibleSection("Visible Layers", settings_key="controls/layers")
