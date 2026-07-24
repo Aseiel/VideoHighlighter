@@ -514,11 +514,17 @@ class SignalTimelineScene(QGraphicsScene):
         return ts
 
     def _nav_timestamps_transcript(self):
+        # With a keyword search active, the ◀▶ arrows step between the spoken
+        # hits only; otherwise between every transcript segment.
+        kws = [k.lower() for k in getattr(self, "transcript_keywords", []) if k]
         ts = []
         for seg in self.cache_data.get('transcript', {}).get('segments', []):
             t = seg.get('start')
-            if t is not None:
-                ts.append(float(t))
+            if t is None:
+                continue
+            if kws and not any(k in seg.get('text', '').lower() for k in kws):
+                continue
+            ts.append(float(t))
         return ts
 
     def layer_has_data(self, key: str) -> bool:
@@ -756,9 +762,13 @@ class SignalTimelineScene(QGraphicsScene):
             current_y = self.draw_waveform_layer(current_y, 80)
                
         # Draw other layers
-        # Layer 1: Transcript
+        # Layer 1: Transcript. Special-cased vs other layers: when toggled off
+        # but a transcript exists, it's drawn *greyed* rather than hidden, so a
+        # disabled transcript still reads as a ghost track on the timeline.
         if self.visible_layers.get('transcript', True):
             current_y = self.draw_transcript_layer(current_y)
+        elif self.cache_data.get('transcript', {}).get('segments'):
+            current_y = self.draw_transcript_layer(current_y, dimmed=True)
 
         # Layer 2: Actions (with better naming)
         if self.visible_layers.get('actions', True):
@@ -859,32 +869,70 @@ class SignalTimelineScene(QGraphicsScene):
                           QBrush(QColor(18, 18, 18)))
         bg.setZValue(-10)
 
-    def draw_transcript_layer(self, y_pos):
-        """Draw transcript segments with improved labeling"""
+    def set_transcript_keywords(self, keywords):
+        """Set the words to mark on the TRANSCRIPT row and rebuild. When set,
+        the row draws an amber marker over every spoken segment that contains a
+        word, and the ◀▶ arrows step between those hits (see
+        _nav_timestamps_transcript). Empty clears the marking."""
+        self.transcript_keywords = [k.strip() for k in (keywords or []) if k and k.strip()]
+        self.build_timeline()
+
+    def _transcript_keyword_hit(self, text):
+        kws = [k.lower() for k in getattr(self, "transcript_keywords", []) if k]
+        return bool(kws) and any(k in text.lower() for k in kws)
+
+    def draw_transcript_layer(self, y_pos, dimmed=False):
+        """Draw transcript segments with improved labeling.
+
+        `dimmed` renders the whole row greyed (used when the transcript layer is
+        toggled off but data exists — a disabled/ghost track). Keyword marks are
+        skipped while dimmed."""
         self.row_labels.append(("TRANSCRIPT", y_pos))
-        
+
+        keywords_active = bool(getattr(self, "transcript_keywords", [])) and not dimmed
         if 'transcript' in self.cache_data and self.cache_data['transcript'].get('segments'):
             for segment in self.cache_data['transcript']['segments']:
                 start = segment.get('start', 0)
                 end = segment.get('end', start + 1)
                 text = segment.get('text', '').strip()
-                
+
                 if text:
                     # Calculate visual weight based on text density
                     words = len(text.split())
                     duration = max(0.1, end - start)
                     density = words / duration
                     intensity = min(10, density * 2)
-                    
+
+                    # Disabled → flat grey; else transcript colour, dimming the
+                    # non-matching segments when a keyword search is active.
+                    is_hit = (not dimmed) and self._transcript_keyword_hit(text)
+                    if dimmed:
+                        color = QColor(120, 120, 120, 60)
+                    else:
+                        color = QColor(self.colors['transcript'])
+                        if keywords_active and not is_hit:
+                            color.setAlpha(70)
+
                     bar = TimelineBar(
                         start, end, y_pos, self.layer_height,
-                        self.colors['transcript'], text[:30] + "..." if len(text) > 30 else text,
+                        color, text[:30] + "..." if len(text) > 30 else text,
                         confidence=intensity,
                         metadata={'full_text': text, 'words': words}
                     )
                     self.draw_bar(bar)
                     self.bars.append(bar)
-        
+
+                    if is_hit:
+                        # Amber marker at the top of the band over the hit.
+                        x = start * self.pixels_per_second
+                        tri = QPolygonF([
+                            QPointF(x - 4, y_pos), QPointF(x + 4, y_pos),
+                            QPointF(x, y_pos + 7),
+                        ])
+                        m = self.addPolygon(tri, QPen(Qt.PenStyle.NoPen),
+                                            QBrush(QColor(255, 196, 0)))
+                        m.setZValue(60)
+
         return y_pos + self.layer_height + self.layer_spacing
     
     def draw_improved_actions_layer(self, y_pos):

@@ -2143,16 +2143,26 @@ class SignalTimelineWindow(QMainWindow):
         self._analysis_running = None       # kind of the active run, or None
         self._analyze_rows = {}             # kind -> {btn, status, label}
 
-        # Objects needs a class list — the one input a button can't avoid.
-        # Prefill from the main GUI's saved list so it's usually one click.
+        # Prefill the class/keep lists from the main GUI's saved settings so a
+        # run is usually one click.
         try:
             from modules.analysis_ondemand import analysis_defaults
-            obj_default = ", ".join(analysis_defaults().get("object_list", []))
+            _d = analysis_defaults()
+            obj_default = ", ".join(_d.get("object_list", []))
+            act_default = ", ".join(_d.get("action_list", []))
+            kw_default = ", ".join(_d.get("search_keywords", []))
         except Exception:
-            obj_default = ""
+            obj_default = act_default = kw_default = ""
 
+        # Actions: optional keep-list (blank = all actions).
+        self.analyze_actions_field = QLineEdit(act_default)
+        self.analyze_actions_field.setPlaceholderText("all actions (or: high kick, archery…)")
+        self.analyze_actions_field.setToolTip(
+            "Optional. Leave blank to detect every action; or list names to keep "
+            "only those. Prefilled from the main window's action keywords.")
         lay.addLayout(self._make_analyze_row(
-            "actions", "Actions", "Run action recognition over the whole video"))
+            "actions", "Actions", "Run action recognition over the whole video",
+            extra=self.analyze_actions_field))
 
         self.analyze_objects_field = QLineEdit(obj_default)
         self.analyze_objects_field.setPlaceholderText("person, car, dog…")
@@ -2163,8 +2173,29 @@ class SignalTimelineWindow(QMainWindow):
             "objects", "Objects", "Detect the object classes listed above",
             extra=self.analyze_objects_field))
 
+        # Transcript: Run transcribes; the keyword field marks spoken moments
+        # on the timeline (amber ticks) and points the TRANSCRIPT ◀▶ at them.
+        tr_extra = QWidget()
+        tr_l = QHBoxLayout(tr_extra)
+        tr_l.setContentsMargins(0, 0, 0, 0)
+        tr_l.setSpacing(4)
+        self.analyze_transcript_kw = QLineEdit(kw_default)
+        self.analyze_transcript_kw.setPlaceholderText("mark words, e.g. goal, score")
+        self.analyze_transcript_kw.setToolTip(
+            "Mark transcript moments where these words are spoken, on the "
+            "timeline. The TRANSCRIPT ◀▶ arrows then jump between the hits. "
+            "Blank clears the marking.")
+        self.analyze_transcript_kw.returnPressed.connect(self._apply_transcript_keywords)
+        tr_l.addWidget(self.analyze_transcript_kw, 1)
+        kw_btn = QPushButton()
+        kw_btn.setIcon(ui_icons.search(color=THEME.text))
+        kw_btn.setFixedWidth(30)
+        kw_btn.setToolTip("Mark these words on the timeline")
+        kw_btn.clicked.connect(self._apply_transcript_keywords)
+        tr_l.addWidget(kw_btn)
         lay.addLayout(self._make_analyze_row(
-            "transcript", "Transcript", "Transcribe speech with Whisper"))
+            "transcript", "Transcript", "Transcribe speech with Whisper",
+            extra=tr_extra))
 
         hint = QLabel("Runs one pass on this video and folds it into the cache. "
                       "Advanced settings live in the main window.")
@@ -2232,7 +2263,9 @@ class SignalTimelineWindow(QMainWindow):
         def work():
             try:
                 if kind == "actions":
-                    result = run_actions(self.video_path, progress=progress, cancel=cancel)
+                    acts = [s.strip() for s in self.analyze_actions_field.text().split(",") if s.strip()]
+                    result = run_actions(self.video_path, interesting_actions=acts,
+                                         progress=progress, cancel=cancel)
                 elif kind == "objects":
                     objs = [s.strip() for s in self.analyze_objects_field.text().split(",") if s.strip()]
                     result = run_objects(self.video_path, objs, progress=progress, cancel=cancel)
@@ -2303,11 +2336,38 @@ class SignalTimelineWindow(QMainWindow):
             self._refresh_transcript_panel(result.get("segments", []))
             if row:
                 row["status"].setText(f"✓ {len(result.get('segments', []))} segments")
+            # If keywords were already typed, mark them on the fresh transcript.
+            if self.analyze_transcript_kw.text().strip():
+                self._apply_transcript_keywords()
 
         # action_types / object_classes may have grown — refresh the status line.
         self.action_types = self.signal_scene.action_types
         self.object_classes = self.signal_scene.object_classes
         self._update_status()
+
+    def _apply_transcript_keywords(self):
+        """Mark the transcript keywords on the timeline (or clear if blank)."""
+        kws = [s.strip() for s in self.analyze_transcript_kw.text().split(",") if s.strip()]
+        sc = self.signal_scene
+        if kws:
+            # Marks are drawn on the TRANSCRIPT row, so make sure it's visible.
+            sc.visible_layers["transcript"] = True
+            cb = getattr(self, "layer_checkboxes", {}).get("transcript")
+            if cb is not None and not cb.isChecked():
+                cb.blockSignals(True)
+                cb.setChecked(True)
+                cb.setToolTip("")
+                cb.blockSignals(False)
+        sc.set_transcript_keywords(kws)   # rebuilds the timeline
+        if hasattr(self, "label_panel"):
+            self.label_panel.refresh_labels()
+        row = self._analyze_rows.get("transcript")
+        if row:
+            if kws:
+                hits = sc._nav_timestamps_transcript()
+                row["status"].setText(f"⌕ {len(hits)} match(es)")
+            elif not row["status"].text().startswith("✓"):
+                row["status"].setText("")
 
     def _enable_layer_and_reload(self, layer_name):
         """Re-ingest the enlarged cache and make the new layer visible + checked."""
