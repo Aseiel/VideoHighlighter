@@ -2151,8 +2151,13 @@ class SignalTimelineWindow(QMainWindow):
             obj_default = ", ".join(_d.get("object_list", []))
             act_default = ", ".join(_d.get("action_list", []))
             kw_default = ", ".join(_d.get("search_keywords", []))
+            # English by default. Only honour the saved source language when the
+            # main GUI actually has transcript enabled — otherwise a stale value
+            # (e.g. "pl" left over while transcript is off) shouldn't win.
+            lang_default = _d.get("language", "en") if _d.get("transcript_enabled") else "en"
         except Exception:
             obj_default = act_default = kw_default = ""
+            lang_default = "en"
 
         # Actions: optional keep-list (blank = all actions).
         self.analyze_actions_field = QLineEdit(act_default)
@@ -2173,12 +2178,34 @@ class SignalTimelineWindow(QMainWindow):
             "objects", "Objects", "Detect the object classes listed above",
             extra=self.analyze_objects_field))
 
-        # Transcript: Run transcribes; the keyword field marks spoken moments
+        # Transcript: Run transcribes; a language picker (English by default)
+        # sets the spoken language, and the keyword field marks spoken moments
         # on the timeline (amber ticks) and points the TRANSCRIPT ◀▶ at them.
         tr_extra = QWidget()
-        tr_l = QHBoxLayout(tr_extra)
-        tr_l.setContentsMargins(0, 0, 0, 0)
-        tr_l.setSpacing(4)
+        tr_v = QVBoxLayout(tr_extra)
+        tr_v.setContentsMargins(0, 0, 0, 0)
+        tr_v.setSpacing(4)
+
+        lang_row = QHBoxLayout()
+        lang_row.setContentsMargins(0, 0, 0, 0)
+        lang_row.setSpacing(4)
+        lang_row.addWidget(QLabel("Language:"))
+        self.analyze_transcript_lang = QComboBox()
+        for code in ["auto", "en", "pl", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh"]:
+            self.analyze_transcript_lang.addItem(code, code)
+        _li = self.analyze_transcript_lang.findData(lang_default)
+        if _li >= 0:
+            self.analyze_transcript_lang.setCurrentIndex(_li)
+        self.analyze_transcript_lang.setToolTip(
+            "Spoken language for transcription. Defaults to English; 'auto' "
+            "detects it. Overrides the main GUI's saved language for this run.")
+        lang_row.addWidget(self.analyze_transcript_lang)
+        lang_row.addStretch()
+        tr_v.addLayout(lang_row)
+
+        kw_row = QHBoxLayout()
+        kw_row.setContentsMargins(0, 0, 0, 0)
+        kw_row.setSpacing(4)
         self.analyze_transcript_kw = QLineEdit(kw_default)
         self.analyze_transcript_kw.setPlaceholderText("mark words, e.g. goal, score")
         self.analyze_transcript_kw.setToolTip(
@@ -2186,13 +2213,15 @@ class SignalTimelineWindow(QMainWindow):
             "timeline. The TRANSCRIPT ◀▶ arrows then jump between the hits. "
             "Blank clears the marking.")
         self.analyze_transcript_kw.returnPressed.connect(self._apply_transcript_keywords)
-        tr_l.addWidget(self.analyze_transcript_kw, 1)
+        kw_row.addWidget(self.analyze_transcript_kw, 1)
         kw_btn = QPushButton()
         kw_btn.setIcon(ui_icons.search(color=THEME.text))
         kw_btn.setFixedWidth(30)
         kw_btn.setToolTip("Mark these words on the timeline")
         kw_btn.clicked.connect(self._apply_transcript_keywords)
-        tr_l.addWidget(kw_btn)
+        kw_row.addWidget(kw_btn)
+        tr_v.addLayout(kw_row)
+
         lay.addLayout(self._make_analyze_row(
             "transcript", "Transcript", "Transcribe speech with Whisper",
             extra=tr_extra))
@@ -2270,7 +2299,9 @@ class SignalTimelineWindow(QMainWindow):
                     objs = [s.strip() for s in self.analyze_objects_field.text().split(",") if s.strip()]
                     result = run_objects(self.video_path, objs, progress=progress, cancel=cancel)
                 else:
-                    result = run_transcript(self.video_path, progress=progress, cancel=cancel)
+                    lang = self.analyze_transcript_lang.currentData() or "en"
+                    result = run_transcript(self.video_path, language=lang,
+                                            progress=progress, cancel=cancel)
                 self.analysis_finished.emit(kind, result)
             except Exception as e:  # includes _Cancelled and ValueError (no classes)
                 self.analysis_finished.emit(kind, e)
