@@ -57,6 +57,7 @@ def analysis_defaults() -> dict:
     advanced_cfg = cfg.get("advanced", {}) or {}
 
     return {
+        "action_list": list((cfg.get("actions", {}) or {}).get("interesting", []) or []),
         "object_list": list(objects_cfg.get("interesting", []) or []),
         # config stores confidence as a 0-100 int (30 → 0.30)
         "object_confidence": float(objects_cfg.get("confidence", 30)) / 100.0,
@@ -65,6 +66,7 @@ def analysis_defaults() -> dict:
         "yolo_type": advanced_cfg.get("yolo_type", "standard") or "standard",
         "whisper_model": transcript_cfg.get("model", "base") or "base",
         "language": transcript_cfg.get("source_lang", "en") or "en",
+        "search_keywords": list(transcript_cfg.get("search_keywords", []) or []),
         "sample_rate": int(advanced_cfg.get("sample_rate", 5) or 5),
     }
 
@@ -137,16 +139,23 @@ def _actions_to_cache(dets) -> list:
 
 
 def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
+                interesting_actions: Optional[list] = None,
                 progress: ProgressFn = None, cancel=None, log=print) -> list:
     """Run action recognition and return the cache-shaped `actions` list
-    (every detection — the timeline's "show all" source)."""
+    (every detection — the timeline's "show all" source).
+
+    `interesting_actions` is an optional keep-list: blank/None detects and
+    keeps all actions; a list narrows the result to those names (same filter
+    the pipeline's `interesting_actions` applies)."""
     from action_recognition import run_action_detection
     d = analysis_defaults()
     sample_rate = sample_rate or d["sample_rate"]
+    keep = [a.strip() for a in (interesting_actions or []) if a and a.strip()] or None
 
     detections, _bboxes = run_action_detection(
         video_path=video_path,
         sample_rate=sample_rate,
+        interesting_actions=keep,
         progress_callback=progress,
         cancel_flag=cancel,
         draw_bboxes=False,
