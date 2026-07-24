@@ -2151,13 +2151,12 @@ class SignalTimelineWindow(QMainWindow):
             obj_default = ", ".join(_d.get("object_list", []))
             act_default = ", ".join(_d.get("action_list", []))
             kw_default = ", ".join(_d.get("search_keywords", []))
-            # English by default. Only honour the saved source language when the
-            # main GUI actually has transcript enabled — otherwise a stale value
-            # (e.g. "pl" left over while transcript is off) shouldn't win.
-            lang_default = _d.get("language", "en") if _d.get("transcript_enabled") else "en"
         except Exception:
             obj_default = act_default = kw_default = ""
-            lang_default = "en"
+        # Transcription always defaults to English; pick another in the row's
+        # dropdown per run. (Deliberately ignores the main GUI's saved source
+        # language, which is often a stale leftover.)
+        lang_default = "en"
 
         # Actions: optional keep-list (blank = all actions).
         self.analyze_actions_field = QLineEdit(act_default)
