@@ -457,6 +457,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         forbidden_ranges = []          # [(start_sec, end_sec), ...] where an avoided id appears
         forbidden_boxes_by_frame = {}  # {frame_idx: [(x1,y1,x2,y2), ...]} avoided ids only
 
+        # Quality gate + music bed (wired from gui_config; safe defaults so a
+        # config that predates these keys behaves exactly as before).
+        QUALITY_GATE = bool(gui_config.get("quality_gate", False))
+        QUALITY_THRESHOLD = float(gui_config.get("quality_threshold", 60.0))
+        MUSIC_PATH = gui_config.get("music_path", "") or ""
+        MUSIC_MODE = gui_config.get("music_mode", "replace") or "replace"
+        MUSIC_VOLUME = float(gui_config.get("music_volume", 0.8))  # 0..1
+
         keyword_matches = []
 
         target_duration = EXACT_DURATION if EXACT_DURATION else MAX_DURATION
@@ -1825,6 +1833,33 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # Sort segments by start time (both modes)
         segments.sort(key=lambda x: x[0])
 
+        # ── Quality gate: penalize blurry clips ───────────────────────────────
+        # Sample sharpness once per SELECTED clip (never per candidate-second):
+        # at most len(segments) VideoCaptures open, regardless of clip length.
+        # A blurry clip has its per-second score in [start, end) knocked down to
+        # 30% so the cache/reporting reflects it; None (unreadable) never
+        # penalizes and never crashes the run.
+        if QUALITY_GATE and segments:
+            try:
+                from modules.clip_quality import sample_sharpness, is_blurry
+
+                penalized = 0
+                for seg_start, seg_end in segments:
+                    score_val = sample_sharpness(
+                        processed_video_path, float(seg_start), float(seg_end),
+                        samples=3,
+                    )
+                    if is_blurry(score_val, QUALITY_THRESHOLD):
+                        penalized += 1
+                        lo = max(0, int(seg_start))
+                        hi = min(len(score), int(seg_end))
+                        if hi > lo:
+                            score[lo:hi] = score[lo:hi] * 0.3
+                log(f"🩹 Quality gate: {penalized} of {len(segments)} clips "
+                    f"penalized as blurry")
+            except Exception as e:
+                log(f"⚠️ Quality gate skipped: {e}")
+
         # AVOID(skip, hard): guarantee no forbidden time survives into the cut
         if forbidden_ranges and (manual_avoid or (AVOID_ENABLED and AVOID_METHOD in ("skip", "crop_then_skip"))):
             before_n = len(segments)
@@ -2184,6 +2219,32 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     except Exception:
                         pass
             log(f"✅ Highlight saved: {OUTPUT_FILE}, duration {total_duration:.1f}s")
+
+            # ── Music bed ────────────────────────────────────────────────────
+            # Mux the chosen track onto the finished highlight. Applied to a
+            # temp file next to the output then os.replace'd on: a bad music
+            # file logs a warning and leaves the original highlight untouched,
+            # never killing a run that already produced a video.
+            if MUSIC_PATH and OUTPUT_FILE and os.path.exists(OUTPUT_FILE):
+                try:
+                    from modules.music_track import apply_music
+
+                    music_root, music_ext = os.path.splitext(OUTPUT_FILE)
+                    music_tmp = f"{music_root}_music{music_ext or '.mp4'}"
+                    log(f"🎵 Applying music: {os.path.basename(MUSIC_PATH)}")
+                    apply_music(
+                        OUTPUT_FILE, MUSIC_PATH, music_tmp,
+                        mode=MUSIC_MODE, music_volume=MUSIC_VOLUME, log_fn=log,
+                    )
+                    os.replace(music_tmp, OUTPUT_FILE)
+                    log("🎵 Music applied to highlight")
+                except Exception as e:
+                    log(f"⚠️ Could not apply music (left highlight as-is): {e}")
+                    try:
+                        if os.path.exists(music_tmp):
+                            os.remove(music_tmp)
+                    except Exception:
+                        pass
         except RuntimeError:
             return None
         except Exception as e:

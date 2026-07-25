@@ -154,29 +154,38 @@ class RunManager:
             self.preview_flag = ctx.Value("b", 1 if self.preview_enabled else 0)
 
             parent_conn, child_conn = ctx.Pipe(duplex=False)
-            self.proc = ctx.Process(
+            proc = ctx.Process(
                 target=worker.run_job,
                 args=(child_conn, job, self.cancel_flag, self.pause_event,
                       self.preview_flag),
                 daemon=True,
             )
-            self.proc.start()
+            self.proc = proc
+            proc.start()
             child_conn.close()  # parent keeps only the read end
 
+            # Hand this pump its own proc handle rather than letting it read
+            # self.proc: once this job finishes and the client starts the next
+            # one, self.proc points at the *new* child, and a stale pump touching
+            # it would join/None the wrong process.
             self.thread = threading.Thread(
-                target=self._pump, args=(parent_conn,), daemon=True
+                target=self._pump, args=(parent_conn, proc), daemon=True
             )
             self.thread.start()
             return self.run_id
 
-    def _pump(self, conn) -> None:
-        """Relay child events until it finishes, and notice if it dies."""
+    def _pump(self, conn, proc) -> None:
+        """Relay events from `proc` until it finishes, and notice if it dies.
+
+        `proc` is captured at start rather than read from self.proc so a pump
+        that outlives its job (still in teardown when the next run starts) never
+        observes or clears the successor's handle."""
         saw_done = False
         try:
             while True:
                 if not conn.poll(0.5):
                     # No data: only bail once the child is truly gone.
-                    if self.proc is not None and not self.proc.is_alive():
+                    if not proc.is_alive():
                         break
                     continue
                 try:
@@ -195,13 +204,11 @@ class RunManager:
                 conn.close()
             except Exception:
                 pass
-            if self.proc is not None:
-                self.proc.join(timeout=5)
+            proc.join(timeout=5)
             # A child that vanished without a `done` was killed or crashed — most
             # likely torch's native runtime faulting on teardown. Report it rather
             # than leaving the UI stuck on "running".
             if not saw_done:
-                code = self.proc.exitcode if self.proc else None
                 if self.cancel_flag.is_set():
                     self._emit({"type": "cancelled"})
                 else:
@@ -209,11 +216,15 @@ class RunManager:
                         "type": "error",
                         "message": (
                             f"The processing engine stopped unexpectedly "
-                            f"(exit code {code}). The run was not completed."
+                            f"(exit code {proc.exitcode}). The run was not completed."
                         ),
                     })
                 self._emit({"type": "done"})
-            self.proc = None
+            # Only clear the slot if it is still ours: the next job may have
+            # already claimed self.proc while we were tearing down.
+            with self._lock:
+                if self.proc is proc:
+                    self.proc = None
 
     def cancel(self) -> bool:
         if self.is_running:
@@ -440,16 +451,120 @@ async def save_composition_rules(req: CompRulesRequest) -> dict:
 
 @app.get("/video-info")
 async def video_info(path: str) -> dict:
-    """Duration/fps for a video, so the UI can show a real time-range slider.
-    Uses the pipeline's own ffprobe-based helper (cv2's frame count is unreliable
-    on VFR footage)."""
+    """Full display metadata for a video, so the UI can show a real time-range
+    slider AND orient a preview correctly. Backed by modules.video_probe (one
+    ffprobe JSON call); keeps the {ok, duration} back-compat shape and adds
+    width/height/fps/rotation. probe_video raises on ffprobe failure, so the
+    try/except yields the {ok:false,error} shape the other endpoints use."""
     try:
         if not os.path.exists(path):
             return {"ok": False, "error": "file not found"}
-        from pipeline import get_video_duration
+        from modules.video_probe import probe_video
 
-        duration = await asyncio.to_thread(get_video_duration, path, lambda *_: None)
-        return {"ok": True, "duration": float(duration or 0)}
+        info = await asyncio.to_thread(probe_video, path)
+        return {
+            "ok": True,
+            "duration": float(info.get("duration") or 0),
+            "width": int(info.get("width") or 0),
+            "height": int(info.get("height") or 0),
+            "fps": float(info.get("fps") or 0),
+            "rotation": int(info.get("rotation") or 0),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+# ── Folder scan + combine ─────────────────────────────────────────────────
+
+_VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm", ".mts", ".m2ts")
+_SCAN_CAP = 2000
+
+
+def _natural_key(name: str):
+    """Split a name into text/number runs so "clip2" sorts before "clip10"."""
+    import re
+
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", name)]
+
+
+def _scan_video_files(path: str, recursive: bool) -> list[str]:
+    """Video files under `path`, natural-sorted, capped at 2000.
+
+    Extension match is case-insensitive against _VIDEO_EXTS. When `recursive`
+    the whole tree is walked (each directory's entries natural-sorted so the
+    result is deterministic); otherwise only the top level. Pure — no I/O
+    beyond listing, so it is unit-testable without spinning up the server."""
+    results: list[str] = []
+    if recursive:
+        for root, dirs, names in os.walk(path):
+            dirs.sort(key=_natural_key)
+            for name in sorted(names, key=_natural_key):
+                if os.path.splitext(name)[1].lower() in _VIDEO_EXTS:
+                    results.append(os.path.join(root, name))
+                    if len(results) >= _SCAN_CAP:
+                        return results
+    else:
+        for name in sorted(os.listdir(path), key=_natural_key):
+            full = os.path.join(path, name)
+            if (os.path.splitext(name)[1].lower() in _VIDEO_EXTS
+                    and os.path.isfile(full)):
+                results.append(full)
+                if len(results) >= _SCAN_CAP:
+                    break
+    return results
+
+
+@app.get("/scan-folder")
+async def scan_folder(path: str, recursive: int = 0) -> dict:
+    """List video files in a folder for the batch picker.
+
+    A missing/non-directory path returns {ok:false,error} (HTTP 200), matching
+    the other endpoints' error shape rather than raising."""
+    try:
+        if not path or not os.path.isdir(path):
+            return {"ok": False, "error": f"not a folder: {path!r}"}
+        files = await asyncio.to_thread(_scan_video_files, path, bool(recursive))
+        return {"ok": True, "files": files, "count": len(files)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class CombineRequest(BaseModel):
+    files: list[str]
+    output: str
+    music_path: str | None = None
+    music_mode: str | None = "replace"
+    music_volume: float | None = 0.8
+
+
+@app.post("/combine")
+async def start_combine(req: CombineRequest) -> dict:
+    """Join finished highlight clips into one reel via the RunManager (job kind
+    'combine'). Validation runs BEFORE any job starts, so a bad request never
+    occupies the single run slot."""
+    files = [f for f in (req.files or []) if f]
+    if len(files) < 2:
+        return {"ok": False, "error": "Need at least 2 files to combine"}
+    missing = [f for f in files if not os.path.exists(f)]
+    if missing:
+        return {"ok": False, "error": f"File(s) not found: {missing}"}
+    if not (req.output or "").strip():
+        return {"ok": False, "error": "No output path provided"}
+
+    job: dict = {"kind": "combine", "files": files, "output": req.output}
+    if req.music_path:
+        job["music_path"] = req.music_path
+        job["music_mode"] = req.music_mode or "replace"
+        job["music_volume"] = float(
+            req.music_volume if req.music_volume is not None else 0.8)
+
+    try:
+        loop = asyncio.get_running_loop()
+        run_id = manager.start_job(job, loop)
+        return {"ok": True, "run_id": run_id}
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
 

@@ -318,7 +318,20 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
                         log_fn(f"📈 Analyzed videos: +{n} this run — lifetime total: {total}")
                 except Exception as exc:  # noqa: BLE001
                     log_fn(f"⚠️ could not update the analyzed counter: {exc}")
-                emit({"type": "finished", "output": output or ""})
+
+                # run_highlighter returns a single output path (str) for one
+                # video, or [(input, output_or_None), ...] for a batch. Keep the
+                # existing `output` back-compat field (first/only path) and add
+                # `outputs`: every produced highlight file, so the UI can offer
+                # "reveal" / "combine" on each one.
+                if isinstance(output, list):
+                    outputs = [entry[1] for entry in output if entry and entry[1]]
+                    back_compat = outputs[0] if outputs else ""
+                else:
+                    outputs = [output] if output else []
+                    back_compat = output or ""
+                emit({"type": "finished", "output": back_compat,
+                      "outputs": outputs})
 
         elif kind == "download":
             from downloader import download_videos_with_immediate_processing
@@ -358,6 +371,27 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
             n = len(bank.all_identities())
             emit({"type": "faces_scanned", "count": n})
             emit({"type": "finished", "output": f"{n} identities"})
+
+        elif kind == "combine":
+            from modules import combine_videos
+
+            music = None
+            if job.get("music_path"):
+                music = {
+                    "path": job["music_path"],
+                    "mode": job.get("music_mode", "replace"),
+                    "volume": float(job.get("music_volume", 0.8)),
+                }
+            try:
+                result = combine_videos.combine_videos(
+                    job["files"], job["output"],
+                    log_fn=log_fn, progress_fn=progress_fn,
+                    cancel_check=lambda: cancel_evt.is_set(),
+                    music=music,
+                )
+                emit({"type": "finished", "output": result})
+            except combine_videos.CombineCancelled:
+                emit({"type": "cancelled"})
 
         else:
             emit({"type": "error", "message": f"unknown job kind: {kind}"})
