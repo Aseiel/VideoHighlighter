@@ -590,6 +590,112 @@ class Worker(QThread):
     def is_cancelled(self):
         return self._cancel_flag.is_set()
 
+
+class SignalRunWorker(QThread):
+    """Run ONE analysis signal on demand over a list of videos, folding each
+    result into that video's cache (leaving the other signals intact).
+
+    This is the main-window twin of the timeline viewer's "Analyze" panel: same
+    engine (`modules.analysis_ondemand`), same fold-into-cache behaviour, just
+    looped over the whole file list instead of one loaded video. It never cuts
+    highlights — it only produces the standalone `.srt`/`.txt` (subtitles /
+    transcript) and/or warms the cache for a later highlight run or the viewer.
+    """
+    finished = Signal(str)                  # short summary, or "" on hard error
+    progress = Signal(int, int, str, str)   # current, total, task, message
+    log = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, kind, video_paths, params=None):
+        super().__init__()
+        self.kind = kind
+        self.video_paths = list(video_paths)
+        self.params = params or {}
+        self._cancel_flag = threading.Event()
+        self._is_running = False
+
+    def run(self):
+        from modules import analysis_ondemand as aod
+        self._is_running = True
+        n = len(self.video_paths)
+        done = 0
+        try:
+            self.log.emit(f"🚀 {self.kind.title()} on demand over {n} video(s)...")
+            for i, vp in enumerate(self.video_paths):
+                if self._cancel_flag.is_set():
+                    break
+                name = os.path.basename(vp)
+                self.log.emit(f"▶️ {self.kind} [{i+1}/{n}]: {name}")
+
+                def progress(cur, tot, task, det, _i=i, _name=name):
+                    frac = (cur / tot) if tot else 0.0
+                    overall = int(((_i + frac) / n) * 100)
+                    self.progress.emit(overall, 100, self.kind.title(), f"{_name}: {det}")
+
+                try:
+                    patch = self._run_one(aod, vp, progress)
+                except aod._Cancelled:
+                    break
+                except Exception as e:
+                    self.log.emit(f"❌ {name}: {e}")
+                    continue
+
+                if patch:
+                    aod.merge_into_cache(vp, patch, log=self.log.emit)
+                    done += 1
+
+            if self._cancel_flag.is_set():
+                self.log.emit("⏹️ On-demand run cancelled")
+                self.cancelled.emit()
+                self.finished.emit("")
+            else:
+                self.finished.emit(f"{self.kind.title()}: {done}/{n} done")
+        except Exception as e:
+            import traceback
+            self.log.emit(f"❌ {self.kind} run error: {e}")
+            self.log.emit(traceback.format_exc())
+            self.finished.emit("")
+        finally:
+            self._is_running = False
+
+    def _run_one(self, aod, video_path, progress):
+        """Dispatch to the matching on-demand runner and shape the cache patch.
+        Mirrors the timeline viewer's per-kind cache keys."""
+        c = self._cancel_flag
+        p = self.params
+        if self.kind == "motion":
+            return aod.run_motion(video_path, progress=progress, cancel=c, log=self.log.emit)
+        if self.kind == "audio":
+            return aod.run_audio(video_path, progress=progress, cancel=c, log=self.log.emit)
+        if self.kind == "objects":
+            result = aod.run_objects(video_path, p.get("objects") or [],
+                                     progress=progress, cancel=c, log=self.log.emit)
+            return {"objects": result}
+        if self.kind == "actions":
+            result = aod.run_actions(video_path, interesting_actions=p.get("actions") or [],
+                                     progress=progress, cancel=c, log=self.log.emit)
+            return {"actions": result, "actions_all": result}
+        if self.kind == "transcript":
+            result = aod.run_transcript(video_path, language=p.get("language"),
+                                        progress=progress, cancel=c, log=self.log.emit)
+            return {"transcript": result}
+        if self.kind == "subtitles":
+            result = aod.run_subtitles(video_path, language=p.get("language"),
+                                       source_lang=p.get("source_lang"),
+                                       target_lang=p.get("target_lang"),
+                                       progress=progress, cancel=c, log=self.log.emit)
+            return {"transcript": result}
+        raise ValueError(f"unknown signal kind: {self.kind}")
+
+    def cancel(self):
+        if self._is_running:
+            self.log.emit("⏹️ Cancellation requested — finishing current video...")
+            self._cancel_flag.set()
+
+    def is_cancelled(self):
+        return self._cancel_flag.is_set()
+
+
 class FaceScanWorker(QThread):
     """Offline identity pass over a video to populate the face bank with everyone
     who appears, so they show up in the Avoid list (the 'dry run')."""
@@ -1165,6 +1271,13 @@ class VideoHighlighterGUI(QWidget):
         # overflows the window. Mirrors the Advanced tab layout.
         basic_layout = QGridLayout()
 
+        # On-demand run buttons sit right next to the scoring row they run. Each
+        # runs that one signal over every video in the list and folds the result
+        # into each cache — no highlights are cut. Registered here so a full
+        # pipeline run (or another on-demand run) can grey them out.
+        self._analyze_buttons = {}
+        self._signal_worker = None
+
         # ── Group 1: Scoring Points ──
         points_box = QGroupBox("Scoring Points")
         points_layout = QFormLayout()
@@ -1219,14 +1332,35 @@ class VideoHighlighterGUI(QWidget):
         outro_row.addStretch(1)
         outro_widget = QWidget(); outro_widget.setLayout(outro_row)
 
-        points_layout.addRow("Scene points:", self.spin_scene_points)
+        # Scene / motion-event / motion-peak all come from ONE detector pass, so
+        # the button lives on the first of the three and runs all three.
+        points_layout.addRow("Scene points:", self._points_row_with_button(
+            self.spin_scene_points, "motion", "Motion & scenes",
+            "Detect scene cuts and motion across every video in the list and cache "
+            "them (covers scene, motion event and motion peak — one pass). No "
+            "highlights are cut."))
         points_layout.addRow("Motion event points:", self.spin_motion_event_points)
         points_layout.addRow("Motion peak points:", self.spin_motion_peak)
-        points_layout.addRow("Audio peak points:", self.spin_audio_peak)
+        points_layout.addRow("Audio peak points:", self._points_row_with_button(
+            self.spin_audio_peak, "audio", "Audio",
+            "Detect audio peaks across every video in the list and cache them. "
+            "No highlights are cut."))
+        # Keyword + transcript points both come from ONE transcription pass.
         points_layout.addRow("Keyword points (keywords in transcript):", self.spin_keyword_points)
-        points_layout.addRow("Transcript points (all words):", self.spin_transcript_points)
-        points_layout.addRow("Object points:", self.spin_object)
-        points_layout.addRow("Action points:", self.spin_action)
+        points_layout.addRow("Transcript points (all words):", self._points_row_with_button(
+            self.spin_transcript_points, "transcript", "Transcribe",
+            "Transcribe every video in the list to a _transcript.txt sidecar and "
+            "cache it (uses the model/language in the Transcript tab). No "
+            "highlights are cut."))
+        points_layout.addRow("Object points:", self._points_row_with_button(
+            self.spin_object, "objects", "Objects",
+            "Detect the classes from the 'Object detection' field below, across "
+            "every video in the list, and cache them. No highlights are cut."))
+        points_layout.addRow("Action points:", self._points_row_with_button(
+            self.spin_action, "actions", "Actions",
+            "Detect the actions from the 'Action keywords' field below (blank = "
+            "all actions), across every video in the list, and cache them. No "
+            "highlights are cut."))
         points_layout.addRow("Intro (window, points):", intro_widget)
         points_layout.addRow("Outro (window, points):", outro_widget)
 
@@ -1349,21 +1483,22 @@ class VideoHighlighterGUI(QWidget):
         self.actions_require_objects_chk.setToolTip("Actions will only add points if objects are also detected in that timeframe")
         basic_layout.addWidget(self.actions_require_objects_chk, 4, 0, 1, 2)
 
-        self.skip_highlights_chk = QCheckBox("Skip highlights")
-        self.skip_highlights_chk.setChecked(highlights_cfg.get("skip_highlights", False))
-        basic_layout.addWidget(self.skip_highlights_chk, 5, 0, 1, 2)
+        # (The old "Skip highlights" checkbox is gone. Producing a transcript or
+        # subtitles without cutting highlights is now a per-signal run button in
+        # the Scoring Points panel above — Transcribe/Objects/Actions/etc. — so
+        # scores never have to be zeroed by hand.)
 
         # Combine every processed video's highlights into one master video.
         # Config key stays under "download" (auto_combine) so saved configs load.
         self.auto_combine_chk = QCheckBox("Combine highlights from all processed videos into one video")
         self.auto_combine_chk.setChecked(self.config_data.get("download", {}).get("auto_combine", True))
         self.auto_combine_chk.setToolTip("When enabled, the highlights from every processed video are merged into a single master video")
-        basic_layout.addWidget(self.auto_combine_chk, 6, 0, 1, 2)
+        basic_layout.addWidget(self.auto_combine_chk, 5, 0, 1, 2)
 
         # Equal-width columns; trailing stretch row keeps groups packed at the top.
         basic_layout.setColumnStretch(0, 1)
         basic_layout.setColumnStretch(1, 1)
-        basic_layout.setRowStretch(7, 1)
+        basic_layout.setRowStretch(6, 1)
 
         basic_tab.setLayout(basic_layout)
         tabs.addTab(basic_tab, "Basic Settings")
@@ -1420,6 +1555,11 @@ class VideoHighlighterGUI(QWidget):
         self.subtitle_target_lang.setCurrentText(subtitles_cfg.get("target_lang", "pl"))
         self.subtitle_target_lang.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
         subtitle_form.addRow("Target language:", self.subtitle_target_lang)
+        _sub_run = self._make_analyze_button(
+            "subtitles", "Make subtitles",
+            "Transcribe every video in the list and write a .srt next to each "
+            "(translated when the target language differs). No highlights are cut.")
+        subtitle_form.addRow("", _sub_run)
         subtitle_group.setLayout(subtitle_form)
         transcript_layout.addWidget(subtitle_group)
 
@@ -2729,7 +2869,6 @@ class VideoHighlighterGUI(QWidget):
             "create_subtitles": self.subtitles_checkbox.isChecked() and use_transcript,
             "source_lang": self.subtitle_source_lang.currentText(),
             "target_lang": self.subtitle_target_lang.currentText(),
-            "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "vr_mode": self.vr_mode_chk.isChecked(),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
@@ -3252,7 +3391,6 @@ class VideoHighlighterGUI(QWidget):
                 "exact_duration": int(self.spin_exact_duration.value()),
                 "keep_temp": self.keep_temp_chk.isChecked(),
                 "render_mode": self.render_mode_combo.currentData(),
-                "skip_highlights": self.skip_highlights_chk.isChecked(),
                 "auto_min_clip": int(self.spin_auto_min_clip.value()),
                 "auto_max_clip": int(self.spin_auto_max_clip.value()),
                 "auto_merge_gap": int(self.spin_auto_merge_gap.value()),
@@ -4080,7 +4218,6 @@ class VideoHighlighterGUI(QWidget):
             "create_subtitles": self.subtitles_checkbox.isChecked() and use_transcript,
             "source_lang": self.subtitle_source_lang.currentText(),
             "target_lang": self.subtitle_target_lang.currentText(),
-            "skip_highlights": self.skip_highlights_chk.isChecked(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
             "yolo_type": self.object_detector_choice()[0],
@@ -4101,19 +4238,6 @@ class VideoHighlighterGUI(QWidget):
             "face_db_path": "./cache/face_db.json",
             "force_reprocess": self.force_reprocess_checkbox.isChecked(),
         }
-
-        # --- Skip highlights logic ---
-        if config.get("skip_highlights", False):
-            config["scene_points"] = 0
-            config["motion_event_points"] = 0
-            config["motion_peak_points"] = 0
-            config["audio_peak_points"] = 0
-            config["object_points"] = 0
-            config["action_points"] = 0
-            config["keyword_points"] = 0
-            config["clip_time"] = 0
-            config["max_duration"] = 0
-            config["exact_duration"] = None
 
         # Remove None values
         config = {k: v for k,v in config.items() if v is not None}
@@ -4148,6 +4272,7 @@ class VideoHighlighterGUI(QWidget):
         self.task_label.setText("🚀 Initializing...")
         self.run_btn.setText("⏸ Pause")
         self.run_btn.setStyleSheet("QPushButton { background-color: #ff8c00; color: white; font-weight: bold; padding: 8px; }")
+        self._set_analyze_buttons_enabled(False)   # no on-demand run while a pipeline runs
         self.cancel_btn.setEnabled(True)
 
         # Disable form inputs during processing
@@ -4195,9 +4320,130 @@ class VideoHighlighterGUI(QWidget):
             self.worker.cancel()
             QTimer.singleShot(10000, self.force_worker_cleanup)
             return
-        
+
+        # Check if an on-demand signal run is going
+        if self._signal_worker and self._signal_worker.isRunning():
+            self.append_log("\n⏹️ === CANCELLATION REQUESTED ===")
+            self.append_log("⏹️ Stopping on-demand run...")
+            self.task_label.setText("⏹️ Cancelling on-demand run...")
+            self.cancel_btn.setText("Cancelling...")
+            self._signal_worker.cancel()
+            return
+
         # Nothing is running
         self.append_log("⚠️ Nothing to cancel - no active process")
+
+    def _make_analyze_button(self, kind, label, tooltip):
+        """A small 'run this one signal on demand' button, registered so the
+        pipeline can grey it out while a full run (or another on-demand run) is
+        active."""
+        btn = QPushButton(label)
+        btn.setToolTip(tooltip)
+        btn.clicked.connect(lambda _=False, k=kind: self.start_signal_run(k))
+        self._analyze_buttons[kind] = btn
+        return btn
+
+    def _points_row_with_button(self, spin, kind, label, tooltip):
+        """Wrap a scoring-point spinbox and its on-demand Run button into one
+        form-row field: [spinbox] [Run button] [stretch]."""
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        h.addWidget(spin)
+        h.addWidget(self._make_analyze_button(kind, label, tooltip))
+        h.addStretch(1)
+        return w
+
+    def _set_analyze_buttons_enabled(self, enabled):
+        for btn in getattr(self, "_analyze_buttons", {}).values():
+            btn.setEnabled(enabled)
+
+    def start_signal_run(self, kind):
+        """Run one analysis signal (objects / actions / transcript / subtitles /
+        motion / audio) over every video in the list, folding each result into
+        that video's cache. No highlights are cut — this is the main-window twin
+        of the timeline viewer's Analyze panel."""
+        if self.worker and self.worker.isRunning():
+            self.append_log("⚠️ A pipeline run is active — let it finish first.")
+            return
+        if self._signal_worker and self._signal_worker.isRunning():
+            self.append_log("⚠️ An on-demand run is already going.")
+            return
+
+        video_paths = self.get_file_list()
+        if not video_paths:
+            self.append_log("⚠️ No videos in the list.")
+            return
+        missing = [p for p in video_paths if not os.path.exists(p)]
+        if missing:
+            self.append_log("⚠️ Video file(s) not found:")
+            for f in missing:
+                self.append_log(f"  - {f}")
+            return
+
+        # Per-kind params + validation.
+        params = {}
+        if kind == "objects":
+            objs = [s.strip() for s in self.objects_input.text().split(",") if s.strip()]
+            if not objs:
+                self.append_log("⚠️ Type at least one object class first (e.g. person, car).")
+                return
+            params["objects"] = objs
+        elif kind == "actions":
+            # Blank = detect every action (same as the timeline viewer).
+            params["actions"] = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
+        elif kind == "transcript":
+            params["language"] = self.transcript_source_lang.currentText()
+        elif kind == "subtitles":
+            params["language"] = self.transcript_source_lang.currentText()
+            params["source_lang"] = self.subtitle_source_lang.currentText()
+            params["target_lang"] = self.subtitle_target_lang.currentText()
+
+        # UI state — reuse the pipeline's progress row.
+        self.log_output.clear()
+        self._show_progress(True)
+        self.process_progress_bar.setVisible(True)
+        self.process_progress_bar.setRange(0, 100)
+        self.process_progress_bar.setValue(0)
+        self.download_progress_bar.setVisible(False)
+        self.hide_batch_progress()
+        self.task_label.setText(f"🚀 {kind.title()} (on demand)…")
+        self._set_analyze_buttons_enabled(False)
+        self.run_btn.setEnabled(False)   # no full run while an on-demand run goes
+        self.cancel_btn.setEnabled(True)
+
+        self._signal_run_paths = list(video_paths)   # for live-refreshing an open viewer
+        self._signal_worker = SignalRunWorker(kind, video_paths, params)
+        self._signal_worker.log.connect(self.append_log)
+        self._signal_worker.progress.connect(self.update_pipeline_progress)
+        self._signal_worker.finished.connect(self._signal_run_finished)
+        self._signal_worker.start()
+
+    @Slot(str)
+    def _signal_run_finished(self, summary):
+        if summary:
+            self.append_log(f"✅ {summary}")
+        self._set_analyze_buttons_enabled(True)
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setText("Cancel")
+        self.task_label.setText("Ready")
+        self.process_progress_bar.setValue(100)
+        self._signal_worker = None
+
+        # If a timeline viewer is open for one of the videos we just ran, refresh
+        # it live so the new signal appears without reopening.
+        tw = getattr(self, 'timeline_window', None)
+        if tw is not None:
+            try:
+                if getattr(tw, 'video_path', None) in getattr(self, '_signal_run_paths', []):
+                    tw.refresh_from_disk()
+                    self.append_log("🔄 Refreshed the open timeline viewer.")
+            except RuntimeError:
+                self.timeline_window = None   # underlying window was destroyed
+            except Exception as e:
+                self.append_log(f"⚠️ Could not refresh timeline viewer: {e}")
 
     def toggle_run(self):
         """Run / Pause / Resume - single button"""
@@ -4403,6 +4649,7 @@ class VideoHighlighterGUI(QWidget):
         self.run_btn.setText("Run Highlighter")
         self.run_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
         self.run_btn.setEnabled(True)
+        self._set_analyze_buttons_enabled(True)
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setText("Cancel")
 
@@ -4462,6 +4709,12 @@ class VideoHighlighterGUI(QWidget):
                 try:
                     same_video = (getattr(existing, 'video_path', None) == video_path)
                     if same_video:
+                        # Pick up any signals added on demand since it was opened
+                        # (per-signal Run buttons fold into the cache on disk).
+                        try:
+                            existing.refresh_from_disk()
+                        except Exception as e:
+                            self.append_log(f"⚠️ Could not refresh timeline cache: {e}")
                         # Un-mute (close() muted the audio outputs) and re-show
                         for ao_attr, obj in (('audio_output', existing),
                                              ('_audio', getattr(existing, 'realtime_preview', None))):

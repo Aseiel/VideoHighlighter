@@ -1680,6 +1680,59 @@ class SignalTimelineWindow(QMainWindow):
         print(f"\n{'='*60}\n")
         return {}
     
+    def refresh_from_disk(self):
+        """Re-read this video's cache from disk and rebuild the timeline, so a
+        signal added on demand elsewhere (the main window's per-signal Run
+        buttons fold straight into the cache file) shows up here — without
+        tearing down this heavy window. Best-effort; a failed reload leaves the
+        current view untouched."""
+        try:
+            fresh = self.load_cache_data()
+        except Exception as e:
+            print(f"⚠️ refresh_from_disk: cache reload failed: {e}")
+            return
+        if not fresh:
+            return
+
+        self.cache_data = fresh
+
+        # Re-ingest signals (updates cache_data, action/object type lists, redraws).
+        self.signal_scene.reload_cache_data(self.cache_data)
+
+        # Audio waveform may have just been added.
+        try:
+            wf = self.load_waveform_from_cache()
+            if wf:
+                self.waveform = wf
+                self.signal_scene.set_waveform_data(wf)
+        except Exception as e:
+            print(f"⚠️ refresh_from_disk: waveform reload failed: {e}")
+
+        # Layers hidden at open because they had no data (see create_controls)
+        # get switched back on now that data exists — mirrors the Analyze panel's
+        # _enable_layer_and_reload.
+        for name, cb in getattr(self, 'layer_checkboxes', {}).items():
+            try:
+                if self.signal_scene.layer_has_data(name) and not cb.isChecked():
+                    cb.blockSignals(True)
+                    cb.setChecked(True)
+                    cb.setToolTip("")
+                    cb.blockSignals(False)
+                    self.signal_scene.visible_layers[name] = True
+            except Exception:
+                continue
+
+        self.signal_scene.build_timeline()
+
+        # Refresh side panels + status line.
+        self.action_types = self.signal_scene.action_types
+        self.object_classes = self.signal_scene.object_classes
+        if hasattr(self, 'label_panel'):
+            self.label_panel.refresh_labels()
+        if hasattr(self, '_update_status'):
+            self._update_status()
+        print("🔄 Timeline refreshed from disk")
+
     def _extract_action_types(self):
         """Extract unique action names for info display"""
         actions = set()
@@ -2158,6 +2211,16 @@ class SignalTimelineWindow(QMainWindow):
         # language, which is often a stale leftover.)
         lang_default = "en"
 
+        # Motion & scenes / Audio: no inputs — one detector pass each, folded
+        # into the cache. Motion covers scene, motion-event and motion-peak rows.
+        lay.addLayout(self._make_analyze_row(
+            "motion", "Motion & scenes",
+            "Detect scene cuts and motion over the whole video (scene, motion "
+            "event and motion peak — one pass)."))
+        lay.addLayout(self._make_analyze_row(
+            "audio", "Audio",
+            "Detect audio peaks (and the waveform) over the whole video."))
+
         # Actions: optional keep-list (blank = all actions).
         self.analyze_actions_field = QLineEdit(act_default)
         self.analyze_actions_field.setPlaceholderText("all actions (or: high kick, archery…)")
@@ -2271,7 +2334,8 @@ class SignalTimelineWindow(QMainWindow):
 
     def _start_analysis(self, kind):
         import threading
-        from modules.analysis_ondemand import run_actions, run_objects, run_transcript
+        from modules.analysis_ondemand import (
+            run_actions, run_objects, run_transcript, run_motion, run_audio)
 
         cancel = threading.Event()
         self._analysis_cancel = cancel
@@ -2290,7 +2354,11 @@ class SignalTimelineWindow(QMainWindow):
 
         def work():
             try:
-                if kind == "actions":
+                if kind == "motion":
+                    result = run_motion(self.video_path, progress=progress, cancel=cancel)
+                elif kind == "audio":
+                    result = run_audio(self.video_path, progress=progress, cancel=cancel)
+                elif kind == "actions":
                     acts = [s.strip() for s in self.analyze_actions_field.text().split(",") if s.strip()]
                     result = run_actions(self.video_path, interesting_actions=acts,
                                          progress=progress, cancel=cancel)
@@ -2346,7 +2414,30 @@ class SignalTimelineWindow(QMainWindow):
                 print(f"❌ {kind} analysis failed: {result}")
             return
 
-        if kind == "actions":
+        if kind == "motion":
+            # One pass yields three signals; fold and enable all three layers.
+            self.cache_data["scenes"] = result.get("scenes", [])
+            self.cache_data["motion_events"] = result.get("motion_events", [])
+            self.cache_data["motion_peaks"] = result.get("motion_peaks", [])
+            self._merge_into_cache_file(result)
+            for layer in ("scenes", "motion_events", "motion_peaks"):
+                self._enable_layer_and_reload(layer)
+            if row:
+                row["status"].setText(
+                    f"✓ {len(result.get('scenes', []))} scenes, "
+                    f"{len(result.get('motion_peaks', []))} peaks")
+        elif kind == "audio":
+            self.cache_data["audio_peaks"] = result.get("audio_peaks", [])
+            self.cache_data["audio"] = result.get("audio", {})
+            self._merge_into_cache_file(result)
+            wf = (result.get("audio") or {}).get("waveform")
+            if wf:
+                self.waveform = wf
+                self.signal_scene.set_waveform_data(wf)
+            self._enable_layer_and_reload("audio_peaks")
+            if row:
+                row["status"].setText(f"✓ {len(result.get('audio_peaks', []))} peaks")
+        elif kind == "actions":
             self.cache_data["actions"] = result
             self.cache_data["actions_all"] = result
             self._merge_into_cache_file({"actions": result, "actions_all": result})
@@ -2426,36 +2517,14 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ Could not refresh transcript panel: {e}")
 
     def _merge_into_cache_file(self, patch: dict):
-        """Merge `patch` into the on-disk cache file for this video (mirrors
-        save_waveform_to_cache). Seeds a legacy <hash>.cache.json if none yet."""
-        try:
-            from pathlib import Path
-            import json
-            cache_dir = Path("./cache")
-            if not cache_dir.exists():
-                print("⚠️ Cache dir missing; analysis not persisted")
-                return
-            video_hash = self._resolve_video_hash()
-            if not video_hash:
-                print("⚠️ No video_hash; analysis not persisted")
-                return
-            matching = list(cache_dir.glob(f"{video_hash}*.cache.json"))
-            if matching:
-                cache_file = matching[0]
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    disk = json.load(f)
-            else:
-                cache_file = cache_dir / f"{video_hash}.cache.json"
-                disk = dict(self.cache_data)
-                disk.setdefault("video_path", str(self.video_path))
-                disk["video_hash"] = video_hash
-                disk["cache_complete"] = True
-            disk.update(patch)
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(disk, f)
-            print(f"💾 Analysis merged → {cache_file.name}")
-        except Exception as e:
-            print(f"⚠️ Could not persist analysis: {e}")
+        """Fold `patch` into this video's on-disk cache via the shared per-signal
+        fold (`analysis_ondemand.merge_into_cache`) — the one path both surfaces
+        use. It updates every matching cache file (not just the first, which
+        could be one the viewer never reads on reopen) and seeds a fresh
+        `<hash>.cache.json` from the current in-memory cache_data when there's
+        none yet."""
+        from modules.analysis_ondemand import merge_into_cache
+        merge_into_cache(self.video_path, patch, seed=self.cache_data, log=print)
 
     @staticmethod
     def _toolbar_separator():
