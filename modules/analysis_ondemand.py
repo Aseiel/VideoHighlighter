@@ -69,6 +69,7 @@ def analysis_defaults() -> dict:
         "transcript_enabled": bool(transcript_cfg.get("enabled", False)),
         "search_keywords": list(transcript_cfg.get("search_keywords", []) or []),
         "sample_rate": int(advanced_cfg.get("sample_rate", 5) or 5),
+        "frame_skip": int(advanced_cfg.get("frame_skip", 5) or 5),
     }
 
 
@@ -110,6 +111,42 @@ def run_transcript(video_path: str, *, model: Optional[str] = None,
         "cached_full_transcript": True,
         "keyword_filtered": False,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Subtitles
+# --------------------------------------------------------------------------- #
+def run_subtitles(video_path: str, *, model: Optional[str] = None,
+                  language: Optional[str] = None, source_lang: Optional[str] = None,
+                  target_lang: Optional[str] = None, progress: ProgressFn = None,
+                  cancel=None, log=print) -> dict:
+    """Transcribe and write a full-video `.srt` next to the video, then return
+    the same cache-shaped `transcript` dict `run_transcript` returns.
+
+    Thin wrapper over `run_transcript` (so it also writes the `_transcript.txt`
+    sidecar and folds identically into the cache) plus `create_srt_file`. When
+    `target_lang` differs from the spoken language the subtitles are translated;
+    the file is named `<video>_<lang>.srt` with the language actually written.
+    """
+    tr = run_transcript(video_path, model=model, language=language,
+                        progress=progress, cancel=cancel, log=log)
+    segments = tr.get("segments", []) or []
+
+    from modules.transcript_srt import create_srt_file
+    base = os.path.splitext(video_path)[0]
+    src = source_lang or language or tr.get("language") or "en"
+    translating = bool(target_lang and target_lang != src)
+    out_lang = target_lang if translating else src
+    srt_path = f"{base}_{out_lang}.srt"
+
+    if cancel is not None and cancel.is_set():
+        raise _Cancelled()
+
+    # create_srt_file translates internally when target_lang != source_lang.
+    create_srt_file(segments, srt_path, source_lang=src,
+                    target_lang=target_lang if translating else None)
+    log(f"✅ Subtitles saved: {srt_path}")
+    return tr
 
 
 # --------------------------------------------------------------------------- #
@@ -219,6 +256,129 @@ def run_objects(video_path: str, objects: list, *, progress: ProgressFn = None,
         {"timestamp": int(sec), "objects": [str(o) for o in objs], "count": len(objs)}
         for sec, objs in sorted(det_by_sec.items())
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Motion & scenes
+# --------------------------------------------------------------------------- #
+def run_motion(video_path: str, *, frame_skip: Optional[int] = None,
+               progress: ProgressFn = None, cancel=None, log=print) -> dict:
+    """Run scene-cut + motion detection and return a cache-shaped patch with
+    `scenes`, `motion_events` and `motion_peaks`.
+
+    One detector pass produces all three signals — which is why the three
+    scoring rows share a single button. Runs on CPU (the universally-available
+    device; the offline pipeline falls back to it too when there's no CUDA).
+    """
+    from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
+    d = analysis_defaults()
+    fs = frame_skip if frame_skip is not None else d["frame_skip"]
+
+    result = detect_scenes_motion_optimized(
+        video_path, frame_skip=int(fs), device="cpu",
+        cancel_flag=cancel, progress_callback=progress,
+    )
+    if cancel is not None and cancel.is_set():
+        raise _Cancelled()
+    scenes, motion_events, motion_peaks = result if (result and len(result) == 3) else ([], [], [])
+    return {
+        "scenes": [{"start": float(s), "end": float(e)} for s, e in scenes],
+        "motion_events": [float(t) for t in motion_events],
+        "motion_peaks": [float(t) for t in motion_peaks],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Audio peaks
+# --------------------------------------------------------------------------- #
+def run_audio(video_path: str, *, progress: ProgressFn = None,
+              cancel=None, log=print) -> dict:
+    """Run audio-peak detection (plus the waveform the timeline viewer draws)
+    and return a cache-shaped patch under both the modern `audio` block and the
+    legacy `audio_peaks` key."""
+    from modules.audio_peaks import extract_audio_peaks, extract_waveform_data
+    if progress:
+        progress(0, 1, "Audio", "Detecting audio peaks…")
+    peaks = [float(t) for t in (extract_audio_peaks(video_path, cancel_flag=cancel) or [])]
+    if cancel is not None and cancel.is_set():
+        raise _Cancelled()
+    try:
+        waveform = extract_waveform_data(video_path)
+    except Exception as e:
+        log(f"⚠️ Waveform extraction failed: {e}")
+        waveform = None
+    if progress:
+        progress(1, 1, "Audio", f"{len(peaks)} peaks")
+    return {
+        "audio_peaks": peaks,
+        "audio": {"peaks": peaks, "waveform": waveform},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Cache fold
+# --------------------------------------------------------------------------- #
+def merge_into_cache(video_path: str, patch: dict, *, seed: dict = None,
+                     log=print) -> bool:
+    """Fold one signal's result into a video's on-disk cache, leaving the other
+    signals intact.
+
+    The single fold path for every on-demand run, from either surface (the main
+    window's per-signal buttons and the timeline viewer's Analyze panel): a
+    per-signal run must *merge*, never overwrite the whole entry (the full
+    pipeline writes every signal at once, so driving a single-signal run through
+    it would clobber the rest).
+
+    When the video has no cache yet, seeds a legacy `<hash>.cache.json`. Pass
+    `seed` (e.g. the caller's in-memory cache_data) to carry any already-known
+    signals into that fresh file rather than starting from just this patch.
+    Best-effort.
+    """
+    try:
+        import json
+        from pathlib import Path
+        from modules.video_cache import VideoAnalysisCache
+
+        cache_dir = Path("./cache")
+        cache_dir.mkdir(exist_ok=True)
+        video_hash = VideoAnalysisCache()._get_video_hash(video_path)
+        if not video_hash:
+            log("⚠️ No video_hash; analysis not persisted")
+            return False
+
+        matching = list(cache_dir.glob(f"{video_hash}*.cache.json"))
+        if matching:
+            # Fold into EVERY matching cache file, not just the first: the
+            # timeline viewer picks its file signature-first (then newest), which
+            # isn't necessarily glob order, so updating only one can leave the
+            # signal in a file the viewer never reads.
+            wrote = 0
+            for cache_file in matching:
+                try:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        disk = json.load(f)
+                except Exception:
+                    continue
+                disk.update(patch)
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(disk, f)
+                wrote += 1
+            log(f"💾 Analysis merged → {wrote} cache file(s)")
+            return wrote > 0
+        else:
+            cache_file = cache_dir / f"{video_hash}.cache.json"
+            disk = dict(seed) if seed else {}
+            disk.setdefault("video_path", str(video_path))
+            disk["video_hash"] = video_hash
+            disk["cache_complete"] = True
+            disk.update(patch)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(disk, f)
+            log(f"💾 Analysis merged → {cache_file.name}")
+            return True
+    except Exception as e:
+        log(f"⚠️ Could not persist analysis: {e}")
+        return False
 
 
 class _Cancelled(Exception):
