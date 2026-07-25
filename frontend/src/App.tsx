@@ -27,13 +27,14 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Toaster } from "@/components/ui/sonner"
 import { toast } from "sonner"
 import { useTheme } from "@/lib/theme"
-import { pickVideos, basename } from "@/lib/files"
+import { pickVideos, pickDirectory, pickAudioFile, basename } from "@/lib/files"
 import {
   DEFAULT_CONFIG,
   toGuiConfig,
   totalPoints,
   fromConfigFile,
   toConfigFile,
+  MUSIC_MODES,
 } from "@/lib/config"
 import type { HighlighterConfig } from "@/lib/config"
 import {
@@ -54,9 +55,13 @@ import {
   openEditor,
   revealLog,
   revealOutput,
+  scanFolder,
+  combineVideos,
   type RunEvent,
 } from "@/lib/api"
 import { VideoCard } from "@/components/VideoCard"
+import { SelectField } from "@/components/SelectField"
+import { Slider } from "@/components/ui/slider"
 import { TimeRange, DEFAULT_TIME_RANGE, type TimeRangeState } from "@/components/TimeRange"
 import {
   DetectionPreview,
@@ -122,6 +127,15 @@ export default function App() {
   // Read inside WS callbacks, which close over the mount-time value otherwise.
   const dlRef = useRef(dl)
   dlRef.current = dl
+  // Reel chaining: when a multi-video run finishes, its outputs are stashed here
+  // and the `done` handler kicks off a /combine. Cleared before that POST so a
+  // combine run can never re-trigger itself. Read cfg/output through refs so the
+  // WS callback (closed over mount-time values) sees the current settings.
+  const pendingReelRef = useRef<string[] | null>(null)
+  const cfgRef = useRef(cfg)
+  cfgRef.current = cfg
+  const outputRef = useRef(output)
+  outputRef.current = output
 
   const set = <K extends keyof HighlighterConfig>(k: K, v: HighlighterConfig[K]) =>
     setCfg((c) => ({ ...c, [k]: v }))
@@ -303,6 +317,8 @@ export default function App() {
         // Downloads and face scans reuse this event for a summary ("3 file(s)"),
         // so only keep an output that's actually a file we can reveal.
         if (/\.[a-z0-9]{2,4}$/i.test(e.output)) setLastOutput(e.output)
+        // Stash produced highlights so `done` can combine them into a reel.
+        if (e.outputs && e.outputs.length > 1) pendingReelRef.current = e.outputs
         toast.success("Done")
         break
       case "cancelled":
@@ -313,12 +329,61 @@ export default function App() {
         appendLog(`✖ ${e.message}`, "err")
         toast.error("Error — see log")
         break
-      case "done":
-        setRunning(false)
-        setTask("")
+      case "done": {
         wsRef.current?.close()
         wsRef.current = null
+        // A finished multi-video run with the reel toggle on: combine its outputs
+        // into one video. Firing from `done` (not `finished`) means the run's
+        // child process has already exited, so /combine won't hit "a run is
+        // already in progress". Clear the stash first — the combine run emits its
+        // own `done`, and a null stash there stops it re-combining itself.
+        const reel = pendingReelRef.current
+        pendingReelRef.current = null
+        if (reel && cfgRef.current.combine_reel) {
+          void startReelCombine(reel)
+        } else {
+          setRunning(false)
+          setTask("")
+        }
         break
+      }
+    }
+  }
+
+  /** Directory of a path, honoring whichever separator it uses. */
+  const pathDir = (p: string) => {
+    const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"))
+    return i === -1 ? "" : p.slice(0, i + 1) // keep the trailing separator
+  }
+
+  /** Combine finished highlights into one reel, reusing the event socket. */
+  const startReelCombine = async (files: string[]) => {
+    const c = cfgRef.current
+    const dir = pathDir(files[0])
+    const stem = (outputRef.current || "highlight.mp4").replace(/\.[^.]+$/, "")
+    const out = `${dir}${stem}_reel.mp4`
+    appendLog(`🎬 Combining ${files.length} highlights into a reel…`, "ok")
+    setTask("Combining reel")
+    wsRef.current = openEventSocket(handleEvent)
+    await new Promise((r) => setTimeout(r, 150))
+    const res = await combineVideos({
+      files,
+      output: out,
+      ...(c.music_path
+        ? {
+            music_path: c.music_path,
+            music_mode: c.music_mode,
+            music_volume: c.music_volume / 100,
+          }
+        : {}),
+    })
+    if (!res.ok) {
+      appendLog(`✖ Reel combine failed: ${res.error ?? "unknown"}`, "err")
+      toast.error(res.error ?? "Reel combine failed")
+      setRunning(false)
+      setTask("")
+      wsRef.current?.close()
+      wsRef.current = null
     }
   }
 
@@ -327,6 +392,8 @@ export default function App() {
     setLog([])
     setFrames([])
     setUsedCache(false)
+    // Only a highlight run arms the reel; clear it so a download/scan can't chain.
+    pendingReelRef.current = null
     setProgress(0)
     setRunning(true)
     // Starting a run is exactly when the output matters.
@@ -347,6 +414,8 @@ export default function App() {
     if (totalPoints(cfg) === 0 && !cfg.skip_highlights)
       return toast.error("Set at least one scoring point")
 
+    // When combining, the reel gets the music once; don't bake it per-clip.
+    const willCombine = cfg.combine_reel && videos.length > 1
     await beginRun()
     const res = await startRun(
       videos,
@@ -355,6 +424,7 @@ export default function App() {
         avoidRanges,
         timeRange,
         duration,
+        willCombine,
       }),
     )
     if (!res.ok) failRun(res.error ?? "Failed to start")
@@ -397,6 +467,26 @@ export default function App() {
   const addVideos = async () => {
     const picked = await pickVideos()
     if (picked.length) setVideos((v) => [...new Set([...v, ...picked])])
+  }
+
+  const addFolder = async () => {
+    const dir = await pickDirectory()
+    if (!dir) return
+    const res = await scanFolder(dir, true)
+    if (!res.ok) return toast.error(res.error ?? "Could not scan folder")
+    if (!res.files.length) return toast("No videos found in that folder")
+    let added = 0
+    setVideos((v) => {
+      const merged = [...new Set([...v, ...res.files])]
+      added = merged.length - v.length
+      return merged
+    })
+    toast.success(`+${added} video${added === 1 ? "" : "s"}`)
+  }
+
+  const pickMusic = async () => {
+    const path = await pickAudioFile()
+    if (path) set("music_path", path)
   }
 
   const launchEditor = async () => {
@@ -460,6 +550,9 @@ export default function App() {
             <Button size="sm" variant="secondary" onClick={addVideos} disabled={running}>
               <Plus className="size-4" /> Add
             </Button>
+            <Button size="sm" variant="secondary" onClick={addFolder} disabled={running}>
+              <FolderOpen className="size-4" /> Add Folder
+            </Button>
             <Button
               size="sm"
               variant="ghost"
@@ -496,6 +589,74 @@ export default function App() {
               disabled={running}
               className="h-8 w-full"
             />
+          </div>
+
+          <Separator className="my-4" />
+
+          {/* Reel + music: turn many highlights into one soundtracked video. */}
+          <div className="space-y-3">
+            {videos.length > 1 && (
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={cfg.combine_reel}
+                  disabled={running}
+                  onCheckedChange={(v) => set("combine_reel", Boolean(v))}
+                />
+                Combine into one reel
+              </label>
+            )}
+            <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3">
+              <Label className="text-sm text-muted-foreground">Music</Label>
+              <span
+                className="min-w-0 truncate text-sm"
+                title={cfg.music_path || undefined}
+              >
+                {cfg.music_path ? basename(cfg.music_path) : (
+                  <span className="text-muted-foreground">No music</span>
+                )}
+              </span>
+              <div className="flex gap-1">
+                <Button size="sm" variant="secondary" onClick={pickMusic} disabled={running}>
+                  Pick
+                </Button>
+                {cfg.music_path && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => set("music_path", "")}
+                    disabled={running}
+                  >
+                    Clear
+                  </Button>
+                )}
+              </div>
+            </div>
+            {cfg.music_path && (
+              <div className="space-y-3">
+                <SelectField
+                  label="Mix"
+                  value={cfg.music_mode}
+                  onChange={(v) => set("music_mode", v)}
+                  options={MUSIC_MODES}
+                  disabled={running}
+                />
+                <div className="flex min-w-0 items-center gap-3">
+                  <Label className="text-sm font-normal text-muted-foreground">Volume</Label>
+                  <Slider
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={[cfg.music_volume]}
+                    onValueChange={([v]) => set("music_volume", v)}
+                    disabled={running}
+                    className="flex-1"
+                  />
+                  <span className="w-10 text-right text-sm tabular-nums text-muted-foreground">
+                    {cfg.music_volume}%
+                  </span>
+                </div>
+              </div>
+            )}
           </div>
         </CardContent>
       </Card>

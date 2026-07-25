@@ -53,6 +53,14 @@ export interface HighlighterConfig {
   // Avoid
   avoid_enabled: boolean
   avoid_method: string
+  // Quality gate
+  quality_gate: boolean
+  quality_threshold: number
+  // Reel + music (music_volume is the UI 0-100 scale; divided by 100 for the engine)
+  music_path: string
+  music_mode: string
+  music_volume: number
+  combine_reel: boolean
 }
 
 export const DEFAULT_CONFIG: HighlighterConfig = {
@@ -98,7 +106,19 @@ export const DEFAULT_CONFIG: HighlighterConfig = {
   draw_action_labels: false,
   avoid_enabled: false,
   avoid_method: "skip",
+  quality_gate: false,
+  quality_threshold: 60,
+  music_path: "",
+  music_mode: "replace",
+  music_volume: 80,
+  combine_reel: true,
 }
+
+export const MUSIC_MODES = [
+  { value: "replace", label: "Replace clip audio" },
+  { value: "mix", label: "Mix under clip audio" },
+  { value: "duck", label: "Duck under clip audio" },
+]
 
 // Option lists mirror the Qt combo boxes.
 export const WHISPER_MODELS = ["tiny", "base", "small", "medium", "large"]
@@ -174,6 +194,9 @@ export interface RunExtras {
   /** Percent range + the first video's duration; applied only when both exist. */
   timeRange?: { enabled: boolean; startPct: number; endPct: number }
   duration?: number
+  /** True when this run will be followed by a /combine step. Music is then
+   *  applied once to the reel, not baked into every clip, so it's withheld here. */
+  willCombine?: boolean
 }
 
 /** Convert the form model into the exact dict pipeline.run_highlighter expects. */
@@ -239,6 +262,17 @@ export function toGuiConfig(
     avoid_manual_ranges: extras.avoidRanges ?? [],
     face_db_path: "./cache/face_db.json",
     force_reprocess: c.force_reprocess,
+    // Quality gate always travels to the pipeline (off by default costs nothing).
+    quality_gate: c.quality_gate,
+    quality_threshold: c.quality_threshold,
+  }
+
+  // Music: when a combine step follows, the reel gets the music once (via
+  // /combine), so don't also bake it into every individual clip. Empty path = off.
+  if (!extras.willCombine && c.music_path) {
+    cfg.music_path = c.music_path
+    cfg.music_mode = c.music_mode
+    cfg.music_volume = c.music_volume / 100
   }
 
   // Time range needs a known duration to convert percentages to seconds — the
@@ -333,6 +367,12 @@ export function fromConfigFile(
     draw_object_boxes: pick(vis.draw_object_boxes, false),
     draw_action_labels: pick(vis.draw_action_labels, false),
     avoid_enabled: pick(av.face_recognition_enabled, false),
+    quality_gate: pick((raw.quality ?? {}).gate, DEFAULT_CONFIG.quality_gate),
+    quality_threshold: pick((raw.quality ?? {}).threshold, DEFAULT_CONFIG.quality_threshold),
+    music_path: pick((raw.music ?? {}).path, DEFAULT_CONFIG.music_path),
+    music_mode: pick((raw.music ?? {}).mode, DEFAULT_CONFIG.music_mode),
+    music_volume: pick((raw.music ?? {}).volume, DEFAULT_CONFIG.music_volume),
+    combine_reel: pick((raw.download ?? {}).auto_combine, DEFAULT_CONFIG.combine_reel),
   }
 }
 
@@ -348,7 +388,9 @@ export function toConfigFile(
 ): Record<string, unknown> {
   return {
     video: { paths: opts.videoPaths },
-    download: opts.download,
+    // auto_combine lives in the download section for Qt parity (its "combine all
+    // highlights" checkbox); the web reel toggle reuses the same key.
+    download: { ...opts.download, auto_combine: c.combine_reel },
     highlights: {
       clip_time: c.clip_time,
       output: opts.output,
@@ -415,6 +457,9 @@ export function toConfigFile(
       draw_action_labels: c.draw_action_labels,
     },
     avoid: { face_recognition_enabled: c.avoid_enabled },
+    quality: { gate: c.quality_gate, threshold: c.quality_threshold },
+    // volume persisted on the UI 0-100 scale; divided by 100 only when sent to the engine.
+    music: { path: c.music_path, mode: c.music_mode, volume: c.music_volume },
   }
 }
 

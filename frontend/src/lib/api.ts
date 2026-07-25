@@ -12,7 +12,7 @@ export type RunEvent =
   | { type: "started"; run_id: string }
   | { type: "log"; message: string }
   | { type: "progress"; current: number; total: number; task: string; detail: string }
-  | { type: "finished"; output: string }
+  | { type: "finished"; output: string; outputs?: string[] }
   | { type: "downloaded"; paths: string[] }
   | { type: "faces_scanned"; count: number }
   /** Detection was skipped because cached results were reused, so no preview
@@ -83,13 +83,53 @@ export async function saveConfigFile(
   return res.json()
 }
 
-/** Duration in seconds via the pipeline's ffprobe helper. */
+/** Duration + dimensions/rotation via the engine's ffprobe helper. */
 export async function getVideoInfo(
   path: string,
-): Promise<{ ok: boolean; duration: number }> {
+): Promise<{
+  ok: boolean
+  duration: number
+  width?: number
+  height?: number
+  fps?: number
+  rotation?: number
+}> {
   const res = await fetch(
     `${SIDECAR_BASE}/video-info?path=${encodeURIComponent(path)}`,
   )
+  return res.json()
+}
+
+/** List video files in a folder (folder-at-once input). */
+export async function scanFolder(
+  path: string,
+  recursive = true,
+): Promise<{ ok: boolean; files: string[]; count: number; error?: string }> {
+  const res = await fetch(
+    `${SIDECAR_BASE}/scan-folder?path=${encodeURIComponent(path)}&recursive=${
+      recursive ? 1 : 0
+    }`,
+  )
+  return res.json()
+}
+
+export interface CombineRequest {
+  files: string[]
+  output: string
+  music_path?: string
+  music_mode?: string
+  music_volume?: number
+}
+
+/** Assemble finished highlights into one reel. Emits events on /ws. */
+export async function combineVideos(
+  req: CombineRequest,
+): Promise<{ ok: boolean; run_id?: string; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/combine`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  })
   return res.json()
 }
 

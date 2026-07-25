@@ -51,6 +51,20 @@ export async function pickModelFile(): Promise<string | null> {
   return Array.isArray(selected) ? (selected[0] ?? null) : selected
 }
 
+/** Pick a music track for the reel. Returns null if cancelled. */
+export async function pickAudioFile(): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt("Paste the path to an audio file:") || null
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "Audio", extensions: ["mp3", "wav", "m4a", "flac", "ogg", "aac"] }],
+  })
+  if (!selected) return null
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected
+}
+
 export function basename(p: string): string {
   return p.split(/[\\/]/).pop() ?? p
 }

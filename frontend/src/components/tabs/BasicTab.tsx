@@ -119,7 +119,27 @@ export function BasicTab({ cfg, set, objectLabels, actionLabels }: Props) {
               />
               Skip highlights
             </label>
+            <label
+              className="flex items-center gap-2 text-sm"
+              title="Scores clips by variance-of-Laplacian sharpness; blurry ones are penalized so they lose to sharp clips of equal interest."
+            >
+              <Checkbox
+                checked={cfg.quality_gate}
+                onCheckedChange={(v) => set("quality_gate", Boolean(v))}
+              />
+              Penalize blurry clips
+            </label>
           </div>
+          {cfg.quality_gate && (
+            <div className="max-w-xs pt-1">
+              <NumberField
+                label="Sharpness threshold"
+                hint="(lower = stricter)"
+                value={cfg.quality_threshold}
+                onChange={(v) => set("quality_threshold", v)}
+              />
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>
