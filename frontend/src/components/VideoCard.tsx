@@ -7,6 +7,7 @@
 import { useEffect, useRef, useState } from "react"
 import { Trash2, Film } from "lucide-react"
 import { basename, fileSrc } from "@/lib/files"
+import { acquireDecodeSlot } from "@/lib/decodeGate"
 
 /** Seconds into the clip to grab the poster from. */
 const POSTER_AT = 1
@@ -39,6 +40,11 @@ export function VideoCard({
   const [poster, setPoster] = useState<string | null>(null)
   const [duration, setDuration] = useState(0)
   const [failed, setFailed] = useState(false)
+  // The decoder only mounts once a slot is granted; see decodeGate. Without the
+  // gate, a folder of 150+ clips mounts 150 <video> decoders at once and takes
+  // WebView2 down with it.
+  const [decoding, setDecoding] = useState(false)
+  const releaseRef = useRef<(() => void) | null>(null)
 
   const src = fileSrc(path)
 
@@ -47,7 +53,35 @@ export function VideoCard({
     setPoster(null)
     setDuration(0)
     setFailed(!src)
+    setDecoding(false)
   }, [src])
+
+  // Queue for a decode slot; mount the <video> only when one is granted. Release
+  // it on unmount so a card scrolled/removed before it finishes doesn't wedge
+  // the queue.
+  useEffect(() => {
+    if (!src) return
+    let cancelled = false
+    void acquireDecodeSlot().then((release) => {
+      if (cancelled) {
+        release()
+        return
+      }
+      releaseRef.current = release
+      setDecoding(true)
+    })
+    return () => {
+      cancelled = true
+      releaseRef.current?.()
+      releaseRef.current = null
+    }
+  }, [src])
+
+  /** Free the decode slot once this card's poster is settled (done or failed). */
+  const releaseSlot = () => {
+    releaseRef.current?.()
+    releaseRef.current = null
+  }
 
   function handleLoadedMetadata() {
     const el = videoRef.current
@@ -75,6 +109,9 @@ export function VideoCard({
       // why: a silent fallback here is indistinguishable from a decode failure.
       console.warn(`poster capture failed for ${path}:`, err)
       setFailed(true)
+    } finally {
+      // Poster captured (or threw) — hand the decoder slot to the next card.
+      releaseSlot()
     }
   }
 
@@ -104,9 +141,10 @@ export function VideoCard({
         {basename(path)}
       </p>
 
-      {/* Hidden decoder that produces the poster + duration. Unmounts once the
-          poster is captured so we don't hold a decoder open per card. */}
-      {src && !failed && !poster && (
+      {/* Hidden decoder that produces the poster + duration. Mounts only once a
+          decode slot is granted (decodeGate) and unmounts once the poster is
+          captured, so we never hold more than a few decoders open at a time. */}
+      {src && decoding && !failed && !poster && (
         <video
           ref={videoRef}
           src={src}
@@ -120,7 +158,10 @@ export function VideoCard({
           className="hidden"
           onLoadedMetadata={handleLoadedMetadata}
           onSeeked={handleSeeked}
-          onError={() => setFailed(true)}
+          onError={() => {
+            setFailed(true)
+            releaseSlot()
+          }}
         />
       )}
     </div>
