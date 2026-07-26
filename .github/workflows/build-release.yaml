@@ -86,6 +86,56 @@ jobs:
           name: windows-build
           path: "VideoHighlighter-Windows-${{ github.event.inputs.release_version }}.7z*"
 
+  # The web UI: a Tauri shell around the React frontend, with the Python engine
+  # bundled as a PyInstaller sidecar. Independent of the Qt build above — both
+  # ship from the same engine source.
+  build-web-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
+      - name: Install Python dependencies
+        run: |
+          pip install numpy==2.2.6 mkl mkl-include
+          pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install openvino==2026.2.1
+          pip install -r requirements.txt
+          pip install -r sidecar/requirements.txt
+          pip install pyinstaller
+      - name: Pre-convert CLIP to OpenVINO IR
+        run: python -m tools.export_clip_ov
+      - name: Build the sidecar
+        run: >
+          pyinstaller packaging/vh-sidecar.spec --noconfirm
+          --distpath dist-sidecar --workpath build-sidecar
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: frontend
+      - name: Build the app
+        run: pnpm tauri build
+        working-directory: frontend
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-windows-build
+          path: |
+            frontend/src-tauri/target/release/bundle/nsis/*.exe
+            frontend/src-tauri/target/release/bundle/msi/*.msi
+
   build-mac:
     runs-on: macos-latest
     steps:

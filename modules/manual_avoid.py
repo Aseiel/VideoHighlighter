@@ -189,3 +189,77 @@ def combine(auto_ranges: Iterable[Range],
     """
     return merge_overlapping(list(auto_ranges) + list(manual_ranges),
                              gap_tolerance=gap_tolerance)
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+# Ranges marked in the timeline viewer used to live only in that window's
+# in-memory scene: main.py read them back by reaching into the live widget
+# (_get_manual_avoid_ranges). That only works because the viewer runs in the
+# same process. Any other consumer — the web UI's sidecar, a second session,
+# or the same session after the viewer is closed — had no way to see them.
+#
+# Storing them on disk, keyed by video path, makes the ranges the source of
+# truth rather than a widget's private state. The in-process reader still wins
+# when the live window is open, so the Qt behaviour is unchanged.
+
+_STORE_FILENAME = "manual_avoid.json"
+
+
+def store_path() -> str:
+    """Location of the shared ranges file (next to the other user data)."""
+    import os
+
+    from modules.app_paths import user_data_dir
+
+    return os.path.join(user_data_dir(), "cache", _STORE_FILENAME)
+
+
+def _load_store() -> dict:
+    import json
+    import os
+
+    path = store_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        # A corrupt store must never block a run; treat it as empty.
+        return {}
+
+
+def load_ranges(video_path: str) -> List[Range]:
+    """Manual avoid ranges saved for ``video_path`` (empty when none)."""
+    raw = _load_store().get(str(video_path)) or []
+    try:
+        return merge_overlapping(parse_ranges(raw))
+    except ValueError:
+        return []
+
+
+def save_ranges(video_path: str, ranges: Iterable[Range]) -> str:
+    """Persist ``ranges`` for ``video_path``. Returns the store path.
+
+    Saving an empty list removes the entry rather than storing [], keeping the
+    file free of dead keys as users clear ranges.
+    """
+    import json
+    import os
+
+    store = _load_store()
+    clean = merge_overlapping(parse_ranges(list(ranges)))
+    key = str(video_path)
+    if clean:
+        store[key] = [[float(a), float(b)] for a, b in clean]
+    else:
+        store.pop(key, None)
+
+    path = store_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(store, fh, indent=2)
+    return path

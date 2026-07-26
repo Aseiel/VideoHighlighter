@@ -14,8 +14,18 @@ Detects:
 
 Generates transcript subtitles via OpenAI Whisper.
 Cuts and merges top scoring segments into a highlight video.
+Combines many clips into a single reel, with an optional music bed
+(replace / mix / duck) and correct handling of rotated (phone / GoPro) footage.
+Optionally penalizes blurry clips so sharp moments win.
 Fully configurable: frame skip, highlight duration, keywords.
-Optional GUI for easy interaction.
+
+Two front ends over one engine:
+- **Qt desktop GUI** (`main.py`) — the original, with the full Timeline Viewer.
+- **Web app** (`frontend/` + `sidecar/`) — a Tauri v2 shell around a React UI,
+  with the Python engine running behind it as a FastAPI sidecar. Adds
+  folder-at-once input, the reel + music controls, and the blur gate. See
+  [`frontend/README.md`](frontend/README.md). It still launches the Qt window
+  for the Timeline Viewer.
 
 
 ## Preview
