@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QComboBox, QTabWidget, QListWidget, QSplitter,
     QDialog, QDialogButtonBox, QAbstractItemView,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
-    QGridLayout, QSlider,
+    QGridLayout, QSlider, QSizePolicy,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
@@ -890,11 +890,11 @@ class VideoHighlighterGUI(QWidget):
         self.config_data = self.load_config()
 
         layout = QVBoxLayout()
-        # Breathing room — the window read cramped with Qt's default tight
-        # margins. Generous outer margin + row spacing is the single biggest
-        # lever on how modern it feels.
-        layout.setContentsMargins(20, 16, 20, 12)
-        layout.setSpacing(14)
+        # A little breathing room, but tight enough that the ~8 stacked sections
+        # don't add up to a screenful of gaps (that empty space pushed the tabs
+        # and Run row down). Trimmed from the original 20/16/14.
+        layout.setContentsMargins(16, 8, 16, 8)
+        layout.setSpacing(6)
 
         # Store video duration
         self.current_video_duration = 0
@@ -902,8 +902,8 @@ class VideoHighlighterGUI(QWidget):
         # --- File picker ---
         file_group = QGroupBox("Input Videos")
         file_layout = QVBoxLayout()
-        file_layout.setContentsMargins(14, 12, 14, 12)
-        file_layout.setSpacing(10)
+        file_layout.setContentsMargins(12, 6, 12, 6)
+        file_layout.setSpacing(6)
 
         # Buttons row
         btn_layout = QHBoxLayout()
@@ -921,9 +921,10 @@ class VideoHighlighterGUI(QWidget):
 
         file_layout.addLayout(btn_layout)
 
-        # File list
+        # File list — compact; it scrolls when there are more files. The tall
+        # white box was the biggest chunk of empty space up top.
         self.file_list = QListWidget()
-        self.file_list.setMaximumHeight(120)
+        self.file_list.setMaximumHeight(46)
         file_layout.addWidget(self.file_list)
 
         saved_paths = self.config_data.get("video", {}).get("paths", [])
@@ -933,6 +934,10 @@ class VideoHighlighterGUI(QWidget):
                     self.file_list.addItem(path)
         
         file_group.setLayout(file_layout)
+        # Vertical Maximum: the group takes only its natural height and never gets
+        # stretched by slack. Without this, extra window height inflated this box
+        # into a tall mostly-empty white panel up top.
+        file_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         layout.addWidget(file_group)
 
         # --- Output filename ---
@@ -955,10 +960,19 @@ class VideoHighlighterGUI(QWidget):
         self.use_time_range_chk.toggled.connect(self.on_time_range_toggle)
         time_range_layout.addWidget(self.use_time_range_chk)
 
+        # Everything below the checkbox lives in a body that is only shown while
+        # "Process only specific time range" is ticked. Off (the default), this
+        # whole group collapses to one line — the slider, %-labels, selection
+        # text and preset buttons no longer take a chunk of the window.
+        self.time_range_body = QWidget()
+        time_range_body_layout = QVBoxLayout(self.time_range_body)
+        time_range_body_layout.setContentsMargins(0, 0, 0, 0)
+        time_range_body_layout.setSpacing(4)
+
         # Video duration label
         self.video_duration_label = QLabel("Set time range in percentages (0-100%) - loads actual times when video is selected")
         self.video_duration_label.setStyleSheet("color: #666; font-style: italic;")
-        time_range_layout.addWidget(self.video_duration_label)
+        time_range_body_layout.addWidget(self.video_duration_label)
 
         # Range slider container
         slider_container = QWidget()
@@ -994,12 +1008,12 @@ class VideoHighlighterGUI(QWidget):
         slider_layout.addLayout(labels_row)
 
         slider_container.setLayout(slider_layout)
-        time_range_layout.addWidget(slider_container)
+        time_range_body_layout.addWidget(slider_container)
 
         # Selection info
         self.selection_info_label = QLabel("Selection: Full video")
         self.selection_info_label.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 10pt;")
-        time_range_layout.addWidget(self.selection_info_label)
+        time_range_body_layout.addWidget(self.selection_info_label)
 
         # Quick presets
         presets_layout = QHBoxLayout()
@@ -1025,9 +1039,14 @@ class VideoHighlighterGUI(QWidget):
         presets_layout.addWidget(self.middle_btn)
         presets_layout.addWidget(self.full_video_btn)
         presets_layout.addStretch()
-        time_range_layout.addLayout(presets_layout)
+        time_range_body_layout.addLayout(presets_layout)
+
+        time_range_layout.addWidget(self.time_range_body)
+        # Collapsed unless the box is already ticked from saved config.
+        self.time_range_body.setVisible(self.use_time_range_chk.isChecked())
 
         time_range_group.setLayout(time_range_layout)
+        time_range_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         layout.addWidget(time_range_group)
 
         # Enable slider if checkbox was already checked from config
@@ -1099,10 +1118,8 @@ class VideoHighlighterGUI(QWidget):
         progress_layout.addWidget(self.task_label)
 
         self.progress_group.setLayout(progress_layout)
-        # Hidden when idle — the progress box only appears while a download or
-        # pipeline runs. The Basic/Advanced tabs use side-by-side layouts, so the
-        # tabs+log splitter has room to shrink when this box appears instead of
-        # pushing the Run/Cancel row and log box off the bottom of the window.
+        # Hidden when idle; sits here near the top (above the tabs) — its original
+        # spot. It only appears while a download or pipeline/analysis runs.
         self.progress_group.setVisible(False)
         layout.addWidget(self.progress_group)
 
@@ -3856,7 +3873,10 @@ class VideoHighlighterGUI(QWidget):
             return f"{minutes:02d}:{secs:02d}"
 
     def on_time_range_toggle(self, checked):
-        """Enable/disable time range controls"""
+        """Show/enable the time-range controls only while the box is ticked;
+        collapse the group to a single line otherwise."""
+        if hasattr(self, "time_range_body"):
+            self.time_range_body.setVisible(checked)
         # Always enable sliders when checkbox is checked, even without video
         self.range_slider.setEnabled(checked)
         
