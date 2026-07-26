@@ -17,6 +17,25 @@ Python, so nothing performance-sensitive crosses the webview boundary. The
 native Qt timeline viewer is still used for the video-heavy surfaces — the
 "Timeline Viewer" button launches it.
 
+## What the web app adds over the Qt GUI
+
+- **Folder-at-once input** — "Add Folder" scans a directory (recursively) for
+  videos, so you can point it at a Downloads/GoPro folder instead of picking
+  files one by one (`GET /scan-folder`).
+- **Reel + music** — with more than one video, "Combine into one reel" stitches
+  the produced highlights into a single video after the run. An optional music
+  bed is applied once to the reel, in one of three modes: **replace** clip
+  audio, **mix** under it, or **duck** it (music dips when the clip is loud).
+  Runs as a `combine` job (`POST /combine`).
+- **Rotation-correct output** — the engine reads each clip's orientation
+  metadata (`GET /video-info` → `rotation`) and bakes rotated phone/GoPro
+  footage upright when cutting and combining, so the reel isn't sideways.
+- **Blur gate** — "Penalize blurry clips" scores candidates by
+  variance-of-Laplacian sharpness and demotes soft ones (off by default).
+
+These live in the engine (`modules/{video_probe,combine_videos,music_track,clip_quality}.py`),
+so the Qt app can call them too; the web UI is just the first to surface them.
+
 ## Develop
 
 ```powershell
