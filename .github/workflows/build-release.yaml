@@ -43,6 +43,7 @@ jobs:
           --add-data "assets;assets"
           --add-data "modules;modules"
           --add-data "models;models"
+          --add-data "video_ai_editor/models;video_ai_editor/models"
           --hidden-import action_recognition
           --hidden-import convert_pth_to_openvino
           --hidden-import crop_actions
@@ -177,6 +178,7 @@ jobs:
             --add-data "assets:assets" \
             --add-data "modules:modules" \
             --add-data "models:models" \
+            --add-data "video_ai_editor/models:video_ai_editor/models" \
             --hidden-import action_recognition \
             --hidden-import convert_pth_to_openvino \
             --hidden-import crop_actions \
