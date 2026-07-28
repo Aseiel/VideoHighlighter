@@ -170,15 +170,21 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: frontend
       - name: Build the app
+        # NSIS only (set in tauri.conf.json). Building "all" also produces an
+        # MSI, and WiX's light.exe is a 32-bit process with a ~2 GB address
+        # space; the bundled sidecar resource is ~1.7 GB (torch + OpenVINO +
+        # CLIP IR), so light.exe ground for 16 minutes and died with no error
+        # code, taking the whole release build down. NSIS has no such limit.
         run: pnpm tauri build
         working-directory: frontend
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: web-windows-build
-          path: |
-            frontend/src-tauri/target/release/bundle/nsis/*.exe
-            frontend/src-tauri/target/release/bundle/msi/*.msi
+          # if-no-files-found guards against a silent empty upload if the bundle
+          # path ever changes again.
+          if-no-files-found: error
+          path: frontend/src-tauri/target/release/bundle/nsis/*.exe
 
   build-mac:
     needs: version
