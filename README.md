@@ -26,13 +26,9 @@ and where each one falls down.
 ## Preview
 
 ![VideoHighlighter](assets/Highlighter.png)
-![Transcript Subtitles](assets/Transcript_Subtitles.png)
 
 ## Timeline Viewer
 ![Timeline Viewer](assets/TimelineViewer.png)
-
-## Visual Search
-![Visual Search](assets/VisualSearch.png)
 
 ## Action Recognition
 ![Action Recognition](assets/power_rangers_actions_annotated.gif)
@@ -40,10 +36,32 @@ and where each one falls down.
 ## Workflow Stages
 ![Workflow Stages](assets/workflow_stages.png)
 
+## Pro edition
+
+This edition already includes live face detection, VR side-by-side playback and
+rendering, offline analysis, CLIP search, the composition engine, and the
+training scripts.
+
+[VideoHighlighter Pro](https://aseiel.github.io/VideoHighlighter-site/) adds:
+
+- **Live object and action overlays** — real-time detection during playback,
+  including on side-by-side VR footage.
+- **Teach a category by pointing** — draw a box around anything, name it, and
+  it is scored live from then on. No dataset, no training run.
+- **Find more like this** — pick a region in one frame and search the whole
+  video for it.
+- **Open-vocabulary detection** — type a plain word and find it, with no
+  trained model for it.
+- **Counter / scoreboard detection** — if the footage has an on-screen counter,
+  every tick proves an event, so Pro can show which real moments the detector
+  missed.
+
+This edition remains free and AGPL-3.0 licensed.
+
 ## Installation
 
 ### Windows (recommended)
-Download the latest `.exe` from [Releases](link) — no Python or dependencies required.
+Download the latest `.exe` from [Releases](https://github.com/Aseiel/VideoHighlighter/releases) — no Python or dependencies required.
 
 ### Linux / Building from Source
 1. **Python & FFmpeg**

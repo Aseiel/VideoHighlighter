@@ -2,6 +2,7 @@
 # project root at every launch)
 debug.log
 debug.prev.log
+timeline_debug.log
 
 # User-imported custom object detectors ("Import model…" in the Advanced tab
 # copies them here). Weights are large and belong to the user, not the repo.
@@ -20,5 +21,13 @@ models/custom/
 # it before packaging). Without it the app re-converts the model from PyTorch on
 # every launch — slow, but never something to commit.
 models/clip-vit-base-patch32-ov/
+
+# Analysis caches — CLIP frame indices, detection/bbox entries, thumbnails,
+# the face database. All rebuilt from the source video on demand, and large.
+cache/
+
+# Training output: checkpoints, logs and run directories written by training/.
+# The runs are the user's own and the weights dwarf the repo.
+training/runs/
 
 __pycache__/
