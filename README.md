@@ -22,6 +22,11 @@ Not sure which detector to reach for? See
 action recognition, CLIP search and the composition engine are each good at,
 and where each one falls down.
 
+> **Want real-time detection?** Everything above runs offline, after the fact.
+> [VideoHighlighter Pro](#pro-edition) adds live object and action overlays
+> during playback, teach-by-example categories, open-vocabulary detection and
+> counter detection. [See what's different →](#pro-edition)
+
 
 ## Preview
 
