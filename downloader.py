@@ -2346,14 +2346,36 @@ def download_video(
                     log_fn("❌ Browser extraction found no video source")
                     return False, None, metadata
 
+                extracted_url, extracted_headers = extracted
+                # Always keep the resolved source so the UI can surface it even when
+                # the automated download fails (IP/session-locked mirrors can only be
+                # fetched from the browser session that minted the token).
+                metadata["extracted_url"] = extracted_url
+                metadata["extracted_headers"] = extracted_headers
                 t_fb = time.time()
                 success_fb, filename_fb = download_from_extracted_source(
-                    extracted, output_template, log_fn,
+                    extracted_url, output_template, log_fn,
                     time_range=time_range,
                     download_full=download_full,
+                    http_headers=extracted_headers,
                 )
                 if not success_fb or not filename_fb or not os.path.exists(filename_fb):
-                    log_fn("❌ Browser-extracted source failed to download")
+                    # yt-dlp cannot pass a Cloudflare TLS-fingerprint check even
+                    # with the right cookie, so retry from inside the browser.
+                    filename_fb = download_via_browser_session(
+                        extracted_url, url, output_template, log_fn, cancel_flag)
+                    success_fb = bool(filename_fb and os.path.exists(filename_fb))
+
+                if not success_fb or not filename_fb or not os.path.exists(filename_fb):
+                    log_fn("❌ Browser-extracted source failed to download "
+                           "(source is IP/session-locked to the browser).")
+                    log_fn("🔗 Direct source URL (copy to download manually):")
+                    log_fn(f"   {extracted_url}")
+                    if extracted_headers.get("referer"):
+                        log_fn(f"   Referer: {extracted_headers['referer']}")
+                    if extracted_headers.get("user-agent"):
+                        log_fn(f"   User-Agent: {extracted_headers['user-agent']}")
+                    metadata["error"] = "extracted_source_blocked"
                     return False, None, metadata
 
                 size_mb = os.path.getsize(filename_fb) / (1024 * 1024)
@@ -2361,6 +2383,17 @@ def download_video(
                 metadata["download_time"] = time.time() - t_fb
                 metadata["fallback_used"] = "browser_extraction"
                 apply_ffprobe_duration(filename_fb)
+                # The extractor can still come back with a pre-roll if the player
+                # never revealed the real stream. Say so loudly rather than
+                # handing the pipeline 30 seconds of advert to analyse.
+                fb_secs = metadata.get("duration_real") or 0
+                if 0 < fb_secs < _AD_MAX_SECONDS:
+                    metadata["advert_suspected"] = True
+                    log_fn(f"⚠️ Result is only {fb_secs:.0f}s — this is almost "
+                           f"certainly a pre-roll advert, not the video.")
+                    log_fn(f"🔗 Source used: {extracted_url}")
+                    log_fn("   The player likely never loaded the real stream. "
+                           "Try again, or open the page and start playback first.")
                 log_fn(f"✅ Fallback 2 succeeded: {os.path.basename(filename_fb)}")
                 log_fn(f"📊 File size: {size_mb:.2f} MB")
 
@@ -2400,6 +2433,57 @@ def download_video(
             size_mb = os.path.getsize(filename) / (1024 * 1024)
             metadata["file_size"] = size_mb
             apply_ffprobe_duration(filename)
+
+            # On a site with no dedicated extractor, yt-dlp's generic fallback
+            # happily downloads the *pre-roll advert* and reports success — so a
+            # very short result is the tell, not an error code. Re-resolve via the
+            # browser (which measures candidates) and keep whichever is longer.
+            real = metadata.get("duration_real") or 0
+            if 0 < real < _AD_MAX_SECONDS:
+                metadata["advert_suspected"] = True
+                log_fn(f"⚠️ Got only {real:.0f}s — that is advert length, not a "
+                       f"video. Re-resolving via browser...")
+                try:
+                    extracted_alt = extract_video_source_via_browser(url, log_fn)
+                except Exception as e:
+                    extracted_alt = None
+                    log_fn(f"⚠️ Browser re-resolve failed: {e}")
+                if extracted_alt:
+                    alt_url, alt_headers = extracted_alt
+                    alt_template = re.sub(r"\.%\(ext\)s$", " [full].%(ext)s",
+                                          output_template)
+                    if alt_template == output_template:
+                        alt_template = output_template + " [full].%(ext)s"
+                    ok_alt, alt_file = download_from_extracted_source(
+                        alt_url, alt_template, log_fn,
+                        time_range=time_range,
+                        download_full=download_full,
+                        http_headers=alt_headers,
+                    )
+                    if ok_alt and alt_file and os.path.exists(alt_file):
+                        alt_secs = get_duration_from_ffprobe(alt_file, log_fn) or 0
+                        if alt_secs > real:
+                            log_fn(f"✅ Replaced the advert with the real video "
+                                   f"({alt_secs:.0f}s)")
+                            try:
+                                os.remove(filename)
+                            except OSError as e:
+                                log_fn(f"⚠️ Could not remove advert file: {e}")
+                            filename = alt_file
+                            size_mb = os.path.getsize(filename) / (1024 * 1024)
+                            metadata["file_size"] = size_mb
+                            metadata["duration_real"] = alt_secs
+                            metadata["duration"] = alt_secs
+                            metadata["fallback_used"] = "advert_retry"
+                            metadata["extracted_url"] = alt_url
+                        else:
+                            log_fn("⚠️ Re-resolved source was no longer than the "
+                                   "original — keeping what we had")
+                            try:
+                                os.remove(alt_file)
+                            except OSError:
+                                pass
+
             log_fn(f"✅ Downloaded: {os.path.basename(filename)}")
             log_fn(f"📊 File size: {size_mb:.2f} MB")
             log_fn(f"⏱️ Download time: {metadata['download_time']:.1f} seconds")
@@ -2733,20 +2817,213 @@ def extract_yandex_video_url(url: str, log_fn: Callable = print) -> Optional[str
     
     return None
 
-def extract_video_source_via_browser(url: str, log_fn: Callable = print) -> Optional[str]:
+# -----------------------------
+# CDN-agnostic media URL detection (used by the browser sniffer)
+# -----------------------------
+# A real media resource: extension in the URL path (query allowed after it).
+_MEDIA_PATH_RE = re.compile(r'\.(m3u8|mpd|mp4|m4v|webm|mov|mkv|flv)(?:$|\?)', re.IGNORECASE)
+# Extensionless streaming endpoints that are still media (googlevideo, etc.).
+_MEDIA_HINT_RE = re.compile(r'(master\.m3u8|playlist\.m3u8|chunklist|/hls/|/dash/|videoplayback|get_file|getvideo)', re.IGNORECASE)
+# Image / thumbnail resources to reject even when the path looks video-ish.
+_IMG_EXT_RE = re.compile(r'\.(jpg|jpeg|png|gif|webp|bmp|svg|ico|vtt)(?:$|\?)', re.IGNORECASE)
+_THUMB_RE = re.compile(r'(thumb|preview|poster|sprite|/covers?/|/avatars?/|screenshot|/vtt/)', re.IGNORECASE)
+# Ad-network / pre-roll creatives. Tube sites autoplay these mp4s, so without
+# this filter the sniffer grabs an advert instead of the real video.
+_AD_RE = re.compile(
+    r'(adtng\.com|/creatives?/|doubleclick|googlesyndication|exoclick|'
+    r'trafficjunky|juicyads|popads|popunder|hilltopads|clickadu|propellerads|'
+    r'admaven|adsco\.re|adnium|realsrv\.com|tsyndicate|magsrv\.com|a-ads)',
+    re.IGNORECASE)
+
+
+def _looks_like_media_url(u: str) -> bool:
+    """True if `u` is a downloadable stream/file, not a thumbnail, sprite or ad.
+    Deliberately CDN-agnostic: matches on the URL shape, not a domain allowlist,
+    so new CDNs (pvvstream.pro, etc.) work without code changes."""
+    if _IMG_EXT_RE.search(u) or _AD_RE.search(u):
+        return False
+    if _MEDIA_PATH_RE.search(u):
+        # An .mp4 living under a thumbnail path is a preview clip, not the video.
+        if _THUMB_RE.search(u) and '.mp4' in u.lower():
+            return False
+        return True
+    # Extensionless hints (getVideoPreview, /hls/ …) — but reject thumbnail
+    # endpoints like ".../getVideoPreview?id=" that match the 'getvideo' hint.
+    return bool(_MEDIA_HINT_RE.search(u)) and not _THUMB_RE.search(u)
+
+
+def _media_fmt_rank(u: str) -> int:
+    """Format rank (lower = better). HLS/DASH manifests beat progressive mp4
+    because tube CDNs usually only expose the full video via the manifest; a
+    master playlist beats a variant playlist."""
+    low = u.lower()
+    path = urllib.parse.urlparse(low).path
+    if 'master.m3u8' in low:
+        return 0
+    if path.endswith('.m3u8') or '.m3u8' in low:
+        return 1
+    if path.endswith('.mpd') or '.mpd' in low:
+        return 2
+    if path.endswith('.mp4') or '.mp4' in low:
+        return 3
+    return 4
+
+
+# A pre-roll advert is short; the feature is not. _AD_RE catches ad *networks*,
+# but a pre-roll served from the site's own CDN under a neutral path looks
+# exactly like the real video — same extension, same host. Length is the only
+# reliable tell, so measure before committing to a download.
+_AD_MAX_SECONDS = 90
+_AD_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _probe_headers(captured_headers: Optional[Dict[str, str]], ua: str,
+                   referer: str) -> Dict[str, str]:
+    """Replay the browser's own headers — hotlink-protected CDNs 403 without."""
+    h = {k.title(): v for k, v in (captured_headers or {}).items()
+         if k.lower() in ("referer", "user-agent", "cookie", "origin")}
+    h.setdefault("User-Agent", ua)
+    h.setdefault("Referer", referer)
+    return h
+
+
+def _hls_info(url: str, headers: Dict[str, str],
+              depth: int = 1) -> Tuple[float, bool]:
+    """(total_seconds, is_live) for an HLS playlist, following a master once.
+
+    A live playlist only lists its recent sliding window, so summing EXTINF
+    gives ~15s no matter how long the stream runs — measuring it as "short"
+    would be meaningless. `#EXT-X-ENDLIST` is what marks a finished VOD, so its
+    absence means live and the duration is reported as unknown.
+    """
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200 or "#EXTM3U" not in (r.text or ""):
+            return 0.0, False
+        text = r.text
+    except requests.RequestException:
+        return 0.0, False
+    if "#EXT-X-STREAM-INF" in text and depth > 0:
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return _hls_info(urllib.parse.urljoin(url, line),
+                                 headers, depth - 1)
+        return 0.0, False
+    live = "#EXT-X-ENDLIST" not in text
+    if live:
+        return 0.0, True
+    return float(sum(float(x) for x in re.findall(r"#EXTINF:\s*([\d.]+)", text))), False
+
+
+def _measure_media(url: str, headers: Dict[str, str]) -> Tuple[float, int, bool]:
+    """(seconds, bytes, is_live); seconds/bytes may be 0 when undeterminable."""
+    low = url.lower()
+    if ".m3u8" in low:
+        secs, live = _hls_info(url, headers)
+        return secs, 0, live
+    if ".mpd" in low:
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            text = r.text or ""
+            if 'type="dynamic"' in text:        # DASH's equivalent of live
+                return 0.0, 0, True
+            m = re.search(r'mediaPresentationDuration="([^"]+)"', text)
+            if m:
+                return (parse_iso8601_duration_enhanced(m.group(1)) or 0.0), 0, False
+        except requests.RequestException:
+            pass
+        return 0.0, 0, False
+    # Progressive: size is a cheap proxy for length.
+    try:
+        r = requests.head(url, headers=headers, timeout=15, allow_redirects=True)
+        cl = r.headers.get("Content-Length", "")
+        if r.status_code < 400 and cl.isdigit():
+            return 0.0, int(cl), False
+    except requests.RequestException:
+        pass
+    try:  # some servers refuse HEAD — ask for one byte and read the total
+        h = dict(headers)
+        h["Range"] = "bytes=0-0"
+        r = requests.get(url, headers=h, timeout=15, stream=True,
+                         allow_redirects=True)
+        cr = r.headers.get("Content-Range", "")
+        r.close()
+        if "/" in cr and cr.rsplit("/", 1)[1].isdigit():
+            return 0.0, int(cr.rsplit("/", 1)[1]), False
+    except requests.RequestException:
+        pass
+    return 0.0, 0, False
+
+
+def _looks_like_advert(seconds: float, size_bytes: int) -> bool:
+    if seconds:
+        return seconds < _AD_MAX_SECONDS
+    return 0 < size_bytes < _AD_MAX_BYTES
+
+
+def _pick_playable(ranked: List[str], captured: Dict[str, Dict[str, str]],
+                   ua: str, referer: str, log_fn: Callable = print,
+                   max_probe: int = 4) -> Optional[str]:
+    """First ranked candidate that isn't an advert, preview, or live stream.
+
+    Deliberately does NOT re-sort by length: the existing (format, capture
+    order) ranking is what makes the video the user opened beat autoplaying
+    recommendations, and a recommendation can easily be longer. This only
+    *skips* unusable entries.
+
+    Returns None when nothing usable was captured. Downloading the best of a bad
+    set is not "no worse" here — a live promo stream never ends, so yt-dlp would
+    run until the disk fills. Failing lets the caller retry or report honestly.
+    """
+    fallback = None
+    for u in ranked[:max_probe]:
+        secs, size, live = _measure_media(
+            u, _probe_headers(captured.get(u), ua, referer))
+        if live:
+            log_fn(f"  ⏭️ live stream (never ends) — not the video, skipping: "
+                   f"{u[:90]}...")
+            continue
+        if secs:
+            desc = f"{int(secs) // 60}:{int(secs) % 60:02d}"
+        elif size:
+            desc = f"{size / 1048576:.1f} MB"
+        else:
+            desc = "length unknown"
+        if _looks_like_advert(secs, size):
+            log_fn(f"  ⏭️ {desc} — looks like an advert/preview, skipping: {u[:90]}...")
+            if fallback is None:
+                fallback = u          # finite, so usable as a last resort
+            continue
+        log_fn(f"  ✓ {desc}: {u[:90]}...")
+        return u
+    if fallback is not None:
+        log_fn("  ⚠ Every candidate measured advert-short; using the best finite "
+               "one — check the result before trusting it")
+        return fallback
+    log_fn("  ✗ No usable media: every candidate was a live stream or unreachable")
+    return None
+
+
+def extract_video_source_via_browser(
+    url: str, log_fn: Callable = print
+) -> Optional[Tuple[str, Dict[str, str]]]:
     """
     Generic Playwright-based video URL extractor. Works for any site:
-    rotates user agents, clicks play buttons, scans shadow DOM, captures
-    network requests, and returns the best media URL found (prefers .mp4).
-    Returns None if nothing usable is found.
+    rotates user agents, triggers playback, scans shadow DOM + iframes, and sniffs
+    the network for the real stream — regardless of which CDN serves it.
+
+    Returns (media_url, http_headers) on success, where http_headers holds the
+    Referer / User-Agent / Cookie / Origin the browser actually used for that
+    request. Those MUST be replayed when downloading, or hotlink-protected CDNs
+    (pvvstream.pro, etc.) answer 403. Returns None if nothing usable is found.
     """
     log_fn("🔍 Trying browser-based video URL extraction...")
-    
+
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-        
+
         with sync_playwright() as p:
-            # Launch browser with more realistic settings
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -2758,333 +3035,347 @@ def extract_video_source_via_browser(url: str, log_fn: Callable = print) -> Opti
                     "--disable-features=IsolateOrigins,site-per-process"
                 ]
             )
-            
-            # Try different user agents
+
+            # Desktop first (most tube players target it), then mobile as a retry.
             user_agents = [
-                # Mobile (Yandex touch site)
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1",
-                # Desktop
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                # Yandex Browser
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 YaBrowser/24.1.0.0 Safari/537.36"
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
             ]
-            
-            video_urls = set()
-            
+
             for ua in user_agents:
                 context = browser.new_context(
                     user_agent=ua,
                     viewport={"width": 1280, "height": 720},
                     ignore_https_errors=True,
                     java_script_enabled=True,
+                    # No hard-coded Referer/Origin here — forcing a foreign origin
+                    # breaks non-Yandex sites. Let the browser set them naturally.
                     extra_http_headers={
                         "Accept": "*/*",
                         "Accept-Language": "en-US,en;q=0.9",
-                        "Accept-Encoding": "gzip, deflate, br",
-                        "Referer": "https://yandex.com/",
-                        "Origin": "https://yandex.com",
-                        "Sec-Fetch-Dest": "empty",
-                        "Sec-Fetch-Mode": "cors",
-                        "Sec-Fetch-Site": "same-site"
                     }
                 )
-                
+
                 page = context.new_page()
-                
-                # Track video-related requests
-                def handle_request(request):
-                    req_url = request.url.lower()
-                    
-                    # Look for actual video content, not previews
-                    video_indicators = [
-                        '.mp4', '.m3u8', '.ts', 'videoplayback',
-                        'mycdn.me', 'cloudfront.net', 'akamaihd.net',
-                        'blob:', 'videocdn', 'video.cdn',
-                        'master.m3u8', 'playlist.m3u8',
-                        'getvideo', 'streaming'
-                    ]
-                    
-                    # Skip obvious thumbnails and previews
-                    skip_indicators = [
-                        '.jpg', '.jpeg', '.png', '.gif', '.webp',
-                        'preview', 'thumbnail', 'poster', 'cover',
-                        'avatar', 'favicon', 'sprite'
-                    ]
-                    
-                    if any(x in req_url for x in skip_indicators):
+
+                # url -> exact request headers the browser used (for replay).
+                captured: Dict[str, Dict[str, str]] = {}
+
+                def _record(req_url: str, request, why: str):
+                    # Bare HLS/DASH segments (.ts/.m4s) are derivable from the
+                    # manifest — capture manifests/progressive files, not chunks.
+                    path = urllib.parse.urlparse(req_url.lower()).path
+                    if path.endswith((".ts", ".m4s")):
                         return
-                        
-                    if any(x in req_url for x in video_indicators):
-                        # Additional check: if it has both video and image patterns, skip it
-                        if '.mp4' in req_url and any(x in req_url for x in ['.jpg', '.jpeg', '.png']):
-                            return
-                        video_urls.add(request.url)
-                        log_fn(f"      📡 Captured: {request.url[:120]}...")
-                
+                    if req_url in captured:
+                        return
+                    # Only the cheap .headers property here — calling the blocking
+                    # all_headers() from inside a request handler breaks capture.
+                    # The Cookie (stripped by .headers) is rebuilt from
+                    # context.cookies() after selection, below.
+                    try:
+                        h = {k.lower(): v for k, v in request.headers.items()}
+                    except Exception:
+                        h = {}
+                    hdrs = {k: h[k] for k in ("referer", "user-agent", "cookie", "origin") if h.get(k)}
+                    captured[req_url] = hdrs
+                    log_fn(f"      📡 Captured ({why}): {req_url[:120]}...")
+
+                def handle_request(request):
+                    if _looks_like_media_url(request.url):
+                        _record(request.url, request, "url")
+
+                def handle_response(response):
+                    """Catch streams whose URL gives nothing away.
+
+                    Signed CDN URLs increasingly carry no extension and no
+                    recognisable path (".../s1/c1/<id>/480/<token>/<expiry>"), so
+                    matching on URL shape alone silently drops the real video and
+                    keeps only the advert, which does end in .mp4. What the
+                    response *is* — resource_type "media", or a video/audio
+                    content-type — is the reliable signal.
+                    """
+                    try:
+                        req = response.request
+                        ctype = (response.headers or {}).get("content-type", "").lower()
+                        is_media = (req.resource_type == "media"
+                                    or ctype.startswith(("video/", "audio/"))
+                                    or "mpegurl" in ctype
+                                    or "dash+xml" in ctype)
+                        if is_media:
+                            _record(response.url, req,
+                                    req.resource_type if req.resource_type == "media"
+                                    else ctype.split(";")[0])
+                    except Exception:
+                        pass
+
                 page.on("request", handle_request)
-                
-                log_fn(f"  • Loading preview with UA: {ua[:50]}...")
-                
+                page.on("response", handle_response)
+
+                # Ad frames open popup tabs on every click. Close them as they
+                # appear: they steal focus, multiply with each nudge, and their
+                # media requests would pollute the capture list.
+                def handle_popup(popup):
+                    try:
+                        log_fn("      🚫 Closed popup tab (ad)")
+                        popup.close()
+                    except Exception:
+                        pass
+
+                context.on("page", handle_popup)
+
+                log_fn(f"  • Loading with UA: {ua[:50]}...")
+
                 try:
-                    # Navigate and wait for content
                     response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                    
                     if response and response.status >= 400:
                         log_fn(f"  ⚠ Bad response: {response.status}")
                         context.close()
                         continue
-                    
-                    # Wait for page to settle
-                    page.wait_for_timeout(5000)
-                    
-                    # Try to find and interact with the video player
-                    log_fn("  • Looking for video player...")
-                    
-                    # Execute JavaScript to find and trigger the actual video
-                    page.evaluate("""
+
+                    page.wait_for_timeout(3000)
+
+                    # Locate the PRIMARY player only — the largest video/iframe/player
+                    # box in the viewport. On feed pages (Yandex preview, tube sites)
+                    # the page is full of recommendation thumbnails; clicking them all
+                    # autoplays the wrong videos. We touch only the main player, so the
+                    # first stream we capture is the video the user actually opened.
+                    locate_primary_js = """
                         () => {
-                            // Scroll to find lazy-loaded content
-                            window.scrollTo(0, document.body.scrollHeight / 2);
-                            
-                            // Look for and click any play button
-                            const playSelectors = [
-                                '.video-preview__play',
-                                '.player-controls__play',
-                                '[aria-label="Play"]',
-                                '[aria-label="Воспроизвести"]',
-                                '.thumb__play',
-                                '.videoplayer__play',
-                                '.play-button',
-                                '.jwplayer__playbutton',
-                                '.vjs-big-play-button',
-                                '[data-testid="play"]',
-                                '.VideoPlayer__play'
-                            ];
-                            
-                            for (const selector of playSelectors) {
-                                const btn = document.querySelector(selector);
-                                if (btn) {
-                                    btn.click();
-                                    console.log('Clicked play button:', selector);
-                                    break;
-                                }
+                            const vw = window.innerWidth, vh = window.innerHeight;
+                            const visArea = (el) => {
+                                const r = el.getBoundingClientRect();
+                                const w = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+                                const h = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+                                return w * h;
+                            };
+                            let best = null, bestA = 0;
+                            const consider = (el) => { const a = visArea(el); if (a > bestA) { bestA = a; best = el; } };
+                            document.querySelectorAll('video, iframe').forEach(consider);
+                            // Fall back to a player-ish container if no real video/iframe.
+                            if (bestA < 20000) {
+                                document.querySelectorAll(
+                                    '[class*="player"],[id*="player"],[class*="video"],.vjs-big-play-button,.jw-icon-display'
+                                ).forEach(consider);
                             }
-                            
-                            // Try to load video directly
-                            const videos = document.querySelectorAll('video');
-                            videos.forEach(v => {
-                                v.preload = 'auto';
-                                v.load();
-                                v.muted = true;
-                                v.play().catch(() => {});
-                            });
-                            
-                            // Look for video in shadow DOM
-                            const findInShadow = (root) => {
-                                if (root.shadowRoot) {
-                                    root.shadowRoot.querySelectorAll('video').forEach(v => {
-                                        v.preload = 'auto';
-                                        v.load();
-                                        v.muted = true;
-                                        v.play().catch(() => {});
-                                    });
-                                    root.shadowRoot.querySelectorAll('*').forEach(findInShadow);
-                                }
-                            };
-                            document.querySelectorAll('*').forEach(findInShadow);
+                            if (!best) return null;
+                            try { best.scrollIntoView({block: 'center'}); } catch (e) {}
+                            if (best.tagName === 'VIDEO') {
+                                try { best.muted = true; const p = best.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+                            }
+                            const r = best.getBoundingClientRect();
+                            const cx = Math.round(Math.min(Math.max(r.left + r.width / 2, 5), vw - 5));
+                            const cy = Math.round(Math.min(Math.max(r.top + r.height / 2, 5), vh - 5));
+                            return [cx, cy, best.tagName.toLowerCase()];
                         }
-                    """)
-                    
-                    # Wait for network activity
-                    page.wait_for_timeout(8000)
-                    
-                    # Check for direct video element with real source
-                    log_fn("  • Checking for video element...")
-                    
-                    video_info = page.evaluate("""
+                    """
+                    try:
+                        prim = page.evaluate(locate_primary_js)
+                    except Exception:
+                        prim = None
+                    if prim:
+                        cx, cy, tag = int(prim[0]), int(prim[1]), prim[2]
+                        log_fn(f"  • Primary player: <{tag}> at ({cx},{cy})")
+                    else:
+                        cx, cy = 640, 360
+                        log_fn("  • No primary player found; clicking viewport center")
+
+                    clicked = []
+
+                    def nudge_primary():
+                        # Real click at the primary player's center. A genuine gesture
+                        # here routes INTO a cross-origin player iframe (deluxtube etc.)
+                        # and satisfies players that gate the manifest behind a click —
+                        # without ever touching recommendation thumbnails.
+                        # Only ONCE: on ad-backed players every further click opens a
+                        # popup tab, so repeating it just spawns adverts.
+                        if not clicked:
+                            clicked.append(True)
+                            try:
+                                page.mouse.click(cx, cy)
+                            except Exception:
+                                pass
+                        # Nudge already-present <video>s (main + same-origin frames) to
+                        # play. We only .play() existing elements — we do NOT click
+                        # thumbnails, so recommendations don't start loading.
+                        for fr in page.frames:
+                            try:
+                                fr.evaluate("() => { const v = document.querySelector('video');"
+                                            " if (v) { v.muted = true; const p = v.play(); if (p && p.catch) p.catch(() => {}); } }")
+                            except Exception:
+                                pass
+
+                    # Measured once per URL; probing is cheap but not free.
+                    _advert: Dict[str, bool] = {}
+
+                    def is_advert(u: str) -> bool:
+                        """Unusable as the feature: ad network, advert-length, or
+                        a live stream (promo widgets embed those, and they never
+                        end so they can never be 'the video')."""
+                        if u not in _advert:
+                            if _AD_RE.search(u):
+                                _advert[u] = True
+                            else:
+                                secs, size, live = _measure_media(
+                                    u, _probe_headers(captured.get(u), ua, page.url))
+                                _advert[u] = live or _looks_like_advert(secs, size)
+                        return _advert[u]
+
+                    def have_manifest() -> bool:
+                        return any(_media_fmt_rank(u) in (0, 1, 2) and not is_advert(u)
+                                   for u in captured)
+
+                    def skip_short_ads() -> None:
+                        """Jump any short clip to its end so the player moves on.
+
+                        A pre-roll blocks the real request until it finishes, and
+                        waiting it out costs 30s per video. Seeking to the end
+                        fires 'ended', which makes the player load the feature."""
+                        js = """
                         () => {
-                            const videos = [];
-                            
-                            // Regular video elements
-                            document.querySelectorAll('video').forEach((v, i) => {
-                                const src = v.currentSrc || v.src || '';
-                                if (src && src.length > 0) {
-                                    videos.push({
-                                        type: 'video',
-                                        index: i,
-                                        src: src,
-                                        duration: v.duration || 0,
-                                        readyState: v.readyState,
-                                        networkState: v.networkState
-                                    });
-                                }
-                                
-                                // Check source tags
-                                v.querySelectorAll('source').forEach((s, j) => {
-                                    if (s.src) {
-                                        videos.push({
-                                            type: 'source',
-                                            index: j,
-                                            src: s.src,
-                                            duration: v.duration || 0
-                                        });
-                                    }
-                                });
+                          let acted = 0;
+                          document.querySelectorAll('video').forEach(v => {
+                            try {
+                              if (v.duration && isFinite(v.duration)
+                                  && v.duration > 0 && v.duration < 90) {
+                                v.muted = true;
+                                try { v.playbackRate = 16; } catch (e) {}
+                                v.currentTime = Math.max(0, v.duration - 0.05);
+                                acted++;
+                              }
+                            } catch (e) {}
+                          });
+                          document.querySelectorAll('button, a, div[role="button"]')
+                            .forEach(b => {
+                              try {
+                                const t = ((b.innerText || '') + ' ' +
+                                           (b.getAttribute('aria-label') || '')).toLowerCase();
+                                if (t.includes('skip') && b.offsetParent !== null) b.click();
+                              } catch (e) {}
                             });
-                            
-                            // Check shadow DOM
-                            const checkShadow = (root) => {
-                                if (root.shadowRoot) {
-                                    root.shadowRoot.querySelectorAll('video').forEach((v, i) => {
-                                        const src = v.currentSrc || v.src || '';
-                                        if (src) {
-                                            videos.push({
-                                                type: 'shadow-video',
-                                                src: src,
-                                                duration: v.duration || 0
-                                            });
-                                        }
-                                    });
-                                    root.shadowRoot.querySelectorAll('*').forEach(checkShadow);
-                                }
-                            };
-                            document.querySelectorAll('*').forEach(checkShadow);
-                            
-                            return videos;
+                          return acted;
                         }
-                    """)
-                    
-                    if video_info and len(video_info) > 0:
-                        log_fn(f"  ✓ Found {len(video_info)} video source(s)")
-                        
-                        # Filter out preview sources (short duration)
-                        valid_sources = []
-                        for v in video_info:
-                            src = v.get('src', '')
-                            duration = v.get('duration', 0)
-                            
-                            # Skip preview sources (duration < 30s or suspicious URLs)
-                            if duration > 0 and duration < 30:
-                                log_fn(f"  ⚠ Skipping preview source (duration: {duration:.1f}s): {src[:80]}...")
-                                continue
-                                
-                            if any(x in src.lower() for x in ['.mp4', '.m3u8', 'videoplayback', 'mycdn.me']):
-                                if not any(x in src.lower() for x in ['.jpg', '.jpeg', '.png', 'preview']):
-                                    valid_sources.append(src)
-                                    log_fn(f"  ✓ Valid source found: {src[:100]}...")
-                        
-                        if valid_sources:
-                            # Prefer .mp4 over .m3u8 for direct download
-                            mp4_sources = [s for s in valid_sources if '.mp4' in s.lower()]
-                            if mp4_sources:
-                                best = mp4_sources[0]
-                                log_fn(f"  ✓ Selected MP4 source: {best[:120]}...")
-                                return best
-                            
-                            # Otherwise use the first valid source
-                            best = valid_sources[0]
-                            log_fn(f"  ✓ Selected source: {best[:120]}...")
-                            return best
-                    
-                    # Check captured network requests
-                    if video_urls:
-                        log_fn(f"  • Found {len(video_urls)} video URLs from network")
-                        
-                        # Filter out preview URLs
-                        filtered_urls = []
-                        for vu in video_urls:
-                            vu_lower = vu.lower()
-                            
-                            # Skip obvious previews
-                            if any(x in vu_lower for x in ['preview', 'thumbnail', 'poster']):
-                                continue
-                                
-                            # Skip image files
-                            if any(vu_lower.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-                                continue
-                                
-                            # Check for video patterns
-                            if any(x in vu_lower for x in ['.mp4', '.m3u8', 'videoplayback', 'mycdn.me']):
-                                filtered_urls.append(vu)
-                        
-                        log_fn(f"  • After filtering: {len(filtered_urls)} actual video URLs")
-                        
-                        if filtered_urls:
-                            def _url_priority(u: str) -> tuple:
-                                u_lower = u.lower()
-                                parsed_u = urllib.parse.urlparse(u)
-                                path = parsed_u.path.lower()
+                        """
+                        for fr in page.frames:
+                            try:
+                                fr.evaluate(js)
+                            except Exception:
+                                pass
 
-                                # Format: direct file extension in path beats query-string-only
-                                if path.endswith(".mp4") or ".mp4/" in path:
-                                    fmt = 0
-                                elif path.endswith(".m3u8") or ".m3u8/" in path:
-                                    fmt = 1
-                                elif ".mp4" in u_lower:
-                                    fmt = 2
-                                elif ".m3u8" in u_lower:
-                                    fmt = 3
-                                else:
-                                    fmt = 99
+                    # Stop on a (non-advert) manifest, or ~3s after the first
+                    # progressive capture that isn't an advert. Stopping on the
+                    # *first* capture would only ever hand us the pre-roll, since
+                    # that is by definition requested before the feature.
+                    log_fn("  • Triggering primary player + waiting for stream...")
+                    deadline = time.time() + 25
+                    hard_deadline = time.time() + 75
+                    first_good = None
+                    waited_for_ad = False
+                    while time.time() < deadline:
+                        nudge_primary()
+                        page.wait_for_timeout(2000)
+                        if have_manifest():
+                            break
+                        if any(not is_advert(u) for u in captured):
+                            if first_good is None:
+                                first_good = time.time()
+                            elif time.time() - first_good >= 3:
+                                break
+                        elif captured:
+                            # Only adverts so far: skip past them and keep waiting
+                            # for the real stream instead of settling for the ad.
+                            if not waited_for_ad:
+                                log_fn("  ⏭️ Only advert media so far — skipping the "
+                                       "pre-roll and waiting for the real stream...")
+                                waited_for_ad = True
+                            skip_short_ads()
+                            deadline = hard_deadline
 
-                                # Penalize auth-token / hotlink-protected URLs
-                                auth = 0
-                                if path.count(",") >= 2:
-                                    auth += 10   # comma-separated key/limit/data segments
-                                if any(k in u_lower for k in ["key=", "token=", "sig=", "auth=", "referer=none"]):
-                                    auth += 5
+                    # Also read any <video>.currentSrc that resolved to a real URL.
+                    log_fn("  • Checking <video> elements...")
+                    try:
+                        srcs = page.evaluate("""
+                            () => {
+                                const out = [];
+                                const grab = (v) => {
+                                    const s = v.currentSrc || v.src || '';
+                                    if (s && !s.startsWith('blob:')) out.push(s);
+                                    v.querySelectorAll('source').forEach(x => { if (x.src) out.push(x.src); });
+                                };
+                                document.querySelectorAll('video').forEach(grab);
+                                const walk = (r) => {
+                                    if (!r.shadowRoot) return;
+                                    r.shadowRoot.querySelectorAll('video').forEach(grab);
+                                    r.shadowRoot.querySelectorAll('*').forEach(walk);
+                                };
+                                document.querySelectorAll('*').forEach(walk);
+                                return out;
+                            }
+                        """) or []
+                    except Exception:
+                        srcs = []
+                    for s in srcs:
+                        if _looks_like_media_url(s) and s not in captured:
+                            captured[s] = {"referer": page.url, "user-agent": ua}
+                            log_fn(f"  ✓ <video> src: {s[:120]}...")
 
-                                # Prefer shorter URLs (more canonical)
-                                length_bucket = len(u) // 100
-
-                                return (fmt, auth, length_bucket)
-
-                            filtered_urls.sort(key=_url_priority)
-
-                            log_fn(f"  • Top 3 candidates by priority:")
-                            for i, u in enumerate(filtered_urls[:3], 1):
-                                log_fn(f"      {i}. {u[:120]}...")
-
-                            best_url = filtered_urls[0]
-                            log_fn(f"  ✓ Best video URL from network: {best_url[:120]}...")
-                            return best_url
-                    
-                    # Check iframes
-                    log_fn("  • Checking iframes...")
-                    frames = page.frames
-                    for i, frame in enumerate(frames[1:], 1):  # Skip main frame
-                        try:
-                            if 'video' in frame.url.lower() or 'player' in frame.url.lower():
-                                log_fn(f"    • Checking iframe {i}: {frame.url[:80]}...")
-                                
-                                # Look for video in iframe
-                                iframe_src = frame.evaluate("""
-                                    () => {
-                                        const v = document.querySelector('video');
-                                        if (v) {
-                                            const src = v.currentSrc || v.src || '';
-                                            if (src) return src;
-                                        }
-                                        const source = document.querySelector('video source');
-                                        return source ? source.src : null;
-                                    }
-                                """)
-                                
-                                if iframe_src:
-                                    log_fn(f"    ✓ Found video in iframe: {iframe_src[:120]}...")
-                                    return iframe_src
-                        except:
+                    if captured:
+                        # Rank by (format, capture order). Capture order matters:
+                        # on feed/preview pages the FIRST media request is the video
+                        # the user opened; later ones are autoplaying recommendations.
+                        order = {u: i for i, u in enumerate(captured)}
+                        sort_key = lambda u: (_media_fmt_rank(u), order[u])
+                        ranked = sorted(captured, key=sort_key)
+                        log_fn(f"  • {len(captured)} media URL(s); top candidates:")
+                        for i, u in enumerate(ranked[:3], 1):
+                            log_fn(f"      {i}. {u[:120]}...")
+                        # A pre-roll is requested *before* the feature, so capture
+                        # order alone hands us the advert whenever formats tie.
+                        # Measure the shortlist and skip anything advert-length.
+                        best = _pick_playable(ranked, captured, ua, page.url, log_fn)
+                        if not best:
+                            # Nothing downloadable here — fall through to the next
+                            # user agent rather than fetching an endless stream.
+                            log_fn("  • No usable media with this UA")
+                            context.close()
                             continue
-                    
+                        hdrs = dict(captured[best] or {})
+                        hdrs.setdefault("user-agent", ua)
+                        hdrs.setdefault("referer", page.url)
+                        # If the request carried no Cookie header, rebuild one from
+                        # the context's cookies for the manifest's domain — signed
+                        # tube manifests are usually session/cookie-bound.
+                        if not hdrs.get("cookie"):
+                            try:
+                                host = urllib.parse.urlparse(best).netloc
+                                jar = [c for c in context.cookies()
+                                       if c.get("domain", "").lstrip(".") in host
+                                       or host.endswith(c.get("domain", "").lstrip("."))]
+                                if jar:
+                                    hdrs["cookie"] = "; ".join(
+                                        f"{c['name']}={c['value']}" for c in jar)
+                            except Exception:
+                                pass
+                        log_fn(f"  ✓ Selected: {best[:120]}...")
+                        if hdrs.get("referer"):
+                            log_fn(f"  🔑 Replay Referer: {hdrs['referer'][:80]}")
+                        if hdrs.get("cookie"):
+                            log_fn(f"  🍪 Replay Cookie: {len(hdrs['cookie'])} chars")
+                        context.close()
+                        return best, hdrs
+
+                    log_fn("  • Nothing captured with this UA")
+
                 except Exception as e:
                     log_fn(f"  ⚠ Error with UA {ua[:30]}: {str(e)[:100]}")
-                
                 finally:
                     context.close()
-            
+
             log_fn("  ✗ No video source found with any user agent")
+            log_fn("  💡 The player may need a real click or a login; try opening it "
+                   "in a visible browser and copying the .m3u8 from DevTools → Network.")
             return None
-            
+
     except ImportError:
         log_fn("  ⚠ Playwright not installed. Run: pip install playwright && playwright install")
         return None
@@ -3158,14 +3449,168 @@ def _capture_yandex_network_media(driver, log_fn):
     log_fn(f"    ✓ Best media URL: {best[:140]}...")
     return best
 
+def download_via_browser_session(
+    media_url: str,
+    page_url: str,
+    output_template: str,
+    log_fn: Callable = print,
+    cancel_flag=None,
+) -> Optional[str]:
+    """Fetch media through a real browser session, byte-ranged to disk.
+
+    Some CDNs sit behind Cloudflare, whose `cf_clearance` cookie is bound to the
+    TLS fingerprint of the browser that solved the challenge — not just to the
+    cookie value. Replaying Referer/User-Agent/Cookie from yt-dlp therefore
+    fails no matter how faithfully they are copied, because the handshake itself
+    is what gets checked.
+
+    Playwright's APIRequestContext issues requests from the browser's own stack
+    and cookie jar, so it is the only path that gets served. We load the watch
+    page first (that is what mints the clearance cookie), then pull the media in
+    ranged chunks so a multi-GB file never has to fit in memory.
+
+    Returns the saved path, or None.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log_fn("⚠️ Playwright not installed — cannot download in-session")
+        return None
+
+    out_path = re.sub(r"\.%\(ext\)s$", ".mp4", output_template)
+    if out_path == output_template:
+        out_path = output_template + ".mp4"
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    chunk = 8 * 1024 * 1024
+    written = 0
+
+    log_fn("🌐 Retrying inside the browser session (Cloudflare-safe)...")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                      "--disable-features=IsolateOrigins,site-per-process"],
+            )
+            context = browser.new_context(user_agent=ua, ignore_https_errors=True,
+                                          viewport={"width": 1366, "height": 768})
+            # Close advert popups so they cannot steal the session or stall us.
+            context.on("page", lambda pg: pg.close() if pg else None)
+            page = context.new_page()
+            try:
+                page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
+                page.wait_for_timeout(4000)      # let the clearance cookie land
+            except Exception as e:
+                log_fn(f"  ⚠ Page load: {str(e)[:100]}")
+
+            total: Optional[int] = None
+            try:
+                with open(out_path, "wb") as f:
+                    while True:
+                        if _flag_is_cancelled(cancel_flag):
+                            log_fn("⏹️ Cancelled during in-session download")
+                            break
+                        r = context.request.get(
+                            media_url,
+                            headers={"Range": f"bytes={written}-{written + chunk - 1}",
+                                     "Referer": page_url},
+                            timeout=120000,
+                        )
+                        if r.status not in (200, 206):
+                            if written == 0:
+                                log_fn(f"  ✗ Session fetch refused: HTTP {r.status}")
+                            break
+                        body = r.body()
+                        if not body:
+                            break
+                        f.write(body)
+                        written += len(body)
+                        cr = (r.headers or {}).get("content-range", "")
+                        if total is None and "/" in cr:
+                            tail = cr.rsplit("/", 1)[1]
+                            if tail.isdigit():
+                                total = int(tail)
+                        if total:
+                            log_fn(f"  ⬇️ {written / 1048576:.1f} / "
+                                   f"{total / 1048576:.1f} MB "
+                                   f"({written * 100 // total}%)")
+                            if written >= total:
+                                break
+                        else:
+                            log_fn(f"  ⬇️ {written / 1048576:.1f} MB")
+                            if r.status == 200:
+                                break      # server ignored Range and sent it all
+            finally:
+                try:
+                    context.close()
+                    browser.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        log_fn(f"  ✗ In-session download failed: {type(e).__name__}: {str(e)[:110]}")
+
+    if written > 0 and os.path.exists(out_path):
+        log_fn(f"✅ In-session download complete: {written / 1048576:.1f} MB")
+        return out_path
+    try:
+        if os.path.exists(out_path) and os.path.getsize(out_path) == 0:
+            os.remove(out_path)
+    except OSError:
+        pass
+    return None
+
+
 def download_from_extracted_source(
     source_url: str,
     output_template: str,
     log_fn: Callable = print,
     time_range: Optional[Tuple[float, float]] = None,
     download_full: bool = True,
+    http_headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[bool, Optional[str]]:
     log_fn(f"📥 Downloading extracted source: {source_url[:100]}...")
+
+    http_headers = http_headers or {}
+    referer = http_headers.get("referer")
+    user_agent = http_headers.get("user-agent")
+    if referer:
+        log_fn(f"🔑 Using Referer: {referer[:80]}")
+
+    # Preflight: a quick ranged GET with the replayed headers. Catches dead /
+    # forbidden sources in seconds instead of letting yt-dlp stall for minutes
+    # (a rejected hotlink-protected source often hangs rather than erroring).
+    def _preflight(u: str) -> bool:
+        pf = {}
+        if referer:
+            pf["Referer"] = referer
+        if user_agent:
+            pf["User-Agent"] = user_agent
+        for k, v in http_headers.items():
+            if k not in ("referer", "user-agent") and v:
+                pf[k.title()] = v
+        pf["Range"] = "bytes=0-1023"
+        try:
+            r = requests.get(u, headers=pf, stream=True, timeout=15, allow_redirects=True)
+            code = r.status_code
+            ctype = r.headers.get("Content-Type", "")
+            r.close()
+        except requests.RequestException as e:
+            log_fn(f"  ⚠ Preflight error: {str(e)[:80]}")
+            return False
+        if code in (200, 206):
+            return True
+        log_fn(f"  ⚠ Preflight HTTP {code} ({ctype or 'no type'}) — source rejected "
+               f"the replayed headers; skipping to avoid a long stall")
+        return False
+
+    if not _preflight(source_url):
+        # For HLS the ffmpeg path below can still succeed with its own header
+        # handling, so only bail early on non-manifest (progressive) sources.
+        if ".m3u8" not in source_url.lower() and ".mpd" not in source_url.lower():
+            return False, None
 
     cmd = [
         "yt-dlp",
@@ -3173,9 +3618,19 @@ def download_from_extracted_source(
         "--no-playlist",
         "--no-warnings",
         "--force-ipv4",
-        "--socket-timeout", "90",
-        "--retries", "6",
+        "--socket-timeout", "30",
+        "--retries", "3",
     ]
+
+    # Replay the browser's request headers so hotlink-protected CDNs don't 403.
+    if referer:
+        cmd.extend(["--referer", referer])
+    if user_agent:
+        cmd.extend(["--user-agent", user_agent])
+    for k, v in http_headers.items():
+        if k in ("referer", "user-agent") or not v:
+            continue
+        cmd.extend(["--add-header", f"{k}:{v}"])
 
     # Apply section cut if a range was requested
     if time_range and not download_full:
@@ -3209,6 +3664,17 @@ def download_from_extracted_source(
             else output_template + ".mp4"
         )
         cmd = ["ffmpeg", "-y"]
+        # Replay headers on the ffmpeg side too — the .ts/.m4s segments are
+        # referer-locked just like the manifest. These are input options and
+        # must precede -i.
+        if user_agent:
+            cmd.extend(["-user_agent", user_agent])
+        if referer:
+            cmd.extend(["-referer", referer])
+        extra_lines = [f"{k.title()}: {v}" for k, v in http_headers.items()
+                       if k not in ("referer", "user-agent") and v]
+        if extra_lines:
+            cmd.extend(["-headers", "".join(line + "\r\n" for line in extra_lines)])
         # ffmpeg time-range cut (much faster than downloading full then trimming)
         if time_range and not download_full:
             start_time, end_time = time_range
