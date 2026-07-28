@@ -17,6 +17,11 @@ Cuts and merges top scoring segments into a highlight video.
 Fully configurable: frame skip, highlight duration, keywords.
 Optional GUI for easy interaction.
 
+Not sure which detector to reach for? See
+[docs/DETECTION-GUIDE.md](docs/DETECTION-GUIDE.md) — what object recognition,
+action recognition, CLIP search and the composition engine are each good at,
+and where each one falls down.
+
 
 ## Preview
 
