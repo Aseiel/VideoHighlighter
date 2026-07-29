@@ -170,21 +170,47 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: frontend
       - name: Build the app
-        # NSIS only (set in tauri.conf.json). Building "all" also produces an
-        # MSI, and WiX's light.exe is a 32-bit process with a ~2 GB address
-        # space; the bundled sidecar resource is ~1.7 GB (torch + OpenVINO +
-        # CLIP IR), so light.exe ground for 16 minutes and died with no error
-        # code, taking the whole release build down. NSIS has no such limit.
+        # Compiles the exe only — bundle.active is false in tauri.conf.json.
+        #
+        # Neither Windows installer format can package this app: the sidecar
+        # resource is ~1.7 GB (CUDA torch + OpenVINO + the pre-converted CLIP
+        # IR), and both installer compilers are 32-bit processes that run out of
+        # address space on it. WiX's light.exe ground for 16 minutes and died
+        # with no error code; makensis failed with "error mmapping file
+        # (1994782295, 33554432) is out of range" — that number is ~1.86 GB.
+        #
+        # So ship portable, exactly like the Qt build above: a split 7z the user
+        # unzips. No code change is needed for this — on Windows Tauri resolves
+        # BaseDirectory::Resource to the executable's own directory, so
+        # video-highlighter.exe with vh-sidecar/ beside it finds the engine at
+        # the same relative path an installer would have created.
         run: pnpm tauri build
         working-directory: frontend
+      - name: Assemble the portable app
+        # Lay out exe + engine as the app expects to find them at runtime.
+        run: |
+          $stage = "dist-web/VideoHighlighter"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "frontend/src-tauri/target/release/video-highlighter.exe" $stage
+          Copy-Item -Recurse "dist-sidecar/vh-sidecar" "$stage/vh-sidecar"
+          # WebView2Loader.dll sits next to the exe when Tauri emits it; ship it
+          # if present so the app does not depend on a system-wide copy.
+          $loader = "frontend/src-tauri/target/release/WebView2Loader.dll"
+          if (Test-Path $loader) { Copy-Item $loader $stage }
+          if (-not (Test-Path "$stage/vh-sidecar/vh-sidecar.exe")) {
+            throw "vh-sidecar.exe missing from the staged app - the layout is wrong."
+          }
+          $size = (Get-ChildItem -Recurse $stage | Measure-Object -Property Length -Sum).Sum / 1GB
+          Write-Host "Portable app size: $([math]::Round($size, 2)) GB"
+      - name: Create archive
+        run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z" ./dist-web/VideoHighlighter
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: web-windows-build
-          # if-no-files-found guards against a silent empty upload if the bundle
-          # path ever changes again.
+          # Fail loudly rather than uploading nothing if the path drifts again.
           if-no-files-found: error
-          path: frontend/src-tauri/target/release/bundle/nsis/*.exe
+          path: "VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z*"
 
   build-mac:
     needs: version
