@@ -937,10 +937,6 @@ class SignalTimelineWindow(QMainWindow):
             self.signal_scene.set_current_time(self.current_time)
             if hasattr(self, 'signal_view'):
                 self.signal_view.ensure_time_visible(self.current_time)
-            # Repaint only — the per-track counters read the playhead, and
-            # refresh_labels() would re-derive every track's events per frame.
-            if hasattr(self, 'label_panel'):
-                self.label_panel.update()
         
         # Sync transcript panel
         if hasattr(self, 'transcript_panel'):
@@ -1975,9 +1971,18 @@ class SignalTimelineWindow(QMainWindow):
 
         # Refresh frozen labels whenever the scene rebuilds
         self.signal_scene.timeline_rebuilt.connect(self.label_panel.refresh_labels)
+        # Repaint, not rebuild: the per-track counters read the playhead, but
+        # re-deriving every track's events on each tick would make playback
+        # crawl. This fires for seeks too, which is what arrow navigation does.
+        self.signal_scene.current_time_changed.connect(
+            lambda _seconds: self.label_panel.update())
 
         # Wire navigation arrows
-        self.label_panel._current_time_fn = lambda: self.current_time
+        # Read the playhead from the scene, not from self.current_time: the
+        # scene is the one thing every seek path updates, whereas a caller can
+        # move the playhead and forget the window's copy.
+        self.label_panel._current_time_fn = lambda: getattr(
+            self.signal_scene, 'current_time_seconds', self.current_time)
         self.label_panel.seek_requested.connect(self.on_time_clicked)
 
         # Initial label load
