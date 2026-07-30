@@ -1909,6 +1909,8 @@ class SignalTimelineWindow(QMainWindow):
         self.signal_scene.add_to_edit_requested.connect(self.on_add_to_edit_requested)
         self.signal_scene.add_clip_to_edit_requested.connect(self.on_add_clip_to_edit)
         self.signal_scene.add_clips_to_edit_requested.connect(self.on_add_clips_to_edit)
+        self.signal_scene.swap_highlight_requested.connect(self.on_swap_highlight)
+        self.signal_scene.undo_highlight_swap_requested.connect(self.on_undo_highlight_swap)
         self.signal_scene.filter_changed.connect(self.on_filter_changed)
         
         # Preview follows drag
@@ -3240,6 +3242,81 @@ class SignalTimelineWindow(QMainWindow):
                 self.current_filters_label.setText(" | ".join(filter_details))
             else:
                 self.current_filters_label.setText("No filters applied")
+
+    # ── swap a chosen clip for the next best one ───────────────────────
+    def _swap_session(self):
+        """The session for this cut, built on first use from the saved report.
+
+        Returns ``None`` — after saying why — when there is nothing to swap
+        from. Re-choosing needs the per-second score, and only the report keeps
+        it; a cut made before reports existed, or with the report deleted, can
+        still be viewed but not re-chosen.
+        """
+        session = getattr(self, "_highlight_swap_session", None)
+        if session is not None:
+            return session
+
+        from modules.highlight_swap import SwapSession, report_path_for
+
+        path = report_path_for(self.video_path)
+        if not path:
+            self._swap_message("No highlight report was found next to this video, "
+                               "so there is nothing to re-choose from. Run the "
+                               "highlighter again to write one.")
+            return None
+        try:
+            session = SwapSession.from_report(path)
+        except Exception as exc:
+            print(f"⚠️ Could not read {path}: {exc}")
+            self._swap_message(f"The highlight report could not be read:\n{exc}")
+            return None
+        if not session.usable:
+            self._swap_message("This report was written before the score was "
+                               "saved with it. Re-run the highlighter to enable "
+                               "swapping.")
+            return None
+
+        self._highlight_swap_session = session
+        return session
+
+    def _swap_message(self, text):
+        QMessageBox.information(self, "Swap clip", text)
+
+    def _apply_swapped_segments(self, session):
+        """Push the session's segments back into the timeline and redraw."""
+        self.cache_data['highlight_segments'] = [
+            [float(start), float(end)] for start, end in session.segments
+        ]
+        # The parallel score metadata no longer lines up with the segments, and
+        # a stale score under a swapped clip is worse than no score at all.
+        self.cache_data.pop('highlight_metadata', None)
+        self.signal_scene.highlight_swaps_done = len(session.rejected)
+        self.signal_scene.cache_data = self.cache_data
+        self.signal_scene.build_timeline()
+
+    def on_swap_highlight(self, index):
+        session = self._swap_session()
+        if session is None:
+            return
+        try:
+            replaced = session.segments[index]
+        except IndexError:
+            return
+        if not session.swap(index):
+            self._swap_message("There is no other moment left to offer for this "
+                               "clip — everything else is either already in the "
+                               "highlight or has been turned down.")
+            return
+        self._apply_swapped_segments(session)
+        print(f"🔀 Swapped highlight {index + 1} "
+              f"({replaced[0]:.1f}s–{replaced[1]:.1f}s) for another moment")
+
+    def on_undo_highlight_swap(self):
+        session = getattr(self, "_highlight_swap_session", None)
+        if session is None or not session.undo():
+            return
+        self._apply_swapped_segments(session)
+        print("↩ Undid the last highlight swap")
 
     def get_highlights_from_signal_data(self):
         """Extract highlights from signal timeline cache data"""
