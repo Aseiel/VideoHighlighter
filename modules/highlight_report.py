@@ -63,12 +63,83 @@ BOOST_SIGNALS = ("motion_event", "motion_peak", "audio", "keyword", "object")
 # report -- and the raw material for a "this should have been included" loop.
 DEFAULT_NEAR_MISS_COUNT = 5
 
+# Resolution of the overview curves. Enough to see the shape of a feature-length
+# video at page width, small enough that the arrays stay a rounding error next to
+# the embedded thumbnails.
+CURVE_POINTS = 480
+
+# Resolution of one clip's own loudness strip. A clip is tens of seconds, not
+# hours, so it can afford a sample every fraction of a second — and needs one,
+# or the strip is a straight line that invites being read as meaning.
+SEGMENT_AUDIO_POINTS = 120
+
 
 def _f(value) -> float:
     """numpy scalar or None -> plain float, so the record is JSON-serialisable."""
     if value is None:
         return 0.0
     return float(value)
+
+
+def downsample(values, points: int = CURVE_POINTS) -> list:
+    """Reduce a per-second array to ``points`` buckets, keeping each bucket's max.
+
+    Max rather than mean: these curves exist to show *where the peaks are*, and
+    averaging a one-second spike into a bucket of thirty erases exactly the thing
+    the reader is looking for.
+    """
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return []
+    if arr.size <= points:
+        return [round(float(v), 4) for v in arr]
+    edges = np.linspace(0, arr.size, points + 1).astype(int)
+    return [
+        round(float(arr[lo:hi].max()), 4) if hi > lo else 0.0
+        for lo, hi in zip(edges[:-1], edges[1:])
+    ]
+
+
+def split_tags(names: Iterable[str],
+               composed_event_names: Optional[Iterable[str]] = None,
+               ) -> tuple[list, list]:
+    """Separate composed events from the raw detections they were composed from.
+
+    The detection layer and the composition layer both end up in one per-second
+    list, which makes a report row read as if a detector had fired for something
+    it has no class for. ``composed_event_names`` is whatever the composition
+    step produced for this run; anything else is a plain detection.
+    """
+    composed = set(composed_event_names or ())
+    objects, events = [], []
+    for name in names:
+        (events if name in composed else objects).append(str(name))
+    return objects, events
+
+
+def boxes_by_second(bbox_cache: Optional[Iterable[Mapping]]) -> dict:
+    """Index the detector's bbox cache by second.
+
+    The cache is a list of ``{timestamp, objects, bboxes, confidences}`` records
+    with boxes already normalised to ``[x, y, w, h]`` in 0..1 — which is why the
+    report can draw them as a CSS overlay and never needs the frame size or an
+    image library.
+    """
+    out: dict = {}
+    for record in bbox_cache or ():
+        sec = int(float(record.get("timestamp", 0)))
+        names = record.get("objects") or []
+        boxes = record.get("bboxes") or []
+        confs = record.get("confidences") or []
+        for i, box in enumerate(boxes):
+            if box is None or len(box) < 4:
+                continue
+            out.setdefault(sec, []).append({
+                "name": str(names[i]) if i < len(names) else "",
+                "box": [_f(v) for v in list(box)[:4]],
+                "confidence": _f(confs[i]) if i < len(confs) else 0.0,
+            })
+    return out
 
 
 def peak_second(score: np.ndarray, start: float, end: float) -> int:
@@ -93,7 +164,8 @@ def _second_detail(sec: int,
                    actions_by_sec: Optional[Mapping[int, Sequence[tuple]]],
                    percentiles: Optional[Mapping[str, float]],
                    boost_multiplier: float,
-                   min_signals_for_boost: int) -> dict:
+                   min_signals_for_boost: int,
+                   composed_event_names: Optional[Iterable[str]] = None) -> dict:
     """Everything known about one second, as a plain dict."""
     breakdown = {}
     for key, _label in SIGNAL_LABELS:
@@ -103,7 +175,8 @@ def _second_detail(sec: int,
     pre_boost = sum(breakdown.values())
     total = _f(score[sec]) if sec < len(score) else 0.0
 
-    objects = list(object_detections.get(sec, [])) if object_detections else []
+    detected = list(object_detections.get(sec, [])) if object_detections else []
+    objects, events = split_tags(detected, composed_event_names)
 
     actions = []
     raw_actions = actions_by_sec.get(sec, []) if actions_by_sec else []
@@ -139,6 +212,7 @@ def _second_detail(sec: int,
         "pre_boost_score": pre_boost,
         "breakdown": breakdown,
         "objects": objects,
+        "events": events,
         "actions": actions,
         "signals_present": contributing,
         "boost": {
@@ -172,6 +246,9 @@ def build_report(*,
                  min_signals_for_boost: int = 2,
                  near_miss_count: int = DEFAULT_NEAR_MISS_COUNT,
                  thumbnail_fn: Optional[Callable[[float], Optional[bytes]]] = None,
+                 composed_event_names: Optional[Iterable[str]] = None,
+                 waveform: Optional[Sequence] = None,
+                 bbox_cache: Optional[Iterable[Mapping]] = None,
                  ) -> dict:
     """Attribute every kept segment to the evidence that selected it.
 
@@ -182,6 +259,15 @@ def build_report(*,
     ``action_percentiles`` is keyed by action name (the pipeline computes them
     per action type) and is used only to label a confidence tier.
 
+    ``composed_event_names`` lets the report tell a composed event apart from the
+    raw detections it was built out of; see :func:`split_tags`.
+
+    ``waveform`` is the loudness envelope of the whole video — the caller's
+    existing ``extract_waveform_data`` output, either ``(min, max, rms)`` triples
+    or bare amplitudes. It is reported even when audio contributed no points,
+    because "was anything happening acoustically here?" is context the reader
+    wants whether or not the scoring used it.
+
     Near-misses are the highest-scoring seconds *not* covered by any kept
     segment. They are what a user would tune the weights to capture, so they are
     reported alongside the selections rather than hidden.
@@ -189,6 +275,24 @@ def build_report(*,
     score = np.asarray(score, dtype=float)
     segments = [(float(s), float(e)) for s, e in segments]
     segments.sort(key=lambda x: x[0])
+    boxes_at = boxes_by_second(bbox_cache)
+
+    # Flatten the loudness envelope once, at full resolution. Each clip then
+    # takes its own slice of *this* rather than of the page-wide curve: at 480
+    # points a feature-length video gives a 30-second clip about four samples,
+    # which draws as a straight line and says nothing.
+    amps: list = []
+    if waveform is not None:
+        try:
+            first = next(iter(waveform))
+        except StopIteration:
+            first = None
+        if isinstance(first, (tuple, list, np.ndarray)):
+            # (min, max, rms) triples: rms is the perceptual one.
+            amps = [abs(float(p[-1])) for p in waveform]
+        elif first is not None:
+            amps = [abs(float(p)) for p in waveform]
+    amps_per_second = (len(amps) / video_duration) if (amps and video_duration) else 0.0
 
     def detail_for(sec: int) -> dict:
         pcts = None
@@ -198,7 +302,7 @@ def build_report(*,
                 pcts = action_percentiles.get(names[0])
         return _second_detail(sec, score, signals, object_detections,
                               actions_by_sec, pcts, boost_multiplier,
-                              min_signals_for_boost)
+                              min_signals_for_boost, composed_event_names)
 
     covered: set = set()
     entries = []
@@ -206,6 +310,12 @@ def build_report(*,
         sec = peak_second(score, start, end)
         covered.update(range(int(start), int(np.ceil(end))))
         entry = detail_for(sec)
+        if boxes_at.get(sec):
+            entry["boxes"] = boxes_at[sec]
+        if amps_per_second:
+            lo = int(start * amps_per_second)
+            hi = max(lo + 1, int(end * amps_per_second))
+            entry["audio"] = downsample(amps[lo:hi], points=SEGMENT_AUDIO_POINTS)
         entry.update({
             "index": i,
             "start": start,
@@ -235,9 +345,20 @@ def build_report(*,
             if len(near_misses) >= near_miss_count:
                 break
 
+    # What the whole cut was actually built out of. A report where one signal
+    # supplies every point is a report about a misconfigured weight table, and
+    # that is only visible in aggregate.
+    signal_totals = {}
+    for key, _label in SIGNAL_LABELS:
+        total = sum(e["breakdown"].get(key, 0.0) for e in entries)
+        if total:
+            signal_totals[key] = _f(total)
+
+    audio_curve = downsample(amps) if amps else []
+
     kept_duration = sum(e - s for s, e in segments)
     return {
-        "schema": 1,
+        "schema": 2,
         "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "video": {
             "path": str(video_path),
@@ -250,9 +371,41 @@ def build_report(*,
             "coverage_pct": _f(100.0 * kept_duration / video_duration) if video_duration else 0.0,
         },
         "settings": dict(settings or {}),
+        "signal_totals": signal_totals,
+        "curves": {
+            "points": CURVE_POINTS,
+            "score": downsample(score),
+            # Full resolution, not just the drawing. Selection runs off this
+            # array, so keeping it is what lets a later "give me a different
+            # clip" re-choose without the video, the detectors or a re-run —
+            # about 25 KB an hour, against ~400 KB of thumbnails.
+            "score_per_second": [round(float(v), 3) for v in score],
+            "audio": audio_curve,
+            # Per-clip strips are drawn against this, not against their own max,
+            # so a quiet clip reads as quiet instead of being stretched to full
+            # height and looking exactly like the loudest moment in the video.
+            "audio_peak": round(float(max(amps)), 4) if amps else 0.0,
+        },
         "segments": entries,
         "near_misses": near_misses,
     }
+
+
+def score_from_report(report: Mapping) -> np.ndarray:
+    """The per-second score the cut was made from.
+
+    With this and :func:`segments_from_report`, a saved report is enough to
+    re-choose a clip — the selection is arithmetic over this array, so nothing
+    has to be re-detected and the video does not have to be present.
+    """
+    return np.asarray(
+        (report.get("curves") or {}).get("score_per_second") or [], dtype=float
+    )
+
+
+def segments_from_report(report: Mapping) -> list[tuple[float, float]]:
+    """The kept ranges, in the order the record lists them."""
+    return [(float(e["start"]), float(e["end"])) for e in report.get("segments", [])]
 
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +429,8 @@ def render_text(report: Mapping) -> str:
                 out.append(f"    {label}: {value:.1f}")
         if e["objects"]:
             out.append(f"    Objects detected: {', '.join(e['objects'])}")
+        if e.get("events"):
+            out.append(f"    Events composed: {', '.join(e['events'])}")
         for a in e["actions"]:
             tier = f" [{a['tier']}]" if a["tier"] else ""
             out.append(f"    Action: {a['name']} ({a['confidence']:.2f}){tier}")
@@ -296,7 +451,7 @@ def render_text(report: Mapping) -> str:
 
 _CSS = """
 :root{--bg:#141416;--card:#1c1c20;--line:#2a2a30;--text:#e8e8ea;--dim:#9a9aa2;
-      --accent:#5ac8b0;--warm:#e8a33d}
+      --accent:#5ac8b0;--warm:#e8a33d;--cool:#7aa7e8}
 *{box-sizing:border-box}
 body{margin:0;padding:32px 20px;background:var(--bg);color:var(--text);
      font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif}
@@ -310,7 +465,19 @@ h1{font-size:22px;margin:0 0 4px}
 .totals .l{font-size:12px;color:var(--dim)}
 .seg{background:var(--card);border:1px solid var(--line);border-radius:10px;
      padding:16px;margin-bottom:14px;display:flex;gap:16px}
-.seg img{width:160px;height:90px;object-fit:cover;border-radius:6px;flex-shrink:0}
+.shotwrap{width:200px;flex-shrink:0;align-self:flex-start}
+/* The box overlay is positioned against this element, so it must wrap the
+   image and nothing else — a caption inside it would skew every percentage. */
+.shot{position:relative}
+.seg img{width:100%;display:block;border-radius:6px}
+.bx{position:absolute;border:1.5px solid var(--cool);border-radius:2px;
+    pointer-events:none}
+.bx.evt{border-color:var(--warm)}
+.bx b{position:absolute;top:-13px;left:-1.5px;font:9.5px/1.35 ui-monospace,monospace;
+      font-weight:600;background:var(--cool);color:#101014;padding:0 3px;
+      border-radius:2px;white-space:nowrap}
+.bx.evt b{background:var(--warm)}
+.shotlab{color:var(--dim);font-size:11px;margin-top:4px;text-align:center}
 .seg .body{flex:1;min-width:0}
 .rng{font-weight:600}
 .pts{color:var(--accent);font-weight:600}
@@ -320,10 +487,38 @@ h1{font-size:22px;margin:0 0 4px}
 .bar .track{flex:1;height:8px;background:#26262c;border-radius:4px;overflow:hidden}
 .bar .fill{height:100%;background:var(--accent)}
 .bar .val{width:42px;text-align:right;color:var(--dim)}
-.tags{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
+.tags{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.tags .kind{font-size:11px;color:var(--dim);text-transform:uppercase;
+            letter-spacing:.06em;width:56px;flex-shrink:0}
 .tag{font-size:12px;padding:2px 8px;border-radius:999px;
      border:1px solid var(--line);color:var(--dim)}
 .tag.act{border-color:var(--accent);color:var(--accent)}
+.tag.evt{border-color:var(--warm);color:var(--warm)}
+.tag.obj{border-color:var(--cool);color:var(--cool)}
+/* Overview */
+.tl{margin:0 0 28px}
+.tl svg{display:block;width:100%;height:96px}
+.tl .cap{display:flex;justify-content:space-between;color:var(--dim);
+         font-size:11.5px;margin-top:4px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;color:var(--dim);font-size:12px;
+        margin-top:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;
+          margin-right:5px;vertical-align:-1px}
+/* Advisor findings */
+.find{background:var(--card);border:1px solid var(--line);border-left-width:3px;
+      border-radius:8px;padding:12px 14px;margin-bottom:10px}
+.find.sev-high{border-left-color:#e8685d}
+.find.sev-medium{border-left-color:var(--warm)}
+.find.sev-low{border-left-color:var(--cool)}
+.find .fh{font-weight:600;margin-bottom:6px}
+.find .sev{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;
+           color:var(--dim);margin-right:8px}
+.find p{margin:4px 0;font-size:13.5px;color:var(--dim)}
+.find .fix{color:var(--text)}
+.narr{background:#191a1f;border:1px solid var(--line);border-radius:8px;
+      padding:12px 14px;margin-bottom:12px;white-space:pre-wrap;font-size:13.5px}
+.wave{display:block;width:100%;height:34px;margin-top:8px;opacity:.85}
+.wavelab{color:var(--dim);font-size:11.5px;margin-top:2px}
 .boost{margin-top:10px;font-size:12.5px;color:var(--warm)}
 h2{font-size:16px;margin:34px 0 6px}
 .note{color:var(--dim);font-size:13px;margin-bottom:14px}
@@ -331,7 +526,7 @@ table{width:100%;border-collapse:collapse;font-size:13.5px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
 th{color:var(--dim);font-weight:500;font-size:12px}
 .scroll{overflow-x:auto}
-@media(max-width:640px){.seg{flex-direction:column}.seg img{width:100%;height:auto}}
+@media(max-width:640px){.seg{flex-direction:column}.shotwrap{width:100%}}
 """
 
 
@@ -350,6 +545,233 @@ def _bars(entry: Mapping, max_points: float) -> str:
     return "".join(rows)
 
 
+def _area_path(values: Sequence[float], width: float, height: float,
+               baseline: float, peak: Optional[float] = None) -> str:
+    """A closed SVG path for a filled area chart.
+
+    ``peak`` is the value drawn at full height; without one the series is scaled
+    to its own maximum. Passing a shared peak is what makes several strips
+    comparable with each other.
+
+    Fills only, no strokes: the SVG is stretched to page width with
+    ``preserveAspectRatio="none"``, which would smear a stroke into a wedge.
+    """
+    if not values:
+        return ""
+    peak = peak or max(values) or 1.0
+    step = width / max(1, len(values) - 1)
+    points = [
+        f"{i * step:.2f},{baseline - (v / peak) * height:.2f}"
+        for i, v in enumerate(values)
+    ]
+    return f"M0,{baseline:.2f} L" + " L".join(points) + f" L{width:.2f},{baseline:.2f} Z"
+
+
+def _overview(report: Mapping) -> str:
+    """Where the kept moments sit in the video, against the score curve.
+
+    The single most-asked question a highlight raises is "did it look at the
+    whole video, or just one stretch of it?", and no amount of per-segment detail
+    answers it. One strip does.
+    """
+    duration = report["video"]["duration"] or 1.0
+    curves = report.get("curves") or {}
+    score_curve = curves.get("score") or []
+    audio_curve = curves.get("audio") or []
+
+    W, H = 1000.0, 96.0
+    curve_h, band_y, band_h = 56.0, 66.0, 16.0
+
+    parts = [
+        f'<svg viewBox="0 0 {W:.0f} {H:.0f}" preserveAspectRatio="none" '
+        f'role="img" aria-label="Where the highlights fall in the video">'
+    ]
+    if score_curve:
+        parts.append(
+            f'<path d="{_area_path(score_curve, W, curve_h, curve_h + 4)}" '
+            f'fill="#2f3a44"/>'
+        )
+    parts.append(f'<rect x="0" y="{band_y}" width="{W:.0f}" height="{band_h}" '
+                 f'fill="#26262c" rx="3"/>')
+
+    for e in report["segments"]:
+        x = max(0.0, e["start"] / duration * W)
+        w = max(2.0, (e["end"] - e["start"]) / duration * W)
+        parts.append(f'<rect x="{x:.2f}" y="{band_y}" width="{w:.2f}" '
+                     f'height="{band_h}" fill="#5ac8b0"/>')
+    for e in report.get("near_misses", []):
+        x = max(0.0, e["second"] / duration * W)
+        parts.append(f'<rect x="{x:.2f}" y="{band_y}" width="2.5" '
+                     f'height="{band_h}" fill="#e8a33d"/>')
+    parts.append("</svg>")
+
+    mid = format_timestamp(duration / 2)
+    caption = (f'<div class="cap"><span>0:00</span><span>{html.escape(mid)}</span>'
+               f'<span>{html.escape(format_timestamp(duration))}</span></div>')
+
+    wave = ""
+    if audio_curve:
+        wave = (
+            f'<svg class="wave" viewBox="0 0 {W:.0f} 34" preserveAspectRatio="none" '
+            f'role="img" aria-label="Loudness across the video">'
+            f'<path d="{_area_path(audio_curve, W, 30.0, 32.0)}" fill="#3a3a46"/>'
+            f'</svg>'
+            '<div class="wavelab">Loudness across the whole video, on the same '
+            'time axis as the strip above — shown for context whether or not '
+            'audio contributed points.</div>'
+        )
+
+    legend = ('<div class="legend">'
+              '<span><i style="background:#2f3a44"></i>score</span>'
+              '<span><i style="background:#5ac8b0"></i>kept</span>'
+              '<span><i style="background:#e8a33d"></i>scored well, not kept</span>'
+              '</div>')
+
+    return f'<div class="tl">{"".join(parts)}{caption}{wave}{legend}</div>'
+
+
+def _summary(report: Mapping) -> str:
+    """What the whole cut was built out of, by signal."""
+    totals = report.get("signal_totals") or {}
+    if not totals:
+        return ""
+    labels = dict(SIGNAL_LABELS)
+    biggest = max(totals.values()) or 1.0
+    rows = "".join(
+        f'<div class="bar"><span class="lab">'
+        f'{html.escape(labels.get(key, key))}</span>'
+        f'<span class="track"><span class="fill" '
+        f'style="width:{value / biggest * 100.0:.1f}%"></span></span>'
+        f'<span class="val">{value:.0f}</span></div>'
+        for key, value in sorted(totals.items(), key=lambda kv: -kv[1])
+    )
+    note = ""
+    if len(totals) == 1:
+        only = labels.get(next(iter(totals)), next(iter(totals)))
+        note = (f'<p class="note">Every point in this highlight came from '
+                f'<b>{html.escape(only)}</b>. The other signals are switched off '
+                f'or weighted at zero — nothing else could influence the cut.</p>')
+    return f'<h2>What decided the cut</h2>{note}{rows}'
+
+
+def _advice(report: Mapping) -> str:
+    """What to change, if anything diagnosed this run (see modules.advisor)."""
+    findings = report.get("advice") or []
+    if not findings:
+        return ""
+    rows = []
+    for f in findings:
+        severity = str(f.get("severity", "low"))
+        rows.append(
+            f'<div class="find sev-{html.escape(severity)}">'
+            f'<div class="fh"><span class="sev">{html.escape(severity)}</span>'
+            f'{html.escape(str(f.get("title", "")))}</div>'
+            f'<p>{html.escape(str(f.get("detail", "")))}</p>'
+            f'<p class="fix"><b>Try:</b> {html.escape(str(f.get("remedy", "")))}</p>'
+            f'</div>'
+        )
+    narration = ""
+    if report.get("advice_narration"):
+        narration = (f'<div class="narr">'
+                     f'{html.escape(str(report["advice_narration"]))}</div>')
+    return (
+        '<h2>What to try next</h2>'
+        '<p class="note">Worked out from this run\'s own numbers — each point '
+        'below is backed by the figures shown with it, not by a guess about '
+        'what you meant.</p>'
+        f'{narration}{"".join(rows)}'
+    )
+
+
+def _tag_rows(entry: Mapping) -> str:
+    """Tags grouped by what produced them, one row per kind."""
+    groups = (
+        ("objects", "obj", [html.escape(str(o)) for o in entry.get("objects", [])]),
+        ("events", "evt", [html.escape(str(v)) for v in entry.get("events", [])]),
+        ("actions", "act", [
+            f'{html.escape(str(a["name"]))} {a["confidence"]:.2f}'
+            for a in entry.get("actions", [])
+        ]),
+    )
+    rows = []
+    for kind, css, items in groups:
+        if not items:
+            continue
+        tags = "".join(f'<span class="tag {css}">{item}</span>' for item in items)
+        rows.append(f'<div class="tags"><span class="kind">{kind}</span>{tags}</div>')
+    return "".join(rows)
+
+
+def _shot(entry: Mapping, composed: frozenset) -> str:
+    """The thumbnail, with what the detector saw drawn over it.
+
+    Boxes are normalised, so percentage positioning reproduces them at any
+    thumbnail width without the report ever touching an image library.
+    """
+    if not entry.get("thumbnail"):
+        return ""
+    overlay = []
+    for box in entry.get("boxes", []):
+        x, y, w, h = box["box"]
+        if w <= 0 or h <= 0:
+            continue
+        kind = " evt" if box["name"] in composed else ""
+        label = html.escape(box["name"]) if box["name"] else ""
+        overlay.append(
+            f'<span class="bx{kind}" style="left:{x * 100:.1f}%;top:{y * 100:.1f}%;'
+            f'width:{w * 100:.1f}%;height:{h * 100:.1f}%">'
+            f'{f"<b>{label}</b>" if label else ""}</span>'
+        )
+    caption = ('<div class="shotlab">boxes as detected at the peak second</div>'
+               if overlay else "")
+    return (f'<div class="shotwrap"><div class="shot">'
+            f'<img src="{entry["thumbnail"]}" alt="">'
+            f'{"".join(overlay)}</div>{caption}</div>')
+
+
+def _segment_wave(report: Mapping, entry: Mapping) -> str:
+    """The loudness envelope under one clip, with its peak second marked."""
+    curves = report.get("curves") or {}
+    audio = curves.get("audio") or []
+    duration = report["video"]["duration"] or 0.0
+    # The clip's own full-resolution slice when the record has one; the coarse
+    # page-wide curve only as a fallback for an older report.
+    window = entry.get("audio") or []
+    if not window:
+        if not audio or duration <= 0:
+            return ""
+        lo = int(entry["start"] / duration * len(audio))
+        hi = max(lo + 2, int(entry["end"] / duration * len(audio)))
+        window = audio[lo:hi]
+    if not window:
+        return ""
+
+    W = 400.0
+    marker = ""
+    span = entry["end"] - entry["start"]
+    if span > 0:
+        pos = min(1.0, max(0.0, (entry["second"] - entry["start"]) / span))
+        marker = (f'<rect x="{pos * W:.1f}" y="0" width="1.5" height="26" '
+                  f'fill="#5ac8b0" opacity=".8"/>')
+
+    scored = entry["breakdown"].get("audio", 0.0)
+    note = (f"contributed {scored:.0f} points" if scored
+            else "contributed no points to this pick")
+    caption = (
+        f'<div class="wavelab">Loudness through the clip — '
+        f'<b style="color:#5ac8b0">|</b> marks {html.escape(entry["timestamp"])}, '
+        f'the second that scored highest. Volume is drawn for context only and '
+        f'{note}, so a louder stretch elsewhere in the clip did not move it.</div>'
+    )
+    return (
+        f'<svg class="wave" viewBox="0 0 {W:.0f} 26" preserveAspectRatio="none" '
+        f'role="img" aria-label="Loudness during this clip">'
+        f'<path d="{_area_path(window, W, 22.0, 24.0, peak=(curves.get("audio_peak") or None))}" '
+        f'fill="#3a3a46"/>'
+        f'{marker}</svg>{caption}'
+    )
+
+
 def render_html(report: Mapping, title: Optional[str] = None) -> str:
     """A standalone page: inline CSS, embedded thumbnails, nothing fetched."""
     video = report["video"]
@@ -357,16 +779,14 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
     heading = title or f"Why these moments — {video['name']}"
 
     max_points = max([e["score"] for e in report["segments"]] or [1.0])
+    composed = frozenset(
+        name for e in report["segments"] for name in e.get("events", [])
+    )
 
     segs = []
     for e in report["segments"]:
-        thumb = (f'<img src="{e["thumbnail"]}" alt="">' if e.get("thumbnail") else "")
-        tags = "".join(
-            f'<span class="tag">{html.escape(o)}</span>' for o in e["objects"]
-        ) + "".join(
-            f'<span class="tag act">{html.escape(a["name"])} '
-            f'{a["confidence"]:.2f}</span>' for a in e["actions"]
-        )
+        thumb = _shot(e, composed)
+        tags = _tag_rows(e)
         boost = ""
         if e["boost"]["applied"]:
             boost = (f'<div class="boost">Multi-signal boost — '
@@ -379,7 +799,8 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
             f'<div class="meta">peak at {html.escape(e["timestamp"])} · '
             f'{e["duration"]:.0f}s long</div>'
             f'{_bars(e, max_points)}'
-            f'{f"<div class=tags>{tags}</div>" if tags else ""}'
+            f'{tags}'
+            f'{_segment_wave(report, e)}'
             f'{boost}</div></div>'
         )
 
@@ -389,7 +810,8 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
             f'<tr><td>{html.escape(e["timestamp"])}</td>'
             f'<td>{e["score"]:.0f}</td>'
             f'<td>{html.escape(", ".join(e["signals_present"]) or "—")}</td>'
-            f'<td>{html.escape(", ".join(e["objects"]) or "—")}</td></tr>'
+            f'<td>{html.escape(", ".join(e["objects"]) or "—")}</td>'
+            f'<td>{html.escape(", ".join(e.get("events", [])) or "—")}</td></tr>'
             for e in report["near_misses"]
         )
         near = (
@@ -399,7 +821,7 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
             'second scored higher. Raise the weight of a signal below to pull '
             'moments like these in.</p>'
             '<div class="scroll"><table><thead><tr><th>Time</th><th>Points</th>'
-            '<th>Signals</th><th>Objects</th></tr></thead>'
+            '<th>Signals</th><th>Objects</th><th>Events</th></tr></thead>'
             f'<tbody>{rows}</tbody></table></div>'
         )
 
@@ -424,6 +846,15 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
   <div><span class="n">{totals["duration"]:.0f}s</span><span class="l">total length</span></div>
   <div><span class="n">{totals["coverage_pct"]:.1f}%</span><span class="l">of the source</span></div>
 </div>
+{_overview(report)}
+{_advice(report)}
+{_summary(report)}
+<h2>The moments, in order</h2>
+<p class="note">One row per clip that was kept. The bars are the points that
+second earned, broken down by signal; the tags are what was detected there,
+grouped by what produced them — <b>objects</b> come straight from the detector,
+<b>events</b> are combinations the composition rules recognised, <b>actions</b>
+come from the action model with their confidence.</p>
 {"".join(segs)}
 {near}
 {settings}

@@ -20,6 +20,7 @@ from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 from modules.video_cutter import cut_video
 from modules.auto_segments import build_auto_segments
+from modules.highlight_select import peak_confidence_by_sec, select_fixed_window_segments
 from modules.device_utils import resolve_yolo_device
 from modules.app_paths import ffmpeg_exe
 
@@ -442,6 +443,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         MAX_DURATION = gui_config.get("max_duration") or config.get("highlights", {}).get("max_duration", 420)
         EXACT_DURATION = gui_config.get("exact_duration") or config.get("highlights", {}).get("exact_duration", None)
         CLIP_TIME = gui_config.get("clip_time") or config.get("highlights", {}).get("clip_time", 10)
+        # 0.0 = take the best-scoring moments wherever they fall (the original
+        # behaviour); 1.0 = spread the cut evenly so the whole video is covered.
+        COVERAGE = gui_config.get("coverage")
+        if COVERAGE is None:
+            COVERAGE = config.get("highlights", {}).get("coverage", 0.0)
+        COVERAGE = float(COVERAGE)
         KEEP_TEMP = gui_config.get("keep_temp", config.get("highlights", {}).get("keep_temp", False))
         # How the final clips are cut/encoded: "cpu" (libx265/libx264 re-encode,
         # VR-safe, slow) or "gpu" (hardware re-encode, fast, may not play in some
@@ -1057,6 +1064,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # --- Object detection ---
         object_bboxes_cache = []  # default so cache save never NameErrors when objects are skipped
         composed_event_names = []  # same reason: set only when the engine runs
+        if using_cache:
+            # The engine does not re-run on a cached pass, so without this the
+            # report has no way to tell a composed event from the detections it
+            # was composed from, and labels every one of them an object.
+            composed_event_names = list(
+                (cached_data or {}).get("composed_event_names") or [])
         if not using_cache:
             if not highlight_objects:
                 log("ℹ Skipping object detection (no objects to highlight)")
@@ -1789,57 +1802,18 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             )
             
         else:
-            # ========== FIXED-WINDOW MODE (original logic) ==========
-            # Only use scored seconds depending on mode
-            if duration_mode == "EXACT":
-                candidate_indices = np.arange(len(score))
-            else:
-                candidate_indices = np.where(score > 0)[0]
-
-            candidate_scores = score[candidate_indices]
-
-            candidate_confidences = np.zeros(len(candidate_indices))
-            for idx, sec in enumerate(candidate_indices):
-                if sec in detections_by_sec:
-                    candidate_confidences[idx] = max(conf for _, conf in detections_by_sec[sec])
-
-            sorted_indices = np.lexsort((-candidate_confidences, -candidate_scores))
-            top_indices_all = candidate_indices[sorted_indices]
-
-            segments = []
-            used_seconds = set()
-
-            for sec in top_indices_all:
-                if sec in used_seconds:
-                    continue
-
-                start = max(0, sec - CLIP_TIME // 2)
-                end = min(video_duration, start + CLIP_TIME)
-
-                if end - start < CLIP_TIME and end < video_duration:
-                    end = min(video_duration, start + CLIP_TIME)
-                if end - start < CLIP_TIME and start > 0:
-                    start = max(0, end - CLIP_TIME)
-
-                if any(s in used_seconds for s in range(int(start), int(end))):
-                    continue
-
-                current_duration = sum(e - s for s, e in segments)
-                remaining = target_duration - current_duration
-                if remaining <= 0:
-                    break
-                if end - start > remaining:
-                    end = start + remaining
-
-                segments.append((start, end))
-                for s in range(int(start), int(end)):
-                    used_seconds.add(s)
-
-                current_duration = sum(e - s for s, e in segments)
-                if duration_mode == "EXACT" and current_duration >= EXACT_DURATION:
-                    break
-                elif duration_mode == "MAX" and current_duration >= MAX_DURATION:
-                    break
+            # ========== FIXED-WINDOW MODE ==========
+            segments = select_fixed_window_segments(
+                score,
+                video_duration=video_duration,
+                clip_time=CLIP_TIME,
+                target_duration=target_duration,
+                duration_mode=duration_mode,
+                confidence_by_sec=peak_confidence_by_sec(detections_by_sec),
+                coverage=COVERAGE,
+            )
+            if COVERAGE > 0:
+                log(f"🎞️ Coverage {COVERAGE:.0%} → spreading clips across the video")
 
         # Sort segments by start time (both modes)
         segments.sort(key=lambda x: x[0])
@@ -1918,10 +1892,21 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         "action_points": ACTION_POINTS,
                         "multi_signal_boost": MULTI_SIGNAL_BOOST,
                         "min_signals_for_boost": MIN_SIGNALS_FOR_BOOST,
+                        "coverage": COVERAGE,
                     },
                     boost_multiplier=MULTI_SIGNAL_BOOST,
                     min_signals_for_boost=MIN_SIGNALS_FOR_BOOST,
                     thumbnail_fn=_thumb,
+                    # So the page can tell a composed event apart from the raw
+                    # detections it was composed from — they arrive in one list.
+                    composed_event_names=composed_event_names,
+                    # Already extracted for the timeline viewer; reporting it
+                    # costs nothing and gives every clip its acoustic context,
+                    # even when audio scored no points.
+                    waveform=waveform_data,
+                    # Already normalised to 0..1, so the page draws them over the
+                    # thumbnail in CSS — no second encode, no bigger images.
+                    bbox_cache=object_bboxes_cache,
                 )
 
                 base = os.path.splitext(OUTPUT_FILE)[0] if OUTPUT_FILE else \
