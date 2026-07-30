@@ -74,6 +74,7 @@ class SignalLabelPanel(QWidget):
         "HIGHLIGHTS":     lambda scene: scene._nav_timestamps_highlights(),
         "TRANSCRIPT":     lambda scene: scene._nav_timestamps_transcript(),
         "VISUAL SEARCH":  lambda scene: scene._nav_timestamps_visual_search(),
+        "EVENTS":         lambda scene: scene._nav_timestamps_events(),
     }
 
     _ARROW_W = 14   # px reserved for each arrow
@@ -1279,6 +1280,121 @@ class SignalTimelineWindow(QMainWindow):
             self.visual_query_checkboxes[query] = checkbox
 
         self._apply_visual_query_fold()
+
+    def refresh_event_checkboxes(self):
+        """One checkbox per composed event, nested under the EVENTS layer.
+
+        The scene already filters bars and ◀ ▶ navigation by visible_events; this
+        is the control for it in the Layers panel, alongside the Advanced
+        dialog's Events tab (both drive the same scene state).
+        """
+        box = getattr(self, '_event_box', None)
+        scene = getattr(self, 'signal_scene', None)
+        if box is None or scene is None:
+            return
+
+        layout = box.layout()
+        while layout.count():                       # drop the previous rows
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.event_checkboxes = {}
+
+        events = list(getattr(scene, 'event_types', []) or [])
+        if events:
+            layout.addWidget(self._build_event_header())
+
+        # Seconds per event, counted from the cache rather than from the drawn
+        # bars — a hidden event still needs its count shown.
+        counts = {}
+        for item in (scene.cache_data.get('objects') or []):
+            for name in (item.get('objects') or []):
+                if isinstance(name, str):
+                    n = name.strip().title()
+                    if n in events:
+                        counts[n] = counts.get(n, 0) + 1
+
+        for event in events:
+            checkbox = QCheckBox(f"{event.replace('_', ' ')} ({counts.get(event, 0)}s)")
+            checkbox.setChecked(scene.visible_events.get(event, True))
+            checkbox.setToolTip(
+                f"Show the '{event}' row, and let ◀ ▶ stop on it")
+            # setChecked runs before this connect, so it can't fire the toggle.
+            checkbox.stateChanged.connect(
+                lambda state, e=event: self._toggle_event(e, state)
+            )
+            layout.addWidget(checkbox)
+            self.event_checkboxes[event] = checkbox
+
+        self._apply_event_fold()
+
+    def _build_event_header(self) -> QWidget:
+        """'Show: all / none' quick toggles above the event list."""
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 0, 0, 2)
+        hl.setSpacing(6)
+        label = QLabel("Show:")
+        label.setStyleSheet("color:#888;font-size:8pt;")
+        hl.addWidget(label)
+        all_btn = self._mini_button("all", "Show every event")
+        all_btn.setFixedSize(24, 16)
+        all_btn.clicked.connect(lambda: self._set_all_event_rows(True))
+        hl.addWidget(all_btn)
+        none_btn = self._mini_button("none", "Hide every event")
+        none_btn.setFixedSize(30, 16)
+        none_btn.clicked.connect(lambda: self._set_all_event_rows(False))
+        hl.addWidget(none_btn)
+        hl.addStretch()
+        return header
+
+    def _apply_event_fold(self):
+        """Show/hide the event list, keeping the collapsed row honest — a hidden
+        event with the list folded would otherwise look like a broken panel, so
+        the caret carries the count whenever something is hidden."""
+        box = getattr(self, '_event_box', None)
+        fold = getattr(self, '_event_fold', None)
+        if box is None or fold is None:
+            return
+        boxes = getattr(self, 'event_checkboxes', {})
+        expanded = getattr(self, '_event_rows_expanded', True)
+
+        box.setVisible(bool(boxes) and expanded)
+        fold.setVisible(bool(boxes))
+        shown = sum(1 for cb in boxes.values() if cb.isChecked())
+        total = len(boxes)
+        if expanded:
+            fold.setText("▾")
+            fold.setToolTip("Hide the event list")
+        else:
+            fold.setText("▸" if shown == total else f"▸ {shown}/{total}")
+            fold.setToolTip(f"Show the event list ({shown}/{total} visible)")
+
+    def _toggle_event_fold(self):
+        self._event_rows_expanded = not getattr(self, '_event_rows_expanded', True)
+        self._apply_event_fold()
+
+    def _toggle_event(self, event: str, state):
+        visible = (state == Qt.CheckState.Checked.value)
+        self.signal_scene.set_event_filter(event, visible)
+        self._apply_event_fold()      # the collapsed caret tracks the count
+        pretty = event.replace('_', ' ')
+        self.statusBar().showMessage(
+            f"Showing '{pretty}'" if visible
+            else f"Hiding '{pretty}' — ◀ ▶ now skip it",
+            2000,
+        )
+
+    def _set_all_event_rows(self, visible: bool):
+        """Show or hide every event at once — one rebuild, not one per event."""
+        self.signal_scene.set_all_events_visible(visible)
+        self.refresh_event_checkboxes()
+        self.statusBar().showMessage(
+            "Showing all events" if visible
+            else "Hid all events — ◀ ▶ have nothing to step",
+            2000,
+        )
 
     def _mini_button(self, text: str, tooltip: str) -> QPushButton:
         """A bare, caret-sized button — the app theme's QPushButton is too heavy
@@ -2500,6 +2616,9 @@ class SignalTimelineWindow(QMainWindow):
             cb.setToolTip("")
             cb.blockSignals(False)
         self.signal_scene.reload_cache_data(self.cache_data)  # re-extract + rebuild
+        # A composition run can introduce events that did not exist when the
+        # Layers panel was built, so its nested list has to be rebuilt too.
+        self.refresh_event_checkboxes()
         if hasattr(self, "label_panel"):
             self.label_panel.refresh_labels()
 
@@ -2858,6 +2977,34 @@ class SignalTimelineWindow(QMainWindow):
             )
             self.layer_checkboxes[layer_name] = checkbox
 
+            if layer_name == 'events':
+                # Same shape as Visual Search below: the layer checkbox means
+                # "show the group", the caret expands a checkbox per composed
+                # event. Built here rather than only in the Advanced dialog
+                # because these are rows on the timeline, and the Layers panel is
+                # where rows get shown and hidden.
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(4)
+                row_layout.addWidget(checkbox)
+                row_layout.addStretch()
+                self._event_fold = self._mini_button("▾", "Hide the event list")
+                self._event_fold.setFixedSize(34, 16)
+                self._event_fold.setVisible(False)   # nothing to fold until rules run
+                self._event_fold.clicked.connect(self._toggle_event_fold)
+                row_layout.addWidget(self._event_fold)
+                layer_layout.addWidget(row)
+
+                self._event_rows_expanded = True
+                self._event_box = QWidget()
+                ev_layout = QVBoxLayout(self._event_box)
+                ev_layout.setContentsMargins(18, 0, 0, 0)   # reads as a child row
+                ev_layout.setSpacing(2)
+                self._event_box.setVisible(False)
+                layer_layout.addWidget(self._event_box)
+                continue
+
             if layer_name != 'visual_search':
                 layer_layout.addWidget(checkbox)
                 continue
@@ -2903,6 +3050,7 @@ class SignalTimelineWindow(QMainWindow):
         layer_group.setContentLayout(layer_layout)
         layout.addWidget(layer_group)
         self.refresh_visual_query_checkboxes()
+        self.refresh_event_checkboxes()
 
         # Avoid ranges — exclude a dragged-selection range from highlight selection
         avoid_group = CollapsibleSection(
@@ -3057,8 +3205,16 @@ class SignalTimelineWindow(QMainWindow):
             
             action_text = f"{len(visible_actions)}/{total_actions} actions"
             object_text = f"{len(visible_objects)}/{total_objects} objects"
-            
-            self.filter_summary.setText(f"Showing: {action_text}, {object_text}")
+
+            parts = [action_text, object_text]
+            # Only mentioned when the video actually has composed events, so the
+            # summary doesn't read "0/0 events" for everyone who never used rules.
+            events = getattr(self.signal_scene, 'visible_events', {})
+            if events:
+                shown = sum(1 for v in events.values() if v)
+                parts.append(f"{shown}/{len(events)} events")
+
+            self.filter_summary.setText("Showing: " + ", ".join(parts))
             self.confidence_label.setText(f"Actions: {self.signal_scene.min_action_confidence:.0%} | Objects: {self.signal_scene.min_object_confidence:.0%}")
 
             # Show which specific filters are active
@@ -3798,21 +3954,26 @@ class SignalTimelineWindow(QMainWindow):
     def on_filter_dialog_closed(self):
         """Update filter summary when dialog closes"""
         self.update_filter_summary()
+        # The dialog's Events tab writes the same scene state as the Layers
+        # panel's nested checkboxes, so re-read it or the two disagree.
+        self.refresh_event_checkboxes()
     
     def show_all_filters(self):
-        """Show all actions and objects with full confidence range"""
+        """Show all actions, objects and composed events, full confidence range"""
         if hasattr(self, 'signal_scene'):
             self.signal_scene.set_all_actions_visible(True)
             self.signal_scene.set_all_objects_visible(True)
+            self.signal_scene.set_all_events_visible(True)
             self.signal_scene.set_action_confidence_filter(0.0, 1.0)
             self.signal_scene.set_object_confidence_filter(0.0, 1.0)
             self.update_filter_summary()
     
     def hide_all_filters(self):
-        """Hide all actions and objects"""
+        """Hide all actions, objects and composed events"""
         if hasattr(self, 'signal_scene'):
             self.signal_scene.set_all_actions_visible(False)
             self.signal_scene.set_all_objects_visible(False)
+            self.signal_scene.set_all_events_visible(False)
             self.update_filter_summary()
     
     def update_filter_summary(self):
@@ -3826,8 +3987,16 @@ class SignalTimelineWindow(QMainWindow):
             
             action_text = f"{len(visible_actions)}/{total_actions} actions"
             object_text = f"{len(visible_objects)}/{total_objects} objects"
-            
-            self.filter_summary.setText(f"Showing: {action_text}, {object_text}")
+
+            parts = [action_text, object_text]
+            # Only mentioned when the video actually has composed events, so the
+            # summary doesn't read "0/0 events" for everyone who never used rules.
+            events = getattr(self.signal_scene, 'visible_events', {})
+            if events:
+                shown = sum(1 for v in events.values() if v)
+                parts.append(f"{shown}/{len(events)} events")
+
+            self.filter_summary.setText("Showing: " + ", ".join(parts))
             
             # Show which specific filters are active
             if len(visible_actions) < total_actions or len(visible_objects) < total_objects:

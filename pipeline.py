@@ -209,7 +209,8 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                          motion_events, motion_peaks, audio_peaks, source_lang="en",
                          waveform_data=None, keyword_segments_only=False,
                          search_keywords=None, keyword_matches=None, action_bboxes=None,
-                         object_bboxes=None, action_detections_all=None):
+                         object_bboxes=None, action_detections_all=None,
+                         composed_event_names=None):
     """
     Collect all analysis results into a structured dictionary for caching.
 
@@ -312,6 +313,16 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
         analysis_data["action_bboxes"] = action_bboxes
     if object_bboxes:
         analysis_data["object_bboxes"] = object_bboxes
+
+    # Which names in `objects` were produced by composition rules rather than
+    # detected. Only the names are stored, not a second copy of the per-second
+    # data: composed events have to live in `objects` to be scored at all
+    # (object scoring counts names found there), so duplicating them would give
+    # two sources of truth that could disagree. This list is what lets the
+    # timeline separate derived events from real detections — without it they are
+    # indistinguishable once merged.
+    if composed_event_names:
+        analysis_data["composed_event_names"] = sorted(set(composed_event_names))
 
     return analysis_data
 
@@ -1045,6 +1056,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- Object detection ---
         object_bboxes_cache = []  # default so cache save never NameErrors when objects are skipped
+        composed_event_names = []  # same reason: set only when the engine runs
         if not using_cache:
             if not highlight_objects:
                 log("ℹ Skipping object detection (no objects to highlight)")
@@ -1133,6 +1145,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     rules_path = composition_rules_path()
                     if rules_path and object_bboxes_cache:
                         engine = CompositionEngine(rules_path)
+                        # Recorded even when nothing matched: these names are
+                        # derived whether or not they fired, and the timeline uses
+                        # the list to tell events apart from real detections.
+                        composed_event_names = list(engine.event_names)
                         composed_det, composed_bb = engine.run(object_bboxes_cache)
                         if composed_det:
                             for sec, names in composed_det.items():
@@ -1428,6 +1444,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     keyword_matches=keyword_matches,
                     action_bboxes=action_bboxes_cache,
                     object_bboxes=object_bboxes_cache,
+                    composed_event_names=composed_event_names,
                 )
                 
                 # Add analysis parameters for future validation

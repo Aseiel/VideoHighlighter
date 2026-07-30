@@ -13,6 +13,11 @@ from PySide6.QtGui import (
 
 class SignalTimelineScene(QGraphicsScene):
     """Improved graphics scene with filtering capabilities"""
+
+    # Seconds of gap tolerated inside one composed-event run before it is split
+    # into two bars. Object detection may sample coarser than once per second,
+    # so a strict "consecutive" test would shatter a continuous event.
+    EVENT_RUN_GAP = 2.0
     
     time_clicked = Signal(float)
     time_dragged = Signal(float)
@@ -66,10 +71,15 @@ class SignalTimelineScene(QGraphicsScene):
         # Extract action and object types for better organization
         self.action_types = self._extract_action_types()
         self.object_classes = self._extract_object_classes()
-        
+        # Composition-rule events, split out of the object classes above so they
+        # get their own filterable group instead of being mixed in with real
+        # detections.
+        self.event_types = self._extract_event_types()
+
         # FILTERS: Track which actions/objects are visible
         self.visible_actions = {action: True for action in self.action_types}
         self.visible_objects = {obj: True for obj in self.object_classes}
+        self.visible_events = {ev: True for ev in self.event_types}
         
         # Confidence filters — separate for actions and objects
         self.min_action_confidence = 0.0
@@ -91,6 +101,7 @@ class SignalTimelineScene(QGraphicsScene):
             ('transcript', ['Transcript']),
             ('actions', [f"Action: {a}" for a in self.action_types]),
             ('objects', [f"Object: {o}" for o in self.object_classes]),
+            ('events', [f"Event: {e}" for e in self.event_types]),
             ('visual_search', [f"Search: {q}" for q in self.visual_queries]),
             ('scenes', ['Scenes']),
             ('motion', ['Motion Events', 'Motion Peaks']),
@@ -107,6 +118,8 @@ class SignalTimelineScene(QGraphicsScene):
                     key = 'actions'
                 elif 'object:' in key:
                     key = 'objects'
+                elif 'event:' in key:
+                    key = 'events'
                 elif 'search:' in key:
                     key = 'visual_search'
                 elif 'final highlights' in key.lower():
@@ -115,6 +128,9 @@ class SignalTimelineScene(QGraphicsScene):
 
         # Always make visual_search toggleable, even when no findings yet
         self.visible_layers.setdefault('visual_search', True)
+        # Events appear only once composition rules have run — keep the toggle
+        # present either way so it doesn't pop in and out of the Layers panel.
+        self.visible_layers.setdefault('events', True)
         # Waveform is a regular layer — visible by default when data exists
         self.visible_layers['waveform'] = bool(self.waveform)
         
@@ -134,6 +150,9 @@ class SignalTimelineScene(QGraphicsScene):
         # Create color palettes
         self.action_colors = self._color_palette(len(self.action_types), start_hue=100)
         self.object_colors = self._color_palette(len(self.object_classes), start_hue=340)
+        # Distinct hue band from objects (340) so a derived event never looks like
+        # a detection at a glance — that distinction is the point of the group.
+        self.event_colors = self._color_palette(len(self.event_types), start_hue=45)
         
         # Merge threshold (seconds) — 0 = no merging
         self.merge_threshold = 0.0
@@ -332,14 +351,48 @@ class SignalTimelineScene(QGraphicsScene):
                 actions.add(name.strip().title())
         return sorted(list(actions)) if actions else ['Unknown']
     
+    def _composed_names_normalised(self) -> set:
+        """Composition-rule event names from the cache, normalised the same way
+        object names are, so the two can be compared.
+
+        Composed events live inside `objects` because that is what object scoring
+        reads — so without this list a derived event is indistinguishable from a
+        detected class, and they end up mixed together in one OBJECTS group.
+        """
+        return {str(n).strip().title()
+                for n in (self.cache_data.get('composed_event_names') or [])
+                if isinstance(n, str) and str(n).strip()}
+
     def _extract_object_classes(self):
-        """Extract unique object classes from cache data"""
+        """Unique object classes from the cache, EXCLUDING composed events —
+        those get their own group (see _extract_event_types)."""
+        composed = self._composed_names_normalised()
         objs = set()
         for item in self.cache_data.get('objects', []):
             for obj in item.get('objects', []):
                 if isinstance(obj, str):
-                    objs.add(obj.strip().title())
+                    name = obj.strip().title()
+                    if name not in composed:
+                        objs.add(name)
         return sorted(list(objs)) if objs else ['Unknown']
+
+    def _extract_event_types(self):
+        """Composed event names that actually occur in the cache.
+
+        Filtered to what occurred rather than every rule name, so a rule that
+        matched nothing does not leave an empty row on the timeline.
+        """
+        composed = self._composed_names_normalised()
+        if not composed:
+            return []
+        seen = set()
+        for item in self.cache_data.get('objects', []):
+            for obj in item.get('objects', []):
+                if isinstance(obj, str):
+                    name = obj.strip().title()
+                    if name in composed:
+                        seen.add(name)
+        return sorted(seen)
     
     def reload_cache_data(self, cache_data=None):
         """Re-ingest cache_data after an on-demand analysis added detections.
@@ -354,12 +407,19 @@ class SignalTimelineScene(QGraphicsScene):
 
         prev_actions = getattr(self, "visible_actions", {})
         prev_objects = getattr(self, "visible_objects", {})
+        prev_events = getattr(self, "visible_events", {})
 
         self.action_types = self._extract_action_types()
         self.object_classes = self._extract_object_classes()
+        self.event_types = self._extract_event_types()
         # Keep prior show/hide for types that persist; default new ones to shown.
         self.visible_actions = {a: prev_actions.get(a, True) for a in self.action_types}
         self.visible_objects = {o: prev_objects.get(o, True) for o in self.object_classes}
+        self.visible_events = {e: prev_events.get(e, True) for e in self.event_types}
+        # Palettes are indexed by position in these lists, so they have to be
+        # rebuilt alongside them or colours shift onto the wrong rows.
+        self.object_colors = self._color_palette(len(self.object_classes), start_hue=340)
+        self.event_colors = self._color_palette(len(self.event_types), start_hue=45)
 
         self.build_timeline()
 
@@ -542,6 +602,11 @@ class SignalTimelineScene(QGraphicsScene):
             'highlights': self._nav_timestamps_highlights,
             'transcript': self._nav_timestamps_transcript,
             'visual_search': self._nav_timestamps_visual_search,
+            # NOT _nav_timestamps_events: that honours visible_events, so hiding
+            # every event would make the layer report "no detections", get
+            # switched off automatically, and be labelled as having no data. This
+            # question is whether the DATA exists, not whether it is on screen.
+            'events': lambda: self.event_types,
         }.get(key)
         if nav is None:
             return True  # unknown layer → leave it visible
@@ -549,6 +614,22 @@ class SignalTimelineScene(QGraphicsScene):
             return bool(nav())
         except Exception:
             return True
+
+    def _nav_timestamps_events(self):
+        """Timestamps of currently-visible composed events, so ◀ ▶ navigation and
+        the layer's has-data check match the bars actually drawn."""
+        composed = self._composed_names_normalised()
+        if not composed:
+            return []
+        ts = []
+        for item in self.cache_data.get('objects', []):
+            for name in item.get('objects', []):
+                if isinstance(name, str):
+                    n = name.strip().title()
+                    if n in composed and self.visible_events.get(n, True):
+                        ts.append(item.get('timestamp', 0))
+                        break
+        return sorted(ts)
 
     def _nav_timestamps_visual_search(self):
         """Timestamps of currently-visible visual-search findings (same query +
@@ -670,6 +751,25 @@ class SignalTimelineScene(QGraphicsScene):
                 'objects': self.visible_objects.copy()
             })
 
+    def set_event_filter(self, event_name, visible):
+        """Set visibility for a single composed event row."""
+        if event_name in self.visible_events:
+            self.visible_events[event_name] = visible
+            self.save_filters()
+            self.build_timeline()
+            self.filter_changed.emit({
+                'actions': self.visible_actions.copy(),
+                'objects': self.visible_objects.copy(),
+                'events': self.visible_events.copy(),
+            })
+
+    def set_all_events_visible(self, visible):
+        """Set every composed event visible or hidden."""
+        for event in self.visible_events:
+            self.visible_events[event] = visible
+        self.save_filters()
+        self.build_timeline()
+
     def set_all_actions_visible(self, visible):
         """Set all actions visible or hidden"""
         for action in self.visible_actions:
@@ -738,6 +838,8 @@ class SignalTimelineScene(QGraphicsScene):
                     key = 'actions'
                 elif 'object:' in key:
                     key = 'objects'
+                elif 'event:' in key:
+                    key = 'events'
                 elif 'search:' in key:
                     key = 'visual_search'
                 elif 'final highlights' in key.lower():
@@ -779,6 +881,11 @@ class SignalTimelineScene(QGraphicsScene):
             current_y = self.draw_improved_objects_layer(current_y)
 
         # Layer 3.5: Visual Search Findings (LLM scans / Visual Search panel)
+        # Layer 3.4: Composition-rule events — kept adjacent to objects, since
+        # that is what they are derived from.
+        if self.visible_layers.get('events', True) and self.event_types:
+            current_y = self.draw_events_layer(current_y)
+
         if self.visible_layers.get('visual_search', True) and self.visual_findings:
             current_y = self.draw_visual_findings_layer(current_y)
         
@@ -1101,6 +1208,87 @@ class SignalTimelineScene(QGraphicsScene):
         
         return y_pos + self.layer_height + self.layer_spacing
     
+    def draw_events_layer(self, y_pos):
+        """Draw composition-rule events as their own group, one row per event.
+
+        Reads the same `objects` list as the object layer — composed events have
+        to live there to be scored — but shows only the names the cache marks as
+        derived, which the object layer correspondingly excludes. No confidence
+        filter is applied: an event is a rule either holding or not, so the
+        confidence sliders (which threshold detector scores) do not apply to it.
+        """
+        self.row_labels.append(("EVENTS", y_pos))
+
+        composed = self._composed_names_normalised()
+        groups = defaultdict(list)
+        for obj_data in self.cache_data.get('objects', []):
+            timestamp = obj_data.get('timestamp', 0)
+            for name in obj_data.get('objects', []):
+                if not isinstance(name, str):
+                    continue
+                name = name.strip().title()
+                if name in composed and self.visible_events.get(name, True):
+                    groups[name].append(timestamp)
+
+        if not groups:
+            text = self.addText("(no composed events)", QFont("Arial", 9))
+            text.setPos(150, y_pos + 15)
+            text.setDefaultTextColor(QColor(150, 150, 150))
+            return y_pos + self.layer_height + self.layer_spacing
+
+        type_height = self.layer_height // max(1, len(groups))
+        current_type_y = y_pos
+
+        for event_type, timestamps in sorted(groups.items()):
+            try:
+                color = self.event_colors[self.event_types.index(event_type)]
+            except (ValueError, IndexError):
+                color = QColor(230, 170, 60)
+
+            # Group consecutive seconds into runs. A rule is evaluated per
+            # sampled second, so adjacent hits are one continuous event and
+            # drawing them as separate one-second bars misrepresents it. Done
+            # here rather than via _merge_intervals because that honours
+            # self.merge_threshold, which defaults to 0 (no merging) and is a
+            # display preference for detections — event contiguity is not
+            # optional. The tolerance absorbs sampling gaps when object detection
+            # ran with a frame skip coarser than one second.
+            merged = []
+            run_start = run_end = None
+            for t in sorted(timestamps):
+                if run_start is None:
+                    run_start, run_end = t, t
+                elif t - run_end <= self.EVENT_RUN_GAP:
+                    run_end = t
+                else:
+                    merged.append((run_start, run_end + 1.0, {}))
+                    run_start, run_end = t, t
+            if run_start is not None:
+                merged.append((run_start, run_end + 1.0, {}))
+
+            # Underscores are how rules are named in YAML but read badly as a
+            # label; the visibility key stays the normalised name.
+            pretty = event_type.replace('_', ' ')
+            for start, end, meta in merged:
+                span = end - start
+                bar_label = f"{pretty} ({span:.0f}s)" if span > 1.5 else pretty
+                bar = TimelineBar(
+                    start, end,
+                    current_type_y, type_height,
+                    color, bar_label,
+                    confidence=1.0,
+                    metadata={'type': event_type, 'composed': True,
+                              'duration': span}
+                )
+                # draw_bar() already appends to self.bars; the other layers pair
+                # it with a second append and so register every bar twice. Not
+                # replicated here.
+                self.draw_bar(bar)
+
+            current_type_y += type_height
+
+        return y_pos + self.layer_height + self.layer_spacing
+
     def draw_scenes_layer(self, y_pos):
         """Draw scene changes with improved labeling"""
         self.row_labels.append(("SCENES", y_pos))
@@ -1716,6 +1904,7 @@ class SignalTimelineScene(QGraphicsScene):
             "max_object_confidence": self.max_object_confidence,
             "visible_actions": self.visible_actions,
             "visible_objects": self.visible_objects,
+            "visible_events": self.visible_events,
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -1743,6 +1932,10 @@ class SignalTimelineScene(QGraphicsScene):
             for k in self.visible_objects:
                 if k in saved_objects:
                     self.visible_objects[k] = bool(saved_objects[k])
+            saved_events = data.get("visible_events", {})
+            for k in self.visible_events:
+                if k in saved_events:
+                    self.visible_events[k] = bool(saved_events[k])
         except FileNotFoundError:
             pass
         except Exception as e:
