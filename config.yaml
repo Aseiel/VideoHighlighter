@@ -1,12 +1,30 @@
 video:
-  path: ''
+  paths: []
+download:
+  last_url: ''
+  save_dir: D:\movies
+  auto_add: true
+  auto_combine: true
+  download_mode: full
+  process_mode: immediate
+  concurrent_downloads: 1
+  time_range_start: 0
+  time_range_end: 300
 highlights:
   clip_time: 10
-  output: ''
+  # 0.0 = best moments wherever they fall, 1.0 = spread evenly over the video
+  coverage: 0.0
+  output: highlight.mp4
   max_duration: 420
   exact_duration: 0
   keep_temp: false
-  skip_highlights: false
+  render_mode: cpu
+  auto_min_clip: 2
+  auto_max_clip: 30
+  auto_merge_gap: 2
+  use_time_range: false
+  range_start_pct: 0
+  range_end_pct: 100
 scoring:
   scene_points: 0
   motion_event_points: 0
@@ -16,18 +34,25 @@ scoring:
   transcript_points: 0
   object_points: 0
   action_points: 0
+  beginning_points: 0
+  ending_points: 0
+  beginning_seconds: 60
+  ending_seconds: 120
   multi_signal_boost: 1.2
   min_signals_for_boost: 2
 actions:
   interesting: []
+  require_objects: false
 objects:
   interesting: []
+  confidence: 30
 keywords:
   transcript_file: transcript.txt
   interesting: []
 transcript:
   enabled: false
   model: base
+  source_lang: en
   search_keywords: []
 subtitles:
   enabled: false
@@ -35,6 +60,19 @@ subtitles:
   target_lang: pl
 advanced:
   frame_skip: 5
+  vr_mode: false
   object_frame_skip: 10
-  yolo_pt_path: ''
-  openvino_model_folder: ''
+  sample_rate: 5
+  yolo_type: custom
+  yolo_model_size: n
+  yolo_custom_model_path: D:\VideoHighlighter\models\custom\best.pt
+  action_backend: auto
+  r3d_model: r3d_18
+  action_models: intel_only
+visualization:
+  draw_object_boxes: false
+  draw_action_labels: false
+avoid:
+  face_recognition_enabled: false
+ui:
+  suppress_no_cache_warning: true

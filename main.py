@@ -1399,6 +1399,38 @@ class VideoHighlighterGUI(QWidget):
         duration_form.addRow("Exact duration (s, 0 = off):", self.spin_exact_duration)
         duration_form.addRow("Clip time (s, 0 = auto):", self.spin_clip_time)
 
+        # ── Best moments <-> Full story ──
+        # How far the cut is allowed to follow the score. Left, it takes the
+        # highest-scoring moments wherever they are, which on a video whose
+        # action is concentrated can mean the whole cut comes from one stretch.
+        # Right, every part of the video contributes.
+        self.slider_coverage = QSlider(Qt.Horizontal)
+        self.slider_coverage.setRange(0, 100)
+        self.slider_coverage.setValue(int(round(float(highlights_cfg.get("coverage", 0.0)) * 100)))
+        self.slider_coverage.setTickPosition(QSlider.TicksBelow)
+        self.slider_coverage.setTickInterval(25)
+
+        coverage_row = QVBoxLayout()
+        coverage_row.addWidget(self.slider_coverage)
+        self.coverage_hint_label = QLabel("")
+        self.coverage_hint_label.setStyleSheet("color: #8b949e; font-size: 11px;")
+        self.coverage_hint_label.setWordWrap(True)
+        coverage_row.addWidget(self.coverage_hint_label)
+
+        def on_coverage_changed(value):
+            if value <= 5:
+                hint = "Best moments — highest-scoring parts only, wherever they fall."
+            elif value >= 95:
+                hint = "Full story — every part of the video is represented."
+            else:
+                hint = f"{value}% toward full story — best moments, spread across the video."
+            self.coverage_hint_label.setText(hint)
+
+        self.slider_coverage.valueChanged.connect(on_coverage_changed)
+        on_coverage_changed(self.slider_coverage.value())
+
+        duration_form.addRow("Best moments ↔ Full story:", coverage_row)
+
         duration_layout.addLayout(duration_form)
 
         # Auto-segmentation info label (always visible, updates dynamically)
@@ -2890,6 +2922,7 @@ class VideoHighlighterGUI(QWidget):
             "object_points": int(self.spin_object.value()),
             "action_points": int(self.spin_action.value()),
             "clip_time": int(self.spin_clip_time.value()),
+            "coverage": self.slider_coverage.value() / 100.0,
             "max_duration": int(self.spin_max_duration.value()),
             "exact_duration": exact_duration,
             "multi_signal_boost": 1.2,
@@ -3424,6 +3457,7 @@ class VideoHighlighterGUI(QWidget):
             },
             "highlights": {
                 "clip_time": int(self.spin_clip_time.value()),
+                "coverage": self.slider_coverage.value() / 100.0,
                 "output": self.output_input.text().strip(),
                 "max_duration": int(self.spin_max_duration.value()),
                 "exact_duration": int(self.spin_exact_duration.value()),
@@ -4243,6 +4277,7 @@ class VideoHighlighterGUI(QWidget):
             "object_points": int(self.spin_object.value()),
             "action_points": int(self.spin_action.value()),
             "clip_time": int(self.spin_clip_time.value()),
+            "coverage": self.slider_coverage.value() / 100.0,
             "max_duration": int(self.spin_max_duration.value()),
             "exact_duration": exact_duration,
             "multi_signal_boost": 1.2,
