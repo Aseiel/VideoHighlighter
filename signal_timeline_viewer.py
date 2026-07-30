@@ -8,6 +8,7 @@ Complete Signal Timeline Viewer with Filters and Edit Timeline
 
 import sys
 import os
+import bisect
 import threading
 from pathlib import Path
 import json
@@ -89,6 +90,10 @@ class SignalLabelPanel(QWidget):
         self._labels = []        # [(name, scene_y), ...]
         self._hit_rows = []      # [(local_y_top, local_y_bot, name), ...] rebuilt in paintEvent
         self._navigable_active = set()  # nav tracks that currently have events
+        # Sorted event times per navigable track, cached at refresh: paintEvent
+        # runs on every scroll and playhead tick, and re-deriving these from the
+        # scene each time would make scrubbing crawl.
+        self._nav_timestamps = {}
         self._current_time_fn = None   # set by the window after construction
 
         signal_view.verticalScrollBar().valueChanged.connect(self.update)
@@ -100,16 +105,34 @@ class SignalLabelPanel(QWidget):
             # Only treat a track as navigable if it actually has events to jump
             # between — otherwise the ◀ ▶ arrows would do nothing.
             self._navigable_active = set()
+            self._nav_timestamps = {}
             for name, fn in self._NAVIGABLE.items():
                 try:
-                    if fn(scene):
+                    timestamps = fn(scene)
+                    if timestamps:
                         self._navigable_active.add(name)
+                        self._nav_timestamps[name] = sorted(timestamps)
                 except Exception:
                     pass
         else:
             self._labels = []
             self._navigable_active = set()
+            self._nav_timestamps = {}
         self.update()
+
+    def _position_in_track(self, name):
+        """"3/17" — which event of this track the playhead has reached.
+
+        Stepping through a track with the arrows otherwise gives no sense of
+        where you are in it or how much is left. Counts events at or before the
+        playhead, so 0 means "before the first one" rather than a false 1.
+        """
+        timestamps = self._nav_timestamps.get(name)
+        if not timestamps:
+            return None
+        current = self._current_time_fn() if self._current_time_fn else 0.0
+        reached = bisect.bisect_right(timestamps, current + 0.1)
+        return f"{reached}/{len(timestamps)}"
 
     @staticmethod
     def _draw_chevron(p, cx, cy, direction, color):
@@ -147,6 +170,8 @@ class SignalLabelPanel(QWidget):
         view = self.signal_view
         font_lbl = QFont("Arial", 8, QFont.Weight.Bold)
         fm_lbl   = QFontMetrics(font_lbl)
+        font_pos = QFont("Arial", 7)
+        fm_pos   = QFontMetrics(font_pos)
 
         for name, scene_y in self._labels:
             view_pt = view.mapFromScene(0, scene_y)
@@ -164,9 +189,22 @@ class SignalLabelPanel(QWidget):
                 self._draw_chevron(p, 7, local_y, "left", QColor(THEME.accent))
                 self._draw_chevron(p, self.width() - 7, local_y, "right", QColor(THEME.accent))
 
+                # Position within the track, right-aligned against the next
+                # chevron — the label elides to make room, since knowing there
+                # are 17 of these matters more than the last few characters of
+                # a name the row is already sorted under.
+                counter = self._position_in_track(name)
+                counter_w = 0
+                if counter:
+                    p.setFont(font_pos)
+                    p.setPen(QColor(THEME.text_dim))
+                    counter_w = fm_pos.horizontalAdvance(counter) + 4
+                    p.drawText(self.width() - self._ARROW_W - counter_w, mid_y,
+                               counter)
+
                 p.setFont(font_lbl)
                 p.setPen(QColor(THEME.text))
-                avail = self.width() - self._ARROW_W * 2 - 6
+                avail = self.width() - self._ARROW_W * 2 - 6 - counter_w
                 clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
                 p.drawText(self._ARROW_W + 3, mid_y, clipped)
             else:
@@ -899,6 +937,10 @@ class SignalTimelineWindow(QMainWindow):
             self.signal_scene.set_current_time(self.current_time)
             if hasattr(self, 'signal_view'):
                 self.signal_view.ensure_time_visible(self.current_time)
+            # Repaint only — the per-track counters read the playhead, and
+            # refresh_labels() would re-derive every track's events per frame.
+            if hasattr(self, 'label_panel'):
+                self.label_panel.update()
         
         # Sync transcript panel
         if hasattr(self, 'transcript_panel'):

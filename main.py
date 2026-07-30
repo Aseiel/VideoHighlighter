@@ -1124,7 +1124,9 @@ class VideoHighlighterGUI(QWidget):
         layout.addWidget(self.progress_group)
 
         # --- Tabs ---
-        tabs = QTabWidget()
+        # Kept on self so features elsewhere can bring a tab forward — the
+        # advisor hands a run to the LLM Chat tab rather than to a window.
+        self.tabs = tabs = QTabWidget()
 
         # --- Tab 0: Download ---
         download_tab = QWidget()
@@ -2313,7 +2315,11 @@ class VideoHighlighterGUI(QWidget):
         self.ai_summary_btn.clicked.connect(self.write_ai_summary)
 
         # The wheel keeps the choices that most users never touch out of sight.
-        self.ai_summary_opts_btn = QPushButton("⚙")
+        # A drawn icon, not a "⚙" glyph: the packaged build has no guarantee of
+        # a font carrying it, and a blank button is what you get when it does
+        # not.
+        self.ai_summary_opts_btn = QPushButton()
+        self.ai_summary_opts_btn.setIcon(_ui_icons.gear())
         self.ai_summary_opts_btn.setFixedWidth(28)
         self.ai_summary_opts_btn.setToolTip("Summary options — ask a question, "
                                             "discuss in chat, choose the model")
@@ -4962,14 +4968,20 @@ class VideoHighlighterGUI(QWidget):
             self.append_log(f"⚠️ Could not hand the report to the chat: {exc}")
 
     def _open_llm_chat_widget(self):
-        """The existing chat window, opened if it is not already up."""
-        for attr in ("llm_chat_widget", "llm_widget", "chat_widget"):
-            widget = getattr(self, attr, None)
-            if widget is not None:
-                widget.show()
-                widget.raise_()
-                return widget
-        return None
+        """The LLM Chat tab, brought to the front."""
+        widget = getattr(self, "llm_chat", None)
+        if widget is None:
+            return None
+        tabs = getattr(self, "tabs", None)
+        if tabs is not None:
+            # The chat is a tab, not a window: handing it a report without
+            # showing it would look like nothing happened.
+            index = tabs.indexOf(widget)
+            if index == -1 and widget.parentWidget() is not None:
+                index = tabs.indexOf(widget.parentWidget())
+            if index != -1:
+                tabs.setCurrentIndex(index)
+        return widget
 
     def open_timeline_viewer(self):
         """Open timeline viewer for the selected video"""
