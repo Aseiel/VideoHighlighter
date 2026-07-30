@@ -27,6 +27,8 @@ class SignalTimelineScene(QGraphicsScene):
     filter_changed = Signal(dict)
     waveform_clicked = Signal(float, float, float)
     timeline_rebuilt = Signal()  # fired after build_timeline finishes
+    swap_highlight_requested = Signal(int)      # index of the clip to replace
+    undo_highlight_swap_requested = Signal()
     
     def __init__(self, cache_data, video_duration, parent=None, waveform=None):
         super().__init__(parent)
@@ -1466,7 +1468,11 @@ class SignalTimelineScene(QGraphicsScene):
                 start, end, y_pos, self.layer_height,
                 self.colors['highlights'], label,
                 confidence=10,
-                metadata={'index': i, 'duration': duration, 'score': score}
+                # 'layer' marks this bar as a chosen clip rather than a
+                # detection, which is what lets the right-click menu offer to
+                # replace it.
+                metadata={'index': i, 'duration': duration, 'score': score,
+                          'layer': 'highlights'}
             )
             self.draw_bar(bar)
             self.bars.append(bar)
@@ -2364,11 +2370,24 @@ class SignalTimelineView(QGraphicsView):
         if len(row_clips) > 1:
             act_all = menu.addAction(f"➕  Add all “{group_name}” clips  ({len(row_clips)})")
 
+        # A chosen clip can also be exchanged for the best moment that lost to
+        # it. Costs a re-select, not a re-analysis, so it is offered inline.
+        act_swap = act_undo = None
+        if meta.get("layer") == "highlights" and meta.get("index") is not None:
+            menu.addSeparator()
+            act_swap = menu.addAction("🔀  Swap for the next best moment")
+            act_undo = menu.addAction("↩  Undo last swap")
+            act_undo.setEnabled(bool(getattr(scene, "highlight_swaps_done", 0)))
+
         chosen = menu.exec(event.globalPosition().toPoint())
         if chosen is act_one:
             scene.add_clip_to_edit_requested.emit(start, end)
         elif act_all is not None and chosen is act_all:
             scene.add_clips_to_edit_requested.emit(row_clips)
+        elif act_swap is not None and chosen is act_swap:
+            scene.swap_highlight_requested.emit(int(meta["index"]))
+        elif act_undo is not None and chosen is act_undo:
+            scene.undo_highlight_swap_requested.emit()
 
     # ── avoid-range context menu ───────────────────────────────────────
     def _avoid_context_menu(self, event):
