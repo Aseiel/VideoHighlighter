@@ -29,6 +29,7 @@ class SignalTimelineScene(QGraphicsScene):
     timeline_rebuilt = Signal()  # fired after build_timeline finishes
     swap_highlight_requested = Signal(int)      # index of the clip to replace
     undo_highlight_swap_requested = Signal()
+    current_time_changed = Signal(float)        # playhead moved, for any reason
     
     def __init__(self, cache_data, video_duration, parent=None, waveform=None):
         super().__init__(parent)
@@ -1747,6 +1748,11 @@ class SignalTimelineScene(QGraphicsScene):
     def set_current_time(self, seconds):
         """Set current time indicator — moves existing line instead of recreating"""
         self.current_time_seconds = seconds
+        # Ten call sites move the playhead — playback ticks, seeks, clip jumps,
+        # arrow navigation. Anything that renders relative to "where am I now"
+        # has to hear about all of them, so it is announced once from here
+        # rather than remembered at each caller.
+        self.current_time_changed.emit(float(seconds))
         
         x = seconds * self.pixels_per_second
         x = max(0, min(x, self.sceneRect().width() - 1))
