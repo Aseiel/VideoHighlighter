@@ -4,6 +4,10 @@ debug.log
 debug.prev.log
 timeline_debug.log
 
+# Timeline viewer filter state (written next to the app at runtime by
+# SignalTimelineScene.save_filters) — per-machine UI state, not repo content.
+timeline_filters.json
+
 # User-imported custom object detectors ("Import model…" in the Advanced tab
 # copies them here). Weights are large and belong to the user, not the repo.
 models/custom/

@@ -67,6 +67,16 @@ class CompositionEngine:
 
     # ------------------------------------------------------------------ public
 
+    @property
+    def event_names(self) -> list:
+        """Every event name this rule set can emit.
+
+        Lets a caller re-running the engine over an existing result strip the
+        previous pass first, so running it twice is idempotent rather than
+        double-counting.
+        """
+        return [s.name for s in self._specs]
+
     def run(self, bbox_cache: list[dict]) -> tuple[dict, list]:
         if not self._specs:
             return {}, []

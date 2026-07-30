@@ -318,6 +318,111 @@ def run_audio(video_path: str, *, progress: ProgressFn = None,
 # --------------------------------------------------------------------------- #
 # Cache fold
 # --------------------------------------------------------------------------- #
+def _cache_files(video_path: str):
+    """``(video_hash, [cache files])`` for a video — the shared discovery rule.
+
+    Extracted so a reader and a writer can never disagree about which files
+    belong to a video: the timeline viewer picks its file signature-first (then
+    newest) rather than by glob order, so anything touching one file has to know
+    about all of them.
+    """
+    from pathlib import Path
+    from modules.video_cache import VideoAnalysisCache
+
+    cache_dir = Path("./cache")
+    cache_dir.mkdir(exist_ok=True)
+    video_hash = VideoAnalysisCache()._get_video_hash(video_path)
+    if not video_hash:
+        return "", []
+    return video_hash, sorted(cache_dir.glob(f"{video_hash}*.cache.json"))
+
+
+def read_cache(video_path: str) -> dict:
+    """The newest on-disk cache for a video, or ``{}`` when there is none."""
+    import json
+
+    _hash, files = _cache_files(video_path)
+    for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return {}
+
+
+def run_composition(video_path: str, *, log=print) -> dict:
+    """Re-apply ``composition_rules.yaml`` to boxes already in the cache.
+
+    The engine is pure: it reads per-frame boxes and writes event names, and
+    never touches the video or a detector. But in ``pipeline.py`` it only runs
+    *inside* a fresh object-detection pass, so editing one rule meant
+    re-detecting the whole video to see the effect — minutes or hours for a
+    change that takes the engine milliseconds. This runs it on its own.
+
+    Returns a cache patch containing the rebuilt ``objects`` list.
+
+    Idempotent by construction: every name the current rule set can emit is
+    stripped from the cached seconds before the new results are folded in, so
+    running it repeatedly converges instead of accumulating duplicates. Because
+    the strip list comes from the rules file, deleting a rule also removes its
+    events on the next run.
+
+    Composed boxes are deliberately NOT written back to ``object_bboxes``. That
+    list is the detector's record; keeping derived entries out of it is what
+    makes re-running safe, since a composed entry is otherwise
+    indistinguishable from a detection.
+    """
+    from modules.app_paths import composition_rules_path
+    from video_ai_editor.composition_engine import CompositionEngine
+
+    rules_path = composition_rules_path()
+    if not rules_path:
+        raise RuntimeError(
+            "No composition_rules.yaml found — add rules in the Advanced tab first.")
+
+    cache = read_cache(video_path)
+    if not cache:
+        raise RuntimeError("No analysis cache for this video — run an analysis first.")
+
+    bboxes = cache.get("object_bboxes") or []
+    if not bboxes:
+        raise RuntimeError(
+            "No object boxes in the cache — run object detection first "
+            "(the rules match against its boxes).")
+
+    engine = CompositionEngine(rules_path)
+    known = set(engine.event_names)
+    if not known:
+        raise RuntimeError(f"No events defined in {rules_path}.")
+
+    composed, _composed_bb = engine.run(bboxes)
+
+    # Rebuild the per-second list: drop this rule set's previous output, keep
+    # every real detection, then fold in the new events.
+    by_sec: dict = {}
+    for entry in cache.get("objects") or []:
+        sec = int(entry.get("timestamp", 0))
+        names = [n for n in (entry.get("objects") or []) if n not in known]
+        if names:
+            by_sec[sec] = names
+    for sec, names in composed.items():
+        merged = set(by_sec.get(int(sec), [])) | set(names)
+        by_sec[int(sec)] = sorted(merged)
+
+    rebuilt = [
+        {"timestamp": sec, "objects": names, "count": len(names)}
+        for sec, names in sorted(by_sec.items())
+    ]
+    hits = sum(len(v) for v in composed.values())
+    log(f"🧩 Composition: {hits} event-hit(s) over {len(composed)} second(s) "
+        f"from {len(bboxes)} cached frames")
+    # Also record WHICH names are derived, so the timeline can group them apart
+    # from real detections. Written on every run so the list tracks the current
+    # rules — a renamed or deleted rule stops being claimed as an event.
+    return {"objects": rebuilt, "composed_event_names": sorted(known)}
+
+
 def merge_into_cache(video_path: str, patch: dict, *, seed: dict = None,
                      log=print) -> bool:
     """Fold one signal's result into a video's on-disk cache, leaving the other
@@ -337,16 +442,22 @@ def merge_into_cache(video_path: str, patch: dict, *, seed: dict = None,
     try:
         import json
         from pathlib import Path
-        from modules.video_cache import VideoAnalysisCache
+        from modules.video_cache import atomic_write_json
 
         cache_dir = Path("./cache")
-        cache_dir.mkdir(exist_ok=True)
-        video_hash = VideoAnalysisCache()._get_video_hash(video_path)
+        video_hash, matching = _cache_files(video_path)
         if not video_hash:
             log("⚠️ No video_hash; analysis not persisted")
             return False
 
-        matching = list(cache_dir.glob(f"{video_hash}*.cache.json"))
+        # Every write goes through atomic_write_json (tmp file + replace) rather
+        # than open(..., "w"). A plain open truncates the destination before the
+        # new content is written, so anything that stops the process mid-write --
+        # a cancel, a crash, power loss, the OS killing a long run -- leaves a
+        # half-written file where a complete cache used to be. Observed for real:
+        # a run killed during this write truncated a cache mid-array and cost the
+        # object_bboxes for a 60-minute video, which is expensive to regenerate.
+        # A cache is derived data, but it is derived over hours.
         if matching:
             # Fold into EVERY matching cache file, not just the first: the
             # timeline viewer picks its file signature-first (then newest), which
@@ -360,8 +471,7 @@ def merge_into_cache(video_path: str, patch: dict, *, seed: dict = None,
                 except Exception:
                     continue
                 disk.update(patch)
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(disk, f)
+                atomic_write_json(Path(cache_file), disk)
                 wrote += 1
             log(f"💾 Analysis merged → {wrote} cache file(s)")
             return wrote > 0
@@ -372,8 +482,7 @@ def merge_into_cache(video_path: str, patch: dict, *, seed: dict = None,
             disk["video_hash"] = video_hash
             disk["cache_complete"] = True
             disk.update(patch)
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(disk, f)
+            atomic_write_json(cache_file, disk)
             log(f"💾 Analysis merged → {cache_file.name}")
             return True
     except Exception as e:
