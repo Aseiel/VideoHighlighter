@@ -2031,6 +2031,14 @@ class LLMChatWidget(QWidget):
                 timeline_ctx = '\n'.join(lines[:15]) + f'\n... ({len(lines)-15} more lines)'
             timeline_ctx += '\n' + self._timeline_bridge.get_available_commands_text()
 
+        # A report handed over by seed_from_report rides along with every
+        # message, not just the first — the model is stateless between turns,
+        # so a follow-up would otherwise be answered about nothing.
+        advisor_ctx = getattr(self, "_advisor_context", "")
+        if advisor_ctx:
+            timeline_ctx = (advisor_ctx + "\n\n" + timeline_ctx
+                            if timeline_ctx else advisor_ctx)
+
         # Capture frame based on mode
         frame_b64 = None
         _text_lower = actual_message.lower()
@@ -2347,6 +2355,39 @@ class LLMChatWidget(QWidget):
         self._append_html(
             f'<div style="color:#aaa;font-style:italic;margin:4px 0;">{safe}</div>'
         )
+
+    def seed_from_report(self, json_path: str):
+        """Put a highlight report's findings in front of the chat.
+
+        The findings are shown, not sent: the user reads what was actually
+        measured and then asks their own question, rather than a canned one
+        being answered before they have said what they care about.
+
+        The findings are also kept as pending context, so the next message
+        carries them — otherwise the model would be asked "why?" about a run it
+        has never been told anything about.
+        """
+        import json as _json
+
+        from modules.advisor import build_prompt, format_findings
+        from modules.highlight_advice import diagnose
+
+        with open(json_path, encoding="utf-8") as fh:
+            report = _json.load(fh)
+
+        findings = diagnose(report)
+        self._advisor_context = build_prompt(report, findings, question=" ")
+        self._append_system(
+            f"Loaded {os.path.basename(json_path)} — "
+            f"{len(findings)} finding(s) from that run:")
+        self._append_system(format_findings(findings))
+        self._append_system(
+            "Ask anything about this cut. Answers come from these findings and "
+            "the advisor documentation, not from the video itself.")
+        if hasattr(self, "input_field"):
+            self.input_field.setPlaceholderText(
+                "e.g. why is every clip so similar?")
+            self.input_field.setFocus()
 
     def _log(self, msg: str):
         self.status_label.setText(msg)
