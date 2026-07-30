@@ -1855,6 +1855,87 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         total_final_duration = sum(e - s for s, e in segments)
         print(f"Total highlight duration: {total_final_duration:.1f}s")
 
+        # ========== WHY-THESE-MOMENTS REPORT ==========
+        # The justification for every kept segment already exists at this point
+        # (the per-signal score arrays, the detections, the action percentiles);
+        # until now it was only printed to the debug log and discarded. Written
+        # here, where `segments` is final but before rendering, so the report
+        # describes the cut that is actually produced.
+        if segments and gui_config.get("write_highlight_report", True):
+            try:
+                from modules.highlight_report import build_report, write_report
+
+                def _thumb(sec, _path=processed_video_path):
+                    """One JPEG per segment peak. Opened per call rather than
+                    holding a capture across the loop: this runs once per
+                    segment, and a stray open handle on the source video is a
+                    worse trade than reopening a few times."""
+                    cap = cv2.VideoCapture(_path)
+                    try:
+                        if not cap.isOpened():
+                            return None
+                        cap.set(cv2.CAP_PROP_POS_MSEC, float(sec) * 1000.0)
+                        ok, frame = cap.read()
+                        if not ok or frame is None:
+                            return None
+                        h, w = frame.shape[:2]
+                        if w > 480:                     # keep the data URI small
+                            frame = cv2.resize(frame, (480, max(1, int(h * 480 / w))))
+                        ok, buf = cv2.imencode(".jpg", frame,
+                                               [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                        return buf.tobytes() if ok else None
+                    finally:
+                        cap.release()
+
+                report = build_report(
+                    video_path=video_path,
+                    video_duration=video_duration,
+                    score=score,
+                    signals={
+                        "scene": scene_score,
+                        "motion_event": motion_event_score,
+                        "motion_peak": motion_peak_score,
+                        "audio": audio_score,
+                        "keyword": keyword_score,
+                        "object": object_score,
+                        "action": action_score,
+                        "beginning": beginning_score,
+                        "ending": ending_score,
+                    },
+                    segments=segments,
+                    object_detections=object_detections,
+                    actions_by_sec=detections_by_sec,
+                    action_percentiles=action_type_percentiles,
+                    settings={
+                        "clip_time": CLIP_TIME,
+                        "duration_mode": duration_mode,
+                        "scene_points": SCENE_POINTS,
+                        "motion_event_points": MOTION_EVENT_POINTS,
+                        "motion_peak_points": MOTION_PEAK_POINTS,
+                        "audio_peak_points": AUDIO_PEAK_POINTS,
+                        "keyword_points": KEYWORD_POINTS,
+                        "object_points": OBJECT_POINTS,
+                        "action_points": ACTION_POINTS,
+                        "multi_signal_boost": MULTI_SIGNAL_BOOST,
+                        "min_signals_for_boost": MIN_SIGNALS_FOR_BOOST,
+                    },
+                    boost_multiplier=MULTI_SIGNAL_BOOST,
+                    min_signals_for_boost=MIN_SIGNALS_FOR_BOOST,
+                    thumbnail_fn=_thumb,
+                )
+
+                base = os.path.splitext(OUTPUT_FILE)[0] if OUTPUT_FILE else \
+                    os.path.splitext(video_path)[0]
+                html_path = f"{base}_why.html"
+                write_report(report, html_path, json_path=f"{base}_why.json")
+                log(f"📄 Why-these-moments report: {os.path.basename(html_path)}")
+                # The same breakdown into the debug log, from the same dict, so
+                # the two can never disagree about what happened.
+                from modules.highlight_report import render_text
+                print("\n" + render_text(report))
+            except Exception as _re:
+                log(f"⚠️ Highlight report skipped: {_re}")
+
         # ========== SAVE HIGHLIGHT SEGMENTS TO CACHE ==========
         if segments and use_cache and not (cancel_flag and cancel_flag.is_set()):
             try:

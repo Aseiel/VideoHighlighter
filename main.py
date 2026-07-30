@@ -2114,6 +2114,19 @@ class VideoHighlighterGUI(QWidget):
         self.bbox_actions_chk.setToolTip("Display detected action names on frames")
         bbox_layout.addWidget(self.bbox_actions_chk)
 
+        # On by default: it costs one frame grab per kept segment and answers the
+        # question every user asks first — why these moments and not others.
+        self.why_report_chk = QCheckBox("Write a highlight report")
+        self.why_report_chk.setChecked(
+            visualization_cfg.get("write_highlight_report", True))
+        self.why_report_chk.setToolTip(
+            "Writes <output>_why.html next to the highlight: every kept segment with\n"
+            "its score breakdown, the objects and actions that triggered it, and the\n"
+            "moments that scored well but were left out.\n\n"
+            "One self-contained file with thumbnails embedded — openable in any\n"
+            "browser and sendable to a client. A matching .json holds the same data.")
+        bbox_layout.addWidget(self.why_report_chk)
+
         bbox_box.setLayout(bbox_layout)
         advanced_layout.addWidget(bbox_box, 1, 1)
 
@@ -2251,6 +2264,12 @@ class VideoHighlighterGUI(QWidget):
         self.timeline_btn.setStyleSheet("QPushButton { background-color: #2f81f7; color: white; font-weight: bold; padding: 8px; }")
         self.timeline_btn.clicked.connect(self.open_timeline_viewer)
 
+        self.why_report_btn = QPushButton("Highlight Report")
+        self.why_report_btn.setToolTip(
+            "Open the report explaining why each highlight was chosen.\n"
+            "Written next to the highlight on every run (Advanced tab toggles it).")
+        self.why_report_btn.clicked.connect(self.open_why_report)
+
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setStyleSheet("QPushButton:enabled { background-color: #ff4444; color: white; font-weight: bold; }")
@@ -2263,6 +2282,7 @@ class VideoHighlighterGUI(QWidget):
         ctrl_layout.addWidget(self.cancel_btn)
         ctrl_layout.addWidget(self.keep_temp_chk)
         ctrl_layout.addWidget(self.timeline_btn)
+        ctrl_layout.addWidget(self.why_report_btn)
         self.debug_console_chk = QCheckBox("Debug log")
         self.debug_console_chk.setChecked(debug_console.is_console_visible())
         self.debug_console_chk.setToolTip(
@@ -2897,6 +2917,7 @@ class VideoHighlighterGUI(QWidget):
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
             "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
             "draw_object_boxes": self.bbox_objects_chk.isChecked(),
+            "write_highlight_report": self.why_report_chk.isChecked(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
             "action_backend": self.action_backend_combo.currentData(),
             "r3d_model": self.r3d_model_combo.currentData(),
@@ -3468,6 +3489,7 @@ class VideoHighlighterGUI(QWidget):
             },
             "visualization": {
                 "draw_object_boxes": self.bbox_objects_chk.isChecked(),
+                "write_highlight_report": self.why_report_chk.isChecked(),
                 "draw_action_labels": self.bbox_actions_chk.isChecked(),
             },
             "avoid": {
@@ -4248,6 +4270,7 @@ class VideoHighlighterGUI(QWidget):
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
             "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
             "draw_object_boxes": self.bbox_objects_chk.isChecked(),
+            "write_highlight_report": self.why_report_chk.isChecked(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
             "action_backend": self.action_backend_combo.currentData(),
             "r3d_model": self.r3d_model_combo.currentData(),
@@ -4699,6 +4722,61 @@ class VideoHighlighterGUI(QWidget):
             except Exception:
                 pass
         return []
+
+    def _why_report_candidates(self) -> list:
+        """Where a report for the current selection could be, newest first.
+
+        Mirrors pipeline.py's own naming (`os.path.splitext(OUTPUT_FILE)[0] +
+        "_why.html"`, falling back to the source video's stem) rather than
+        guessing, so the button and the writer cannot disagree about the path.
+        Several candidates because the output name is resolved differently for a
+        single file than for a batch.
+        """
+        out = []
+        video_paths = self.get_file_list()
+        output_base = self.output_input.text().strip() or "highlight.mp4"
+
+        for vp in video_paths:
+            source_dir = os.path.dirname(vp)
+            # single-file run: <source dir>/<output name>
+            out.append(os.path.join(source_dir,
+                                    os.path.splitext(output_base)[0] + "_why.html"))
+            # batch run: the pipeline appends _highlight per input
+            base = os.path.splitext(os.path.basename(vp))[0]
+            out.append(os.path.join(source_dir, f"{base}_highlight_why.html"))
+            # OUTPUT_FILE empty → pipeline falls back to the video's own stem
+            out.append(os.path.splitext(vp)[0] + "_why.html")
+
+        seen, uniq = set(), []
+        for p in out:
+            if p not in seen:
+                seen.add(p)
+                uniq.append(p)
+        return [p for p in uniq if os.path.exists(p)]
+
+    def open_why_report(self):
+        """Open the newest "why these moments" report for the current selection."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        found = self._why_report_candidates()
+        if not found:
+            if not self.get_file_list():
+                self.append_log("⚠️ Add a video first — the report sits next to its highlight.")
+                return
+            self.append_log(
+                "⚠️ No report found yet. Run the highlighter with “Write a highlight "
+                "report” enabled (Advanced tab) — it is written before the video is "
+                "encoded, so it appears early in the run.")
+            return
+
+        newest = max(found, key=lambda p: os.path.getmtime(p))
+        if QDesktopServices.openUrl(QUrl.fromLocalFile(newest)):
+            self.append_log(f"📄 Opened report: {os.path.basename(newest)}")
+        else:
+            # No browser association is plausible on a stripped Windows install;
+            # the path is more useful than a silent failure.
+            self.append_log(f"⚠️ Could not open a browser. The report is at: {newest}")
 
     def open_timeline_viewer(self):
         """Open timeline viewer for the selected video"""
