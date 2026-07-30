@@ -80,11 +80,19 @@ class SignalLabelPanel(QWidget):
 
     _ARROW_W = 14   # px reserved for each arrow
     _ROW_H   = 20   # hit-test height per label row
+    # The column sizes itself to its content between these. A fixed width had
+    # to be wide enough for the longest label and was then wasted on every
+    # other row; adding the counters pushed "AUDIO WAVEFORM" into an ellipsis.
+    _MIN_W   = 150
+    # High enough that the measurement, not the clamp, decides on a normal
+    # setup: "AUDIO WAVEFORM" beside a four-digit counter needs about 230px,
+    # and font substitution can make that wider on someone else's machine.
+    _MAX_W   = 280
 
     def __init__(self, signal_view, parent=None):
         super().__init__(parent)
         self.signal_view = signal_view
-        self.setFixedWidth(150)
+        self.setFixedWidth(self._MIN_W)
         self.setMinimumHeight(100)
         self.setCursor(Qt.ArrowCursor)
         self._labels = []        # [(name, scene_y), ...]
@@ -118,7 +126,29 @@ class SignalLabelPanel(QWidget):
             self._labels = []
             self._navigable_active = set()
             self._nav_timestamps = {}
+        self._fit_width()
         self.update()
+    def _fit_width(self):
+        """Widen the column so the longest row reads in full, within limits.
+
+        Sized against each track's *total*, not its live position: the counter
+        grows to its widest as playback advances, and a column that resized
+        under the cursor while you watched would be worse than one ellipsis.
+        """
+        font_lbl = QFont("Arial", 8, QFont.Weight.Bold)
+        fm_lbl = QFontMetrics(font_lbl)
+        fm_pos = QFontMetrics(QFont("Arial", 7))
+
+        widest = 0
+        for name, _scene_y in self._labels:
+            needed = fm_lbl.horizontalAdvance(name) + 6
+            if name in self._navigable_active:
+                total = len(self._nav_timestamps.get(name, ()))
+                counter = f"{total}/{total}"
+                needed += self._ARROW_W * 2 + fm_pos.horizontalAdvance(counter) + 8
+            widest = max(widest, needed)
+
+        self.setFixedWidth(max(self._MIN_W, min(self._MAX_W, widest)))
 
     def _position_in_track(self, name):
         """"3/17" — which event of this track the playhead has reached.
