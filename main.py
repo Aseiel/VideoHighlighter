@@ -2301,6 +2301,23 @@ class VideoHighlighterGUI(QWidget):
             "Open the report explaining why each highlight was chosen.\n"
             "Written next to the highlight on every run (Advanced tab toggles it).")
         self.why_report_btn.clicked.connect(self.open_why_report)
+        # "AI Summary" writes a few plain-language sentences into that same
+        # report. Separate button because it costs a model run and tens of
+        # seconds — the report itself must stay instant.
+        self.ai_summary_btn = QPushButton("AI Summary")
+        self.ai_summary_btn.setToolTip(
+            "Add a short plain-language summary to the Highlight Report:\n"
+            "what shaped this cut, and the one change most likely to improve it.\n"
+            "Runs your local model, so it takes a moment. The report's findings\n"
+            "are always there without it.")
+        self.ai_summary_btn.clicked.connect(self.write_ai_summary)
+
+        # The wheel keeps the choices that most users never touch out of sight.
+        self.ai_summary_opts_btn = QPushButton("⚙")
+        self.ai_summary_opts_btn.setFixedWidth(28)
+        self.ai_summary_opts_btn.setToolTip("Summary options — ask a question, "
+                                            "discuss in chat, choose the model")
+        self.ai_summary_opts_btn.clicked.connect(self.show_ai_summary_menu)
 
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
@@ -2315,6 +2332,8 @@ class VideoHighlighterGUI(QWidget):
         ctrl_layout.addWidget(self.keep_temp_chk)
         ctrl_layout.addWidget(self.timeline_btn)
         ctrl_layout.addWidget(self.why_report_btn)
+        ctrl_layout.addWidget(self.ai_summary_btn)
+        ctrl_layout.addWidget(self.ai_summary_opts_btn)
         self.debug_console_chk = QCheckBox("Debug log")
         self.debug_console_chk.setChecked(debug_console.is_console_visible())
         self.debug_console_chk.setToolTip(
@@ -4812,6 +4831,145 @@ class VideoHighlighterGUI(QWidget):
             # No browser association is plausible on a stripped Windows install;
             # the path is more useful than a silent failure.
             self.append_log(f"⚠️ Could not open a browser. The report is at: {newest}")
+
+    # ── AI summary of the highlight report ─────────────────────────────
+    def _newest_why_report_json(self):
+        """The JSON beside the newest report, or None with a logged reason."""
+        found = self._why_report_candidates()
+        if not found:
+            self.append_log("⚠️ No highlight report yet — run the highlighter "
+                            "first, the summary is written into that report.")
+            return None
+        newest = max(found, key=lambda p: os.path.getmtime(p))
+        json_path = os.path.splitext(newest)[0] + ".json"
+        if not os.path.exists(json_path):
+            self.append_log(f"⚠️ {os.path.basename(newest)} has no .json beside "
+                            "it, so there is nothing to summarise from.")
+            return None
+        return json_path
+
+    def _ai_summary_settings(self):
+        from PySide6.QtCore import QSettings
+        s = QSettings("VideoHighlighter", "Pro")
+        return (s.value("advisor/backend", "ollama"),
+                s.value("advisor/model", "llama3"))
+
+    def write_ai_summary(self, question=None):
+        """Generate the summary and put it in the report, then open it."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtWidgets import QApplication
+
+        json_path = self._newest_why_report_json()
+        if not json_path:
+            return
+
+        from modules import advisor
+        backend, model = self._ai_summary_settings()
+        self.append_log(f"🤖 Asking {backend}/{model} to summarise the report… "
+                        "this takes a moment.")
+        # The call blocks; without this the window looks hung rather than busy.
+        self.ai_summary_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            llm = advisor.load_llm(backend, model)
+            if llm is None:
+                self.append_log(
+                    f"⚠️ Could not reach {backend}/{model}. The report's findings "
+                    "are there without it — only the summary needs a model.")
+                return
+            text = advisor.summarise_report_file(
+                json_path, llm=llm, question=question or None)
+        except Exception as exc:
+            self.append_log(f"⚠️ Summary failed: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.ai_summary_btn.setEnabled(True)
+
+        if not text:
+            self.append_log("⚠️ The model returned nothing; report unchanged.")
+            return
+        self.append_log(f"💡 {text}")
+        html_path = os.path.splitext(json_path)[0] + ".html"
+        if os.path.exists(html_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
+
+    def show_ai_summary_menu(self):
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        act_ask = menu.addAction("Ask a question about this cut…")
+        act_chat = menu.addAction("Discuss in LLM chat")
+        menu.addSeparator()
+        backend, model = self._ai_summary_settings()
+        act_model = menu.addAction(f"Model: {backend} / {model}…")
+
+        chosen = menu.exec(self.ai_summary_opts_btn.mapToGlobal(
+            self.ai_summary_opts_btn.rect().bottomLeft()))
+        if chosen is act_ask:
+            self._ask_ai_summary_question()
+        elif chosen is act_chat:
+            self._discuss_report_in_chat()
+        elif chosen is act_model:
+            self._choose_ai_summary_model()
+
+    def _ask_ai_summary_question(self):
+        from PySide6.QtWidgets import QInputDialog
+
+        question, ok = QInputDialog.getText(
+            self, "Ask about this cut",
+            "What would you like to know?\n"
+            "The model answers from this run's findings and the advisor docs.",
+            text="Why is every clip so similar?")
+        if ok and question.strip():
+            self.write_ai_summary(question.strip())
+
+    def _choose_ai_summary_model(self):
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QInputDialog
+
+        backend, model = self._ai_summary_settings()
+        backends = ["ollama", "llama-cpp"]
+        picked, ok = QInputDialog.getItem(
+            self, "Summary model", "Backend:", backends,
+            backends.index(backend) if backend in backends else 0, False)
+        if not ok:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Summary model",
+            "Model name (ollama) or path to a .gguf (llama-cpp):", text=model)
+        if not ok or not name.strip():
+            return
+        s = QSettings("VideoHighlighter", "Pro")
+        s.setValue("advisor/backend", picked)
+        s.setValue("advisor/model", name.strip())
+        self.append_log(f"🤖 Summary model set to {picked} / {name.strip()}")
+
+    def _discuss_report_in_chat(self):
+        """Open the LLM chat with this run's findings already in front of it."""
+        json_path = self._newest_why_report_json()
+        if not json_path:
+            return
+        widget = self._open_llm_chat_widget()
+        if widget is None:
+            self.append_log("⚠️ The LLM chat window is not available in this build.")
+            return
+        try:
+            widget.seed_from_report(json_path)
+        except Exception as exc:
+            self.append_log(f"⚠️ Could not hand the report to the chat: {exc}")
+
+    def _open_llm_chat_widget(self):
+        """The existing chat window, opened if it is not already up."""
+        for attr in ("llm_chat_widget", "llm_widget", "chat_widget"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.show()
+                widget.raise_()
+                return widget
+        return None
 
     def open_timeline_viewer(self):
         """Open timeline viewer for the selected video"""

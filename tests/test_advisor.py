@@ -1,0 +1,245 @@
+"""Tests for `modules.advisor` — findings joined to the pages that explain them.
+
+The behaviour worth protecting is the boundary: everything works with no model,
+the model is only ever given material that was computed rather than recalled,
+and a model that misbehaves cannot take the run down with it.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from modules import advisor
+from modules.highlight_advice import diagnose
+from modules.highlight_report import build_report
+
+
+def _report(n=600):
+    keys = ("scene", "motion_event", "motion_peak", "audio",
+            "keyword", "object", "action")
+    sig = {k: np.zeros(n) for k in keys}
+    sig["object"][100] = 10.0
+    return build_report(
+        video_path="a.mp4", video_duration=n, score=sum(sig.values()),
+        signals=sig, segments=[(95, 105)],
+        settings={"clip_time": 10, "duration_mode": "MAX", "object_points": 5})
+
+
+class _FakeLLM:
+    """Stands in for llm.llm_module.LLMModule — same generate() shape."""
+
+    def __init__(self, reply="Raise a second signal's weight.", boom=False):
+        self.reply, self.boom = reply, boom
+        self.prompt = self.system = None
+
+    def generate(self, prompt, system="", max_tokens=1024, **kw):
+        if self.boom:
+            raise RuntimeError("model not loaded")
+        self.prompt, self.system = prompt, system
+        return self.reply
+
+
+class TestKnowledge:
+    def test_the_shipped_pages_load(self):
+        topics = advisor.knowledge_topics()
+        assert {"weights", "coverage", "thresholds", "training"} <= set(topics)
+
+    def test_the_index_is_not_served_as_a_topic(self):
+        assert "README" not in advisor.knowledge_topics()
+
+    def test_every_topic_a_finding_can_reference_actually_exists(self):
+        """A finding pointing at a missing page would explain nothing."""
+        from modules.highlight_advice import (
+            _rule_single_signal, _rule_concentrated, _rule_dominant_tag,
+            _rule_flat_score, _rule_boost_never_fired, _rule_near_miss_gap,
+            _rule_short_of_target, _rule_silent_detector,
+        )
+        available = set(advisor.knowledge_topics())
+        referenced = {"weights", "thresholds", "coverage", "variety"}
+        assert referenced <= available
+
+    def test_only_the_referenced_pages_are_selected(self):
+        findings = diagnose(_report())
+        picked = advisor.knowledge_for(findings)
+        assert picked
+        assert set(picked) <= {f.topic for f in findings}
+
+    def test_a_missing_knowledge_folder_is_not_an_error(self, tmp_path):
+        assert advisor.knowledge_topics(str(tmp_path / "nope")) == {}
+
+
+class TestFormatting:
+    def test_findings_render_as_text(self):
+        text = advisor.format_findings(diagnose(_report()))
+        assert "Only one kind of evidence" in text
+
+    def test_no_findings_says_so_rather_than_returning_nothing(self):
+        assert "No problems" in advisor.format_findings([])
+
+
+class TestPrompt:
+    def test_the_prompt_carries_the_findings_and_their_pages(self):
+        rep = _report()
+        prompt = advisor.build_prompt(rep, diagnose(rep))
+        assert "Findings computed from this run" in prompt
+        assert "Only one kind of evidence" in prompt
+        assert "## weights" in prompt or "### weights" in prompt
+
+    def test_the_prompt_states_the_run_it_is_about(self):
+        rep = _report()
+        prompt = advisor.build_prompt(rep, diagnose(rep))
+        assert "1 clips" in prompt or "1 clip" in prompt
+        assert "object_points=5" in prompt
+
+    def test_a_question_replaces_the_default_task(self):
+        rep = _report()
+        prompt = advisor.build_prompt(rep, diagnose(rep), question="Why so short?")
+        assert "Why so short?" in prompt
+
+    def test_the_system_prompt_forbids_inventing_numbers(self):
+        assert "Never invent a number" in advisor.SYSTEM_PROMPT
+
+
+class TestNarration:
+    def test_no_model_means_no_narration_and_no_error(self):
+        rep = _report()
+        assert advisor.narrate(rep, diagnose(rep), llm=None) is None
+
+    def test_a_model_is_given_the_system_prompt_and_the_findings(self):
+        rep = _report()
+        llm = _FakeLLM()
+        advisor.narrate(rep, diagnose(rep), llm=llm)
+        assert llm.system == advisor.SYSTEM_PROMPT
+        assert "Findings computed from this run" in llm.prompt
+
+    def test_a_failing_model_does_not_propagate(self):
+        """A missing or broken model must not take the run down with it."""
+        rep = _report()
+        assert advisor.narrate(rep, diagnose(rep), llm=_FakeLLM(boom=True)) is None
+
+    def test_an_empty_reply_is_treated_as_no_narration(self):
+        rep = _report()
+        assert advisor.narrate(rep, diagnose(rep), llm=_FakeLLM(reply="   ")) is None
+
+
+class TestAdvise:
+    def test_works_end_to_end_without_a_model(self):
+        result = advisor.advise(_report())
+        assert result["findings"]
+        assert result["narration"] is None
+        assert "weights" in result["topics"]
+
+    def test_includes_the_narration_when_a_model_is_present(self):
+        result = advisor.advise(_report(), llm=_FakeLLM(reply="Do this."))
+        assert result["narration"] == "Do this."
+
+    def test_findings_are_json_serialisable(self):
+        import json
+        json.dumps(advisor.advise(_report())["findings"])
+
+
+class _QueryOnlyLLM:
+    """Stands in for LLMModule, which exposes query() rather than generate()."""
+
+    def __init__(self, reply="Enable a second signal."):
+        self.reply = reply
+        self.kwargs = None
+
+    def query(self, user_message, **kwargs):
+        self.kwargs = dict(kwargs, user_message=user_message)
+        return self.reply
+
+
+class _NeitherLLM:
+    pass
+
+
+class TestLLMInterfaces:
+    """The advisor must work with what the app actually holds."""
+
+    def test_a_query_only_model_is_supported(self):
+        rep = _report()
+        llm = _QueryOnlyLLM()
+        assert advisor.narrate(rep, diagnose(rep), llm=llm) == "Enable a second signal."
+
+    def test_query_is_given_the_system_prompt(self):
+        rep = _report()
+        llm = _QueryOnlyLLM()
+        advisor.narrate(rep, diagnose(rep), llm=llm)
+        assert llm.kwargs["system_prompt"] == advisor.SYSTEM_PROMPT
+
+    def test_query_is_told_not_to_add_its_own_video_context(self):
+        """The prompt is already complete; LLMModule must not prepend to it."""
+        rep = _report()
+        llm = _QueryOnlyLLM()
+        advisor.narrate(rep, diagnose(rep), llm=llm)
+        assert llm.kwargs["free_chat_mode"] is True
+
+    def test_generate_is_preferred_when_both_exist(self):
+        class Both:
+            def generate(self, prompt, system="", max_tokens=1024):
+                return "from generate"
+
+            def query(self, user_message, **kw):
+                return "from query"
+
+        rep = _report()
+        assert advisor.narrate(rep, diagnose(rep), llm=Both()) == "from generate"
+
+    def test_an_object_with_neither_is_reported_not_crashed(self):
+        rep = _report()
+        assert advisor.narrate(rep, diagnose(rep), llm=_NeitherLLM()) is None
+
+
+class TestSummaryTask:
+    def test_the_default_ask_is_short(self):
+        """This lands above findings that already say everything in full."""
+        assert "3 sentences or fewer" in advisor.SUMMARY_TASK
+        assert advisor.SUMMARY_TOKENS <= 250
+
+    def test_the_default_task_is_used_when_no_question_is_given(self):
+        rep = _report()
+        assert advisor.SUMMARY_TASK in advisor.build_prompt(rep, diagnose(rep))
+
+
+class TestSummariseReportFile:
+    def _written(self, tmp_path):
+        from modules.highlight_report import write_report
+        json_path = tmp_path / "r.json"
+        html_path = tmp_path / "r.html"
+        write_report(_report(), str(html_path), str(json_path))
+        return str(json_path), str(html_path)
+
+    def test_the_summary_lands_in_both_the_record_and_the_page(self, tmp_path):
+        import json
+        json_path, html_path = self._written(tmp_path)
+        text = advisor.summarise_report_file(
+            json_path, llm=_FakeLLM(reply="Enable a second signal."))
+        assert text == "Enable a second signal."
+
+        record = json.loads(open(json_path, encoding="utf-8").read())
+        assert record["advice_narration"] == "Enable a second signal."
+        assert record["advice"], "findings must be stored alongside it"
+        assert "Enable a second signal." in open(html_path, encoding="utf-8").read()
+
+    def test_a_question_is_passed_through(self, tmp_path):
+        json_path, _ = self._written(tmp_path)
+        llm = _FakeLLM()
+        advisor.summarise_report_file(json_path, llm=llm, question="Why short?")
+        assert "Why short?" in llm.prompt
+
+    def test_a_failed_generation_leaves_the_report_untouched(self, tmp_path):
+        import json
+        json_path, _ = self._written(tmp_path)
+        before = open(json_path, encoding="utf-8").read()
+        assert advisor.summarise_report_file(json_path, llm=_FakeLLM(boom=True)) is None
+        assert open(json_path, encoding="utf-8").read() == before
+        assert "advice_narration" not in json.loads(before)
+
+    def test_a_missing_html_is_not_an_error(self, tmp_path):
+        """The JSON is the record; the page beside it is optional."""
+        import os
+        json_path, html_path = self._written(tmp_path)
+        os.remove(html_path)
+        assert advisor.summarise_report_file(json_path, llm=_FakeLLM()) is not None

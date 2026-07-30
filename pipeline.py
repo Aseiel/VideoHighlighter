@@ -1893,6 +1893,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         "multi_signal_boost": MULTI_SIGNAL_BOOST,
                         "min_signals_for_boost": MIN_SIGNALS_FOR_BOOST,
                         "coverage": COVERAGE,
+                        # The advisor compares this against what was produced:
+                        # in MAX mode a short cut means few seconds scored.
+                        "target_duration": target_duration,
                     },
                     boost_multiplier=MULTI_SIGNAL_BOOST,
                     min_signals_for_boost=MIN_SIGNALS_FOR_BOOST,
@@ -1908,6 +1911,17 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # thumbnail in CSS — no second encode, no bigger images.
                     bbox_cache=object_bboxes_cache,
                 )
+
+                # Diagnose the run before writing it out, so the page and the
+                # JSON carry the same findings and neither can drift.
+                try:
+                    from modules.highlight_advice import attach_advice
+                    attach_advice(report)
+                    if report.get("advice"):
+                        log(f"💡 {len(report['advice'])} suggestion(s) in the "
+                            "highlight report")
+                except Exception as _ae:
+                    print(f"⚠️ Advisor skipped: {_ae}")
 
                 base = os.path.splitext(OUTPUT_FILE)[0] if OUTPUT_FILE else \
                     os.path.splitext(video_path)[0]
