@@ -26,8 +26,15 @@ from typing import Mapping, Optional, Sequence
 # Percentile at which a moment is genuinely unusual for its video rather than
 # merely above average. Set high on purpose: the word has to keep its meaning.
 EXCEPTIONAL = 90.0
-NOTABLE = 75.0
-ORDINARY = 60.0
+NOTABLE = 70.0
+# Wide on purpose. Most clips in most cuts are unremarkable relative to each
+# other, and a narrow middle band pushes ordinary clips into "weaker", which
+# reads as a criticism of a clip that is doing nothing wrong.
+ORDINARY = 30.0
+
+# A score shared by at least this much of the cut is a tie, not a rank. A
+# majority, because the sentence says "most" and it has to be true.
+TIED_SHARE = 0.5
 
 # Loudness is judged against the file, not an absolute level — a quiet recording
 # has loud moments too, and they are what its highlights are made of.
@@ -70,6 +77,16 @@ def _standing(entry: Mapping, peer_scores: Optional[Sequence[float]]) -> str:
     ordered = sorted(peer_scores)
     if ordered[0] == ordered[-1]:
         return "Scored the same as every other clip here"
+
+    # A clip tied with most of the cut has no rank worth reporting. Ranking it
+    # anyway lands the whole tied group mid-scale and then calls them all
+    # weaker — which is how fifteen of sixteen top-scoring clips came to be
+    # described as the ones that scraped in. A tie is information about the
+    # scoring, not about the clip, so say that instead.
+    tied = sum(1 for s in ordered if s == score)
+    if tied / len(ordered) >= TIED_SHARE:
+        return "Scored the same as most of the other clips here"
+
     # Midrank, as elsewhere: counting only what is strictly below caps the best
     # of five clips at 80%, so the top of a short cut could never be called the
     # top of it.
