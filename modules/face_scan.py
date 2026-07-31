@@ -160,6 +160,46 @@ def moments_for(seconds: Mapping,
     return hits
 
 
+def segments_for(seconds: Mapping,
+                 label: str,
+                 *,
+                 min_confidence: float = 0.0,
+                 merge_gap: float = 2.0,
+                 pad: float = 0.5,
+                 duration: Optional[float] = None) -> list:
+    """Matching seconds merged into watchable ranges.
+
+    A list of isolated seconds is not something anyone can play. Adjacent hits
+    become one clip, a short gap between them is bridged rather than cutting the
+    moment in two, and each range is padded so it does not begin exactly on the
+    frame the expression was recognised.
+    """
+    hits = sorted(sec for sec, _confidence in
+                  moments_for(seconds, label, min_confidence=min_confidence))
+    if not hits:
+        return []
+
+    ranges: list = []
+    start = previous = hits[0]
+    for sec in hits[1:]:
+        if sec - previous <= merge_gap:
+            previous = sec
+            continue
+        ranges.append((start, previous))
+        start = previous = sec
+    ranges.append((start, previous))
+
+    out = []
+    for lo, hi in ranges:
+        begin = max(0.0, lo - pad)
+        end = hi + 1.0 + pad
+        if duration:
+            end = min(float(duration), end)
+        if end > begin:
+            out.append((float(begin), float(end)))
+    return out
+
+
 def label_counts(seconds: Mapping) -> dict:
     """How many seconds each expression accounted for."""
     counts = {label: 0 for label in EMOTION_LABELS}
