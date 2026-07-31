@@ -2330,6 +2330,15 @@ class VideoHighlighterGUI(QWidget):
         self.cancel_btn.setStyleSheet("QPushButton:enabled { background-color: #ff4444; color: white; font-weight: bold; }")
         self.cancel_btn.clicked.connect(self.cancel_pipeline)
 
+        # Scores and reports without encoding. Detection is cached, so this is
+        # seconds once a video has been analysed — cheap enough to use as the
+        # normal way of trying a setting.
+        self.report_only_btn = QPushButton("Report Only")
+        self.report_only_btn.setToolTip(
+            "Re-score with the current settings and write the Highlight Report,\n"
+            "without rendering a video. Fast on a video already analysed.")
+        self.report_only_btn.clicked.connect(lambda: self.run_pipeline(report_only=True))
+
         self.run_btn = QPushButton("Run Highlighter")
         self.run_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
         self.run_btn.clicked.connect(self.toggle_run)
@@ -2351,6 +2360,7 @@ class VideoHighlighterGUI(QWidget):
         debug_console.register_checkbox(self.debug_console_chk)
         ctrl_layout.addWidget(self.debug_console_chk)
         ctrl_layout.addStretch()
+        ctrl_layout.addWidget(self.report_only_btn)
         ctrl_layout.addWidget(self.run_btn)
         layout.addLayout(ctrl_layout)
 
@@ -2948,6 +2958,7 @@ class VideoHighlighterGUI(QWidget):
             "action_points": int(self.spin_action.value()),
             "clip_time": int(self.spin_clip_time.value()),
             "coverage": self.slider_coverage.value() / 100.0,
+            "report_only": bool(getattr(self, "_report_only", False)),
             "max_duration": int(self.spin_max_duration.value()),
             "exact_duration": exact_duration,
             "multi_signal_boost": 1.2,
@@ -4186,9 +4197,16 @@ class VideoHighlighterGUI(QWidget):
         except Exception as e:
             print(f"⚠️ preview draw error: {e}")
 
-    def run_pipeline(self):
+    def run_pipeline(self, report_only: bool = False):
         from pipeline import run_highlighter
-        """Start the pipeline processing (UPDATED for multi-file)"""
+        """Start the pipeline processing (UPDATED for multi-file).
+
+        ``report_only`` scores and reports without encoding anything. Tuning
+        weights is cheap — detection is cached — but re-rendering a highlight
+        to find out what the new weights did is not, and that cost is what
+        makes trying a setting feel expensive.
+        """
+        self._report_only = bool(report_only)
         video_paths = self.get_file_list()
         
         if not video_paths:
@@ -4303,6 +4321,7 @@ class VideoHighlighterGUI(QWidget):
             "action_points": int(self.spin_action.value()),
             "clip_time": int(self.spin_clip_time.value()),
             "coverage": self.slider_coverage.value() / 100.0,
+            "report_only": bool(getattr(self, "_report_only", False)),
             "max_duration": int(self.spin_max_duration.value()),
             "exact_duration": exact_duration,
             "multi_signal_boost": 1.2,
@@ -4552,7 +4571,7 @@ class VideoHighlighterGUI(QWidget):
         """Run / Pause / Resume - single button"""
         # Not running → start pipeline
         if not self.worker or not self.worker._is_running:
-            self.run_pipeline()
+            self.run_pipeline(report_only=False)
             return
 
         # Running and not paused → pause
