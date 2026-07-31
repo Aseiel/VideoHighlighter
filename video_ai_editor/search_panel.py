@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt, Signal, QByteArray, QThread
 from PySide6.QtGui import QPixmap, QColor, QPainter, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QFrame, QSizePolicy, QSplitter, QComboBox,
+    QScrollArea, QFrame, QSizePolicy, QSplitter, QComboBox, QMenu,
 )
 
 from modules.face_emotions import EMOTION_LABELS
@@ -124,23 +124,19 @@ def build_segments(
 # ── Face card ─────────────────────────────────────────────────────────────────
 
 class _FaceCard(QFrame):
-    clicked = Signal(str)  # identity_id
+    clicked = Signal(str)              # identity_id
+    avoid_toggled = Signal(str, bool)  # identity_id, should be avoided
 
-    def __init__(self, identity_id: str, name: str, thumb_b64: str | None, parent=None):
+    def __init__(self, identity_id: str, name: str, thumb_b64: str | None,
+                 avoided: bool = False, parent=None):
         super().__init__(parent)
         self.identity_id = identity_id
+        self.avoided = bool(avoided)
         self.setFixedHeight(THUMB_SIZE + 28)
         self.setMinimumWidth(70)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.setCursor(Qt.PointingHandCursor)
-        self.setStyleSheet("""
-            QFrame {
-                background: #141414;
-                border: 1px solid #3a3a3a;
-                border-radius: 6px;
-            }
-            QFrame:hover { border-color: #4a90f5; background: #1f1f1f; }
-        """)
+        self._apply_style()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -153,15 +149,48 @@ class _FaceCard(QFrame):
         thumb_lbl.setPixmap(pix)
         layout.addWidget(thumb_lbl, alignment=Qt.AlignHCenter)
 
-        name_lbl = QLabel(name or "Unknown")
-        name_lbl.setAlignment(Qt.AlignCenter)
-        name_lbl.setStyleSheet("color: #cccccc; font-size: 10px; border: none; background: transparent;")
-        name_lbl.setFixedWidth(THUMB_SIZE + 8)
-        layout.addWidget(name_lbl, alignment=Qt.AlignHCenter)
+        self._name_lbl = QLabel(name or "Unknown")
+        self._name_lbl.setAlignment(Qt.AlignCenter)
+        self._name_lbl.setFixedWidth(THUMB_SIZE + 8)
+        layout.addWidget(self._name_lbl, alignment=Qt.AlignHCenter)
+        self._apply_name_style()
+
+    def _apply_style(self):
+        """Avoided people are marked on the card itself.
+
+        The setting lives in the face bank and changes what the next run cuts,
+        so it has to be visible where the faces are — not only in a tab
+        somewhere else."""
+        border = "#c04a4a" if self.avoided else "#3a3a3a"
+        self.setStyleSheet(
+            "QFrame { background: #141414; border: 1px solid %s;"
+            " border-radius: 6px; }"
+            "QFrame:hover { border-color: #4a90f5; background: #1f1f1f; }"
+            % border
+        )
+
+    def _apply_name_style(self):
+        colour = "#c88080" if self.avoided else "#cccccc"
+        self._name_lbl.setStyleSheet(
+            "color: %s; font-size: 10px; border: none; background: transparent;"
+            % colour
+        )
+
+    def set_avoided(self, avoided: bool):
+        self.avoided = bool(avoided)
+        self._apply_style()
+        self._apply_name_style()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.clicked.emit(self.identity_id)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        action = menu.addAction("Stop avoiding in highlights" if self.avoided
+                                else "Avoid this person in highlights")
+        if menu.exec(event.globalPos()) is action:
+            self.avoid_toggled.emit(self.identity_id, not self.avoided)
 
 
 # ── Segment row ───────────────────────────────────────────────────────────────
@@ -267,6 +296,7 @@ class SearchPanel(QWidget):
         self._video_path     = video_path
 
         self._identities: dict[str, dict] = {}
+        self._cards: dict[str, _FaceCard] = {}
         self._current_segments: list[tuple[float, float]] = []
 
         self._build_ui()
@@ -433,6 +463,7 @@ class SearchPanel(QWidget):
                     iid = rec.get("id")
                     if iid in seen:
                         seen[iid]["thumb_b64"] = rec.get("thumb")
+                        seen[iid]["avoided"] = bool(rec.get("avoid"))
                         if rec.get("name"):
                             seen[iid]["name"] = rec["name"]
             except Exception as e:
@@ -443,12 +474,45 @@ class SearchPanel(QWidget):
 
         # Populate face cards, sorted by appearance count
         for iid, info in sorted(seen.items(), key=lambda kv: -kv[1]["count"]):
-            card = _FaceCard(iid, info["name"], info["thumb_b64"])
+            card = _FaceCard(iid, info["name"], info["thumb_b64"],
+                             avoided=info.get("avoided", False))
             card.clicked.connect(self._on_face_selected)
+            card.avoid_toggled.connect(self._on_avoid_toggled)
+            self._cards[iid] = card
             # Insert before trailing stretch
             self._face_grid_layout.insertWidget(self._face_grid_layout.count() - 1, card)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
+
+    def _on_avoid_toggled(self, identity_id: str, avoided: bool):
+        """Mark a person as one the highlighter should skip.
+
+        The face bank is the same one the pipeline reads, so this changes what
+        the next run cuts. It is written immediately: a preference that only
+        survives if the app closes cleanly is one nobody can rely on.
+        """
+        try:
+            from video_ai_editor.face_identity import FaceIdentityBank
+
+            bank = FaceIdentityBank(db_path=self._face_db_path
+                                    or "./cache/face_db.json")
+            bank.load()
+            bank.set_avoid(identity_id, avoided)
+            if not bank.save():
+                raise IOError("face bank could not be written")
+        except Exception as exc:                      # noqa: BLE001
+            print(f"⚠️ Could not change avoid for {identity_id}: {exc}")
+            self._expr_status.setText(f"Could not save the avoid setting: {exc}")
+            return
+
+        card = self._cards.get(identity_id)
+        if card is not None:
+            card.set_avoided(avoided)
+        if identity_id in self._identities:
+            self._identities[identity_id]["avoided"] = avoided
+        name = (self._identities.get(identity_id) or {}).get("name", "this person")
+        self._expr_status.setText(
+            f"{name} will be {'skipped' if avoided else 'included'} on the next run.")
 
     def _on_face_selected(self, identity_id: str):
         info = self._identities.get(identity_id, {})
