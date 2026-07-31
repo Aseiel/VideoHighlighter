@@ -5,7 +5,7 @@ at, this one names five expressions with no setup at all. They are the same two
 tiers the rest of the app already has — a fixed vocabulary that works out of the
 box, and taught categories for everything the vocabulary has no word for.
 
-Both consume the *same crop*. ``face_examples.scan_frames`` finds and crops the
+Both consume the *same crop*. ``face_crops.scan_frames`` finds and cuts the
 faces once; the crop then goes to CLIP for taught categories and here for the
 built-in classes. No second decode, no second detection pass.
 

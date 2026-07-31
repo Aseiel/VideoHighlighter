@@ -32,7 +32,7 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 import numpy as np
 
 from modules.face_emotions import EMOTION_LABELS, emotions_by_second
-from modules.face_examples import DEFAULT_PAD, MIN_DETECTION_SCORE, crop_face
+from modules.face_crops import DEFAULT_PAD, MIN_DETECTION_SCORE, crop_face
 
 SCHEMA = 1
 

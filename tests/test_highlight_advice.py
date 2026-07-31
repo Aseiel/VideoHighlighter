@@ -241,3 +241,43 @@ class TestOlderReports:
         rep = _report(signals={"object": {100: 10.0}})
         rep["signal_totals"] = {"object": 999.0}
         assert signal_totals(rep)["object"] == 999.0
+
+
+class TestExpressions:
+    def _rep(self, **settings):
+        return _report(signals={"object": {100: 10.0}, "audio": {100: 4.0}},
+                       settings=settings)
+
+    def test_weighted_with_no_class_chosen_is_flagged(self):
+        findings = diagnose(self._rep(face_expression_points=8,
+                                      face_expression_labels=[]))
+        assert "expressions_unselected" in _ids(findings)
+
+    def test_quiet_once_a_class_is_chosen(self):
+        findings = diagnose(self._rep(face_expression_points=8,
+                                      face_expression_labels=["happy"]))
+        assert "expressions_unselected" not in _ids(findings)
+
+    def test_quiet_when_expressions_are_not_weighted(self):
+        assert "expressions_unselected" not in _ids(diagnose(self._rep()))
+
+    def test_one_class_swallowing_the_video_is_called_out(self):
+        counts = {"sad": 857, "neutral": 482, "surprise": 236, "happy": 196}
+        finding = next(f for f in diagnose(self._rep(
+            face_expression_counts=counts)) if f.id == "expression_lopsided")
+        assert "sad" in finding.detail
+        assert "cannot read these faces" in finding.detail
+        assert finding.topic == "training"
+
+    def test_a_balanced_spread_is_not_flagged(self):
+        counts = {"sad": 100, "neutral": 100, "surprise": 100, "happy": 100}
+        assert "expression_lopsided" not in _ids(
+            diagnose(self._rep(face_expression_counts=counts)))
+
+    def test_too_few_readable_seconds_to_conclude_anything(self):
+        counts = {"sad": 9, "happy": 1}
+        assert "expression_lopsided" not in _ids(
+            diagnose(self._rep(face_expression_counts=counts)))
+
+    def test_no_scan_means_no_claim(self):
+        assert "expression_lopsided" not in _ids(diagnose(self._rep()))

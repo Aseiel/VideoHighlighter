@@ -20,7 +20,7 @@ from modules.face_emotions import (
     top_emotion,
     to_signal,
 )
-from modules.face_examples import FaceCrop
+from modules.face_crops import FaceCrop
 
 
 def _probs(**named):
