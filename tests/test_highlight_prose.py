@@ -62,7 +62,10 @@ class TestStanding:
             _entry(score=15.0), [15.0, 15.0, 15.0, 15.0])
 
     def test_too_few_clips_to_rank(self):
-        assert describe(_entry(score=5.0), [5.0, 6.0]) == ""
+        """No ranking claim — but the share still leads the sentence."""
+        text = describe(_entry(score=5.0, percentile=50.0), [5.0, 6.0])
+        assert "strongest" not in text and "weaker" not in text
+        assert text.startswith("Outscored 50% of the video")
 
 
 class TestEvidence:
@@ -204,3 +207,35 @@ class TestTies:
     def test_an_ordinary_clip_is_not_called_weak(self):
         peers = [1.0, 5.0, 10.0, 15.0, 20.0]
         assert "weaker" not in describe(_entry(score=10.0), peers)
+
+
+class TestVideoShare:
+    """The number people look for first belongs in the sentence."""
+
+    def test_every_clip_states_what_it_outscored(self):
+        peers = [15.0] * 15 + [10.0]
+        for score in (15.0, 10.0):
+            text = describe(_entry(score=score, percentile=89.0), peers)
+            assert "outscored 89% of the video" in text
+
+    def test_it_is_there_even_when_nothing_else_is(self):
+        text = describe(_entry(score=15.0, percentile=94.0), [15.0] * 4)
+        assert "outscored 94% of the video" in text
+
+    def test_a_low_share_is_reported_just_as_plainly(self):
+        """Much of the video scoring comparably is worth knowing too."""
+        peers = [15.0] * 15 + [10.0]
+        assert "outscored 31% of the video" in describe(
+            _entry(score=15.0, percentile=31.0), peers)
+
+    def test_a_record_without_the_measurement_makes_no_claim(self):
+        entry = {"breakdown": {"object": 5.0}, "signals_present": ["object"],
+                 "measured": {}, "score": 5.0}
+        assert "outscored" not in describe(entry, [5.0, 6.0, 7.0])
+
+    def test_it_leads_the_evidence(self):
+        peers = [1.0, 2.0, 100.0]
+        text = describe(_entry(score=100.0, percentile=97.0,
+                               breakdown={"object": 5.0}, present=["object"]),
+                        peers)
+        assert text.index("outscored") < text.index("what was on screen")
