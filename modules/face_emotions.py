@@ -10,8 +10,8 @@ faces once; the crop then goes to CLIP for taught categories and here for the
 built-in classes. No second decode, no second detection pass.
 
 Model: ``emotions-recognition-retail-0003`` from Intel's Open Model Zoo — 5
-classes, ~2.4 MB, Apache 2.0, and OpenVINO IR, which is the runtime and the
-packaging path this project already uses for its action classifier. The licence
+classes, ~9.5 MB in FP32, Apache 2.0, and OpenVINO IR, which is the runtime
+and the packaging path this project already uses for its action classifier. The licence
 matters as much as the accuracy here: most off-the-shelf face models are
 derivatives that would not survive the commercial build.
 
@@ -146,6 +146,9 @@ class EmotionClassifier:
         self.device = device
         self._compiled = None
         self._output = None
+        # None once the network accepts a dynamic batch; 1 when it insists
+        # on the shape it was published with.
+        self._batch = None
 
     def available(self) -> bool:
         """Whether the model files are actually present."""
@@ -162,13 +165,23 @@ class EmotionClassifier:
                   "categories are unaffected.")
             return False
         try:
-            from openvino import Core
+            from openvino import Core, PartialShape
 
             core = Core()
             model = core.read_model(self.model_path)
+            # The published model has a static batch of 1, so feeding it a
+            # batch raises rather than looping internally. Reshape to a dynamic
+            # batch where the runtime allows it, and remember when it does not
+            # so the caller feeds one crop at a time instead of failing.
+            try:
+                model.reshape({model.input(0): PartialShape([-1, 3, *INPUT_SIZE])})
+                self._batch = None
+            except Exception:
+                self._batch = 1
             self._compiled = core.compile_model(model, self.device)
             self._output = self._compiled.output(0)
-            print(f"✅ Expression classifier loaded ({self.device})")
+            print(f"✅ Expression classifier loaded ({self.device}"
+                  f"{', batch of 1' if self._batch == 1 else ''})")
             return True
         except Exception as exc:
             print(f"⚠️ Expression classifier failed to load: {exc}")
@@ -185,4 +198,4 @@ class EmotionClassifier:
         """Probabilities per crop, or an empty array if the model is not loaded."""
         if self._compiled is None and not self.load():
             return np.zeros((0, len(EMOTION_LABELS)), dtype=np.float32)
-        return classify_crops(crops, self.infer)
+        return classify_crops(crops, self.infer, batch=self._batch or 16)
