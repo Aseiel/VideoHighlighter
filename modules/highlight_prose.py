@@ -145,6 +145,33 @@ def _loudness(measured: Mapping) -> str:
     return ""
 
 
+def _confidence(entry: Mapping, measured: Mapping) -> str:
+    """How sure the detector was about what it saw.
+
+    A moment can score well on a detection the model was barely willing to
+    make. The score does not carry that — points are the same whether the
+    detector was certain or guessing — so without this a reader cannot tell a
+    solid pick from one resting on a 0.31.
+
+    Actions are preferred when present because they carry their own confidence
+    and a tier; otherwise the strongest box at the peak second.
+    """
+    actions = entry.get("actions") or []
+    if actions:
+        best = max(actions, key=lambda a: float(a.get("confidence") or 0.0))
+        tier = best.get("tier")
+        name = str(best.get("name") or "an action")
+        return (f"{name} recognised at {float(best['confidence']):.2f}"
+                + (f" ({tier})" if tier else ""))
+    confidence = measured.get("detection_confidence")
+    if confidence is None:
+        return ""
+    # The strongest box at that second, not the only one — say so, or a
+    # clip with one certain detection and three doubtful ones reads as
+    # uniformly certain.
+    return f"its strongest detection at {float(confidence):.2f}"
+
+
 def _agreement(entry: Mapping, measured: Mapping) -> str:
     """Signals arriving together is the difference between noise and an event.
 
@@ -188,6 +215,9 @@ def describe(entry: Mapping,
                 else " alone")
         parts.append(f"{evidence}{only} {agreement}".strip()
                      if agreement else f"{evidence}{only}")
+    confidence = _confidence(entry, measured)
+    if confidence:
+        parts.append(confidence)
     loudness = _loudness(measured)
     if loudness:
         parts.append(loudness)

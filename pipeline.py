@@ -1079,6 +1079,15 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             # was composed from, and labels every one of them an object.
             composed_event_names = list(
                 (cached_data or {}).get("composed_event_names") or [])
+            # Same trap: the boxes are only ever appended inside the detection
+            # branch, so on a cached pass this stayed empty and the report lost
+            # both the overlay on each thumbnail and every detector confidence
+            # behind it — silently, because an empty list is a legal answer.
+            object_bboxes_cache = list(
+                (cached_data or {}).get("object_bboxes") or [])
+            if object_bboxes_cache:
+                log(f"ℹ Reusing {len(object_bboxes_cache)} cached detection "
+                    "frame(s) for the report")
         if not using_cache:
             if not highlight_objects:
                 log("ℹ Skipping object detection (no objects to highlight)")
