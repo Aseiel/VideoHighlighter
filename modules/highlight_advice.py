@@ -414,14 +414,94 @@ def _rule_expression_lopsided(report) -> Optional[Finding]:
     )
 
 
+# What a user can say is wrong, and the findings each complaint makes relevant.
+# Naming the complaint is what turns "add another signal" into "this one".
+CONCERNS = {
+    "repetitive": "the clips are too similar to each other",
+    "wrong_moments": "it picked moments I did not want",
+    "missed_moments": "it missed moments I did want",
+    "too_short": "the highlight is shorter than I asked for",
+    "arbitrary": "the choices look random",
+}
+
+
+def _rule_unused_detector(report, concern=None) -> list:
+    """A detector that found plenty and was never allowed to count.
+
+    Scenes, motion and audio peaks are detected whatever their weight, so when
+    the record says a detector fired hundreds of times at zero points, the
+    advice can name it instead of suggesting "a signal" in the abstract.
+    """
+    settings = report.get("settings") or {}
+    activity = settings.get("detector_activity") or {}
+    kept = len(_kept(report))
+    out = []
+    for key, weight_key in SIGNAL_WEIGHTS.items():
+        found = int(activity.get(key) or 0)
+        weight = settings.get(weight_key) or 0
+        # Enough to discriminate: comfortably more events than clips, or it
+        # would only re-rank the moments already chosen.
+        if weight > 0 or found < max(20, kept * 3):
+            continue
+        out.append(Finding(
+            id=f"unused_{key}",
+            severity="high" if concern in ("arbitrary", "repetitive") else "medium",
+            title=f"{SIGNAL_NAMES[key].capitalize()} were found but count for nothing",
+            detail=(f"{found} {SIGNAL_NAMES[key]} were detected across this "
+                    f"video and are weighted at zero, so none of them could "
+                    f"influence the {kept} moments that were chosen."),
+            remedy=(f"Give {SIGNAL_NAMES[key]} a small weight — 3 to 5 points "
+                    "is usually enough to break ties without taking over — and "
+                    "re-run. Detection is cached, so it costs a re-score, not "
+                    "a re-analysis."),
+            topic="weights",
+            evidence={"signal": key, "detected": found, "clips": kept},
+        ))
+    # Most events first: the detector with the most to say is the best bet.
+    out.sort(key=lambda f: -f.evidence["detected"])
+    return out
+
+
+def _rule_concern_repetitive(report, concern=None) -> Optional[Finding]:
+    """Asked for variety when nothing in the scoring rewards it."""
+    if concern != "repetitive":
+        return None
+    scoring = _scoring_signals(report)
+    if len(scoring) > 1:
+        return None
+    key = next(iter(scoring), "")
+    return Finding(
+        id="concern_repetitive",
+        severity="high",
+        title="Nothing in this run could have produced variety",
+        detail=(f"Every point came from {SIGNAL_NAMES.get(key, key)}, so the "
+                "highest-scoring moments are the ones where that signal was "
+                "strongest — and those tend to look alike. Selection has no "
+                "notion of variety; it takes the top scores."),
+        remedy=("Two things help, in this order: raise the Best moments <-> "
+                "Full story slider, which spreads the cut across the video, "
+                "and give a second signal a weight so a moment has to be "
+                "interesting in more than one way to win."),
+        topic="variety",
+        evidence={"signal": key},
+    )
+
+
 def diagnose(report: Mapping,
              *,
-             rejected: Optional[Sequence[Sequence[float]]] = None) -> list:
+             rejected: Optional[Sequence[Sequence[float]]] = None,
+             concern: Optional[str] = None) -> list:
     """Every finding the record supports, most serious first.
 
     ``rejected`` is the time ranges the user swapped away, which turns "here is
     what your settings do" into "here is what your settings do that you did not
     want".
+
+    ``concern`` is what the user said was wrong (see :data:`CONCERNS`). Findings
+    are the same facts either way; naming the complaint decides which of them
+    lead, and adds the ones that only make sense as an answer to a question. An
+    advisor that does not know what disappointed you can only list everything
+    it noticed.
     """
     findings = []
     for rule in (_rule_single_signal, _rule_flat_score, _rule_concentrated,
@@ -432,6 +512,10 @@ def diagnose(report: Mapping,
         if found:
             findings.append(found)
     findings.extend(_rule_silent_detector(report))
+    findings.extend(_rule_unused_detector(report, concern))
+    concern_finding = _rule_concern_repetitive(report, concern)
+    if concern_finding:
+        findings.append(concern_finding)
     rejected_finding = _rule_rejected_share_a_tag(report, rejected)
     if rejected_finding:
         findings.append(rejected_finding)
@@ -443,7 +527,11 @@ def diagnose(report: Mapping,
 
 def attach_advice(report: dict,
                   *,
-                  rejected: Optional[Sequence[Sequence[float]]] = None) -> dict:
+                  rejected: Optional[Sequence[Sequence[float]]] = None,
+                  concern: Optional[str] = None) -> dict:
     """Put the findings into the record, so page and model read the same list."""
-    report["advice"] = [f.as_dict() for f in diagnose(report, rejected=rejected)]
+    report["advice"] = [f.as_dict() for f in
+                        diagnose(report, rejected=rejected, concern=concern)]
+    if concern:
+        report["advice_concern"] = str(concern)
     return report

@@ -1944,6 +1944,22 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         # classifier cannot read this footage at all.
                         "face_expression_counts": (
                             _face_label_counts(face_seconds) if face_seconds else {}),
+                        # How much each detector actually found, regardless of
+                        # what it was worth. Scenes, motion and audio peaks are
+                        # detected whatever their weight, so without this the
+                        # report cannot tell "never fires" from "fires four
+                        # hundred times and is switched off" — and can only give
+                        # generic advice about which signal to try next.
+                        "detector_activity": {
+                            "scene": len(scenes or []),
+                            "motion_event": len(motion_events or []),
+                            "motion_peak": len(motion_peaks or []),
+                            "audio": len(audio_peaks or []),
+                            "keyword": len(keyword_matches or []),
+                            "object": len(object_detections or {}),
+                            "action": len(detections_by_sec or {}),
+                            "face": len(face_seconds or {}),
+                        },
                     },
                     boost_multiplier=MULTI_SIGNAL_BOOST,
                     min_signals_for_boost=MIN_SIGNALS_FOR_BOOST,
