@@ -13,16 +13,19 @@ import re
 import numpy as np
 
 from modules.highlight_report import (
+    SILENCE_DBFS,
     boxes_by_second,
     build_report,
     downsample,
     format_timestamp,
     peak_second,
     render_html,
+    percentile_rank,
     render_text,
     score_from_report,
     segments_from_report,
     split_tags,
+    to_dbfs,
     write_report,
 )
 
@@ -646,3 +649,119 @@ class TestAdviceSection:
         page = render_html(rep)
         assert "<script>x</script>" not in page
         assert "&lt;script&gt;" in page
+
+
+class TestMeasurements:
+    """Physical facts, not points — the substrate for explaining a moment."""
+
+    def _rep(self, n=600, segments=None, **kw):
+        sig = _signals(n=n, **kw.pop("signals", {}))
+        return build_report(video_path="a.mp4", video_duration=n,
+                            score=_score(sig, n=n), signals=sig,
+                            segments=segments or [(95, 105)], **kw)
+
+    def test_percentile_rank_is_a_position_not_a_value(self):
+        values = np.sort(np.array([1.0, 2.0, 3.0, 4.0]))
+        assert percentile_rank(values, 1.0) == 12.5
+        assert percentile_rank(values, 3.0) == 62.5
+        assert percentile_rank(values, 99.0) == 100.0
+
+    def test_ties_share_the_middle_rather_than_the_bottom(self):
+        """A run where every kept moment scored the same is not a run of
+        bottom-ranked moments — they are simply all alike."""
+        values = np.full(20, 15.0)
+        assert percentile_rank(values, 15.0) == 50.0
+
+    def test_percentile_of_nothing_is_zero_not_a_crash(self):
+        assert percentile_rank(np.array([]), 5.0) == 0.0
+
+    def test_dbfs_conversion(self):
+        assert to_dbfs(1.0) == 0.0
+        assert to_dbfs(0.5) == -6.0
+        assert to_dbfs(0.1) == -20.0
+
+    def test_silence_reports_a_floor_not_negative_infinity(self):
+        assert to_dbfs(0.0) == SILENCE_DBFS
+        assert np.isfinite(to_dbfs(0.0))
+
+    def test_a_top_moment_ranks_near_the_top(self):
+        """Against a real spread of activity, not against three data points."""
+        points = {sec: 1.0 + (sec % 5) for sec in range(200, 500, 5)}
+        points[100] = 20.0                     # the clip's peak, highest of all
+        rep = self._rep(signals={"object": points}, segments=[(95, 105)])
+        assert rep["segments"][0]["measured"]["score_percentile"] > 95
+
+    def test_loudness_is_reported_in_dbfs_with_its_rank(self):
+        n = 600
+        wave = [0.01] * (n * 4)
+        for i in range(100 * 4, 100 * 4 + 8):
+            wave[i] = 0.5                      # -6 dBFS burst inside the clip
+        rep = self._rep(signals={"object": {100: 10.0}}, waveform=wave)
+        measured = rep["segments"][0]["measured"]
+        assert measured["loudness_dbfs"] == -6.0
+        assert measured["loudness_percentile"] > 90
+
+    def test_no_waveform_means_no_loudness_claim(self):
+        measured = self._rep(signals={"object": {100: 10.0}})["segments"][0]["measured"]
+        assert "loudness_dbfs" not in measured
+
+    def test_each_contributing_signal_gets_a_rank(self):
+        rep = self._rep(signals={"object": {100: 10.0, 300: 1.0},
+                                 "audio": {100: 8.0, 400: 1.0}})
+        signals = rep["segments"][0]["measured"]["signals"]
+        assert set(signals) == {"object", "audio"}
+        assert signals["object"]["percentile"] == 75.0   # top of two, midranked
+        assert signals["object"]["at"] == 100
+
+    def test_signals_that_never_fired_in_the_clip_are_absent(self):
+        rep = self._rep(signals={"object": {100: 10.0}, "audio": {400: 8.0}})
+        assert "audio" not in rep["segments"][0]["measured"]["signals"]
+
+    def test_signals_firing_together_are_reported_as_coinciding(self):
+        rep = self._rep(signals={"object": {100: 10.0}, "audio": {100: 8.0}})
+        measured = rep["segments"][0]["measured"]
+        assert measured["signal_spread_seconds"] == 0.0
+        assert measured["signals_coincide"] is True
+
+    def test_signals_far_apart_are_not_a_coincidence(self):
+        rep = self._rep(signals={"object": {96: 10.0}, "audio": {104: 8.0}},
+                        segments=[(95, 105)])
+        measured = rep["segments"][0]["measured"]
+        assert measured["signal_spread_seconds"] == 8.0
+        assert measured["signals_coincide"] is False
+
+    def test_one_signal_alone_makes_no_coincidence_claim(self):
+        measured = self._rep(signals={"object": {100: 10.0}})["segments"][0]["measured"]
+        assert "signals_coincide" not in measured
+
+    def test_detection_confidence_comes_from_the_boxes(self):
+        rep = self._rep(signals={"object": {100: 10.0}},
+                        bbox_cache=[{"timestamp": 100.0, "objects": ["a", "b"],
+                                     "bboxes": [[0, 0, 1, 1], [0, 0, 1, 1]],
+                                     "confidences": [0.42, 0.91]}])
+        assert rep["segments"][0]["measured"]["detection_confidence"] == 0.91
+
+    def test_measurements_are_json_serialisable(self):
+        json.dumps(self._rep(signals={"object": {100: 10.0}})["segments"][0]["measured"])
+
+    def test_the_page_states_them_in_real_units(self):
+        n = 600
+        wave = [0.01] * (n * 4)
+        for i in range(100 * 4, 100 * 4 + 8):
+            wave[i] = 0.5
+        rep = self._rep(signals={"object": {100: 10.0}, "audio": {100: 8.0}},
+                        waveform=wave)
+        page = render_html(rep)
+        assert "dBFS" in page
+        assert "scored above" in page
+        assert "signals landed together" in page
+
+    def test_percentiles_ignore_the_silence_between_events(self):
+        """Ranking against zeros would make any detection look exceptional."""
+        points = {sec: 1.0 + (sec % 7) for sec in range(0, 600, 5)}
+        points[100] = 3.0                      # unremarkable among its peers
+        sig = _signals(n=600, object=points)
+        rep = build_report(video_path="a.mp4", video_duration=600,
+                           score=_score(sig, n=600), signals=sig,
+                           segments=[(95, 105)])
+        assert rep["segments"][0]["measured"]["score_percentile"] < 90
