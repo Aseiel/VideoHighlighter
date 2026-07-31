@@ -615,8 +615,18 @@ class SearchPanel(QWidget):
         # Clear rows (keep trailing stretch)
         while self._seg_list_layout.count() > 1:
             item = self._seg_list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            widget = item.widget()
+            if widget is None:
+                continue
+            if widget is self._no_results_lbl:
+                # Long-lived and reused across refreshes, unlike the rows.
+                # deleteLater() only schedules the destruction, so it survives
+                # this call and dies on the next turn of the event loop —
+                # leaving self._no_results_lbl pointing at a freed C++ object
+                # for whichever refresh comes after. Unparent it instead.
+                widget.setParent(None)
+                continue
+            widget.deleteLater()
 
         if not segments:
             self._no_results_lbl.show()
