@@ -46,6 +46,7 @@ SIGNAL_LABELS = (
     ("keyword", "Keyword"),
     ("object", "Objects"),
     ("action", "Actions"),
+    ("face", "Expression"),
     # Position bonuses. Included because they feed the same total: if they were
     # omitted, the points they contribute would show up in `total - pre_boost`
     # and be reported as a multi-signal boost that never happened.
@@ -56,7 +57,8 @@ SIGNAL_LABELS = (
 # Signals that count toward the multi-signal boost. A position bonus is not
 # evidence about content, and the pipeline's own boost test excludes them, so
 # counting them here would over-report the signal count.
-BOOST_SIGNALS = ("motion_event", "motion_peak", "audio", "keyword", "object")
+BOOST_SIGNALS = ("motion_event", "motion_peak", "audio", "keyword", "object",
+                 "face")
 
 # How many unselected peaks to report. These are the moments a user would
 # adjust weights to capture, so they are the most actionable rows in the whole
