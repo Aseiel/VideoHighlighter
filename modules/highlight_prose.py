@@ -102,6 +102,23 @@ def _standing(entry: Mapping, peer_scores: Optional[Sequence[float]]) -> str:
     return "One of the weaker clips that still made the cut"
 
 
+def _video_share(measured: Mapping) -> str:
+    """How much of the video this moment outscored.
+
+    Kept in the sentence rather than only in the figures below it: it is the
+    one number that answers "was this worth keeping" without knowing anything
+    about the weight table, and it is the first thing people look for.
+
+    It is honest in both directions. A high share means the scoring was
+    selective; a low one means much of the video scored comparably, and the
+    choice between those moments was closer to arbitrary than it looks.
+    """
+    percentile = measured.get("score_percentile")
+    if percentile is None:
+        return ""
+    return f"outscored {percentile:.0f}% of the video"
+
+
 def _evidence(entry: Mapping) -> str:
     """What actually fired, named the way a person would name it.
 
@@ -161,9 +178,12 @@ def describe(entry: Mapping,
     agreement = _agreement(entry, measured)
 
     parts = []
+    share = _video_share(measured)
+    if share:
+        parts.append(share)
     if evidence:
-        # What fired always leads: "two signals agreed" is worth much less than
-        # knowing it was sound and movement.
+        # What fired always leads the evidence: "two signals agreed" is worth
+        # much less than knowing it was sound and movement.
         only = ("" if len(entry.get("signals_present") or []) != 1
                 else " alone")
         parts.append(f"{evidence}{only} {agreement}".strip()
@@ -172,11 +192,14 @@ def describe(entry: Mapping,
     if loudness:
         parts.append(loudness)
 
-    if not standing:
-        return f"Chosen on {_join(parts)}." if parts else ""
-    if parts:
-        return f"{standing} — {_join(parts)}."
-    return f"{standing}."
+    if standing:
+        return f"{standing} — {_join(parts)}." if parts else f"{standing}."
+    if not parts:
+        return ""
+    # No ranking to lead with, so the first clause becomes the sentence.
+    head, rest = parts[0], parts[1:]
+    head = head[0].upper() + head[1:]
+    return f"{head} — {_join(rest)}." if rest else f"{head}."
 
 
 def describe_all(report: Mapping) -> list:
