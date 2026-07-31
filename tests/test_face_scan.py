@@ -21,6 +21,7 @@ from modules.face_scan import (
     moments_for,
     save,
     scan,
+    segments_for,
 )
 
 
@@ -171,3 +172,53 @@ class TestCache:
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["video"] == "a.mp4" and data["interval"] == 2.0
         assert data["schema"] == 1
+
+
+class TestSegments:
+    """Isolated seconds are not something anyone can play."""
+
+    def _seconds(self, *pairs):
+        return {sec: {"label": label, "confidence": 0.9, "faces": 1}
+                for sec, label in pairs}
+
+    def test_adjacent_hits_become_one_range(self):
+        seconds = self._seconds((10, "happy"), (11, "happy"), (12, "happy"))
+        assert segments_for(seconds, "happy", pad=0.0) == [(10.0, 13.0)]
+
+    def test_a_short_gap_is_bridged_rather_than_cutting_the_moment(self):
+        seconds = self._seconds((10, "happy"), (12, "happy"))
+        assert segments_for(seconds, "happy", merge_gap=2.0, pad=0.0) == [(10.0, 13.0)]
+
+    def test_a_long_gap_separates_them(self):
+        seconds = self._seconds((10, "happy"), (40, "happy"))
+        assert segments_for(seconds, "happy", merge_gap=2.0, pad=0.0) == [
+            (10.0, 11.0), (40.0, 41.0)]
+
+    def test_ranges_are_padded_on_both_sides(self):
+        seconds = self._seconds((10, "happy"))
+        assert segments_for(seconds, "happy", pad=0.5) == [(9.5, 11.5)]
+
+    def test_padding_never_runs_before_the_start(self):
+        seconds = self._seconds((0, "happy"))
+        assert segments_for(seconds, "happy", pad=2.0)[0][0] == 0.0
+
+    def test_padding_never_runs_past_the_end(self):
+        seconds = self._seconds((99, "happy"))
+        assert segments_for(seconds, "happy", pad=2.0, duration=100)[0][1] == 100.0
+
+    def test_other_expressions_are_not_included(self):
+        seconds = self._seconds((10, "happy"), (11, "sad"), (12, "happy"))
+        assert segments_for(seconds, "happy", merge_gap=0.5, pad=0.0) == [
+            (10.0, 11.0), (12.0, 13.0)]
+
+    def test_the_confidence_floor_applies(self):
+        seconds = {10: {"label": "happy", "confidence": 0.4, "faces": 1}}
+        assert segments_for(seconds, "happy", min_confidence=0.5) == []
+
+    def test_an_expression_that_never_appeared_gives_nothing(self):
+        assert segments_for(self._seconds((10, "happy")), "anger") == []
+
+    def test_ranges_come_back_in_order(self):
+        seconds = self._seconds((40, "happy"), (10, "happy"), (25, "happy"))
+        out = segments_for(seconds, "happy", merge_gap=1.0, pad=0.0)
+        assert out == sorted(out)

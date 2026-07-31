@@ -13,12 +13,14 @@ import json
 import os
 from typing import Callable
 
-from PySide6.QtCore import Qt, Signal, QByteArray
+from PySide6.QtCore import Qt, Signal, QByteArray, QThread
 from PySide6.QtGui import QPixmap, QColor, QPainter, QFont
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QFrame, QSizePolicy, QSplitter,
+    QScrollArea, QFrame, QSizePolicy, QSplitter, QComboBox,
 )
+
+from modules.face_emotions import EMOTION_LABELS
 
 THUMB_SIZE = 56    # face card thumbnail px
 MERGE_GAP  = 2.0  # seconds — gaps smaller than this are merged
@@ -51,6 +53,37 @@ def _pixmap_from_b64(b64: str, size: int) -> QPixmap:
     except Exception:
         pass
     return _placeholder_pixmap(size)
+
+
+def load_identity_entries(video_path: str) -> list[dict]:
+    """Load the identity-tagged per-frame entries for a video, straight from the
+    Avoid pass's cache (cache/avoid/<key>.entries.json). Load-only — never runs
+    tracking/recognition. Returns [] if the video was never face-scanned.
+
+    Resolved cwd-INDEPENDENTLY (repo root via this module's location, then a
+    cwd-relative ./cache fallback) so it works no matter where the app launched.
+    Matched by exact key only — the key is the sole reliable video↔file link.
+    """
+    if not video_path:
+        return []
+    try:
+        from modules.compute_forbidden import _entries_key
+        key = _entries_key(video_path, "n", 15, 3)
+        fname = key + ".entries.json"
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for p in (os.path.join(repo_root, "cache", "avoid", fname),
+                  os.path.join("cache", "avoid", fname)):
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as fh:
+                    entries = json.load(fh)
+                print(f"🪪 SearchPanel: loaded {len(entries)} identity-tagged "
+                      f"frame(s) from {p}")
+                return entries or []
+        print(f"🪪 SearchPanel: no identity entries for "
+              f"'{os.path.basename(video_path)}' (key={key})")
+    except Exception as e:
+        print(f"⚠️ SearchPanel.load_identity_entries failed: {e}")
+    return []
 
 
 def build_segments(
@@ -166,6 +199,42 @@ class _SegmentRow(QWidget):
 
 # ── Main panel ────────────────────────────────────────────────────────────────
 
+class _ExpressionScanWorker(QThread):
+    """Runs the face sweep off the UI thread.
+
+    Minutes of detection on a feature-length file, so it cannot run inline —
+    a frozen window during a scan reads as a crash.
+    """
+    done = Signal(dict)
+    failed = Signal(str)
+    progress = Signal(float, float)
+
+    def __init__(self, video_path: str, cache_dir: str = "./cache",
+                 rescan: bool = False, parent=None):
+        super().__init__(parent)
+        self._video_path = video_path
+        self._cache_dir = cache_dir
+        self._rescan = rescan
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            from modules.face_scan import scan_video
+            seconds = scan_video(
+                self._video_path,
+                cache_dir=self._cache_dir,
+                use_cache=not self._rescan,
+                cancel_fn=lambda: self._cancelled,
+                progress_fn=lambda at, total: self.progress.emit(at, total),
+            )
+            self.done.emit(seconds or {})
+        except Exception as exc:                      # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class SearchPanel(QWidget):
     """
     Face identity search panel for the timeline viewer.
@@ -186,6 +255,7 @@ class SearchPanel(QWidget):
         on_jump: Callable[[float], None],
         on_add_clip: Callable[[float, float], None],
         face_db_path: str | None = None,
+        video_path: str | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -194,12 +264,27 @@ class SearchPanel(QWidget):
         self._jump           = on_jump
         self._add_clip       = on_add_clip
         self._face_db_path   = face_db_path
+        self._video_path     = video_path
 
         self._identities: dict[str, dict] = {}
         self._current_segments: list[tuple[float, float]] = []
 
         self._build_ui()
         self._load_identities()
+
+    def _entries(self) -> list[dict]:
+        """The identity-tagged frames to search over. Prefer whatever the cache
+        already holds; otherwise load them directly from disk by video path (so
+        the panel works even if the viewer never populated cache_data)."""
+        entries = (self._cache_data.get("identity_entries")
+                   or self._cache_data.get("object_bboxes"))
+        if entries:
+            return entries
+        entries = load_identity_entries(self._video_path)
+        if entries:
+            # Cache it so the People timeline layer and re-queries reuse it.
+            self._cache_data["identity_entries"] = entries
+        return entries
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -216,6 +301,37 @@ class SearchPanel(QWidget):
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #686868; font-size: 10px;")
         root.addWidget(hint)
+
+        # ── Expressions ───────────────────────────────────────────────────────
+        # Its own question, not a highlight setting: "where is this expression"
+        # is asked and answered here, and the results feed the same jump / add
+        # controls as a person search.
+        expr_row = QHBoxLayout()
+        expr_row.setSpacing(4)
+
+        self._expr_scan_btn = QPushButton("Scan expressions")
+        self._expr_scan_btn.setToolTip(
+            "Detect faces across the video and classify their expression.\n"
+            "Runs once and is cached, so asking a second question is instant.")
+        self._expr_scan_btn.clicked.connect(self._scan_expressions)
+        expr_row.addWidget(self._expr_scan_btn)
+
+        self._expr_combo = QComboBox()
+        self._expr_combo.addItem("— expression —", "")
+        for _label in EMOTION_LABELS:
+            self._expr_combo.addItem(_label, _label)
+        self._expr_combo.setEnabled(False)
+        self._expr_combo.currentIndexChanged.connect(self._on_expression_picked)
+        expr_row.addWidget(self._expr_combo, 1)
+        root.addLayout(expr_row)
+
+        self._expr_status = QLabel("")
+        self._expr_status.setWordWrap(True)
+        self._expr_status.setStyleSheet("color: #686868; font-size: 10px;")
+        root.addWidget(self._expr_status)
+        self._expr_seconds: dict = {}
+        self._expr_worker = None
+        self._load_cached_expressions()
 
         splitter = QSplitter(Qt.Vertical)
         splitter.setChildrenCollapsible(False)
@@ -290,7 +406,7 @@ class SearchPanel(QWidget):
     # ── Data ──────────────────────────────────────────────────────────────────
 
     def _load_identities(self):
-        object_bboxes = self._cache_data.get("object_bboxes") or []
+        object_bboxes = self._entries()
 
         seen: dict[str, dict] = {}
         for entry in object_bboxes:
@@ -338,7 +454,7 @@ class SearchPanel(QWidget):
         info = self._identities.get(identity_id, {})
         name = info.get("name", identity_id[:8])
 
-        object_bboxes = self._cache_data.get("object_bboxes") or []
+        object_bboxes = self._entries()
         segments = build_segments(object_bboxes, identity_id, self._video_duration)
         self._current_segments = segments
 
@@ -346,6 +462,85 @@ class SearchPanel(QWidget):
         self._results_header.setText(
             f"{name} — {len(segments)} segment{'s' if len(segments) != 1 else ''}, {total:.1f}s total"
         )
+        self._add_all_btn.setEnabled(bool(segments))
+        self._refresh_results(segments)
+
+    # ── expressions ───────────────────────────────────────────────────────────
+    def _load_cached_expressions(self):
+        """Reuse a scan from a previous session or the highlighter's own run."""
+        if not self._video_path:
+            return
+        try:
+            from modules.face_scan import cache_path_for, load as load_scan
+            seconds = load_scan(cache_path_for(self._video_path))
+        except Exception:
+            seconds = None
+        if seconds:
+            self._apply_expression_scan(seconds, cached=True)
+
+    def _scan_expressions(self):
+        if self._expr_worker is not None:
+            self._expr_worker.cancel()
+            self._expr_status.setText("Cancelling…")
+            return
+        if not self._video_path:
+            self._expr_status.setText("No video to scan.")
+            return
+
+        self._expr_scan_btn.setText("Cancel")
+        self._expr_status.setText("Scanning…")
+        worker = _ExpressionScanWorker(self._video_path)
+        worker.done.connect(self._on_expression_scan_done)
+        worker.failed.connect(self._on_expression_scan_failed)
+        worker.progress.connect(
+            lambda at, total: self._expr_status.setText(
+                f"Scanning… {at / total * 100:.0f}%" if total else "Scanning…"))
+        worker.finished.connect(self._on_expression_worker_finished)
+        self._expr_worker = worker
+        worker.start()
+
+    def _on_expression_worker_finished(self):
+        self._expr_worker = None
+        self._expr_scan_btn.setText("Scan expressions")
+
+    def _on_expression_scan_failed(self, message: str):
+        self._expr_status.setText(f"Scan failed: {message}")
+
+    def _on_expression_scan_done(self, seconds: dict):
+        if not seconds:
+            # The classifier is optional; saying so beats an empty result that
+            # looks like the video simply had no faces in it.
+            self._expr_status.setText(
+                "No expressions found. If the expression model is not "
+                "installed, that is why — the log says which.")
+            return
+        self._apply_expression_scan(seconds)
+
+    def _apply_expression_scan(self, seconds: dict, cached: bool = False):
+        from modules.face_scan import label_counts
+
+        self._expr_seconds = seconds
+        self._expr_combo.setEnabled(True)
+        counts = label_counts(seconds)
+        summary = ", ".join(f"{label} {count}"
+                            for label, count in sorted(counts.items(),
+                                                       key=lambda kv: -kv[1])
+                            if count)
+        prefix = "Cached scan" if cached else "Scanned"
+        self._expr_status.setText(
+            f"{prefix}: {len(seconds)} second(s) with a readable face"
+            + (f" — {summary}" if summary else ""))
+
+    def _on_expression_picked(self, _index: int):
+        label = self._expr_combo.currentData() or ""
+        if not label or not self._expr_seconds:
+            return
+        from modules.face_scan import segments_for
+
+        segments = segments_for(self._expr_seconds, label,
+                                duration=self._video_duration)
+        self._current_segments = segments
+        self._results_header.setText(f"{len(segments)} clip(s) of '{label}'")
         self._add_all_btn.setEnabled(bool(segments))
         self._refresh_results(segments)
 
