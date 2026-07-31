@@ -234,7 +234,10 @@ class _ExpressionScanWorker(QThread):
     Minutes of detection on a feature-length file, so it cannot run inline —
     a frozen window during a scan reads as a crash.
     """
-    done = Signal(dict)
+    # Signal(object), not Signal(dict): a dict signal marshals through
+    # QVariantMap, which is keyed by string, so a scan keyed by second arrives
+    # empty on the other side — the scan succeeds and the panel reports nothing.
+    done = Signal(object)
     failed = Signal(str)
     progress = Signal(float, float)
 
