@@ -180,3 +180,27 @@ class TestRunSummary:
     def test_two_identical_clips_are_not_called_a_tied_run(self):
         """Two is too few to conclude the ranking failed."""
         assert "identically" not in summarise_run(self._report([15.0, 15.0]))
+
+
+class TestTies:
+    """A tie is information about the scoring, not a rank for the clip."""
+
+    def test_a_clip_tied_with_most_of_the_cut_is_not_called_weaker(self):
+        """The reported bug: 15 clips at 15.0 and one at 10.0 had the fifteen
+        top scorers described as the ones that scraped in."""
+        peers = [15.0] * 15 + [10.0]
+        text = describe(_entry(score=15.0), peers)
+        assert "weaker" not in text
+        assert "same as most of the other clips" in text
+
+    def test_the_genuinely_lower_clip_is_still_marked(self):
+        peers = [15.0] * 15 + [10.0]
+        assert "weaker" in describe(_entry(score=10.0), peers)
+
+    def test_a_small_tie_group_is_still_ranked(self):
+        peers = [1.0, 2.0, 3.0, 10.0, 10.0]
+        assert "same as most" not in describe(_entry(score=10.0), peers)
+
+    def test_an_ordinary_clip_is_not_called_weak(self):
+        peers = [1.0, 5.0, 10.0, 15.0, 20.0]
+        assert "weaker" not in describe(_entry(score=10.0), peers)
