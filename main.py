@@ -4906,6 +4906,7 @@ class VideoHighlighterGUI(QWidget):
         from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
+        act_wrong = menu.addAction("Something's wrong with this cut…")
         act_ask = menu.addAction("Ask a question about this cut…")
         act_chat = menu.addAction("Discuss in LLM chat")
         menu.addSeparator()
@@ -4914,12 +4915,64 @@ class VideoHighlighterGUI(QWidget):
 
         chosen = menu.exec(self.ai_summary_opts_btn.mapToGlobal(
             self.ai_summary_opts_btn.rect().bottomLeft()))
-        if chosen is act_ask:
+        if chosen is act_wrong:
+            self._report_what_is_wrong()
+        elif chosen is act_ask:
             self._ask_ai_summary_question()
         elif chosen is act_chat:
             self._discuss_report_in_chat()
         elif chosen is act_model:
             self._choose_ai_summary_model()
+
+    def _report_what_is_wrong(self):
+        """Ask what disappointed the user, then answer that.
+
+        Without this the advisor can only list everything it noticed. Naming
+        the complaint is what turns "give another signal a weight" into which
+        one, and why that one.
+        """
+        import json
+
+        from PySide6.QtWidgets import QInputDialog
+        from modules.highlight_advice import CONCERNS, attach_advice
+
+        json_path = self._newest_why_report_json()
+        if not json_path:
+            return
+
+        labels = list(CONCERNS.values())
+        picked, ok = QInputDialog.getItem(
+            self, "What is wrong with this highlight?",
+            "Pick the closest one — the report is re-read with that in mind:",
+            labels, 0, False)
+        if not ok:
+            return
+        concern = next(k for k, v in CONCERNS.items() if v == picked)
+
+        try:
+            with open(json_path, encoding="utf-8") as fh:
+                report = json.load(fh)
+            attach_advice(report, concern=concern)
+            with open(json_path, "w", encoding="utf-8") as fh:
+                json.dump(report, fh, indent=1)
+
+            from modules.highlight_report import render_html
+            html_path = os.path.splitext(json_path)[0] + ".html"
+            with open(html_path, "w", encoding="utf-8") as fh:
+                fh.write(render_html(report))
+        except Exception as exc:
+            self.append_log(f"⚠️ Could not re-read the report: {exc}")
+            return
+
+        findings = report.get("advice") or []
+        self.append_log(f"💡 Re-read with '{picked}' in mind — "
+                        f"{len(findings)} suggestion(s):")
+        for finding in findings[:3]:
+            self.append_log(f"   • {finding.get('title', '')}")
+
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
 
     def _ask_ai_summary_question(self):
         from PySide6.QtWidgets import QInputDialog

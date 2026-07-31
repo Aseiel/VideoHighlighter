@@ -281,3 +281,66 @@ class TestExpressions:
 
     def test_no_scan_means_no_claim(self):
         assert "expression_lopsided" not in _ids(diagnose(self._rep()))
+
+
+class TestUnusedDetector:
+    """Naming the detector is the difference between advice and a platitude."""
+
+    def _rep(self, activity, **settings):
+        base = {"detector_activity": activity, "object_points": 5}
+        base.update(settings)
+        return _report(signals={"object": {100: 10.0}},
+                       segments=[(95, 105), (295, 305), (495, 505)],
+                       settings=base)
+
+    def test_a_detector_that_found_plenty_at_zero_weight_is_named(self):
+        finding = next(f for f in diagnose(self._rep({"audio": 412}))
+                       if f.id == "unused_audio")
+        assert "412" in finding.detail
+        assert "3 to 5 points" in finding.remedy
+
+    def test_the_busiest_detector_is_suggested_first(self):
+        findings = [f for f in diagnose(self._rep({"audio": 100, "scene": 900}))
+                    if f.id.startswith("unused_")]
+        assert findings[0].id == "unused_scene"
+
+    def test_a_weighted_detector_is_not_suggested(self):
+        assert "unused_audio" not in _ids(
+            diagnose(self._rep({"audio": 412}, audio_peak_points=4)))
+
+    def test_too_few_events_to_discriminate(self):
+        """Fewer events than clips would only re-rank what was already chosen."""
+        assert "unused_audio" not in _ids(diagnose(self._rep({"audio": 4})))
+
+    def test_no_activity_recorded_means_no_claim(self):
+        assert not [f for f in diagnose(self._rep({})) if f.id.startswith("unused_")]
+
+
+class TestConcerns:
+    def _rep(self):
+        return _report(signals={"object": {100: 10.0}},
+                       segments=[(95, 105), (295, 305), (495, 505)],
+                       settings={"detector_activity": {"audio": 400}})
+
+    def test_saying_it_is_repetitive_gets_an_answer_about_variety(self):
+        findings = diagnose(self._rep(), concern="repetitive")
+        finding = next(f for f in findings if f.id == "concern_repetitive")
+        assert "no notion of variety" in finding.detail
+        assert "Full story" in finding.remedy
+
+    def test_that_answer_is_absent_when_nothing_was_said(self):
+        assert "concern_repetitive" not in _ids(diagnose(self._rep()))
+
+    def test_a_stated_concern_raises_the_relevant_finding(self):
+        plain = next(f for f in diagnose(self._rep()) if f.id == "unused_audio")
+        raised = next(f for f in diagnose(self._rep(), concern="arbitrary")
+                      if f.id == "unused_audio")
+        assert plain.severity == "medium" and raised.severity == "high"
+
+    def test_the_concern_is_recorded_with_the_advice(self):
+        rep = attach_advice(self._rep(), concern="repetitive")
+        assert rep["advice_concern"] == "repetitive"
+
+    def test_every_concern_has_a_readable_description(self):
+        from modules.highlight_advice import CONCERNS
+        assert all(isinstance(v, str) and v for v in CONCERNS.values())
