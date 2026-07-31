@@ -239,3 +239,44 @@ class TestVideoShare:
                                breakdown={"object": 5.0}, present=["object"]),
                         peers)
         assert text.index("outscored") < text.index("what was on screen")
+
+
+class TestConfidence:
+    """Points are identical whether the detector was certain or guessing."""
+
+    PEERS = [1.0, 2.0, 100.0]
+
+    def test_the_detector_confidence_is_stated(self):
+        text = describe(_entry(score=100.0, detection_confidence=0.94), self.PEERS)
+        assert "its strongest detection at 0.94" in text
+
+    def test_a_weak_detection_is_reported_just_as_plainly(self):
+        text = describe(_entry(score=100.0, detection_confidence=0.31), self.PEERS)
+        assert "0.31" in text
+
+    def test_an_action_is_named_with_its_confidence(self):
+        entry = _entry(score=100.0)
+        entry["actions"] = [{"name": "jumping", "confidence": 0.88, "tier": None}]
+        assert "jumping recognised at 0.88" in describe(entry, self.PEERS)
+
+    def test_the_confidence_tier_is_carried_through(self):
+        entry = _entry(score=100.0)
+        entry["actions"] = [{"name": "jumping", "confidence": 0.9, "tier": "bonus"}]
+        assert "(bonus)" in describe(entry, self.PEERS)
+
+    def test_the_strongest_action_is_the_one_reported(self):
+        entry = _entry(score=100.0)
+        entry["actions"] = [{"name": "weak", "confidence": 0.4, "tier": None},
+                            {"name": "strong", "confidence": 0.9, "tier": None}]
+        text = describe(entry, self.PEERS)
+        assert "strong" in text and "weak recognised" not in text
+
+    def test_an_action_is_preferred_over_a_box(self):
+        """It carries a tier and a name; a box confidence carries neither."""
+        entry = _entry(score=100.0, detection_confidence=0.94)
+        entry["actions"] = [{"name": "jumping", "confidence": 0.5, "tier": None}]
+        text = describe(entry, self.PEERS)
+        assert "jumping" in text and "strongest detection" not in text
+
+    def test_no_confidence_recorded_means_no_claim(self):
+        assert "detection at" not in describe(_entry(score=100.0), self.PEERS)
