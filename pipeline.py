@@ -2279,6 +2279,16 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         check_cancellation(cancel_flag, log, "segment selection")
 
+        # Report-only: everything above is analysis and scoring, all of it cheap
+        # on a cached pass. Encoding is the expensive half, and re-encoding a
+        # highlight nobody asked for is the reason tuning weights feels costly
+        # when it is not. Stop here so the settings can be tried freely.
+        if gui_config.get("report_only"):
+            log(f"📄 Report only — {len(segments)} segment(s) scored, "
+                "no video written.")
+            progress.update_progress(100, 100, "Pipeline", "Report ready")
+            return segments
+
         # Cut and concatenate
         progress.update_progress(90, 100, "Pipeline", "Creating highlight video...")
         _render_mode_label = {"cpu": "CPU re-encode (libx265/264)",
