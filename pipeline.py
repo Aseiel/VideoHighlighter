@@ -1521,6 +1521,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         beginning_score = np.zeros_like(score)
         ending_score = np.zeros_like(score)
         object_score = np.zeros_like(score)
+        face_score = np.zeros_like(score)
         action_score = np.zeros(int(video_duration) + 1)
 
         # Scoring configuration: prefer gui overrides, else config.yaml, else defaults
@@ -1536,6 +1537,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         MULTI_SIGNAL_BOOST = gui_config.get("multi_signal_boost", config.get("multi_signal_boost", 1.2))
         MIN_SIGNALS_FOR_BOOST = gui_config.get("min_signals_for_boost", config.get("min_signals_for_boost", 2))
         OBJECT_POINTS = gui_config.get("object_points", config.get("object_points", 10))
+        # Expressions score only when the user names which ones matter:
+        # rewarding all five would reward every second a face is visible.
+        FACE_POINTS = gui_config.get("face_expression_points",
+                                     config.get("face_expression_points", 0))
+        FACE_LABELS = gui_config.get("face_expression_labels",
+                                     config.get("face_expression_labels", [])) or []
         ACTION_POINTS = gui_config.get("action_points", config.get("action_points", 10))
         keyword_set = set()
         if keyword_matches:
@@ -1674,9 +1681,35 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         for i in range(max(0, int(video_duration) - ENDING_SECONDS), int(video_duration)):
             ending_score[i] += ENDING_POINTS
 
+        # ── Facial expressions ──
+        # Scanned only when it can change the outcome: the sweep costs real time
+        # per video, and with no weight or no labels selected every second it
+        # produced would be multiplied by zero.
+        face_seconds = {}
+        if FACE_POINTS and FACE_LABELS:
+            try:
+                from modules.face_scan import best_by_second, scan_video
+                from modules.face_emotions import to_signal as face_to_signal
+
+                face_seconds = scan_video(
+                    processed_video_path,
+                    cache_dir=gui_config.get("cache_dir", "./cache"),
+                    cancel_fn=(lambda: bool(cancel_flag and cancel_flag.is_set())),
+                    log_fn=log,
+                )
+                if face_seconds:
+                    face_score = face_to_signal(
+                        best_by_second(face_seconds), video_duration,
+                        labels=FACE_LABELS, points=FACE_POINTS)
+                    log(f"😐 Expressions: {int((face_score > 0).sum())} second(s) "
+                        f"matched {', '.join(FACE_LABELS)}")
+            except Exception as _fe:
+                log(f"⚠️ Expression scan skipped: {_fe}")
+
         # Sum signals
         score = (scene_score + motion_event_score + motion_peak_score + audio_score +
-                 keyword_score + beginning_score + ending_score + object_score + action_score)
+                 keyword_score + beginning_score + ending_score + object_score +
+                 action_score + face_score)
 
         # Multi-signal boost
         motion_set = set(int(t) for t in motion_events)
@@ -1873,6 +1906,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         "keyword": keyword_score,
                         "object": object_score,
                         "action": action_score,
+                        "face": face_score,
                         "beginning": beginning_score,
                         "ending": ending_score,
                     },

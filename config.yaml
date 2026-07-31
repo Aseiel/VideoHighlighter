@@ -34,6 +34,10 @@ scoring:
   transcript_points: 0
   object_points: 0
   action_points: 0
+  # Expressions score only for the classes named here, e.g. [happy, surprise].
+  # Scoring all five would score every second a face is visible.
+  face_expression_points: 0
+  face_expression_labels: []
   beginning_points: 0
   ending_points: 0
   beginning_seconds: 60

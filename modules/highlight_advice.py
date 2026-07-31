@@ -33,6 +33,7 @@ SIGNAL_WEIGHTS = {
     "keyword": "keyword_points",
     "object": "object_points",
     "action": "action_points",
+    "face": "face_expression_points",
 }
 
 SIGNAL_NAMES = {
@@ -43,6 +44,7 @@ SIGNAL_NAMES = {
     "keyword": "transcript keywords",
     "object": "objects",
     "action": "actions",
+    "face": "facial expressions",
 }
 
 # A cut drawn from less than this fraction of the video is concentrated enough
