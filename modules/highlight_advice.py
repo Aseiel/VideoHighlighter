@@ -360,6 +360,60 @@ def _rule_short_of_target(report) -> Optional[Finding]:
     )
 
 
+def _rule_expressions_unselected(report) -> Optional[Finding]:
+    """Weighted, scanned, and scoring nothing because no class was chosen."""
+    settings = report.get("settings") or {}
+    weight = settings.get("face_expression_points") or 0
+    labels = settings.get("face_expression_labels") or []
+    if weight <= 0 or labels:
+        return None
+    return Finding(
+        id="expressions_unselected",
+        severity="medium",
+        title="Expressions are weighted but no expression was chosen",
+        detail=(f"Facial expressions are worth {weight} points, but no class "
+                "is selected, so nothing can match. The scan does not even "
+                "run — there is no outcome it could change."),
+        remedy=("Name the expressions that matter to you. Matching all of them "
+                "would score every second a face is visible, which separates "
+                "nothing, so the choice is deliberately yours."),
+        topic="weights",
+        evidence={"weight": weight},
+    )
+
+
+def _rule_expression_lopsided(report) -> Optional[Finding]:
+    """One class swallowing the scan usually means the model cannot read these
+    faces at all — the failure it is most important to name, because it looks
+    exactly like a confident answer."""
+    counts = (report.get("settings") or {}).get("face_expression_counts") or {}
+    total = sum(int(v) for v in counts.values())
+    if total < 30:
+        return None
+    label, count = max(counts.items(), key=lambda kv: int(kv[1]))
+    share = int(count) / total
+    if share < 0.45:
+        return None
+    return Finding(
+        id="expression_lopsided",
+        severity="medium",
+        title="One expression accounts for most of the video",
+        detail=(f"'{label}' was reported for {count} of {total} readable "
+                f"seconds ({share * 100:.0f}%). The classifier was trained on "
+                "posed, frontal faces and returns a label for every face it is "
+                "given, so on footage unlike that training set a single class "
+                "dominating usually means it cannot read these faces — not "
+                "that the video is mostly that expression."),
+        remedy=("Jump to a few of those moments and check the label against "
+                "what is on screen. If it does not hold up, the built-in "
+                "classes are the wrong tool for this footage and a category "
+                "taught from your own example crops is the answer."),
+        topic="training",
+        evidence={"label": label, "count": int(count), "readable": total,
+                  "share": round(share, 3)},
+    )
+
+
 def diagnose(report: Mapping,
              *,
              rejected: Optional[Sequence[Sequence[float]]] = None) -> list:
@@ -372,7 +426,8 @@ def diagnose(report: Mapping,
     findings = []
     for rule in (_rule_single_signal, _rule_flat_score, _rule_concentrated,
                  _rule_boost_never_fired, _rule_near_miss_gap,
-                 _rule_dominant_tag, _rule_short_of_target):
+                 _rule_dominant_tag, _rule_short_of_target,
+                 _rule_expressions_unselected, _rule_expression_lopsided):
         found = rule(report)
         if found:
             findings.append(found)

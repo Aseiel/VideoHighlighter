@@ -196,6 +196,15 @@ def check_cancellation(cancel_flag, log_fn, step_name="operation"):
         log_fn(f"⏹️ Cancelled during {step_name}")
         raise RuntimeError(f"Operation cancelled during {step_name}")
 
+def _face_label_counts(face_seconds):
+    """How many readable seconds each expression accounted for."""
+    try:
+        from modules.face_scan import label_counts
+        return {k: v for k, v in label_counts(face_seconds).items() if v}
+    except Exception:
+        return {}
+
+
 def check_gpu_availability(log_fn=print):
     """Legacy shim — the single source of truth is device_utils.detect_best_device()."""
     from modules.device_utils import detect_best_device
@@ -1930,6 +1939,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         # The advisor compares this against what was produced:
                         # in MAX mode a short cut means few seconds scored.
                         "target_duration": target_duration,
+                        # What the expression scan actually saw. One class
+                        # swallowing the video is the advisor's cue that the
+                        # classifier cannot read this footage at all.
+                        "face_expression_counts": (
+                            _face_label_counts(face_seconds) if face_seconds else {}),
                     },
                     boost_multiplier=MULTI_SIGNAL_BOOST,
                     min_signals_for_boost=MIN_SIGNALS_FOR_BOOST,

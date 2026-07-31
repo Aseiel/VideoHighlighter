@@ -593,7 +593,8 @@ body{margin:0;padding:32px 20px;background:var(--bg);color:var(--text);
      font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif}
 .wrap{max-width:900px;margin:0 auto}
 h1{font-size:22px;margin:0 0 4px}
-.sub{color:var(--dim);font-size:13.5px;margin-bottom:28px}
+.sub{color:var(--dim);font-size:13.5px;margin-bottom:8px}
+.sub2{color:var(--text);font-size:15px;margin-bottom:24px}
 .totals{display:flex;gap:28px;flex-wrap:wrap;padding:16px 0 24px;
         border-bottom:1px solid var(--line);margin-bottom:28px}
 .totals div span{display:block}
@@ -618,7 +619,8 @@ h1{font-size:22px;margin:0 0 4px}
 .rng{font-weight:600}
 .pts{color:var(--accent);font-weight:600}
 .meta{color:var(--dim);font-size:13px;margin:2px 0 10px}
-.meas{color:var(--cool);font-size:12.5px;margin:8px 0 2px}
+.says{color:var(--text);font-size:13.5px;margin:10px 0 2px}
+.meas{color:var(--cool);font-size:12px;margin:2px 0}
 .bar{display:flex;align-items:center;gap:10px;margin:3px 0;font-size:13px}
 .bar .lab{width:110px;color:var(--dim);flex-shrink:0}
 .bar .track{flex:1;height:8px;background:#26262c;border-radius:4px;overflow:hidden}
@@ -702,6 +704,15 @@ def _area_path(values: Sequence[float], width: float, height: float,
         for i, v in enumerate(values)
     ]
     return f"M0,{baseline:.2f} L" + " L".join(points) + f" L{width:.2f},{baseline:.2f} Z"
+
+
+def _run_sentence(report: Mapping) -> str:
+    """The one-line reading of the whole run, above the totals."""
+    try:
+        from modules.highlight_prose import summarise_run
+        return summarise_run(report)
+    except Exception:
+        return ""
 
 
 def _overview(report: Mapping) -> str:
@@ -820,11 +831,21 @@ def _advice(report: Mapping) -> str:
     )
 
 
-def _measurements(entry: Mapping) -> str:
-    """What was physically true here, in units that outlive the weight table."""
+def _measurements(entry: Mapping, peer_scores=None) -> str:
+    """What was physically true here, in units that outlive the weight table.
+
+    Led by the plain-language reading of those same numbers: a row of figures
+    is precise and mostly unread, and the sentence above them is what a person
+    actually takes away.
+    """
     m = entry.get("measured") or {}
     if not m:
         return ""
+
+    from modules.highlight_prose import describe
+
+    sentence = describe(entry, peer_scores)
+    lead = (f'<div class="says">{html.escape(sentence)}</div>' if sentence else "")
 
     parts = []
     pct = m.get("score_percentile")
@@ -845,8 +866,8 @@ def _measurements(entry: Mapping) -> str:
         parts.append(f"best detection {m['detection_confidence']:.2f}")
 
     if not parts:
-        return ""
-    return f'<div class="meas">{html.escape(" · ".join(parts))}</div>'
+        return lead
+    return lead + f'<div class="meas">{html.escape(" · ".join(parts))}</div>'
 
 
 def _tag_rows(entry: Mapping) -> str:
@@ -945,6 +966,8 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
     heading = title or f"Why these moments — {video['name']}"
 
     max_points = max([e["score"] for e in report["segments"]] or [1.0])
+    # Each clip is described relative to the others in the cut.
+    peer_scores = [float(e.get("score") or 0.0) for e in report["segments"]]
     composed = frozenset(
         name for e in report["segments"] for name in e.get("events", [])
     )
@@ -965,7 +988,7 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
             f'<div class="meta">peak at {html.escape(e["timestamp"])} · '
             f'{e["duration"]:.0f}s long</div>'
             f'{_bars(e, max_points)}'
-            f'{_measurements(e)}'
+            f'{_measurements(e, peer_scores)}'
             f'{tags}'
             f'{_segment_wave(report, e)}'
             f'{boost}</div></div>'
@@ -1008,6 +1031,7 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
 <body><div class="wrap">
 <h1>{html.escape(heading)}</h1>
 <div class="sub">Generated {html.escape(report["generated_at"])}</div>
+<div class="sub2">{html.escape(_run_sentence(report))}</div>
 <div class="totals">
   <div><span class="n">{totals["segments"]}</span><span class="l">segments kept</span></div>
   <div><span class="n">{totals["duration"]:.0f}s</span><span class="l">total length</span></div>
