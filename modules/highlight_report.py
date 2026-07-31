@@ -73,6 +73,14 @@ CURVE_POINTS = 480
 # or the strip is a straight line that invites being read as meaning.
 SEGMENT_AUDIO_POINTS = 120
 
+# Floor for dBFS, so digital silence reports a number instead of -inf.
+SILENCE_DBFS = -100.0
+
+# Two signals firing this far apart or closer are treated as one event rather
+# than a coincidence — roughly the window in which a sound and the movement
+# that caused it are the same moment.
+COINCIDENCE_SECONDS = 1.0
+
 
 def _f(value) -> float:
     """numpy scalar or None -> plain float, so the record is JSON-serialisable."""
@@ -98,6 +106,36 @@ def downsample(values, points: int = CURVE_POINTS) -> list:
         round(float(arr[lo:hi].max()), 4) if hi > lo else 0.0
         for lo, hi in zip(edges[:-1], edges[1:])
     ]
+
+
+def percentile_rank(sorted_values: np.ndarray, value: float) -> float:
+    """Where ``value`` sits in ``sorted_values``, as a percentage.
+
+    Points say a moment scored; a percentile says whether it was *unusual*, and
+    only the second answers "was this outstanding?".
+
+    Ties take the midrank. Counting only what is strictly below would rank a
+    video where every kept moment scored the same at the very bottom — true
+    arithmetically, and a lie about the clip. Sharing the tie puts them at 50%:
+    no better or worse than the rest, which is exactly the situation.
+    """
+    if sorted_values.size == 0:
+        return 0.0
+    below = float(np.searchsorted(sorted_values, value, side="left"))
+    at_or_below = float(np.searchsorted(sorted_values, value, side="right"))
+    return round((below + at_or_below) / 2.0 / sorted_values.size * 100.0, 1)
+
+
+def to_dbfs(amplitude: float) -> float:
+    """Normalised amplitude (0..1) to dBFS, floored at ``SILENCE_DBFS``.
+
+    A real unit rather than a score: "-6 dBFS" survives a change to the weight
+    table, and is the difference between "audio contributed 4 points" and
+    "this is the loudest moment in the file".
+    """
+    if amplitude <= 0:
+        return SILENCE_DBFS
+    return max(SILENCE_DBFS, round(20.0 * float(np.log10(amplitude)), 1))
 
 
 def split_tags(names: Iterable[str],
@@ -140,6 +178,81 @@ def boxes_by_second(bbox_cache: Optional[Iterable[Mapping]]) -> dict:
                 "confidence": _f(confs[i]) if i < len(confs) else 0.0,
             })
     return out
+
+
+def measure_segment(*,
+                    start: float,
+                    end: float,
+                    peak: int,
+                    score: np.ndarray,
+                    sorted_scores: np.ndarray,
+                    signals: Mapping[str, np.ndarray],
+                    sorted_signals: Mapping[str, np.ndarray],
+                    amps: Sequence[float],
+                    sorted_amps: np.ndarray,
+                    amps_per_second: float,
+                    boxes: Sequence[Mapping]) -> dict:
+    """The physical facts behind one clip, not the points they earned.
+
+    Points are a function of the weight table: change a weight and every number
+    in the report moves, which makes them useless for saying what actually
+    happened. Loudness in dBFS, a detector's confidence, and how far apart two
+    signals fired are properties of the video, and they are what an explanation
+    of *why this moment* has to be built from.
+    """
+    measured: dict = {
+        "score_percentile": percentile_rank(sorted_scores, _f(score[peak])
+                                            if peak < len(score) else 0.0),
+    }
+
+    # Loudness across the clip, in a unit that means something outside this run.
+    if amps_per_second:
+        lo = int(start * amps_per_second)
+        hi = max(lo + 1, int(end * amps_per_second))
+        window = amps[lo:hi]
+        if window:
+            loudest = max(window)
+            measured["loudness_dbfs"] = to_dbfs(loudest)
+            measured["loudness_percentile"] = percentile_rank(sorted_amps, loudest)
+
+    # How each contributing signal ranks against the rest of the video, and the
+    # second inside this clip where it fired hardest.
+    per_signal = {}
+    fired_at = []
+    for key, _label in SIGNAL_LABELS:
+        arr = signals.get(key)
+        if arr is None or not len(arr):
+            continue
+        lo, hi = int(start), min(len(arr), int(np.ceil(end)))
+        if hi <= lo:
+            continue
+        window = np.asarray(arr[lo:hi], dtype=float)
+        if not window.any():
+            continue
+        best = int(np.argmax(window))
+        per_signal[key] = {
+            "value": _f(window[best]),
+            "at": lo + best,
+            "percentile": percentile_rank(sorted_signals.get(key, np.array([])),
+                                          float(window[best])),
+        }
+        if key in BOOST_SIGNALS:
+            fired_at.append(lo + best)
+    if per_signal:
+        measured["signals"] = per_signal
+
+    # Signals landing together is the difference between a loud moment and a
+    # loud moment you can see the cause of.
+    if len(fired_at) > 1:
+        spread = max(fired_at) - min(fired_at)
+        measured["signal_spread_seconds"] = float(spread)
+        measured["signals_coincide"] = bool(spread <= COINCIDENCE_SECONDS)
+
+    if boxes:
+        measured["detection_confidence"] = round(
+            max(float(b.get("confidence") or 0.0) for b in boxes), 3)
+
+    return measured
 
 
 def peak_second(score: np.ndarray, start: float, end: float) -> int:
@@ -294,6 +407,19 @@ def build_report(*,
             amps = [abs(float(p)) for p in waveform]
     amps_per_second = (len(amps) / video_duration) if (amps and video_duration) else 0.0
 
+    # Sorted once for the percentile lookups: every clip is ranked against the
+    # same distributions, and sorting per clip would be the expensive part.
+    # Zeros are excluded — a moment is unusual relative to the video's activity,
+    # not relative to the silence between it.
+    sorted_scores = np.sort(score[score > 0])
+    sorted_amps = np.sort(np.asarray([a for a in amps if a > 0], dtype=float))
+    sorted_signals = {}
+    for key, _label in SIGNAL_LABELS:
+        arr = signals.get(key)
+        if arr is not None and len(arr):
+            arr = np.asarray(arr, dtype=float)
+            sorted_signals[key] = np.sort(arr[arr > 0])
+
     def detail_for(sec: int) -> dict:
         pcts = None
         if action_percentiles and actions_by_sec and sec in actions_by_sec:
@@ -312,6 +438,14 @@ def build_report(*,
         entry = detail_for(sec)
         if boxes_at.get(sec):
             entry["boxes"] = boxes_at[sec]
+        entry["measured"] = measure_segment(
+            start=start, end=end, peak=sec,
+            score=score, sorted_scores=sorted_scores,
+            signals=signals, sorted_signals=sorted_signals,
+            amps=amps, sorted_amps=sorted_amps,
+            amps_per_second=amps_per_second,
+            boxes=boxes_at.get(sec, ()),
+        )
         if amps_per_second:
             lo = int(start * amps_per_second)
             hi = max(lo + 1, int(end * amps_per_second))
@@ -482,6 +616,7 @@ h1{font-size:22px;margin:0 0 4px}
 .rng{font-weight:600}
 .pts{color:var(--accent);font-weight:600}
 .meta{color:var(--dim);font-size:13px;margin:2px 0 10px}
+.meas{color:var(--cool);font-size:12.5px;margin:8px 0 2px}
 .bar{display:flex;align-items:center;gap:10px;margin:3px 0;font-size:13px}
 .bar .lab{width:110px;color:var(--dim);flex-shrink:0}
 .bar .track{flex:1;height:8px;background:#26262c;border-radius:4px;overflow:hidden}
@@ -683,6 +818,35 @@ def _advice(report: Mapping) -> str:
     )
 
 
+def _measurements(entry: Mapping) -> str:
+    """What was physically true here, in units that outlive the weight table."""
+    m = entry.get("measured") or {}
+    if not m:
+        return ""
+
+    parts = []
+    pct = m.get("score_percentile")
+    if pct is not None:
+        parts.append(f"scored above {pct:.0f}% of the video")
+    if "loudness_dbfs" in m:
+        loud = f"peaked at {m['loudness_dbfs']:.0f} dBFS"
+        if "loudness_percentile" in m:
+            loud += f" ({m['loudness_percentile']:.0f}th pct)"
+        parts.append(loud)
+    if m.get("signals_coincide"):
+        spread = m.get("signal_spread_seconds", 0.0)
+        parts.append("signals landed together"
+                     if spread <= 0 else f"signals within {spread:.0f}s")
+    elif "signal_spread_seconds" in m:
+        parts.append(f"signals {m['signal_spread_seconds']:.0f}s apart")
+    if "detection_confidence" in m:
+        parts.append(f"best detection {m['detection_confidence']:.2f}")
+
+    if not parts:
+        return ""
+    return f'<div class="meas">{html.escape(" · ".join(parts))}</div>'
+
+
 def _tag_rows(entry: Mapping) -> str:
     """Tags grouped by what produced them, one row per kind."""
     groups = (
@@ -799,6 +963,7 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
             f'<div class="meta">peak at {html.escape(e["timestamp"])} · '
             f'{e["duration"]:.0f}s long</div>'
             f'{_bars(e, max_points)}'
+            f'{_measurements(e)}'
             f'{tags}'
             f'{_segment_wave(report, e)}'
             f'{boost}</div></div>'
