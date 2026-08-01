@@ -149,12 +149,21 @@ class CompositionEngine:
             for name in sorted(raw_events[ts]):
                 if name not in sec_events[sec]:
                     sec_events[sec].append(name)
-                union = self._union_box(raw_boxes[ts].get(name, []))
+                matched = raw_boxes[ts].get(name, [])
+                union = self._union_box([m['box'] for m in matched])
+                # A rule needs *every* detection it matched, so the event is
+                # only as sure as its weakest one. This used to emit 1.0, which
+                # put a boolean into the same field every detector writes its
+                # certainty into — and readers of that field, quite reasonably,
+                # took it to mean the detector was certain. A rule firing on two
+                # barely-there detections is not the same evidence as one firing
+                # on two solid ones, and now it does not claim to be.
+                confidence = min((m['conf'] for m in matched), default=0.0)
                 overlay_bboxes.append({
                     'timestamp': ts,
                     'objects': [name],
                     'bboxes': [union] if union else [],
-                    'confidences': [1.0] if union else [],
+                    'confidences': [round(float(confidence), 3)] if union else [],
                 })
 
         return dict(sec_events), overlay_bboxes
@@ -221,7 +230,12 @@ class CompositionEngine:
         return inter / union if union > 0 else 0.0
 
     def _evaluate(self, spec: _EventSpec, effective: dict) -> tuple:
-        """Returns (fired: bool, matched_boxes: list[box]).
+        """Returns (fired: bool, matched: list[{'box', 'conf'}]).
+
+        The detections are returned whole rather than reduced to geometry: an
+        event's confidence is derived from theirs, and a box alone cannot say
+        how sure anything was.
+
 
         Source instances are consumed across rules — a source object that
         satisfies rule 1 is removed from the pool before rule 2 is checked,
@@ -251,8 +265,10 @@ class CompositionEngine:
             available[rule.source_class] = [
                 s for i, s in enumerate(sources) if i not in claimed_idx
             ]
-            all_matched.extend(s['box'] for s in claimed)
-            all_matched.extend(r['box'] for r in regions)
+            # Carry the detections themselves, not just their geometry: the
+            # caller needs their confidences to say how sure the event is.
+            all_matched.extend(claimed)
+            all_matched.extend(regions)
         return True, all_matched
 
     @staticmethod
