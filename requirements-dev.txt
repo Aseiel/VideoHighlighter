@@ -3,3 +3,6 @@
 # (~5 MB) rather than the full requirements.txt (~1.9 GB).
 pytest
 numpy
+pyyaml        # real parser for the composition-rules tests (not shimmed): a
+              # mocked safe_load returns a MagicMock, so rules parse to nothing
+              # and the tests pass against an empty rule set
