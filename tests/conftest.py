@@ -16,6 +16,13 @@ libraries are used.
 
 What is NOT shimmed
 ===================
+`yaml` is deliberately NOT shimmed either. It is a ~250 KB parser rather than a
+heavy ML library, so it costs nothing to install, and mocking it is actively
+wrong: `MagicMock.safe_load()` returns a MagicMock instead of a dict, so
+anything driven by a YAML file (the composition rules engine) silently parses
+to nothing and its tests assert against an empty rule set that looks valid. It
+is in `requirements-dev.txt` for the same reason a real parser always is.
+
 `numpy` is a real dependency of the tests (the pipeline math operates on numpy
 arrays) and is installed alongside pytest. `collections`, `os`, `re`, etc. are
 stdlib.
@@ -50,7 +57,6 @@ _HEAVY_DEPS = [
     "ffmpeg",
     "moviepy",
     "moviepy.editor",
-    "yaml",
     "tqdm",
     "resemblyzer",
     "librosa",
