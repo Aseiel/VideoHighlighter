@@ -5599,6 +5599,15 @@ if __name__ == "__main__":
     # Central theme: one graphite + accent stylesheet for all base widgets.
     # Additive — screens with their own inline styles still override it.
     _ui_theme.apply(app)
+    # One icon for every window the app opens (main window, timeline viewer,
+    # dialogs). Set on the QApplication so nothing has to remember to do it.
+    # The .ico carries several sizes: the artwork for large ones, and a
+    # simplified mark for 16-32px, where the fine outlines of the full logo
+    # disappear into the background — which is the size the taskbar uses.
+    _icon_path = _resource_path(os.path.join("assets", "icon.ico"))
+    if os.path.exists(_icon_path):
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(_icon_path))
     # Reopen the live debug-log window if it was on last session (needs the
     # QApplication, hence here and not earlier).
     debug_console.restore_console_preference()
