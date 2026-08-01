@@ -731,6 +731,74 @@ class FaceScanWorker(QThread):
                 self.log.emit(f"❌ Face scan failed: {e}")
                 self.done.emit(-1)
 
+class UpdateCheckWorker(QThread):
+    """Ask the update manifest whether a newer build exists.
+
+    Off the GUI thread because a network round trip on it would freeze the
+    window for the whole timeout on a bad connection — at the exact moment the
+    user is trying to start work. Nothing here touches a widget; the answer
+    travels back as a signal, and silence means "nothing to say".
+    """
+
+    found = Signal(object)   # modules.update_check.UpdateInfo
+    nothing = Signal(str)    # only for an explicit "check now": why it found nothing
+
+    def __init__(self, force=False, parent=None):
+        super().__init__(parent)
+        self.force = force
+
+    def run(self):
+        try:
+            from modules import update_check
+            info = update_check.check_for_update(force=self.force)
+        except Exception as e:
+            # An update check must never be the reason anything goes wrong.
+            print(f"update_check: check failed ({type(e).__name__}: {e})")
+            if self.force:
+                self.nothing.emit("Could not check right now.")
+            return
+        if info:
+            self.found.emit(info)
+        elif self.force:
+            # The automatic check says nothing when there is nothing; a user who
+            # pressed a button is owed an answer either way.
+            self.nothing.emit(f"You're on the latest version ({__version__}).")
+
+
+class UpdateInstallWorker(QThread):
+    """Download and install a release, off the GUI thread.
+
+    All the logic lives in modules/update_install; this only marshals progress
+    and the result back to the window.
+    """
+
+    progress = Signal(str, int, int, str)   # phase, done, total, detail
+    finished_with = Signal(object)          # update_install.InstallResult
+
+    def __init__(self, manifest_url, root, parent=None):
+        super().__init__(parent)
+        self.manifest_url = manifest_url
+        self.root = root
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        from modules import update_install
+        try:
+            result = update_install.install_update(
+                self.manifest_url, self.root,
+                progress=lambda *a: self.progress.emit(*a),
+                should_cancel=lambda: self._cancel,
+            )
+        except Exception as e:
+            print(f"update_install: unexpected failure ({type(e).__name__}: {e})")
+            result = update_install.InstallResult(
+                ok=False, message=f"The update failed: {e}")
+        self.finished_with.emit(result)
+
+
 class RangeSlider(QWidget):
     """Single slider with two handles for selecting a range"""
     startChanged = Signal(int)
@@ -901,6 +969,13 @@ class VideoHighlighterGUI(QWidget):
         # and Run row down). Trimmed from the original 20/16/14.
         layout.setContentsMargins(16, 8, 16, 8)
         layout.setSpacing(6)
+
+        # --- Update notice (hidden unless there is actually a newer build) ---
+        # Costs no vertical space while hidden, which is the whole reason it is
+        # a banner and not a startup dialog: nothing interrupts a launch, and
+        # nothing is permanently occupying a row on a small screen.
+        self.update_banner = self._build_update_banner()
+        layout.addWidget(self.update_banner)
 
         # Store video duration
         self.current_video_duration = 0
@@ -2298,6 +2373,12 @@ class VideoHighlighterGUI(QWidget):
 
         # Defer first populate until after __init__ finishes (so log_output exists)
         QTimer.singleShot(0, self.refresh_avoid_list)
+        # Let the window finish painting first — the check is never urgent, and
+        # its own throttle means most launches do no network at all.
+        QTimer.singleShot(3000, self._start_update_check)
+        # Clear whatever the last update displaced. It can only be deleted now,
+        # on a launch after the process that had those files open has exited.
+        QTimer.singleShot(1500, self._sweep_updated_files)
 
         # --- Run / Cancel Controls ---
         ctrl_layout = QHBoxLayout()
@@ -2472,6 +2553,197 @@ class VideoHighlighterGUI(QWidget):
         log_height = 150 if available >= 460 else 110
         splitter.setSizes([max(280, available - log_height), log_height])
 
+    # --- Update notice ---
+    def _build_update_banner(self):
+        """The hidden-by-default "a newer version exists" strip.
+
+        Built once at startup and only ever shown/hidden, so the check that
+        fills it in never has to construct widgets from its own thread.
+        """
+        banner = QWidget()
+        banner.setVisible(False)
+        banner.setStyleSheet(
+            "QWidget { background: #2d4a63; border-radius: 4px; }"
+            "QLabel { color: #e8f1f8; background: transparent; }"
+        )
+        row = QHBoxLayout()
+        row.setContentsMargins(10, 6, 6, 6)
+        row.setSpacing(8)
+
+        self.update_label = QLabel()
+        self.update_label.setWordWrap(True)
+        row.addWidget(self.update_label, 1)
+
+        # Shown only while an install is running.
+        self.update_progress = QProgressBar()
+        self.update_progress.setVisible(False)
+        self.update_progress.setMaximumWidth(220)
+        row.addWidget(self.update_progress)
+
+        self.update_install_btn = QPushButton("Download and install")
+        self.update_install_btn.clicked.connect(self._install_update)
+        self.update_install_btn.setVisible(False)
+        row.addWidget(self.update_install_btn)
+
+        self.update_get_btn = QPushButton("Get it")
+        self.update_get_btn.clicked.connect(self._open_update_download)
+        row.addWidget(self.update_get_btn)
+
+        self.update_skip_btn = QPushButton("Skip this version")
+        self.update_skip_btn.clicked.connect(self._skip_update)
+        row.addWidget(self.update_skip_btn)
+
+        self.update_close_btn = QPushButton("✕")
+        self.update_close_btn.setFixedWidth(28)
+        self.update_close_btn.setToolTip("Hide until the next check")
+        self.update_close_btn.clicked.connect(
+            lambda: self.update_banner.setVisible(False))
+        row.addWidget(self.update_close_btn)
+
+        banner.setLayout(row)
+        return banner
+
+    def _start_update_check(self, force=False):
+        """Kick off the manifest check in the background.
+
+        Deliberately after the window is up: startup must not wait on the
+        network, and a user who never sees a newer build should never know
+        this ran.
+        """
+        self.update_worker = UpdateCheckWorker(force=force, parent=self)
+        self.update_worker.found.connect(self._on_update_available)
+        self.update_worker.nothing.connect(self._on_update_check_quiet)
+        self.update_worker.start()
+
+    def _on_update_available(self, info):
+        """Show the banner. Runs on the GUI thread (queued signal)."""
+        self._pending_update = info
+        text = f"<b>{info.headline}</b>"
+        if info.notes:
+            text += f"<br>{info.notes}"
+        self.update_label.setText(text)
+
+        # Installing in place is only offered to a packaged build. From source
+        # the "install root" is the git checkout, and an update would overwrite
+        # working files with release ones — so a dev build gets the download
+        # link like any release published before the updater existed.
+        can_install = bool(info.can_self_install) and getattr(sys, "frozen", False)
+        self.update_install_btn.setVisible(can_install)
+        self.update_get_btn.setVisible(not can_install)
+
+        self.update_banner.setVisible(True)
+        print(f"update_check: {info.version} available (running {__version__})"
+              f"{' [self-install]' if can_install else ''}")
+
+    def _sweep_updated_files(self):
+        from modules import update_apply
+
+        try:
+            freed = update_apply.sweep_old(update_apply.install_root())
+        except Exception as e:
+            print(f"update_apply: sweep failed ({e})")
+            return
+        if freed:
+            print(f"update_apply: reclaimed {freed / (1024 ** 2):.1f} MB "
+                  "from the previous update")
+
+    def _install_update(self):
+        """Download and apply the pending release."""
+        info = getattr(self, "_pending_update", None)
+        if not info or not info.manifest_url:
+            return
+        from modules import update_apply
+
+        self.update_install_btn.setEnabled(False)
+        self.update_skip_btn.setVisible(False)
+        self.update_close_btn.setVisible(False)
+        self.update_progress.setVisible(True)
+        self.update_progress.setRange(0, 0)     # indeterminate until sizes known
+        self.update_label.setText("<b>Preparing update…</b>")
+
+        self.update_installer = UpdateInstallWorker(
+            info.manifest_url, update_apply.install_root(), parent=self)
+        self.update_installer.progress.connect(self._on_install_progress)
+        self.update_installer.finished_with.connect(self._on_install_finished)
+        self.update_installer.start()
+
+    def _on_install_progress(self, phase, done, total, detail):
+        from modules import update_install
+
+        if phase == update_install.DOWNLOADING and total:
+            self.update_progress.setRange(0, total)
+            self.update_progress.setValue(done)
+            mb_done, mb_total = done / (1024 ** 2), total / (1024 ** 2)
+            self.update_label.setText(
+                f"<b>Downloading {mb_done:.1f} / {mb_total:.1f} MB</b><br>{detail}")
+        else:
+            self.update_progress.setRange(0, 0)
+            self.update_label.setText(f"<b>{detail or phase}</b>")
+
+    def _on_install_finished(self, result):
+        from PySide6.QtWidgets import QMessageBox
+
+        self.update_progress.setVisible(False)
+        self.update_install_btn.setEnabled(True)
+        self.update_close_btn.setVisible(True)
+
+        if not result.ok:
+            self.update_skip_btn.setVisible(True)
+            self.update_label.setText(f"<b>{result.message}</b>")
+            self.append_log(f"⚠️ Update: {result.message}")
+            return
+
+        self.update_label.setText(f"<b>{result.message}</b>")
+        self.append_log(f"✅ Update: {result.message}")
+        if not result.restart_required:
+            return
+
+        answer = QMessageBox.question(
+            self, "Restart now?",
+            f"{result.message}\n\nRestart Video Highlighter now?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self._restart_for_update()
+
+    def _restart_for_update(self):
+        """Relaunch the (now updated) app and quit this process.
+
+        The new files are already in place; this process is still running the
+        copies that were moved aside, which is why a restart is what actually
+        switches versions. The displaced files are swept on the next launch,
+        once nothing holds them open.
+        """
+        import subprocess
+        from modules import update_apply
+
+        try:
+            subprocess.Popen(update_apply.relaunch_command(),
+                             cwd=update_apply.install_root(), close_fds=True)
+        except Exception as e:
+            print(f"update_install: could not relaunch ({e})")
+            return
+        QApplication.quit()
+
+    def _on_update_check_quiet(self, message):
+        """Answer an explicit "check now" that turned up nothing."""
+        if hasattr(self, "update_status_label"):
+            self.update_status_label.setText(message)
+
+    def _open_update_download(self):
+        info = getattr(self, "_pending_update", None)
+        if not info or not info.download_url:
+            return
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl(info.download_url))
+
+    def _skip_update(self):
+        info = getattr(self, "_pending_update", None)
+        if info:
+            from modules import update_check
+            update_check.skip_version(info.version)
+        self.update_banner.setVisible(False)
+
     def _build_about_tab(self):
         """A read-only About & Contact panel: version, support links, licensing."""
         outer = QWidget()
@@ -2496,6 +2768,32 @@ class VideoHighlighterGUI(QWidget):
         subtitle.setStyleSheet("color: #888;")
         subtitle.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(subtitle)
+
+        # --- Updates ---
+        from modules import update_check as _update_check
+
+        upd_group = QGroupBox("Updates")
+        upd_layout = QVBoxLayout(upd_group)
+
+        upd_auto = QCheckBox("Check for a newer version automatically")
+        upd_auto.setChecked(_update_check.is_enabled())
+        upd_auto.setToolTip(
+            "Once a day, downloads a small text file listing the latest "
+            "version. Nothing about you or this computer is sent."
+        )
+        upd_auto.toggled.connect(_update_check.set_enabled)
+        upd_layout.addWidget(upd_auto)
+
+        upd_row = QHBoxLayout()
+        upd_now_btn = QPushButton("Check now")
+        upd_now_btn.clicked.connect(lambda: self._start_update_check(force=True))
+        upd_row.addWidget(upd_now_btn)
+        self.update_status_label = QLabel("")
+        self.update_status_label.setStyleSheet("color: #888;")
+        upd_row.addWidget(self.update_status_label)
+        upd_row.addStretch()
+        upd_layout.addLayout(upd_row)
+        layout.addWidget(upd_group)
 
         # --- Upgrade to Pro ---
         pro_group = QGroupBox("VideoHighlighter Pro")

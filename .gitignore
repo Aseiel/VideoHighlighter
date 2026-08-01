@@ -35,3 +35,12 @@ cache/
 training/runs/
 
 __pycache__/
+
+# Update-check state (last check, skipped version) — per install, never shared.
+update_state.json
+# Updater working dirs: files being downloaded, and the ones displaced by the
+# last update pending a sweep. Both appear in the install root at runtime.
+.update-staging/
+.update-old/
+publish/
+.secrets/
