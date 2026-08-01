@@ -117,6 +117,25 @@ jobs:
         run: |
           $size = (Get-ChildItem -Recurse ./dist/VideoHighlighter | Measure-Object -Property Length -Sum).Sum / 1GB
           Write-Host "Build size: $([math]::Round($size, 2)) GB"
+      - name: Generate release manifest
+        # Every shipped file with its SHA-256, written INTO the bundle before
+        # archiving so each install carries a record of what it was given. The
+        # updater diffs the next release against it and fetches only the files
+        # that differ.
+        #
+        # Deliberately NOT signed here: the release signing key decides what
+        # executes on users' machines, so it stays offline rather than living
+        # in Actions secrets, where anyone who can edit a workflow could
+        # exfiltrate it. Sign the manifest locally, then publish the .sig.
+        run: |
+          $v = python -c "import version; print(version.__version__)"
+          $e = python -c "import version; print(version.__edition__)"
+          python tools/build_manifest.py generate --root dist/VideoHighlighter --version "$v" --edition "$e" --base-url "${{ vars.UPDATE_BASE_URL }}"
+      - name: Upload unsigned manifest (sign this locally)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-manifest
+          path: dist/VideoHighlighter/manifest.json
       - name: Create archive
         run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z" ./dist/VideoHighlighter
       - name: Upload artifact
