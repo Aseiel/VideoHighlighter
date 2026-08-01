@@ -193,7 +193,8 @@ def measure_segment(*,
                     amps: Sequence[float],
                     sorted_amps: np.ndarray,
                     amps_per_second: float,
-                    boxes: Sequence[Mapping]) -> dict:
+                    boxes: Sequence[Mapping],
+                    composed: frozenset = frozenset()) -> dict:
     """The physical facts behind one clip, not the points they earned.
 
     Points are a function of the weight table: change a weight and every number
@@ -250,9 +251,15 @@ def measure_segment(*,
         measured["signal_spread_seconds"] = float(spread)
         measured["signals_coincide"] = bool(spread <= COINCIDENCE_SECONDS)
 
-    if boxes:
+    # Composed events are emitted with a confidence of 1.0 because a rule either
+    # matched or it did not — there is no detector certainty in a rule outcome.
+    # Taking the maximum over every box therefore reported 1.00 whenever a rule
+    # fired, which is "a rule matched" wearing the costume of "the detector was
+    # certain". Only real detections answer the question being asked.
+    detections = [b for b in boxes if b.get("name") not in composed]
+    if detections:
         measured["detection_confidence"] = round(
-            max(float(b.get("confidence") or 0.0) for b in boxes), 3)
+            max(float(b.get("confidence") or 0.0) for b in detections), 3)
 
     return measured
 
@@ -364,6 +371,7 @@ def build_report(*,
                  composed_event_names: Optional[Iterable[str]] = None,
                  waveform: Optional[Sequence] = None,
                  bbox_cache: Optional[Iterable[Mapping]] = None,
+                 expressions: Optional[Mapping] = None,
                  ) -> dict:
     """Attribute every kept segment to the evidence that selected it.
 
@@ -382,6 +390,11 @@ def build_report(*,
     or bare amplitudes. It is reported even when audio contributed no points,
     because "was anything happening acoustically here?" is context the reader
     wants whether or not the scoring used it.
+
+    ``expressions`` is the per-second expression scan (either shape
+    ``modules.face_scan`` produces). Together with ``bbox_cache`` it is what
+    lets each clip be compared with the rest of the video on what was *on
+    screen* rather than on what it scored; see :mod:`modules.highlight_compare`.
 
     Near-misses are the highest-scoring seconds *not* covered by any kept
     segment. They are what a user would tune the weights to capture, so they are
@@ -422,6 +435,17 @@ def build_report(*,
             arr = np.asarray(arr, dtype=float)
             sorted_signals[key] = np.sort(arr[arr > 0])
 
+    # What every clip's subjects are ranked against. Built once for the video —
+    # per clip it would re-sort the same detections for every row. Imported here
+    # rather than at module scope because the comparison module imports this one
+    # back for `percentile_rank`.
+    try:
+        from modules.highlight_compare import build_distributions, compare_segment
+        distributions = build_distributions(bbox_cache, expressions)
+    except Exception as exc:                       # pragma: no cover - defensive
+        print(f"⚠️ Subject comparison skipped: {exc}")
+        distributions = compare_segment = None
+
     def detail_for(sec: int) -> dict:
         pcts = None
         if action_percentiles and actions_by_sec and sec in actions_by_sec:
@@ -447,7 +471,12 @@ def build_report(*,
             amps=amps, sorted_amps=sorted_amps,
             amps_per_second=amps_per_second,
             boxes=boxes_at.get(sec, ()),
+            composed=frozenset(composed_event_names or ()),
         )
+        if compare_segment is not None:
+            comparison = compare_segment(distributions, start, end)
+            if comparison:
+                entry["measured"]["comparison"] = comparison
         if amps_per_second:
             lo = int(start * amps_per_second)
             hi = max(lo + 1, int(end * amps_per_second))
@@ -492,9 +521,21 @@ def build_report(*,
 
     audio_curve = downsample(amps) if amps else []
 
+    # How the expression reading moves across the whole file, when there is one.
+    # A property of the video rather than of any clip, so it sits beside the
+    # curves rather than inside a segment.
+    arc = {}
+    if expressions:
+        try:
+            from modules.expression_arc import analyse
+            arc = analyse(expressions, video_duration, segments=segments,
+                          detections=object_detections)
+        except Exception as exc:                   # pragma: no cover - defensive
+            print(f"⚠️ Expression arc skipped: {exc}")
+
     kept_duration = sum(e - s for s, e in segments)
     return {
-        "schema": 2,
+        "schema": 3,
         "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
         "video": {
             "path": str(video_path),
@@ -524,6 +565,7 @@ def build_report(*,
         },
         "segments": entries,
         "near_misses": near_misses,
+        "expression_arc": arc,
     }
 
 
@@ -547,6 +589,20 @@ def segments_from_report(report: Mapping) -> list[tuple[float, float]]:
 # --------------------------------------------------------------------------- #
 # Renderers
 # --------------------------------------------------------------------------- #
+
+def _standout_lines(entry: Mapping) -> list:
+    """The comparative findings for one clip, or nothing.
+
+    Wrapped so both renderers can fail the same way: the prose module is
+    imported lazily everywhere in here, and a build without it should cost the
+    report its sentences, not the whole page.
+    """
+    try:
+        from modules.highlight_prose import explain_standout
+        return explain_standout(entry)
+    except Exception:
+        return []
+
 
 def render_text(report: Mapping) -> str:
     """The debug-log view — the same breakdown the pipeline used to print."""
@@ -574,6 +630,20 @@ def render_text(report: Mapping) -> str:
         if b["applied"]:
             out.append(f"    Multi-signal boost: {b['signal_count']} signals "
                        f"x{b['multiplier']} -> +{b['points']:.1f}")
+        for line in _standout_lines(e):
+            out.append(f"    * {line}")
+
+    arc = report.get("expression_arc") or {}
+    if arc:
+        try:
+            from modules.highlight_prose import summarise_expression_arc
+            lines = summarise_expression_arc(arc)
+        except Exception:
+            lines = []
+        if lines:
+            out.append("")
+            out.append("--- How the expression reading moves ---")
+            out.extend(f"    {line}" for line in lines)
 
     if report["near_misses"]:
         out.append("")
@@ -620,6 +690,9 @@ h1{font-size:22px;margin:0 0 4px}
 .pts{color:var(--accent);font-weight:600}
 .meta{color:var(--dim);font-size:13px;margin:2px 0 10px}
 .says{color:var(--text);font-size:13.5px;margin:10px 0 2px}
+.why{margin:6px 0 4px;padding-left:18px;color:var(--text);font-size:13px}
+.why li{margin:3px 0}
+.why li::marker{color:var(--accent)}
 .meas{color:var(--cool);font-size:12px;margin:2px 0}
 .bar{display:flex;align-items:center;gap:10px;margin:3px 0;font-size:13px}
 .bar .lab{width:110px;color:var(--dim);flex-shrink:0}
@@ -656,6 +729,11 @@ h1{font-size:22px;margin:0 0 4px}
 .find .fix{color:var(--text)}
 .narr{background:#191a1f;border:1px solid var(--line);border-radius:8px;
       padding:12px 14px;margin-bottom:12px;white-space:pre-wrap;font-size:13.5px}
+.arcnote p{margin:0 0 8px;color:var(--dim);font-size:13.5px}
+.arcnote p:first-child{color:var(--text)}
+.arcnote p:last-child{margin-bottom:0;font-size:12.5px;font-style:italic}
+.valchart{display:block;width:100%;height:90px;margin:4px 0 2px}
+.reading{color:var(--dim);font-size:12.5px;margin:6px 0 0}
 .wave{display:block;width:100%;height:34px;margin-top:8px;opacity:.85}
 .wavelab{color:var(--dim);font-size:11.5px;margin-top:2px}
 .boost{margin-top:10px;font-size:12.5px;color:var(--warm)}
@@ -713,6 +791,23 @@ def _run_sentence(report: Mapping) -> str:
         return summarise_run(report)
     except Exception:
         return ""
+
+
+def _standout_summary(report: Mapping) -> str:
+    """Which clip each comparison axis singled out, once, near the top.
+
+    The per-clip findings are spread down the page, so the question they most
+    obviously raise — "which one is the unusual one, then?" — is the one the
+    page answered least well.
+    """
+    try:
+        from modules.highlight_prose import summarise_standouts
+        sentence = summarise_standouts(report)
+    except Exception:
+        sentence = ""
+    if not sentence:
+        return ""
+    return f'<div class="narr">{html.escape(sentence)}</div>'
 
 
 def _overview(report: Mapping) -> str:
@@ -802,6 +897,91 @@ def _summary(report: Mapping) -> str:
     return f'<h2>What decided the cut</h2>{note}{rows}'
 
 
+def _expression_arc(report: Mapping) -> str:
+    """How the expression reading moves across the file, drawn and stated.
+
+    The chart is the point of the section. A distribution ("45% sad") is one
+    number and reads as a verdict on the whole video; the same data as twelve
+    bars shows a reader the stretches it came from, which is both more useful
+    and much harder to over-read.
+    """
+    arc = report.get("expression_arc") or {}
+    if not arc:
+        return ""
+
+    try:
+        from modules.highlight_prose import summarise_expression_arc
+        lines = summarise_expression_arc(arc)
+    except Exception:
+        lines = []
+
+    buckets = arc.get("buckets") or []
+    chart = ""
+    if buckets:
+        W, H, mid, reach = 1000.0, 90.0, 45.0, 38.0
+        width = W / max(1, len(buckets))
+        bars = []
+        for b in buckets:
+            x = b["index"] * width
+            if "valence" not in b:
+                bars.append(f'<rect x="{x + 1:.1f}" y="{mid - 1:.1f}" '
+                            f'width="{width - 2:.1f}" height="2" fill="#3a3a46"/>')
+                continue
+            value = float(b["valence"])
+            height = min(reach, abs(value) * reach / 0.8)
+            y = mid - height if value > 0 else mid
+            colour = "#5ac8b0" if value > 0 else "#e8685d"
+            bars.append(f'<rect x="{x + 1:.1f}" y="{y:.1f}" '
+                        f'width="{width - 2:.1f}" height="{max(1.0, height):.1f}" '
+                        f'fill="{colour}" opacity=".85"/>')
+        shift = arc.get("shift") or {}
+        marker = ""
+        duration = float((arc.get("coverage") or {}).get("duration") or 0.0)
+        if shift and duration > 0:
+            x = max(0.0, min(W, float(shift["at"]) / duration * W))
+            marker = (f'<rect x="{x:.1f}" y="0" width="1.5" height="{H:.0f}" '
+                      f'fill="#e8a33d"/>')
+        chart = (
+            f'<svg class="valchart" viewBox="0 0 {W:.0f} {H:.0f}" '
+            f'preserveAspectRatio="none" role="img" '
+            f'aria-label="Expression valence across the video">'
+            f'<line x1="0" y1="{mid}" x2="{W:.0f}" y2="{mid}" stroke="#3a3a46" '
+            f'stroke-width="1"/>{"".join(bars)}{marker}</svg>'
+            f'<div class="legend">'
+            f'<span><i style="background:#5ac8b0"></i>positive-reading</span>'
+            f'<span><i style="background:#e8685d"></i>negative-reading</span>'
+            + ('<span><i style="background:#e8a33d"></i>where it changes most'
+               '</span>' if shift else '')
+            + '</div>'
+        )
+
+    body = "".join(f"<p>{html.escape(line)}</p>" for line in lines)
+
+    episodes = ""
+    rows = [e for e in (arc.get("episodes") or [])][:8]
+    if rows:
+        cells = "".join(
+            f'<tr><td>{html.escape(format_timestamp(e["start"]))} – '
+            f'{html.escape(format_timestamp(e["end"]))}</td>'
+            f'<td>{e["seconds"]:.0f}s</td>'
+            f'<td>{html.escape(str(e["dominant"]))}</td>'
+            f'<td>{e["valence"]:+.2f}</td>'
+            f'<td>{e["read_seconds"]}</td></tr>'
+            for e in rows
+        )
+        episodes = (
+            '<p class="note">The longest stretches that read consistently one '
+            'way. These are the places to check the footage — a stretch is a '
+            'pointer, not a conclusion.</p>'
+            '<div class="scroll"><table><thead><tr><th>Range</th><th>Length</th>'
+            '<th>Mostly</th><th>Valence</th><th>Seconds read</th></tr></thead>'
+            f'<tbody>{cells}</tbody></table></div>'
+        )
+
+    return (f'<h2>How the expression reading moves</h2>'
+            f'<div class="narr arcnote">{body}</div>{chart}{episodes}')
+
+
 def _advice(report: Mapping) -> str:
     """What to change, if anything diagnosed this run (see modules.advisor)."""
     findings = report.get("advice") or []
@@ -846,6 +1026,14 @@ def _measurements(entry: Mapping, peer_scores=None) -> str:
 
     sentence = describe(entry, peer_scores)
     lead = (f'<div class="says">{html.escape(sentence)}</div>' if sentence else "")
+
+    # The comparative reading, when this clip had one. Its own block rather than
+    # more clauses on the sentence above: this is the part a reader consults to
+    # argue with the pick, and it is worth the vertical space it takes.
+    standout = _standout_lines(entry)
+    if standout:
+        items = "".join(f"<li>{html.escape(line)}</li>" for line in standout)
+        lead += f'<ul class="why">{items}</ul>'
 
     parts = []
     pct = m.get("score_percentile")
@@ -968,6 +1156,9 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
     max_points = max([e["score"] for e in report["segments"]] or [1.0])
     # Each clip is described relative to the others in the cut.
     peer_scores = [float(e.get("score") or 0.0) for e in report["segments"]]
+    arc = report.get("expression_arc") or {}
+    readings = {r["index"]: r for r in (arc.get("segments") or [])}
+    video_valence = float((arc.get("valence") or {}).get("mean_all_read") or 0.0)
     composed = frozenset(
         name for e in report["segments"] for name in e.get("events", [])
     )
@@ -976,6 +1167,16 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
     for e in report["segments"]:
         thumb = _shot(e, composed)
         tags = _tag_rows(e)
+        reading = ""
+        if e["index"] in readings:
+            try:
+                from modules.highlight_prose import describe_segment_reading
+                sentence = describe_segment_reading(readings[e["index"]],
+                                                    video_valence)
+            except Exception:
+                sentence = ""
+            if sentence:
+                reading = f'<div class="reading">{html.escape(sentence)}</div>'
         boost = ""
         if e["boost"]["applied"]:
             boost = (f'<div class="boost">Multi-signal boost — '
@@ -990,6 +1191,7 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
             f'{_bars(e, max_points)}'
             f'{_measurements(e, peer_scores)}'
             f'{tags}'
+            f'{reading}'
             f'{_segment_wave(report, e)}'
             f'{boost}</div></div>'
         )
@@ -1038,6 +1240,8 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
   <div><span class="n">{totals["coverage_pct"]:.1f}%</span><span class="l">of the source</span></div>
 </div>
 {_overview(report)}
+{_standout_summary(report)}
+{_expression_arc(report)}
 {_advice(report)}
 {_summary(report)}
 <h2>The moments, in order</h2>
