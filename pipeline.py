@@ -1724,6 +1724,25 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             except Exception as _fe:
                 log(f"⚠️ Expression scan skipped: {_fe}")
 
+        # Report-only fallback. The scan above runs solely when expressions are
+        # being *scored*, which is right for the cut — but it also meant that
+        # turning the weight off silently removed a whole section of the report
+        # for a video whose scan was already sitting in the cache. Loading it
+        # costs no model and no decode, and it cannot affect the cut: this runs
+        # after `face_score` is final, so the arithmetic is untouched either way.
+        if not face_seconds:
+            try:
+                from modules.face_scan import cache_path_for
+                from modules.face_scan import load as load_face_scan
+                _cached = load_face_scan(cache_path_for(
+                    processed_video_path, gui_config.get("cache_dir", "./cache")))
+                if _cached:
+                    face_seconds = _cached
+                    print(f"ℹ Expression scan reused for the report only "
+                          f"({len(_cached)} second(s)); it scored no points.")
+            except Exception as _fe:
+                print(f"⚠️ Cached expression scan not loaded: {_fe}")
+
         # Sum signals
         score = (scene_score + motion_event_score + motion_peak_score + audio_score +
                  keyword_score + beginning_score + ending_score + object_score +
@@ -1983,6 +2002,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # Already normalised to 0..1, so the page draws them over the
                     # thumbnail in CSS — no second encode, no bigger images.
                     bbox_cache=object_bboxes_cache,
+                    # The per-second expression scan, not just its totals: with
+                    # the boxes above it is what lets a clip be compared with the
+                    # rest of the video on what was on screen rather than on what
+                    # it scored.
+                    expressions=face_seconds,
                 )
 
                 # Diagnose the run before writing it out, so the page and the
