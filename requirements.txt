@@ -41,3 +41,7 @@ webdriver-manager
 # on Intel GPU / CPU. pillow is above.
 transformers
 optimum-intel  # OpenVINO backend only — the CUDA path does not import it
+cryptography  # Ed25519 verification of release manifests (modules/update_manifest.py).
+              # The updater replaces executables, so an unverified manifest is
+              # not installed at all — without this the update check still
+              # notifies, but can never self-install.
