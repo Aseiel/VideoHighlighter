@@ -277,7 +277,7 @@ class TestRenderers:
         write_report(rep, str(html_path), str(json_path))
 
         assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")
-        assert json.loads(json_path.read_text(encoding="utf-8"))["schema"] == 2
+        assert json.loads(json_path.read_text(encoding="utf-8"))["schema"] == 3
 
 
 class TestTagGrouping:
@@ -765,3 +765,103 @@ class TestMeasurements:
                            score=_score(sig, n=600), signals=sig,
                            segments=[(95, 105)])
         assert rep["segments"][0]["measured"]["score_percentile"] < 90
+
+
+class TestConfidenceExcludesRules:
+    """A rule outcome is not a detector's certainty."""
+
+    def _rep(self, **kw):
+        sig = _signals(object={17: 10.0})
+        return build_report(video_path="a.mp4", video_duration=60,
+                            score=_score(sig), signals=sig, segments=[(10, 20)],
+                            bbox_cache=[{"timestamp": 17.0,
+                                         "objects": ["cup", "table_set"],
+                                         "bboxes": [[0, 0, 1, 1], [0, 0, 1, 1]],
+                                         "confidences": [0.62, 1.0]}], **kw)
+
+    def test_a_composed_event_does_not_become_the_confidence(self):
+        rep = self._rep(composed_event_names=["table_set"])
+        assert rep["segments"][0]["measured"]["detection_confidence"] == 0.62
+
+    def test_without_the_composed_list_the_rule_still_dominates(self):
+        """Documents why composed_event_names has to reach the measurement."""
+        rep = self._rep()
+        assert rep["segments"][0]["measured"]["detection_confidence"] == 1.0
+
+    def test_only_rules_at_a_second_means_no_confidence_claim(self):
+        sig = _signals(object={17: 10.0})
+        rep = build_report(video_path="a.mp4", video_duration=60,
+                           score=_score(sig), signals=sig, segments=[(10, 20)],
+                           composed_event_names=["table_set"],
+                           bbox_cache=[{"timestamp": 17.0,
+                                        "objects": ["table_set"],
+                                        "bboxes": [[0, 0, 1, 1]],
+                                        "confidences": [1.0]}])
+        assert "detection_confidence" not in rep["segments"][0]["measured"]
+
+
+class TestSubjectComparison:
+    """The comparative reading reaches the record and both renderers.
+
+    `modules.highlight_compare` owns the arithmetic and is tested there; what is
+    checked here is the wiring — that a caller passing the detector's boxes and
+    the expression scan gets findings in the JSON, on the page and in the debug
+    log, and that a caller passing neither is not penalised for it.
+    """
+
+    N = 120
+
+    def _cache(self):
+        """A steady video whose one clip holds a subject three times its usual
+        size relative to the person beside it."""
+        cache = []
+        for sec in range(self.N):
+            scale = (0.5, 1.0, 1.5)[sec % 3]
+            ratio = 3.0 if 58 <= sec <= 66 else 1.0
+            cache.append({
+                "timestamp": float(sec),
+                "objects": ["person", "dog"],
+                "bboxes": [[0.1, 0.1, 0.25 * scale, 0.5 * scale],
+                           [0.5, 0.5, 0.125 * scale * ratio, 0.25 * scale]],
+                "confidences": [0.95, 0.88],
+            })
+        return cache
+
+    def _built(self, **over):
+        signals = _signals(n=self.N, object={60: 9.0})
+        kwargs = dict(video_path="v.mp4", video_duration=float(self.N),
+                      score=_score(signals, n=self.N), signals=signals,
+                      segments=[(58.0, 68.0)], near_miss_count=0)
+        kwargs.update(over)
+        return build_report(**kwargs)
+
+    def test_the_comparison_lands_in_the_record(self):
+        report = self._built(bbox_cache=self._cache())
+        comparison = report["segments"][0]["measured"]["comparison"]
+        dog = next(s for s in comparison["subjects"] if s["name"] == "dog")
+        assert dog["relative"]["reference"] == "person"
+        assert dog["relative"]["percentile"] > 90.0
+
+    def test_the_finding_reaches_the_page(self):
+        page = render_html(self._built(bbox_cache=self._cache()))
+        assert '<ul class="why">' in page
+        assert "the person beside it" in page
+
+    def test_the_finding_reaches_the_debug_log(self):
+        assert "the person beside it" in render_text(
+            self._built(bbox_cache=self._cache()))
+
+    def test_the_expression_scan_is_accepted_in_either_shape(self):
+        tuples = {sec: ("neutral", 0.7) for sec in range(self.N)}
+        tuples.update({sec: ("surprise", 0.95) for sec in range(58, 68)})
+        dicts = {sec: {"label": label, "confidence": conf}
+                 for sec, (label, conf) in tuples.items()}
+        for scan in (tuples, dicts):
+            comparison = self._built(expressions=scan)["segments"][0][
+                "measured"]["comparison"]
+            assert comparison["expression"]["label"] == "surprise"
+
+    def test_a_run_with_no_detector_and_no_faces_reports_nothing_extra(self):
+        report = self._built()
+        assert "comparison" not in report["segments"][0]["measured"]
+        assert '<ul class="why">' not in render_html(report)
