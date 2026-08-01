@@ -880,7 +880,13 @@ class VideoHighlighterGUI(QWidget):
         self.setWindowTitle(f"Video Highlighter v{__version__} {__edition__}")
         screen = QApplication.primaryScreen().availableGeometry()
         w = min(1000, screen.width() - 20)
-        h = min(800, screen.height() - 20)
+        # Open as tall as the screen comfortably allows. The fixed sections
+        # above the tabs (input list, output name, time range) cost ~410px
+        # before a single tab row is drawn, so an 800px window spent half its
+        # height before the settings even started. The cap only binds on very
+        # tall screens; everywhere else the available height decides, and the
+        # window can still shrink to its ~794px minimum.
+        h = min(1200, screen.height() - 20)
         self.resize(w, h)
         self.move(screen.x() + (screen.width() - w) // 2, screen.y())
 
@@ -1096,13 +1102,12 @@ class VideoHighlighterGUI(QWidget):
         self.download_progress_bar.setRange(0, 100)
         progress_layout.addWidget(self.download_progress_bar)
 
-        # Batch counter — its own row because the process bar and task_label
-        # below are rewritten by every pipeline stage of the current video.
-        self.batch_progress_bar = QProgressBar()
-        self.batch_progress_bar.setVisible(False)
-        self.batch_progress_bar.setFormat("%v / %m videos")
-        progress_layout.addWidget(self.batch_progress_bar)
-
+        # Batch counter as text, not a bar. The whole group is hidden when idle
+        # and shown while running, so every row in it is height the window gains
+        # at the moment a run starts — and on a screen where the window is
+        # already at its limit, that pushes the buttons under the taskbar. The
+        # label below said "Video 1/1" anyway, so the bar was a second copy of
+        # the same fact costing a row.
         self.batch_label = QLabel()
         self.batch_label.setVisible(False)
         self.batch_label.setStyleSheet("color: #666; font-weight: bold;")
@@ -1281,7 +1286,7 @@ class VideoHighlighterGUI(QWidget):
         download_layout.addWidget(download_group)
         download_layout.addStretch()
         download_tab.setLayout(download_layout)
-        tabs.addTab(download_tab, "Download")
+        tabs.addTab(self._scrollable(download_tab), "Download")
 
         # --- Tab 1: Basic Settings ---
         basic_tab = QWidget()
@@ -1552,7 +1557,7 @@ class VideoHighlighterGUI(QWidget):
         basic_layout.setRowStretch(6, 1)
 
         basic_tab.setLayout(basic_layout)
-        tabs.addTab(basic_tab, "Basic Settings")
+        tabs.addTab(self._scrollable(basic_tab), "Basic Settings")
 
         # --- Tab 2: Transcript & Subtitles ---
         transcript_cfg = self.config_data.get("transcript", {})
@@ -1615,7 +1620,7 @@ class VideoHighlighterGUI(QWidget):
         transcript_layout.addWidget(subtitle_group)
 
         transcript_tab.setLayout(transcript_layout)
-        tabs.addTab(transcript_tab, "Transcript && Subtitles")
+        tabs.addTab(self._scrollable(transcript_tab), "Transcript && Subtitles")
 
         # --- Tab 3: Advanced Tab ---
         advanced_cfg = self.config_data.get("advanced", {})
@@ -2201,10 +2206,18 @@ class VideoHighlighterGUI(QWidget):
         advanced_tab.setLayout(QVBoxLayout())
         advanced_tab.layout().setContentsMargins(0, 0, 0, 0)
         advanced_tab.layout().addWidget(advanced_scroll)
-        tabs.addTab(advanced_tab, "Advanced")
+        tabs.addTab(self._scrollable(advanced_tab), "Advanced")
 
         content_splitter = QSplitter(Qt.Vertical)
+        # A floor, not the old behaviour. Wrapping the pages in scroll areas
+        # dropped the tab widget's minimum height to almost nothing, which is
+        # what let the window finally shrink — but it also left nothing
+        # resisting the splitter, so the tabs collapsed to a couple of rows
+        # while the empty log pane kept its share. Small enough that the window
+        # still fits a 1080p screen, big enough to show a form without folding.
+        tabs.setMinimumHeight(280)
         content_splitter.addWidget(tabs)
+        self.content_splitter = content_splitter
         layout.addWidget(content_splitter)
 
         # --- Tab 4: LLM Chat ---
@@ -2213,7 +2226,7 @@ class VideoHighlighterGUI(QWidget):
         self.llm_chat = LLMChatWidget(parent=self)
         llm_layout.addWidget(self.llm_chat)
         llm_tab.setLayout(llm_layout)
-        tabs.addTab(llm_tab, "LLM Chat")
+        tabs.addTab(self._scrollable(llm_tab), "LLM Chat")
 
         # --- Tab 5: Avoid ---
         avoid_tab = QWidget()
@@ -2278,10 +2291,10 @@ class VideoHighlighterGUI(QWidget):
         avoid_group.setLayout(avoid_group_layout)
         avoid_layout.addWidget(avoid_group, 1)
         avoid_tab.setLayout(avoid_layout)
-        tabs.addTab(avoid_tab, "Avoid")
+        tabs.addTab(self._scrollable(avoid_tab), "Avoid")
 
         # --- Tab: About & Contact ---
-        tabs.addTab(self._build_about_tab(), "About")
+        tabs.addTab(self._scrollable(self._build_about_tab()), "About")
 
         # Defer first populate until after __init__ finishes (so log_output exists)
         QTimer.singleShot(0, self.refresh_avoid_list)
@@ -2377,7 +2390,12 @@ class VideoHighlighterGUI(QWidget):
         content_splitter.addWidget(log_widget)
         content_splitter.setStretchFactor(0, 3)
         content_splitter.setStretchFactor(1, 1)
-        content_splitter.setSizes([h - 200, 150])  # give log ~150px
+        # Sized against the splitter's own height, not the window's. Asking for
+        # window-height-derived sizes here requests more than the splitter
+        # actually receives (the input list and time range are above it), and
+        # QSplitter then scales BOTH panes down proportionally — which is what
+        # squeezed the tabs while the log kept its 80px minimum.
+        QTimer.singleShot(0, self._balance_content_splitter)
 
         self.setLayout(layout)
 
@@ -2421,6 +2439,39 @@ class VideoHighlighterGUI(QWidget):
         self.on_process_mode_changed()  # sync spinner enabled
 
     # --- About / Contact tab ---
+    @staticmethod
+    def _scrollable(page):
+        """Wrap a tab page so it can shrink, and scroll instead of clipping.
+
+        QTabWidget takes its minimum height from its tallest page, so one big
+        tab set the floor for the entire window — 1049px, more than a 1080p
+        screen has once the taskbar is accounted for. The window then could not
+        shrink to fit, and the row of buttons at the bottom ended up under the
+        taskbar, which is where this started.
+        """
+        from PySide6.QtWidgets import QScrollArea
+
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        area.setWidget(page)
+        return area
+
+    def _balance_content_splitter(self):
+        """Give the log a fixed slice and the tabs everything else.
+
+        Runs after the first layout pass, when the splitter knows how tall it
+        actually is. The log is a status pane — it wants a readable few lines,
+        not a proportional share of the window.
+        """
+        splitter = getattr(self, "content_splitter", None)
+        if splitter is None:
+            return
+        available = splitter.height()
+        log_height = 150 if available >= 460 else 110
+        splitter.setSizes([max(280, available - log_height), log_height])
+
     def _build_about_tab(self):
         """A read-only About & Contact panel: version, support links, licensing."""
         outer = QWidget()
@@ -3905,15 +3956,14 @@ class VideoHighlighterGUI(QWidget):
     @Slot(int, int, str, str)
     def update_batch_progress(self, current: int, total: int, task_name: str, details: str = ""):
         """Videos finished out of total, kept visible for the whole batch run."""
-        self.batch_progress_bar.setRange(0, max(1, total))
-        self.batch_progress_bar.setValue(max(0, min(current, total)))
-        self.batch_progress_bar.setVisible(True)
-        self.batch_label.setText(f"📦 {details}")
+        # Only worth stating when there is more than one video: "1 / 1" tells
+        # nobody anything they cannot see from the file list.
+        counter = f"{max(0, min(current, total))}/{total}  " if total > 1 else ""
+        self.batch_label.setText(f"📦 {counter}{details}")
         self.batch_label.setVisible(True)
         QApplication.processEvents()
 
     def hide_batch_progress(self):
-        self.batch_progress_bar.setVisible(False)
         self.batch_label.setVisible(False)
 
     @Slot(str)
