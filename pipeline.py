@@ -893,7 +893,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # Call the actual motion detection function with video path
                     result = detect_scenes_motion_optimized(
                         processed_video_path,
-                        scene_threshold=70.0,
+                        # Was hardcoded to 70.0, which made `scene_threshold` a
+                        # phantom setting: it sits in the analysis cache
+                        # signature, so changing it forced a full re-analysis
+                        # and then produced the identical result. The default
+                        # is unchanged, so this alters nothing until it is set.
+                        scene_threshold=float(gui_config.get(
+                            "scene_threshold", config.get("scene_threshold", 70.0))),
                         motion_threshold=100.0,
                         spike_factor=1.2,
                         freeze_seconds=4,
