@@ -842,16 +842,43 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         start_time = time.time()
 
         # --- 1+2 Detect scenes + motion + peaks with live progress ---
-        if not using_cache:
+        # The gate has to read exactly what the *scoring* will read, or the two
+        # disagree about the same setting. They did: this gate defaulted
+        # motion_peak_points to 0 while MOTION_PEAK_POINTS below defaults it to
+        # 3, so a config that set neither skipped the detector and then scored
+        # peaks it had never looked for. Resolved once, here, and used for both
+        # the gate and the backfill check.
+        effective_points = {
+            "scene_points": gui_config.get(
+                "scene_points", config.get("scene_points", 0)),
+            "motion_event_points": gui_config.get(
+                "motion_event_points", config.get("motion_event_points", 0)),
+            "motion_peak_points": gui_config.get(
+                "motion_peak_points", config.get("motion_peak_points", 3)),
+            "audio_peak_points": gui_config.get(
+                "audio_peak_points", config.get("audio_peak_points", 0)),
+        }
+
+        # A cached run can still be missing motion data - the points that gate
+        # the detector are scoring weights and deliberately outside the cache
+        # signature, so a cache written while they were zero holds empty lists
+        # forever. `modules.analysis_plan` owns that reasoning and the registry
+        # of which settings do this; see its docstring for why it is a module
+        # rather than a condition written out here for the third time.
+        from modules.analysis_plan import describe as _describe_backfill
+        from modules.analysis_plan import gate_is_open, needs_backfill
+        motion_wanted = gate_is_open(effective_points, "motion")
+        motion_backfill = needs_backfill(
+            "motion", effective_points, using_cache=using_cache,
+            values=(scenes, motion_events, motion_peaks))
+        if motion_backfill:
+            log(_describe_backfill("motion"))
+
+        if not using_cache or motion_backfill:
             progress.update_progress(10, 100, "Pipeline", "Detecting motion and scenes...")
-            
-            # Check if we should skip motion detection based on GUI config
-            scene_points = gui_config.get("scene_points", 0)
-            motion_event_points = gui_config.get("motion_event_points", 0) 
-            motion_peak_points = gui_config.get("motion_peak_points", 0)
 
             # Skip motion detection if all motion-related points are 0
-            if scene_points == 0 and motion_event_points == 0 and motion_peak_points == 0:
+            if not motion_wanted:
                 log("ℹ️ Skipping motion detection (all scene/motion points set to 0)")
                 scenes, motion_events, motion_peaks = [], [], []
                 progress.update_progress(25, 100, "Pipeline", "Motion detection skipped - no motion scoring enabled")
@@ -903,6 +930,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         audio_peaks = audio_peaks if 'audio_peaks' in locals() else []
         waveform_data = None
+        audio_backfill = False   # set below only on a cached pass; see analysis_plan
 
         def _get_cached_waveform(cached):
             if not cached:
@@ -929,6 +957,25 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             audio_peaks = _get_cached_audio_peaks(cached_data)
             waveform_data = _get_cached_waveform(cached_data)
 
+            # Same trap as motion: `audio_peak_points` gates the detector but is
+            # a scoring weight, so a cache written with it at zero holds an empty
+            # peak list that raising the weight could never refill.
+            audio_backfill = needs_backfill(
+                "audio_peaks", effective_points, using_cache=True,
+                values=(audio_peaks,))
+            if audio_backfill:
+                log(_describe_backfill("audio_peaks"))
+                try:
+                    check_cancellation(cancel_flag, log, "audio peak detection")
+                    audio_peaks = extract_audio_peaks(processed_video_path,
+                                                      cancel_flag=cancel_flag)
+                    log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
+                except RuntimeError:
+                    return None
+                except Exception as e:
+                    log(f"⚠️ Audio peak detection failed: {e}")
+                    audio_peaks = []
+
             # If waveform wasn't cached in older runs, compute it now (cheap) so timeline works
             if waveform_data is None:
                 try:
@@ -944,7 +991,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         else:
             # Check if we should skip audio detection based on GUI config
-            audio_peak_points = gui_config.get("audio_peak_points", 0)
+            audio_peak_points = effective_points["audio_peak_points"]
 
             # Always try to compute waveform for the timeline viewer
             try:
@@ -974,6 +1021,35 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
                 except RuntimeError:
                     return None
+
+        # Keep what the backfills just cost, so this is a one-off rather than a
+        # tax on every future run. Only the backfilled keys are replaced, in the
+        # blob exactly as it was loaded - rebuilding it from this run's locals
+        # would write back a transcript and detection set that a cached pass
+        # never fully populates, turning a good cache into a partial one. The
+        # signature is unchanged because the analysis *inputs* are unchanged;
+        # what was missing was an artifact, not a different run.
+        if ((motion_backfill or audio_backfill) and use_cache
+                and not (cancel_flag and cancel_flag.is_set())):
+            try:
+                if motion_backfill:
+                    cached_data["scenes"] = [{"start": float(s), "end": float(e)}
+                                             for s, e in scenes]
+                    cached_data["motion_events"] = [float(t) for t in motion_events]
+                    cached_data["motion_peaks"] = [float(t) for t in motion_peaks]
+                if audio_backfill:
+                    audio_block = cached_data.get("audio")
+                    if isinstance(audio_block, dict):
+                        audio_block["peaks"] = [float(t) for t in audio_peaks]
+                    else:                      # legacy top-level layout
+                        cached_data["audio_peaks"] = [float(t) for t in audio_peaks]
+                cache.save(processed_video_path, cached_data, params=analysis_params)
+                filled = ", ".join(n for n, on in (("motion", motion_backfill),
+                                                   ("audio peaks", audio_backfill))
+                                   if on)
+                log(f"💾 Cached the {filled} data - the next run reuses it.")
+            except Exception as e:
+                log(f"⚠️ Could not cache the backfilled data: {e}")
 
         # 4 Object detection setup
         progress.update_progress(40, 100, "Pipeline", "Setting up object detection...")
@@ -1931,6 +2007,20 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     finally:
                         cap.release()
 
+                # The video's own structure, so every clip can be filed under
+                # the stretch it came from and each stretch compared with the
+                # whole. Built from `scenes`, which is already in hand, plus the
+                # CLIP index *only if a previous run cached one* - see
+                # `cached_index_arrays`. Never encodes frames here, so this
+                # cannot slow a run down.
+                chapters = []
+                try:
+                    from modules.chapters import chapters_for_video
+                    chapters = chapters_for_video(video_path, scenes,
+                                                  video_duration, log_fn=print)
+                except Exception as _ce:
+                    print(f"⚠️ Chapters skipped: {_ce}")
+
                 report = build_report(
                     video_path=video_path,
                     video_duration=video_duration,
@@ -2007,6 +2097,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # rest of the video on what was on screen rather than on what
                     # it scored.
                     expressions=face_seconds,
+                    chapters=chapters,
                 )
 
                 # Diagnose the run before writing it out, so the page and the
