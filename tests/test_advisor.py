@@ -97,6 +97,30 @@ class TestPrompt:
         prompt = advisor.build_prompt(rep, diagnose(rep), question="Why so short?")
         assert "Why so short?" in prompt
 
+    def test_chapter_structure_reaches_the_model_as_sentences(self):
+        """Sentences, not raw ratios — the model must not do the arithmetic."""
+        rep = _report()
+        rep["chapters"] = [
+            {"number": 1, "start": 0.0, "end": 60.0, "duration": 60.0,
+             "timestamp": "0:00:00", "title": "Chapter 1", "shots": 20,
+             "pace": "steady", "method": "visual", "clips": 1,
+             "runtime_share_pct": 25.0, "cut_share_pct": 100.0,
+             "cut_share_lift": 4.0},
+            {"number": 2, "start": 60.0, "end": 240.0, "duration": 180.0,
+             "timestamp": "0:01:00", "title": "Chapter 2", "shots": 20,
+             "pace": "steady", "method": "visual", "clips": 0,
+             "runtime_share_pct": 75.0, "cut_share_pct": 0.0,
+             "cut_share_lift": 0.0},
+        ]
+        prompt = advisor.build_prompt(rep, diagnose(rep))
+        assert "How the video divides" in prompt
+        assert "2 chapters" in prompt
+        assert "Nothing from this chapter was selected." in prompt
+
+    def test_a_report_without_chapters_adds_no_section(self):
+        rep = _report()
+        assert "How the video divides" not in advisor.build_prompt(rep, diagnose(rep))
+
     def test_the_system_prompt_forbids_inventing_numbers(self):
         assert "Never invent a number" in advisor.SYSTEM_PROMPT
 
