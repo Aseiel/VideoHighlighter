@@ -127,8 +127,31 @@ def build_prompt(report: Mapping,
         "## Findings computed from this run",
         format_findings(findings),
         "",
-        "## Documentation",
     ]
+
+    # Where in the video the cut came from. Worth the tokens because it answers
+    # a question the findings cannot: a cut drawn entirely from one stretch of a
+    # long video is a fact about the footage, and the model can only say so if
+    # it is told the structure. Sentences rather than raw numbers, so the model
+    # is summarising a claim that was already checked instead of doing the
+    # arithmetic itself — which is where it would invent one.
+    chapters = report.get("chapters") or []
+    if chapters:
+        try:
+            from modules.highlight_prose import (describe_chapter,
+                                                 summarise_chapter_run)
+            lines = [summarise_chapter_run(chapters)]
+            for ch in chapters:
+                said = "; ".join(describe_chapter(ch))
+                lines.append(f"- {ch.get('timestamp', '')} {ch.get('title', '')} "
+                             f"({float(ch.get('duration') or 0):.0f}s, "
+                             f"{int(ch.get('clips') or 0)} clip(s)): {said}")
+            parts += ["## How the video divides, and where the clips came from",
+                      "\n".join(lines), ""]
+        except Exception as exc:            # narration must survive this
+            print(f"⚠️ Chapter context skipped: {exc}")
+
+    parts.append("## Documentation")
     for name, text in knowledge_for(findings, knowledge_dir).items():
         parts.append(f"### {name}\n{text}")
 

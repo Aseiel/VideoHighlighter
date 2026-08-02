@@ -684,3 +684,114 @@ def summarise_run(report: Mapping) -> str:
     if duration and span:
         parts.append(f"drawn from {span / duration * 100:.0f}% of its length")
     return _join(parts).capitalize() + "."
+
+
+def _lift_phrase(lift: float) -> str:
+    """Turn a ratio into words, in the direction it actually points.
+
+    "0.4x as much" is arithmetic; "less than half as much" is the same fact in
+    a form a reader takes in at a glance. Below parity the ratio is inverted so
+    the sentence never asks anyone to reason about a fraction.
+    """
+    if lift <= 0:
+        return ""
+    if lift >= 1.0:
+        return f"{lift:.1f}× as much" if lift >= 1.15 else "about as much"
+    return f"{1.0 / lift:.1f}× less"
+
+
+def describe_chapter(chapter: Mapping) -> list:
+    """What marks one chapter out from the rest of its video.
+
+    Deliberately willing to return a single flat sentence. Most chapters of most
+    videos are not distinctive, and a breakdown that finds a story in every one
+    of them is telling the reader nothing they can act on — the chapters that
+    *are* different only mean something against neighbours that are not.
+    """
+    from modules.chapter_compare import CUT_SHARE_LIFT, distinctive
+
+    lines = []
+
+    # Where the cut came from. First because it needs no detector, so it is the
+    # one line that survives on a video nothing was run against.
+    clips = int(chapter.get("clips") or 0)
+    share_lift = float(chapter.get("cut_share_lift") or 0.0)
+    runtime_share = float(chapter.get("runtime_share_pct") or 0.0)
+    cut_share = float(chapter.get("cut_share_pct") or 0.0)
+    if clips and share_lift >= CUT_SHARE_LIFT:
+        lines.append(
+            f"Supplied {cut_share:.0f}% of the cut from {runtime_share:.0f}% of "
+            f"the runtime — {share_lift:.1f}× its share, across {clips} clip"
+            f"{'' if clips == 1 else 's'}.")
+    elif not clips:
+        lines.append("Nothing from this chapter was selected.")
+
+    for finding in distinctive(chapter):
+        phrase = _lift_phrase(float(finding["lift"]))
+        if not phrase:
+            continue
+        seconds = int(finding.get("seconds") or 0)
+        if finding["kind"] == "expression":
+            lines.append(
+                f"Reads {finding['name']} for {finding['chapter_share_pct']:.0f}% "
+                f"of its readable seconds — {phrase} as the video overall "
+                f"({finding['video_share_pct']:.0f}%), over {seconds}s.")
+        else:
+            lines.append(
+                f"{finding['name']} is on screen for "
+                f"{finding['chapter_share_pct']:.0f}% of this chapter's detected "
+                f"seconds — {phrase} as across the video "
+                f"({finding['video_share_pct']:.0f}%), over {seconds}s.")
+
+    # Pace and level describe how a stretch was shot and mixed rather than what
+    # is in it, so they come last and only when they are clearly off the video's
+    # own norm.
+    pace_lift = float(chapter.get("pace_lift") or 0.0)
+    if pace_lift and (pace_lift >= 1.5 or pace_lift <= 0.67):
+        direction = "faster" if pace_lift > 1 else "slower"
+        lines.append(f"Cuts {direction} than the video's average — "
+                     f"{float(chapter.get('shots_per_minute') or 0):.0f} shots a "
+                     f"minute, {_lift_phrase(pace_lift)}.")
+
+    level = float(chapter.get("loudness_delta_db") or 0.0)
+    if abs(level) >= 3.0:
+        lines.append(f"Runs {abs(level):.0f} dB "
+                     f"{'louder' if level > 0 else 'quieter'} than the video's "
+                     "median level.")
+
+    if not lines:
+        lines.append("Nothing here separates it from the rest of the video.")
+    return lines
+
+
+def summarise_chapter_run(chapters: Sequence[Mapping]) -> str:
+    """One sentence about the chapter breakdown as a whole.
+
+    The useful fact is concentration — whether the highlights came from
+    everywhere or from one stretch. A cut drawn entirely from two chapters of
+    twelve is a finding about the video; the same clips spread evenly is a
+    finding about the detector.
+    """
+    chapters = list(chapters or [])
+    if not chapters:
+        return ""
+    if len(chapters) == 1:
+        return ("The video was not divided — nothing in its shot structure "
+                "separated one stretch from another.")
+
+    with_clips = [c for c in chapters if int(c.get("clips") or 0)]
+    method = str(chapters[0].get("method") or "")
+    basis = ("its own shot lengths" if method == "shot-length"
+             else "where the footage stops looking like what came before")
+
+    if not with_clips:
+        return (f"{len(chapters)} chapters, divided on {basis}. "
+                "No clips were selected from any of them.")
+
+    share = 100.0 * len(with_clips) / len(chapters)
+    lead = max(chapters, key=lambda c: float(c.get("cut_share_pct") or 0.0))
+    tail = (f" The largest single contribution is {lead['title']}, at "
+            f"{float(lead.get('cut_share_pct') or 0):.0f}% of the cut."
+            if float(lead.get("cut_share_pct") or 0) > 0 else "")
+    return (f"{len(chapters)} chapters, divided on {basis}. Clips came from "
+            f"{len(with_clips)} of them ({share:.0f}%).{tail}")

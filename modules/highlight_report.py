@@ -372,6 +372,7 @@ def build_report(*,
                  waveform: Optional[Sequence] = None,
                  bbox_cache: Optional[Iterable[Mapping]] = None,
                  expressions: Optional[Mapping] = None,
+                 chapters: Optional[Sequence[Mapping]] = None,
                  ) -> dict:
     """Attribute every kept segment to the evidence that selected it.
 
@@ -395,6 +396,12 @@ def build_report(*,
     ``modules.face_scan`` produces). Together with ``bbox_cache`` it is what
     lets each clip be compared with the rest of the video on what was *on
     screen* rather than on what it scored; see :mod:`modules.highlight_compare`.
+
+    ``chapters`` is ``modules.chapters.chapterize``'s partition. Supplying it
+    files every clip under the stretch it came from and measures each stretch
+    against the whole video; see :mod:`modules.chapter_compare`. It is optional
+    and costs nothing when absent — a report without it is exactly the report
+    that was produced before chapters existed.
 
     Near-misses are the highest-scoring seconds *not* covered by any kept
     segment. They are what a user would tune the weights to capture, so they are
@@ -533,6 +540,25 @@ def build_report(*,
         except Exception as exc:                   # pragma: no cover - defensive
             print(f"⚠️ Expression arc skipped: {exc}")
 
+    # Where each clip sits in the video's own structure, and how the stretches
+    # differ from one another. Defensive like the arc above: a chapter list is
+    # an addition to the record, and failing to build one should not cost the
+    # reader the rest of it.
+    chapter_rows = []
+    if chapters:
+        try:
+            from modules.chapter_compare import assign_chapters, summarise_chapters
+            chapter_rows = summarise_chapters(
+                chapters, score=score, segments=segments, amps=amps,
+                amps_per_second=amps_per_second, distributions=distributions,
+                video_duration=video_duration)
+            for entry, number in zip(entries, assign_chapters(chapters, segments)):
+                if number:
+                    entry["chapter"] = int(number)
+        except Exception as exc:                   # pragma: no cover - defensive
+            print(f"⚠️ Chapter breakdown skipped: {exc}")
+            chapter_rows = []
+
     kept_duration = sum(e - s for s, e in segments)
     return {
         "schema": 3,
@@ -566,6 +592,7 @@ def build_report(*,
         "segments": entries,
         "near_misses": near_misses,
         "expression_arc": arc,
+        "chapters": chapter_rows,
     }
 
 
@@ -632,6 +659,30 @@ def render_text(report: Mapping) -> str:
                        f"x{b['multiplier']} -> +{b['points']:.1f}")
         for line in _standout_lines(e):
             out.append(f"    * {line}")
+
+    chapters = report.get("chapters") or []
+    if chapters:
+        try:
+            from modules.highlight_prose import (describe_chapter,
+                                                 summarise_chapter_run)
+            headline = summarise_chapter_run(chapters)
+        except Exception:
+            describe_chapter = None
+            headline = ""
+        out.append("")
+        out.append("--- The video in chapters ---")
+        if headline:
+            out.append(f"    {headline}")
+        for ch in chapters:
+            out.append("")
+            clips = ch.get("clip_indices") or []
+            out.append(f"    {ch['timestamp']}  {ch['title']}  "
+                       f"({ch['duration']:.0f}s, {ch['shots']} shots, {ch['pace']})")
+            out.append(f"        Clips: "
+                       + (", ".join(f"[{i}]" for i in clips) if clips else "none"))
+            if describe_chapter is not None:
+                for line in describe_chapter(ch):
+                    out.append(f"        * {line}")
 
     arc = report.get("expression_arc") or {}
     if arc:
@@ -733,6 +784,13 @@ h1{font-size:22px;margin:0 0 4px}
 .arcnote p:first-child{color:var(--text)}
 .arcnote p:last-child{margin-bottom:0;font-size:12.5px;font-style:italic}
 .valchart{display:block;width:100%;height:90px;margin:4px 0 2px}
+.chapstrip{display:block;width:100%;height:34px;margin:4px 0 2px;
+           border-radius:4px;overflow:hidden}
+.chap{background:var(--card);border:1px solid var(--line);border-radius:10px;
+      padding:12px 14px;margin-bottom:10px}
+.chaph{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+.chap .why{margin:8px 0 0}
+.chap .meta{margin:2px 0 0}
 .reading{color:var(--dim);font-size:12.5px;margin:6px 0 0}
 .wave{display:block;width:100%;height:34px;margin-top:8px;opacity:.85}
 .wavelab{color:var(--dim);font-size:11.5px;margin-top:2px}
@@ -980,6 +1038,86 @@ def _expression_arc(report: Mapping) -> str:
 
     return (f'<h2>How the expression reading moves</h2>'
             f'<div class="narr arcnote">{body}</div>{chart}{episodes}')
+
+
+def _chapters(report: Mapping) -> str:
+    """The video's own structure, with each clip filed under where it came from.
+
+    The strip is the point of the section, for the same reason the arc has a
+    chart: a table of twelve chapters is twelve facts read one at a time, while
+    the same data drawn to scale shows at a glance that the cut came from two
+    stretches and ignored the rest. Segment width is runtime; fill is share of
+    the cut, so a chapter that punched above its length is visibly fuller than
+    its neighbours without anyone reading a number.
+    """
+    chapters = report.get("chapters") or []
+    if not chapters:
+        return ""
+
+    try:
+        from modules.highlight_prose import describe_chapter, summarise_chapter_run
+        headline = summarise_chapter_run(chapters)
+    except Exception:
+        describe_chapter, headline = None, ""
+
+    duration = float((report.get("video") or {}).get("duration") or 0.0)
+    strip = ""
+    if duration > 0:
+        W, H = 1000.0, 34.0
+        blocks = []
+        for ch in chapters:
+            x = float(ch["start"]) / duration * W
+            width = max(1.0, float(ch["duration"]) / duration * W)
+            # Fill height carries share of the cut, capped so one dominant
+            # chapter cannot flatten every other block into invisibility.
+            lift = min(3.0, float(ch.get("cut_share_lift") or 0.0))
+            fill = min(H, H * lift / 3.0)
+            blocks.append(
+                f'<rect x="{x + 0.5:.1f}" y="0" width="{width - 1:.1f}" '
+                f'height="{H:.0f}" fill="#26262c"/>'
+                f'<rect x="{x + 0.5:.1f}" y="{H - fill:.1f}" '
+                f'width="{width - 1:.1f}" height="{fill:.1f}" '
+                f'fill="#5ac8b0" opacity=".8"><title>{html.escape(str(ch["title"]))}'
+                f' — {float(ch.get("cut_share_pct") or 0):.0f}% of the cut</title>'
+                f'</rect>')
+        strip = (f'<svg class="chapstrip" viewBox="0 0 {W:.0f} {H:.0f}" '
+                 f'preserveAspectRatio="none" role="img" '
+                 f'aria-label="Chapters across the video, filled by share of the cut">'
+                 f'{"".join(blocks)}</svg>'
+                 '<div class="legend"><span><i style="background:#5ac8b0"></i>'
+                 'share of the cut, against the chapter\'s share of runtime</span>'
+                 '</div>')
+
+    rows = []
+    for ch in chapters:
+        lines = describe_chapter(ch) if describe_chapter is not None else []
+        body = "".join(f"<li>{html.escape(line)}</li>" for line in lines)
+        clips = ch.get("clip_indices") or []
+        picked = (", ".join(f"clip {i}" for i in clips) if clips
+                  else "no clips selected")
+        rows.append(
+            f'<div class="chap">'
+            f'<div class="chaph"><span class="rng">'
+            f'{html.escape(str(ch["timestamp"]))} · {html.escape(str(ch["title"]))}'
+            f'</span> <span class="pts">{float(ch.get("cut_share_pct") or 0):.0f}%'
+            f'</span></div>'
+            f'<div class="meta">{float(ch["duration"]):.0f}s · '
+            f'{int(ch.get("shots") or 0)} shots · {html.escape(str(ch.get("pace", "")))}'
+            f' · {html.escape(picked)}</div>'
+            f'<ul class="why">{body}</ul></div>')
+
+    narration = (f'<div class="narr">{html.escape(headline)}</div>'
+                 if headline else "")
+    return (
+        '<h2>The video in chapters</h2>'
+        '<p class="note">Where the footage stops looking like what came before, '
+        'measured on the video\'s own shot structure — every boundary falls on a '
+        'real cut. Each chapter is then compared with the whole video, so what '
+        'is listed is what is different about that stretch, not what is in it. '
+        'Chapters have no titles because nothing here is taught a vocabulary; '
+        'the numbers are the description.</p>'
+        f'{narration}{strip}{"".join(rows)}'
+    )
 
 
 def _advice(report: Mapping) -> str:
@@ -1241,6 +1379,7 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
 </div>
 {_overview(report)}
 {_standout_summary(report)}
+{_chapters(report)}
 {_expression_arc(report)}
 {_advice(report)}
 {_summary(report)}
