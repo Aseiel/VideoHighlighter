@@ -66,6 +66,12 @@ def detect_scenes_motion_optimized(video_path,
     scenes = []
     motion_events = []
     motion_peaks = []
+    # Every sampled frame's difference from the one before it, kept rather than
+    # thresholded on the spot. Deciding cuts after the pass is what lets the
+    # threshold be checked against the video's own distribution when the
+    # configured one turns out to be unreachable — see modules/scene_cuts.py.
+    # One float per sampled frame: an hour at frame_skip=5 is ~43k of them.
+    scene_diffs = []
     
     if device in ["xpu", "cuda"] or device.startswith("cuda"):
         torch.backends.cudnn.benchmark = True
@@ -282,12 +288,8 @@ def detect_scenes_motion_optimized(video_path,
                             break
                             
                         if prev_gray_scene is not None:
-                            diff_scene = np.abs(prev_gray_scene - gray_scene).mean()
-                            if diff_scene > scene_threshold:
-                                scene_end_sec = frame_idx / fps
-                                scenes.append((scene_start_sec, scene_end_sec))
-                                scene_start_sec = scene_end_sec
-                                current_scene_id += 1
+                            scene_diffs.append((frame_idx, float(
+                                np.abs(prev_gray_scene - gray_scene).mean())))
                         prev_gray_scene = gray_scene
                     
                     # Check cancellation before motion detection
@@ -332,12 +334,8 @@ def detect_scenes_motion_optimized(video_path,
                 if cancel_flag and cancel_flag.is_set():
                     break
                 if prev_gray_scene is not None:
-                    diff_scene = np.abs(prev_gray_scene - gray_scene).mean()
-                    if diff_scene > scene_threshold:
-                        scene_end_sec = frame_idx / fps
-                        scenes.append((scene_start_sec, scene_end_sec))
-                        scene_start_sec = scene_end_sec
-                        current_scene_id += 1
+                    scene_diffs.append((frame_idx, float(
+                        np.abs(prev_gray_scene - gray_scene).mean())))
                 prev_gray_scene = gray_scene
             
             # Motion detection for remaining
@@ -356,10 +354,42 @@ def detect_scenes_motion_optimized(video_path,
                 sampled_done = sampled_total  # final batch → report 100%
             _report_progress()
         
-        # Final scene only if not cancelled
+        # Decide the cuts now that the whole distribution is known. Doing it
+        # here rather than per frame is what lets an unreachable threshold be
+        # noticed at all: a fixed number describes the mastering, not the
+        # content, and on graded footage 70 is never reached, which used to
+        # come back as one scene covering the film. See modules/scene_cuts.py.
         if not (cancel_flag and cancel_flag.is_set()):
-            scenes.append((scene_start_sec, video_duration))
-        
+            from modules.scene_cuts import resolve, scenes_from_cuts
+
+            # OpenCV cannot always report a frame count (VR/8K/streamed), so
+            # fall back to the last frame actually read rather than trusting a
+            # zero that would collapse every scene to nothing.
+            if video_duration <= 0 and scene_diffs:
+                video_duration = scene_diffs[-1][0] / fps
+
+            diffs = [d for _idx, d in scene_diffs]
+            minutes = video_duration / 60.0 if video_duration > 0 else 0.0
+            # Shortest shot worth reporting, expressed in samples because that
+            # is the lattice the differences live on. Half a second: below that
+            # it is a dissolve or the frames either side of one cut, not a shot.
+            min_gap = max(1, int(round(0.5 * fps / frame_skip)))
+            picked, used_threshold, recalibrated = resolve(
+                diffs, minutes, scene_threshold, min_gap=min_gap)
+            cut_times = [scene_diffs[i][0] / fps for i in picked]
+            scenes = scenes_from_cuts(cut_times, video_duration)
+
+            if debug or recalibrated:
+                rate = (len(scenes) / minutes) if minutes else 0.0
+                if recalibrated:
+                    print(f"🎬 Scene threshold {scene_threshold:.0f} found nothing "
+                          f"in {minutes:.0f} min; recalibrated to "
+                          f"{used_threshold:.1f} from this video's own frame "
+                          f"differences -> {len(scenes)} scenes ({rate:.1f}/min)")
+                else:
+                    print(f"🎬 Scenes: {len(scenes)} at threshold "
+                          f"{used_threshold:.0f} ({rate:.1f}/min)")
+
         pbar.close()
         
         # Wait for loader thread to finish
