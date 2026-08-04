@@ -220,7 +220,8 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                          waveform_data=None, keyword_segments_only=False,
                          search_keywords=None, keyword_matches=None, action_bboxes=None,
                          object_bboxes=None, action_detections_all=None,
-                         composed_event_names=None):
+                         composed_event_names=None, loudness_bursts=None,
+                         loudness_levels=None):
     """
     Collect all analysis results into a structured dictionary for caching.
 
@@ -312,7 +313,14 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
     # Store in a structured way for easy access
     analysis_data["audio"] = {
         "peaks": audio_peaks_clean,
-        "waveform": waveform_data
+        "waveform": waveform_data,
+        # Events, not per-second curves: the curves are six arrays the length of
+        # the video and a caller who wants them can re-measure in a few seconds.
+        "loudness_bursts": loudness_bursts or [],
+        # One float per second. Cached rather than recomputed because the
+        # report's per-class comparison needs every second, and re-deriving it
+        # means decoding the audio again on a run that otherwise touches none.
+        "loudness_levels": [float(v) for v in (loudness_levels or [])]
     }
     
     # Also keep legacy key for backward compatibility
@@ -1028,6 +1036,65 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 except RuntimeError:
                     return None
 
+        # --- 3b Loudness bursts ---------------------------------------------
+        # Where the audio rises above its own *local* level, grouped into events.
+        # This sits beside `audio_peaks` rather than replacing it because the two
+        # answer different questions: that one thresholds at a fixed -20 dBFS,
+        # which is a property of the mastering rather than of the content, and on
+        # two files mastered 17 dB apart it cannot describe both. A z-score
+        # against a rolling median can. See modules/loudness_bursts.py.
+        LOUDNESS_BURST_POINTS = gui_config.get(
+            "loudness_burst_points",
+            config.get("scoring", {}).get("loudness_burst_points", 0))
+        loudness_bursts = []
+        # Per-second dBFS, kept because the report compares the level measured
+        # during each labelled class and that needs a value for every second,
+        # not only the ones that stood out. See modules/level_by_class.py.
+        loudness_levels = []
+        if LOUDNESS_BURST_POINTS:
+            _cached_blob = cached_data if "cached_data" in locals() else None
+            _cached_bursts = None
+            if using_cache and isinstance(_cached_blob, dict):
+                _audio_blob = _cached_blob.get("audio")
+                if isinstance(_audio_blob, dict):
+                    _cached_bursts = _audio_blob.get("loudness_bursts")
+                    loudness_levels = _audio_blob.get("loudness_levels") or []
+            if _cached_bursts:
+                loudness_bursts = _cached_bursts
+                log(f"ℹ️ Using cached loudness bursts "
+                    f"({len(loudness_bursts)} event(s))")
+            else:
+                progress.update_progress(31, 100, "Pipeline",
+                                         "Finding loudness bursts...")
+                log("🔹 Step 3b: Finding loudness bursts...")
+                try:
+                    check_cancellation(cancel_flag, log, "loudness burst detection")
+                    from modules import loudness_bursts as _lb
+                    _lb_cfg = config.get("loudness_bursts", {}) or {}
+                    _lb_result = _lb.detect(
+                        processed_video_path,
+                        z_threshold=float(_lb_cfg.get("z_threshold", _lb.DEFAULT_Z)),
+                        min_duration=float(_lb_cfg.get(
+                            "min_duration", _lb.DEFAULT_MIN_DURATION)),
+                        edge_guard=float(_lb_cfg.get(
+                            "edge_guard", _lb.DEFAULT_EDGE_GUARD)),
+                        merge_gap=float(_lb_cfg.get(
+                            "merge_gap", _lb.DEFAULT_MERGE_GAP)),
+                        include_levels=True,
+                        cancel=cancel_flag)
+                    loudness_bursts = _lb_result["events"]
+                    loudness_levels = _lb_result.get("levels") or []
+                    log(f"✅ Loudness bursts: {len(loudness_bursts)} event(s) "
+                        f"({_lb_result['events_per_hour']}/hour)")
+                except RuntimeError as e:
+                    # No audio track is a fact about the file, not a failure of
+                    # the run -- every other signal is still worth having.
+                    log(f"⚠️ Loudness burst detection skipped: {e}")
+                    loudness_bursts = []
+                except Exception as e:
+                    log(f"⚠️ Loudness burst detection failed: {e}")
+                    loudness_bursts = []
+
         # Keep what the backfills just cost, so this is a one-off rather than a
         # tax on every future run. Only the backfilled keys are replaced, in the
         # blob exactly as it was loaded - rebuilding it from this run's locals
@@ -1558,6 +1625,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     action_bboxes=action_bboxes_cache,
                     object_bboxes=object_bboxes_cache,
                     composed_event_names=composed_event_names,
+                    loudness_bursts=loudness_bursts,
+                    loudness_levels=loudness_levels,
                 )
                 
                 # Add analysis parameters for future validation
@@ -1617,6 +1686,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         motion_event_score = np.zeros_like(score)
         motion_peak_score = np.zeros_like(score)
         audio_score = np.zeros_like(score)
+        loudness_burst_score = np.zeros_like(score)
         keyword_score = np.zeros_like(score)
         beginning_score = np.zeros_like(score)
         ending_score = np.zeros_like(score)
@@ -1682,7 +1752,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # Check if total possible score is zero (highlight will be empty in MAX mode)
         total_possible = (SCENE_POINTS + MOTION_PEAK_POINTS + MOTION_EVENT_POINTS +
-                        AUDIO_PEAK_POINTS + KEYWORD_POINTS + BEGINNING_POINTS +
+                        AUDIO_PEAK_POINTS + LOUDNESS_BURST_POINTS +
+                        KEYWORD_POINTS + BEGINNING_POINTS +
                         ENDING_POINTS + OBJECT_POINTS + ACTION_POINTS)
         if total_possible == 0:
             log("⚠️ WARNING: All scoring signals are set to 0. No moments will be scored and "
@@ -1708,6 +1779,15 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             idx = int(round(t))
             if 0 <= idx < len(score):
                 audio_score[idx] += AUDIO_PEAK_POINTS
+
+        # Every second an event spans, not just its peak: a loudness burst is a
+        # moment with a duration, and scoring only the peak second would make the
+        # clip-builder cut around a single instant of a two-second event.
+        from modules.loudness_bursts import event_seconds as _burst_seconds
+        loudness_burst_set = _burst_seconds(loudness_bursts)
+        for sec in loudness_burst_set:
+            if 0 <= sec < len(score):
+                loudness_burst_score[sec] += LOUDNESS_BURST_POINTS
 
         for sec in keyword_set:
             if 0 <= sec < len(keyword_score):
@@ -1827,6 +1907,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # Sum signals
         score = (scene_score + motion_event_score + motion_peak_score + audio_score +
+                 loudness_burst_score +
                  keyword_score + beginning_score + ending_score + object_score +
                  action_score + face_score)
 
@@ -1842,6 +1923,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 i in motion_set,
                 i in motion_peaks_set,
                 i in audio_set,
+                i in loudness_burst_set,
                 i in keyword_set,
                 i in object_set,
                 i in action_set
@@ -2031,11 +2113,19 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     video_path=video_path,
                     video_duration=video_duration,
                     score=score,
+                    # Per-second dBFS. The report derives both the per-clip peak
+                    # and the whole-video per-class comparison from it, the same
+                    # way it derives the chapter comparison from `chapters`.
+                    loudness_levels=loudness_levels,
+                    # Timestamps, so each clip can name the peak it was scored
+                    # on and offer to play it.
+                    motion_peaks=[float(t) for t in motion_peaks],
                     signals={
                         "scene": scene_score,
                         "motion_event": motion_event_score,
                         "motion_peak": motion_peak_score,
                         "audio": audio_score,
+                        "loudness_burst": loudness_burst_score,
                         "keyword": keyword_score,
                         "object": object_score,
                         "action": action_score,
@@ -2054,6 +2144,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         "motion_event_points": MOTION_EVENT_POINTS,
                         "motion_peak_points": MOTION_PEAK_POINTS,
                         "audio_peak_points": AUDIO_PEAK_POINTS,
+                        "loudness_burst_points": LOUDNESS_BURST_POINTS,
                         "keyword_points": KEYWORD_POINTS,
                         "object_points": OBJECT_POINTS,
                         "action_points": ACTION_POINTS,
@@ -2386,6 +2477,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 motion_event_score[idx] > 0,
                 motion_peak_score[idx] > 0,
                 audio_score[idx] > 0,
+                loudness_burst_score[idx] > 0,
                 keyword_score[idx] > 0,
                 object_score[idx] > 0,
                 idx in detections_by_sec
@@ -2589,7 +2681,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         motion_peaks=motion_peaks,
                         audio_peaks=audio_peaks,
                         source_lang=SOURCE_LANG,
-                        waveform_data=waveform_data
+                        waveform_data=waveform_data,
+                        loudness_bursts=loudness_bursts,
+                        loudness_levels=loudness_levels
                     )
 
                 # Hand the edit timeline EXACTLY what we cut (post-subtract,

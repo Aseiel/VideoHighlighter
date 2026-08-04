@@ -219,6 +219,34 @@ def _agreement(entry: Mapping, measured: Mapping) -> str:
     return f"landing within {spread:.0f}s of each other"
 
 
+def _as_sentences(parts: Sequence[str], lead: str = "") -> str:
+    """Where the clip stands, then what it was chosen on. Two sentences, not one.
+
+    Four measurements chained with commas reads as one long breath and gets
+    skipped. Splitting them changes nothing about what is claimed and a great
+    deal about whether anyone finishes the line.
+
+    The break falls after the ranking because that is the natural seam: where
+    this clip stands is one thought, what fired is another. It deliberately does
+    *not* split further and capitalise each clause, which was tried and was
+    worse — half these clauses begin with detected names ("jumping recognised
+    at 0.88"), and sentence-casing them rewrites data the detector produced.
+    A fixed lead-in carries the second sentence instead, so nothing measured
+    ever has to start one.
+    """
+    parts = [p for p in parts if p]
+    if not parts:
+        return f"{lead}." if lead else ""
+    head, rest = parts[0], parts[1:]
+    if lead:
+        first = f"{lead} — {head}."
+    else:
+        first = f"{head[0].upper()}{head[1:]}."
+    if not rest:
+        return first
+    return f"{first} Chosen on {_join(rest)}."
+
+
 def describe(entry: Mapping,
              peer_scores: Optional[Sequence[float]] = None) -> str:
     """One sentence about why this clip is in the highlight.
@@ -254,13 +282,10 @@ def describe(entry: Mapping,
         parts.append(loudness)
 
     if standing:
-        return f"{standing} — {_join(parts)}." if parts else f"{standing}."
+        return _as_sentences(parts, lead=standing)
     if not parts:
         return ""
-    # No ranking to lead with, so the first clause becomes the sentence.
-    head, rest = parts[0], parts[1:]
-    head = head[0].upper() + head[1:]
-    return f"{head} — {_join(rest)}." if rest else f"{head}."
+    return _as_sentences(parts[1:], lead=parts[0][0].upper() + parts[0][1:])
 
 
 # A size claim resting on a box the detector was this unsure of should carry the
@@ -269,8 +294,12 @@ def describe(entry: Mapping,
 WEAK_DETECTION = 0.5
 
 
-def _subject_line(subject: Mapping) -> str:
-    """What is unusual about one detected class here, or nothing.
+def _subject_line(subject: Mapping) -> tuple:
+    """What is unusual about one detected class here, as ``(kind, line)``.
+
+    The kind is returned so the caller can keep the paragraph varied — three
+    findings of the same shape read as one finding repeated. See
+    :func:`explain_standout`.
 
     The order of preference is the order of trustworthiness. A ratio against
     something else in the same frame comes first because moving the camera
@@ -280,10 +309,11 @@ def _subject_line(subject: Mapping) -> str:
     """
     name = str(subject.get("name") or "").strip()
     if not name:
-        return ""
+        return "", ""
 
     relative = subject.get("relative") or {}
     lead = ""
+    kind = ""
     median = float(relative.get("median") or 0.0)
     ratio = float(relative.get("ratio") or 0.0)
     # Ranked high *and* actually different. Either alone is a sentence that
@@ -293,6 +323,7 @@ def _subject_line(subject: Mapping) -> str:
             and float(relative.get("percentile") or 0.0) >= NOTABLE):
         linear = float(relative.get("linear_ratio")
                        or math.sqrt(max(0.0, float(relative["ratio"]))))
+        kind = "relative"
         lead = (
             f"{name} covers {float(relative['ratio']):.1f}× the area of the "
             f"{relative['reference']} beside it — about {linear:.1f}× across — "
@@ -302,6 +333,7 @@ def _subject_line(subject: Mapping) -> str:
         )
     elif (subject.get("enough_samples")
           and float(subject.get("frame_share_percentile") or 0.0) >= NOTABLE):
+        kind = "frame_share"
         lead = (
             f"{name} fills {float(subject['frame_share']):.1f}% of the frame — "
             f"more than in {float(subject['frame_share_percentile']):.0f}% of "
@@ -314,6 +346,7 @@ def _subject_line(subject: Mapping) -> str:
     rarity = ""
     if (prevalence is not None and float(prevalence) <= RARE_PREVALENCE
             and int(subject.get("detections") or 0) >= MIN_RARE_DETECTIONS):
+        kind = kind or "rarity"
         rarity = (f"{name} is in only {float(prevalence):.0f}% of the video's "
                   f"detected seconds")
 
@@ -324,7 +357,7 @@ def _subject_line(subject: Mapping) -> str:
     elif rarity:
         lead = rarity
     if not lead:
-        return ""
+        return "", ""
 
     caveats = []
     presence = subject.get("clip_presence_pct")
@@ -335,7 +368,7 @@ def _subject_line(subject: Mapping) -> str:
         caveats.append(f"on a {float(confidence):.2f} detection")
     if caveats:
         lead = f"{lead} — {_join(caveats)}"
-    return lead[0].upper() + lead[1:] + "."
+    return kind, lead[0].upper() + lead[1:] + "."
 
 
 def _expression_line(expression: Mapping) -> str:
@@ -384,6 +417,14 @@ def _expression_line(expression: Mapping) -> str:
     return "The expression classifier " + ", ".join(parts) + "."
 
 
+# At most this many size/rarity findings under one clip, and at most this many
+# of any single kind. Measured on a real run: three detected classes produced
+# three frame-share sentences in a row, which reads as one sentence written
+# three times and pushes the loudness and expression readings out of sight.
+MAX_SUBJECT_LINES = 2
+MAX_LINES_PER_KIND = {"relative": 1, "frame_share": 1, "rarity": 2}
+
+
 def explain_standout(entry: Mapping) -> list:
     """The deeper reading of one clip: what was different about what was on screen.
 
@@ -398,11 +439,24 @@ def explain_standout(entry: Mapping) -> list:
     the reader to skip the section entirely.
     """
     comparison = (entry.get("measured") or {}).get("comparison") or {}
-    lines = []
+    lines: list = []
+    used: dict = {}
     for subject in comparison.get("subjects") or ():
-        line = _subject_line(subject)
-        if line:
-            lines.append(line)
+        kind, line = _subject_line(subject)
+        if not line:
+            continue
+        # Three findings of the same shape read as one finding repeated, and a
+        # paragraph of them buries whatever else the clip had to say. The frame
+        # -share reading is the one that multiplies -- every class in a frame has
+        # a share, so an unconstrained list becomes a table of areas -- and it is
+        # also the weakest, since it cannot tell a larger subject from a closer
+        # camera. One of those is plenty.
+        if used.get(kind, 0) >= MAX_LINES_PER_KIND.get(kind, 1):
+            continue
+        used[kind] = used.get(kind, 0) + 1
+        lines.append(line)
+        if len(lines) >= MAX_SUBJECT_LINES:
+            break
     expression = _expression_line(comparison.get("expression") or {})
     if expression:
         lines.append(expression)
@@ -700,6 +754,88 @@ def _lift_phrase(lift: float) -> str:
     return f"{1.0 / lift:.1f}× less"
 
 
+# How close a chapter's best second has to come to the cut threshold before the
+# miss is called narrow. Within a tenth is close enough that a small weight
+# change would flip it; further out and saying "nearly" would be flattery.
+NEAR_MISS_SHARE = 0.9
+
+
+def _why_not_selected(chapter: Mapping) -> list:
+    """Why nothing was taken from this stretch — the three reasons differ.
+
+    "Nothing was selected" is true of most chapters of most videos and tells a
+    reader nothing they can act on. The useful question is which of three things
+    happened, because each has a different fix:
+
+    *Nothing fired here.* No detector scored a single second. Raising weights
+    cannot help; the stretch is invisible to whatever was run, and the fix is a
+    detector, not a number.
+
+    *It scored, but under the bar.* The gap to the weakest clip that was kept is
+    the actionable figure, and the signals that did fire name which weight to
+    raise.
+
+    *It scored well enough and still lost.* The cut filled before reaching it —
+    a length or coverage limit, not a scoring problem. Telling someone to raise
+    a weight here would waste their afternoon.
+    """
+    lines = ["Nothing from this chapter was selected."]
+
+    peak = chapter.get("score_peak")
+    threshold = chapter.get("cut_threshold")
+    fired = list(chapter.get("signals_present") or [])
+
+    if peak is None:
+        return lines
+
+    peak = float(peak)
+    if peak <= 0:
+        lines.append("Nothing here scored at all — no detector fired in this "
+                     "stretch, so no weighting would have pulled a clip out of "
+                     "it. It is invisible to what was run, not merely weaker.")
+        return lines
+
+    stamp = chapter.get("score_peak_second")
+    where = f" at {_clock(float(stamp))}" if stamp is not None else ""
+
+    if threshold is None:
+        lines.append(f"Its best second scored {peak:.0f}{where}.")
+        return lines
+
+    threshold = float(threshold)
+    if peak >= threshold:
+        lines.append(
+            f"Its best second scored {peak:.0f}{where}, which clears the "
+            f"{threshold:.0f} the weakest kept clip managed — so this stretch "
+            f"lost to length rather than to score. The cut filled up before it. "
+            f"Raising a weight will not change that; a longer highlight, or "
+            f"more even coverage, would.")
+        return lines
+
+    gap = threshold - peak
+    close = peak >= threshold * NEAR_MISS_SHARE
+    lead = ("Came close: its" if close else "Its")
+    lines.append(
+        f"{lead} best second scored {peak:.0f}{where}, against {threshold:.0f} "
+        f"for the weakest clip that made the cut — short by {gap:.0f}.")
+    if fired:
+        # The reader tunes weights by the names on the settings table, so the
+        # sentence has to use those and not the internal keys.
+        try:
+            from modules.highlight_report import SIGNAL_LABELS
+            labels = dict(SIGNAL_LABELS)
+        except Exception:
+            labels = {}
+        named = [labels.get(key, key) for key in fired]
+        lines.append(
+            f"What did fire here: {_join(named)}. Raising one of those weights "
+            f"is what would bring this stretch in.")
+    else:
+        lines.append("No signal scored a point here, so there is no weight to "
+                     "raise — this stretch needs a detector it does not have.")
+    return lines
+
+
 def describe_chapter(chapter: Mapping) -> list:
     """What marks one chapter out from the rest of its video.
 
@@ -724,23 +860,46 @@ def describe_chapter(chapter: Mapping) -> list:
             f"the runtime — {share_lift:.1f}× its share, across {clips} clip"
             f"{'' if clips == 1 else 's'}.")
     elif not clips:
-        lines.append("Nothing from this chapter was selected.")
+        lines.extend(_why_not_selected(chapter))
+
+    # What this stretch is mostly made of, and what changed at its start. These
+    # come before the video-wide comparisons because they are what turns a list
+    # of chapters into a sequence: "what is this" then "what changed", rather
+    # than eleven independent verdicts against the same average.
+    dominant = chapter.get("dominant") or {}
+    if dominant:
+        lines.append(f"Mostly {dominant['name']} — on screen for "
+                     f"{float(dominant['share_pct']):.0f}% of this chapter's "
+                     f"detected seconds.")
+
+    for change in (chapter.get("changes") or []):
+        was, now = float(change["from_pct"]), float(change["to_pct"])
+        if change["direction"] == "rose":
+            lines.append(f"{change['name']} takes over here — up from "
+                         f"{was:.0f}% of the previous chapter to {now:.0f}%.")
+        else:
+            lines.append(f"{change['name']} drops back — {was:.0f}% of the "
+                         f"previous chapter, {now:.0f}% of this one.")
 
     for finding in distinctive(chapter):
         phrase = _lift_phrase(float(finding["lift"]))
         if not phrase:
             continue
         seconds = int(finding.get("seconds") or 0)
+        # "1.4x less" takes "than"; "1.4x as much" takes "as". A single fixed
+        # joiner produced "1.4x less as across the video" on every chapter where
+        # a class was under-represented, which is most of them.
+        joiner = "as" if phrase.endswith("as much") else "than"
         if finding["kind"] == "expression":
             lines.append(
                 f"Reads {finding['name']} for {finding['chapter_share_pct']:.0f}% "
-                f"of its readable seconds — {phrase} as the video overall "
+                f"of its readable seconds — {phrase} {joiner} the video overall "
                 f"({finding['video_share_pct']:.0f}%), over {seconds}s.")
         else:
             lines.append(
                 f"{finding['name']} is on screen for "
                 f"{finding['chapter_share_pct']:.0f}% of this chapter's detected "
-                f"seconds — {phrase} as across the video "
+                f"seconds — {phrase} {joiner} across the video "
                 f"({finding['video_share_pct']:.0f}%), over {seconds}s.")
 
     # Pace and level describe how a stretch was shot and mixed rather than what
@@ -795,3 +954,241 @@ def summarise_chapter_run(chapters: Sequence[Mapping]) -> str:
             if float(lead.get("cut_share_pct") or 0) > 0 else "")
     return (f"{len(chapters)} chapters, divided on {basis}. Clips came from "
             f"{len(with_clips)} of them ({share:.0f}%).{tail}")
+
+
+# How far above the video's own middle a moment has to sit before the sentence
+# reaches for a strong word. Calibrated on measured material: confirmed
+# stand-out moments landed between +7 and +24 dB against the median, so the top
+# band has to start high enough that most of them do not qualify for it.
+FAR_ABOVE_DB = 18.0
+WELL_ABOVE_DB = 10.0
+ABOVE_DB = 4.0
+
+
+def _level_phrase(vs_video_db: Optional[float]) -> str:
+    """How the peak sat against the video, in words rather than decibels."""
+    if vs_video_db is None:
+        return ""
+    if vs_video_db >= FAR_ABOVE_DB:
+        return "far above"
+    if vs_video_db >= WELL_ABOVE_DB:
+        return "well above"
+    if vs_video_db >= ABOVE_DB:
+        return "above"
+    if vs_video_db <= -ABOVE_DB:
+        return "below"
+    return "close to"
+
+
+def describe_loudest(entry: Mapping) -> str:
+    """Where a clip was loudest, and what was on screen, in one sentence.
+
+    Says *loud*, never *why* it was loud. The distinction is not pedantry: on
+    measured material the same acoustic signature appeared during three
+    different kinds of moment, and a sentence that named the kind would have
+    been wrong two times in three while reading exactly as confidently.
+    """
+    loud = entry.get("loudest") or {}
+    if not loud:
+        return ""
+    stamp = str(loud.get("timestamp", ""))
+    vs = loud.get("vs_video_db")
+    phrase = _level_phrase(vs if vs is None else float(vs))
+
+    names = [str(c) for c in (loud.get("classes") or [])]
+    where = _join(names)
+    if where:
+        verb = "was" if len(names) == 1 else "were"
+        tail = f" {where} {verb} on screen at that second."
+    else:
+        tail = " Nothing was labelled at that second."
+
+    if phrase in ("far above", "well above"):
+        return (f"Loudest at {stamp}, {phrase} this video's usual level "
+                f"({float(vs):+.0f} dB).{tail}")
+    if phrase == "above":
+        return (f"Loudest at {stamp}, a little above the video's usual level "
+                f"({float(vs):+.0f} dB).{tail}")
+    if phrase == "below":
+        return (f"Loudest at {stamp}, but still quieter than the video "
+                f"typically is ({float(vs):+.0f} dB).{tail}")
+    return (f"Loudest at {stamp}, about as loud as the video usually "
+            f"is.{tail}")
+
+
+def describe_motion_peak(entry: Mapping) -> str:
+    """Where movement spiked and then stopped inside this clip.
+
+    Named for the shape the detector actually looks for -- a burst above the
+    scene's own average, followed by several seconds below it -- rather than
+    for "action", which is what the number gets read as. The distinction earns
+    its keep: continuous movement never produces the stillness the rule needs,
+    so on footage that does not pause, these mark where activity *ended*
+    (often a cut) and not where it was most intense.
+    """
+    peak = entry.get("motion_peak") or {}
+    if not peak:
+        return ""
+    count = int(peak.get("count") or 1)
+    stamp = str(peak.get("timestamp", ""))
+    if count > 1:
+        return (f"Movement spiked at {stamp} and dropped away after — the "
+                f"burst-then-stillness this signal scores. {count} of them fall "
+                f"inside this clip.")
+    return (f"Movement spiked at {stamp} and dropped away after — the "
+            f"burst-then-stillness this signal scores.")
+
+
+def summarise_level_by_class(data: Mapping) -> list:
+    """The per-class level comparison, said plainly — including when it says nothing.
+
+    Three sentences at most, and the third is the one that matters: loudness
+    measures emphasis, not cause. Stated once here rather than hedged into every
+    other sentence, so the prose stays readable while the limit stays visible.
+    """
+    data = data or {}
+    rows = list(data.get("classes") or [])
+    if not rows:
+        return []
+
+    lines = []
+
+    loudest = data.get("loudest") or {}
+    if loudest:
+        where = _join([str(c) for c in (loudest.get("classes") or [])])
+        stamp = str(loudest.get("timestamp", ""))
+        if where:
+            lines.append(f"The loudest labelled second in the whole video is "
+                         f"{stamp}, with {where} on screen.")
+        else:
+            lines.append(f"The loudest labelled second in the whole video is "
+                         f"{stamp}.")
+
+    comp = data.get("comparison") or {}
+    if comp:
+        louder, quieter = comp.get("louder"), comp.get("quieter")
+        diff = abs(float(comp.get("median_difference_db") or 0.0))
+        pairs = int(comp.get("pairs") or 0)
+        if comp.get("resolvable"):
+            lines.append(
+                f"Across {pairs} separate stretches, this video was "
+                f"consistently louder during {louder} than during {quieter} — "
+                f"by about {diff:.1f} dB. Because each stretch was compared "
+                f"with nearby material rather than with the video as a whole, "
+                f"that difference is not just a matter of where in the video "
+                f"each happened.")
+        else:
+            mde = float(comp.get("min_detectable_db") or 0.0)
+            lines.append(
+                f"{louder} measured about {diff:.1f} dB louder than {quieter}, "
+                f"but that is inside the margin: across {pairs} stretches the "
+                f"readings scatter enough that nothing smaller than "
+                f"{mde:.1f} dB can be told from noise here. Treat the two as "
+                f"indistinguishable in this video — which is not the same as "
+                f"saying they would be in another.")
+    elif len(rows) > 1:
+        lines.append("The classes never occurred close enough together in time "
+                     "to be compared fairly, so no difference is claimed.")
+
+    # The limit, once. Everything above is about level; none of it is about
+    # cause, and on measured material the same signature covered three
+    # different kinds of moment.
+    lines.append(
+        "All of this measures how loud, not why. The same acoustic signature "
+        "turns up on different kinds of moment, so these numbers say where the "
+        "emphasis fell — what it meant is a judgement for whoever watches it.")
+    return lines
+
+
+# Two marked seconds this close are the same event seen twice, not one following
+# another. Below it "came before" is a claim about detector timing, not content.
+TOGETHER_SECONDS = 2
+
+# A gap wider than this is two things that happened in the same clip, not a
+# sequence -- saying one followed the other would invent a link across half a
+# minute of unexamined footage.
+SEQUENCE_SECONDS = 20
+
+
+def describe_signal_relations(entry: Mapping) -> str:
+    """How the seconds this clip named relate to each other.
+
+    The report marks a loudest second and a motion peak and, until now, left
+    them as two unconnected facts. Their *order* is the thing a reader
+    reconstructs by hand otherwise, and it is free: both are already measured.
+
+    Says which came first and how far apart, and nothing about why. One clip
+    cannot distinguish "the movement stopped and then she reacted" from two
+    unrelated events sharing thirty seconds, and the sentence must not pretend
+    otherwise -- :func:`summarise_signal_relations` is where a repeated ordering
+    becomes evidence, because that needs the whole run.
+    """
+    loud = entry.get("loudest") or {}
+    motion = entry.get("motion_peak") or {}
+    if loud.get("second") is None or motion.get("second") is None:
+        return ""
+    gap = int(loud["second"]) - int(motion["second"])
+    if abs(gap) <= TOGETHER_SECONDS:
+        return (f"Both landed together — movement stopped and the loudest point "
+                f"arrived within {abs(gap)}s of each other.")
+    if abs(gap) > SEQUENCE_SECONDS:
+        return (f"The two are {abs(gap)}s apart in this clip, far enough that "
+                f"they are separate events rather than one following the other.")
+    if gap > 0:
+        return (f"Movement stopped first, at {motion['timestamp']}; the loudest "
+                f"point came {gap}s later, at {loud['timestamp']}.")
+    return (f"The loudest point came first, at {loud['timestamp']}; movement "
+            f"dropped away {abs(gap)}s later, at {motion['timestamp']}.")
+
+
+# How many clips must carry both marks before their ordering is worth a claim.
+MIN_CLIPS_FOR_PATTERN = 4
+
+# And how consistently they must agree. Two-thirds is the point at which the
+# ordering is describing the footage rather than the four clips that happened
+# to land that way.
+PATTERN_AGREEMENT = 0.67
+
+
+def summarise_signal_relations(segments: Sequence[Mapping]) -> str:
+    """Whether the ordering repeats across the run, which is what makes it a finding.
+
+    One clip where movement stopped nine seconds before the loudest point is a
+    coincidence. Seven of nine is a property of the footage, and it is the kind
+    of thing a person would otherwise only notice after watching the whole
+    thing twice. Returns nothing when the clips disagree -- a split verdict is
+    the honest output of a split measurement.
+    """
+    gaps = []
+    for e in segments or ():
+        loud = (e.get("loudest") or {}).get("second")
+        motion = (e.get("motion_peak") or {}).get("second")
+        if loud is None or motion is None:
+            continue
+        gap = int(loud) - int(motion)
+        if abs(gap) <= SEQUENCE_SECONDS:
+            gaps.append(gap)
+    if len(gaps) < MIN_CLIPS_FOR_PATTERN:
+        return ""
+
+    after = [g for g in gaps if g > TOGETHER_SECONDS]
+    before = [g for g in gaps if g < -TOGETHER_SECONDS]
+    together = [g for g in gaps if abs(g) <= TOGETHER_SECONDS]
+    total = len(gaps)
+
+    if len(after) / total >= PATTERN_AGREEMENT:
+        median = sorted(abs(g) for g in after)[len(after) // 2]
+        return (f"In {len(after)} of {total} clips the loudest point arrives "
+                f"after movement has stopped, typically about {median}s later. "
+                f"That ordering is a property of this footage, not of any one "
+                f"clip — what it means is still a matter for whoever watches it.")
+    if len(before) / total >= PATTERN_AGREEMENT:
+        median = sorted(abs(g) for g in before)[len(before) // 2]
+        return (f"In {len(before)} of {total} clips the loudest point comes "
+                f"first and movement drops away about {median}s afterwards.")
+    if len(together) / total >= PATTERN_AGREEMENT:
+        return (f"In {len(together)} of {total} clips the loudest point and the "
+                f"motion peak land within {TOGETHER_SECONDS}s of each other.")
+    return (f"Across {total} clips the two land in no consistent order — "
+            f"{len(after)} with sound after movement, {len(before)} before, "
+            f"{len(together)} together. Nothing here links them.")

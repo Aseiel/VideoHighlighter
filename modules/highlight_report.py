@@ -31,7 +31,9 @@ import base64
 import datetime as _dt
 import html
 import json
+import os
 from typing import Callable, Iterable, Mapping, Optional, Sequence
+from urllib.parse import quote
 
 import numpy as np
 
@@ -43,6 +45,7 @@ SIGNAL_LABELS = (
     ("motion_event", "Motion event"),
     ("motion_peak", "Motion peak"),
     ("audio", "Audio peak"),
+    ("loudness_burst", "Loudness burst"),
     ("keyword", "Keyword"),
     ("object", "Objects"),
     ("action", "Actions"),
@@ -57,8 +60,8 @@ SIGNAL_LABELS = (
 # Signals that count toward the multi-signal boost. A position bonus is not
 # evidence about content, and the pipeline's own boost test excludes them, so
 # counting them here would over-report the signal count.
-BOOST_SIGNALS = ("motion_event", "motion_peak", "audio", "keyword", "object",
-                 "face")
+BOOST_SIGNALS = ("motion_event", "motion_peak", "audio", "loudness_burst",
+                 "keyword", "object", "face")
 
 # How many unselected peaks to report. These are the moments a user would
 # adjust weights to capture, so they are the most actionable rows in the whole
@@ -373,6 +376,8 @@ def build_report(*,
                  bbox_cache: Optional[Iterable[Mapping]] = None,
                  expressions: Optional[Mapping] = None,
                  chapters: Optional[Sequence[Mapping]] = None,
+                 loudness_levels: Optional[Sequence[float]] = None,
+                 motion_peaks: Optional[Sequence[float]] = None,
                  ) -> dict:
     """Attribute every kept segment to the evidence that selected it.
 
@@ -397,6 +402,14 @@ def build_report(*,
     lets each clip be compared with the rest of the video on what was *on
     screen* rather than on what it scored; see :mod:`modules.highlight_compare`.
 
+    ``loudness_levels`` is per-second loudness in dBFS from
+    ``modules.loudness_bursts.detect(include_levels=True)``. Supplying it adds
+    two things: the loudest second of each clip with whatever was labelled
+    there, and a whole-video comparison of the level measured during each class.
+    The second of those is a claim rather than a description, so
+    :mod:`modules.level_by_class` prints the smallest difference the material
+    could resolve beside it and declines to rank when the effect is below that.
+
     ``chapters`` is ``modules.chapters.chapterize``'s partition. Supplying it
     files every clip under the stretch it came from and measures each stretch
     against the whole video; see :mod:`modules.chapter_compare`. It is optional
@@ -411,6 +424,15 @@ def build_report(*,
     segments = [(float(s), float(e)) for s, e in segments]
     segments.sort(key=lambda x: x[0])
     boxes_at = boxes_by_second(bbox_cache)
+
+    # Per-second loudness, if the caller measured it. The median is taken once
+    # here so every clip's peak can be quoted against the same reference.
+    levels = list(loudness_levels or [])
+    level_median = float(np.median(levels)) if levels else None
+
+    # Motion peaks are timestamps, not a curve: the detector reports where a
+    # burst of movement was followed by stillness, and nothing in between.
+    peak_times = sorted(float(t) for t in (motion_peaks or []))
 
     # Flatten the loudness envelope once, at full resolution. Each clip then
     # takes its own slice of *this* rather than of the page-wide curve: at 480
@@ -465,6 +487,7 @@ def build_report(*,
 
     covered: set = set()
     entries = []
+    output_clock = 0.0
     for i, (start, end) in enumerate(segments, start=1):
         sec = peak_second(score, start, end)
         covered.update(range(int(start), int(np.ceil(end))))
@@ -484,17 +507,48 @@ def build_report(*,
             comparison = compare_segment(distributions, start, end)
             if comparison:
                 entry["measured"]["comparison"] = comparison
+        # Which motion peaks fall inside this clip. The one nearest the scoring
+        # peak is quoted, because that is the one the reader is being asked to
+        # accept as evidence for *this* pick -- the earliest would often be a
+        # different event that happens to share the clip.
+        inside = [t for t in peak_times if start <= t <= end]
+        if inside:
+            nearest = min(inside, key=lambda t: abs(t - sec))
+            entry["motion_peak"] = {
+                "second": int(nearest),
+                "timestamp": format_timestamp(nearest),
+                "count": len(inside),
+            }
+
+        if levels:
+            try:
+                from modules.level_by_class import peak_in_range
+                loud = peak_in_range(levels, object_detections or {}, start, end,
+                                     video_median=level_median)
+                if loud:
+                    entry["loudest"] = loud
+            except Exception as exc:               # pragma: no cover - defensive
+                print(f"⚠️ Clip loudness peak skipped: {exc}")
         if amps_per_second:
             lo = int(start * amps_per_second)
             hi = max(lo + 1, int(end * amps_per_second))
             entry["audio"] = downsample(amps[lo:hi], points=SEGMENT_AUDIO_POINTS)
+        # Where this clip lands in the rendered highlight, as opposed to where it
+        # came from. Every other timestamp in this report is a source position,
+        # which is the right default for arguing with the pick -- but useless for
+        # finding the moment again while watching the output.
         entry.update({
             "index": i,
             "start": start,
             "end": end,
             "duration": end - start,
             "range": f"{format_timestamp(start)} – {format_timestamp(end)}",
+            "output_start": round(output_clock, 2),
+            "output_end": round(output_clock + (end - start), 2),
+            "output_range": (f"{format_timestamp(output_clock)} – "
+                             f"{format_timestamp(output_clock + (end - start))}"),
         })
+        output_clock += end - start
         if thumbnail_fn is not None:
             try:
                 raw = thumbnail_fn(sec)
@@ -528,6 +582,21 @@ def build_report(*,
 
     audio_curve = downsample(amps) if amps else []
 
+    # How loud the video was during each labelled class. Built here rather than
+    # by the caller for the same reason the chapter comparison is: it is derived
+    # from inputs the report already holds, and a caller that had to assemble it
+    # could assemble it differently from run to run.
+    level_summary = None
+    if levels and object_detections:
+        try:
+            from modules.level_by_class import summarise as _summarise_levels
+            level_summary = _summarise_levels(
+                levels, object_detections,
+                classes=(list(composed_event_names) if composed_event_names
+                         else None))
+        except Exception as exc:                   # pragma: no cover - defensive
+            print(f"⚠️ Level-by-class summary skipped: {exc}")
+
     # How the expression reading moves across the whole file, when there is one.
     # A property of the video rather than of any clip, so it sits beside the
     # curves rather than inside a segment.
@@ -548,10 +617,14 @@ def build_report(*,
     if chapters:
         try:
             from modules.chapter_compare import assign_chapters, summarise_chapters
+            # The weakest clip that made the cut is the bar everything else had
+            # to clear, so it is what "why not this stretch" is measured against.
+            kept_scores = [float(e.get("score") or 0.0) for e in entries]
             chapter_rows = summarise_chapters(
                 chapters, score=score, segments=segments, amps=amps,
                 amps_per_second=amps_per_second, distributions=distributions,
-                video_duration=video_duration)
+                video_duration=video_duration, signals=signals,
+                cut_threshold=(min(kept_scores) if kept_scores else None))
             for entry, number in zip(entries, assign_chapters(chapters, segments)):
                 if number:
                     entry["chapter"] = int(number)
@@ -593,7 +666,20 @@ def build_report(*,
         "near_misses": near_misses,
         "expression_arc": arc,
         "chapters": chapter_rows,
+        "level_by_class": level_summary,
+        # Whether the ordering between the marked seconds repeats across the
+        # run. One clip's ordering is a coincidence; a repeated one is a
+        # property of the footage, and that difference needs every clip.
+        "signal_relations": _signal_relations_summary(entries),
     }
+
+
+def _signal_relations_summary(entries: Sequence[Mapping]) -> str:
+    try:
+        from modules.highlight_prose import summarise_signal_relations
+        return summarise_signal_relations(entries)
+    except Exception:                              # pragma: no cover - defensive
+        return ""
 
 
 def score_from_report(report: Mapping) -> np.ndarray:
@@ -642,6 +728,8 @@ def render_text(report: Mapping) -> str:
         out.append("")
         out.append(f"[{e['index']}] {e['range']}  peak {e['timestamp']} "
                    f"({e['second']}s): {e['score']:.1f} points")
+        if e.get("output_range"):
+            out.append(f"    In the highlight: {e['output_range']}")
         for key, label in SIGNAL_LABELS:
             value = e["breakdown"].get(key, 0.0)
             if value:
@@ -659,6 +747,36 @@ def render_text(report: Mapping) -> str:
                        f"x{b['multiplier']} -> +{b['points']:.1f}")
         for line in _standout_lines(e):
             out.append(f"    * {line}")
+        loud = e.get("loudest")
+        if loud:
+            try:
+                from modules.highlight_prose import describe_loudest
+                sentence = describe_loudest(e)
+            except Exception:
+                sentence = ""
+            if sentence:
+                out.append(f"    * {sentence}")
+            where = ", ".join(loud["classes"]) or "nothing labelled there"
+            vs = (f" ({loud['vs_video_db']:+.1f} dB vs the video's middle)"
+                  if "vs_video_db" in loud else "")
+            out.append(f"      peak {loud['timestamp']} at "
+                       f"{loud['level_dbfs']:.1f} dBFS{vs} — {where}")
+        motion = e.get("motion_peak")
+        if motion and float((e.get("breakdown") or {}).get("motion_peak") or 0) > 0:
+            try:
+                from modules.highlight_prose import describe_motion_peak
+                said = describe_motion_peak(e)
+            except Exception:
+                said = ""
+            if said:
+                out.append(f"    * {said}")
+        try:
+            from modules.highlight_prose import describe_signal_relations
+            rel = describe_signal_relations(e)
+        except Exception:
+            rel = ""
+        if rel:
+            out.append(f"    * {rel}")
 
     chapters = report.get("chapters") or []
     if chapters:
@@ -676,13 +794,46 @@ def render_text(report: Mapping) -> str:
         for ch in chapters:
             out.append("")
             clips = ch.get("clip_indices") or []
-            out.append(f"    {ch['timestamp']}  {ch['title']}  "
-                       f"({ch['duration']:.0f}s, {ch['shots']} shots, {ch['pace']})")
+            out.append(f"    {ch['timestamp']} – {format_timestamp(float(ch['end']))}"
+                       f"  {ch['title']}  ({ch['duration']:.0f}s, "
+                       f"{ch['shots']} shots, {ch['pace']})"
+                       + ("" if ch.get("clips") else "   [not used]"))
             out.append(f"        Clips: "
                        + (", ".join(f"[{i}]" for i in clips) if clips else "none"))
             if describe_chapter is not None:
                 for line in describe_chapter(ch):
                     out.append(f"        * {line}")
+
+    relations = report.get("signal_relations") or ""
+    if relations:
+        out.append("")
+        out.append("--- Across the clips ---")
+        out.append(f"    {relations}")
+
+    lbc = report.get("level_by_class") or {}
+    if lbc.get("classes"):
+        out.append("")
+        out.append("--- Level by labelled class ---")
+        try:
+            from modules.highlight_prose import summarise_level_by_class
+            for line in summarise_level_by_class(lbc):
+                out.append(f"    {line}")
+            out.append("")
+        except Exception:
+            pass
+        for row in lbc["classes"]:
+            out.append(f"    {row['name']:<24} {row['median_dbfs']:7.1f} dBFS   "
+                       f"{row['seconds']:5d}s   "
+                       f"IQR {row['p25_dbfs']:.1f}…{row['p75_dbfs']:.1f}")
+        comp = lbc.get("comparison")
+        if comp:
+            out.append("")
+            out.append(f"    {comp['headline']}")
+            out.append(f"        {comp['detail']}")
+        else:
+            out.append("")
+            out.append("    Only one class had enough labelled seconds to "
+                       "describe; nothing to compare it against.")
 
     arc = report.get("expression_arc") or {}
     if arc:
@@ -728,6 +879,19 @@ h1{font-size:22px;margin:0 0 4px}
    image and nothing else — a caption inside it would skew every percentage. */
 .shot{position:relative}
 .seg img{width:100%;display:block;border-radius:6px}
+.nums{margin:8px 0 2px}
+.nums summary{cursor:pointer;color:var(--dim);font-size:12px;
+     list-style:none;display:inline-block;border-bottom:1px dotted var(--line)}
+.nums summary::-webkit-details-marker{display:none}
+.nums summary:hover{color:var(--acc);border-color:var(--acc)}
+.nums[open] summary{margin-bottom:6px}
+.play{margin-top:10px}
+.play video{width:100%;max-height:340px;display:block;border-radius:6px;
+     background:#000}
+.playbar{display:flex;gap:10px;align-items:center;margin-top:6px;font-size:12px}
+.seek{font:inherit;cursor:pointer;border:1px solid var(--line);border-radius:4px;
+     padding:3px 8px;background:transparent;color:inherit}
+.seek:hover{border-color:var(--acc)}
 .bx{position:absolute;border:1.5px solid var(--cool);border-radius:2px;
     pointer-events:none}
 .bx.evt{border-color:var(--warm)}
@@ -788,6 +952,8 @@ h1{font-size:22px;margin:0 0 4px}
            border-radius:4px;overflow:hidden}
 .chap{background:var(--card);border:1px solid var(--line);border-radius:10px;
       padding:12px 14px;margin-bottom:10px}
+.chap.unused{background:transparent;border-style:dashed;opacity:.6}
+.chap.unused .rng,.chap.unused .pts{color:var(--dim)}
 .chaph{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
 .chap .why{margin:8px 0 0}
 .chap .meta{margin:2px 0 0}
@@ -931,6 +1097,83 @@ def _overview(report: Mapping) -> str:
     return f'<div class="tl">{"".join(parts)}{caption}{wave}{legend}</div>'
 
 
+def _signal_relations(report: Mapping) -> str:
+    """Whether the seconds the clips named fall in a repeating order.
+
+    Sits near the top because it is a statement about the *video*, not about any
+    clip — and because it is the one line in the report that could not be
+    reconstructed by reading the clips one at a time.
+    """
+    said = report.get("signal_relations") or ""
+    if not said:
+        return ""
+    return (f'<div class="narr"><b>Across the clips</b><br>'
+            f'{html.escape(said)}</div>')
+
+
+def _cut_timeline(report: Mapping) -> str:
+    """The clips laid end to end — the highlight's own timeline, not the video's.
+
+    Complements the strip above rather than replacing it. On a feature-length
+    source a 10-second clip is a slice two pixels wide, so the full-video view
+    answers "was the whole video considered" and can answer nothing else. Here
+    each clip is given width in proportion to its share of the *output*, which
+    makes short clips legible and puts every position on the same clock as the
+    rendered file — so a moment can be found again while watching it.
+    """
+    segs = report.get("segments") or []
+    if not segs:
+        return ""
+    total = sum(float(e["duration"]) for e in segs) or 1.0
+    max_score = max([float(e.get("score") or 0.0) for e in segs] or [1.0]) or 1.0
+
+    W, H = 1000.0, 46.0
+    parts = [f'<svg viewBox="0 0 {W:.0f} {H:.0f}" preserveAspectRatio="none" '
+             f'role="img" aria-label="The clips in output order">']
+    x = 0.0
+    for e in segs:
+        w = float(e["duration"]) / total * W
+        # Height carries the score so the strip ranks as well as locates; a flat
+        # row of identical blocks would say only "there are twelve of them".
+        share = float(e.get("score") or 0.0) / max_score
+        h = 10.0 + 24.0 * share
+        parts.append(f'<rect x="{x:.2f}" y="{(H - h - 8):.2f}" '
+                     f'width="{max(1.0, w - 1.0):.2f}" height="{h:.2f}" '
+                     f'fill="#5ac8b0" rx="2"><title>clip {e["index"]} · '
+                     f'{html.escape(str(e["output_range"]))} in the output · '
+                     f'from {html.escape(str(e["range"]))} · '
+                     f'{float(e.get("score") or 0):.0f} points</title></rect>')
+        if w > 22:
+            parts.append(f'<text x="{(x + w / 2):.2f}" y="{H - 1:.2f}" '
+                         f'text-anchor="middle" font-size="9" fill="#8b95a1">'
+                         f'{e["index"]}</text>')
+        x += w
+    parts.append("</svg>")
+
+    rows = "".join(
+        f'<tr><td>{e["index"]}</td>'
+        f'<td>{html.escape(str(e["output_range"]))}</td>'
+        f'<td>{html.escape(str(e["range"]))}</td>'
+        f'<td>{float(e["duration"]):.0f}s</td>'
+        f'<td>{float(e.get("score") or 0):.0f}</td></tr>'
+        for e in segs)
+
+    return (
+        '<h2>The cut, end to end</h2>'
+        '<p class="note">The same clips as above, but on the output\'s clock '
+        'rather than the source\'s — bar width is each clip\'s share of the '
+        'highlight, height is what it scored. Use the left column to find a '
+        'moment while watching the rendered file; the right column is where it '
+        'came from, which is what every other timestamp in this report uses.</p>'
+        f'<div class="tl">{"".join(parts)}'
+        f'<div class="cap"><span>0:00</span>'
+        f'<span>{html.escape(format_timestamp(total))}</span></div></div>'
+        '<div class="scroll"><table><thead><tr><th>Clip</th>'
+        '<th>In the highlight</th><th>In the source</th><th>Length</th>'
+        f'<th>Points</th></tr></thead><tbody>{rows}</tbody></table></div>'
+    )
+
+
 def _summary(report: Mapping) -> str:
     """What the whole cut was built out of, by signal."""
     totals = report.get("signal_totals") or {}
@@ -1040,6 +1283,74 @@ def _expression_arc(report: Mapping) -> str:
             f'<div class="narr arcnote">{body}</div>{chart}{episodes}')
 
 
+def _level_by_class(report: Mapping) -> str:
+    """How loud the video was during each labelled class, and whether that differs.
+
+    Two things, kept apart on purpose. The per-class medians are descriptive and
+    always true of what was measured. The comparison is a *claim*, and it is
+    printed with the smallest difference the material could resolve beside it —
+    so a reader can see when the answer is "this video cannot tell you" rather
+    than being handed a ranking that noise produced. See
+    :mod:`modules.level_by_class`.
+    """
+    data = report.get("level_by_class") or {}
+    rows = data.get("classes") or []
+    if not rows:
+        return ""
+
+    loudest = max(r["median_dbfs"] for r in rows)
+    quietest = min(r["median_dbfs"] for r in rows)
+    span = max(1e-6, loudest - quietest)
+
+    bars = []
+    for r in rows:
+        # Bar length is position within the observed range, so a 1 dB spread
+        # does not draw like a 20 dB one.
+        pct = 6 + 94 * (r["median_dbfs"] - quietest) / span
+        bars.append(
+            f'<div class="bar"><span style="width:150px">'
+            f'{html.escape(str(r["name"]))}</span>'
+            f'<i style="width:{pct:.0f}%;background:var(--acc)"></i>'
+            f'<span>{r["median_dbfs"]:.1f} dBFS</span>'
+            f'<span class="dim"> · {r["seconds"]}s · '
+            f'IQR {r["p25_dbfs"]:.1f}…{r["p75_dbfs"]:.1f}</span></div>')
+
+    # The plain reading first. A page of decibels is unarguable and unread; the
+    # sentences are what a person takes away, and the figures under them are
+    # what lets them disagree.
+    try:
+        from modules.highlight_prose import summarise_level_by_class
+        said = summarise_level_by_class(data)
+    except Exception:
+        said = []
+    peak = ""
+    if said:
+        peak = ('<div class="narr">'
+                + "".join(f"<p>{html.escape(line)}</p>" for line in said)
+                + '</div>')
+
+    comp = data.get("comparison")
+    if comp:
+        cls = "note" if not comp.get("resolvable") else ""
+        verdict = (f'<p class="{cls}"><b>{html.escape(comp["headline"])}</b> — '
+                   f'{html.escape(comp["detail"])}</p>')
+    else:
+        verdict = ('<p class="note">Only one class had enough labelled seconds '
+                   'to describe, so there is nothing to compare it against.</p>')
+
+    return (
+        '<h2>Level by labelled class</h2>'
+        '<p class="note">The audio level measured during the seconds carrying '
+        'each label. Descriptive first: these medians are simply what was '
+        'measured. The comparison below them is paired — each stretch is '
+        'compared against nearby material of the other class — because level '
+        'varies far more across a video than between classes, so an unpaired '
+        'difference mostly reports <i>where</i> something occurred rather than '
+        '<i>what</i> it was.</p>'
+        f'{peak}{"".join(bars)}{verdict}'
+    )
+
+
 def _chapters(report: Mapping) -> str:
     """The video's own structure, with each clip filed under where it came from.
 
@@ -1095,10 +1406,15 @@ def _chapters(report: Mapping) -> str:
         clips = ch.get("clip_indices") or []
         picked = (", ".join(f"clip {i}" for i in clips) if clips
                   else "no clips selected")
+        # Greyed when nothing was taken from it, so "which stretches did the cut
+        # ignore" is answerable at a glance rather than by reading eleven blocks.
+        unused = " unused" if not clips else ""
+        span = (f'{html.escape(str(ch["timestamp"]))} – '
+                f'{html.escape(format_timestamp(float(ch["end"])))}')
         rows.append(
-            f'<div class="chap">'
+            f'<div class="chap{unused}">'
             f'<div class="chaph"><span class="rng">'
-            f'{html.escape(str(ch["timestamp"]))} · {html.escape(str(ch["title"]))}'
+            f'{span} · {html.escape(str(ch["title"]))}'
             f'</span> <span class="pts">{float(ch.get("cut_share_pct") or 0):.0f}%'
             f'</span></div>'
             f'<div class="meta">{float(ch["duration"]):.0f}s · '
@@ -1162,6 +1478,12 @@ def _measurements(entry: Mapping, peer_scores=None) -> str:
 
     from modules.highlight_prose import describe
 
+    # Figures accumulate here and are folded away at the end. Kept in the same
+    # block as the sentences they support rather than moved to a page of their
+    # own: the number next to the claim is what lets a reader argue with a pick,
+    # and a separate page of measurements is one nobody opens.
+    figures: list = []
+
     sentence = describe(entry, peer_scores)
     lead = (f'<div class="says">{html.escape(sentence)}</div>' if sentence else "")
 
@@ -1172,6 +1494,49 @@ def _measurements(entry: Mapping, peer_scores=None) -> str:
     if standout:
         items = "".join(f"<li>{html.escape(line)}</li>" for line in standout)
         lead += f'<ul class="why">{items}</ul>'
+
+    # Where this clip was loudest, and what was labelled there. Deliberately
+    # about *this* clip rather than the video: the whole-video class comparison
+    # lives in its own section, and repeating it under every clip would state a
+    # video-wide claim twelve times as though it were twelve observations.
+    loud = entry.get("loudest")
+    if loud:
+        try:
+            from modules.highlight_prose import describe_loudest
+            sentence = describe_loudest(entry)
+        except Exception:
+            sentence = ""
+        where = (", ".join(html.escape(c) for c in loud["classes"])
+                 or "nothing labelled there")
+        vs = ""
+        if "vs_video_db" in loud:
+            vs = (f' · {loud["vs_video_db"]:+.1f} dB vs the video\'s middle')
+        lead += f'<div class="says">{html.escape(sentence)}</div>'
+        figures.append(f'Peak {loud["timestamp"]} at {loud["level_dbfs"]:.1f} '
+                       f'dBFS{vs} — {where}')
+
+    # Motion peaks only get a sentence when they actually scored here. A signal
+    # that fired but earned nothing is in the breakdown already, and narrating
+    # it would imply it drove the pick.
+    if entry.get("motion_peak") and float(
+            (entry.get("breakdown") or {}).get("motion_peak") or 0.0) > 0:
+        try:
+            from modules.highlight_prose import describe_motion_peak
+            said = describe_motion_peak(entry)
+        except Exception:
+            said = ""
+        if said:
+            lead += f'<div class="says">{html.escape(said)}</div>'
+
+    # How the seconds this clip named relate to each other. Last, because it
+    # only means anything once both have been stated.
+    try:
+        from modules.highlight_prose import describe_signal_relations
+        relation = describe_signal_relations(entry)
+    except Exception:
+        relation = ""
+    if relation:
+        lead += f'<div class="says rel">{html.escape(relation)}</div>'
 
     parts = []
     pct = m.get("score_percentile")
@@ -1191,9 +1556,16 @@ def _measurements(entry: Mapping, peer_scores=None) -> str:
     if "detection_confidence" in m:
         parts.append(f"best detection {m['detection_confidence']:.2f}")
 
-    if not parts:
+    if parts:
+        figures.append(" · ".join(parts))
+    if not figures:
         return lead
-    return lead + f'<div class="meas">{html.escape(" · ".join(parts))}</div>'
+    body = "".join(f'<div class="meas">{html.escape(f)}</div>' for f in figures)
+    # Closed by default. The page then reads as prose, and the evidence is one
+    # click away on the clip a reader is actually questioning — rather than
+    # every clip shouting its arithmetic at someone skimming.
+    return (lead + '<details class="nums"><summary>show the measurements'
+            f'</summary>{body}</details>')
 
 
 def _tag_rows(entry: Mapping) -> str:
@@ -1242,6 +1614,74 @@ def _shot(entry: Mapping, composed: frozenset) -> str:
             f'{"".join(overlay)}</div>{caption}</div>')
 
 
+def _player_script(media_src: Optional[str]) -> str:
+    """Wire the seek buttons, and say so when the source cannot be found.
+
+    The failure worth handling is a report opened away from its video: the
+    players go silent while every figure on the page stays valid, which reads
+    like the analysis is broken when it is not. One line of explanation on the
+    first error is cheaper than the confusion.
+    """
+    if not media_src:
+        return ""
+    return (
+        "<script>(function(){"
+        "document.querySelectorAll('.seek').forEach(function(b){"
+        "b.addEventListener('click',function(){"
+        "var v=b.closest('.play').querySelector('video');"
+        "v.currentTime=parseFloat(b.dataset.t);v.play();});});"
+        "document.querySelectorAll('.play video').forEach(function(v){"
+        "v.addEventListener('error',function(){"
+        "var bar=v.closest('.play').querySelector('.playbar');"
+        "if(bar&&!bar.dataset.warned){bar.dataset.warned='1';"
+        "bar.innerHTML='<span class=\\\"dim\\\">Source video not found beside this "
+        "report — playback only, every measurement above is unaffected.</span>';}"
+        "});});"
+        "})();</script>"
+    )
+
+
+def _player(entry: Mapping, media_src: Optional[str]) -> str:
+    """A player for one clip, pointed at the source file rather than embedding it.
+
+    A media fragment (``#t=start,end``) means the browser fetches only the range
+    asked for and stops at the end of the clip, so twelve of these cost twelve
+    seeks rather than twelve copies of the video. ``preload="none"`` keeps the
+    page from opening twelve connections the moment it loads.
+
+    The trade is that the report is no longer self-contained: move it away from
+    the video, or rename the video, and the players go dead while every number
+    on the page stays true. That is said on the page rather than left to be
+    discovered.
+    """
+    if not media_src:
+        return ""
+    start, end = float(entry.get("start", 0)), float(entry.get("end", 0))
+    # Seeking is the point of these: each claim is about one second, and
+    # scrubbing to it by hand across twelve clips is how a reader stops checking.
+    # One button per second the report makes a claim about.
+    marks = []
+    loud = entry.get("loudest") or {}
+    if loud.get("second") is not None:
+        marks.append(("loudest second", loud["second"], loud.get("timestamp", "")))
+    motion = entry.get("motion_peak") or {}
+    if motion.get("second") is not None:
+        marks.append(("motion peak", motion["second"], motion.get("timestamp", "")))
+    # In the order they happen, not the order the report computed them. The row
+    # of buttons is a miniature timeline of the clip, and one that ran backwards
+    # would have a reader seeking against the direction they are watching.
+    marks.sort(key=lambda m: float(m[1]))
+    jump = "".join(
+        f'<button class="seek" data-t="{float(sec):.0f}">▶ {html.escape(label)}'
+        f' ({html.escape(str(stamp))})</button>'
+        for label, sec, stamp in marks)
+    return (f'<div class="play">'
+            f'<video controls preload="none" '
+            f'src="{html.escape(media_src)}#t={start:.0f},{end:.0f}"></video>'
+            f'<div class="playbar">{jump}'
+            f'<span class="dim">plays the source file in place</span></div></div>')
+
+
 def _segment_wave(report: Mapping, entry: Mapping) -> str:
     """The loudness envelope under one clip, with its peak second marked."""
     curves = report.get("curves") or {}
@@ -1285,8 +1725,16 @@ def _segment_wave(report: Mapping, entry: Mapping) -> str:
     )
 
 
-def render_html(report: Mapping, title: Optional[str] = None) -> str:
-    """A standalone page: inline CSS, embedded thumbnails, nothing fetched."""
+def render_html(report: Mapping, title: Optional[str] = None,
+                media_src: Optional[str] = None) -> str:
+    """A page with inline CSS and embedded thumbnails.
+
+    ``media_src`` is a URL — normally a relative path — to the source video. Pass
+    it and each clip gets a player seeked to its own range; leave it out and the
+    page is fully standalone, which is what it was before players existed. The
+    media is deliberately never embedded: a dozen clips would add tens of
+    megabytes to a file whose entire value is that it opens instantly.
+    """
     video = report["video"]
     totals = report["totals"]
     heading = title or f"Why these moments — {video['name']}"
@@ -1331,6 +1779,7 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
             f'{tags}'
             f'{reading}'
             f'{_segment_wave(report, e)}'
+            f'{_player(e, media_src)}'
             f'{boost}</div></div>'
         )
 
@@ -1378,8 +1827,11 @@ def render_html(report: Mapping, title: Optional[str] = None) -> str:
   <div><span class="n">{totals["coverage_pct"]:.1f}%</span><span class="l">of the source</span></div>
 </div>
 {_overview(report)}
+{_signal_relations(report)}
+{_cut_timeline(report)}
 {_standout_summary(report)}
 {_chapters(report)}
+{_level_by_class(report)}
 {_expression_arc(report)}
 {_advice(report)}
 {_summary(report)}
@@ -1392,21 +1844,48 @@ come from the action model with their confidence.</p>
 {"".join(segs)}
 {near}
 {settings}
-</div></body></html>
+</div>{_player_script(media_src)}</body></html>
 """
+
+
+def media_src_for(report: Mapping, html_path: str) -> Optional[str]:
+    """A relative URL from the report to the video it describes, or nothing.
+
+    Relative so the pair can be moved together, and percent-encoded because
+    real filenames carry spaces, brackets and non-ASCII — an unescaped ``#`` or
+    ``?`` in a name would truncate the URL at exactly the wrong place and the
+    media fragment appended after it would land inside the filename.
+
+    Returns ``None`` when no relative path exists (a different drive on Windows),
+    rather than emitting an absolute ``file://`` URL that only works on the
+    machine that produced it.
+    """
+    source = (report.get("video") or {}).get("path")
+    if not source:
+        return None
+    try:
+        rel = os.path.relpath(source, os.path.dirname(os.path.abspath(html_path)))
+    except ValueError:                      # different drive; no relative path
+        return None
+    return quote(rel.replace(os.sep, "/"))
 
 
 def write_report(report: Mapping, html_path: str,
                  json_path: Optional[str] = None,
-                 title: Optional[str] = None) -> None:
+                 title: Optional[str] = None,
+                 link_media: bool = True) -> None:
     """Write the page, and the record it was rendered from.
 
     The JSON is not a debugging leftover: it is the structured form a later
     "this pick was wrong" signal has to attach to, and rebuilding it from HTML
     would be absurd.
+
+    ``link_media`` adds a player per clip pointing at the source video. Turn it
+    off for a page that has to survive being moved away from the footage.
     """
+    src = media_src_for(report, html_path) if link_media else None
     with open(html_path, "w", encoding="utf-8") as fh:
-        fh.write(render_html(report, title=title))
+        fh.write(render_html(report, title=title, media_src=src))
     if json_path:
         with open(json_path, "w", encoding="utf-8") as fh:
             json.dump(report, fh, indent=1)

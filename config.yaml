@@ -30,6 +30,7 @@ scoring:
   motion_event_points: 0
   motion_peak_points: 0
   audio_peak_points: 0
+  loudness_burst_points: 0
   keyword_points: 0
   transcript_points: 0
   object_points: 0
@@ -80,3 +81,16 @@ avoid:
   face_recognition_enabled: false
 ui:
   suppress_no_cache_warning: true
+loudness_bursts:
+  # Where the audio rises above its own local level. Every number here is a
+  # policy choice about what to surface, not a property of the audio -- see
+  # modules/loudness_bursts.py for what each was measured to do.
+  z_threshold: 2.0
+  # Seconds an excursion must hold. The single most consequential value: 1.5
+  # (which suits sustained applause) reports nothing on material whose events
+  # last a second or two.
+  min_duration: 1.0
+  # Seconds ignored at each end, where titles and music beds live.
+  edge_guard: 120
+  # Candidates closer than this become one event.
+  merge_gap: 30

@@ -1393,6 +1393,17 @@ class VideoHighlighterGUI(QWidget):
         self.spin_audio_peak = QSpinBox(); self.spin_audio_peak.setRange(0,100); self.spin_audio_peak.setValue(scoring_cfg.get("audio_peak_points", 0))
         self.spin_audio_peak.setToolTip("Points when audio intensity spikes (e.g. crowd roar, explosions, bells, loud impacts)")
 
+        self.spin_loudness_burst = QSpinBox(); self.spin_loudness_burst.setRange(0,100)
+        self.spin_loudness_burst.setValue(scoring_cfg.get("loudness_burst_points", 0))
+        self.spin_loudness_burst.setToolTip(
+            "Points where the audio rises above its OWN local level, not a fixed "
+            "threshold.\n\nUse this instead of audio peak points when the interesting "
+            "moments are loud for this part of this video rather than loud in "
+            "absolute terms \u2014 it self-calibrates, so the same setting works on "
+            "quietly and loudly mastered files.\n\nFinds brief moments that stand out "
+            "from their surroundings; a passage that is loud throughout will not "
+            "stand out from itself and is not reported.")
+
         self.spin_keyword_points = QSpinBox(); self.spin_keyword_points.setRange(0,100); self.spin_keyword_points.setValue(scoring_cfg.get("keyword_points", 2))
         self.spin_keyword_points.setToolTip("Points when a search keyword is found in speech (needs transcript enabled)")
         # Keyword scoring only works with a transcript — grey it out until then.
@@ -1444,6 +1455,8 @@ class VideoHighlighterGUI(QWidget):
             self.spin_audio_peak, "audio", "Audio",
             "Detect audio peaks across every video in the list and cache them. "
             "No highlights are cut."))
+        points_layout.addRow("Loudness burst points (relative to local level):",
+                             self.spin_loudness_burst)
         # Keyword + transcript points both come from ONE transcription pass.
         points_layout.addRow("Keyword points (keywords in transcript):", self.spin_keyword_points)
         points_layout.addRow("Transcript points (all words):", self._points_row_with_button(
@@ -3297,6 +3310,7 @@ class VideoHighlighterGUI(QWidget):
             "motion_event_points": int(self.spin_motion_event_points.value()),
             "motion_peak_points": int(self.spin_motion_peak.value()),
             "audio_peak_points": int(self.spin_audio_peak.value()),
+            "loudness_burst_points": int(self.spin_loudness_burst.value()),
             "keyword_points": int(self.spin_keyword_points.value()),
             "transcript_points": int(self.spin_transcript_points.value()),
             "beginning_points": int(self.spin_beginning_points.value()),
@@ -3860,6 +3874,7 @@ class VideoHighlighterGUI(QWidget):
                 "motion_event_points": int(self.spin_motion_event_points.value()),
                 "motion_peak_points": int(self.spin_motion_peak.value()),
                 "audio_peak_points": int(self.spin_audio_peak.value()),
+                "loudness_burst_points": int(self.spin_loudness_burst.value()),
                 "keyword_points": int(self.spin_keyword_points.value()),
                 "transcript_points": int(self.spin_transcript_points.value()),
                 "object_points": int(self.spin_object.value()),
@@ -3894,6 +3909,11 @@ class VideoHighlighterGUI(QWidget):
                 "source_lang": self.subtitle_source_lang.currentText(),
                 "target_lang": self.subtitle_target_lang.currentText(),
             },
+            # Detector knobs with no widget of their own. Carried through from
+            # whatever is on disk rather than omitted, because this dict is
+            # written whole - anything missing here is deleted from config.yaml
+            # the first time the user saves settings.
+            "loudness_bursts": self.config_data.get("loudness_bursts", {}),
             "advanced": {
                 "frame_skip": int(self.frame_skip_spin.value()),
                 "vr_mode": self.vr_mode_chk.isChecked(),
@@ -4578,6 +4598,7 @@ class VideoHighlighterGUI(QWidget):
         motion_event_points = int(self.spin_motion_event_points.value())
         motion_peak_points = int(self.spin_motion_peak.value())
         audio_peak_points = int(self.spin_audio_peak.value())
+        loudness_burst_points = int(self.spin_loudness_burst.value())
         
         # Object points only count if objects are configured
         highlight_objects = [s.strip() for s in self.objects_input.text().split(",") if s.strip()]
@@ -4596,7 +4617,8 @@ class VideoHighlighterGUI(QWidget):
         ending_points = int(self.spin_ending_points.value())
         
         total_points = (scene_points + motion_event_points + motion_peak_points + 
-                       audio_peak_points + keyword_points + transcript_points + 
+                       audio_peak_points + loudness_burst_points +
+                       keyword_points + transcript_points + 
                        beginning_points + ending_points + object_points + action_points)
         
         if total_points == 0:
@@ -4659,6 +4681,7 @@ class VideoHighlighterGUI(QWidget):
             "motion_event_points": int(self.spin_motion_event_points.value()),
             "motion_peak_points": int(self.spin_motion_peak.value()),
             "audio_peak_points": int(self.spin_audio_peak.value()),
+            "loudness_burst_points": int(self.spin_loudness_burst.value()),
             "keyword_points": int(self.spin_keyword_points.value()),
             "transcript_points": int(self.spin_transcript_points.value()),
             "beginning_points": int(self.spin_beginning_points.value()),
