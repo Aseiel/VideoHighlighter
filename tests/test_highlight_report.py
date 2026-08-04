@@ -8,7 +8,10 @@ through `thumbnail_fn`, which is the reason that parameter exists.
 from __future__ import annotations
 
 import json
+import os
 import re
+
+import pytest
 
 import numpy as np
 
@@ -865,3 +868,249 @@ class TestSubjectComparison:
         report = self._built()
         assert "comparison" not in report["segments"][0]["measured"]
         assert '<ul class="why">' not in render_html(report)
+
+
+# --- clip players -----------------------------------------------------------
+
+MEDIA_DIR = os.path.join(os.sep + "media", "movies")
+REPORT_ELSEWHERE = os.path.join(os.sep + "media", "reports")
+VIDEO_NAME = "clip test [x].mp4"
+
+
+def _player_report():
+    return build_report(
+        video_path=os.path.join(MEDIA_DIR, VIDEO_NAME), video_duration=100.0,
+        score=np.ones(101), signals={}, segments=[(10, 20), (40, 50)],
+        object_detections={15: ["a"]}, actions_by_sec={},
+        loudness_levels=[-30.0] * 101, settings={},
+    )
+
+
+def test_media_src_is_relative_and_percent_encoded():
+    from modules.highlight_report import media_src_for
+    rep = _player_report()
+    src = media_src_for(rep, os.path.join(MEDIA_DIR, "out_why.html"))
+    assert src == "clip%20test%20%5Bx%5D.mp4"
+    # Brackets and spaces must not survive raw: a bare '#' or '?' in a real
+    # filename would truncate the URL before the media fragment.
+    assert " " not in src and "[" not in src
+
+
+def test_media_src_walks_up_when_the_report_is_written_elsewhere(tmp_path):
+    """Real absolute dirs, so this exercises relpath rather than one OS's spelling."""
+    from modules.highlight_report import media_src_for
+    movies, reports = tmp_path / "movies", tmp_path / "reports"
+    movies.mkdir()
+    reports.mkdir()
+    rep = build_report(
+        video_path=str(movies / VIDEO_NAME), video_duration=100.0,
+        score=np.ones(101), signals={}, segments=[(10, 20)],
+        object_detections={}, actions_by_sec={}, settings={})
+    src = media_src_for(rep, str(reports / "out_why.html"))
+    assert src.startswith("../movies/")
+    assert src.endswith("clip%20test%20%5Bx%5D.mp4")
+    assert "\\" not in src          # URLs use forward slashes on every platform
+
+
+@pytest.mark.skipif(os.name != "nt",
+                    reason="only Windows has volumes with no relative path between them")
+def test_media_src_declines_rather_than_emitting_an_absolute_path():
+    """A different drive has no relative path; a file:// URL would only work here."""
+    from modules.highlight_report import media_src_for
+    rep = build_report(
+        video_path=r"D:\movies\clip.mp4", video_duration=10.0,
+        score=np.ones(11), signals={}, segments=[(0, 10)],
+        object_detections={}, actions_by_sec={}, settings={})
+    assert media_src_for(rep, r"C:\elsewhere\out_why.html") is None
+    assert media_src_for({"video": {}},
+                         os.path.join(MEDIA_DIR, "out_why.html")) is None
+
+
+def test_each_clip_gets_a_player_seeked_to_its_own_range():
+    from modules.highlight_report import media_src_for
+    rep = _player_report()
+    page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
+    assert page.count("<video") == 2
+    assert "#t=10,20" in page and "#t=40,50" in page
+    # preload matters: twelve autoloading players would open twelve connections.
+    assert 'preload="none"' in page
+
+
+def test_the_seek_button_targets_the_loudest_second():
+    from modules.highlight_report import media_src_for
+    rep = _player_report()
+    page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
+    assert re.findall(r'data-t="([0-9.]+)"', page) == ["10", "40"]
+
+
+def test_the_page_is_standalone_when_no_source_is_linked():
+    """Without media_src the report is exactly what it was before players."""
+    page = render_html(_player_report())
+    assert "<video" not in page
+    assert "<script>" not in page
+
+
+def test_a_missing_source_is_explained_rather_than_silent():
+    from modules.highlight_report import media_src_for
+    rep = _player_report()
+    page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
+    assert "Source video not found" in page
+    assert "every measurement above is unaffected" in page
+
+
+def test_write_report_can_opt_out_of_linking(tmp_path):
+    from modules.highlight_report import write_report
+    html_path = tmp_path / "r.html"
+    write_report(_player_report(), str(html_path), link_media=False)
+    assert "<video" not in html_path.read_text(encoding="utf-8")
+
+
+# --- the cut's own timeline -------------------------------------------------
+
+def _cut_report():
+    n = 3600
+    score = np.zeros(n + 1)
+    score[100:120] = 20
+    score[1500:1510] = 12
+    score[3000:3040] = 30
+    return build_report(
+        video_path="x.mp4", video_duration=float(n), score=score,
+        signals={"object": score.copy()},
+        segments=[(100, 120), (1500, 1510), (3000, 3040)],
+        object_detections={}, actions_by_sec={}, settings={},
+    )
+
+
+def test_output_positions_run_on_the_highlights_clock_not_the_sources():
+    rep = _cut_report()
+    starts = [e["output_start"] for e in rep["segments"]]
+    ends = [e["output_end"] for e in rep["segments"]]
+    assert starts == [0.0, 20.0, 30.0]
+    assert ends == [20.0, 30.0, 70.0]
+    # Each clip begins exactly where the previous ended: no gaps, because the
+    # gaps are what the cut removed.
+    assert starts[1:] == ends[:-1]
+
+
+def test_output_length_matches_the_sum_of_the_clips():
+    rep = _cut_report()
+    total = sum(e["duration"] for e in rep["segments"])
+    assert rep["segments"][-1]["output_end"] == total
+
+
+def test_source_range_is_still_the_default_everywhere_else():
+    """Output positions are an addition; every other timestamp stays source."""
+    rep = _cut_report()
+    first = rep["segments"][0]
+    assert first["range"].startswith("1:40")        # source
+    assert first["output_range"].startswith("0:00")  # output
+
+
+def test_the_cut_timeline_gives_every_clip_visible_width():
+    """A 10s clip in an hour is two pixels on the full-video strip; not here."""
+    from modules.highlight_report import _cut_timeline
+    svg = _cut_timeline(_cut_report())
+    assert "The cut, end to end" in svg
+    widths = [float(w) for w in re.findall(r'<rect[^>]*width="([0-9.]+)"', svg)]
+    assert len(widths) == 3
+    assert min(widths) > 100        # the 10s clip is 1/7 of a 1000-unit strip
+    # Widths are proportional to duration: 20s, 10s, 40s.
+    assert widths[2] > widths[0] > widths[1]
+
+
+def test_the_cut_timeline_carries_both_clocks_for_each_clip():
+    from modules.highlight_report import _cut_timeline
+    svg = _cut_timeline(_cut_report())
+    assert "in the output" in svg          # tooltip
+    assert "In the highlight" in svg       # table heading
+    assert "In the source" in svg
+
+
+def test_no_clips_means_no_cut_timeline():
+    from modules.highlight_report import _cut_timeline
+    assert _cut_timeline({"segments": []}) == ""
+
+
+# --- motion peaks -----------------------------------------------------------
+
+def _motion_report(peaks, points=5.0):
+    n = 300
+    score = np.zeros(n + 1)
+    score[100:130] = 20
+    score[120] = 40          # unambiguous scoring second, so "nearest" has meaning
+    return build_report(
+        video_path=os.path.join(MEDIA_DIR, "m.mp4"), video_duration=float(n), score=score,
+        signals={"motion_peak": score.copy() * (points / 20.0)},
+        segments=[(100, 130)], object_detections={}, actions_by_sec={},
+        motion_peaks=peaks, settings={},
+    )
+
+
+def test_the_peak_nearest_the_scoring_second_is_the_one_quoted():
+    """A clip can contain several; the one being offered as evidence is the
+    one beside the second that actually scored."""
+    rep = _motion_report([102.0, 118.0, 128.0])
+    peak = rep["segments"][0]["motion_peak"]
+    assert peak["count"] == 3
+    assert rep["segments"][0]["second"] == 120     # the second that scored
+    assert peak["second"] == 118                   # the peak beside it, not 102
+
+
+def test_peaks_outside_the_clip_are_not_counted():
+    rep = _motion_report([50.0, 105.0, 250.0])
+    assert rep["segments"][0]["motion_peak"]["count"] == 1
+
+
+def test_a_clip_with_no_peak_carries_no_claim():
+    rep = _motion_report([50.0, 250.0])
+    assert "motion_peak" not in rep["segments"][0]
+
+
+def test_the_sentence_names_the_shape_not_the_word_action():
+    from modules.highlight_prose import describe_motion_peak
+    said = describe_motion_peak({"motion_peak": {"second": 118,
+                                                "timestamp": "1:58", "count": 1}})
+    assert "spiked at 1:58" in said
+    assert "dropped away after" in said
+    # "action" is what the number gets misread as; the rule measures stillness.
+    assert "action" not in said.lower()
+
+
+def test_a_peak_that_scored_nothing_is_not_narrated():
+    """It is in the breakdown already; a sentence would imply it drove the pick."""
+    from modules.highlight_report import _measurements
+    rep = _motion_report([118.0], points=0.0)
+    entry = rep["segments"][0]
+    assert "spiked at" not in _measurements(entry, [20.0])
+
+
+def test_both_marked_seconds_get_a_seek_button():
+    from modules.highlight_report import media_src_for, render_html
+    rep = _motion_report([118.0])
+    rep["segments"][0]["loudest"] = {"second": 110, "timestamp": "1:50",
+                                     "level_dbfs": -12.0, "classes": []}
+    page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
+    assert "loudest second" in page and "motion peak" in page
+    assert sorted(re.findall(r'data-t="([0-9.]+)"', page)) == ["110", "118"]
+
+
+def test_seek_buttons_follow_the_clock_not_the_computation_order():
+    """The row is a miniature timeline; it must not run backwards."""
+    from modules.highlight_report import media_src_for, render_html
+    rep = _motion_report([105.0])
+    rep["segments"][0]["loudest"] = {"second": 125, "timestamp": "2:05",
+                                     "level_dbfs": -12.0, "classes": []}
+    page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
+    assert re.findall(r'data-t="([0-9.]+)"', page) == ["105", "125"]
+    # ...and the labels travel with their seconds.
+    assert page.index("motion peak") < page.index("loudest second")
+
+
+def test_the_later_signal_comes_second():
+    from modules.highlight_report import media_src_for, render_html
+    rep = _motion_report([128.0])
+    rep["segments"][0]["loudest"] = {"second": 104, "timestamp": "1:44",
+                                     "level_dbfs": -12.0, "classes": []}
+    page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
+    assert re.findall(r'data-t="([0-9.]+)"', page) == ["104", "128"]
+    assert page.index("loudest second") < page.index("motion peak")

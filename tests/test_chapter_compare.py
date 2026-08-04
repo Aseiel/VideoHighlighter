@@ -315,3 +315,94 @@ class TestShape:
             amps=[0.1] * 200, amps_per_second=1.0,
             distributions=_distributions(largest), video_duration=200.0)
         json.dumps(rows)
+
+
+# --- chapters as a sequence, not a list -------------------------------------
+
+def _seq_chapter(number, start, end):
+    return {"number": number, "start": start, "end": end,
+            "timestamp": f"{start // 60}:{start % 60:02d}",
+            "title": f"Chapter {number}", "duration": end - start,
+            "shots": 5, "pace": "steady"}
+
+
+def _detections(spans):
+    """{name: [(start, end)]} -> the `distributions` shape summarise_chapters wants."""
+    largest, seconds_with = {}, {}
+    for name, ranges in spans.items():
+        for a, b in ranges:
+            for sec in range(a, b):
+                largest.setdefault(sec, {})[name] = 1
+    for sec, names in largest.items():
+        for name in names:
+            seconds_with[name] = seconds_with.get(name, 0) + 1
+    return {"largest": largest, "seconds_with": seconds_with,
+            "detected_seconds": len(largest)}
+
+
+def test_a_class_taking_over_is_reported_against_the_previous_chapter():
+    from modules.chapter_compare import summarise_chapters
+    chapters = [_seq_chapter(1, 0, 100), _seq_chapter(2, 100, 200)]
+    dist = _detections({"class_a": [(0, 100), (100, 200)],
+                        "class_b": [(0, 10), (100, 190)]})
+    rows = summarise_chapters(chapters, distributions=dist, video_duration=200)
+    changes = {c["name"]: c for c in (rows[1].get("changes") or [])}
+    assert "class_b" in changes
+    assert changes["class_b"]["direction"] == "rose"
+    assert changes["class_b"]["from_pct"] < 15
+    assert changes["class_b"]["to_pct"] > 85
+
+
+def test_the_first_chapter_has_nothing_to_change_from():
+    from modules.chapter_compare import summarise_chapters
+    chapters = [_seq_chapter(1, 0, 100), _seq_chapter(2, 100, 200)]
+    dist = _detections({"class_a": [(0, 200)]})
+    rows = summarise_chapters(chapters, distributions=dist, video_duration=200)
+    assert "changes" not in rows[0]
+
+
+def test_a_small_wobble_is_not_a_change():
+    """Second-to-second detector scatter must not read as a narrative beat."""
+    from modules.chapter_compare import summarise_chapters
+    chapters = [_seq_chapter(1, 0, 100), _seq_chapter(2, 100, 200)]
+    dist = _detections({"class_a": [(0, 100), (100, 200)],
+                        "class_b": [(0, 50), (100, 145)]})
+    rows = summarise_chapters(chapters, distributions=dist, video_duration=200)
+    assert not rows[1].get("changes")
+
+
+def test_at_most_two_movers_are_reported():
+    from modules.chapter_compare import summarise_chapters
+    chapters = [_seq_chapter(1, 0, 100), _seq_chapter(2, 100, 200)]
+    dist = _detections({
+        "class_a": [(0, 100), (100, 200)],
+        "class_b": [(100, 200)], "class_c": [(100, 200)],
+        "class_d": [(100, 200)], "class_e": [(100, 200)],
+    })
+    rows = summarise_chapters(chapters, distributions=dist, video_duration=200)
+    assert len(rows[1].get("changes") or []) <= 2
+
+
+def test_a_chapter_carried_by_one_class_says_so():
+    from modules.chapter_compare import summarise_chapters
+    chapters = [_seq_chapter(1, 0, 100)]
+    dist = _detections({"class_a": [(0, 100)], "class_b": [(0, 10)]})
+    rows = summarise_chapters(chapters, distributions=dist, video_duration=100)
+    assert rows[0]["dominant"]["name"] == "class_a"
+    assert rows[0]["dominant"]["share_pct"] >= 45
+
+
+def test_the_comparative_reads_as_english_in_both_directions():
+    """'1.4x less as across the video' shipped for a while; it must not return."""
+    from modules.highlight_prose import describe_chapter
+    more = describe_chapter({"clips": 1, "subjects": [
+        {"name": "class_a", "kind": "subject", "lift": 2.0, "seconds": 30,
+         "chapter_share_pct": 60.0, "video_share_pct": 30.0,
+         "enough_samples": True}]})
+    less = describe_chapter({"clips": 1, "subjects": [
+        {"name": "class_a", "kind": "subject", "lift": 0.5, "seconds": 30,
+         "chapter_share_pct": 15.0, "video_share_pct": 30.0,
+         "enough_samples": True}]})
+    assert "as much as across the video" in " ".join(more)
+    assert "less than across the video" in " ".join(less)
+    assert "less as across" not in " ".join(less)

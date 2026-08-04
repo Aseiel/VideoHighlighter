@@ -133,11 +133,39 @@ class TestAgreement:
 
 
 class TestSentenceShape:
-    def test_it_is_one_sentence(self):
+    def test_the_ranking_and_the_evidence_are_separate_sentences(self):
+        """Was one sentence; four clauses on one breath went unread.
+
+        The seam falls after the ranking because that is where the thought
+        changes: where this clip stands, then what it was chosen on.
+        """
         text = describe(_entry(score=100.0, present=["audio", "object"],
                                signals_coincide=True, signal_spread_seconds=0.0,
-                               loudness_percentile=99.0, loudness_dbfs=-2.0), [1.0, 2.0, 100.0])
-        assert text.count(".") == 1 and text.endswith(".")
+                               loudness_percentile=99.0, loudness_dbfs=-2.0),
+                        [1.0, 2.0, 100.0])
+        assert ". Chosen on " in text
+        assert text.endswith(".")
+        # Neither half should be a paragraph in disguise.
+        for part in text.split(". "):
+            assert len(part.split()) <= 25
+
+    def test_a_single_clause_stays_a_single_sentence(self):
+        text = describe(_entry(score=100.0), [1.0, 2.0, 100.0])
+        assert "Chosen on" not in text
+        assert text.endswith(".")
+
+    def test_detected_names_are_never_sentence_cased(self):
+        """Splitting further and capitalising each clause rewrote the data.
+
+        A detected name is the detector's output, not prose — "jumping" must
+        not come back as "Jumping" because it happened to land where a sentence
+        started.
+        """
+        entry = _entry(score=100.0)
+        entry["actions"] = [{"name": "jumping", "confidence": 0.88, "tier": None}]
+        text = describe(entry, [1.0, 2.0, 100.0])
+        assert "jumping recognised at 0.88" in text
+        assert "Jumping" not in text
 
     def test_an_empty_entry_produces_nothing_rather_than_a_guess(self):
         assert describe({"measured": {}, "breakdown": {}}) == ""
@@ -654,3 +682,214 @@ class TestClassConditionedProse:
     def test_no_breakdown_adds_no_lines(self):
         assert not any("No detected class" in l
                        for l in summarise_expression_arc(_analysis()))
+
+
+# --- loudness prose ---------------------------------------------------------
+
+def test_describe_loudest_reaches_for_a_strong_word_only_when_earned():
+    from modules.highlight_prose import describe_loudest
+    far = describe_loudest({"loudest": {"timestamp": "47:58", "vs_video_db": 23.7,
+                                        "classes": ["class_a"]}})
+    mild = describe_loudest({"loudest": {"timestamp": "12:00", "vs_video_db": 5.0,
+                                         "classes": ["class_a"]}})
+    flat = describe_loudest({"loudest": {"timestamp": "12:00", "vs_video_db": 1.0,
+                                         "classes": ["class_a"]}})
+    assert "far above" in far
+    assert "a little above" in mild
+    assert "about as loud as the video usually is" in flat
+
+
+def test_describe_loudest_says_loud_never_why():
+    """The sentence must not name a cause: the same signature covers several."""
+    from modules.highlight_prose import describe_loudest
+    said = describe_loudest({"loudest": {"timestamp": "47:58", "vs_video_db": 23.7,
+                                         "classes": ["class_a"]}})
+    assert "on screen at that second" in said
+    for invented in ("pleasure", "enjoy", "pain", "because", "reacting"):
+        assert invented not in said.lower()
+
+
+def test_describe_loudest_agrees_with_its_subject():
+    from modules.highlight_prose import describe_loudest
+    one = describe_loudest({"loudest": {"timestamp": "1:00", "vs_video_db": 20.0,
+                                        "classes": ["class_a"]}})
+    many = describe_loudest({"loudest": {"timestamp": "1:00", "vs_video_db": 20.0,
+                                         "classes": ["class_a", "class_b"]}})
+    assert "class_a was on screen" in one
+    assert "were on screen" in many
+
+
+def test_describe_loudest_admits_an_unlabelled_peak():
+    from modules.highlight_prose import describe_loudest
+    said = describe_loudest({"loudest": {"timestamp": "1:00", "vs_video_db": 20.0,
+                                         "classes": []}})
+    assert "Nothing was labelled at that second." in said
+    assert describe_loudest({}) == ""
+
+
+def test_level_summary_refuses_to_rank_inside_the_margin():
+    from modules.highlight_prose import summarise_level_by_class
+    lines = summarise_level_by_class({
+        "classes": [{"name": "class_a"}, {"name": "class_b"}],
+        "comparison": {"louder": "class_a", "quieter": "class_b",
+                       "median_difference_db": 1.14, "min_detectable_db": 4.14,
+                       "pairs": 10, "resolvable": False},
+    })
+    body = " ".join(lines)
+    assert "inside the margin" in body
+    assert "indistinguishable in this video" in body
+    assert "not the same as saying they would be in another" in body
+
+
+def test_level_summary_states_the_difference_when_it_is_real():
+    from modules.highlight_prose import summarise_level_by_class
+    lines = summarise_level_by_class({
+        "classes": [{"name": "class_a"}, {"name": "class_b"}],
+        "comparison": {"louder": "class_a", "quieter": "class_b",
+                       "median_difference_db": 8.2, "min_detectable_db": 3.0,
+                       "pairs": 12, "resolvable": True},
+    })
+    body = " ".join(lines)
+    assert "consistently louder during class_a" in body
+    assert "not just a matter of where in the video" in body
+
+
+def test_level_summary_always_carries_the_limit():
+    """However the comparison lands, the prose must say what it does not measure."""
+    from modules.highlight_prose import summarise_level_by_class
+    for resolvable in (True, False):
+        lines = summarise_level_by_class({
+            "classes": [{"name": "a"}, {"name": "b"}],
+            "comparison": {"louder": "a", "quieter": "b",
+                           "median_difference_db": 5.0, "min_detectable_db": 1.0,
+                           "pairs": 9, "resolvable": resolvable},
+        })
+        assert "measures how loud, not why" in " ".join(lines)
+    assert summarise_level_by_class({}) == []
+
+
+# --- why a chapter contributed nothing --------------------------------------
+
+def _unselected(**kw):
+    from modules.highlight_prose import describe_chapter
+    base = {"clips": 0}
+    base.update(kw)
+    return " ".join(describe_chapter(base))
+
+
+def test_a_chapter_that_never_scored_is_not_a_weighting_problem():
+    said = _unselected(score_peak=0.0, cut_threshold=18.0)
+    assert "no detector fired in this stretch" in said
+    assert "invisible to what was run" in said
+    # Must not send the reader to the weight table for a problem it cannot fix.
+    assert "Raising" not in said
+
+
+def test_a_chapter_under_the_bar_names_the_gap_and_the_weights():
+    said = _unselected(score_peak=11.0, score_peak_second=872,
+                       cut_threshold=18.0,
+                       signals_present=["loudness_burst", "object"])
+    assert "scored 11 at 14:32" in said
+    assert "against 18" in said
+    assert "short by 7" in said
+    # Human labels, not internal keys — the reader tunes by what the table says.
+    assert "Loudness burst" in said and "Objects" in said
+    assert "loudness_burst" not in said
+
+
+def test_a_near_miss_says_so_only_when_it_is_near():
+    close = _unselected(score_peak=17.0, cut_threshold=18.0,
+                        signals_present=["object"])
+    far = _unselected(score_peak=6.0, cut_threshold=18.0,
+                      signals_present=["object"])
+    assert "Came close" in close
+    assert "Came close" not in far
+
+
+def test_a_chapter_that_cleared_the_bar_lost_to_length_not_score():
+    said = _unselected(score_peak=24.0, score_peak_second=2100,
+                       cut_threshold=18.0, signals_present=["object"])
+    assert "lost to length rather than to score" in said
+    assert "cut filled up before it" in said
+    # The opposite advice from the under-the-bar case, and it must not appear.
+    assert "would bring this stretch in" not in said
+
+
+def test_a_scoring_chapter_with_no_named_signal_asks_for_a_detector():
+    said = _unselected(score_peak=6.0, cut_threshold=18.0, signals_present=[])
+    assert "no weight to raise" in said
+    assert "needs a detector it does not have" in said
+
+
+def test_without_score_data_it_says_only_what_it_knows():
+    said = _unselected()
+    assert said.strip() == "Nothing from this chapter was selected."
+
+
+# --- relating the marked seconds to each other ------------------------------
+
+def _marks(motion, loud):
+    return {"motion_peak": {"second": motion, "timestamp": f"{motion//60}:{motion%60:02d}"},
+            "loudest": {"second": loud, "timestamp": f"{loud//60}:{loud%60:02d}"}}
+
+
+def test_the_order_of_the_two_marked_seconds_is_stated():
+    from modules.highlight_prose import describe_signal_relations
+    said = describe_signal_relations(_marks(1719, 1728))
+    assert "Movement stopped first" in said
+    assert "9s later" in said
+    # Order, never cause: one clip cannot tell a sequence from a coincidence.
+    for invented in ("because", "caused", "triggered", "in response"):
+        assert invented not in said.lower()
+
+
+def test_the_reverse_order_is_reported_as_such():
+    from modules.highlight_prose import describe_signal_relations
+    said = describe_signal_relations(_marks(1730, 1720))
+    assert "loudest point came first" in said
+
+
+def test_near_simultaneous_marks_are_not_called_a_sequence():
+    from modules.highlight_prose import describe_signal_relations
+    said = describe_signal_relations(_marks(1728, 1729))
+    assert "landed together" in said
+    assert "later" not in said
+
+
+def test_marks_far_apart_are_refused_as_a_sequence():
+    """Half a minute of unexamined footage between them is not 'one then the other'."""
+    from modules.highlight_prose import describe_signal_relations
+    said = describe_signal_relations(_marks(1600, 1728))
+    assert "separate events" in said
+
+
+def test_one_mark_alone_relates_to_nothing():
+    from modules.highlight_prose import describe_signal_relations
+    assert describe_signal_relations({"loudest": {"second": 10}}) == ""
+    assert describe_signal_relations({}) == ""
+
+
+def test_a_repeated_ordering_across_clips_becomes_a_finding():
+    from modules.highlight_prose import summarise_signal_relations
+    clips = [_marks(100, 109), _marks(200, 206), _marks(300, 312),
+             _marks(400, 405), _marks(500, 511)]
+    said = summarise_signal_relations(clips)
+    assert "5 of 5 clips" in said
+    assert "after movement has stopped" in said
+    # Still declines to say what it means.
+    assert "matter for whoever watches it" in said
+
+
+def test_clips_that_disagree_produce_no_pattern_claim():
+    from modules.highlight_prose import summarise_signal_relations
+    clips = [_marks(100, 109), _marks(206, 200), _marks(300, 312),
+             _marks(405, 400), _marks(500, 511), _marks(604, 600)]
+    said = summarise_signal_relations(clips)
+    assert "no consistent order" in said
+    assert "Nothing here links them" in said
+
+
+def test_too_few_clips_to_claim_a_pattern():
+    """Three clips agreeing is three coincidences agreeing."""
+    from modules.highlight_prose import summarise_signal_relations
+    assert summarise_signal_relations([_marks(100, 109), _marks(200, 206)]) == ""

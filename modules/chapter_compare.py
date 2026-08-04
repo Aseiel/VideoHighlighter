@@ -193,7 +193,9 @@ def summarise_chapters(chapters: Sequence[Mapping],
                        amps: Sequence[float] = (),
                        amps_per_second: float = 0.0,
                        distributions: Optional[Mapping] = None,
-                       video_duration: float = 0.0) -> list[dict]:
+                       video_duration: float = 0.0,
+                       signals: Optional[Mapping] = None,
+                       cut_threshold: Optional[float] = None) -> list[dict]:
     """Measure every chapter against the whole video. Returns JSON-safe dicts.
 
     Each returned dict is the caller's chapter dict plus the comparisons. The
@@ -248,6 +250,26 @@ def summarise_chapters(chapters: Sequence[Mapping],
             live = window_score[window_score > 0]
             ch["score_mean"] = round(float(live.mean()) if live.size else 0.0, 2)
             ch["score_lift"] = round(_safe_ratio(ch["score_mean"], video_score_mean), 2)
+            # The best single second, and where. A chapter is selected on its
+            # peaks, not its average, so the mean above cannot answer "why was
+            # nothing taken from here" -- a stretch can be unremarkable overall
+            # and still contain the second that should have been cut.
+            if window_score.size:
+                best = int(np.argmax(window_score))
+                ch["score_peak"] = round(float(window_score[best]), 2)
+                ch["score_peak_second"] = lo + best
+
+        # --- which detectors fired here --------------------------------------
+        # Named so an unselected chapter can say *which* weight to raise rather
+        # than leaving the reader to guess from a total of zero.
+        if signals:
+            fired = []
+            lo, hi = max(0, int(start)), int(math.ceil(end))
+            for key, arr in signals.items():
+                arr = np.asarray(arr, dtype=float)
+                if arr.size and float(arr[lo:min(hi, len(arr))].sum()) > 0:
+                    fired.append(key)
+            ch["signals_present"] = sorted(fired)
 
         # --- pace ------------------------------------------------------------
         if seconds > 0:
@@ -272,11 +294,74 @@ def summarise_chapters(chapters: Sequence[Mapping],
         subjects = _prevalence_lifts(largest, window, seconds_with, detected_seconds)
         if subjects:
             ch["subjects"] = subjects[:MAX_FINDINGS]
+        # Every class's share, not only the ones that cleared the lift bars.
+        # The bars answer "is this chapter unusual for the video"; a *change*
+        # between neighbours is a different question and needs the full set,
+        # since a class can move sharply while staying near the video average.
+        if subjects:
+            ch["class_shares"] = {f["name"]: f["chapter_share_pct"]
+                                  for f in subjects}
         expression = _expression_lifts(expressions, window)
         if expression:
             ch["expression"] = expression[:MAX_FINDINGS]
 
+        # The bar this chapter had to clear. Carried on every row so a renderer
+        # can explain one chapter without being handed the whole list.
+        if cut_threshold is not None:
+            ch["cut_threshold"] = round(float(cut_threshold), 2)
+
+    _mark_changes(chapters)
     return chapters
+
+
+# A class has to move at least this many percentage points between neighbouring
+# chapters before the move is worth a sentence. Below it the "change" is mostly
+# the detector's own second-to-second scatter.
+CHANGE_POINTS = 12.0
+
+# Above this share a class is doing enough of the chapter to be called its
+# subject rather than something merely present in it.
+DOMINANT_SHARE = 45.0
+
+
+def _mark_changes(chapters: Sequence[Mapping]) -> None:
+    """What each chapter changed relative to the one before it. Mutates in place.
+
+    This is where a run of chapters becomes a sequence rather than a list. Each
+    chapter compared against the *video* says how unusual it is; each compared
+    against its *predecessor* says what happened at the boundary, and only the
+    second reads as one thing following another.
+
+    Nothing here interprets. A class rising from 4% to 28% of a chapter's
+    detected seconds is a measurement; what it means is the reader's.
+    """
+    previous: Optional[Mapping] = None
+    for ch in chapters:
+        shares = ch.get("class_shares") or {}
+        if previous is not None:
+            before = previous.get("class_shares") or {}
+            moves = []
+            for name in set(shares) | set(before):
+                was, now = float(before.get(name, 0.0)), float(shares.get(name, 0.0))
+                if abs(now - was) >= CHANGE_POINTS:
+                    moves.append({
+                        "name": str(name),
+                        "from_pct": round(was, 1),
+                        "to_pct": round(now, 1),
+                        "direction": "rose" if now > was else "fell",
+                    })
+            moves.sort(key=lambda m: -abs(m["to_pct"] - m["from_pct"]))
+            # Two at most. A boundary where five things moved at once is a scene
+            # change, and listing all five describes the edit rather than the
+            # content -- the two largest movers are the beat worth reading.
+            if moves:
+                ch["changes"] = moves[:2]
+        # The class carrying most of this chapter, when one does.
+        if shares:
+            name, pct = max(shares.items(), key=lambda kv: kv[1])
+            if float(pct) >= DOMINANT_SHARE:
+                ch["dominant"] = {"name": str(name), "share_pct": round(float(pct), 1)}
+        previous = ch
 
 
 def distinctive(chapter: Mapping) -> list[dict]:
