@@ -430,3 +430,29 @@ def test_the_loader_asks_for_a_window_the_prompt_can_live_in():
     import modules.advisor as advisor
     assert "n_ctx=n_ctx" in inspect.getsource(advisor.load_llm)
     assert advisor.DEFAULT_N_CTX > 4096
+
+
+def test_reading_is_given_room_that_advising_is_not():
+    """At 0.3 and 200 tokens the same report produced the same paragraph."""
+    from modules.advisor import (READING_TEMPERATURE, READING_TOKENS,
+                                 SUMMARY_TOKENS)
+    assert READING_TOKENS > SUMMARY_TOKENS
+    assert READING_TEMPERATURE > 0.5
+
+
+def test_the_temperature_reaches_the_model():
+    from modules.advisor import _generate
+
+    seen = {}
+
+    class _Fake:
+        def generate(self, prompt, system="", max_tokens=0, **kwargs):
+            seen.update(kwargs)
+            return "said"
+
+    _generate(_Fake(), "p", "s", 100, 0.85)
+    assert seen.get("temperature") == 0.85
+    seen.clear()
+    # Advising leaves it alone rather than pinning it to a number of its own.
+    _generate(_Fake(), "p", "s", 100, None)
+    assert "temperature" not in seen

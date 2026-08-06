@@ -82,10 +82,21 @@ READING_SYSTEM_PROMPT = (
 )
 
 READING_TASK = (
-    "In 4 sentences or fewer: say what this video looks like it is doing, and "
-    "point at the one connection between signals that a person should check "
-    "first."
+    "Say what this video looks like it is doing. Work through the connections "
+    "between the signals rather than listing them, and where a combination "
+    "suggests something to you, say so and say what would confirm it. Point at "
+    "the one thing a person should check first."
 )
+
+# Reading gets room that advising does not. The advisor answers "raise this
+# weight" in three sentences and anything longer is padding; a reading is an
+# argument, and an argument cut off at three sentences is a verdict. The
+# temperature is the same distinction: `query` defaults to 0.3, which is right
+# for an instruction that has one correct answer and wrong for one that asks
+# what something looks like — at 0.3 the same report produces the same paragraph
+# every run, which reads as the model having nothing to add.
+READING_TOKENS = 500
+READING_TEMPERATURE = 0.85
 
 # The default ask. Deliberately tight: this lands at the top of a report whose
 # findings are already listed underneath in full, so a long restatement of them
@@ -285,7 +296,8 @@ def _fit(head: str, blocks: Sequence, task: str, max_chars: int) -> str:
         dropped.append(lost[1].splitlines()[0].lstrip("# ").strip())
 
 
-def _generate(llm, prompt: str, system: str, max_tokens: int) -> str:
+def _generate(llm, prompt: str, system: str, max_tokens: int,
+              temperature: Optional[float] = None) -> str:
     """Call whichever text interface this object offers.
 
     ``LLMModule`` exposes ``query`` and takes its context-building on itself;
@@ -293,11 +305,12 @@ def _generate(llm, prompt: str, system: str, max_tokens: int) -> str:
     pass whatever it already has, and ``free_chat_mode`` keeps ``query`` from
     prepending its own video context — the prompt here is complete on its own.
     """
+    extra = {} if temperature is None else {"temperature": temperature}
     if hasattr(llm, "generate"):
-        return llm.generate(prompt, system=system, max_tokens=max_tokens)
+        return llm.generate(prompt, system=system, max_tokens=max_tokens, **extra)
     if hasattr(llm, "query"):
         return llm.query(prompt, system_prompt=system, free_chat_mode=True,
-                         max_tokens=max_tokens)
+                         max_tokens=max_tokens, **extra)
     raise TypeError(f"{type(llm).__name__} offers neither generate() nor query()")
 
 
@@ -308,7 +321,8 @@ def narrate(report: Mapping,
             question: Optional[str] = None,
             knowledge_dir: str = KNOWLEDGE_DIR,
             max_tokens: int = SUMMARY_TOKENS,
-            system: Optional[str] = None) -> Optional[str]:
+            system: Optional[str] = None,
+            temperature: Optional[float] = None) -> Optional[str]:
     """Ask a local model to phrase the findings. ``None`` if none is available.
 
     ``llm`` is either an ``llm.llm_module.LLMModule`` or one of its backends —
@@ -319,7 +333,8 @@ def narrate(report: Mapping,
         return None
     prompt = build_prompt(report, findings, question, knowledge_dir)
     try:
-        text = _generate(llm, prompt, system or SYSTEM_PROMPT, max_tokens)
+        text = _generate(llm, prompt, system or SYSTEM_PROMPT, max_tokens,
+                         temperature)
     except Exception as exc:            # a missing model must not break the run
         print(f"⚠️ Advisor narration failed: {exc}")
         return None
@@ -371,7 +386,9 @@ def summarise_report_file(json_path: str,
     text = narrate(report, findings, llm=llm,
                    question=question or (READING_TASK if reading else None),
                    knowledge_dir=knowledge_dir,
-                   system=READING_SYSTEM_PROMPT if reading else None)
+                   system=READING_SYSTEM_PROMPT if reading else None,
+                   max_tokens=READING_TOKENS if reading else SUMMARY_TOKENS,
+                   temperature=READING_TEMPERATURE if reading else None)
     if not text:
         return None
 
