@@ -811,6 +811,10 @@ class SignalTimelineWindow(QMainWindow):
         if self.realtime_preview is not None:
             self.realtime_preview.avoid_person_requested.connect(self._on_avoid_person)
 
+        # The live preview built its own audio output before the volume controls
+        # existed — line them all up with the slider now.
+        self._apply_audio_state()
+
         dock.setWidget(preview_widget)
         return dock
 
@@ -825,6 +829,10 @@ class SignalTimelineWindow(QMainWindow):
 
         # Pause the outgoing player
         self._active_player.pause()
+
+        # The incoming player has its own audio output — make sure it starts on
+        # the volume/mute the user set, not on whatever it was left at.
+        self._apply_audio_state()
 
         if "Live" in text:
             # ── Switch to Live real-time overlay ──
@@ -1123,21 +1131,36 @@ class SignalTimelineWindow(QMainWindow):
 
         QTimer.singleShot(200, lambda: setattr(self, '_block_position_updates', False))
 
+    def _audio_outputs(self):
+        """Every QAudioOutput the preview can play through.
+
+        The live overlay owns its own player and audio output, so the volume
+        slider and the mute button have to drive both — otherwise they do
+        nothing in Live mode (cache or real-time) and the live player just
+        keeps whatever volume it was constructed with.
+        """
+        outs = [getattr(self, 'audio_output', None)]
+        if getattr(self, 'realtime_preview', None) is not None:
+            outs.append(getattr(self.realtime_preview, 'audio_output', None))
+        return [ao for ao in outs if ao is not None]
+
+    def _apply_audio_state(self):
+        """Push the current slider + mute state onto every audio output."""
+        muted = hasattr(self, 'mute_btn') and self.mute_btn.isChecked()
+        volume = 0.0 if muted else self.volume_slider.value() / 100.0
+        for ao in self._audio_outputs():
+            ao.setVolume(volume)
+
     def set_volume(self, value):
         """Set video volume"""
-        self.audio_output.setVolume(value / 100.0)
+        self._apply_audio_state()
 
     def toggle_mute(self, muted):
         """Toggle audio mute"""
-        if muted:
-            self._pre_mute_volume = self.audio_output.volume()
-            self.audio_output.setVolume(0)
-            self.mute_btn.setText("🔇")
-            self.volume_slider.setEnabled(False)
-        else:
-            self.audio_output.setVolume(getattr(self, '_pre_mute_volume', 0.8))
-            self.mute_btn.setText("🔊")
-            self.volume_slider.setEnabled(True)
+        # The slider keeps its value while muted, so it is the pre-mute volume.
+        self.mute_btn.setText("🔇" if muted else "🔊")
+        self.volume_slider.setEnabled(not muted)
+        self._apply_audio_state()
 
     def update_video_duration(self, duration):
         """Update video duration display"""
@@ -3647,14 +3670,6 @@ class SignalTimelineWindow(QMainWindow):
         self.play_edit_btn.setText("▶ Play Edit")
         if hasattr(self, 'play_btn'):
             self.play_btn.setText("▶ Play")
-
-    def _get_active_audio_output(self):
-        """Return the QAudioOutput attached to whichever player is currently active."""
-        if self._active_player is self.video_player:
-            return getattr(self, 'audio_output', None)
-        if self.realtime_preview and self._active_player is self.realtime_preview.player:
-            return getattr(self.realtime_preview, 'audio_output', None)
-        return None
 
     @Slot(float)
     def on_time_dragged(self, time):
