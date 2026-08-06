@@ -160,6 +160,82 @@ def split_tags(names: Iterable[str],
     return objects, events
 
 
+# How close a shot change has to sit to a marked second before the mark cannot
+# be told apart from the edit. A cut replaces the framing, the lighting and often
+# the subject inside one frame, and a detector reacting to that is reacting to
+# the cut. Two seconds either side, matching the window the report uses
+# everywhere else for "the same instant".
+CUT_WINDOW = 2.0
+
+
+def at_cut(cut_times: Sequence[float], second: Optional[float],
+           window: float = CUT_WINDOW) -> Optional[bool]:
+    """Whether a shot change lands near this second.
+
+    ``None`` when no cuts were supplied — which is not the same as ``False``,
+    and the prose has to be able to tell those apart. A run without scene
+    detection cannot say a mark was clean, only that it does not know.
+    """
+    if second is None or not cut_times:
+        return None
+    return any(abs(float(t) - float(second)) <= window for t in cut_times)
+
+
+def event_onset(object_detections: Optional[Mapping],
+                start: float,
+                end: float,
+                composed_event_names: Optional[Iterable[str]] = None,
+                ) -> Optional[dict]:
+    """The second something *arrives* on screen inside one clip.
+
+    The fourth mark, and the one that carries whatever meaning this run has:
+    the other three are physics -- level, movement, a classifier's label -- and
+    this one is named by whatever the user taught the app to look for. Ordering
+    the physics around it is what turns three timestamps into a description of
+    the moment rather than of the signal processing.
+
+    *Arrives* is the whole of it. A class on screen from the clip's first second
+    is scenery: it was there before the clip and says nothing about when
+    anything happened. Only a class whose first second falls after the clip's
+    start is an event in this clip, and requiring that is what keeps the mark
+    from being "a person is present", which is true of everything.
+
+    Composed events win over raw detections because they are the layer the user
+    defined -- a rule they wrote naming a thing they care about -- where a
+    detection is whatever the model happens to have a class for.
+    """
+    if not object_detections:
+        return None
+    composed = set(composed_event_names or ())
+    lo, hi = int(start), int(np.ceil(end))
+
+    seen: dict = {}
+    for sec in range(lo, hi):
+        for name in object_detections.get(sec, ()) or ():
+            seen.setdefault(str(name), []).append(sec)
+
+    best = None
+    for name, seconds in seen.items():
+        first = min(seconds)
+        # Present from the clip's start, so it did not arrive here; and a class
+        # seen once is a flicker, the same bar the expression mark uses.
+        if first <= lo or len(seconds) < 2:
+            continue
+        key = (1 if name in composed else 0, len(seconds), -first)
+        if best is None or key > best[0]:
+            best = (key, name, first, len(seconds))
+    if not best:
+        return None
+    _key, name, first, count = best
+    return {
+        "second": int(first),
+        "timestamp": format_timestamp(float(first)),
+        "name": name,
+        "composed": bool(name in composed),
+        "seconds": int(count),
+    }
+
+
 def boxes_by_second(bbox_cache: Optional[Iterable[Mapping]]) -> dict:
     """Index the detector's bbox cache by second.
 
@@ -378,6 +454,7 @@ def build_report(*,
                  chapters: Optional[Sequence[Mapping]] = None,
                  loudness_levels: Optional[Sequence[float]] = None,
                  motion_peaks: Optional[Sequence[float]] = None,
+                 scene_cuts: Optional[Sequence[float]] = None,
                  ) -> dict:
     """Attribute every kept segment to the evidence that selected it.
 
@@ -433,6 +510,12 @@ def build_report(*,
     # Motion peaks are timestamps, not a curve: the detector reports where a
     # burst of movement was followed by stillness, and nothing in between.
     peak_times = sorted(float(t) for t in (motion_peaks or []))
+
+    # Where the shot changes. Not a signal in its own right here — it is what
+    # every other mark has to be checked against, because a cut changes the
+    # framing, the lighting and often the subject in one frame, and any mark
+    # that lands on one may be describing the edit rather than the footage.
+    cut_times = sorted(float(t) for t in (scene_cuts or []))
 
     # Flatten the loudness envelope once, at full resolution. Each clip then
     # takes its own slice of *this* rather than of the page-wide curve: at 480
@@ -529,6 +612,33 @@ def build_report(*,
                     entry["loudest"] = loud
             except Exception as exc:               # pragma: no cover - defensive
                 print(f"⚠️ Clip loudness peak skipped: {exc}")
+
+        # What arrived on screen inside this clip, if anything did. Named by the
+        # user's own categories where a run has them, which is why it is the
+        # mark the others are worth ordering against.
+        onset = event_onset(object_detections, start, end, composed_event_names)
+        if onset:
+            # Whether the camera changed at the same moment. An arrival on a cut
+            # may have been on screen already and simply out of frame.
+            onset["at_cut"] = at_cut(cut_times, onset.get("second"))
+            entry["event_onset"] = onset
+
+        # The third marked second: where the expression reading settled. Only
+        # useful next to the two above, which is why it is measured here rather
+        # than left to the arc -- the arc averages each clip flat, and an average
+        # cannot be put in an order with anything.
+        if expressions:
+            try:
+                from modules.expression_arc import peak_in_range as expression_peak
+                reading = expression_peak(expressions, start, end)
+                if reading:
+                    # The check that decides whether the turn is worth anything.
+                    # A reading that changes on a cut is a different shot of a
+                    # face, which is not the same as a face that changed.
+                    reading["at_cut"] = at_cut(cut_times, reading.get("second"))
+                    entry["expression_peak"] = reading
+            except Exception as exc:               # pragma: no cover - defensive
+                print(f"⚠️ Clip expression peak skipped: {exc}")
         if amps_per_second:
             lo = int(start * amps_per_second)
             hi = max(lo + 1, int(end * amps_per_second))
@@ -558,6 +668,23 @@ def build_report(*,
                 entry["thumbnail"] = ("data:image/jpeg;base64,"
                                       + base64.b64encode(raw).decode("ascii"))
         entries.append(entry)
+
+    # How often the video produces each clip's combination of marks anywhere in
+    # itself. Computed after every clip's marks are known, and cheap: it reuses
+    # the same per-second arrays the clips were measured from.
+    try:
+        from modules.signal_combinations import marks_of, rate, survey
+        found = survey(video_duration, motion_peaks=peak_times, levels=levels,
+                       expressions=expressions,
+                       object_detections=object_detections,
+                       composed_event_names=composed_event_names)
+        threshold = (found or {}).get("loud_threshold")
+        for entry in entries:
+            combination = rate(found, marks_of(entry, threshold))
+            if combination:
+                entry["combination"] = combination
+    except Exception as exc:                       # pragma: no cover - defensive
+        print(f"⚠️ Combination rate skipped: {exc}")
 
     near_misses = []
     if near_miss_count > 0 and len(score):
@@ -671,6 +798,9 @@ def build_report(*,
         # run. One clip's ordering is a coincidence; a repeated one is a
         # property of the footage, and that difference needs every clip.
         "signal_relations": _signal_relations_summary(entries),
+        # What tends to happen around each category, counted rather than
+        # asserted. Built here so the page and the JSON carry the same figures.
+        "event_relations": _event_relations_summary(entries, arc),
     }
 
 
@@ -680,6 +810,16 @@ def _signal_relations_summary(entries: Sequence[Mapping]) -> str:
         return summarise_signal_relations(entries)
     except Exception:                              # pragma: no cover - defensive
         return ""
+
+
+def _event_relations_summary(entries: Sequence[Mapping],
+                             arc: Optional[Mapping] = None) -> list:
+    try:
+        from modules.highlight_prose import summarise_event_relations
+        readings = {r["index"]: r for r in ((arc or {}).get("segments") or [])}
+        return summarise_event_relations(entries, readings)
+    except Exception:                              # pragma: no cover - defensive
+        return []
 
 
 def score_from_report(report: Mapping) -> np.ndarray:
@@ -717,6 +857,31 @@ def _standout_lines(entry: Mapping) -> list:
         return []
 
 
+def _conclusion(report: Mapping) -> list:
+    """The run's own summary, wrapped so a failure costs a paragraph not a page."""
+    try:
+        from modules.highlight_prose import conclude
+        return conclude(report)
+    except Exception as exc:                       # pragma: no cover - defensive
+        print(f"⚠️ Conclusion skipped: {exc}")
+        return []
+
+
+def _segment_readings(report: Mapping) -> dict:
+    """The whole-video expression scan's per-clip rows, keyed by clip index."""
+    arc = report.get("expression_arc") or {}
+    return {r["index"]: r for r in (arc.get("segments") or [])}
+
+
+def _comparison_rows(entry: Mapping, readings: Mapping) -> list:
+    """One clip's signed comparison against its video, for either renderer."""
+    try:
+        from modules.highlight_prose import compare_to_video
+        return compare_to_video(entry, readings.get(entry.get("index")))
+    except Exception:
+        return []
+
+
 def render_text(report: Mapping) -> str:
     """The debug-log view — the same breakdown the pipeline used to print."""
     out = ["=== HIGHLIGHT BREAKDOWN ==="]
@@ -724,12 +889,32 @@ def render_text(report: Mapping) -> str:
     out.append(f"{t['segments']} segment(s), {t['duration']:.1f}s "
                f"({t['coverage_pct']:.1f}% of the source)")
 
+    # The whole run in a few lines, before any of the detail. First because it
+    # is the only part a reader is guaranteed to reach.
+    for section in _conclusion(report):
+        out.append("")
+        out.append(f"  {section['heading'].upper()}")
+        for line in section["lines"]:
+            out.append(f"    {line}")
+
+    said = str(report.get("reading") or "").strip()
+    if said:
+        out.append("")
+        out.append("  READ BY A LOCAL MODEL (not measured)")
+        out.append(f"    {said}")
+
+    readings = _segment_readings(report)
+    video_valence = float(((report.get("expression_arc") or {}).get("valence")
+                           or {}).get("mean_all_read") or 0.0)
+    peer_scores = [float(e.get("score") or 0.0) for e in report["segments"]]
     for e in report["segments"]:
         out.append("")
-        out.append(f"[{e['index']}] {e['range']}  peak {e['timestamp']} "
+        out.append(f"[Clip {e['index']}] {e['range']}  peak {e['timestamp']} "
                    f"({e['second']}s): {e['score']:.1f} points")
         if e.get("output_range"):
             out.append(f"    In the highlight: {e['output_range']}")
+        if e.get("chapter"):
+            out.append(f"    From {_chapter_title(report, e['chapter'])}")
         for key, label in SIGNAL_LABELS:
             value = e["breakdown"].get(key, 0.0)
             if value:
@@ -745,38 +930,37 @@ def render_text(report: Mapping) -> str:
         if b["applied"]:
             out.append(f"    Multi-signal boost: {b['signal_count']} signals "
                        f"x{b['multiplier']} -> +{b['points']:.1f}")
-        for line in _standout_lines(e):
-            out.append(f"    * {line}")
+        # Grouped by the signal that produced each line, the same way the
+        # conclusion at the top of the report is.
+        for heading, lines in _clip_sections(e, readings, video_valence,
+                                             peer_scores):
+            out.append(f"      {heading}")
+            for line in lines:
+                out.append(f"        {line}")
+        try:
+            from modules.highlight_prose import describe_signal_relations
+            exact = describe_signal_relations(e)
+        except Exception:
+            exact = ""
+        if exact:
+            out.append(f"      {exact}")
         loud = e.get("loudest")
         if loud:
-            try:
-                from modules.highlight_prose import describe_loudest
-                sentence = describe_loudest(e)
-            except Exception:
-                sentence = ""
-            if sentence:
-                out.append(f"    * {sentence}")
             where = ", ".join(loud["classes"]) or "nothing labelled there"
             vs = (f" ({loud['vs_video_db']:+.1f} dB vs the video's middle)"
                   if "vs_video_db" in loud else "")
             out.append(f"      peak {loud['timestamp']} at "
                        f"{loud['level_dbfs']:.1f} dBFS{vs} — {where}")
-        motion = e.get("motion_peak")
-        if motion and float((e.get("breakdown") or {}).get("motion_peak") or 0) > 0:
-            try:
-                from modules.highlight_prose import describe_motion_peak
-                said = describe_motion_peak(e)
-            except Exception:
-                said = ""
-            if said:
-                out.append(f"    * {said}")
+        # Last under the clip: the same comparisons the sentences above make,
+        # collapsed into signs. A reader scanning for the clip that runs against
+        # the file finds it here without reading any of them.
         try:
-            from modules.highlight_prose import describe_signal_relations
-            rel = describe_signal_relations(e)
+            from modules.highlight_prose import format_comparison
+            strip = format_comparison(_comparison_rows(e, readings))
         except Exception:
-            rel = ""
-        if rel:
-            out.append(f"    * {rel}")
+            strip = ""
+        if strip:
+            out.append(f"    {strip}")
 
     chapters = report.get("chapters") or []
     if chapters:
@@ -805,10 +989,14 @@ def render_text(report: Mapping) -> str:
                     out.append(f"        * {line}")
 
     relations = report.get("signal_relations") or ""
-    if relations:
+    events = report.get("event_relations") or []
+    if relations or events:
         out.append("")
         out.append("--- Across the clips ---")
-        out.append(f"    {relations}")
+        if relations:
+            out.append(f"    {relations}")
+        for line in events:
+            out.append(f"    {line}")
 
     lbc = report.get("level_by_class") or {}
     if lbc.get("classes"):
@@ -873,7 +1061,15 @@ h1{font-size:22px;margin:0 0 4px}
 .totals .n{font-size:24px;color:var(--accent)}
 .totals .l{font-size:12px;color:var(--dim)}
 .seg{background:var(--card);border:1px solid var(--line);border-radius:10px;
-     padding:16px;margin-bottom:14px;display:flex;gap:16px}
+     padding:16px;margin-bottom:14px;display:flex;gap:16px;scroll-margin-top:12px}
+/* The clip's number, so a row can be named out loud and linked to from the
+   cut table and the chapter list rather than counted down to by hand. */
+.num{display:inline-block;font:600 12px/1.6 ui-monospace,monospace;
+     color:var(--accent);border:1px solid var(--line);border-radius:4px;
+     padding:0 6px;margin-right:8px;vertical-align:1px}
+.chapof{color:var(--dim)}
+a.clip{color:inherit;text-decoration:none;border-bottom:1px dotted var(--line)}
+a.clip:hover{color:var(--accent);border-color:var(--accent)}
 .shotwrap{width:200px;flex-shrink:0;align-self:flex-start}
 /* The box overlay is positioned against this element, so it must wrap the
    image and nothing else — a caption inside it would skew every percentage. */
@@ -905,10 +1101,22 @@ h1{font-size:22px;margin:0 0 4px}
 .pts{color:var(--accent);font-weight:600}
 .meta{color:var(--dim);font-size:13px;margin:2px 0 10px}
 .says{color:var(--text);font-size:13.5px;margin:10px 0 2px}
+.csec{margin:10px 0 0}
+.csec b{display:block;color:var(--dim);font-size:10.5px;font-weight:700;
+        text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px}
+.csec.sum b{color:var(--accent)}
 .why{margin:6px 0 4px;padding-left:18px;color:var(--text);font-size:13px}
 .why li{margin:3px 0}
 .why li::marker{color:var(--accent)}
 .meas{color:var(--cool);font-size:12px;margin:2px 0}
+.vs{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px;margin:8px 0 2px}
+.vs .lab{font-size:11px;color:var(--dim);text-transform:uppercase;
+         letter-spacing:.06em;cursor:help}
+.vs .ax{font-size:12px;color:var(--text);white-space:nowrap}
+.vs .sgn{font:600 12px ui-monospace,monospace;margin-right:4px;color:var(--dim)}
+.vs .up .sgn{color:var(--accent)}
+.vs .down .sgn{color:var(--warm)}
+.vs .fig{color:var(--dim)}
 .bar{display:flex;align-items:center;gap:10px;margin:3px 0;font-size:13px}
 .bar .lab{width:110px;color:var(--dim);flex-shrink:0}
 .bar .track{flex:1;height:8px;background:#26262c;border-radius:4px;overflow:hidden}
@@ -944,6 +1152,21 @@ h1{font-size:22px;margin:0 0 4px}
 .find .fix{color:var(--text)}
 .narr{background:#191a1f;border:1px solid var(--line);border-radius:8px;
       padding:12px 14px;margin-bottom:12px;white-space:pre-wrap;font-size:13.5px}
+.concl{background:#191a1f;border:1px solid var(--line);border-left:3px solid var(--accent);
+       border-radius:8px;padding:14px 16px 16px;margin-bottom:14px}
+.concl h2{margin:0 0 10px;font-size:15px;border:0;padding:0}
+.reading-llm{background:#191a1f;border:1px solid var(--line);
+             border-left:3px solid var(--warm);border-radius:8px;
+             padding:12px 14px;margin-bottom:14px}
+.reading-llm b{display:block;color:var(--warm);font-size:11px;font-weight:700;
+               text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
+.reading-llm p{margin:0 0 6px;font-size:14px;line-height:1.55}
+.reading-llm .cav{margin:8px 0 0;color:var(--dim);font-size:11.5px}
+.concl b{display:block;color:var(--accent);font-size:11px;font-weight:700;
+         text-transform:uppercase;letter-spacing:.08em;margin:12px 0 4px}
+.concl b:first-of-type{margin-top:0}
+.concl p{margin:0 0 4px;font-size:14px;line-height:1.55}
+.concl p:last-child{margin-bottom:0}
 .arcnote p{margin:0 0 8px;color:var(--dim);font-size:13.5px}
 .arcnote p:first-child{color:var(--text)}
 .arcnote p:last-child{margin-bottom:0;font-size:12.5px;font-style:italic}
@@ -1097,6 +1320,43 @@ def _overview(report: Mapping) -> str:
     return f'<div class="tl">{"".join(parts)}{caption}{wave}{legend}</div>'
 
 
+def _reading_block(report: Mapping) -> str:
+    """A local model's reading of the run, when the user asked for one.
+
+    Its own block, labelled as written by a model, and below the measured
+    conclusion rather than above it. The order is the argument: what was
+    measured first, what someone thinks it looks like second, and never the two
+    in one voice.
+    """
+    said = str(report.get("reading") or "").strip()
+    if not said:
+        return ""
+    return (f'<div class="reading-llm"><b>Read by a local model</b>'
+            f'<p>{html.escape(said)}</p>'
+            f'<p class="cav">Written by a language model from the sections '
+            f'above, not measured. It was told to work only from them and to '
+            f'introduce no figures, so every part of it can be checked against '
+            f'what is on this page.</p></div>')
+
+
+def _conclusion_block(report: Mapping) -> str:
+    """The run's summary, at the top of the page.
+
+    Above everything, including the curves: it is assembled from the sections
+    below, and a summary printed after what it summarises is a summary nobody
+    needs by the time they reach it.
+    """
+    sections = _conclusion(report)
+    if not sections:
+        return ""
+    body = ""
+    for section in sections:
+        body += f'<b>{html.escape(str(section["heading"]))}</b>'
+        body += "".join(f"<p>{html.escape(str(line))}</p>"
+                        for line in section["lines"])
+    return (f'<div class="concl"><h2>What this run found</h2>{body}</div>')
+
+
 def _signal_relations(report: Mapping) -> str:
     """Whether the seconds the clips named fall in a repeating order.
 
@@ -1105,10 +1365,13 @@ def _signal_relations(report: Mapping) -> str:
     reconstructed by reading the clips one at a time.
     """
     said = report.get("signal_relations") or ""
-    if not said:
+    events = report.get("event_relations") or []
+    if not said and not events:
         return ""
-    return (f'<div class="narr"><b>Across the clips</b><br>'
-            f'{html.escape(said)}</div>')
+    body = f'{html.escape(said)}' if said else ""
+    for line in events:
+        body += f'<p>{html.escape(str(line))}</p>'
+    return (f'<div class="narr"><b>Across the clips</b><br>{body}</div>')
 
 
 def _cut_timeline(report: Mapping) -> str:
@@ -1151,7 +1414,7 @@ def _cut_timeline(report: Mapping) -> str:
     parts.append("</svg>")
 
     rows = "".join(
-        f'<tr><td>{e["index"]}</td>'
+        f'<tr><td><a class="clip" href="#clip-{e["index"]}">{e["index"]}</a></td>'
         f'<td>{html.escape(str(e["output_range"]))}</td>'
         f'<td>{html.escape(str(e["range"]))}</td>'
         f'<td>{float(e["duration"]):.0f}s</td>'
@@ -1351,6 +1614,25 @@ def _level_by_class(report: Mapping) -> str:
     )
 
 
+def _chapter_title(report: Mapping, number: Optional[int]) -> str:
+    """What to call chapter ``number`` on a clip card.
+
+    The stored title is used when there is one, because a caller that renamed
+    the chapters meant that name to be what the reader sees; the positional
+    fallback keeps older records — and runs whose chapter list failed to
+    summarise — readable rather than blank.
+    """
+    if not number:
+        return ""
+    for ch in report.get("chapters") or []:
+        if int(ch.get("number") or 0) == int(number):
+            title = str(ch.get("title") or "").strip()
+            if title:
+                return title
+            break
+    return f"chapter {int(number)}"
+
+
 def _chapters(report: Mapping) -> str:
     """The video's own structure, with each clip filed under where it came from.
 
@@ -1404,8 +1686,11 @@ def _chapters(report: Mapping) -> str:
         lines = describe_chapter(ch) if describe_chapter is not None else []
         body = "".join(f"<li>{html.escape(line)}</li>" for line in lines)
         clips = ch.get("clip_indices") or []
-        picked = (", ".join(f"clip {i}" for i in clips) if clips
-                  else "no clips selected")
+        # Linked, because "clip 7" is only useful if reaching clip 7 is one
+        # click rather than a scroll through everything before it.
+        picked = (", ".join(f'<a class="clip" href="#clip-{int(i)}">clip {int(i)}</a>'
+                            for i in clips)
+                  if clips else "no clips selected")
         # Greyed when nothing was taken from it, so "which stretches did the cut
         # ignore" is answerable at a glance rather than by reading eleven blocks.
         unused = " unused" if not clips else ""
@@ -1419,7 +1704,7 @@ def _chapters(report: Mapping) -> str:
             f'</span></div>'
             f'<div class="meta">{float(ch["duration"]):.0f}s · '
             f'{int(ch.get("shots") or 0)} shots · {html.escape(str(ch.get("pace", "")))}'
-            f' · {html.escape(picked)}</div>'
+            f' · {picked}</div>'
             f'<ul class="why">{body}</ul></div>')
 
     narration = (f'<div class="narr">{html.escape(headline)}</div>'
@@ -1437,9 +1722,16 @@ def _chapters(report: Mapping) -> str:
 
 
 def _advice(report: Mapping) -> str:
-    """What to change, if anything diagnosed this run (see modules.advisor)."""
+    """What to change, if anything diagnosed this run (see modules.advisor).
+
+    A clean run has no findings and used to return here, taking the model's
+    summary with it — the narration was written into the record, the page was
+    re-rendered, and nothing changed on screen. Silent, and indistinguishable
+    from the model having failed.
+    """
     findings = report.get("advice") or []
-    if not findings:
+    narrated = str(report.get("advice_narration") or "").strip()
+    if not findings and not narrated:
         return ""
     rows = []
     for f in findings:
@@ -1452,20 +1744,58 @@ def _advice(report: Mapping) -> str:
             f'<p class="fix"><b>Try:</b> {html.escape(str(f.get("remedy", "")))}</p>'
             f'</div>'
         )
-    narration = ""
-    if report.get("advice_narration"):
-        narration = (f'<div class="narr">'
-                     f'{html.escape(str(report["advice_narration"]))}</div>')
+    narration = (f'<div class="narr">{html.escape(narrated)}</div>'
+                 if narrated else "")
+    note = ('<p class="note">Worked out from this run\'s own numbers — each '
+            'point below is backed by the figures shown with it, not by a guess '
+            'about what you meant.</p>' if findings else
+            '<p class="note">Nothing in this run was diagnosed as a problem. '
+            'The summary below was written by a local model from the sections '
+            'above.</p>')
     return (
         '<h2>What to try next</h2>'
-        '<p class="note">Worked out from this run\'s own numbers — each point '
-        'below is backed by the figures shown with it, not by a guess about '
-        'what you meant.</p>'
-        f'{narration}{"".join(rows)}'
+        f'{note}{narration}{"".join(rows)}'
     )
 
 
-def _measurements(entry: Mapping, peer_scores=None) -> str:
+def _comparison_strip(entry: Mapping, readings: Mapping) -> str:
+    """The signed comparison as a row of chips, one per axis.
+
+    Colour carries the sign as well as the glyph, so the strip is scannable down
+    a page of clips — but the glyph is what the meaning rests on: ``+`` and ``-``
+    survive a screenshot, a printout and a reader who cannot tell the two hues
+    apart, and colour alone would not.
+    """
+    rows = _comparison_rows(entry, readings)
+    if not rows:
+        return ""
+    css = {"+": "up", "-": "down", "=": "same"}
+    chips = "".join(
+        f'<span class="ax {css.get(r["sign"], "same")}">'
+        f'<span class="sgn">{html.escape(r["sign"])}</span>'
+        f'{html.escape(r["name"])} '
+        f'<span class="fig">{html.escape(r["figure"])}</span></span>'
+        for r in rows)
+    return (f'<div class="vs"><span class="lab" title="Above (+) or below (-) '
+            f'this video&#39;s own norm — not better or worse">vs the video'
+            f'</span>{chips}</div>')
+
+
+def _clip_sections(entry: Mapping, readings: Mapping,
+                   video_valence: float = 0.0, peer_scores=None) -> list:
+    """One clip's prose, grouped by signal — wrapped so a failure costs a block."""
+    try:
+        from modules.highlight_prose import clip_sections
+        return clip_sections(entry, readings.get(entry.get("index")),
+                             video_valence, peer_scores)
+    except Exception as exc:                       # pragma: no cover - defensive
+        print(f"⚠️ Clip sections skipped: {exc}")
+        return []
+
+
+def _measurements(entry: Mapping, peer_scores=None,
+                  readings: Optional[Mapping] = None,
+                  video_valence: float = 0.0) -> str:
     """What was physically true here, in units that outlive the weight table.
 
     Led by the plain-language reading of those same numbers: a row of figures
@@ -1476,67 +1806,59 @@ def _measurements(entry: Mapping, peer_scores=None) -> str:
     if not m:
         return ""
 
-    from modules.highlight_prose import describe
-
     # Figures accumulate here and are folded away at the end. Kept in the same
     # block as the sentences they support rather than moved to a page of their
     # own: the number next to the claim is what lets a reader argue with a pick,
     # and a separate page of measurements is one nobody opens.
     figures: list = []
+    lead = ""
 
-    sentence = describe(entry, peer_scores)
-    lead = (f'<div class="says">{html.escape(sentence)}</div>' if sentence else "")
+    # Everything the clip has to say, filed under the signal that produced it.
+    # There is no lead sentence above this any more: it opened with the same
+    # standing the Summary now states in words, and carried three figures that
+    # are all printed under "show the measurements" below.
+    for heading, lines in _clip_sections(entry, readings or {},
+                                         video_valence, peer_scores):
+        items = "".join(f"<li>{html.escape(line)}</li>" for line in lines)
+        # The summary is marked rather than inferred from its position: it is
+        # the only section about more than one signal, and it is not always the
+        # last one present.
+        css = "csec sum" if heading == "Summary" else "csec"
+        lead += (f'<div class="{css}"><b>{html.escape(heading)}</b>'
+                 f'<ul class="why">{items}</ul></div>')
 
-    # The comparative reading, when this clip had one. Its own block rather than
-    # more clauses on the sentence above: this is the part a reader consults to
-    # argue with the pick, and it is worth the vertical space it takes.
-    standout = _standout_lines(entry)
-    if standout:
-        items = "".join(f"<li>{html.escape(line)}</li>" for line in standout)
-        lead += f'<ul class="why">{items}</ul>'
+    # The loudness figure travels with the folded measurements rather than the
+    # sentence: it is the arithmetic behind "Sound", not a second claim.
+    try:
+        from modules.highlight_prose import describe_signal_relations
+        exact = describe_signal_relations(entry)
+    except Exception:
+        exact = ""
+    if exact:
+        figures.append(exact)
 
-    # Where this clip was loudest, and what was labelled there. Deliberately
-    # about *this* clip rather than the video: the whole-video class comparison
-    # lives in its own section, and repeating it under every clip would state a
-    # video-wide claim twelve times as though it were twelve observations.
+    combination = entry.get("combination") or {}
+    if combination.get("windows"):
+        figures.append(
+            f'Same combination in {combination["matching"]} of '
+            f'{combination["windows"]} of the video\'s '
+            f'{combination["window_seconds"]}s stretches '
+            f'({combination["pct"]:.0f}%)')
+
     loud = entry.get("loudest")
     if loud:
-        try:
-            from modules.highlight_prose import describe_loudest
-            sentence = describe_loudest(entry)
-        except Exception:
-            sentence = ""
         where = (", ".join(html.escape(c) for c in loud["classes"])
                  or "nothing labelled there")
         vs = ""
         if "vs_video_db" in loud:
             vs = (f' · {loud["vs_video_db"]:+.1f} dB vs the video\'s middle')
-        lead += f'<div class="says">{html.escape(sentence)}</div>'
         figures.append(f'Peak {loud["timestamp"]} at {loud["level_dbfs"]:.1f} '
                        f'dBFS{vs} — {where}')
 
-    # Motion peaks only get a sentence when they actually scored here. A signal
-    # that fired but earned nothing is in the breakdown already, and narrating
-    # it would imply it drove the pick.
-    if entry.get("motion_peak") and float(
-            (entry.get("breakdown") or {}).get("motion_peak") or 0.0) > 0:
-        try:
-            from modules.highlight_prose import describe_motion_peak
-            said = describe_motion_peak(entry)
-        except Exception:
-            said = ""
-        if said:
-            lead += f'<div class="says">{html.escape(said)}</div>'
-
-    # How the seconds this clip named relate to each other. Last, because it
-    # only means anything once both have been stated.
-    try:
-        from modules.highlight_prose import describe_signal_relations
-        relation = describe_signal_relations(entry)
-    except Exception:
-        relation = ""
-    if relation:
-        lead += f'<div class="says rel">{html.escape(relation)}</div>'
+    # The same comparisons as signs, under the prose that makes them. Above the
+    # folded figures rather than inside them: this is the part a reader uses to
+    # decide which clip to look at, and it has to be visible without a click.
+    lead += _comparison_strip(entry, readings or {})
 
     parts = []
     pct = m.get("score_percentile")
@@ -1667,6 +1989,13 @@ def _player(entry: Mapping, media_src: Optional[str]) -> str:
     motion = entry.get("motion_peak") or {}
     if motion.get("second") is not None:
         marks.append(("motion peak", motion["second"], motion.get("timestamp", "")))
+    reading = entry.get("expression_peak") or {}
+    if reading.get("second") is not None:
+        # Named for the label rather than "expression peak": the button is how a
+        # reader checks the claim, and checking it means knowing what to look
+        # for before pressing play.
+        marks.append((f"reads {reading.get('label', '')}", reading["second"],
+                      reading.get("timestamp", "")))
     # In the order they happen, not the order the report computed them. The row
     # of buttons is a miniature timeline of the clip, and one that ran backwards
     # would have a reader seeking against the direction they are watching.
@@ -1743,7 +2072,7 @@ def render_html(report: Mapping, title: Optional[str] = None,
     # Each clip is described relative to the others in the cut.
     peer_scores = [float(e.get("score") or 0.0) for e in report["segments"]]
     arc = report.get("expression_arc") or {}
-    readings = {r["index"]: r for r in (arc.get("segments") or [])}
+    readings = _segment_readings(report)
     video_valence = float((arc.get("valence") or {}).get("mean_all_read") or 0.0)
     composed = frozenset(
         name for e in report["segments"] for name in e.get("events", [])
@@ -1753,31 +2082,31 @@ def render_html(report: Mapping, title: Optional[str] = None,
     for e in report["segments"]:
         thumb = _shot(e, composed)
         tags = _tag_rows(e)
-        reading = ""
-        if e["index"] in readings:
-            try:
-                from modules.highlight_prose import describe_segment_reading
-                sentence = describe_segment_reading(readings[e["index"]],
-                                                    video_valence)
-            except Exception:
-                sentence = ""
-            if sentence:
-                reading = f'<div class="reading">{html.escape(sentence)}</div>'
+        # The clip's own expression reading now sits under the Face expression
+        # heading with the rest of that signal, rather than adrift at the foot
+        # of the card where it read as an afterthought.
         boost = ""
         if e["boost"]["applied"]:
             boost = (f'<div class="boost">Multi-signal boost — '
                      f'{e["boost"]["signal_count"]} signals agreed, '
                      f'×{e["boost"]["multiplier"]:g} (+{e["boost"]["points"]:.0f})</div>')
+        # Which chapter the clip came from, when the run has chapters at all —
+        # the card is otherwise the one place in the report that never says
+        # where in the video's own structure the moment sits.
+        chapter = e.get("chapter")
+        from_chapter = (f' · <span class="chapof">from '
+                        f'{html.escape(_chapter_title(report, chapter))}</span>'
+                        if chapter else "")
         segs.append(
-            f'<div class="seg">{thumb}<div class="body">'
-            f'<div><span class="rng">{html.escape(e["range"])}</span> · '
+            f'<div class="seg" id="clip-{e["index"]}">{thumb}<div class="body">'
+            f'<div><span class="num">Clip {e["index"]}</span>'
+            f'<span class="rng">{html.escape(e["range"])}</span> · '
             f'<span class="pts">{e["score"]:.0f} points</span></div>'
             f'<div class="meta">peak at {html.escape(e["timestamp"])} · '
-            f'{e["duration"]:.0f}s long</div>'
+            f'{e["duration"]:.0f}s long{from_chapter}</div>'
             f'{_bars(e, max_points)}'
-            f'{_measurements(e, peer_scores)}'
+            f'{_measurements(e, peer_scores, readings, video_valence)}'
             f'{tags}'
-            f'{reading}'
             f'{_segment_wave(report, e)}'
             f'{_player(e, media_src)}'
             f'{boost}</div></div>'
@@ -1826,6 +2155,8 @@ def render_html(report: Mapping, title: Optional[str] = None,
   <div><span class="n">{totals["duration"]:.0f}s</span><span class="l">total length</span></div>
   <div><span class="n">{totals["coverage_pct"]:.1f}%</span><span class="l">of the source</span></div>
 </div>
+{_conclusion_block(report)}
+{_reading_block(report)}
 {_overview(report)}
 {_signal_relations(report)}
 {_cut_timeline(report)}

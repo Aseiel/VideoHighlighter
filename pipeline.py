@@ -2120,6 +2120,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # Timestamps, so each clip can name the peak it was scored
                     # on and offer to play it.
                     motion_peaks=[float(t) for t in motion_peaks],
+                    # Where the shot changes, so every other mark can be checked
+                    # against the edit. A reading that turns on a cut is a
+                    # different shot of a face, not a face that changed, and
+                    # without these the report cannot tell the two apart.
+                    scene_cuts=[float(s) for s, _e in (scenes or [])],
                     signals={
                         "scene": scene_score,
                         "motion_event": motion_event_score,
@@ -2148,6 +2153,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         "keyword_points": KEYWORD_POINTS,
                         "object_points": OBJECT_POINTS,
                         "action_points": ACTION_POINTS,
+                        # Both, not just the weight: the advisor's rule for
+                        # "weighted but no class chosen" needs to tell an empty
+                        # selection from an absent setting, and without these
+                        # two keys it could never fire at all.
+                        "face_expression_points": FACE_POINTS,
+                        "face_expression_labels": list(FACE_LABELS),
                         "multi_signal_boost": MULTI_SIGNAL_BOOST,
                         "min_signals_for_boost": MIN_SIGNALS_FOR_BOOST,
                         "coverage": COVERAGE,

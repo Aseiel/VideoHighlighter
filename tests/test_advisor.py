@@ -267,3 +267,166 @@ class TestSummariseReportFile:
         json_path, html_path = self._written(tmp_path)
         os.remove(html_path)
         assert advisor.summarise_report_file(json_path, llm=_FakeLLM()) is not None
+
+
+# --- reading the footage, as opposed to advising on the settings ------------
+
+def _footage_report():
+    return {
+        "video": {"duration": 900.0},
+        "totals": {"segments": 2, "duration": 60.0, "coverage_pct": 6.7},
+        "settings": {},
+        "segments": [
+            {"index": 1, "range": "0:58 - 1:28", "breakdown": {"motion_peak": 5.0},
+             "signals_present": ["motion_peak", "audio"],
+             "measured": {"score_percentile": 90.0},
+             "motion_peak": {"second": 60, "timestamp": "1:00", "count": 1},
+             "loudest": {"second": 64, "timestamp": "1:04", "vs_video_db": 20.0,
+                         "level_dbfs": -4.0, "classes": []},
+             "expression_peak": {"second": 68, "timestamp": "1:08",
+                                 "label": "surprise", "confidence": 0.8,
+                                 "seconds": 4, "read_seconds": 12,
+                                 "turned": True, "from_label": "neutral"},
+             "combination": {"marks": ["loud", "movement", "reading"],
+                             "matching": 2, "windows": 60,
+                             "window_seconds": 30, "pct": 3.3}},
+        ],
+    }
+
+
+def test_the_model_is_shown_what_the_run_found_in_the_footage():
+    """Without it the model can discuss weights and never the moments."""
+    from modules.advisor import build_prompt
+    from modules.highlight_advice import diagnose
+    report = _footage_report()
+    prompt = build_prompt(report, diagnose(report))
+    assert "## What the run found in the footage" in prompt
+    assert "## The kept clips, one line each" in prompt
+    assert "In clock order" in prompt
+
+
+def test_the_clip_lines_carry_the_rarity_that_argues_with_them():
+    from modules.advisor import build_prompt
+    from modules.highlight_advice import diagnose
+    report = _footage_report()
+    prompt = build_prompt(report, diagnose(report))
+    assert "is rare in this video" in prompt
+
+
+def test_the_reading_prompt_permits_a_guess_and_requires_it_to_be_marked():
+    from modules.advisor import READING_SYSTEM_PROMPT as rules
+    assert "may suggest what a combination of signals could mean" in rules
+    assert "Mark it as your reading" in rules
+    # ...and still cannot introduce arithmetic of its own.
+    assert "Never state a number that is not already in the material" in rules
+
+
+def test_the_reading_prompt_carries_the_limit_of_the_expression_channel():
+    from modules.advisor import READING_SYSTEM_PROMPT as rules
+    assert "cannot tell a performed expression from a felt one" in rules
+
+
+def test_advice_and_reading_are_kept_in_different_fields():
+    """Two opposite questions; a reader must be able to tell which is which."""
+    from modules.advisor import READING_SYSTEM_PROMPT, SYSTEM_PROMPT
+    assert READING_SYSTEM_PROMPT != SYSTEM_PROMPT
+    assert "never speculate" not in READING_SYSTEM_PROMPT.lower()
+
+
+def test_a_gguf_path_reaches_the_backend_as_a_path():
+    """The picker offers a .gguf; a name and a file are different arguments.
+
+    Passing the path as `model` left llama-cpp with an empty `model_path` and a
+    "GGUF model not found:" naming no file at all, so every local-model summary
+    failed identically to a missing model.
+    """
+    import modules.advisor as advisor
+
+    seen = {}
+
+    class _Fake:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def load(self):
+            return None
+
+    import llm.llm_module as llm_module
+    original = llm_module.LLMModule
+    llm_module.LLMModule = _Fake
+    try:
+        advisor.load_llm("llama-cpp", "D:/models/a.gguf")
+        assert seen.get("model_path") == "D:/models/a.gguf"
+        assert "model" not in seen
+        seen.clear()
+        advisor.load_llm("ollama", "llama3")
+        assert seen.get("model") == "llama3"
+        assert "model_path" not in seen
+    finally:
+        llm_module.LLMModule = original
+
+
+# --- fitting the prompt into a real context window --------------------------
+
+def _blocks():
+    return [(1, "## Footage\n" + "f" * 400),
+            (2, "## Documentation\n" + "d" * 400),
+            (3, "## Clips\n" + "c" * 400),
+            (4, "## Chapters\n" + "h" * 400)]
+
+
+def test_a_prompt_that_fits_keeps_everything():
+    from modules.advisor import _fit
+    said = _fit("HEAD", _blocks(), "## Task\nask", max_chars=10000)
+    for heading in ("## Footage", "## Documentation", "## Clips", "## Chapters"):
+        assert heading in said
+    assert "Left out" not in said
+
+
+def test_the_least_useful_section_goes_first():
+    """llama.cpp refuses an over-long call outright, so this is a budget."""
+    from modules.advisor import _fit
+    said = _fit("HEAD", _blocks(), "## Task\nask", max_chars=1500)
+    assert "## Footage" in said          # priority 1 survives
+    assert "## Chapters" not in said     # priority 4 goes first
+    assert len(said) <= 1500
+
+
+def test_the_question_is_never_dropped():
+    """A model given context and no question answers one it invented."""
+    from modules.advisor import _fit
+    said = _fit("HEAD", _blocks(), "## Task\nask", max_chars=1)
+    assert said.endswith("## Task\nask")
+
+
+def test_what_was_cut_is_named_in_the_prompt():
+    """A summary written without the chapters must not describe a video without them."""
+    from modules.advisor import _fit
+    said = _fit("HEAD", _blocks(), "## Task\nask", max_chars=1500)
+    assert "Left out of this prompt for length: Chapters" in said
+    assert "do not describe them as missing from the run" in said
+
+
+def test_a_real_report_fits_the_window_the_loader_asks_for():
+    """The failure this replaces was 5391 tokens against a 4096-token window."""
+    from modules.advisor import (DEFAULT_N_CTX, MAX_PROMPT_CHARS, SUMMARY_TOKENS,
+                                 build_prompt)
+    from modules.highlight_advice import diagnose
+    report = _footage_report()
+    # Twelve clips, scoring differently — a run the size that overran the window.
+    report["segments"] = [
+        dict(report["segments"][0], index=i, score=float(i),
+             start=i * 60.0, end=i * 60.0 + 30.0)
+        for i in range(1, 13)]
+    prompt = build_prompt(report, diagnose(report))
+    assert len(prompt) <= MAX_PROMPT_CHARS
+    # Four characters to the token, plus the answer, inside the window.
+    assert MAX_PROMPT_CHARS / 4 + SUMMARY_TOKENS < DEFAULT_N_CTX
+
+
+def test_the_loader_asks_for_a_window_the_prompt_can_live_in():
+    import inspect
+
+    import modules.advisor as advisor
+    assert "n_ctx=n_ctx" in inspect.getsource(advisor.load_llm)
+    assert advisor.DEFAULT_N_CTX > 4096

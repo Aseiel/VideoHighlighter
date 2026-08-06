@@ -864,10 +864,51 @@ class TestSubjectComparison:
                 "measured"]["comparison"]
             assert comparison["expression"]["label"] == "surprise"
 
+    def _turning_scan(self):
+        scan = {sec: ("neutral", 0.9) for sec in range(self.N)}
+        scan.update({sec: ("surprise", 0.9) for sec in range(63, 68)})
+        return scan
+
+    def test_the_marked_second_reaches_the_record_and_both_renderings(self):
+        report = self._built(expressions=self._turning_scan(),
+                             loudness_levels=[-30.0] * self.N)
+        reading = report["segments"][0]["expression_peak"]
+        assert reading["label"] == "surprise" and reading["second"] == 63
+        assert reading["turned"] is True
+        for page in (render_text(report), render_html(report)):
+            assert "turns from neutral to surprise" in page
+
+    def test_the_marked_second_is_ordered_against_the_loudest_one(self):
+        # Loudest at second 60, the reading settles at 63.
+        levels = [-30.0] * self.N
+        levels[60] = -5.0
+        report = self._built(expressions=self._turning_scan(),
+                             loudness_levels=levels)
+        assert "3s after the loudest point" in render_text(report)
+
+    def test_the_marked_second_is_reachable_from_the_player(self):
+        report = self._built(expressions=self._turning_scan(),
+                             loudness_levels=[-30.0] * self.N)
+        page = render_html(report, media_src="v.mp4")
+        assert 'data-t="63"' in page and "reads surprise" in page
+
+    def test_the_signed_comparison_reaches_both_renderings(self):
+        levels = [-40.0] * self.N
+        levels[60] = -5.0
+        report = self._built(expressions=self._turning_scan(),
+                             loudness_levels=levels)
+        assert "vs the video: + loudness" in render_text(report)
+        page = render_html(report)
+        assert '<div class="vs">' in page and 'class="ax up"' in page
+
     def test_a_run_with_no_detector_and_no_faces_reports_nothing_extra(self):
         report = self._built()
         assert "comparison" not in report["segments"][0]["measured"]
-        assert '<ul class="why">' not in render_html(report)
+        # Named sections rather than the bullet markup they share: the clip
+        # still summarises itself, it just has nothing comparative to say.
+        page = render_html(report)
+        assert "<b>On screen</b>" not in page
+        assert "<b>Face expression</b>" not in page
 
 
 # --- clip players -----------------------------------------------------------
@@ -1114,3 +1155,102 @@ def test_the_later_signal_comes_second():
     page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
     assert re.findall(r'data-t="([0-9.]+)"', page) == ["104", "128"]
     assert page.index("loudest second") < page.index("motion peak")
+
+
+# --- what arrived on screen, as the mark the others order around ------------
+
+class TestEventOnset:
+    """The category channel: named by the user's own rules, not by this repo.
+
+    Only *arrivals* count. A class on screen from a clip's first second is
+    scenery — it was there before the clip started and marks nothing — and
+    without that rule the mark would be "a person is present", which is true of
+    almost every clip in almost every video.
+    """
+
+    def _built(self, detections, composed=None, **over):
+        n = 200
+        score = np.zeros(n)
+        score[100:130] = 5.0
+        kwargs = dict(video_path="v.mp4", video_duration=float(n), score=score,
+                      signals={}, segments=[(100.0, 130.0)], near_miss_count=0,
+                      object_detections=detections, settings={},
+                      composed_event_names=composed)
+        kwargs.update(over)
+        return build_report(**kwargs)
+
+    def _detections(self, spans):
+        out = {}
+        for name, start, end in spans:
+            for sec in range(start, end):
+                out.setdefault(sec, []).append(name)
+        return out
+
+    def test_something_arriving_mid_clip_is_the_mark(self):
+        report = self._built(self._detections([("dog", 108, 125)]))
+        onset = report["segments"][0]["event_onset"]
+        assert onset["second"] == 108 and onset["name"] == "dog"
+
+    def test_scenery_present_from_the_first_second_marks_nothing(self):
+        report = self._built(self._detections([("person", 90, 130)]))
+        assert "event_onset" not in report["segments"][0]
+
+    def test_a_single_frame_is_a_flicker_not_an_arrival(self):
+        report = self._built(self._detections([("dog", 110, 111)]))
+        assert "event_onset" not in report["segments"][0]
+
+    def test_a_user_composed_event_outranks_a_raw_detection(self):
+        report = self._built(
+            self._detections([("dog", 105, 128), ("routine A", 112, 120)]),
+            composed=["routine A"])
+        onset = report["segments"][0]["event_onset"]
+        assert onset["name"] == "routine A" and onset["composed"] is True
+
+    def test_the_arrival_leads_the_clip_sequence(self):
+        levels = [-30.0] * 200
+        levels[115] = -4.0
+        report = self._built(self._detections([("dog", 108, 125)]),
+                             loudness_levels=levels)
+        said = render_text(report)
+        assert "In clock order: dog comes on screen at 1:48" in said
+        assert "the loudest point arrives 7s later" in said
+
+    def test_the_run_level_count_reaches_both_renderings(self):
+        n = 600
+        score = np.zeros(n)
+        segments = [(60.0, 90.0), (160.0, 190.0), (260.0, 290.0), (360.0, 390.0)]
+        spans, levels = [], [-30.0] * n
+        for start, _end in segments:
+            start = int(start)
+            score[start:start + 30] = 5.0
+            spans.append(("dog", start + 5, start + 25))
+            levels[start + 12] = -4.0
+        report = build_report(
+            video_path="v.mp4", video_duration=float(n), score=score, signals={},
+            segments=segments, near_miss_count=0, settings={},
+            object_detections=self._detections(spans), loudness_levels=levels)
+        assert len(report["event_relations"]) == 1
+        said = report["event_relations"][0]
+        assert "dog arrives in 4 of the kept clips" in said
+        assert said in render_text(report)
+        assert "dog arrives in 4 of the kept clips" in render_html(report)
+
+
+def test_a_model_summary_reaches_a_page_with_no_findings_on_it():
+    """A clean run wrote the summary into the record and showed nothing.
+
+    `_advice` returned early when there were no findings, taking the narration
+    with it — so the model ran, the page was re-rendered, and the report looked
+    untouched.
+    """
+    report = _player_report()
+    report["advice"] = []
+    report["advice_narration"] = "The cut is drawn from two stretches."
+    page = render_html(report)
+    assert "The cut is drawn from two stretches." in page
+    assert "Nothing in this run was diagnosed as a problem" in page
+
+
+def test_a_page_with_neither_findings_nor_a_summary_says_nothing():
+    report = _player_report()
+    assert "What to try next" not in render_html(report)
