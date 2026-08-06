@@ -70,6 +70,7 @@ jobs:
         run: >
           pyinstaller --name "VideoHighlighter"
           --icon "assets/icon.ico"
+          --splash "assets/splash.png"
           --windowed
           --noconfirm
           --add-data "config.yaml;."

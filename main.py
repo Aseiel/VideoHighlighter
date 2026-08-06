@@ -9,6 +9,18 @@ import sys
 from modules import debug_console
 debug_console.install()
 
+# Progress reporting for the launch itself. Imported here, before the heavy
+# imports below, because in a frozen build *they* are the slow part — several
+# seconds of decompressing and initialising cv2/OpenVINO/transformers before
+# any window can exist. The bootloader's splash covers that stretch with the
+# logo; these stage() calls are what make a slow launch readable afterwards in
+# debug.log, and they would drive the splash text too if the build ever moves
+# to a .spec (see modules/startup_splash.py on why the CLI flag cannot).
+# This module deliberately pulls in no Qt, so it cannot disturb the import
+# order below, which matters on Windows.
+from modules import startup_splash
+startup_splash.stage("Loading the video engine…")
+
 import cv2
 import json
 import subprocess
@@ -28,10 +40,12 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
+startup_splash.stage("Loading the assistant…")
 from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 from modules.ui import icons as _ui_icons, theme as _ui_theme
 
+startup_splash.stage("Loading the detection runtime…")
 try:
     import openvino  # registers OpenVINO's DLL dir on Windows
 except Exception:
@@ -5457,10 +5471,22 @@ class VideoHighlighterGUI(QWidget):
                     if same_video:
                         # Pick up any signals added on demand since it was opened
                         # (per-signal Run buttons fold into the cache on disk).
+                        #
+                        # Reusing the window is not the instant path it looks
+                        # like: the refresh re-ingests every signal and redraws
+                        # the timeline, which on a long video takes as long as
+                        # building the window did — and it blocks the GUI
+                        # thread, with the old view still on screen. Without the
+                        # splash, reopening looked like the app had frozen.
+                        startup_splash.begin("Reopening timeline viewer",
+                                             os.path.basename(video_path),
+                                             steps=4, parent=self)
                         try:
                             existing.refresh_from_disk()
                         except Exception as e:
                             self.append_log(f"⚠️ Could not refresh timeline cache: {e}")
+                        finally:
+                            startup_splash.finish(existing)
                         # Un-mute (close() muted the audio outputs) and re-show
                         for ao_attr, obj in (('audio_output', existing),
                                              ('_audio', getattr(existing, 'realtime_preview', None))):
@@ -5548,10 +5574,28 @@ class VideoHighlighterGUI(QWidget):
 
             
             self.append_log(f"📊 Opening timeline viewer for: {os.path.basename(video_path)}")
-            
-            # Create and show the timeline window
-            self.timeline_window = SignalTimelineWindow(video_path, cache_data)
-            self.timeline_window.show()
+
+            # Building this window takes several seconds on a real analysis —
+            # the signal timeline and the assistant panel are most of it — and
+            # it blocks the GUI thread, so without the splash the app just
+            # appears to hang. The window reports its own stages (see
+            # signal_timeline_viewer.init_ui).
+            startup_splash.begin("Opening timeline viewer",
+                                 os.path.basename(video_path), steps=6,
+                                 parent=self)
+            startup_splash.stage("Reading the analysis cache…")
+            window = None
+            try:
+                # Create and show the timeline window
+                window = SignalTimelineWindow(video_path, cache_data)
+                self.timeline_window = window
+                window.show()
+            finally:
+                # finally: a viewer that fails half-way must not leave an
+                # always-on-top splash stranded over the app with no window
+                # behind it to explain itself. `window` stays None in that
+                # case, so a *previous* viewer is never raised by mistake.
+                startup_splash.finish(window)
             # Connect LLM chat to timeline and video
             self.llm_chat.set_timeline_window(self.timeline_window)
             self.llm_chat.set_video_path(video_path)
@@ -5634,11 +5678,21 @@ if __name__ == "__main__":
     if os.path.exists(_icon_path):
         from PySide6.QtGui import QIcon
         app.setWindowIcon(QIcon(_icon_path))
+
+    # Hand over from the bootloader's splash to the Qt one, which can keep
+    # reporting through the window build (the remaining seconds) and follows
+    # the app's theme. begin() closes the native splash once this is painted.
+    startup_splash.begin(f"VideoHighlighter {__edition__}",
+                         f"Version {__version__}", steps=2)
+
     # Reopen the live debug-log window if it was on last session (needs the
     # QApplication, hence here and not earlier).
     debug_console.restore_console_preference()
+
+    startup_splash.stage("Building the workspace…")
     gui = VideoHighlighterGUI()
     gui.show()
+    startup_splash.finish(gui)
     exit_code = app.exec()
 
     # Backup hard-exit in case app.exec() does return (main closeEvent already

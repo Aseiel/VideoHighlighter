@@ -43,6 +43,11 @@ from datetime import datetime, timedelta
 from modules.ui.collapsible import CollapsibleSection
 from modules.ui.theme import DARK as THEME
 from modules.ui import icons as ui_icons
+# Building this window blocks the GUI thread for several seconds, so it reports
+# what it is on. The calls are no-ops unless someone opened a splash first
+# (modules/startup_splash.py), which keeps the window's own code free of any
+# knowledge of who, if anyone, is watching.
+from modules import startup_splash
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
 from video_ai_editor.timeline_export import TimelineExporter
@@ -1869,7 +1874,15 @@ class SignalTimelineWindow(QMainWindow):
         signal added on demand elsewhere (the main window's per-signal Run
         buttons fold straight into the cache file) shows up here — without
         tearing down this heavy window. Best-effort; a failed reload leaves the
-        current view untouched."""
+        current view untouched.
+
+        Reports stages like the initial build does: this is not the cheap path
+        it sounds like — re-ingesting the signals and redrawing the timeline is
+        seconds of blocked GUI thread on a long video, and reopening the viewer
+        runs it (see main.open_timeline_viewer, which reuses the window). The
+        calls are no-ops when nobody opened a splash, so the on-demand-analysis
+        caller is unaffected."""
+        startup_splash.stage("Re-reading the analysis cache…")
         try:
             fresh = self.load_cache_data()
         except Exception as e:
@@ -1881,6 +1894,7 @@ class SignalTimelineWindow(QMainWindow):
         self.cache_data = fresh
 
         # Re-ingest signals (updates cache_data, action/object type lists, redraws).
+        startup_splash.stage("Reloading signals…")
         self.signal_scene.reload_cache_data(self.cache_data)
 
         # Audio waveform may have just been added.
@@ -1906,9 +1920,11 @@ class SignalTimelineWindow(QMainWindow):
             except Exception:
                 continue
 
+        startup_splash.stage("Redrawing the timeline…")
         self.signal_scene.build_timeline()
 
         # Refresh side panels + status line.
+        startup_splash.stage("Refreshing the panels…")
         self.action_types = self.signal_scene.action_types
         self.object_classes = self.signal_scene.object_classes
         if hasattr(self, 'label_panel'):
@@ -1960,6 +1976,7 @@ class SignalTimelineWindow(QMainWindow):
         print(f"🎵 init_ui: Creating scene with waveform data ({len(self.waveform) if self.waveform else 0} points)")
         
         # Create scene with current waveform data (may be empty initially)
+        startup_splash.stage("Drawing the signal timeline…")
         self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration, waveform=self.waveform)
         self.signal_view = SignalTimelineView(self.signal_scene)
         # Lower floor so the whole top band (preview + timeline + controls) can
@@ -2025,6 +2042,7 @@ class SignalTimelineWindow(QMainWindow):
         edit_layout = QVBoxLayout(edit_widget)
         
         # Edit timeline
+        startup_splash.stage("Building the edit timeline…")
         self.edit_scene = EditTimelineScene(self.video_path, self.video_duration, cache=self.cache, cache_data=self.cache_data)
         self.edit_view = QGraphicsView(self.edit_scene)
         self.edit_view.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -2042,6 +2060,7 @@ class SignalTimelineWindow(QMainWindow):
         """)
         
         # --- LLM Chat Panel (in timeline) ---
+        startup_splash.stage("Starting the assistant…")
         try:
             from llm.llm_chat_widget import LLMChatWidget
             self.llm_chat = LLMChatWidget(parent=self, compact=True, cache_dir="./cache")
@@ -2097,6 +2116,7 @@ class SignalTimelineWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, controls_dock)
 
         # 🎬 ADD VIDEO PREVIEW DOCK
+        startup_splash.stage("Starting the video preview…")
         try:
             preview_dock = self.create_video_preview_dock()
             self.addDockWidget(Qt.LeftDockWidgetArea, preview_dock)
@@ -2108,6 +2128,7 @@ class SignalTimelineWindow(QMainWindow):
         # column (they used to be hidden docks behind toggle buttons, which
         # cost a second click and hid that they exist at all).
         self.setTabPosition(Qt.RightDockWidgetArea, QTabWidget.TabPosition.North)
+        startup_splash.stage("Building the side panels…")
         try:
             search_dock = self.create_search_dock()
             self.addDockWidget(Qt.RightDockWidgetArea, search_dock)
