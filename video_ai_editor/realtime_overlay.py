@@ -107,6 +107,45 @@ def action_abbrev(name: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────
+# StickyMenu — a menu whose checkboxes don't dismiss it
+# ──────────────────────────────────────────────────────────────────
+
+class StickyMenu(QMenu):
+    """QMenu that stays open when one of its checkable items is toggled.
+
+    Qt closes the whole menu chain on any trigger, so hiding four classes
+    on the overlay filter meant reopening the filter four times. Checkable
+    items now toggle in place; plain actions ("Show all", …) still close
+    the menu the usual way.
+    """
+
+    def _sticky_action(self) -> QAction | None:
+        act = self.activeAction()
+        if act is not None and act.isEnabled() and act.isCheckable():
+            return act
+        return None
+
+    def mouseReleaseEvent(self, event):
+        act = self._sticky_action()
+        # Only swallow releases that land on the item itself — a release
+        # outside the menu still dismisses it.
+        if act is not None and self.actionGeometry(act).contains(event.position().toPoint()):
+            act.trigger()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            act = self._sticky_action()
+            if act is not None:
+                act.trigger()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+
+# ──────────────────────────────────────────────────────────────────
 # LazyBBoxLoader — loads bboxes on demand
 # ──────────────────────────────────────────────────────────────────
 
@@ -1019,7 +1058,8 @@ class RealtimeOverlayPreview(QWidget):
 
         # Facial recognition is always offered — it's driven by the live face
         # worker, not the cache. Rebuilt on open so newly seen faces show up.
-        self._face_filter_menu = self._filter_menu.addMenu("🙂 Facial recognition")
+        self._face_filter_menu = StickyMenu("🙂 Facial recognition", self._filter_menu)
+        self._filter_menu.addMenu(self._face_filter_menu)
         self._face_filter_menu.aboutToShow.connect(self._rebuild_face_filter)
 
         if self._filter_actions:
@@ -1038,7 +1078,8 @@ class RealtimeOverlayPreview(QWidget):
         `names` are the raw class_name keys the scene filters on; the badge
         prefix is stripped for display only.
         """
-        sub = self._filter_menu.addMenu(title)
+        sub = StickyMenu(title, self._filter_menu)
+        self._filter_menu.addMenu(sub)
         group_actions: list[QAction] = []
 
         show_all = sub.addAction("Show all")
