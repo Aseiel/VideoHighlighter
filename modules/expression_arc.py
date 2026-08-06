@@ -123,6 +123,18 @@ CLASS_DELTA = 0.15
 # over eleven seconds is not a property of the class.
 MIN_CLASS_SECONDS = 30
 
+# A label held for fewer read seconds than this is a flicker rather than a
+# reading. Same number UNSTABLE_RUN calls too fast to be tracking anything: a
+# single second unlike the seconds either side of it is what a classifier
+# produces on a blurred frame, and pinning a moment on it would put a timestamp
+# on noise.
+MIN_PEAK_RUN = 2
+
+# How far back a differently-labelled second may sit and still count as what the
+# reading turned *from*. Beyond it the face was unreadable in between, so
+# "turned" would be describing a gap in the scan rather than a change on screen.
+TURN_GAP = 4
+
 
 def _normalise(expressions: Optional[Mapping]) -> dict:
     """``{second: (label, confidence)}`` from either shape the app produces."""
@@ -554,6 +566,115 @@ def _class_readings(labels: Mapping, detections: Mapping,
         })
     rows.sort(key=lambda r: (-abs(r["delta"]), r["name"]))
     return rows
+
+
+def peak_in_range(expressions: Optional[Mapping],
+                  start: float,
+                  end: float) -> Optional[dict]:
+    """The clearest stretch of one label inside a clip, and where it began.
+
+    The report already marks the second a clip was loudest and the second
+    movement stopped. This is the third mark of the same kind, and it is the one
+    that makes the other two comparable to something a person watches for: a
+    reading that arrives *after* the loudest point is a different clip from one
+    where it was there all along, and neither the arc nor the per-clip average
+    can tell those apart, because both average the clip flat.
+
+    What is returned is the *onset* — the first second of the run, not the
+    second the classifier was most sure. Confidence peaks wherever the face
+    happened to be most frontal, which is a fact about the camera; the onset is
+    the earliest second the reading was there at all, and that is the thing worth
+    putting beside another timestamp.
+
+    Two kinds of run are skipped, for the same reason. Neutral ones: timing a
+    neutral reading against the loudest point relates a moment to the absence of
+    one, which reads as a finding and is not. And the video's own dominant label
+    when it holds most of the file — a clip that reads sad inside a file that
+    reads sad throughout has told the reader about the file, and putting a
+    timestamp on it dresses the baseline up as an event. What is wanted is the
+    reading that departs from the norm, which is why the norm has to be measured
+    before a clip can be judged against it.
+
+    `surprise` is kept despite carrying no valence — it is unvalenced because
+    delight and alarm produce it alike, not because it is uninformative, and it
+    is the label most likely to mark the second something happened.
+
+    Returns ``None`` whenever nothing clears the bars, which is common and is
+    the point: a clip whose face was unreadable, or whose reading never settled,
+    has no second to name and should not be given one.
+    """
+    labels = _normalise(expressions)
+    if not labels:
+        return None
+    seconds = sorted(labels)
+    inside = [s for s in seconds if float(start) <= s < float(end)]
+    if not inside:
+        return None
+
+    # Runs of one label, contiguous in *read* seconds like `_runs` — a second
+    # the face was not visible in should not split a reading in two.
+    runs: list = []
+    for sec in inside:
+        label, confidence = labels[sec]
+        if runs and runs[-1]["label"] == label:
+            runs[-1]["seconds"].append(sec)
+            runs[-1]["confidence"].append(confidence)
+        else:
+            runs.append({"label": label, "seconds": [sec],
+                         "confidence": [confidence]})
+
+    # What this file reads as when nothing in particular is happening. Measured
+    # over the whole scan rather than the clip, because a clip is far too short
+    # to establish its own norm — and a norm taken from the clip would rule out
+    # exactly the run that fills it.
+    counts: dict = {}
+    for label, _confidence in labels.values():
+        counts[label] = counts.get(label, 0) + 1
+    dominant = max(sorted(counts), key=lambda k: counts[k])
+    pervasive = (100.0 * counts[dominant] / len(labels)) >= DOMINANT_SHARE
+
+    usable = []
+    for run in runs:
+        if str(run["label"]).lower() == "neutral":
+            continue
+        if pervasive and run["label"] == dominant:
+            continue
+        if len(run["seconds"]) < MIN_PEAK_RUN:
+            continue
+        mean = float(np.mean(run["confidence"]))
+        if mean < LOW_CONFIDENCE:
+            continue
+        usable.append((mean, len(run["seconds"]), run))
+    if not usable:
+        return None
+
+    # Strongest reading first, then the longest, then the earliest. Mean rather
+    # than peak confidence: a run that reads 0.8 throughout is better evidence
+    # than one that touched 0.9 on a single frame and 0.4 either side of it.
+    mean, length, run = max(usable, key=lambda u: (u[0], u[1], -u[2]["seconds"][0]))
+    onset = int(run["seconds"][0])
+
+    # What it turned from, when there is a reading close enough behind it to
+    # have turned from anything. Deliberately looks outside the clip too: a
+    # change three seconds before the clip starts is still a change.
+    previous = [s for s in seconds if s < onset]
+    from_label = ""
+    if previous:
+        last = previous[-1]
+        earlier = labels[last][0]
+        if onset - last <= TURN_GAP and earlier != run["label"]:
+            from_label = earlier
+
+    return {
+        "second": onset,
+        "timestamp": f"{onset // 60}:{onset % 60:02d}",
+        "label": run["label"],
+        "confidence": round(mean, 2),
+        "seconds": int(length),
+        "read_seconds": len(inside),
+        "turned": bool(from_label),
+        "from_label": from_label,
+    }
 
 
 def _segment_readings(labels: Mapping, segments: Iterable[Sequence[float]],

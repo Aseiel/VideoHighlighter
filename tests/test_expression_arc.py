@@ -19,6 +19,7 @@ from modules.expression_arc import (
     DOMINANT_SHARE,
     GOOD_FIT,
     analyse,
+    peak_in_range,
     valence_of,
 )
 
@@ -266,3 +267,76 @@ class TestClassReadings:
     def test_no_detections_means_no_class_breakdown(self):
         assert "by_class" not in analyse(_scan([("sad", 0, 600, 0.9)]),
                                          duration=600)
+
+
+class TestPeakInRange:
+    """The clip's own marked second — the one that gets put in an order.
+
+    Everything here is about refusing to name a second. The measurement is only
+    worth anything beside the loudest second and the motion peak, and a
+    timestamp taken off a single blurred frame would sit in that sentence
+    looking exactly as solid as one taken off a four-second run.
+    """
+
+    def test_the_onset_is_reported_not_the_most_confident_second(self):
+        """Confidence peaks where the face is frontal, which is about the camera."""
+        scan = _scan([("neutral", 0, 40, 0.9)])
+        scan.update({40: ("surprise", 0.7), 41: ("surprise", 0.95),
+                     42: ("surprise", 0.7)})
+        found = peak_in_range(scan, 30, 60)
+        assert found["second"] == 40
+        assert found["label"] == "surprise"
+        assert found["seconds"] == 3
+
+    def test_what_the_reading_turned_from_is_carried(self):
+        scan = _scan([("neutral", 0, 40, 0.9), ("happy", 40, 46, 0.9)])
+        found = peak_in_range(scan, 30, 60)
+        assert found["turned"] is True
+        assert found["from_label"] == "neutral"
+
+    def test_a_reading_that_was_already_there_is_not_called_a_turn(self):
+        scan = _scan([("sad", 0, 40, 0.9), ("happy", 40, 70, 0.9),
+                      ("neutral", 70, 100, 0.9)])
+        found = peak_in_range(scan, 45, 70)
+        assert found["label"] == "happy"
+        assert found["turned"] is False
+        assert found["from_label"] == ""
+
+    def test_the_video_own_reading_is_not_dressed_up_as_a_moment(self):
+        """A sad clip inside a sad film describes the film, not the clip."""
+        scan = _scan([("sad", 0, 200, 0.9)])
+        scan.update(_scan([("happy", 60, 70, 0.85)]))
+        assert peak_in_range(scan, 100, 140) is None
+        # ...and the run that departs from that norm is the one that gets named.
+        assert peak_in_range(scan, 55, 80)["label"] == "happy"
+
+    def test_a_single_second_is_a_flicker_and_names_nothing(self):
+        scan = _scan([("neutral", 0, 60, 0.9)])
+        scan[40] = ("anger", 0.99)
+        assert peak_in_range(scan, 30, 60) is None
+
+    def test_a_near_tie_is_not_a_reading(self):
+        """The floor `face_emotions` uses to call a face unreadable."""
+        scan = _scan([("neutral", 0, 40, 0.9), ("sad", 40, 50, 0.45)])
+        assert peak_in_range(scan, 30, 60) is None
+
+    def test_neutral_is_never_the_mark(self):
+        """Timing a moment against the absence of one reads as a finding."""
+        scan = _scan([("neutral", 0, 60, 0.95)])
+        assert peak_in_range(scan, 0, 60) is None
+
+    def test_the_strongest_run_wins_not_the_first(self):
+        scan = _scan([("sad", 0, 10, 0.65), ("neutral", 10, 20, 0.9),
+                      ("happy", 20, 30, 0.92)])
+        assert peak_in_range(scan, 0, 30)["label"] == "happy"
+
+    def test_a_clip_with_no_readable_face_has_no_mark(self):
+        assert peak_in_range(_scan([("happy", 0, 60, 0.9)]), 200, 260) is None
+        assert peak_in_range({}, 0, 60) is None
+
+    def test_the_evidence_behind_the_mark_is_reported_with_it(self):
+        scan = _scan([("neutral", 0, 40, 0.9), ("happy", 40, 50, 0.8)])
+        found = peak_in_range(scan, 30, 60)
+        assert found["read_seconds"] == 20
+        assert found["confidence"] == 0.8
+        assert found["timestamp"] == "0:40"

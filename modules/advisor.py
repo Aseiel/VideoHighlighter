@@ -51,6 +51,42 @@ SYSTEM_PROMPT = (
     "settings will not fix it rather than suggesting settings."
 )
 
+# The other thing a model can usefully do with this report: read the footage
+# rather than the settings. Kept as its own prompt because the two ask for
+# opposite behaviour -- the advisor above must never speculate, and this is
+# hired to. What makes that safe is not caution, it is separation: it says out
+# loud that it is reading rather than measuring, and it cannot introduce a
+# figure, so anything it suggests can be checked against the sections above it.
+READING_SYSTEM_PROMPT = (
+    "You are reading measurements another tool made of someone's video, and "
+    "telling them what it looks like was going on. The measurements are given "
+    "as plain sentences, already checked.\n"
+    "Rules:\n"
+    "1. Every observation must rest on something in the material given. If you "
+    "want to say something it does not support, say instead that the "
+    "measurements do not show it.\n"
+    "2. Never state a number that is not already in the material.\n"
+    "3. You may suggest what a combination of signals could mean. Mark it as "
+    "your reading when you do -- 'this looks like', 'this could be' -- and "
+    "never phrase a guess so it reads as something that was measured.\n"
+    "4. The interesting part is how signals relate to each other across clips. "
+    "Prefer one connection you can point at over a list of what each signal "
+    "did.\n"
+    "5. If the material says a combination is common in this video, say that it "
+    "does not single any moment out, however suggestive it looks.\n"
+    "6. The expression labels come from a five-class classifier that cannot "
+    "tell a performed expression from a felt one. Treat them as labels on a "
+    "face, and say so if you build anything on them.\n"
+    "7. Be brief and concrete. No preamble, no headings, no restating the "
+    "question."
+)
+
+READING_TASK = (
+    "In 4 sentences or fewer: say what this video looks like it is doing, and "
+    "point at the one connection between signals that a person should check "
+    "first."
+)
+
 # The default ask. Deliberately tight: this lands at the top of a report whose
 # findings are already listed underneath in full, so a long restatement of them
 # pushes the actual evidence off the screen and earns nothing.
@@ -62,6 +98,19 @@ SUMMARY_TASK = (
 # Tokens for that summary. Three sentences do not need more, and every token is
 # time the user waits.
 SUMMARY_TOKENS = 200
+
+# How much prompt a local model can be handed. llama.cpp refuses the entire call
+# when the prompt overruns the context window — "Prompt exceeds n_ctx" and
+# nothing generated — so this is a budget rather than a guideline: overrunning it
+# costs the whole narration, not its last paragraph. Roughly four characters to
+# the token against the window :func:`load_llm` asks for, leaving room for the
+# system prompt and the answer.
+MAX_PROMPT_CHARS = 24000
+
+# What the report asks a llama-cpp model for. The 4096 default is smaller than
+# this report's own prompt once a video has chapters and a dozen clips, and the
+# failure it produces is silent at the point the user sees it.
+DEFAULT_N_CTX = 8192
 
 
 def knowledge_topics(knowledge_dir: str = KNOWLEDGE_DIR) -> dict:
@@ -110,12 +159,23 @@ def format_findings(findings: Sequence[Finding]) -> str:
 def build_prompt(report: Mapping,
                  findings: Sequence[Finding],
                  question: Optional[str] = None,
-                 knowledge_dir: str = KNOWLEDGE_DIR) -> str:
-    """What the model is given: this run, its findings, and the relevant pages."""
+                 knowledge_dir: str = KNOWLEDGE_DIR,
+                 max_chars: int = MAX_PROMPT_CHARS) -> str:
+    """What the model is given: this run, its findings, and the relevant pages.
+
+    Assembled to a budget — see :func:`_fit`. A report with a dozen clips and a
+    chapter breakdown outgrew the default context window of a local model, and
+    llama.cpp answers that by refusing the call rather than by truncating, so
+    the user lost the narration entirely rather than its least useful section.
+    """
     totals = report.get("totals") or {}
     video = report.get("video") or {}
     settings = report.get("settings") or {}
 
+    # (priority, text) for everything optional. The head and the findings are
+    # not in here: without them there is nothing to narrate and the call is a
+    # waste of the minute the user spends waiting for it.
+    blocks = []
     parts = [
         "## This run",
         f"Video length: {float(video.get('duration') or 0) / 60:.0f} minutes",
@@ -128,6 +188,43 @@ def build_prompt(report: Mapping,
         format_findings(findings),
         "",
     ]
+
+    # What the run actually measured about the footage, as opposed to what it
+    # diagnosed about the settings. Without this the model is asked to comment
+    # on a video it has been told nothing about beyond its length: it can
+    # discuss weights and never the moments, which is half the question people
+    # ask it. Sentences again rather than figures, for the reason below.
+    try:
+        from modules.highlight_prose import (clip_sections, conclude,
+                                             summarise_clip)
+        sections = conclude(report)
+        if sections:
+            lines = []
+            for section in sections:
+                lines.append(f"### {section['heading']}")
+                lines.extend(section["lines"])
+            blocks.append((1, "## What the run found in the footage\n"
+                              + "\n".join(lines)))
+
+        # Per clip: the order its marks arrived in and how unusual that
+        # combination is for this video. This is the raw material for any
+        # observation about how the signals relate, and it is the part the model
+        # cannot reconstruct from anything else in the prompt.
+        clips = []
+        for entry in (report.get("segments") or [])[:12]:
+            said = " ".join(summarise_clip(entry))
+            if not said:
+                continue
+            channels = [h for h, _lines in clip_sections(entry)]
+            clips.append(f"- Clip {entry.get('index', '?')} "
+                         f"({entry.get('range', '')}): {said} "
+                         f"[channels with something to say: "
+                         f"{', '.join(channels) or 'none'}]")
+        if clips:
+            blocks.append((3, "## The kept clips, one line each\n"
+                              + "\n".join(clips)))
+    except Exception as exc:                # narration must survive this
+        print(f"⚠️ Footage context skipped: {exc}")
 
     # Where in the video the cut came from. Worth the tokens because it answers
     # a question the findings cannot: a cut drawn entirely from one stretch of a
@@ -146,19 +243,46 @@ def build_prompt(report: Mapping,
                 lines.append(f"- {ch.get('timestamp', '')} {ch.get('title', '')} "
                              f"({float(ch.get('duration') or 0):.0f}s, "
                              f"{int(ch.get('clips') or 0)} clip(s)): {said}")
-            parts += ["## How the video divides, and where the clips came from",
-                      "\n".join(lines), ""]
+            blocks.append((
+                4, "## How the video divides, and where the clips came from\n"
+                   + "\n".join(lines)))
         except Exception as exc:            # narration must survive this
             print(f"⚠️ Chapter context skipped: {exc}")
 
-    parts.append("## Documentation")
-    for name, text in knowledge_for(findings, knowledge_dir).items():
-        parts.append(f"### {name}\n{text}")
+    docs = knowledge_for(findings, knowledge_dir)
+    if docs:
+        blocks.append((2, "## Documentation\n" + "\n".join(
+            f"### {name}\n{text}" for name, text in docs.items())))
 
-    parts.append("")
-    parts.append("## Task")
-    parts.append(question or SUMMARY_TASK)
-    return "\n".join(parts)
+    return _fit("\n".join(parts), blocks,
+                "## Task\n" + (question or SUMMARY_TASK), max_chars)
+
+
+def _fit(head: str, blocks: Sequence, task: str, max_chars: int) -> str:
+    """Head, as many blocks as fit, then the task — and a note on what was cut.
+
+    Blocks are dropped in reverse order of what they are worth to the answer,
+    lowest priority first. The task is never dropped: a model given context and
+    no question answers one it invented.
+
+    What was left out is named in the prompt. A summary written without the
+    chapter breakdown must not read as a summary of a video that did not have
+    one, and a model told nothing about the omission has no way to avoid that.
+    """
+    kept = sorted(blocks, key=lambda b: b[0])
+    dropped = []
+    while True:
+        body = "\n\n".join(text for _priority, text in kept)
+        note = ""
+        if dropped:
+            note = ("\n\n(Left out of this prompt for length: "
+                    + ", ".join(dropped) + ". These were measured — do not "
+                    "describe them as missing from the run.)")
+        prompt = f"{head}\n{body}{note}\n\n{task}"
+        if len(prompt) <= max_chars or not kept:
+            return prompt
+        lost = kept.pop()
+        dropped.append(lost[1].splitlines()[0].lstrip("# ").strip())
 
 
 def _generate(llm, prompt: str, system: str, max_tokens: int) -> str:
@@ -183,7 +307,8 @@ def narrate(report: Mapping,
             llm=None,
             question: Optional[str] = None,
             knowledge_dir: str = KNOWLEDGE_DIR,
-            max_tokens: int = SUMMARY_TOKENS) -> Optional[str]:
+            max_tokens: int = SUMMARY_TOKENS,
+            system: Optional[str] = None) -> Optional[str]:
     """Ask a local model to phrase the findings. ``None`` if none is available.
 
     ``llm`` is either an ``llm.llm_module.LLMModule`` or one of its backends —
@@ -194,7 +319,7 @@ def narrate(report: Mapping,
         return None
     prompt = build_prompt(report, findings, question, knowledge_dir)
     try:
-        text = _generate(llm, prompt, SYSTEM_PROMPT, max_tokens)
+        text = _generate(llm, prompt, system or SYSTEM_PROMPT, max_tokens)
     except Exception as exc:            # a missing model must not break the run
         print(f"⚠️ Advisor narration failed: {exc}")
         return None
@@ -222,7 +347,8 @@ def summarise_report_file(json_path: str,
                           *,
                           llm,
                           question: Optional[str] = None,
-                          knowledge_dir: str = KNOWLEDGE_DIR) -> Optional[str]:
+                          knowledge_dir: str = KNOWLEDGE_DIR,
+                          reading: bool = False) -> Optional[str]:
     """Write a short summary into a report already on disk, page and record both.
 
     Re-renders the HTML from the updated record rather than patching it, so the
@@ -239,13 +365,18 @@ def summarise_report_file(json_path: str,
         report = json.load(fh)
 
     findings = diagnose(report)
-    text = narrate(report, findings, llm=llm, question=question,
-                   knowledge_dir=knowledge_dir)
+    # Two different jobs, kept in two different fields. Tuning advice and a
+    # reading of the footage answer opposite questions, and a reader who cannot
+    # tell which one they are looking at will act on the wrong one.
+    text = narrate(report, findings, llm=llm,
+                   question=question or (READING_TASK if reading else None),
+                   knowledge_dir=knowledge_dir,
+                   system=READING_SYSTEM_PROMPT if reading else None)
     if not text:
         return None
 
     report["advice"] = [f.as_dict() for f in findings]
-    report["advice_narration"] = text
+    report["reading" if reading else "advice_narration"] = text
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=1)
 
@@ -256,12 +387,20 @@ def summarise_report_file(json_path: str,
     return text
 
 
-def load_llm(backend: str = "ollama", model: str = "llama3"):
+def load_llm(backend: str = "ollama", model: str = "llama3",
+             mmproj: Optional[str] = None, n_ctx: int = DEFAULT_N_CTX):
     """Load a local model for narration, or return ``None`` with a reason.
 
     Never called automatically: narration costs seconds to minutes, and paying
     that on every render — for prose that repeats findings already on the page —
     would be a poor trade.
+
+    ``model`` is an Ollama tag or, for ``llama-cpp``, the path to a ``.gguf``.
+    The two go to different constructor arguments — ``LLMModule`` takes a name
+    as ``model`` and a file as ``model_path``, and passing a path as the name
+    left the backend with an empty path and a "GGUF model not found:" that named
+    no file. The model picker has offered a .gguf path since it was written, so
+    every attempt to use one from here failed that way.
     """
     try:
         from llm.llm_module import LLMModule
@@ -269,7 +408,11 @@ def load_llm(backend: str = "ollama", model: str = "llama3"):
         print(f"⚠️ No LLM stack available: {exc}")
         return None
     try:
-        llm = LLMModule(backend=backend, model=model)
+        if backend == "llama-cpp":
+            llm = LLMModule(backend=backend, model_path=model,
+                            mmproj_path=mmproj, n_ctx=n_ctx)
+        else:
+            llm = LLMModule(backend=backend, model=model)
         llm.load()
         return llm
     except Exception as exc:

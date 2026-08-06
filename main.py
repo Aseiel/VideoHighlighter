@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QComboBox, QTabWidget, QListWidget, QSplitter,
     QDialog, QDialogButtonBox, QAbstractItemView,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
-    QGridLayout, QSlider, QSizePolicy,
+    QGridLayout, QSlider, QSizePolicy, QToolButton, QMenu,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
@@ -44,6 +44,9 @@ startup_splash.stage("Loading the assistant…")
 from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 from modules.ui import icons as _ui_icons, theme as _ui_theme
+# The five classes the expression scan can report. Imported for the Basic
+# tab's picker; the module itself loads no model until something asks it to scan.
+from modules.face_emotions import EMOTION_LABELS
 
 startup_splash.stage("Loading the detection runtime…")
 try:
@@ -1393,7 +1396,8 @@ class VideoHighlighterGUI(QWidget):
 
         # ── Group 1: Scoring Points ──
         points_box = QGroupBox("Scoring Points")
-        points_layout = QFormLayout()
+        points_layout = QVBoxLayout()
+        points_layout.setSpacing(6)
 
         self.spin_scene_points = QSpinBox(); self.spin_scene_points.setRange(0,100); self.spin_scene_points.setValue(scoring_cfg.get("scene_points", 0))
         self.spin_scene_points.setToolTip("Points awarded when a new scene cut is detected (abrupt visual change)")
@@ -1432,6 +1436,36 @@ class VideoHighlighterGUI(QWidget):
         self.spin_action = QSpinBox(); self.spin_action.setRange(0,1000); self.spin_action.setValue(scoring_cfg.get("action_points", 10))
         self.spin_action.setToolTip("Points when a configured action is recognized (e.g. punching, jumping, dancing)")
 
+        self.spin_face_expression = QSpinBox(); self.spin_face_expression.setRange(0,100)
+        self.spin_face_expression.setValue(scoring_cfg.get("face_expression_points", 0))
+        self.spin_face_expression.setToolTip(
+            "Points for a second whose strongest face reads as one of the "
+            "expressions you pick beside this.\n\nThe scan runs only when this "
+            "is above 0 AND at least one expression is chosen — with either "
+            "missing there is no outcome it could change, so it is skipped.\n\n"
+            "It reports what a five-class classifier saw on a face, not what "
+            "anyone felt: it has no notion of intensity, degrades on profile "
+            "and occlusion, and cannot tell a performed expression from a felt "
+            "one.")
+        self._face_label_actions = {}
+        self.btn_face_labels = QToolButton()
+        self.btn_face_labels.setPopupMode(QToolButton.InstantPopup)
+        self.btn_face_labels.setToolTip(
+            "Which expressions earn the points above. Picking all of them "
+            "scores every second a face is visible, which distinguishes "
+            "nothing — so choose the ones that mark the moments you want.")
+        face_menu = QMenu(self.btn_face_labels)
+        chosen = {str(x).lower()
+                  for x in (scoring_cfg.get("face_expression_labels") or [])}
+        for _label in EMOTION_LABELS:
+            act = face_menu.addAction(_label)
+            act.setCheckable(True)
+            act.setChecked(_label in chosen)
+            act.toggled.connect(self._update_face_labels_button)
+            self._face_label_actions[_label] = act
+        self.btn_face_labels.setMenu(face_menu)
+        self._update_face_labels_button()
+
         self.spin_beginning_seconds = QSpinBox(); self.spin_beginning_seconds.setRange(0,3600); self.spin_beginning_seconds.setSuffix(" s"); self.spin_beginning_seconds.setValue(scoring_cfg.get("beginning_seconds", 60))
         self.spin_beginning_seconds.setToolTip("How many seconds from the start of the video count as the intro window")
 
@@ -1456,39 +1490,72 @@ class VideoHighlighterGUI(QWidget):
         outro_row.addStretch(1)
         outro_widget = QWidget(); outro_widget.setLayout(outro_row)
 
+        # One box per signal rather than one list of eleven rows. The labels
+        # only mean anything once the reader knows which detector a row belongs
+        # to, and in a flat column that has to be inferred from the wording of
+        # each label — which is why the shortest ones ("Scene points") were the
+        # hardest to place. A box answers it before the row is read.
+        face_row = QWidget()
+        face_h = QHBoxLayout(face_row)
+        face_h.setContentsMargins(0, 0, 0, 0)
+        face_h.setSpacing(6)
+        face_h.addWidget(self.spin_face_expression)
+        face_h.addWidget(self.btn_face_labels)
+        face_h.addStretch(1)
+
         # Scene / motion-event / motion-peak all come from ONE detector pass, so
         # the button lives on the first of the three and runs all three.
-        points_layout.addRow("Scene points:", self._points_row_with_button(
-            self.spin_scene_points, "motion", "Motion & scenes",
-            "Detect scene cuts and motion across every video in the list and cache "
-            "them (covers scene, motion event and motion peak — one pass). No "
-            "highlights are cut."))
-        points_layout.addRow("Motion event points:", self.spin_motion_event_points)
-        points_layout.addRow("Motion peak points:", self.spin_motion_peak)
-        points_layout.addRow("Audio peak points:", self._points_row_with_button(
-            self.spin_audio_peak, "audio", "Audio",
-            "Detect audio peaks across every video in the list and cache them. "
-            "No highlights are cut."))
-        points_layout.addRow("Loudness burst points (relative to local level):",
-                             self.spin_loudness_burst)
-        # Keyword + transcript points both come from ONE transcription pass.
-        points_layout.addRow("Keyword points (keywords in transcript):", self.spin_keyword_points)
-        points_layout.addRow("Transcript points (all words):", self._points_row_with_button(
-            self.spin_transcript_points, "transcript", "Transcribe",
-            "Transcribe every video in the list to a _transcript.txt sidecar and "
-            "cache it (uses the model/language in the Transcript tab). No "
-            "highlights are cut."))
-        points_layout.addRow("Object points:", self._points_row_with_button(
-            self.spin_object, "objects", "Objects",
-            "Detect the classes from the 'Object detection' field below, across "
-            "every video in the list, and cache them. No highlights are cut."))
-        points_layout.addRow("Action points:", self._points_row_with_button(
-            self.spin_action, "actions", "Actions",
-            "Detect the actions from the 'Action keywords' field below (blank = "
-            "all actions), across every video in the list, and cache them. No "
-            "highlights are cut."))
-        points_layout.addRow("Intro (window, points):", intro_widget)
-        points_layout.addRow("Outro (window, points):", outro_widget)
+        # Keyword + transcript points likewise share one transcription pass.
+        groups = (
+            ("Movement && scenes", (
+                ("Scene points:", self._points_row_with_button(
+                    self.spin_scene_points, "motion", "Motion & scenes",
+                    "Detect scene cuts and motion across every video in the list "
+                    "and cache them (covers scene, motion event and motion peak "
+                    "— one pass). No highlights are cut.")),
+                ("Motion event points:", self.spin_motion_event_points),
+                ("Motion peak points:", self.spin_motion_peak),
+            )),
+            ("Audio", (
+                ("Audio peak points:", self._points_row_with_button(
+                    self.spin_audio_peak, "audio", "Audio",
+                    "Detect audio peaks across every video in the list and cache "
+                    "them. No highlights are cut.")),
+                ("Loudness burst points (vs local level):",
+                 self.spin_loudness_burst),
+            )),
+            ("Speech", (
+                ("Keyword points (keywords in transcript):",
+                 self.spin_keyword_points),
+                ("Transcript points (all words):", self._points_row_with_button(
+                    self.spin_transcript_points, "transcript", "Transcribe",
+                    "Transcribe every video in the list to a _transcript.txt "
+                    "sidecar and cache it (uses the model/language in the "
+                    "Transcript tab). No highlights are cut.")),
+            )),
+            ("Objects && actions", (
+                ("Object points:", self._points_row_with_button(
+                    self.spin_object, "objects", "Objects",
+                    "Detect the classes from the 'Object detection' field below, "
+                    "across every video in the list, and cache them. No "
+                    "highlights are cut.")),
+                ("Action points:", self._points_row_with_button(
+                    self.spin_action, "actions", "Actions",
+                    "Detect the actions from the 'Action keywords' field below "
+                    "(blank = all actions), across every video in the list, and "
+                    "cache them. No highlights are cut.")),
+            )),
+            ("Face expression", (
+                ("Points, and which expressions:", face_row),
+            )),
+            ("Where in the video", (
+                ("Intro (window, points):", intro_widget),
+                ("Outro (window, points):", outro_widget),
+            )),
+        )
+        for title, rows in groups:
+            points_layout.addWidget(self._points_group(title, rows))
+        points_layout.addStretch(1)
 
         points_box.setLayout(points_layout)
         basic_layout.addWidget(points_box, 0, 0, Qt.AlignTop)
@@ -3333,6 +3400,8 @@ class VideoHighlighterGUI(QWidget):
             "ending_seconds": int(self.spin_ending_seconds.value()),
             "object_points": int(self.spin_object.value()),
             "action_points": int(self.spin_action.value()),
+            "face_expression_points": int(self.spin_face_expression.value()),
+            "face_expression_labels": self.selected_face_labels(),
             "clip_time": int(self.spin_clip_time.value()),
             "coverage": self.slider_coverage.value() / 100.0,
             "report_only": bool(getattr(self, "_report_only", False)),
@@ -3893,6 +3962,8 @@ class VideoHighlighterGUI(QWidget):
                 "transcript_points": int(self.spin_transcript_points.value()),
                 "object_points": int(self.spin_object.value()),
                 "action_points": int(self.spin_action.value()),
+                "face_expression_points": int(self.spin_face_expression.value()),
+                "face_expression_labels": self.selected_face_labels(),
                 "beginning_points": int(self.spin_beginning_points.value()),
                 "ending_points": int(self.spin_ending_points.value()),
                 "beginning_seconds": int(self.spin_beginning_seconds.value()),
@@ -4630,10 +4701,17 @@ class VideoHighlighterGUI(QWidget):
         beginning_points = int(self.spin_beginning_points.value())
         ending_points = int(self.spin_ending_points.value())
         
+        # Expressions only count when a class is chosen, for the same reason
+        # objects need a class list: the scan is skipped otherwise, so counting
+        # the weight would promise points nothing can earn.
+        face_points = (int(self.spin_face_expression.value())
+                       if self.selected_face_labels() else 0)
+
         total_points = (scene_points + motion_event_points + motion_peak_points + 
                        audio_peak_points + loudness_burst_points +
                        keyword_points + transcript_points + 
-                       beginning_points + ending_points + object_points + action_points)
+                       beginning_points + ending_points + object_points + action_points
+                       + face_points)
         
         if total_points == 0:
             self.append_log("❌ ERROR: All scoring points are set to 0!")
@@ -4704,6 +4782,8 @@ class VideoHighlighterGUI(QWidget):
             "ending_seconds": int(self.spin_ending_seconds.value()),
             "object_points": int(self.spin_object.value()),
             "action_points": int(self.spin_action.value()),
+            "face_expression_points": int(self.spin_face_expression.value()),
+            "face_expression_labels": self.selected_face_labels(),
             "clip_time": int(self.spin_clip_time.value()),
             "coverage": self.slider_coverage.value() / 100.0,
             "report_only": bool(getattr(self, "_report_only", False)),
@@ -4849,6 +4929,40 @@ class VideoHighlighterGUI(QWidget):
         btn.clicked.connect(lambda _=False, k=kind: self.start_signal_run(k))
         self._analyze_buttons[kind] = btn
         return btn
+
+    def _points_group(self, title, rows):
+        """One signal's scoring rows, in their own titled box.
+
+        ``rows`` is ``((label, field), ...)`` — the same pairs a form layout
+        takes, so a row moves between groups by moving one tuple.
+        """
+        box = QGroupBox(title)
+        form = QFormLayout()
+        form.setContentsMargins(8, 4, 8, 4)
+        form.setSpacing(4)
+        for label, field in rows:
+            form.addRow(label, field)
+        box.setLayout(form)
+        return box
+
+    def selected_face_labels(self):
+        """The expression classes chosen to score, lowercased for the pipeline."""
+        return [name for name, act in
+                getattr(self, "_face_label_actions", {}).items()
+                if act.isChecked()]
+
+    def _update_face_labels_button(self, *_args):
+        """Keep the button reading as what it will actually score.
+
+        Named rather than counted while the list is short: "happy, surprise" is
+        the setting itself, where "2 selected" makes the user open the menu to
+        find out what they chose. The empty case has to say the consequence —
+        points with nothing selected score nothing at all, and a button reading
+        "none" would look like a valid state.
+        """
+        chosen = self.selected_face_labels()
+        self.btn_face_labels.setText(
+            ", ".join(chosen) if chosen else "pick expressions…")
 
     def _points_row_with_button(self, spin, kind, label, tooltip):
         """Wrap a scoring-point spinbox and its on-demand Run button into one
@@ -5259,13 +5373,48 @@ class VideoHighlighterGUI(QWidget):
         return json_path
 
     def _ai_summary_settings(self):
-        from PySide6.QtCore import QSettings
-        s = QSettings("VideoHighlighter", "Pro")
-        return (s.value("advisor/backend", "ollama"),
-                s.value("advisor/model", "llama3"))
+        """The model a report is written with, as ``(backend, name-or-path)``."""
+        entry = self._active_llm_model()
+        if not entry:
+            return ("ollama", "llama3")
+        return (entry["backend"], entry["model"])
 
-    def write_ai_summary(self, question=None):
-        """Generate the summary and put it in the report, then open it."""
+    def _llm_models(self):
+        """Every configured model, oldest single-model setting folded in."""
+        from PySide6.QtCore import QSettings
+        from modules.llm_models import migrate, parse
+
+        s = QSettings("VideoHighlighter", "Pro")
+        models = parse(s.value("advisor/models"))
+        if not models:
+            models = migrate(models, s.value("advisor/backend"),
+                             s.value("advisor/model"))
+        return models
+
+    def _save_llm_models(self, models, chosen=None):
+        from PySide6.QtCore import QSettings
+        from modules.llm_models import label_for, serialise
+
+        s = QSettings("VideoHighlighter", "Pro")
+        s.setValue("advisor/models", serialise(models))
+        if chosen is not None:
+            s.setValue("advisor/model_chosen", label_for(chosen))
+
+    def _active_llm_model(self):
+        from PySide6.QtCore import QSettings
+        from modules.llm_models import active
+
+        s = QSettings("VideoHighlighter", "Pro")
+        return active(self._llm_models(), s.value("advisor/model_chosen"))
+
+    def write_ai_summary(self, question=None, reading=False, model=None):
+        """Generate the summary and put it in the report, then open it.
+
+        ``reading`` swaps the task: the default asks what to change about the
+        run, this asks what the footage looks like it is doing. Two different
+        questions, kept in two fields on the report so a reader can always tell
+        which one they are looking at.
+        """
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
         from PySide6.QtWidgets import QApplication
@@ -5275,22 +5424,27 @@ class VideoHighlighterGUI(QWidget):
             return
 
         from modules import advisor
-        backend, model = self._ai_summary_settings()
-        self.append_log(f"🤖 Asking {backend}/{model} to summarise the report… "
-                        "this takes a moment.")
+        entry = model or self._active_llm_model()
+        backend = (entry or {}).get("backend", "ollama")
+        model = (entry or {}).get("model", "llama3")
+        mmproj = (entry or {}).get("mmproj")
+        self.append_log(
+            f"🤖 Asking {backend}/{model} to "
+            f"{'read what happens in this cut' if reading else 'summarise the report'}… "
+            "this takes a moment.")
         # The call blocks; without this the window looks hung rather than busy.
         self.ai_summary_btn.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
         try:
-            llm = advisor.load_llm(backend, model)
+            llm = advisor.load_llm(backend, model, mmproj=mmproj)
             if llm is None:
                 self.append_log(
                     f"⚠️ Could not reach {backend}/{model}. The report's findings "
                     "are there without it — only the summary needs a model.")
                 return
             text = advisor.summarise_report_file(
-                json_path, llm=llm, question=question or None)
+                json_path, llm=llm, question=question or None, reading=reading)
         except Exception as exc:
             self.append_log(f"⚠️ Summary failed: {exc}")
             return
@@ -5309,17 +5463,47 @@ class VideoHighlighterGUI(QWidget):
     def show_ai_summary_menu(self):
         from PySide6.QtWidgets import QMenu
 
+        from modules.llm_models import label_for
+
         menu = QMenu(self)
+        # First, because it is the one that answers "what is in this video"
+        # rather than "what should I change" — and the one people reach for.
+        act_read = menu.addAction("Read what happens in this cut…")
         act_wrong = menu.addAction("Something's wrong with this cut…")
         act_ask = menu.addAction("Ask a question about this cut…")
         act_chat = menu.addAction("Discuss in LLM chat")
+
+        # Which model writes it. A submenu rather than a setting to go and
+        # change, because the choice belongs to the run: reading a scene and
+        # advising on weights suit different models, and picking one here is the
+        # difference between switching and going to look for where switching
+        # lives.
+        models = self._llm_models()
+        active_model = self._active_llm_model()
+        read_with = {}
+        if len(models) > 1:
+            menu.addSeparator()
+            sub = menu.addMenu("Read with…")
+            for entry in models:
+                item = sub.addAction(label_for(entry))
+                item.setCheckable(True)
+                item.setChecked(entry == active_model)
+                item.setToolTip(f"{entry['backend']} · {entry['model']}")
+                read_with[item] = entry
+
         menu.addSeparator()
-        backend, model = self._ai_summary_settings()
-        act_model = menu.addAction(f"Model: {backend} / {model}…")
+        act_model = menu.addAction(
+            f"Models: {label_for(active_model)}…" if models else "Add a model…")
 
         chosen = menu.exec(self.ai_summary_opts_btn.mapToGlobal(
             self.ai_summary_opts_btn.rect().bottomLeft()))
-        if chosen is act_wrong:
+        if chosen in read_with:
+            entry = read_with[chosen]
+            self._save_llm_models(models, chosen=entry)
+            self.write_ai_summary(reading=True, model=entry)
+        elif chosen is act_read:
+            self.write_ai_summary(reading=True)
+        elif chosen is act_wrong:
             self._report_what_is_wrong()
         elif chosen is act_ask:
             self._ask_ai_summary_question()
@@ -5390,25 +5574,28 @@ class VideoHighlighterGUI(QWidget):
             self.write_ai_summary(question.strip())
 
     def _choose_ai_summary_model(self):
-        from PySide6.QtCore import QSettings
-        from PySide6.QtWidgets import QInputDialog
+        """The report's models, on one screen — the chat panel's form, listed.
 
-        backend, model = self._ai_summary_settings()
-        backends = ["ollama", "llama-cpp"]
-        picked, ok = QInputDialog.getItem(
-            self, "Summary model", "Backend:", backends,
-            backends.index(backend) if backend in backends else 0, False)
-        if not ok:
-            return
-        name, ok = QInputDialog.getText(
-            self, "Summary model",
-            "Model name (ollama) or path to a .gguf (llama-cpp):", text=model)
-        if not ok or not name.strip():
-            return
-        s = QSettings("VideoHighlighter", "Pro")
-        s.setValue("advisor/backend", picked)
-        s.setValue("advisor/model", name.strip())
-        self.append_log(f"🤖 Summary model set to {picked} / {name.strip()}")
+        Was a chain of four prompts with no view of what was already configured
+        and no way back from the second one.
+        """
+        from modules.llm_models import label_for
+        from modules.ui.model_dialog import ModelDialog
+
+        models = self._llm_models()
+        active = self._active_llm_model()
+        dialog = ModelDialog(self, models=models,
+                             chosen=label_for(active) if active else None)
+        dialog.exec()
+
+        self._save_llm_models(dialog.models)
+        if dialog.chosen:
+            from PySide6.QtCore import QSettings
+            QSettings("VideoHighlighter", "Pro").setValue(
+                "advisor/model_chosen", dialog.chosen)
+            self.append_log(f"🤖 The report will be written with {dialog.chosen}.")
+        elif not dialog.models:
+            self.append_log("🤖 No model configured for the report.")
 
     def _discuss_report_in_chat(self):
         """Open the LLM chat with this run's findings already in front of it."""
