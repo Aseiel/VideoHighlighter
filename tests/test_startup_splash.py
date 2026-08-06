@@ -63,7 +63,7 @@ def qt_app():
 
 class TestSplashLifecycle:
     def test_begin_shows_and_finish_clears(self, qt_app):
-        splash = startup_splash.begin("VideoHighlighter Pro", "Version 9.9", steps=3)
+        splash = startup_splash.begin("VideoHighlighter", "Version 9.9", steps=3)
 
         assert splash is not None
         assert startup_splash.active()
