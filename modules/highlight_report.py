@@ -794,6 +794,30 @@ def build_report(*,
             print(f"⚠️ Transcript summary skipped: {exc}")
             speech_summary = {}
 
+    # What was talked about that nothing was watching for, and what an earlier
+    # run added a rule to watch for. Both only mean anything once there is a
+    # transcript to compare the class list against, so both live here.
+    vocabulary = {}
+    checks = []
+    if chapter_rows and speech_summary:
+        try:
+            from modules.vocabulary_gap import observed_classes, summarise
+            vocabulary = summarise(
+                chapter_rows,
+                observed_classes(object_detections, bbox_cache,
+                                 composed_event_names or ()),
+                list(composed_event_names or ()))
+        except Exception as exc:                   # pragma: no cover - defensive
+            print(f"⚠️ Vocabulary gap skipped: {exc}")
+    try:
+        from modules.rule_proposal import load_checks, settle_checks
+        pending = load_checks(video_path)
+        if pending:
+            checks = settle_checks(pending, object_detections,
+                                   list(composed_event_names or ()))
+    except Exception as exc:                       # pragma: no cover - defensive
+        print(f"⚠️ Pending checks skipped: {exc}")
+
     kept_duration = sum(e - s for s, e in segments)
     return {
         "schema": 3,
@@ -832,6 +856,13 @@ def build_report(*,
         # against. Empty when no transcript was run, which is what every
         # renderer below tests rather than testing a config flag.
         "speech": speech_summary,
+        # What the detector could see, and what the video talked about that it
+        # could not. The gap is what makes an unconfirmable claim visible as
+        # such rather than as an absence nobody noticed.
+        "vocabulary": vocabulary,
+        # Claims an earlier run added a rule to test, and whether that rule
+        # fired this time. This is what closes the loop the advisor opens.
+        "checks": checks,
         "level_by_class": level_summary,
         # Whether the ordering between the marked seconds repeats across the
         # run. One clip's ordering is a coincidence; a repeated one is a
