@@ -544,24 +544,38 @@ def summarise_clip(entry: Mapping,
     louder than the video it came from — each one already measured, each one
     said the way a person would say it.
 
-    "In clock order" survives the rewrite and is doing the same work it always
-    did. Plain prose about one moment reads as a story, and a story reads as a
-    cause; three words at the front keep the sentence an ordering.
+    It reads as a paragraph rather than as four findings stacked up. Each of
+    these was its own bullet once, and a clip described in four clauses that
+    never refer to each other reads like a form someone filled in — which is
+    what a reader is being spared here, not given a compressed version of.
+
+    "In order" survives the rewrite and is doing the same work the longer phrase
+    did. Prose about one moment reads as a story, and a story reads as a cause;
+    two words at the front keep the sentence an ordering without narrating the
+    caution.
     """
-    lines = []
+    said = []
+
     opening = _standing_and_evidence(entry, peer_scores)
     if opening:
-        lines.append(opening)
+        said.append(opening)
+
+    # The order and the clip's character in one sentence: they are the same
+    # thought — what happened, and what it was like — and splitting them was
+    # what made the summary read as a list of separate verdicts.
     chain = _clip_chain(entry)
-    if chain:
-        lines.append(chain)
     character = _clip_character(entry)
-    if character:
-        lines.append(character)
+    if chain and character:
+        said.append(f"{chain[:-1]} — {character[0].lower()}{character[1:]}")
+    elif chain:
+        said.append(chain)
+    elif character:
+        said.append(character)
+
     unusual = describe_combination(entry)
     if unusual:
-        lines.append(unusual)
-    return lines
+        said.append(unusual)
+    return [" ".join(said)] if said else []
 
 
 # How much of a video has to carry a combination before it stops being unusual.
@@ -601,17 +615,15 @@ def describe_combination(entry: Mapping) -> str:
     pct = float(combination.get("pct") or 0.0)
 
     if pct <= RARE_COMBINATION:
-        return (f"All of that together — {named} — is rare in this video: "
-                f"almost no other stretch of it carries the same combination.")
+        return ("Hardly anywhere else in this video do those land together, "
+                "which is what makes the clip worth a look.")
     if pct <= UNCOMMON_COMBINATION:
-        return (f"That combination — {named} — turns up in a minority of this "
-                f"video's other stretches.")
+        return "Not many other stretches of this video put those together."
     if pct <= COMMON_COMBINATION:
-        return (f"That combination — {named} — is fairly common here: a good "
-                f"part of the video carries it too.")
-    return (f"That combination — {named} — is routine in this video: most "
-            f"stretches of it carry the same marks, so the agreement between "
-            f"these signals says little about this clip in particular.")
+        return ("A fair part of the video does the same thing, so this is not "
+                "the only place to look.")
+    return ("Most of the video does the same thing, though — so the signals "
+            "agreeing here says little about this clip in particular.")
 
 
 def _standing_and_evidence(entry: Mapping,
@@ -672,7 +684,7 @@ def _clip_chain(entry: Mapping) -> str:
         else:
             words = _gap_words(gap).replace(" later", " after that")
             clauses.append(f"{clause} {words}")
-    return f"In clock order: {_join(clauses)}."
+    return f"In order: {_join(clauses)}."
 
 
 def _clip_character(entry: Mapping) -> str:
@@ -1142,6 +1154,13 @@ def describe_chapter(chapter: Mapping) -> list:
             lines.append(f"{change['name']} drops back — {was:.0f}% of the "
                          f"previous chapter, {now:.0f}% of this one.")
 
+    # What was said, when a transcript was run. Placed with the other "what is
+    # this stretch" lines rather than with the video-wide comparisons below,
+    # because on footage where the detectors have little to distinguish it is
+    # the only line that says what the chapter is *about* rather than how it
+    # ranks. Empty when no transcript reached the report.
+    lines.extend(describe_speech(chapter))
+
     for finding in distinctive(chapter):
         phrase = _lift_phrase(float(finding["lift"]))
         if not phrase:
@@ -1182,6 +1201,118 @@ def describe_chapter(chapter: Mapping) -> list:
     if not lines:
         lines.append("Nothing here separates it from the rest of the video.")
     return lines
+
+
+def describe_speech(chapter: Mapping) -> list:
+    """What the soundtrack of one chapter was, in sentences. ``[]`` if silent.
+
+    Every clause is a threshold over a figure :mod:`modules.chapter_speech`
+    measured, exactly like the rest of this module — the transcript widens what
+    can be described, it does not license a guess. In particular the distinctive
+    words are introduced as *the words this stretch used and the others did
+    not*, never as what the stretch is about: the first is arithmetic over the
+    transcript and the second is a reading, and only the reader (or the narrator
+    in :mod:`modules.advisor`, which is labelled as speculating) gets to make
+    it.
+    """
+    from modules.chapter_speech import NEARLY_SILENT_PCT, SPEECH_DROP, SPEECH_LIFT
+
+    lines = []
+    share = chapter.get("speech_share_pct")
+    if share is None:                    # no transcript reached this run
+        return lines
+    share = float(share)
+    words = int(chapter.get("words") or 0)
+
+    # The change against the previous chapter first: it is the one speech fact
+    # that describes a boundary rather than a stretch, and a chapter list is
+    # read top to bottom.
+    change = chapter.get("speech_change") or {}
+    if change:
+        was, now = float(change["from_pct"]), float(change["to_pct"])
+        if change["direction"] == "rose":
+            lines.append(f"The talking starts here — {was:.0f}% of the previous "
+                         f"chapter was speech against {now:.0f}% of this one.")
+        else:
+            lines.append(f"The talking stops here — {was:.0f}% of the previous "
+                         f"chapter was speech against {now:.0f}% of this one.")
+
+    if share <= NEARLY_SILENT_PCT:
+        # Said plainly rather than as a percentage: "4% speech" invites the
+        # reader to picture sparse dialogue, and four per cent of nine minutes
+        # is a handful of words in a stretch that is otherwise silent.
+        if not change:
+            lines.append("Almost nothing is said in this stretch."
+                         if words else "Nothing is said in this stretch.")
+    else:
+        lift = float(chapter.get("speech_lift") or 0.0)
+        rate = float(chapter.get("words_per_minute") or 0.0)
+        detail = f"{share:.0f}% of it is speech, {rate:.0f} words a minute"
+        if lift >= SPEECH_LIFT:
+            lines.append(f"Talks more than the rest of the video — {detail}, "
+                         f"{lift:.1f}× the video's rate.")
+        elif lift and lift <= SPEECH_DROP:
+            lines.append(f"Quieter in words than the rest of the video — "
+                         f"{detail}, {lift:.1f}× the video's rate.")
+        elif not change:
+            lines.append(f"{detail.capitalize()}.")
+
+    found = chapter.get("speech_words") or []
+    if found:
+        said = ", ".join(str(f["word"]) for f in found)
+        # "and the others did not" is load-bearing. Without it the list reads as
+        # the chapter's subject, which is a claim about meaning that inverse
+        # document frequency cannot support.
+        lines.append(f"Words used here that the other chapters did not: {said}.")
+
+    speakers = chapter.get("speakers") or []
+    if len(speakers) > 1:
+        top = speakers[0]
+        lines.append(f"{len(speakers)} voices, the longest speaking for "
+                     f"{float(top.get('seconds') or 0):.0f}s.")
+    elif len(speakers) == 1:
+        lines.append("One voice throughout.")
+
+    return lines
+
+
+def summarise_speech_run(chapters: Sequence[Mapping],
+                         video: Optional[Mapping] = None) -> str:
+    """One sentence about how speech is distributed across the whole video.
+
+    The fact worth one line is *concentration*: a transcript whose words all sit
+    in two of eleven chapters says the video has a spoken section and a wordless
+    one, which is a structural finding no visual signal in this repo produces.
+    An evenly spoken video says the opposite, and both are more useful than the
+    total word count.
+    """
+    from modules.chapter_speech import NEARLY_SILENT_PCT
+
+    rows = [c for c in (chapters or []) if c.get("speech_share_pct") is not None]
+    if not rows:
+        return ""
+    total_words = sum(int(c.get("words") or 0) for c in rows)
+    if not total_words:
+        return "Nothing in the video was transcribed as speech."
+
+    spoken = [c for c in rows if float(c.get("speech_share_pct") or 0.0)
+              > NEARLY_SILENT_PCT]
+    overall = float((video or {}).get("speech_share_pct") or 0.0)
+    head = (f"{total_words} words transcribed"
+            + (f", {overall:.0f}% of the runtime" if overall else ""))
+
+    if not spoken:
+        return f"{head} — none of it concentrated enough to describe a chapter."
+    if len(spoken) == len(rows):
+        return f"{head}, spread across every chapter."
+
+    # Ranked, because "which stretches" is the question this sentence exists to
+    # answer and an unordered list of numbers does not answer it.
+    spoken.sort(key=lambda c: -float(c.get("speech_share_pct") or 0.0))
+    named = ", ".join(str(c.get("title") or f"chapter {c.get('number')}")
+                      for c in spoken[:3])
+    return (f"{head}, concentrated in {len(spoken)} of {len(rows)} chapters "
+            f"({named}) — the rest is close to wordless.")
 
 
 def summarise_chapter_run(chapters: Sequence[Mapping]) -> str:
@@ -1683,7 +1814,7 @@ def describe_sequence(entry: Mapping) -> str:
             clauses.append(f"{clause} {gap}s later")
         else:
             clauses.append(f"{clause} {gap}s after that")
-    return f"In clock order: {_join(clauses)}."
+    return f"In order: {_join(clauses)}."
 
 
 def describe_signal_relations(entry: Mapping) -> str:
@@ -2046,13 +2177,15 @@ def _section_summary(report: Mapping) -> list:
 
     if len(steps) < 2:
         return []
+    # One short line, not the paragraph this used to be. The limit has to be
+    # visible, and a reader who meets four sentences of it under every report
+    # stops reading the section rather than the caveat — which loses both. The
+    # sections above already say what each measurement is; this only has to say
+    # that an order is not a cause.
     return [
         "Put together, most of the kept clips run the same way: "
-        + ", ".join(steps) + ".",
-        "That is the order these things happen in, and the report can say no "
-        "more than that. What the moment meant — whether anyone felt what the "
-        "face was labelled, whether the sound was a reaction to what was on "
-        "screen — is not in the measurements, and is for whoever watches it.",
+        + ", ".join(steps)
+        + " — an order, not a cause; what it meant is for whoever watches it.",
     ]
 
 

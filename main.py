@@ -5443,8 +5443,10 @@ class VideoHighlighterGUI(QWidget):
                     f"⚠️ Could not reach {backend}/{model}. The report's findings "
                     "are there without it — only the summary needs a model.")
                 return
+            from modules.llm_models import label_for
             text = advisor.summarise_report_file(
-                json_path, llm=llm, question=question or None, reading=reading)
+                json_path, llm=llm, question=question or None, reading=reading,
+                model_name=label_for(entry))
         except Exception as exc:
             self.append_log(f"⚠️ Summary failed: {exc}")
             return
@@ -5460,6 +5462,214 @@ class VideoHighlighterGUI(QWidget):
         if os.path.exists(html_path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
 
+    def write_chapter_story(self, model=None):
+        """Narrate every chapter of the newest report, then open it.
+
+        One model call per chapter, so this is minutes rather than seconds and
+        the log has to show progress — a silent wait of that length reads as a
+        hang. The projector is asked for here, unlike everywhere else in the
+        report: this is the one narration that sends pictures, and a model that
+        can see the footage is the difference between describing what was said
+        and describing what happened.
+        """
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtWidgets import QApplication
+
+        json_path = self._newest_why_report_json()
+        if not json_path:
+            return
+
+        import json
+
+        from modules import advisor, chapter_story
+        from modules.llm_models import label_for
+
+        try:
+            with open(json_path, encoding="utf-8") as fh:
+                chapters = json.load(fh).get("chapters") or []
+        except Exception as exc:
+            self.append_log(f"⚠️ Could not read the report: {exc}")
+            return
+        if not chapters:
+            self.append_log("⚠️ This report has no chapters to tell.")
+            return
+
+        entry = model or self._active_llm_model()
+        backend = (entry or {}).get("backend", "ollama")
+        name = (entry or {}).get("model", "llama3")
+        mmproj = (entry or {}).get("mmproj")
+        self.append_log(
+            f"📖 Asking {backend}/{name} to tell {len(chapters)} chapters — "
+            "one call each, so this takes minutes, not seconds.")
+        self.ai_summary_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            llm = advisor.load_llm(backend, name, mmproj=mmproj, vision=True)
+            if llm is None:
+                self.append_log(
+                    f"⚠️ Could not reach {backend}/{name}. The chapters keep "
+                    "their measurements — only the telling needs a model.")
+                return
+
+            def progress(line):
+                # Straight to the user's pane rather than the debug log: this
+                # is the only thing moving for the next several minutes.
+                self.append_log(line)
+                QApplication.processEvents()
+
+            told = chapter_story.tell_report_file(
+                json_path, llm=llm, model_name=label_for(entry),
+                log_fn=progress)
+        except Exception as exc:
+            self.append_log(f"⚠️ Telling the chapters failed: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.ai_summary_btn.setEnabled(True)
+
+        if not told:
+            self.append_log("⚠️ The model returned nothing; report unchanged.")
+            return
+        self.append_log(f"📖 Told {told} of {len(chapters)} chapters.")
+        html_path = os.path.splitext(json_path)[0] + ".html"
+        if os.path.exists(html_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
+
+    def propose_composition_rule(self, model=None):
+        """Draft a rule that would let the next run check something that was said.
+
+        The one place in this app where a model's output becomes configuration,
+        so the sequence is fixed: it proposes, `rule_proposal` rejects anything
+        naming a class this video has no detections for, the user reads the YAML
+        and says yes, and only then is the file written. There is no path that
+        skips the middle two.
+        """
+        import json
+
+        from PySide6.QtWidgets import (QApplication, QInputDialog, QMessageBox)
+
+        from modules import advisor, rule_proposal
+        from modules.app_paths import composition_rules_path
+        from modules.llm_models import label_for
+
+        json_path = self._newest_why_report_json()
+        if not json_path:
+            return
+        try:
+            with open(json_path, encoding="utf-8") as fh:
+                report = json.load(fh)
+        except Exception as exc:
+            self.append_log(f"⚠️ Could not read the report: {exc}")
+            return
+
+        vocabulary = report.get("vocabulary") or {}
+        classes = vocabulary.get("classes") or []
+        if not classes:
+            self.append_log(
+                "⚠️ This report has no detections to build a rule from. Run "
+                "object detection with a transcript first.")
+            return
+
+        # What the user wants tested. Seeded from the strongest gap so the
+        # common case is a keypress, and editable because the gap is a
+        # candidate rather than a question.
+        # Seeded with the longest line among the gaps rather than the most
+        # distinctive one. Keyness ranks "Mm-hmm." top on real footage — it is
+        # genuinely concentrated and genuinely not a claim — and a dialog that
+        # opens with it reads as the feature being broken. Length is a crude
+        # proxy for "contains an assertion" and beats the alternative.
+        gaps = vocabulary.get("gaps") or []
+        seed = max((str(where.get("quote") or "")
+                    for gap in gaps for where in (gap.get("chapters") or [])),
+                   key=len, default="")
+        claim, ok = QInputDialog.getMultiLineText(
+            self, "Check something that was said",
+            "Which claim should the next run try to check?\n"
+            "A line from the transcript works best — the rule is built to "
+            "confirm or contradict it.\n"
+            f"Classes available in this video: {', '.join(classes)}",
+            seed)
+        if not ok or not claim.strip():
+            return
+
+        entry = model or self._active_llm_model()
+        backend = (entry or {}).get("backend", "ollama")
+        name = (entry or {}).get("model", "llama3")
+        rules_path = composition_rules_path()
+        self.append_log(f"🧩 Asking {backend}/{name} for a rule that would "
+                        "check that…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            llm = advisor.load_llm(backend, name)
+            if llm is None:
+                self.append_log(f"⚠️ Could not reach {backend}/{name}.")
+                return
+            proposal = rule_proposal.propose(
+                claim.strip(), classes, llm=llm,
+                existing=rule_proposal.existing_rules(rules_path),
+                gaps=gaps, claim_at=self._claim_second(report, claim),
+                model_name=label_for(entry))
+        except Exception as exc:
+            self.append_log(f"⚠️ Rule proposal failed: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if proposal is None:
+            self.append_log(
+                "⚠️ No usable rule came back. Either the claim cannot be "
+                "expressed with the classes this video has, or the model named "
+                "one it does not have — the debug log says which.")
+            return
+
+        answer = QMessageBox.question(
+            self, "Add this rule?",
+            f"<b>{proposal.label}</b><br><br>"
+            f"{proposal.why}<br><br>"
+            f"<pre>{proposal.as_yaml()}</pre>"
+            f"Add it to your composition rules?<br>"
+            f"<small>{rules_path}<br>The current file is backed up first. "
+            f"Object detection must re-run before this can fire.</small>",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self.append_log("ℹ️ Rule not added.")
+            return
+
+        try:
+            rule_proposal.apply(rules_path, proposal,
+                                video_path=(report.get("video") or {}).get("path"))
+        except Exception as exc:
+            self.append_log(f"⚠️ Could not write the rule: {exc}")
+            return
+        self.append_log(
+            f"✅ Added '{proposal.name}' to {os.path.basename(rules_path)}. "
+            "Re-run with object detection forced (a cached detection pass "
+            "skips the composition engine), then tell the chapters again — the "
+            "report will say whether it fired.")
+
+    @staticmethod
+    def _claim_second(report, claim):
+        """Where in the video a claim was said, if it is a line of transcript.
+
+        Matched on the stored text so the check can be filed under the chapter
+        the sentence belongs to. Returns None when the user typed a question of
+        their own rather than pasting a line, which is a perfectly good way to
+        use this and simply carries no timestamp.
+        """
+        wanted = " ".join(str(claim or "").split()).lower()
+        if not wanted:
+            return None
+        for chapter in (report.get("chapters") or []):
+            for line in ((chapter.get("dialogue") or [])
+                         + (chapter.get("quotes") or [])):
+                text = " ".join(str(line.get("text") or "").split()).lower()
+                if text and (text in wanted or wanted in text):
+                    return float(line.get("start") or 0.0)
+        return None
+
     def show_ai_summary_menu(self):
         from PySide6.QtWidgets import QMenu
 
@@ -5469,6 +5679,13 @@ class VideoHighlighterGUI(QWidget):
         # First, because it is the one that answers "what is in this video"
         # rather than "what should I change" — and the one people reach for.
         act_read = menu.addAction("Read what happens in this cut…")
+        # The chapter walk-through is the slow one — a call per chapter rather
+        # than one for the report — so it says so on the menu rather than in a
+        # log line the user reads after committing to the wait.
+        act_story = menu.addAction("Tell the story, chapter by chapter… (slow)")
+        # Closes the loop the other two open: they describe what was said, this
+        # is how the next run gets a signal that can check it.
+        act_rule = menu.addAction("Check something that was said…")
         act_wrong = menu.addAction("Something's wrong with this cut…")
         act_ask = menu.addAction("Ask a question about this cut…")
         act_chat = menu.addAction("Discuss in LLM chat")
@@ -5503,6 +5720,10 @@ class VideoHighlighterGUI(QWidget):
             self.write_ai_summary(reading=True, model=entry)
         elif chosen is act_read:
             self.write_ai_summary(reading=True)
+        elif chosen is act_story:
+            self.write_chapter_story()
+        elif chosen is act_rule:
+            self.propose_composition_rule()
         elif chosen is act_wrong:
             self._report_what_is_wrong()
         elif chosen is act_ask:
@@ -5563,15 +5784,26 @@ class VideoHighlighterGUI(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
 
     def _ask_ai_summary_question(self):
+        """A typed question is about the footage, and goes to the reader.
+
+        It went to the advisor, whose system prompt opens "you help someone tune
+        a video highlight tool" and whose rules push every answer toward a weight
+        to change. So a question about what happens in a video was answered by
+        the persona hired to talk about settings, and came back sounding like it
+        had refused — when it had simply been asked by the wrong one of the two.
+
+        Tuning questions have their own item on this menu.
+        """
         from PySide6.QtWidgets import QInputDialog
 
         question, ok = QInputDialog.getText(
             self, "Ask about this cut",
-            "What would you like to know?\n"
-            "The model answers from this run's findings and the advisor docs.",
-            text="Why is every clip so similar?")
+            "What would you like to know about this video?\n"
+            "The model answers from what the run measured — the marks, their "
+            "order, and how often the video repeats them.",
+            text="What does the pattern across these clips look like to you?")
         if ok and question.strip():
-            self.write_ai_summary(question.strip())
+            self.write_ai_summary(question.strip(), reading=True)
 
     def _choose_ai_summary_model(self):
         """The report's models, on one screen — the chat panel's form, listed.
