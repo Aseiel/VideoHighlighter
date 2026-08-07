@@ -962,7 +962,7 @@ def test_three_marks_are_told_as_one_sequence():
     from modules.highlight_prose import describe_signal_relations
     entry = dict(_marks(1719, 1728), expression_peak=_reading(1731))
     said = describe_signal_relations(entry)
-    assert said == ("In clock order: movement drops away at 28:39, the loudest "
+    assert said == ("In order: movement drops away at 28:39, the loudest "
                     "point arrives 9s later and the reading turns to surprise "
                     "3s after that.")
     # The sequence replaces the pairwise comparisons rather than joining them.
@@ -973,7 +973,7 @@ def test_the_sequence_is_an_ordering_and_says_so():
     from modules.highlight_prose import describe_signal_relations
     said = describe_signal_relations(
         dict(_marks(1719, 1728), expression_peak=_reading(1731)))
-    assert said.startswith("In clock order:")
+    assert said.startswith("In order:")
     for invented in ("because", "caused", "triggered", "resulted",
                      "reacted", "in response", "led to"):
         assert invented not in said.lower()
@@ -1000,7 +1000,7 @@ def test_a_gap_too_wide_to_examine_breaks_the_chain():
     entry = dict(_marks(1600, 1728), expression_peak=_reading(1731))
     said = describe_signal_relations(entry)
     # Motion is stranded 128s back, so the remaining pair falls to comparison.
-    assert "In clock order" not in said
+    assert "In order:" not in said
     assert "turns to surprise 3s after the loudest point" in said
 
 
@@ -1146,7 +1146,7 @@ def test_the_category_leads_the_sequence_when_it_arrives_first():
                  event_onset={"second": 1715, "name": "routine A",
                               "timestamp": "28:35"})
     said = describe_sequence(entry)
-    assert said.startswith("In clock order: routine A comes on screen at 28:35")
+    assert said.startswith("In order: routine A comes on screen at 28:35")
     assert "movement drops away 4s later" in said
 
 
@@ -1300,8 +1300,10 @@ def test_the_summary_never_names_a_feeling_or_a_cause():
 def test_the_summary_ends_on_what_it_cannot_say():
     from modules.highlight_prose import conclude
     last = conclude(_run_report(segments=_ordered_clips()))[-1]["lines"][-1]
-    assert "the order these things happen in" in last
-    assert "is for whoever watches it" in last
+    # One clause now, not four sentences: a caveat nobody finishes reading
+    # loses the section and the caveat both.
+    assert "an order, not a cause" in last
+    assert "for whoever watches it" in last
 
 
 def test_one_step_is_not_a_sequence_worth_summarising():
@@ -1375,7 +1377,7 @@ def test_each_line_sits_under_the_signal_that_produced_it():
     assert "surprise" in filed["Face expression"]
     # Sentence-cased by `_subject_line`, which leads with the class name.
     assert "Guitar fills" in filed["On screen"]
-    assert "In clock order" in filed["Summary"]
+    assert "In order:" in filed["Summary"]
 
 
 def test_the_relation_between_signals_is_the_summary_not_a_signal():
@@ -1383,7 +1385,7 @@ def test_the_relation_between_signals_is_the_summary_not_a_signal():
     from modules.highlight_prose import clip_sections
     for heading, lines in clip_sections(_full_clip()):
         if heading != "Summary":
-            assert "In clock order" not in " ".join(lines)
+            assert "In order:" not in " ".join(lines)
 
 
 def test_a_signal_that_measured_nothing_gets_no_heading():

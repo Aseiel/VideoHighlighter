@@ -24,6 +24,7 @@ Standalone usage — findings need nothing installed, narration needs a model:
 """
 from __future__ import annotations
 
+import datetime as _dt
 import os
 from typing import Mapping, Optional, Sequence
 
@@ -260,6 +261,42 @@ def build_prompt(report: Mapping,
         except Exception as exc:            # narration must survive this
             print(f"⚠️ Chapter context skipped: {exc}")
 
+    # What was actually said, when a transcript was run. Priority 0 — ahead of
+    # everything optional including the documentation — because it is the only
+    # block in the prompt that carries meaning rather than magnitude. Every
+    # other section tells the model how much of something there was; this one
+    # tells it what the video is about, and without it a question like "what
+    # happens here" can only be answered from motion curves and expression
+    # labels, which is how a narrator ends up inventing a plot.
+    #
+    # Quotes rather than a summary of them: a model handed the lines can be
+    # checked against the report page, which prints the same lines under the
+    # same chapters, and a model handed a paraphrase cannot.
+    speech = report.get("speech") or {}
+    if speech:
+        try:
+            from modules.highlight_prose import summarise_speech_run
+            said = [summarise_speech_run(report.get("chapters") or [], speech)]
+            for ch in (report.get("chapters") or []):
+                quotes = ch.get("quotes") or []
+                if not quotes:
+                    continue
+                head = f"- {ch.get('timestamp', '')} {ch.get('title', '')}"
+                if ch.get("speech_title"):
+                    head += f" [distinctive words: {ch['speech_title']}]"
+                said.append(head)
+                for q in quotes:
+                    who = f"{q['speaker']}: " if q.get("speaker") else ""
+                    said.append(f"    {q['timestamp']} {who}\"{q['text']}\"")
+            if len(said) > 1:
+                blocks.append((
+                    0, "## What is said in the video, by chapter\n"
+                       "Transcribed speech, quoted verbatim. The bracketed words "
+                       "are the ones each chapter used and the others did not — "
+                       "arithmetic, not a reading.\n" + "\n".join(said)))
+        except Exception as exc:            # narration must survive this
+            print(f"⚠️ Transcript context skipped: {exc}")
+
     docs = knowledge_for(findings, knowledge_dir)
     if docs:
         blocks.append((2, "## Documentation\n" + "\n".join(
@@ -363,7 +400,8 @@ def summarise_report_file(json_path: str,
                           llm,
                           question: Optional[str] = None,
                           knowledge_dir: str = KNOWLEDGE_DIR,
-                          reading: bool = False) -> Optional[str]:
+                          reading: bool = False,
+                          model_name: Optional[str] = None) -> Optional[str]:
     """Write a short summary into a report already on disk, page and record both.
 
     Re-renders the HTML from the updated record rather than patching it, so the
@@ -393,7 +431,19 @@ def summarise_report_file(json_path: str,
         return None
 
     report["advice"] = [f.as_dict() for f in findings]
-    report["reading" if reading else "advice_narration"] = text
+    if reading:
+        # Kept as a thread rather than a field. Each answer used to replace the
+        # last, so a second question silently destroyed the first answer and the
+        # report could only ever hold one -- which is the wrong shape for the
+        # thing people actually do with it, which is ask again.
+        report.setdefault("conversation", []).append({
+            "asked": question or "What happens in this cut?",
+            "answer": text,
+            "model": str(model_name or ""),
+            "at": _dt.datetime.now().isoformat(timespec="seconds"),
+        })
+    else:
+        report["advice_narration"] = text
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=1)
 
@@ -405,7 +455,8 @@ def summarise_report_file(json_path: str,
 
 
 def load_llm(backend: str = "ollama", model: str = "llama3",
-             mmproj: Optional[str] = None, n_ctx: int = DEFAULT_N_CTX):
+             mmproj: Optional[str] = None, n_ctx: int = DEFAULT_N_CTX,
+             vision: bool = False):
     """Load a local model for narration, or return ``None`` with a reason.
 
     Never called automatically: narration costs seconds to minutes, and paying
@@ -418,6 +469,15 @@ def load_llm(backend: str = "ollama", model: str = "llama3",
     left the backend with an empty path and a "GGUF model not found:" that named
     no file. The model picker has offered a .gguf path since it was written, so
     every attempt to use one from here failed that way.
+
+    ``mmproj`` is ignored unless ``vision`` is asked for, and that is not a
+    tidiness rule. Handing llama-cpp a projector makes it build a
+    ``Llava15ChatHandler``, which replaces the model's own chat template with
+    LLaVA's ``USER:``/``ASSISTANT:`` format. An instruct model prompted that way
+    answers in the wrong shape, trips the stop sequences on its first line, and
+    returns nothing — which surfaces as "the model returned nothing" and reads
+    for all the world like a refusal. The report's narration sends no images, so
+    it has nothing to gain from a projector and a working answer to lose.
     """
     try:
         from llm.llm_module import LLMModule
@@ -426,8 +486,14 @@ def load_llm(backend: str = "ollama", model: str = "llama3",
         return None
     try:
         if backend == "llama-cpp":
+            if mmproj and not vision:
+                print("ℹ Ignoring the vision projector for a text-only "
+                      "summary — attaching it would replace this model's chat "
+                      "template with LLaVA's, and the answer would come back "
+                      "empty.")
             llm = LLMModule(backend=backend, model_path=model,
-                            mmproj_path=mmproj, n_ctx=n_ctx)
+                            mmproj_path=(mmproj if vision else None),
+                            n_ctx=n_ctx)
         else:
             llm = LLMModule(backend=backend, model=model)
         llm.load()

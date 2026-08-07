@@ -106,17 +106,17 @@ class TestProse:
                                 "pct": pct}}
 
     def test_a_combination_the_video_rarely_produces_is_called_rare(self):
-        assert "is rare in this video" in describe_combination(self._entry(2.0))
+        assert "Hardly anywhere else in this video" in describe_combination(self._entry(2.0))
 
     def test_a_combination_the_video_produces_constantly_is_deflated(self):
         """The finding that four signals agreed is not one if they always do."""
         said = describe_combination(self._entry(85.0))
-        assert "routine in this video" in said
+        assert "Most of the video does the same thing" in said
         assert "says little about this clip in particular" in said
 
     def test_the_middle_is_not_dressed_up_as_either(self):
-        assert "a minority" in describe_combination(self._entry(18.0))
-        assert "fairly common" in describe_combination(self._entry(40.0))
+        assert "Not many other stretches" in describe_combination(self._entry(18.0))
+        assert "A fair part of the video" in describe_combination(self._entry(40.0))
 
     def test_one_mark_is_not_a_combination(self):
         assert describe_combination(self._entry(2.0, marks=["loud"])) == ""

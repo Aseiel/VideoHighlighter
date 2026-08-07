@@ -5443,8 +5443,10 @@ class VideoHighlighterGUI(QWidget):
                     f"⚠️ Could not reach {backend}/{model}. The report's findings "
                     "are there without it — only the summary needs a model.")
                 return
+            from modules.llm_models import label_for
             text = advisor.summarise_report_file(
-                json_path, llm=llm, question=question or None, reading=reading)
+                json_path, llm=llm, question=question or None, reading=reading,
+                model_name=label_for(entry))
         except Exception as exc:
             self.append_log(f"⚠️ Summary failed: {exc}")
             return
@@ -5460,6 +5462,81 @@ class VideoHighlighterGUI(QWidget):
         if os.path.exists(html_path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
 
+    def write_chapter_story(self, model=None):
+        """Narrate every chapter of the newest report, then open it.
+
+        One model call per chapter, so this is minutes rather than seconds and
+        the log has to show progress — a silent wait of that length reads as a
+        hang. The projector is asked for here, unlike everywhere else in the
+        report: this is the one narration that sends pictures, and a model that
+        can see the footage is the difference between describing what was said
+        and describing what happened.
+        """
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtWidgets import QApplication
+
+        json_path = self._newest_why_report_json()
+        if not json_path:
+            return
+
+        import json
+
+        from modules import advisor, chapter_story
+        from modules.llm_models import label_for
+
+        try:
+            with open(json_path, encoding="utf-8") as fh:
+                chapters = json.load(fh).get("chapters") or []
+        except Exception as exc:
+            self.append_log(f"⚠️ Could not read the report: {exc}")
+            return
+        if not chapters:
+            self.append_log("⚠️ This report has no chapters to tell.")
+            return
+
+        entry = model or self._active_llm_model()
+        backend = (entry or {}).get("backend", "ollama")
+        name = (entry or {}).get("model", "llama3")
+        mmproj = (entry or {}).get("mmproj")
+        self.append_log(
+            f"📖 Asking {backend}/{name} to tell {len(chapters)} chapters — "
+            "one call each, so this takes minutes, not seconds.")
+        self.ai_summary_btn.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            llm = advisor.load_llm(backend, name, mmproj=mmproj, vision=True)
+            if llm is None:
+                self.append_log(
+                    f"⚠️ Could not reach {backend}/{name}. The chapters keep "
+                    "their measurements — only the telling needs a model.")
+                return
+
+            def progress(line):
+                # Straight to the user's pane rather than the debug log: this
+                # is the only thing moving for the next several minutes.
+                self.append_log(line)
+                QApplication.processEvents()
+
+            told = chapter_story.tell_report_file(
+                json_path, llm=llm, model_name=label_for(entry),
+                log_fn=progress)
+        except Exception as exc:
+            self.append_log(f"⚠️ Telling the chapters failed: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.ai_summary_btn.setEnabled(True)
+
+        if not told:
+            self.append_log("⚠️ The model returned nothing; report unchanged.")
+            return
+        self.append_log(f"📖 Told {told} of {len(chapters)} chapters.")
+        html_path = os.path.splitext(json_path)[0] + ".html"
+        if os.path.exists(html_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
+
     def show_ai_summary_menu(self):
         from PySide6.QtWidgets import QMenu
 
@@ -5469,6 +5546,10 @@ class VideoHighlighterGUI(QWidget):
         # First, because it is the one that answers "what is in this video"
         # rather than "what should I change" — and the one people reach for.
         act_read = menu.addAction("Read what happens in this cut…")
+        # The chapter walk-through is the slow one — a call per chapter rather
+        # than one for the report — so it says so on the menu rather than in a
+        # log line the user reads after committing to the wait.
+        act_story = menu.addAction("Tell the story, chapter by chapter… (slow)")
         act_wrong = menu.addAction("Something's wrong with this cut…")
         act_ask = menu.addAction("Ask a question about this cut…")
         act_chat = menu.addAction("Discuss in LLM chat")
@@ -5503,6 +5584,8 @@ class VideoHighlighterGUI(QWidget):
             self.write_ai_summary(reading=True, model=entry)
         elif chosen is act_read:
             self.write_ai_summary(reading=True)
+        elif chosen is act_story:
+            self.write_chapter_story()
         elif chosen is act_wrong:
             self._report_what_is_wrong()
         elif chosen is act_ask:
@@ -5563,15 +5646,26 @@ class VideoHighlighterGUI(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
 
     def _ask_ai_summary_question(self):
+        """A typed question is about the footage, and goes to the reader.
+
+        It went to the advisor, whose system prompt opens "you help someone tune
+        a video highlight tool" and whose rules push every answer toward a weight
+        to change. So a question about what happens in a video was answered by
+        the persona hired to talk about settings, and came back sounding like it
+        had refused — when it had simply been asked by the wrong one of the two.
+
+        Tuning questions have their own item on this menu.
+        """
         from PySide6.QtWidgets import QInputDialog
 
         question, ok = QInputDialog.getText(
             self, "Ask about this cut",
-            "What would you like to know?\n"
-            "The model answers from this run's findings and the advisor docs.",
-            text="Why is every clip so similar?")
+            "What would you like to know about this video?\n"
+            "The model answers from what the run measured — the marks, their "
+            "order, and how often the video repeats them.",
+            text="What does the pattern across these clips look like to you?")
         if ok and question.strip():
-            self.write_ai_summary(question.strip())
+            self.write_ai_summary(question.strip(), reading=True)
 
     def _choose_ai_summary_model(self):
         """The report's models, on one screen — the chat panel's form, listed.
