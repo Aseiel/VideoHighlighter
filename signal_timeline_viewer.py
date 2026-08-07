@@ -2041,6 +2041,8 @@ class SignalTimelineWindow(QMainWindow):
         # Re-ingest signals (updates cache_data, action/object type lists, redraws).
         startup_splash.stage("Reloading signals…")
         self.signal_scene.reload_cache_data(self.cache_data)
+        self.refresh_event_checkboxes()   # composed events may have just appeared
+        self.refresh_object_checkboxes()  # and so may object classes
 
         # Audio waveform may have just been added.
         try:
