@@ -108,6 +108,53 @@ def _chapter_facts(chapter: Mapping) -> list[str]:
         return []
 
 
+def _checks_here(report: Mapping, chapter: Mapping) -> list:
+    """Claims under test that were spoken inside this chapter, as told lines.
+
+    Filed by *where the claim was said*, not by where its rule fired. The two
+    are usually different stretches — somebody describes in the last five
+    minutes something that happened in the middle — and the paragraph that
+    should weigh the evidence is the one covering the sentence, because that is
+    the paragraph a reader is reading when they wonder whether it is true.
+    """
+    start, end = float(chapter.get("start") or 0), float(chapter.get("end") or 0)
+    lines = []
+    for check in (report.get("checks") or []):
+        at = check.get("claim_at")
+        if at is None or not (start <= float(at) < end):
+            continue
+        claim = str(check.get("claim") or "").strip()
+        state = str(check.get("state") or "")
+        if state == "fired":
+            outcome = (f"That arrangement was found in "
+                       f"{int(check.get('seconds') or 0)} second(s) of the "
+                       f"video, at {_timestamp(check.get('first') or 0)}"
+                       + (f" and {_timestamp(check.get('last') or 0)}"
+                          if check.get("last") != check.get("first") else "")
+                       + ".")
+        elif state == "never_fired":
+            outcome = ("That arrangement was looked for in this run and never "
+                       "found. It may still have happened out of the "
+                       "detector's view.")
+        else:
+            outcome = ("The rule meant to look for it is not loaded, so this "
+                       "run says nothing about it either way.")
+        lines.append(f'- Someone said: "{claim}". A rule '
+                     f'({check.get("label") or check.get("rule")}) was added to '
+                     f'test it. {outcome} Say whether what you can see here '
+                     f'agrees with what was said, and if the two do not match, '
+                     f'say so plainly.')
+    return lines
+
+
+def _timestamp(seconds) -> str:
+    try:
+        seconds = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "?"
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
 def _dialogue_block(chapter: Mapping, budget: int) -> str:
     """Everything said in the chapter, trimmed from the middle if it must be.
 
@@ -150,6 +197,15 @@ def chapter_prompt(report: Mapping, chapter: Mapping,
     facts = _chapter_facts(chapter)
     if facts:
         parts += ["## What was measured here", *(f"- {f}" for f in facts), ""]
+
+    # A claim an earlier run added a rule to test, when that claim was made in
+    # this stretch. This is the point of the whole loop: the run that finally
+    # has the signal is the one that can say whether it agrees, and it can only
+    # do that if it is told which sentence it is answering.
+    outstanding = _checks_here(report, chapter)
+    if outstanding:
+        parts += ["## A claim made here that a later rule was added to test",
+                  *outstanding, ""]
 
     if previous:
         parts += ["## What the previous stretch was",

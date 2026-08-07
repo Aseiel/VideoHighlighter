@@ -5537,6 +5537,139 @@ class VideoHighlighterGUI(QWidget):
         if os.path.exists(html_path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
 
+    def propose_composition_rule(self, model=None):
+        """Draft a rule that would let the next run check something that was said.
+
+        The one place in this app where a model's output becomes configuration,
+        so the sequence is fixed: it proposes, `rule_proposal` rejects anything
+        naming a class this video has no detections for, the user reads the YAML
+        and says yes, and only then is the file written. There is no path that
+        skips the middle two.
+        """
+        import json
+
+        from PySide6.QtWidgets import (QApplication, QInputDialog, QMessageBox)
+
+        from modules import advisor, rule_proposal
+        from modules.app_paths import composition_rules_path
+        from modules.llm_models import label_for
+
+        json_path = self._newest_why_report_json()
+        if not json_path:
+            return
+        try:
+            with open(json_path, encoding="utf-8") as fh:
+                report = json.load(fh)
+        except Exception as exc:
+            self.append_log(f"⚠️ Could not read the report: {exc}")
+            return
+
+        vocabulary = report.get("vocabulary") or {}
+        classes = vocabulary.get("classes") or []
+        if not classes:
+            self.append_log(
+                "⚠️ This report has no detections to build a rule from. Run "
+                "object detection with a transcript first.")
+            return
+
+        # What the user wants tested. Seeded from the strongest gap so the
+        # common case is a keypress, and editable because the gap is a
+        # candidate rather than a question.
+        # Seeded with the longest line among the gaps rather than the most
+        # distinctive one. Keyness ranks "Mm-hmm." top on real footage — it is
+        # genuinely concentrated and genuinely not a claim — and a dialog that
+        # opens with it reads as the feature being broken. Length is a crude
+        # proxy for "contains an assertion" and beats the alternative.
+        gaps = vocabulary.get("gaps") or []
+        seed = max((str(where.get("quote") or "")
+                    for gap in gaps for where in (gap.get("chapters") or [])),
+                   key=len, default="")
+        claim, ok = QInputDialog.getMultiLineText(
+            self, "Check something that was said",
+            "Which claim should the next run try to check?\n"
+            "A line from the transcript works best — the rule is built to "
+            "confirm or contradict it.\n"
+            f"Classes available in this video: {', '.join(classes)}",
+            seed)
+        if not ok or not claim.strip():
+            return
+
+        entry = model or self._active_llm_model()
+        backend = (entry or {}).get("backend", "ollama")
+        name = (entry or {}).get("model", "llama3")
+        rules_path = composition_rules_path()
+        self.append_log(f"🧩 Asking {backend}/{name} for a rule that would "
+                        "check that…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            llm = advisor.load_llm(backend, name)
+            if llm is None:
+                self.append_log(f"⚠️ Could not reach {backend}/{name}.")
+                return
+            proposal = rule_proposal.propose(
+                claim.strip(), classes, llm=llm,
+                existing=rule_proposal.existing_rules(rules_path),
+                gaps=gaps, claim_at=self._claim_second(report, claim),
+                model_name=label_for(entry))
+        except Exception as exc:
+            self.append_log(f"⚠️ Rule proposal failed: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if proposal is None:
+            self.append_log(
+                "⚠️ No usable rule came back. Either the claim cannot be "
+                "expressed with the classes this video has, or the model named "
+                "one it does not have — the debug log says which.")
+            return
+
+        answer = QMessageBox.question(
+            self, "Add this rule?",
+            f"<b>{proposal.label}</b><br><br>"
+            f"{proposal.why}<br><br>"
+            f"<pre>{proposal.as_yaml()}</pre>"
+            f"Add it to your composition rules?<br>"
+            f"<small>{rules_path}<br>The current file is backed up first. "
+            f"Object detection must re-run before this can fire.</small>",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self.append_log("ℹ️ Rule not added.")
+            return
+
+        try:
+            rule_proposal.apply(rules_path, proposal,
+                                video_path=(report.get("video") or {}).get("path"))
+        except Exception as exc:
+            self.append_log(f"⚠️ Could not write the rule: {exc}")
+            return
+        self.append_log(
+            f"✅ Added '{proposal.name}' to {os.path.basename(rules_path)}. "
+            "Re-run with object detection forced (a cached detection pass "
+            "skips the composition engine), then tell the chapters again — the "
+            "report will say whether it fired.")
+
+    @staticmethod
+    def _claim_second(report, claim):
+        """Where in the video a claim was said, if it is a line of transcript.
+
+        Matched on the stored text so the check can be filed under the chapter
+        the sentence belongs to. Returns None when the user typed a question of
+        their own rather than pasting a line, which is a perfectly good way to
+        use this and simply carries no timestamp.
+        """
+        wanted = " ".join(str(claim or "").split()).lower()
+        if not wanted:
+            return None
+        for chapter in (report.get("chapters") or []):
+            for line in ((chapter.get("dialogue") or [])
+                         + (chapter.get("quotes") or [])):
+                text = " ".join(str(line.get("text") or "").split()).lower()
+                if text and (text in wanted or wanted in text):
+                    return float(line.get("start") or 0.0)
+        return None
+
     def show_ai_summary_menu(self):
         from PySide6.QtWidgets import QMenu
 
@@ -5550,6 +5683,9 @@ class VideoHighlighterGUI(QWidget):
         # than one for the report — so it says so on the menu rather than in a
         # log line the user reads after committing to the wait.
         act_story = menu.addAction("Tell the story, chapter by chapter… (slow)")
+        # Closes the loop the other two open: they describe what was said, this
+        # is how the next run gets a signal that can check it.
+        act_rule = menu.addAction("Check something that was said…")
         act_wrong = menu.addAction("Something's wrong with this cut…")
         act_ask = menu.addAction("Ask a question about this cut…")
         act_chat = menu.addAction("Discuss in LLM chat")
@@ -5586,6 +5722,8 @@ class VideoHighlighterGUI(QWidget):
             self.write_ai_summary(reading=True)
         elif chosen is act_story:
             self.write_chapter_story()
+        elif chosen is act_rule:
+            self.propose_composition_rule()
         elif chosen is act_wrong:
             self._report_what_is_wrong()
         elif chosen is act_ask:
