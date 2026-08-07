@@ -1425,6 +1425,128 @@ class SignalTimelineWindow(QMainWindow):
 
         self._apply_event_fold()
 
+    def refresh_object_checkboxes(self):
+        """One checkbox per detected class, nested under the OBJECTS layer.
+
+        The same shape the EVENTS group has had since composed events arrived,
+        and the reason for it is the same: these are rows on the timeline, and
+        the Layers panel is where rows get shown and hidden. Until now the only
+        way to hide one class was the Advanced dialog — two clicks and a modal
+        to do what its neighbour does inline, which reads as the objects group
+        being broken rather than as a control living somewhere else.
+
+        Both this and the dialog drive the same scene state, so neither can
+        become the authority and they cannot disagree.
+        """
+        box = getattr(self, '_object_box', None)
+        scene = getattr(self, 'signal_scene', None)
+        if box is None or scene is None:
+            return
+
+        layout = box.layout()
+        while layout.count():                       # drop the previous rows
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.object_checkboxes = {}
+
+        # `object_classes` already excludes composed events — they are their own
+        # group, and listing them twice would make hiding one from here look
+        # like it had done nothing.
+        classes = list(getattr(scene, 'object_classes', []) or [])
+        classes = [c for c in classes if c and c != 'Unknown']
+        if classes:
+            layout.addWidget(self._build_object_header())
+
+        counts = {}
+        for item in (scene.cache_data.get('objects') or []):
+            for name in (item.get('objects') or []):
+                if isinstance(name, str):
+                    n = name.strip().title()
+                    if n in classes:
+                        counts[n] = counts.get(n, 0) + 1
+
+        for name in classes:
+            checkbox = QCheckBox(f"{name.replace('_', ' ')} ({counts.get(name, 0)}s)")
+            checkbox.setChecked(scene.visible_objects.get(name, True))
+            checkbox.setToolTip(f"Show the '{name}' row, and let ◀ ▶ stop on it")
+            # setChecked runs before this connect, so it can't fire the toggle.
+            checkbox.stateChanged.connect(
+                lambda state, o=name: self._toggle_object(o, state)
+            )
+            layout.addWidget(checkbox)
+            self.object_checkboxes[name] = checkbox
+
+        self._apply_object_fold()
+
+    def _build_object_header(self) -> QWidget:
+        """'Show: all / none' quick toggles above the object list."""
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 0, 0, 2)
+        hl.setSpacing(6)
+        label = QLabel("Show:")
+        label.setStyleSheet("color:#888;font-size:8pt;")
+        hl.addWidget(label)
+        all_btn = self._mini_button("all", "Show every object class")
+        all_btn.setFixedSize(24, 16)
+        all_btn.clicked.connect(lambda: self._set_all_object_rows(True))
+        hl.addWidget(all_btn)
+        none_btn = self._mini_button("none", "Hide every object class")
+        none_btn.setFixedSize(30, 16)
+        none_btn.clicked.connect(lambda: self._set_all_object_rows(False))
+        hl.addWidget(none_btn)
+        hl.addStretch()
+        return header
+
+    def _apply_object_fold(self):
+        """Show/hide the object list, keeping the collapsed row honest — the
+        caret carries the count whenever something is hidden, so a folded group
+        never looks the same as a complete one."""
+        box = getattr(self, '_object_box', None)
+        fold = getattr(self, '_object_fold', None)
+        if box is None or fold is None:
+            return
+        boxes = getattr(self, 'object_checkboxes', {})
+        expanded = getattr(self, '_object_rows_expanded', True)
+
+        box.setVisible(bool(boxes) and expanded)
+        fold.setVisible(bool(boxes))
+        shown = sum(1 for cb in boxes.values() if cb.isChecked())
+        total = len(boxes)
+        if expanded:
+            fold.setText("▾")
+            fold.setToolTip("Hide the object list")
+        else:
+            fold.setText("▸" if shown == total else f"▸ {shown}/{total}")
+            fold.setToolTip(f"Show the object list ({shown}/{total} visible)")
+
+    def _toggle_object_fold(self):
+        self._object_rows_expanded = not getattr(self, '_object_rows_expanded', True)
+        self._apply_object_fold()
+
+    def _toggle_object(self, name: str, state):
+        visible = (state == Qt.CheckState.Checked.value)
+        self.signal_scene.set_object_filter(name, visible)
+        self._apply_object_fold()     # the collapsed caret tracks the count
+        pretty = name.replace('_', ' ')
+        self.statusBar().showMessage(
+            f"Showing '{pretty}'" if visible
+            else f"Hiding '{pretty}' — ◀ ▶ now skip it",
+            2000,
+        )
+
+    def _set_all_object_rows(self, visible: bool):
+        """Show or hide every class at once — one rebuild, not one per class."""
+        self.signal_scene.set_all_objects_visible(visible)
+        self.refresh_object_checkboxes()
+        self.statusBar().showMessage(
+            "Showing all objects" if visible
+            else "Hid all objects — ◀ ▶ have nothing to step",
+            2000,
+        )
+
     def _build_event_header(self) -> QWidget:
         """'Show: all / none' quick toggles above the event list."""
         header = QWidget()
@@ -2742,6 +2864,7 @@ class SignalTimelineWindow(QMainWindow):
         # A composition run can introduce events that did not exist when the
         # Layers panel was built, so its nested list has to be rebuilt too.
         self.refresh_event_checkboxes()
+        self.refresh_object_checkboxes()
         if hasattr(self, "label_panel"):
             self.label_panel.refresh_labels()
 
@@ -3100,6 +3223,32 @@ class SignalTimelineWindow(QMainWindow):
             )
             self.layer_checkboxes[layer_name] = checkbox
 
+            if layer_name == 'objects':
+                # Same shape as the events group below it. Built here for the
+                # same reason: an object class is a row on the timeline, and
+                # this panel is where rows get shown and hidden.
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(4)
+                row_layout.addWidget(checkbox)
+                row_layout.addStretch()
+                self._object_fold = self._mini_button("▾", "Hide the object list")
+                self._object_fold.setFixedSize(34, 16)
+                self._object_fold.setVisible(False)   # nothing to fold until detections exist
+                self._object_fold.clicked.connect(self._toggle_object_fold)
+                row_layout.addWidget(self._object_fold)
+                layer_layout.addWidget(row)
+
+                self._object_rows_expanded = True
+                self._object_box = QWidget()
+                obj_layout = QVBoxLayout(self._object_box)
+                obj_layout.setContentsMargins(18, 0, 0, 0)   # reads as a child row
+                obj_layout.setSpacing(2)
+                self._object_box.setVisible(False)
+                layer_layout.addWidget(self._object_box)
+                continue
+
             if layer_name == 'events':
                 # Same shape as Visual Search below: the layer checkbox means
                 # "show the group", the caret expands a checkbox per composed
@@ -3174,6 +3323,7 @@ class SignalTimelineWindow(QMainWindow):
         layout.addWidget(layer_group)
         self.refresh_visual_query_checkboxes()
         self.refresh_event_checkboxes()
+        self.refresh_object_checkboxes()
 
         # Avoid ranges — exclude a dragged-selection range from highlight selection
         avoid_group = CollapsibleSection(
@@ -4144,9 +4294,12 @@ class SignalTimelineWindow(QMainWindow):
     def on_filter_dialog_closed(self):
         """Update filter summary when dialog closes"""
         self.update_filter_summary()
-        # The dialog's Events tab writes the same scene state as the Layers
-        # panel's nested checkboxes, so re-read it or the two disagree.
+        # The dialog's Events and Objects tabs write the same scene state as
+        # the Layers panel's nested checkboxes, so re-read both or they
+        # disagree — which is how a class hidden in one place comes back
+        # ticked in the other.
         self.refresh_event_checkboxes()
+        self.refresh_object_checkboxes()
     
     def show_all_filters(self):
         """Show all actions, objects and composed events, full confidence range"""
