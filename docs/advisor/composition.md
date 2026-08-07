@@ -48,3 +48,44 @@ rule is cheap.
 
 See the composition engine section of `docs/DETECTION-GUIDE.md` for the rule
 format itself.
+
+## When the transcript describes something no class covers
+
+With a transcript, the report can compare two lists: what people talked about
+and what the detector produced. A word said far more often in one stretch than
+in the rest of the video, matching no class name, is a gap — something the run
+had no way to check.
+
+This is worth treating differently from every other finding here, because it is
+not about a setting. A weight can be raised; a class the detector does not have
+cannot be conjured by any configuration. The three honest outcomes are:
+
+- **The word describes an arrangement of classes you already detect.** Then a
+  composition rule closes the gap, and the next run can check the claim. Nothing
+  needs retraining.
+- **The word describes something no class covers.** Then no rule helps, and the
+  options are a custom category taught from examples, or accepting that this
+  claim is outside what the tool can see.
+- **The word is not about the picture at all.** People discuss the past, the
+  weather, and each other. Most gaps are this, and closing them is wasted work.
+
+Deciding which of the three applies is a judgement about meaning, and this tool
+does not make it. The advisor can draft a rule for the first case, but only from
+classes your detector actually produced in that file — a rule naming anything
+else parses, loads and fires on nothing, costing a re-run to discover.
+
+## Claims left waiting on a rule
+
+When a rule is added to check something that was said, the report remembers the
+pairing and reports the outcome on the next run. Three states, and they are not
+equivalent:
+
+- **Fired.** The arrangement occurred. That is a measurement; what it means for
+  the claim is still a reading, and a rule can fire on the right arrangement of
+  the wrong boxes. Watch the seconds it marked.
+- **Never fired.** Weak evidence against, not proof. The arrangement may have
+  happened outside the detector's view, or the rule may be too strict. Loosen it
+  once before concluding anything.
+- **Not in the rules.** The rule is not being evaluated, so the run says nothing
+  either way. Usually this means the detection pass came from cache — the
+  composition engine only runs when objects are actually re-detected.

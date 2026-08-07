@@ -487,6 +487,116 @@ def _rule_concern_repetitive(report, concern=None) -> Optional[Finding]:
     )
 
 
+def _rule_unchecked_vocabulary(report) -> Optional[Finding]:
+    """The video talks about things no class covers, so no signal can check them.
+
+    The most consequential finding this module can make once a transcript is
+    involved, because it is the only one that is about the *limits* of the run
+    rather than its settings. Everything else here says a weight is wrong; this
+    says the run could not have answered the question, however the weights were
+    set — and names what would have to exist before it could.
+    """
+    vocabulary = report.get("vocabulary") or {}
+    gaps = vocabulary.get("gaps") or []
+    if not gaps:
+        return None
+    words = ", ".join(str(g["word"]) for g in gaps[:4])
+    classes = vocabulary.get("classes") or []
+    lead = gaps[0]
+    where = (lead.get("chapters") or [{}])[0]
+    return Finding(
+        id="unchecked_vocabulary",
+        severity="medium",
+        title="The video talks about things nothing was watching for",
+        detail=(f"{len(gaps)} word(s) are said far more often in one stretch "
+                f"than in the rest of the video and match no class this "
+                f"detector produced here ({words}). The strongest is "
+                f"\"{lead['word']}\", said {lead['count']} time(s) at "
+                f"{lead['times']:.0f}× the video's rate, around "
+                f"{where.get('timestamp', 'a chapter')}. The detector produced "
+                f"{len(classes)} class(es) in this file, so any claim resting "
+                f"on those words was neither confirmed nor contradicted — it "
+                f"was simply not measured."),
+        remedy=("Decide whether any of those words describes an arrangement of "
+                "classes you already detect. If it does, a composition rule "
+                "will label it and the next run can check the claim; if it does "
+                "not, the detector has no way to see it and no setting will "
+                "change that. The advisor can draft the rule for you."),
+        topic="composition",
+        evidence={"gaps": gaps[:4], "classes": classes},
+    )
+
+
+def _rule_pending_checks(report) -> list:
+    """An earlier run added a rule to test a claim. Say how it turned out."""
+    out = []
+    for check in (report.get("checks") or []):
+        state = str(check.get("state") or "")
+        rule = str(check.get("rule") or "")
+        claim = str(check.get("claim") or "").strip()
+        quoted = f' The claim was: "{claim}"' if claim else ""
+        if state == "fired":
+            out.append(Finding(
+                id=f"check_fired:{rule}",
+                severity="low",
+                title=f"The rule added to check a claim fired: {rule}",
+                detail=(f"'{rule}' matched {int(check.get('seconds') or 0)} "
+                        f"second(s), between {format_seconds(check.get('first'))} "
+                        f"and {format_seconds(check.get('last'))}.{quoted} "
+                        "That the arrangement occurred is measured; what it "
+                        "means for the claim is still a reading."),
+                remedy=("Watch the seconds it marked before relying on it. A "
+                        "rule can fire on the right arrangement of the wrong "
+                        "boxes, and this one has not been checked by eye yet."),
+                topic="composition",
+                evidence={"check": check},
+            ))
+        elif state == "never_fired":
+            out.append(Finding(
+                id=f"check_silent:{rule}",
+                severity="medium",
+                title=f"The rule added to check a claim never fired: {rule}",
+                detail=(f"'{rule}' is in the rules and matched nothing in this "
+                        f"run.{quoted} That is weak evidence against the claim "
+                        "and not proof: the arrangement may have happened "
+                        "outside the detector's view, or the rule may be too "
+                        "strict for it."),
+                remedy=("Loosen the rule before concluding anything — widen the "
+                        "count range or the time window and re-run. If it still "
+                        "finds nothing, the claim is unsupported by what this "
+                        "detector can see."),
+                topic="composition",
+                evidence={"check": check},
+            ))
+        elif state == "not_in_rules":
+            out.append(Finding(
+                id=f"check_missing:{rule}",
+                severity="high",
+                title=f"A claim is waiting on a rule that is not loaded: {rule}",
+                detail=(f"An earlier run recorded '{rule}' as the way to check "
+                        f"a claim, and the composition engine is not evaluating "
+                        f"it.{quoted} Nothing in this report says anything about "
+                        "that claim either way."),
+                remedy=("Check the rule is still in your composition rules file "
+                        "and that the object detection pass actually re-ran — a "
+                        "cached detection pass skips the composition engine "
+                        "entirely."),
+                topic="composition",
+                evidence={"check": check},
+            ))
+    return out
+
+
+def format_seconds(value) -> str:
+    """``h:mm:ss`` for a finding's detail line. Local to keep this module free
+    of a report import for one string."""
+    try:
+        seconds = max(0, int(value))
+    except (TypeError, ValueError):
+        return "?"
+    return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
 def diagnose(report: Mapping,
              *,
              rejected: Optional[Sequence[Sequence[float]]] = None,
@@ -507,10 +617,12 @@ def diagnose(report: Mapping,
     for rule in (_rule_single_signal, _rule_flat_score, _rule_concentrated,
                  _rule_boost_never_fired, _rule_near_miss_gap,
                  _rule_dominant_tag, _rule_short_of_target,
-                 _rule_expressions_unselected, _rule_expression_lopsided):
+                 _rule_expressions_unselected, _rule_expression_lopsided,
+                 _rule_unchecked_vocabulary):
         found = rule(report)
         if found:
             findings.append(found)
+    findings.extend(_rule_pending_checks(report))
     findings.extend(_rule_silent_detector(report))
     findings.extend(_rule_unused_detector(report, concern))
     concern_finding = _rule_concern_repetitive(report, concern)

@@ -452,6 +452,7 @@ def build_report(*,
                  bbox_cache: Optional[Iterable[Mapping]] = None,
                  expressions: Optional[Mapping] = None,
                  chapters: Optional[Sequence[Mapping]] = None,
+                 transcript: Optional[Sequence[Mapping]] = None,
                  loudness_levels: Optional[Sequence[float]] = None,
                  motion_peaks: Optional[Sequence[float]] = None,
                  scene_cuts: Optional[Sequence[float]] = None,
@@ -492,6 +493,15 @@ def build_report(*,
     against the whole video; see :mod:`modules.chapter_compare`. It is optional
     and costs nothing when absent — a report without it is exactly the report
     that was produced before chapters existed.
+
+    ``transcript`` is ``modules.transcript.get_transcript_segments``'s output —
+    ``start``/``end``/``text``, optionally ``speaker``. It is the only input here
+    that carries a *vocabulary*, and it is used for description rather than for
+    scoring: each chapter gains how much of it is speech, the words it used that
+    the other chapters did not, and a few timestamped lines; each clip gains what
+    was said during it. See :mod:`modules.chapter_speech`. Supplying it changes
+    nothing that was measured — a run with and a run without produce the same
+    clips — so the two reports are directly comparable.
 
     Near-misses are the highest-scoring seconds *not* covered by any kept
     segment. They are what a user would tune the weights to capture, so they are
@@ -759,6 +769,55 @@ def build_report(*,
             print(f"⚠️ Chapter breakdown skipped: {exc}")
             chapter_rows = []
 
+    # What was said, if a transcript was run. Layered on top of the chapter
+    # comparison rather than folded into it: the partition is decided by the
+    # picture and must stay decided by the picture, so that enabling the
+    # transcript adds description to the same chapters instead of producing
+    # different ones. Clips get their lines here for the same reason — a quote
+    # is evidence the reader can check, and it is worth more beside the clip it
+    # belongs to than in a transcript file they have to search.
+    speech_summary = {}
+    lines = [s for s in (transcript or []) if str(s.get("text") or "").strip()]
+    if lines:
+        try:
+            from modules.chapter_speech import (clip_speech, summarise_speech,
+                                                video_speech)
+            speech_summary = video_speech(lines, video_duration)
+            if chapter_rows:
+                chapter_rows = summarise_speech(chapter_rows, lines,
+                                                video_duration=video_duration)
+            for entry, (start, end) in zip(entries, segments):
+                said = clip_speech(lines, float(start), float(end))
+                if said:
+                    entry["speech"] = said
+        except Exception as exc:                   # pragma: no cover - defensive
+            print(f"⚠️ Transcript summary skipped: {exc}")
+            speech_summary = {}
+
+    # What was talked about that nothing was watching for, and what an earlier
+    # run added a rule to watch for. Both only mean anything once there is a
+    # transcript to compare the class list against, so both live here.
+    vocabulary = {}
+    checks = []
+    if chapter_rows and speech_summary:
+        try:
+            from modules.vocabulary_gap import observed_classes, summarise
+            vocabulary = summarise(
+                chapter_rows,
+                observed_classes(object_detections, bbox_cache,
+                                 composed_event_names or ()),
+                list(composed_event_names or ()))
+        except Exception as exc:                   # pragma: no cover - defensive
+            print(f"⚠️ Vocabulary gap skipped: {exc}")
+    try:
+        from modules.rule_proposal import load_checks, settle_checks
+        pending = load_checks(video_path)
+        if pending:
+            checks = settle_checks(pending, object_detections,
+                                   list(composed_event_names or ()))
+    except Exception as exc:                       # pragma: no cover - defensive
+        print(f"⚠️ Pending checks skipped: {exc}")
+
     kept_duration = sum(e - s for s, e in segments)
     return {
         "schema": 3,
@@ -793,6 +852,17 @@ def build_report(*,
         "near_misses": near_misses,
         "expression_arc": arc,
         "chapters": chapter_rows,
+        # Whole-video speech, the reference each chapter's share is measured
+        # against. Empty when no transcript was run, which is what every
+        # renderer below tests rather than testing a config flag.
+        "speech": speech_summary,
+        # What the detector could see, and what the video talked about that it
+        # could not. The gap is what makes an unconfirmable claim visible as
+        # such rather than as an absence nobody noticed.
+        "vocabulary": vocabulary,
+        # Claims an earlier run added a rule to test, and whether that rule
+        # fired this time. This is what closes the loop the advisor opens.
+        "checks": checks,
         "level_by_class": level_summary,
         # Whether the ordering between the marked seconds repeats across the
         # run. One clip's ordering is a coincidence; a repeated one is a
@@ -897,11 +967,16 @@ def render_text(report: Mapping) -> str:
         for line in section["lines"]:
             out.append(f"    {line}")
 
-    said = str(report.get("reading") or "").strip()
-    if said:
+    turns = list(report.get("conversation") or [])
+    if str(report.get("reading") or "").strip():
+        turns.append({"asked": "What happens in this cut?",
+                      "answer": report["reading"]})
+    if turns:
         out.append("")
-        out.append("  READ BY A LOCAL MODEL (not measured)")
-        out.append(f"    {said}")
+        out.append("  ASKED OF THIS REPORT (a model's answers, not measured)")
+        for turn in turns:
+            out.append(f"    Q: {str(turn.get('asked') or '').strip()}")
+            out.append(f"    A: {str(turn.get('answer') or '').strip()}")
 
     readings = _segment_readings(report)
     video_valence = float(((report.get("expression_arc") or {}).get("valence")
@@ -923,6 +998,9 @@ def render_text(report: Mapping) -> str:
             out.append(f"    Objects detected: {', '.join(e['objects'])}")
         if e.get("events"):
             out.append(f"    Events composed: {', '.join(e['events'])}")
+        for line in ((e.get("speech") or {}).get("lines") or []):
+            who = f"{line['speaker']}: " if line.get("speaker") else ""
+            out.append(f"    Said {line['timestamp']}  {who}\"{line['text']}\"")
         for a in e["actions"]:
             tier = f" [{a['tier']}]" if a["tier"] else ""
             out.append(f"    Action: {a['name']} ({a['confidence']:.2f}){tier}")
@@ -966,27 +1044,41 @@ def render_text(report: Mapping) -> str:
     if chapters:
         try:
             from modules.highlight_prose import (describe_chapter,
-                                                 summarise_chapter_run)
+                                                 summarise_chapter_run,
+                                                 summarise_speech_run)
             headline = summarise_chapter_run(chapters)
+            spoken_headline = summarise_speech_run(chapters, report.get("speech"))
         except Exception:
             describe_chapter = None
-            headline = ""
+            headline = spoken_headline = ""
         out.append("")
         out.append("--- The video in chapters ---")
         if headline:
             out.append(f"    {headline}")
+        if spoken_headline:
+            out.append(f"    {spoken_headline}")
         for ch in chapters:
             out.append("")
             clips = ch.get("clip_indices") or []
+            named = (f" — {ch['speech_title']}" if ch.get("speech_title") else "")
             out.append(f"    {ch['timestamp']} – {format_timestamp(float(ch['end']))}"
-                       f"  {ch['title']}  ({ch['duration']:.0f}s, "
+                       f"  {ch['title']}{named}  ({ch['duration']:.0f}s, "
                        f"{ch['shots']} shots, {ch['pace']})"
                        + ("" if ch.get("clips") else "   [not used]"))
             out.append(f"        Clips: "
                        + (", ".join(f"[{i}]" for i in clips) if clips else "none"))
+            if str(ch.get("story") or "").strip():
+                out.append(f"        (read) {str(ch['story']).strip()}")
             if describe_chapter is not None:
                 for line in describe_chapter(ch):
                     out.append(f"        * {line}")
+            # The quotes the line above is derived from. Indented under it so
+            # the derivation is visible in the text dump too — this file is what
+            # gets pasted into a bug report when a title looks wrong.
+            for quote in (ch.get("quotes") or []):
+                who = f"{quote['speaker']}: " if quote.get("speaker") else ""
+                out.append(f"          {quote['timestamp']}  {who}"
+                           f"\"{quote['text']}\"")
 
     relations = report.get("signal_relations") or ""
     events = report.get("event_relations") or []
@@ -1105,6 +1197,7 @@ a.clip:hover{color:var(--accent);border-color:var(--accent)}
 .csec b{display:block;color:var(--dim);font-size:10.5px;font-weight:700;
         text-transform:uppercase;letter-spacing:.08em;margin-bottom:2px}
 .csec.sum b{color:var(--accent)}
+.csec.sum p{margin:0 0 4px;font-size:13.5px;line-height:1.55}
 .why{margin:6px 0 4px;padding-left:18px;color:var(--text);font-size:13px}
 .why li{margin:3px 0}
 .why li::marker{color:var(--accent)}
@@ -1161,6 +1254,12 @@ a.clip:hover{color:var(--accent);border-color:var(--accent)}
 .reading-llm b{display:block;color:var(--warm);font-size:11px;font-weight:700;
                text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
 .reading-llm p{margin:0 0 6px;font-size:14px;line-height:1.55}
+.reading-llm .turn{border-top:1px solid var(--line);padding:8px 0 2px}
+.reading-llm .turn:first-of-type{border-top:0;padding-top:0}
+.reading-llm .q{color:var(--dim);font-size:12.5px;margin-bottom:3px}
+.reading-llm .q::before{content:"Q ";color:var(--warm);font-weight:700}
+.reading-llm .a{font-size:14px;line-height:1.55;white-space:pre-wrap}
+.reading-llm .who{color:var(--dim);font-size:11px;margin-top:3px}
 .reading-llm .cav{margin:8px 0 0;color:var(--dim);font-size:11.5px}
 .concl b{display:block;color:var(--accent);font-size:11px;font-weight:700;
          text-transform:uppercase;letter-spacing:.08em;margin:12px 0 4px}
@@ -1180,6 +1279,36 @@ a.clip:hover{color:var(--accent);border-color:var(--accent)}
 .chaph{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
 .chap .why{margin:8px 0 0}
 .chap .meta{margin:2px 0 0}
+.chapsaid{color:var(--accent);font-weight:400}
+/* The one paragraph on the page a model wrote. Set apart deliberately — a
+   reading that looks like the measurements around it is the failure mode. */
+.story{background:#191a1f;border:1px solid var(--line);border-left:3px solid
+       var(--warm);border-radius:8px;padding:9px 12px;margin:9px 0 4px}
+.story .lab{color:var(--warm);font-size:11px;text-transform:uppercase;
+            letter-spacing:.05em}
+.story p{margin:4px 0 0;font-size:14px;line-height:1.6}
+.script{margin-top:8px}
+.script summary{color:var(--dim);font-size:12px;cursor:pointer}
+.script summary:hover{color:var(--text)}
+.script .said{max-height:340px;overflow-y:auto}
+/* Quoted transcript. Indented off a rule and set in italic so a line taken
+   from the footage never reads as a sentence the report wrote. */
+.said{list-style:none;margin:8px 0 0;padding:0 0 0 10px;
+      border-left:2px solid var(--line)}
+.said li{margin:4px 0;font-size:13px;line-height:1.5;color:var(--dim)}
+.said q{color:var(--text);font-style:italic}
+.said q::before{content:"“"}
+.said q::after{content:"”"}
+.qt{color:var(--dim);font-variant-numeric:tabular-nums;font-size:12px;
+    margin-right:6px}
+.qseek{background:none;border:0;padding:0;margin-right:6px;cursor:pointer;
+       color:var(--accent);font:inherit;font-size:12px;
+       font-variant-numeric:tabular-nums}
+.qseek:hover{text-decoration:underline}
+.spk{color:var(--dim);font-size:12px;margin-right:4px}
+.saidbox{margin-top:10px}
+.saidbox .lab{color:var(--dim);font-size:11.5px;text-transform:uppercase;
+              letter-spacing:.04em}
 .reading{color:var(--dim);font-size:12.5px;margin:6px 0 0}
 .wave{display:block;width:100%;height:34px;margin-top:8px;opacity:.85}
 .wavelab{color:var(--dim);font-size:11.5px;margin-top:2px}
@@ -1321,18 +1450,41 @@ def _overview(report: Mapping) -> str:
 
 
 def _reading_block(report: Mapping) -> str:
-    """A local model's reading of the run, when the user asked for one.
+    """What a local model was asked about this run, and what it answered.
 
-    Its own block, labelled as written by a model, and below the measured
-    conclusion rather than above it. The order is the argument: what was
-    measured first, what someone thinks it looks like second, and never the two
-    in one voice.
+    A thread rather than a field, because asking one question about a video is
+    rare and asking a second is the normal case — and the second used to
+    overwrite the first. Kept in the report rather than in a chat window for the
+    same reason the findings are: the answer is about this run, and six months
+    later the run is what someone still has.
+
+    Below the measured conclusion and visibly separate from it. The order is the
+    argument: what was measured first, what someone's model made of it second,
+    and never the two in one voice.
     """
-    said = str(report.get("reading") or "").strip()
-    if not said:
+    turns = list(report.get("conversation") or [])
+    legacy = str(report.get("reading") or "").strip()
+    if legacy:
+        turns.append({"asked": "What happens in this cut?", "answer": legacy})
+    if not turns:
         return ""
-    return (f'<div class="reading-llm"><b>Read by a local model</b>'
-            f'<p>{html.escape(said)}</p>'
+
+    rows = ""
+    for turn in turns:
+        asked = html.escape(str(turn.get("asked") or "")).strip()
+        answer = html.escape(str(turn.get("answer") or "")).strip()
+        if not answer:
+            continue
+        who = html.escape(str(turn.get("model") or "")).strip()
+        when = html.escape(str(turn.get("at") or "")).strip()
+        stamp = " · ".join(x for x in (who, when) if x)
+        rows += (f'<div class="turn"><div class="q">{asked}</div>'
+                 f'<div class="a">{answer}</div>'
+                 + (f'<div class="who">{stamp}</div>' if stamp else "")
+                 + '</div>')
+    if not rows:
+        return ""
+    return (f'<div class="reading-llm"><b>Asked of this report</b>{rows}'
             f'<p class="cav">Written by a language model from the sections '
             f'above, not measured. It was told to work only from them and to '
             f'introduce no figures, so every part of it can be checked against '
@@ -1648,10 +1800,13 @@ def _chapters(report: Mapping) -> str:
         return ""
 
     try:
-        from modules.highlight_prose import describe_chapter, summarise_chapter_run
+        from modules.highlight_prose import (describe_chapter,
+                                             summarise_chapter_run,
+                                             summarise_speech_run)
         headline = summarise_chapter_run(chapters)
+        spoken_headline = summarise_speech_run(chapters, report.get("speech"))
     except Exception:
-        describe_chapter, headline = None, ""
+        describe_chapter, headline, spoken_headline = None, "", ""
 
     duration = float((report.get("video") or {}).get("duration") or 0.0)
     strip = ""
@@ -1696,27 +1851,87 @@ def _chapters(report: Mapping) -> str:
         unused = " unused" if not clips else ""
         span = (f'{html.escape(str(ch["timestamp"]))} – '
                 f'{html.escape(format_timestamp(float(ch["end"])))}')
+        # The words this stretch used and its neighbours did not, beside the
+        # positional title rather than replacing it. Replacing it would make a
+        # derived phrase look like the chapter's name, and a reader who sees
+        # "Chapter 4 — <words>" can tell which half was measured how.
+        said_title = str(ch.get("speech_title") or "").strip()
+        named = (f' <span class="chapsaid">— {html.escape(said_title)}</span>'
+                 if said_title else "")
+        quotes = _quote_lines(ch.get("quotes") or [])
+        # The told paragraph sits above the measurements it was written from,
+        # because it is what the section is read for — and inside the same
+        # block, because a reader who doubts a sentence has to find the figures
+        # without leaving it. It is marked at both ends: a class the stylesheet
+        # sets apart, and the word "read" in the label.
+        story = ""
+        if str(ch.get("story") or "").strip():
+            story = (f'<div class="story"><span class="lab">read from this '
+                     f'stretch</span><p>{html.escape(str(ch["story"]).strip())}'
+                     f'</p></div>')
+        # Everything said, folded away. Open by default it would bury sixteen
+        # chapters under an hour of transcript; absent altogether, the paragraph
+        # above has nothing a reader can check it against.
+        dialogue = ""
+        lines = ch.get("dialogue") or []
+        if len(lines) > len(ch.get("quotes") or []):
+            dialogue = (f'<details class="script"><summary>everything said here'
+                        f' ({len(lines)} lines)</summary>'
+                        f'{_quote_lines(lines)}</details>')
         rows.append(
             f'<div class="chap{unused}">'
             f'<div class="chaph"><span class="rng">'
-            f'{span} · {html.escape(str(ch["title"]))}'
+            f'{span} · {html.escape(str(ch["title"]))}{named}'
             f'</span> <span class="pts">{float(ch.get("cut_share_pct") or 0):.0f}%'
             f'</span></div>'
             f'<div class="meta">{float(ch["duration"]):.0f}s · '
             f'{int(ch.get("shots") or 0)} shots · {html.escape(str(ch.get("pace", "")))}'
             f' · {picked}</div>'
-            f'<ul class="why">{body}</ul></div>')
+            f'{story}'
+            f'<ul class="why">{body}</ul>{quotes}{dialogue}</div>')
 
-    narration = (f'<div class="narr">{html.escape(headline)}</div>'
-                 if headline else "")
+    said = f"<br>{html.escape(spoken_headline)}" if spoken_headline else ""
+    narration = (f'<div class="narr">{html.escape(headline)}{said}</div>'
+                 if (headline or said) else "")
+    # The note changes with the run, because the two runs are genuinely
+    # different documents: without a transcript the chapters can only be
+    # described by number, and saying so is what stops a reader concluding the
+    # feature is broken.
+    told = report.get("chapter_story") or {}
+    if told:
+        # Named, dated and counted. The paragraphs are the only text in this
+        # report a model wrote, and a reader has to be able to tell at a glance
+        # which model wrote them and whether it could see the footage.
+        seen = ("frames and the transcript" if told.get("with_frames")
+                else "the transcript and the measurements")
+        note = (f'Each stretch below is described by '
+                f'{html.escape(str(told.get("model") or "a local model"))}, '
+                f'reading {seen} — those paragraphs are a reading, not a '
+                f'measurement, and everything under them is what they were '
+                f'written from. The boundaries and every figure were computed '
+                f'before any model saw them, and the words beside each title '
+                f'are arithmetic over the transcript rather than anybody\'s '
+                f'reading of it.')
+    elif report.get("speech"):
+        note = ('Where the footage stops looking like what came before, measured '
+                'on the video\'s own shot structure — every boundary falls on a '
+                'real cut. Each chapter is then compared with the whole video, so '
+                'what is listed is what is different about that stretch, not what '
+                'is in it. The words beside each title are the ones that stretch '
+                'used and the others did not — arithmetic over the transcript, '
+                'not a reading of it; the quotes underneath are what it is based '
+                'on.')
+    else:
+        note = ('Where the footage stops looking like what came before, measured '
+                'on the video\'s own shot structure — every boundary falls on a '
+                'real cut. Each chapter is then compared with the whole video, so '
+                'what is listed is what is different about that stretch, not what '
+                'is in it. Chapters have no titles because nothing here is taught '
+                'a vocabulary; run the transcript and each one is named from the '
+                'words spoken in it.')
     return (
         '<h2>The video in chapters</h2>'
-        '<p class="note">Where the footage stops looking like what came before, '
-        'measured on the video\'s own shot structure — every boundary falls on a '
-        'real cut. Each chapter is then compared with the whole video, so what '
-        'is listed is what is different about that stretch, not what is in it. '
-        'Chapters have no titles because nothing here is taught a vocabulary; '
-        'the numbers are the description.</p>'
+        f'<p class="note">{note}</p>'
         f'{narration}{strip}{"".join(rows)}'
     )
 
@@ -1823,9 +2038,14 @@ def _measurements(entry: Mapping, peer_scores=None,
         # The summary is marked rather than inferred from its position: it is
         # the only section about more than one signal, and it is not always the
         # last one present.
-        css = "csec sum" if heading == "Summary" else "csec"
-        lead += (f'<div class="{css}"><b>{html.escape(heading)}</b>'
-                 f'<ul class="why">{items}</ul></div>')
+        if heading == "Summary":
+            # A paragraph, not bullets. It is one thought about the clip, and a
+            # bulleted list of one item reads as a form with a field in it.
+            body = "".join(f'<p>{html.escape(line)}</p>' for line in lines)
+            lead += f'<div class="csec sum"><b>Summary</b>{body}</div>'
+        else:
+            lead += (f'<div class="csec"><b>{html.escape(heading)}</b>'
+                     f'<ul class="why">{items}</ul></div>')
 
     # The loudness figure travels with the folded measurements rather than the
     # sentence: it is the arithmetic behind "Sound", not a second claim.
@@ -1909,6 +2129,45 @@ def _tag_rows(entry: Mapping) -> str:
     return "".join(rows)
 
 
+def _quote_lines(quotes: Sequence[Mapping], seekable: bool = False) -> str:
+    """Timestamped lines of transcript, as evidence rather than as decoration.
+
+    The timestamp is the point: a quote a reader cannot locate is an assertion,
+    and one they can play is a fact. Inside a clip card the stamp becomes a
+    button that seeks that card's own player; in the chapter list there is no
+    player to seek, so it stays text.
+    """
+    rows = []
+    for q in quotes or []:
+        stamp = html.escape(str(q.get("timestamp") or ""))
+        at = float(q.get("start") or 0.0)
+        mark = (f'<button class="qseek" data-t="{at:.0f}">{stamp}</button>'
+                if seekable else f'<span class="qt">{stamp}</span>')
+        speaker = str(q.get("speaker") or "").strip()
+        who = f'<span class="spk">{html.escape(speaker)}</span> ' if speaker else ""
+        rows.append(f'<li>{mark} {who}'
+                    f'<q>{html.escape(str(q.get("text") or ""))}</q></li>')
+    return f'<ul class="said">{"".join(rows)}</ul>' if rows else ""
+
+
+def _spoken(entry: Mapping) -> str:
+    """The clip's own transcript lines, when a transcript was run.
+
+    Under the tags rather than at the foot of the card: what was said belongs
+    with what was detected, and a reader deciding whether a pick is right reads
+    both together or neither.
+    """
+    said = entry.get("speech") or {}
+    lines = said.get("lines") or []
+    if not lines:
+        return ""
+    total = int(said.get("total") or len(lines))
+    more = (f' <span class="dim">+{total - len(lines)} more</span>'
+            if total > len(lines) else "")
+    return (f'<div class="saidbox"><div class="lab">said here{more}</div>'
+            f'{_quote_lines(lines, seekable=True)}</div>')
+
+
 def _shot(entry: Mapping, composed: frozenset) -> str:
     """The thumbnail, with what the detector saw drawn over it.
 
@@ -1952,6 +2211,14 @@ def _player_script(media_src: Optional[str]) -> str:
         "b.addEventListener('click',function(){"
         "var v=b.closest('.play').querySelector('video');"
         "v.currentTime=parseFloat(b.dataset.t);v.play();});});"
+        # A quoted line seeks the player on its own card. Scoped to `.seg`
+        # rather than `.play` because the quotes sit above the player, so
+        # `closest('.play')` finds nothing from there.
+        "document.querySelectorAll('.qseek').forEach(function(b){"
+        "b.addEventListener('click',function(){"
+        "var s=b.closest('.seg');var v=s?s.querySelector('video'):null;"
+        "if(v){v.currentTime=parseFloat(b.dataset.t);v.play();"
+        "v.scrollIntoView({block:'nearest'});}});});"
         "document.querySelectorAll('.play video').forEach(function(v){"
         "v.addEventListener('error',function(){"
         "var bar=v.closest('.play').querySelector('.playbar');"
@@ -2107,6 +2374,7 @@ def render_html(report: Mapping, title: Optional[str] = None,
             f'{_bars(e, max_points)}'
             f'{_measurements(e, peer_scores, readings, video_valence)}'
             f'{tags}'
+            f'{_spoken(e)}'
             f'{_segment_wave(report, e)}'
             f'{_player(e, media_src)}'
             f'{boost}</div></div>'

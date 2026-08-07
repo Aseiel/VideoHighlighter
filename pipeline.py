@@ -2125,6 +2125,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # different shot of a face, not a face that changed, and
                     # without these the report cannot tell the two apart.
                     scene_cuts=[float(s) for s, _e in (scenes or [])],
+                    # What was said, when the transcript ran. Description only —
+                    # the keyword signal above is the only thing speech scores
+                    # with, so a run with the transcript enabled picks the same
+                    # clips and the two reports can be compared side by side.
+                    transcript=transcript_segments,
                     signals={
                         "scene": scene_score,
                         "motion_event": motion_event_score,
