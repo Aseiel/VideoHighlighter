@@ -1223,9 +1223,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         object_bboxes_cache = []  # default so cache save never NameErrors when objects are skipped
         composed_event_names = []  # same reason: set only when the engine runs
         if using_cache:
-            # The engine does not re-run on a cached pass, so without this the
-            # report has no way to tell a composed event from the detections it
-            # was composed from, and labels every one of them an object.
+            # Which events the *cached* detections already carry. The engine
+            # re-runs below either way; this is what tells it what to strip
+            # first, so a rule deleted since that pass does not outlive the file
+            # it was deleted from.
             composed_event_names = list(
                 (cached_data or {}).get("composed_event_names") or [])
             # Same trap: the boxes are only ever appended inside the detection
@@ -1318,35 +1319,39 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
                 log(f"✅ Object detection complete: {len(object_detections)} seconds with objects")
 
-                # --- Composition engine: derive events from spatial relations ---
-                try:
-                    from video_ai_editor.composition_engine import CompositionEngine
-                    from modules.app_paths import composition_rules_path
-                    rules_path = composition_rules_path()
-                    if rules_path and object_bboxes_cache:
-                        engine = CompositionEngine(rules_path)
-                        # Recorded even when nothing matched: these names are
-                        # derived whether or not they fired, and the timeline uses
-                        # the list to tell events apart from real detections.
-                        composed_event_names = list(engine.event_names)
-                        composed_det, composed_bb = engine.run(object_bboxes_cache)
-                        if composed_det:
-                            for sec, names in composed_det.items():
-                                object_detections.setdefault(sec, [])
-                                object_detections[sec] = sorted(
-                                    set(object_detections[sec]) | set(names)
-                                )
-                            object_bboxes_cache += composed_bb
-                            log(f"✅ Composition engine: "
-                                f"{sum(len(v) for v in composed_det.values())} event-hits "
-                                f"over {len(composed_det)} seconds")
-                        else:
-                            log("ℹ️ Composition engine: no events matched")
-                except Exception as _ce:
-                    log(f"⚠️ Composition engine skipped: {_ce}")
-
         else:
             log("ℹ️ Using cached object detections")
+
+        # --- Composition engine: derive events from spatial relations ---
+        # Outside both branches on purpose. Rules are a reading of boxes that
+        # already exist, so editing one and re-running must not require the
+        # detections to be computed again — it used to, and the symptom was a
+        # rule change that silently did nothing on a cached pass. See
+        # modules/compose_events.py; the call is idempotent.
+        try:
+            from modules.app_paths import composition_rules_path
+            from modules.compose_events import apply_rules, write_back
+
+            _was = set(composed_event_names or [])
+            (object_detections, object_bboxes_cache,
+             composed_event_names, _hits) = apply_rules(
+                object_detections, object_bboxes_cache,
+                rules_path=composition_rules_path(),
+                previous_names=composed_event_names,
+                log_fn=log)
+            # Only on a cached pass, and only when the rule set actually moved.
+            # A fresh pass writes the whole cache further down; rewriting it
+            # here as well would be the same file twice. The timeline reads the
+            # cache directly, so without this it keeps showing the old layer
+            # list while the report names the new events.
+            if using_cache and _was != set(composed_event_names or []):
+                write_back(processed_video_path, cached_data,
+                           object_detections, object_bboxes_cache,
+                           composed_event_names,
+                           cache_dir=gui_config.get("cache_dir", "./cache"),
+                           params=analysis_params, log_fn=log)
+        except Exception as _ce:
+            log(f"⚠️ Composition engine skipped: {_ce}")
 
         print("Detections per second:", len(object_detections))
 
