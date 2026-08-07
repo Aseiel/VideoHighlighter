@@ -139,7 +139,7 @@ def apply_rules(object_detections: Optional[Mapping],
         detections[sec] = sorted(set(detections.get(sec, [])) | set(found))
     boxes = boxes + list(composed_boxes)
 
-    changed = previous and previous != set(names)
+    changed = bool(previous) and previous != set(names)
     note = ""
     if changed:
         added = sorted(set(names) - previous)
@@ -157,3 +157,66 @@ def apply_rules(object_detections: Optional[Mapping],
         log_fn(f"ℹ️ Composition engine: {len(names)} rule(s), nothing "
                f"matched{note}")
     return detections, boxes, names, hits
+
+
+def write_back(video_path: str,
+               cached_data: Optional[Mapping],
+               detections: Mapping,
+               boxes: Sequence[Mapping],
+               names: Sequence[str],
+               *,
+               cache_dir: str = "./cache",
+               params: Optional[Mapping] = None,
+               log_fn=print) -> bool:
+    """Put re-derived events back into the analysis cache. ``True`` if written.
+
+    The report is built in memory and therefore sees new events immediately; the
+    *timeline viewer* reads the cache directly, so without this a user who edits
+    a rule gets a report that names the new event and a timeline whose layer
+    list still shows the old ones. Two views of one run disagreeing is worse
+    than either being stale, because only one of them is wrong and nothing says
+    which.
+
+    Only the three derived keys are replaced. Everything expensive -- the boxes
+    the detector produced, the transcript, the audio -- is written back exactly
+    as it was loaded, and the parameters are the ones the entry was found under,
+    so this overwrites that entry rather than creating a second one.
+
+    Returns ``False`` rather than raising: a cache that could not be refreshed
+    costs the timeline its update, and losing the run over it would be a much
+    worse trade.
+    """
+    if not cached_data:
+        return False
+    try:
+        from modules.video_cache import VideoAnalysisCache
+
+        updated = dict(cached_data)
+        # The cache stores seconds as rows, not as a mapping; `objects` here has
+        # to match what `collect_analysis_data` writes or every reader of the
+        # cache has to learn two shapes.
+        updated["objects"] = [
+            {"timestamp": int(sec),
+             "objects": [str(o) for o in found],
+             "count": len(found)}
+            for sec, found in sorted(detections.items()) if found
+        ]
+        updated["object_bboxes"] = list(boxes)
+        updated["composed_event_names"] = sorted(str(n) for n in names)
+
+        # Keys the cache layer adds itself. Left in would be harmless; taken out
+        # keeps `save` the only thing that decides what a cache entry says about
+        # when and how it was written.
+        payload = {k: v for k, v in updated.items()
+                   if k not in ("video_path", "video_hash", "cached_at",
+                                "cache_version", "cache_complete",
+                                "analysis_signature", "analysis_parameters")}
+        cache = VideoAnalysisCache(cache_dir=cache_dir)
+        cache.save(video_path, payload,
+                   params=dict(params) if params else None)
+        log_fn("✅ Cached events refreshed — the timeline will show the "
+               "current rule set.")
+        return True
+    except Exception as exc:
+        log_fn(f"⚠️ Could not refresh cached events: {exc}")
+        return False

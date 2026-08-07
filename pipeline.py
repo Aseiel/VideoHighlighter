@@ -1330,14 +1330,26 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # modules/compose_events.py; the call is idempotent.
         try:
             from modules.app_paths import composition_rules_path
-            from modules.compose_events import apply_rules
+            from modules.compose_events import apply_rules, write_back
 
+            _was = set(composed_event_names or [])
             (object_detections, object_bboxes_cache,
              composed_event_names, _hits) = apply_rules(
                 object_detections, object_bboxes_cache,
                 rules_path=composition_rules_path(),
                 previous_names=composed_event_names,
                 log_fn=log)
+            # Only on a cached pass, and only when the rule set actually moved.
+            # A fresh pass writes the whole cache further down; rewriting it
+            # here as well would be the same file twice. The timeline reads the
+            # cache directly, so without this it keeps showing the old layer
+            # list while the report names the new events.
+            if using_cache and _was != set(composed_event_names or []):
+                write_back(processed_video_path, cached_data,
+                           object_detections, object_bboxes_cache,
+                           composed_event_names,
+                           cache_dir=gui_config.get("cache_dir", "./cache"),
+                           params=analysis_params, log_fn=log)
         except Exception as _ce:
             log(f"⚠️ Composition engine skipped: {_ce}")
 
