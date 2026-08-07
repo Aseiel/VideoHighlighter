@@ -22,6 +22,30 @@ preset lists, commit messages, UI strings:
 If a feature seems to require naming that content in the repo, the design is
 wrong: make it user-supplied.
 
+## Never rewrite this repo's history
+
+This repo takes pull requests from outside the project, and a contributor's
+commits are the only record that they were here. **`main` is append-only: push
+fast-forward, never force.** Not to drop a trailer, not to tidy a message, not
+to re-attribute a merge. If a push needs `--force`, stop and ask the maintainer
+first — no reason clears that bar on its own.
+
+A rewrite re-hashes every commit from the rewrite point forward, contributors'
+included. GitHub's contributor index is cached against the *old* hashes and does
+not follow, so an outside contributor silently disappears from the sidebar and
+the graph — while people whose commits are long gone stay listed. The only
+forced repair is a GitHub Support ticket.
+
+- Never `filter-repo`, `rebase`, `commit --amend`, or `reset --hard` anything
+  already pushed to `main`.
+- A contributor's authorship is theirs. Don't "fix" it by re-authoring their
+  commits or by adding `Co-Authored-By` to a merge commit — the author field
+  already credits them, and a trailer is strictly weaker.
+- If someone is missing from the contributors sidebar, that is almost always the
+  stale cache rather than the repo. Check the commit's `author.login` via the
+  API first. The answer is to wait for the recompute or to open a support
+  ticket — never to push again harder.
+
 ## Conventions
 
 - The packaged exe is `--windowed`: `stdout` goes nowhere, so `modules/debug_console.py`
