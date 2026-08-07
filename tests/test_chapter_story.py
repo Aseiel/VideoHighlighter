@@ -117,6 +117,63 @@ class TestPrompt:
         assert "omitted for length" in prompt
 
 
+class TestRepetition:
+    """A local model at this size sometimes locks onto a sentence and repeats
+    it until it runs out of tokens. That is not a bad reading, it is a stuck
+    one, and it buries whatever the model said in its first two sentences."""
+
+    def test_a_verbatim_loop_is_cut_at_the_repeat(self):
+        one = "They worked at the bench for most of the stretch. "
+        two = "Someone passed a tool across. "
+        assert chapter_story.trim_repetition(one + two + one + two) \
+            == (one + two).strip()
+
+    def test_a_paraphrased_loop_is_cut_too(self):
+        # The real failure was not verbatim: the model re-emitted the same
+        # sentence with one word swapped, which exact matching sails past.
+        first = ("The video continues from the previous stretch with a player "
+                 "saying they would see. ")
+        again = ("The talking continues from the previous stretch with a "
+                 "player saying they would see. ")
+        assert chapter_story.trim_repetition(first + again) == first.strip()
+
+    def test_a_short_sentence_may_repeat_without_being_a_loop(self):
+        # "It is not clear." twice in four sentences is a model hedging twice.
+        text = ("It is not clear. They worked at a bench in near silence for "
+                "the whole stretch. It is not clear.")
+        assert chapter_story.trim_repetition(text) == text
+
+    def test_an_intact_paragraph_comes_back_byte_identical(self):
+        # The caller tells a trimmed paragraph from an intact one by length, so
+        # re-joining and normalising whitespace here would report every chapter
+        # as having looped.
+        text = ("They worked at a bench. Someone passed a chisel across; the "
+                "other took it without looking up.")
+        assert chapter_story.trim_repetition(text) == text
+
+    def test_a_looping_chapter_keeps_what_came_before_the_loop(self):
+        rep = _report()
+        sentence = "They stood at the bench and said very little to each other. "
+
+        class _StuckLLM(_FakeLLM):
+            def generate(self, prompt, **kw):
+                self.calls.append({"prompt": prompt})
+                return sentence * 5
+
+        logged = []
+        told = chapter_story.tell(rep, llm=_StuckLLM(), log_fn=logged.append)
+        assert told[0]["story"] == sentence.strip()
+        assert any("repeated itself" in m for m in logged)
+
+    def test_a_short_answer_is_never_treated_as_a_loop(self):
+        # Rule 5 asks for one short sentence when the material is too thin to
+        # describe. A length floor on the survivor would throw those away.
+        rep = _report()
+        told = chapter_story.tell(rep, llm=_FakeLLM(reply="Too thin to say."),
+                                  log_fn=lambda _m: None)
+        assert all(ch["story"] for ch in told)
+
+
 class TestTell:
     def test_every_chapter_gets_a_paragraph(self):
         rep = _report()

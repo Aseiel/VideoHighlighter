@@ -99,10 +99,15 @@ FRAME_WIDTH = 512
 
 
 def _chapter_facts(chapter: Mapping) -> list[str]:
-    """The measured sentences for one chapter, as the page shows them."""
+    """The measured sentences for one chapter, as the page shows them.
+
+    Minus the spoken-evidence rows, which :func:`_evidence_here` puts in a
+    section of their own with the question attached. Sending both copies is
+    what turned a chapter's prompt into the same figures twice.
+    """
     try:
         from modules.highlight_prose import describe_chapter
-        return list(describe_chapter(chapter))
+        return list(describe_chapter(chapter, spoken_evidence=False))
     except Exception as exc:                       # pragma: no cover - defensive
         print(f"⚠️ Chapter facts skipped: {exc}")
         return []
@@ -165,61 +170,53 @@ def _evidence_here(chapter: Mapping) -> list:
     The caution about what a match means is stated once, in the section header,
     rather than per row — a model reading it five times starts hedging every
     sentence, and the point is to get a verdict, not a disclaimer.
+
+    The clauses themselves come from :mod:`modules.highlight_prose`, the same
+    ones printed under the paragraph. Writing a second set here is how the page
+    and the prompt end up quoting different figures for one run.
+
+    Laid out one class to a line, not as a single sentence of semicolons. The
+    first version packed three classes and a dozen figures into one 800-
+    character bullet, directly above a system prompt forbidding the model to
+    state a number — and an 8B model handed that repeated one sentence until it
+    hit the token cap. The content was right and the shape was unusable.
     """
-    from modules.spoken_evidence import MAX_PER_CHAPTER, MIN_LEVEL_DELTA_DB
+    from modules.highlight_prose import _found_phrase, _where_phrases
+    from modules.spoken_evidence import MAX_PER_CHAPTER
 
     lines = []
     for row in (chapter.get("spoken_evidence") or [])[:MAX_PER_CHAPTER]:
-        name = str(row.get("name") or "")
-        seconds = int(row.get("seconds") or 0)
-        said = (f'Someone said at {row.get("timestamp", "")}: '
-                f'"{str(row.get("quote") or "").strip()}". '
-                f'This run was labelling {name} throughout the video.')
-        if not seconds:
-            lines.append(f"- {said} It was never labelled anywhere in the "
-                         f"file, so what was said here has nothing in this run "
-                         f"agreeing with it. Say so.")
+        classes = list(row.get("classes") or [])
+        if not classes:
             continue
-
-        facts = [f"{name} was labelled in {seconds} second(s) of the video"]
-        share = row.get("video_share_pct")
-        if share:
-            facts[-1] += f", {float(share):.0f}% of everything it detected"
-        densest = row.get("densest_chapter") or {}
-        if densest:
-            facts.append(f"most of it in chapter {densest.get('number')} at "
-                         f"{densest.get('timestamp')}, where it holds "
-                         f"{float(densest.get('share_pct') or 0):.0f}% of the "
-                         f"stretch")
-        elif row.get("first"):
-            facts.append(f"first labelled at {row['first']}, last at "
-                         f"{row.get('last')}")
-        here = row.get("here_share_pct")
-        if here is not None:
-            facts.append(f"{float(here):.0f}% of this stretch")
-        loudest = (row.get("level") or {}).get("loudest") or {}
-        if loudest:
-            delta = loudest.get("vs_video_db")
-            fact = f"its loudest second is {loudest.get('timestamp')}"
-            if delta is not None and abs(float(delta)) >= MIN_LEVEL_DELTA_DB:
-                fact += (f", {abs(float(delta)):.0f} dB "
-                         f"{'above' if float(delta) >= 0 else 'below'} the "
-                         f"video's median level")
-            alongside = loudest.get("with") or []
-            if alongside:
-                fact += (f", with {', '.join(str(a) for a in alongside)} also "
-                         f"labelled at that second")
-            facts.append(fact)
-        clips = row.get("clips") or []
-        if clips:
-            facts.append(f"{len(clips)} of the kept clips overlap it"
-                         if len(clips) > 1 else "one kept clip overlaps it")
-        # Not capitalised: the first word of the list is a class name, and
-        # those are the user's own, where case can be part of the name.
-        lines.append(f"- {said} " + "; ".join(facts) +
-                     ". Say whether that bears out what was said, and where it "
-                     "does not, say so plainly.")
+        lines.append(f'Someone said at {row.get("timestamp", "")}: '
+                     f'"{str(row.get("quote") or "").strip()}"')
+        if row.get("kind") == "name":
+            lines.append("That is the name of something this run was labelling "
+                         "all the way through the video:")
+        else:
+            lines.append(f'The word "{row.get("said")}" is in the name of '
+                         f'{_written(len(classes))} '
+                         f'{"thing" if len(classes) == 1 else "things"} this '
+                         f'run was labelling all the way through the video:')
+        # Ranked most-measured first by the caller, so reading down the list is
+        # reading the comparison. Not capitalised: the first word of each line
+        # is a class name, and those are the user's own.
+        for entry in classes:
+            clauses = [_found_phrase(entry)] + _where_phrases(entry)
+            lines.append(f"- {entry.get('name')}: " + "; ".join(clauses) + ".")
+        ask = ("Say whether that bears out what was said. Where it does not, "
+               "say so plainly — that is the useful sentence, not the "
+               "agreement.")
+        if len(classes) > 1:
+            ask += (" If the run found much more of one of them than of "
+                    "another, say which.")
+        lines.append(ask)
     return lines
+
+
+def _written(n: int) -> str:
+    return {1: "one", 2: "two", 3: "three"}.get(n, str(n))
 
 
 def _timestamp(seconds) -> str:
@@ -362,6 +359,80 @@ def frames_from_video(video_path: str, count: int = FRAMES_PER_CHAPTER):
     return sample
 
 
+# A sentence has to carry at least this many words before repeating it counts
+# as a loop. Short ones recur legitimately — "It is not clear." twice in four
+# sentences is a model hedging twice, not a model stuck.
+MIN_REPEAT_WORDS = 8
+
+# How much of a sentence's vocabulary has to already have appeared in one
+# earlier sentence before it is a restatement rather than a new thought.
+# Measured against the shorter of the two, not against the union: a model
+# looping does not repeat verbatim, it re-emits the same sentence with a word
+# swapped and a clause of noise attached, and a union-based ratio scores that
+# as barely half a match. The observed loop was 0.92 by this measure and 0.73
+# by the other, so the choice is the difference between catching it and not.
+REPEAT_OVERLAP = 0.8
+
+_SENTENCE_END = (". ", "? ", "! ", "; ")
+
+
+def _sentences(text: str) -> list:
+    """Split on sentence enders, keeping the ender with its sentence."""
+    out, start = [], 0
+    for i in range(len(text)):
+        if text[i:i + 2] in _SENTENCE_END:
+            out.append(text[start:i + 1])
+            start = i + 2
+    if start < len(text):
+        out.append(text[start:])
+    return out
+
+
+def trim_repetition(text: str) -> str:
+    """Cut a paragraph where it starts saying the same thing again.
+
+    Local models at this size and temperature sometimes lock onto a sentence
+    and emit it until they hit the token cap. The result is not a bad reading,
+    it is a stuck one — and this module's whole claim is that a reading which
+    says what it is costs the reader nothing to discount. A paragraph that
+    repeats itself four times is not something a reader can discount; it is
+    something they have to scroll past, and it buries whatever the model
+    actually said in its first two sentences.
+
+    So the loop is cut and what came before it is kept. Cutting rather than
+    dropping, because the sentences before the model got stuck are usually the
+    ones worth having, and they were written from the same evidence.
+
+    A sentence that merely resembles an earlier one is occasionally a genuine
+    development of it, and this will cut that too. The trade is deliberate: the
+    cost of being wrong is one sentence, and the cost of not doing it is a
+    paragraph that says the same thing four times under a heading claiming it
+    describes the stretch.
+    """
+    from modules.chapter_speech import tokenize
+
+    text = str(text or "")
+    sentences = _sentences(text)
+    seen: list = []
+    kept: list = []
+    for sentence in sentences:
+        words = set(tokenize(sentence))
+        if len(words) >= MIN_REPEAT_WORDS and any(
+                len(words & earlier) / min(len(words), len(earlier))
+                >= REPEAT_OVERLAP for earlier in seen):
+            break
+        if words:
+            seen.append(words)
+        kept.append(sentence)
+    # Returned untouched when nothing was cut, so that a caller can tell a
+    # trimmed paragraph from an intact one by length. Re-joining unconditionally
+    # normalises whitespace and shortens most paragraphs by a character, which
+    # is enough to make every chapter report itself as having looped.
+    if len(kept) == len(sentences):
+        return text.strip()
+    return " ".join(s.strip() for s in kept).strip()
+
+
 def _tell_one(llm, prompt: str, images: Optional[Sequence[str]]) -> str:
     """One call, with pictures when the model takes them.
 
@@ -422,6 +493,15 @@ def tell(report: Mapping,
             continue
         if not text:
             continue
+        trimmed = trim_repetition(text)
+        if len(trimmed) < len(text):
+            # Said out loud rather than fixed silently: a model looping on one
+            # chapter usually loops on the next, and a user watching the log is
+            # the one who can do something about it. No length floor on what
+            # survives — rule 5 asks for a single short sentence when the
+            # material is thin, and one of those is a legitimate paragraph.
+            log_fn(f"✂️ Chapter {index} repeated itself; kept what came before.")
+            text = trimmed
         ch["story"] = text
         # Only a told chapter carries forward. A skipped one would otherwise
         # hand the next chapter the one before it as if they were adjacent.
@@ -448,6 +528,18 @@ def tell_report_file(json_path: str,
 
     with open(json_path, encoding="utf-8") as fh:
         report = json.load(fh)
+
+    # Derive the spoken evidence when the record predates it. Without this the
+    # section could only ever appear on a video analysed from scratch — and
+    # this entry point exists precisely because analysis is run once and the
+    # narration re-run over the record afterwards, which is exactly the case
+    # where the answer would silently be missing.
+    if not any(ch.get("spoken_evidence") for ch in (report.get("chapters") or [])):
+        try:
+            from modules.spoken_evidence import from_report
+            report["chapters"] = from_report(report)
+        except Exception as exc:                   # pragma: no cover - defensive
+            print(f"⚠️ Spoken evidence backfill skipped: {exc}")
 
     frames_fn = None
     if use_frames:
