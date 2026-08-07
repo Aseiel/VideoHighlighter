@@ -1,5 +1,9 @@
 VideoHighlighter (Freeware)
 
+<!-- hy-mt2-i18n:start -->
+**English** | [中文](./README_zh-CN.md) | [日本語](./README_ja.md) | [Español](./README_es.md)
+<!-- hy-mt2-i18n:end -->
+
 A Python tool to automatically generate highlight clips from videos using scene detection, motion detection, audio peaks, object detection, action recognition, and transcript analysis.
 
 
