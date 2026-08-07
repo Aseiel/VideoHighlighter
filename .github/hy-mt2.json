@@ -1,0 +1,17 @@
+{
+  "sourceReadme": "README.md",
+  "targets": [
+    {
+      "language": "zh-CN",
+      "path": "README_zh-CN.md"
+    },
+    {
+      "language": "ja",
+      "path": "README_ja.md"
+    },
+    {
+      "language": "es",
+      "path": "README_es.md"
+    }
+  ]
+}
