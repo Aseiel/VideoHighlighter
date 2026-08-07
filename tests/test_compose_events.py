@@ -165,6 +165,88 @@ class TestDegradedCases:
         assert dets == before_dets and len(boxes) == before_len
 
 
+class TestWriteBack:
+    """The report is built in memory; the timeline reads the cache.
+
+    So re-deriving events without writing them back leaves the two views of one
+    run disagreeing — the report naming an event the timeline's layer list has
+    never heard of — and nothing on either says which is right.
+    """
+
+    def _cached(self):
+        return {"video_path": "a.mp4", "cached_at": "old",
+                "cache_version": "1.1", "analysis_signature": "sig",
+                "composed_event_names": ["old_event"],
+                "objects": [{"timestamp": 10, "objects": ["clamp"], "count": 1}],
+                "object_bboxes": [{"timestamp": 10.0, "objects": ["clamp"]}],
+                "transcript": {"segments": [{"start": 0, "text": "keep me"}]}}
+
+    def _write(self, tmp_path, video, **over):
+        from modules.compose_events import write_back
+
+        kwargs = dict(cached_data=self._cached(),
+                      detections={10: ["clamp", "clamped_board"]},
+                      boxes=[{"timestamp": 10.0, "objects": ["clamp"]}],
+                      names=["clamped_board"])
+        kwargs.update(over)
+        return write_back(str(video), kwargs.pop("cached_data"),
+                          kwargs.pop("detections"), kwargs.pop("boxes"),
+                          kwargs.pop("names"),
+                          cache_dir=str(tmp_path / "cache"),
+                          params={"schema": "v1"}, log_fn=lambda _m: None,
+                          **kwargs)
+
+    def _reload(self, tmp_path, video):
+        from modules.video_cache import VideoAnalysisCache
+
+        return VideoAnalysisCache(cache_dir=str(tmp_path / "cache")).load(
+            str(video), params={"schema": "v1"})
+
+    def test_the_new_event_names_reach_the_cache(self, tmp_path):
+        video = tmp_path / "a.mp4"
+        video.write_bytes(b"x")
+        assert self._write(tmp_path, video) is True
+        assert self._reload(tmp_path, video)["composed_event_names"] \
+            == ["clamped_board"]
+
+    def test_the_seconds_are_written_in_the_cache_s_own_shape(self, tmp_path):
+        # Rows, not a mapping. A second shape would make every reader of the
+        # cache learn both.
+        video = tmp_path / "a.mp4"
+        video.write_bytes(b"x")
+        self._write(tmp_path, video)
+        rows = self._reload(tmp_path, video)["objects"]
+        assert rows == [{"timestamp": 10, "objects": ["clamp", "clamped_board"],
+                         "count": 2}]
+
+    def test_everything_expensive_survives_untouched(self, tmp_path):
+        video = tmp_path / "a.mp4"
+        video.write_bytes(b"x")
+        self._write(tmp_path, video)
+        assert self._reload(tmp_path, video)["transcript"]["segments"][0]["text"] \
+            == "keep me"
+
+    def test_the_stale_timestamp_is_not_carried_over(self, tmp_path):
+        video = tmp_path / "a.mp4"
+        video.write_bytes(b"x")
+        self._write(tmp_path, video)
+        assert self._reload(tmp_path, video)["cached_at"] != "old"
+
+    def test_nothing_cached_is_not_written(self, tmp_path):
+        video = tmp_path / "a.mp4"
+        video.write_bytes(b"x")
+        assert self._write(tmp_path, video, cached_data=None) is False
+
+    def test_a_failure_is_reported_rather_than_raised(self, tmp_path):
+        # Losing the run because a cache refresh failed would be a far worse
+        # trade than a stale timeline.
+        from modules.compose_events import write_back
+
+        assert write_back("/no/such/video.mp4", {"objects": []}, {}, [], [],
+                          cache_dir=str(tmp_path / "c"),
+                          log_fn=lambda _m: None) in (True, False)
+
+
 class TestStripAndFingerprint:
     def test_strip_keeps_a_detector_frame_at_the_same_second(self):
         boxes = [{"timestamp": 10.0, "objects": ["clamp"], "bboxes": [[0, 0, 1, 1]]},
