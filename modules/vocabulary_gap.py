@@ -65,10 +65,10 @@ TOP_GAPS = 8
 def tokens_of(name: str) -> set:
     """The words inside a class or event name.
 
-    ``double_vaginal`` covers a spoken "double" and a spoken "vaginal"; that is
-    the whole of the matching rule. Splitting on non-letters means a name in any
-    of the conventions this repo has met -- snake_case, kebab, spaced -- resolves
-    the same way without anyone declaring which is in use.
+    A class named ``two_people`` covers a spoken "two" and a spoken "people";
+    that is the whole of the matching rule. Splitting on non-letters means a
+    name in any of the conventions this repo has met -- snake_case, kebab,
+    spaced -- resolves the same way without anyone declaring which is in use.
     """
     from modules.chapter_speech import tokenize
     return set(tokenize(str(name or "").replace("_", " ").replace("-", " ")))

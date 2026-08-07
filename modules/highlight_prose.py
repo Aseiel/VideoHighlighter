@@ -1160,6 +1160,10 @@ def describe_chapter(chapter: Mapping) -> list:
     # the only line that says what the chapter is *about* rather than how it
     # ranks. Empty when no transcript reached the report.
     lines.extend(describe_speech(chapter))
+    # Immediately after the speech lines, because it answers the question those
+    # lines raise: the words this stretch used and the others did not are
+    # printed just above, and this says which of them the run also measured.
+    lines.extend(describe_spoken_evidence(chapter))
 
     for finding in distinctive(chapter):
         phrase = _lift_phrase(float(finding["lift"]))
@@ -1273,6 +1277,88 @@ def describe_speech(chapter: Mapping) -> list:
     elif len(speakers) == 1:
         lines.append("One voice throughout.")
 
+    return lines
+
+
+def describe_spoken_evidence(chapter: Mapping,
+                             limit: Optional[int] = None) -> list:
+    """What the run measured about something this stretch talked about.
+
+    Two sentences a row, and the split is the point of them. The first says
+    what was named and how much of it the run found at all; the second says
+    *where* it found it, which is almost never the stretch the sentence was
+    said in. A reader who only has the first can think a claim was confirmed
+    when the label sits forty minutes away.
+
+    The lines are printed here — on the page and in the record — for the same
+    reason every other figure in a chapter block is: the narration in
+    :mod:`modules.chapter_story` is written from them and forbidden to restate
+    them, so a reader who doubts the paragraph has to find the arithmetic
+    without leaving the block.
+
+    Nothing here says the claim is true. The match is between the words spoken
+    and the name of a class; whether the two are about the same thing is a
+    judgement, and it stays the reader's.
+    """
+    from modules.spoken_evidence import MAX_ON_PAGE, MIN_LEVEL_DELTA_DB
+
+    rows = list(chapter.get("spoken_evidence") or [])
+    if not rows:
+        return []
+
+    lines = []
+    for row in rows[:(MAX_ON_PAGE if limit is None else limit)]:
+        name = str(row.get("name") or "")
+        seconds = int(row.get("seconds") or 0)
+        share = row.get("video_share_pct")
+        # "was watched for" rather than "happened": the run labelled seconds,
+        # and a reader must be able to tell the two apart.
+        found = (f"labelled in {seconds}s of the video"
+                 + (f", {float(share):.0f}% of everything it detected"
+                    if share else "")) if seconds else (
+                     "never labelled anywhere in this run, though it was a "
+                     "class the detector could emit")
+        lines.append(f'Names {name}, which this run measured — {found}. '
+                     f'(Said at {row.get("timestamp", "")}: '
+                     f'"{str(row.get("quote") or "").strip()}")')
+        if not seconds:
+            continue
+
+        where = []
+        densest = row.get("densest_chapter") or {}
+        here = row.get("here_share_pct")
+        if densest:
+            where.append(f"most of it is in chapter {densest.get('number')} "
+                         f"({densest.get('timestamp')}), "
+                         f"{float(densest.get('share_pct') or 0):.0f}% of that "
+                         f"stretch's detected seconds")
+        elif row.get("first"):
+            # No per-chapter shares to rank — the span is the weakest true
+            # answer to "where", and a row with no answer at all is one a
+            # reader cannot go and check.
+            where.append(f"first labelled at {row['first']}, last at "
+                         f"{row.get('last')}")
+        if here is not None:
+            where.append(f"{float(here):.0f}% of this one")
+        loudest = (row.get("level") or {}).get("loudest") or {}
+        if loudest:
+            delta = loudest.get("vs_video_db")
+            level = f"its loudest second is {loudest.get('timestamp')}"
+            # Under a dB is not a difference this material can resolve — the
+            # point :mod:`modules.level_by_class` is built around — so the
+            # second is named without a claim about how loud it was.
+            if delta is not None and abs(float(delta)) >= MIN_LEVEL_DELTA_DB:
+                level += f", {float(delta):+.0f} dB against the video's median"
+            alongside = loudest.get("with") or []
+            if alongside:
+                level += f", with {_join([str(a) for a in alongside])} also labelled there"
+            where.append(level)
+        clips = row.get("clips") or []
+        if clips:
+            where.append(f"{len(clips)} kept clip"
+                         f"{' overlaps' if len(clips) == 1 else 's overlap'} it")
+        if where:
+            lines.append(f"Where {name} actually is: " + "; ".join(where) + ".")
     return lines
 
 

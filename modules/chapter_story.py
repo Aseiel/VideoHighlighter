@@ -147,6 +147,81 @@ def _checks_here(report: Mapping, chapter: Mapping) -> list:
     return lines
 
 
+def _evidence_here(chapter: Mapping) -> list:
+    """Things said in this stretch that the run has its own measurement of.
+
+    The counterpart of :func:`_checks_here`, and the commoner case by far. That
+    one answers a claim an *earlier* run went away and added a rule for; this
+    one answers a claim the current run can already settle, because whatever was
+    named happens to be something the detector was labelling all along.
+
+    Told as evidence with an explicit ask rather than left in the measured
+    facts above, because a model handed a figure treats it as background and a
+    model handed a question answers it. The question is the feature: a narration
+    that repeats what a speaker said about a moment has added nothing, and the
+    same narration saying the run found that moment somewhere else, or barely at
+    all, is the thing a transcript on its own cannot produce.
+
+    The caution about what a match means is stated once, in the section header,
+    rather than per row — a model reading it five times starts hedging every
+    sentence, and the point is to get a verdict, not a disclaimer.
+    """
+    from modules.spoken_evidence import MAX_PER_CHAPTER, MIN_LEVEL_DELTA_DB
+
+    lines = []
+    for row in (chapter.get("spoken_evidence") or [])[:MAX_PER_CHAPTER]:
+        name = str(row.get("name") or "")
+        seconds = int(row.get("seconds") or 0)
+        said = (f'Someone said at {row.get("timestamp", "")}: '
+                f'"{str(row.get("quote") or "").strip()}". '
+                f'This run was labelling {name} throughout the video.')
+        if not seconds:
+            lines.append(f"- {said} It was never labelled anywhere in the "
+                         f"file, so what was said here has nothing in this run "
+                         f"agreeing with it. Say so.")
+            continue
+
+        facts = [f"{name} was labelled in {seconds} second(s) of the video"]
+        share = row.get("video_share_pct")
+        if share:
+            facts[-1] += f", {float(share):.0f}% of everything it detected"
+        densest = row.get("densest_chapter") or {}
+        if densest:
+            facts.append(f"most of it in chapter {densest.get('number')} at "
+                         f"{densest.get('timestamp')}, where it holds "
+                         f"{float(densest.get('share_pct') or 0):.0f}% of the "
+                         f"stretch")
+        elif row.get("first"):
+            facts.append(f"first labelled at {row['first']}, last at "
+                         f"{row.get('last')}")
+        here = row.get("here_share_pct")
+        if here is not None:
+            facts.append(f"{float(here):.0f}% of this stretch")
+        loudest = (row.get("level") or {}).get("loudest") or {}
+        if loudest:
+            delta = loudest.get("vs_video_db")
+            fact = f"its loudest second is {loudest.get('timestamp')}"
+            if delta is not None and abs(float(delta)) >= MIN_LEVEL_DELTA_DB:
+                fact += (f", {abs(float(delta)):.0f} dB "
+                         f"{'above' if float(delta) >= 0 else 'below'} the "
+                         f"video's median level")
+            alongside = loudest.get("with") or []
+            if alongside:
+                fact += (f", with {', '.join(str(a) for a in alongside)} also "
+                         f"labelled at that second")
+            facts.append(fact)
+        clips = row.get("clips") or []
+        if clips:
+            facts.append(f"{len(clips)} of the kept clips overlap it"
+                         if len(clips) > 1 else "one kept clip overlaps it")
+        # Not capitalised: the first word of the list is a class name, and
+        # those are the user's own, where case can be part of the name.
+        lines.append(f"- {said} " + "; ".join(facts) +
+                     ". Say whether that bears out what was said, and where it "
+                     "does not, say so plainly.")
+    return lines
+
+
 def _timestamp(seconds) -> str:
     try:
         seconds = max(0, int(seconds))
@@ -206,6 +281,19 @@ def chapter_prompt(report: Mapping, chapter: Mapping,
     if outstanding:
         parts += ["## A claim made here that a later rule was added to test",
                   *outstanding, ""]
+
+    # Above the transcript, because it is about a specific line in it and a
+    # model reading the transcript afterwards will find that line and weigh it.
+    # Below the measurements, because those describe *this* stretch and these
+    # figures describe the whole video.
+    evidence = _evidence_here(chapter)
+    if evidence:
+        parts += ["## Something said here that this run measured for itself",
+                  "The match is between the words spoken and the name of "
+                  "something the detector was labelling — nothing more. If the "
+                  "line reads as being about something else, say that instead "
+                  "of forcing the two together.",
+                  *evidence, ""]
 
     if previous:
         parts += ["## What the previous stretch was",

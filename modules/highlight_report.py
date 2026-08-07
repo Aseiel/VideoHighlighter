@@ -809,6 +809,24 @@ def build_report(*,
                 list(composed_event_names or ()))
         except Exception as exc:                   # pragma: no cover - defensive
             print(f"⚠️ Vocabulary gap skipped: {exc}")
+        # The other half of the same comparison: what was talked about that this
+        # run *did* measure. The gap says which claims nobody could check; this
+        # says what the answer is for the ones somebody can — and it is the half
+        # that lets a narration disagree with a speaker instead of paraphrasing
+        # them. Both need the same two inputs, so both live here.
+        try:
+            from modules.spoken_evidence import attach as _attach_evidence
+            chapter_rows = _attach_evidence(
+                chapter_rows,
+                list(vocabulary.get("classes") or [])
+                + list(vocabulary.get("events") or []),
+                labels_by_second=object_detections or {},
+                segments=segments,
+                levels=levels,
+                detected_seconds=int((distributions or {})
+                                     .get("detected_seconds") or 0))
+        except Exception as exc:                   # pragma: no cover - defensive
+            print(f"⚠️ Spoken evidence skipped: {exc}")
     try:
         from modules.rule_proposal import load_checks, settle_checks
         pending = load_checks(video_path)
