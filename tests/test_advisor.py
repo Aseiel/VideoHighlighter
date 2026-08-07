@@ -302,7 +302,7 @@ def test_the_model_is_shown_what_the_run_found_in_the_footage():
     prompt = build_prompt(report, diagnose(report))
     assert "## What the run found in the footage" in prompt
     assert "## The kept clips, one line each" in prompt
-    assert "In clock order" in prompt
+    assert "In order:" in prompt
 
 
 def test_the_clip_lines_carry_the_rarity_that_argues_with_them():
@@ -310,7 +310,7 @@ def test_the_clip_lines_carry_the_rarity_that_argues_with_them():
     from modules.highlight_advice import diagnose
     report = _footage_report()
     prompt = build_prompt(report, diagnose(report))
-    assert "is rare in this video" in prompt
+    assert "Hardly anywhere else in this video" in prompt
 
 
 def test_the_reading_prompt_permits_a_guess_and_requires_it_to_be_marked():
@@ -456,3 +456,37 @@ def test_the_temperature_reaches_the_model():
     # Advising leaves it alone rather than pinning it to a number of its own.
     _generate(_Fake(), "p", "s", 100, None)
     assert "temperature" not in seen
+
+
+def test_a_projector_is_not_attached_to_a_text_only_summary():
+    """It swaps the model's chat template for LLaVA's and the answer comes back empty.
+
+    A Llama-3 instruct model prompted in LLaVA's USER:/ASSISTANT: format answers
+    in the wrong shape, hits the stop sequences on its first line, and returns
+    nothing — which surfaces as "the model returned nothing" and reads like a
+    refusal.
+    """
+    import modules.advisor as advisor
+
+    seen = {}
+
+    class _Fake:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def load(self):
+            return None
+
+    import llm.llm_module as llm_module
+    original = llm_module.LLMModule
+    llm_module.LLMModule = _Fake
+    try:
+        advisor.load_llm("llama-cpp", "D:/m/a.gguf", mmproj="D:/m/mmproj.gguf")
+        assert seen.get("mmproj_path") is None
+        seen.clear()
+        # ...and it is still available to whatever actually sends an image.
+        advisor.load_llm("llama-cpp", "D:/m/a.gguf", mmproj="D:/m/mmproj.gguf",
+                         vision=True)
+        assert seen.get("mmproj_path") == "D:/m/mmproj.gguf"
+    finally:
+        llm_module.LLMModule = original

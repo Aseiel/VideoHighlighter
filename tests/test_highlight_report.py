@@ -1212,7 +1212,7 @@ class TestEventOnset:
         report = self._built(self._detections([("dog", 108, 125)]),
                              loudness_levels=levels)
         said = render_text(report)
-        assert "In clock order: dog comes on screen at 1:48" in said
+        assert "In order: dog comes on screen at 1:48" in said
         assert "the loudest point arrives 7s later" in said
 
     def test_the_run_level_count_reaches_both_renderings(self):
@@ -1254,3 +1254,50 @@ def test_a_model_summary_reaches_a_page_with_no_findings_on_it():
 def test_a_page_with_neither_findings_nor_a_summary_says_nothing():
     report = _player_report()
     assert "What to try next" not in render_html(report)
+
+
+class TestConversation:
+    """Questions asked of a report, kept with it.
+
+    Each answer used to replace the last, so a second question destroyed the
+    first — the wrong shape for the thing people do with it, which is ask again.
+    """
+
+    def _asked(self, *turns):
+        report = _player_report()
+        report["conversation"] = list(turns)
+        return report
+
+    def test_every_answer_is_kept_with_the_question_that_got_it(self):
+        report = self._asked(
+            {"asked": "What is going on here?", "answer": "A first answer.",
+             "model": "some-model", "at": "2026-08-07T10:00:00"},
+            {"asked": "And in the last clip?", "answer": "A second answer."})
+        page = render_html(report)
+        for text in ("What is going on here?", "A first answer.",
+                     "And in the last clip?", "A second answer."):
+            assert text in page
+
+    def test_the_thread_names_the_model_that_answered(self):
+        page = render_html(self._asked(
+            {"asked": "q", "answer": "a", "model": "some-model",
+             "at": "2026-08-07T10:00:00"}))
+        assert "some-model" in page
+
+    def test_it_is_never_presented_as_measured(self):
+        page = render_html(self._asked({"asked": "q", "answer": "a"}))
+        assert "not measured" in page
+
+    def test_an_older_report_with_a_single_reading_still_renders(self):
+        report = _player_report()
+        report["reading"] = "An answer from before the thread existed."
+        assert "An answer from before the thread existed." in render_html(report)
+
+    def test_the_debug_view_carries_the_thread_too(self):
+        said = render_text(self._asked({"asked": "What is going on?",
+                                        "answer": "An answer."}))
+        assert "Q: What is going on?" in said
+        assert "A: An answer." in said
+
+    def test_a_report_nobody_asked_anything_shows_no_thread(self):
+        assert "Asked of this report" not in render_html(_player_report())
