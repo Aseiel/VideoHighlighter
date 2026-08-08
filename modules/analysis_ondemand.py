@@ -76,6 +76,64 @@ def analysis_defaults() -> dict:
 # --------------------------------------------------------------------------- #
 # Transcript
 # --------------------------------------------------------------------------- #
+def _write_transcript_sidecar(video_path: str, segments: list, *,
+                              only_if_missing: bool = False, log=print) -> None:
+    """Write the plain-text `<video>_transcript.txt` the Transcript tab reads."""
+    try:
+        base = os.path.splitext(video_path)[0]
+        path = f"{base}_transcript.txt"
+        if only_if_missing and os.path.exists(path):
+            return
+        from modules.transcript_srt import create_enhanced_transcript
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(create_enhanced_transcript(segments))
+    except Exception as e:
+        log(f"⚠️ Could not write transcript sidecar: {e}")
+
+
+def cached_transcript(video_path: str, *, language: Optional[str] = None,
+                      log=print) -> Optional[dict]:
+    """The transcript already in this video's cache, when it can stand in for a
+    fresh one — otherwise ``None``.
+
+    Transcription is the most expensive thing either surface can start, and some
+    of what the buttons offer is *derived* from a transcript rather than being
+    one: subtitles are an `.srt` written from segments, which the cache may
+    already hold. Reuse is only sound when the cached transcript covers the
+    whole video — a keyword-filtered one kept only the moments around the search
+    words, so subtitles built from it would be full of holes — and when it is in
+    the language this run asked for.
+
+    Looks in every cache file the video owns, not just the newest: a video here
+    had a 1362-segment transcript in one file and an empty one in its sibling.
+    """
+    wanted = language or analysis_defaults()["language"]
+    best, rejected = None, []
+
+    for data in read_caches(video_path):
+        tr = (data or {}).get("transcript") or {}
+        segments = tr.get("segments") or []
+        if not segments:
+            continue
+        if tr.get("keyword_filtered"):
+            rejected.append("ℹ️ The cached transcript covers only the keyword "
+                            "matches — transcribing the whole video instead")
+            continue
+        cached_lang = tr.get("language")
+        if wanted and wanted != "auto" and cached_lang and cached_lang != wanted:
+            rejected.append(f"ℹ️ The cached transcript is '{cached_lang}' but this "
+                            f"run asked for '{wanted}' — transcribing again")
+            continue
+        if best is None or len(segments) > len(best.get("segments") or []):
+            best = tr
+
+    if best is not None:
+        return best
+    if rejected:
+        log(rejected[0])   # why the transcript that *is* there cannot be used
+    return None
+
+
 def run_transcript(video_path: str, *, model: Optional[str] = None,
                    language: Optional[str] = None, progress: ProgressFn = None,
                    cancel=None, log=print) -> dict:
@@ -83,6 +141,11 @@ def run_transcript(video_path: str, *, model: Optional[str] = None,
 
     Also writes the sibling `<video>_transcript.txt` the Transcript panel reads,
     matching the pipeline's behaviour.
+
+    Always transcribes: this is the button whose whole purpose is producing a
+    transcript, so pressing it with one already cached means "do it again" (a
+    different model or language, or a cache you no longer trust). Runs that only
+    *need* a transcript should ask `cached_transcript` first.
     """
     from modules.transcript import get_transcript_segments
     d = analysis_defaults()
@@ -97,13 +160,7 @@ def run_transcript(video_path: str, *, model: Optional[str] = None,
         raise _Cancelled()
 
     # Persist the plain-text sibling so the Transcript tab finds it on reopen.
-    try:
-        from modules.transcript_srt import create_enhanced_transcript
-        base = os.path.splitext(video_path)[0]
-        with open(f"{base}_transcript.txt", "w", encoding="utf-8") as f:
-            f.write(create_enhanced_transcript(segments))
-    except Exception as e:
-        log(f"⚠️ Could not write transcript sidecar: {e}")
+    _write_transcript_sidecar(video_path, segments, log=log)
 
     return {
         "segments": segments or [],
@@ -118,18 +175,35 @@ def run_transcript(video_path: str, *, model: Optional[str] = None,
 # --------------------------------------------------------------------------- #
 def run_subtitles(video_path: str, *, model: Optional[str] = None,
                   language: Optional[str] = None, source_lang: Optional[str] = None,
-                  target_lang: Optional[str] = None, progress: ProgressFn = None,
-                  cancel=None, log=print) -> dict:
-    """Transcribe and write a full-video `.srt` next to the video, then return
-    the same cache-shaped `transcript` dict `run_transcript` returns.
+                  target_lang: Optional[str] = None, reuse_cached: bool = True,
+                  progress: ProgressFn = None, cancel=None, log=print) -> dict:
+    """Write a full-video `.srt` next to the video, then return the same
+    cache-shaped `transcript` dict `run_transcript` returns.
 
     Thin wrapper over `run_transcript` (so it also writes the `_transcript.txt`
     sidecar and folds identically into the cache) plus `create_srt_file`. When
     `target_lang` differs from the spoken language the subtitles are translated;
     the file is named `<video>_<lang>.srt` with the language actually written.
+
+    Transcribes only when it has to. What this produces is the `.srt`, and a
+    transcript of that video may already be sitting in the cache from an earlier
+    run — re-deriving it costs minutes to hours for a file that takes seconds to
+    write. `reuse_cached=False` forces a fresh pass.
     """
-    tr = run_transcript(video_path, model=model, language=language,
-                        progress=progress, cancel=cancel, log=log)
+    tr = cached_transcript(video_path, language=language, log=log) if reuse_cached else None
+    if tr is not None:
+        n = len(tr.get("segments") or [])
+        log(f"✅ Using the transcript already in this video's cache ({n} segments) "
+            f"— no re-transcription")
+        if progress:
+            progress(50, 100, "Subtitles", f"Reusing cached transcript ({n} segments)")
+        # An older cache can predate the sidecar the Transcript tab reads, and
+        # the run that would have written it is the one being skipped.
+        _write_transcript_sidecar(video_path, tr.get("segments") or [],
+                                  only_if_missing=True, log=log)
+    else:
+        tr = run_transcript(video_path, model=model, language=language,
+                            progress=progress, cancel=cancel, log=log)
     segments = tr.get("segments", []) or []
 
     from modules.transcript_srt import create_srt_file
@@ -141,6 +215,11 @@ def run_subtitles(video_path: str, *, model: Optional[str] = None,
 
     if cancel is not None and cancel.is_set():
         raise _Cancelled()
+
+    if progress:
+        progress(92, 100, "Subtitles",
+                 f"Translating to {target_lang}..." if translating
+                 else f"Writing {os.path.basename(srt_path)}...")
 
     # create_srt_file translates internally when target_lang != source_lang.
     create_srt_file(segments, srt_path, source_lang=src,
@@ -337,18 +416,32 @@ def _cache_files(video_path: str):
     return video_hash, sorted(cache_dir.glob(f"{video_hash}*.cache.json"))
 
 
-def read_cache(video_path: str) -> dict:
-    """The newest on-disk cache for a video, or ``{}`` when there is none."""
+def read_caches(video_path: str) -> list:
+    """Every readable on-disk cache for a video, newest first.
+
+    One video can own several cache files — the pipeline names them by
+    parameter signature, and older runs leave a legacy `<hash>.cache.json`
+    behind. `merge_into_cache` deliberately writes a result into *all* of them,
+    so a reader hunting for one signal has to look in all of them too: the
+    newest file is not necessarily the one holding the transcript.
+    """
     import json
 
+    out = []
     _hash, files = _cache_files(video_path)
     for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                out.append(json.load(f))
         except Exception:
             continue
-    return {}
+    return out
+
+
+def read_cache(video_path: str) -> dict:
+    """The newest on-disk cache for a video, or ``{}`` when there is none."""
+    caches = read_caches(video_path)
+    return caches[0] if caches else {}
 
 
 def run_composition(video_path: str, *, log=print) -> dict:
