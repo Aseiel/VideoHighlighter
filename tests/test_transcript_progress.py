@@ -64,14 +64,20 @@ class TestForwardingBar:
 def fake_whisper_transcribe(monkeypatch):
     """A stand-in `whisper.transcribe` module holding a sentinel `tqdm`.
 
-    `import whisper.transcribe as x` binds the *attribute* on the parent
-    package, so a sys.modules entry alone would be ignored wherever the real
-    Whisper is installed — both have to be patched.
+    Shaped like the real thing, shadowing included: `whisper/__init__.py` does
+    `from .transcribe import transcribe`, so the *attribute* `whisper.transcribe`
+    is the function while the module lives only in `sys.modules`. Code that
+    reaches for the attribute finds a function with no `tqdm` on it and silently
+    does nothing — which is what shipped the first time.
     """
     mod = types.ModuleType("whisper.transcribe")
     mod.tqdm = "the-real-tqdm"
     monkeypatch.setitem(sys.modules, "whisper.transcribe", mod)
-    monkeypatch.setattr(tr.whisper, "transcribe", mod, raising=False)
+
+    def transcribe(*args, **kwargs):        # the shadowing function
+        raise AssertionError("not the module")
+
+    monkeypatch.setattr(tr.whisper, "transcribe", transcribe, raising=False)
     return mod
 
 
@@ -99,11 +105,23 @@ class TestWhisperProgressPatch:
         with tr._whisper_progress(None):
             assert fake_whisper_transcribe.tqdm == "the-real-tqdm"
 
+    def test_reaches_the_module_the_function_shadows(self, fake_whisper_transcribe):
+        """The bug this whole mechanism shipped with, pinned.
+
+        `whisper.transcribe` the attribute is a function; the module holding
+        the `tqdm` name is only in `sys.modules`. Resolving the attribute finds
+        no `tqdm`, skips the swap, and leaves the bar exactly as coarse as it
+        was — with every test passing, because a fixture that hands back a
+        module cannot see the difference.
+        """
+        assert callable(getattr(tr.whisper, "transcribe"))  # the shadow is in place
+        with tr._whisper_progress(lambda f: None):
+            assert fake_whisper_transcribe.tqdm != "the-real-tqdm"
+
     def test_missing_whisper_internals_are_survivable(self, monkeypatch):
         """A future Whisper that no longer looks like this must still transcribe."""
         bare = types.ModuleType("whisper.transcribe")  # no tqdm
         monkeypatch.setitem(sys.modules, "whisper.transcribe", bare)
-        monkeypatch.setattr(tr.whisper, "transcribe", bare, raising=False)
         with tr._whisper_progress(lambda f: None):
             pass  # no raise
 
@@ -118,7 +136,9 @@ class _FakeModel:
         self.steps = steps
 
     def transcribe(self, chunk, **params):
-        import whisper.transcribe as wt
+        # Whisper's decode loop reads `tqdm` out of its own module globals,
+        # which is the sys.modules entry — not the shadowed attribute.
+        wt = sys.modules["whisper.transcribe"]
         with wt.tqdm.tqdm(total=self.steps, unit="frames", disable=False) as bar:
             for _ in range(self.steps):
                 bar.update(1)

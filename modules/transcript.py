@@ -45,12 +45,18 @@ def _whisper_progress(on_frac):
     attribute on the real tqdm module, which every other library shares. If
     Whisper's internals ever stop looking like this, the bar simply stays as
     coarse as it was before; transcription itself is untouched either way.
+
+    The module has to come from ``import_module``: ``whisper/__init__.py`` does
+    ``from .transcribe import transcribe``, so ``whisper.transcribe`` the
+    *attribute* is the function, and ``import whisper.transcribe as x`` binds
+    that function rather than the module holding the name we need.
     """
     if on_frac is None:
         yield
         return
     try:
-        import whisper.transcribe as _wt
+        import importlib
+        _wt = importlib.import_module("whisper.transcribe")
     except Exception:
         yield
         return
@@ -213,6 +219,9 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
                         
         # Whisper walks the chunk 30 seconds at a time; that inner walk is the
         # only signal there is while a chunk (up to 10 minutes of audio) decodes.
+        # It skips its own progress update on windows it judges to be silence,
+        # so a quiet stretch still shows as a pause — the closing report below
+        # makes sure the chunk ends where it should regardless.
         with _whisper_progress(lambda f, _i=idx: report(_i, f, f"{int(f * 100)}%")):
             result = model.transcribe(chunk, **transcribe_params)
 
