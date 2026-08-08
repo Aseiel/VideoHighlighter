@@ -3,7 +3,74 @@ import whisper
 import torch
 from tqdm import tqdm
 import re
+import contextlib
 import subprocess
+
+
+class _ForwardingBar:
+    """Stands in for the tqdm bar Whisper drives, reporting to a callback.
+
+    Whisper's decode loop is the only thing that knows how far into a chunk it
+    is, and it publishes that to a tqdm bar — which, in the packaged
+    ``--windowed`` build, writes to a stderr that goes nowhere. Wearing tqdm's
+    shape here turns those updates into progress the GUI can show.
+    """
+
+    def __init__(self, total=None, on_frac=None, **_kwargs):
+        self.total = total or 0
+        self.n = 0
+        self._on_frac = on_frac
+
+    def update(self, n=1):
+        self.n += n
+        if self._on_frac and self.total:
+            self._on_frac(max(0.0, min(1.0, self.n / self.total)))
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+@contextlib.contextmanager
+def _whisper_progress(on_frac):
+    """Route Whisper's own per-chunk progress to ``on_frac`` for the duration.
+
+    Swaps the ``tqdm`` name in ``whisper.transcribe``'s namespace — not the
+    attribute on the real tqdm module, which every other library shares. If
+    Whisper's internals ever stop looking like this, the bar simply stays as
+    coarse as it was before; transcription itself is untouched either way.
+    """
+    if on_frac is None:
+        yield
+        return
+    try:
+        import whisper.transcribe as _wt
+    except Exception:
+        yield
+        return
+
+    real = getattr(_wt, "tqdm", None)
+    if real is None:
+        yield
+        return
+
+    class _Shim:
+        @staticmethod
+        def tqdm(*args, **kwargs):
+            kwargs.pop("disable", None)
+            return _ForwardingBar(*args, on_frac=on_frac, **kwargs)
+
+    _wt.tqdm = _Shim
+    try:
+        yield
+    finally:
+        _wt.tqdm = real
 
 def is_repetitive_hallucination(text, threshold=0.7):
     """Detect repetitive segments like 'ha ha ha'"""
@@ -85,25 +152,44 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log_fn(f"Using device for Whisper: {device}")
-    
+
     log_fn(f"🔤 Language parameter received: {language}")
+
+    # The bar's own share of the run: loading and splitting are quick, the
+    # chunk loop is everything else. Reported against 100 so a caller that
+    # forwards these straight to a progress bar shows one steady climb.
+    if progress_fn:
+        progress_fn(1, 100, "Transcription", f"Loading Whisper '{model_name}'...")
 
     model = whisper.load_model(model_name, device=device)
     log_fn("Splitting video into chunks...")
 
+    if progress_fn:
+        progress_fn(3, 100, "Transcription", "Splitting audio...")
+
     chunks = split_audio(video_file, chunk_length=chunk_length)
     log_fn(f"Created {len(chunks)} chunks")
 
+    CHUNKS_FROM, CHUNKS_TO = 5, 90
+
+    def report(idx, within, note=""):
+        """Position inside the chunk loop, as a whole-run percentage."""
+        if not progress_fn or not chunks:
+            return
+        done = (idx + within) / len(chunks)
+        detail = f"Chunk {idx+1}/{len(chunks)}"
+        if note:
+            detail += f" — {note}"
+        progress_fn(
+            int(CHUNKS_FROM + done * (CHUNKS_TO - CHUNKS_FROM)),
+            100,
+            "Transcription",
+            detail,
+        )
+
     all_segments = []
     for idx, chunk in enumerate(chunks):
-        # Progress indicator
-        if progress_fn:
-            progress_fn(
-                int((idx / len(chunks)) * 60),
-                100,
-                "Transcription",
-                f"Processing chunk {idx+1}/{len(chunks)}"
-            )
+        report(idx, 0.0)
 
         log_fn(f"➡️ Transcribing chunk {idx+1}/{len(chunks)}: {chunk}")
 
@@ -125,8 +211,13 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
         if language != "auto":
             transcribe_params["language"] = language
                         
-        result = model.transcribe(chunk, **transcribe_params)
-        
+        # Whisper walks the chunk 30 seconds at a time; that inner walk is the
+        # only signal there is while a chunk (up to 10 minutes of audio) decodes.
+        with _whisper_progress(lambda f, _i=idx: report(_i, f, f"{int(f * 100)}%")):
+            result = model.transcribe(chunk, **transcribe_params)
+
+        report(idx, 1.0)
+
         detected_lang = result.get('language', 'unknown')
         
         # Warn if language mismatch
