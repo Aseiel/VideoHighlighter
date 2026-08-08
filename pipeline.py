@@ -791,12 +791,18 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 try:
                     check_cancellation(cancel_flag, log, "transcript processing")
                     transcript_segments = get_transcript_segments(
-                        processed_video_path, 
-                        model_name=TRANSCRIPT_MODEL, 
-                        progress_fn=progress_fn, 
+                        processed_video_path,
+                        model_name=TRANSCRIPT_MODEL,
+                        progress_fn=progress_fn,
                         log_fn=log,
                         language=TRANSCRIPT_SOURCE_LANG,
-                        enable_diarization=True
+                        enable_diarization=True,
+                        # Checked inside the decode loop. Without it a cancel
+                        # was noticed only once the whole transcript finished,
+                        # which on a feature-length video is the entire wait.
+                        # TranscriptionCancelled is a RuntimeError, so the
+                        # handler below already treats it as "stop the run".
+                        should_cancel=(lambda: bool(cancel_flag and cancel_flag.is_set())),
                     )
                     
                     check_cancellation(cancel_flag, log, "transcript processing")

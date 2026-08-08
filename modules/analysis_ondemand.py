@@ -147,15 +147,21 @@ def run_transcript(video_path: str, *, model: Optional[str] = None,
     different model or language, or a cache you no longer trust). Runs that only
     *need* a transcript should ask `cached_transcript` first.
     """
-    from modules.transcript import get_transcript_segments
+    from modules.transcript import get_transcript_segments, TranscriptionCancelled
     d = analysis_defaults()
     model = model or d["whisper_model"]
     language = language or d["language"]
 
-    segments = get_transcript_segments(
-        video_path, model_name=model, progress_fn=progress, log_fn=log,
-        language=language, enable_diarization=False,
-    )
+    try:
+        segments = get_transcript_segments(
+            video_path, model_name=model, progress_fn=progress, log_fn=log,
+            language=language, enable_diarization=False,
+            # Cancel lands inside Whisper's decode loop, so pressing it during a
+            # ten-minute chunk stops there instead of at the end of the chunk.
+            should_cancel=(cancel.is_set if cancel is not None else None),
+        )
+    except TranscriptionCancelled:
+        raise _Cancelled()
     if cancel is not None and cancel.is_set():
         raise _Cancelled()
 
