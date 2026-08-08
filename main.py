@@ -6101,6 +6101,12 @@ if __name__ == "__main__":
     # Central theme: one graphite + accent stylesheet for all base widgets.
     # Additive — screens with their own inline styles still override it.
     _ui_theme.apply(app)
+    # The settings screens are tall scrolling columns of spin boxes; Qt's
+    # default hands the wheel to whichever one is under the cursor, so scrolling
+    # past the Scoring Points panel quietly re-scores the next run. Wheel scrolls
+    # the panel instead, everywhere in the app.
+    from modules.ui.wheel_guard import install as _install_wheel_guard
+    _install_wheel_guard(app)
     # One icon for every window the app opens (main window, timeline viewer,
     # dialogs). Set on the QApplication so nothing has to remember to do it.
     # The .ico carries every size from 16 to 256px, all of them the same logo
