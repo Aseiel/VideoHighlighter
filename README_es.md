@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.png" alt="VideoHighlighter" width="160">
+</p>
+
 <!-- hy-mt2-i18n:start -->
 [English](./README.md) | [中文](./README_zh-CN.md) | [日本語](./README_ja.md) | **Español**
 <!-- hy-mt2-i18n:end -->

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.png" alt="VideoHighlighter" width="160">
+</p>
+
 VideoHighlighter (Freeware)
 
 <!-- hy-mt2-i18n:start -->
