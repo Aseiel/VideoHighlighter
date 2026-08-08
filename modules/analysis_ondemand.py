@@ -173,6 +173,27 @@ def run_transcript(video_path: str, *, model: Optional[str] = None,
 # --------------------------------------------------------------------------- #
 # Subtitles
 # --------------------------------------------------------------------------- #
+def _band(progress: ProgressFn, lo: int, hi: int) -> ProgressFn:
+    """Squeeze a sub-step's own 0-100 into ``[lo, hi]`` of the caller's bar.
+
+    A run made of two long passes (transcribe, then translate) would otherwise
+    have each of them drive the bar from 0 to 100 in turn, which reads as the
+    work restarting.
+    """
+    if progress is None:
+        return None
+
+    def report(current, total, task="", details=""):
+        try:
+            frac = float(current) / float(total) if total else 0.0
+        except Exception:
+            frac = 0.0
+        frac = max(0.0, min(1.0, frac))
+        progress(int(lo + frac * (hi - lo)), 100, task, details)
+
+    return report
+
+
 def run_subtitles(video_path: str, *, model: Optional[str] = None,
                   language: Optional[str] = None, source_lang: Optional[str] = None,
                   target_lang: Optional[str] = None, reuse_cached: bool = True,
@@ -190,20 +211,26 @@ def run_subtitles(video_path: str, *, model: Optional[str] = None,
     run — re-deriving it costs minutes to hours for a file that takes seconds to
     write. `reuse_cached=False` forces a fresh pass.
     """
+    # Transcribing owns the first stretch of the bar and translating the rest;
+    # a reused transcript simply starts at the boundary.
+    TRANSCRIBE_TO = 60
+
     tr = cached_transcript(video_path, language=language, log=log) if reuse_cached else None
     if tr is not None:
         n = len(tr.get("segments") or [])
         log(f"✅ Using the transcript already in this video's cache ({n} segments) "
             f"— no re-transcription")
         if progress:
-            progress(50, 100, "Subtitles", f"Reusing cached transcript ({n} segments)")
+            progress(TRANSCRIBE_TO, 100, "Subtitles",
+                     f"Reusing cached transcript ({n} segments)")
         # An older cache can predate the sidecar the Transcript tab reads, and
         # the run that would have written it is the one being skipped.
         _write_transcript_sidecar(video_path, tr.get("segments") or [],
                                   only_if_missing=True, log=log)
     else:
         tr = run_transcript(video_path, model=model, language=language,
-                            progress=progress, cancel=cancel, log=log)
+                            progress=_band(progress, 0, TRANSCRIBE_TO),
+                            cancel=cancel, log=log)
     segments = tr.get("segments", []) or []
 
     from modules.transcript_srt import create_srt_file
@@ -217,13 +244,16 @@ def run_subtitles(video_path: str, *, model: Optional[str] = None,
         raise _Cancelled()
 
     if progress:
-        progress(92, 100, "Subtitles",
-                 f"Translating to {target_lang}..." if translating
+        progress(TRANSCRIBE_TO, 100, "Subtitles",
+                 f"Translating {len(segments)} segments to {target_lang}..." if translating
                  else f"Writing {os.path.basename(srt_path)}...")
 
-    # create_srt_file translates internally when target_lang != source_lang.
+    # create_srt_file translates internally when target_lang != source_lang —
+    # hundreds of LLM batches for a long video, and the second place a subtitle
+    # run can sit for minutes, so it gets the rest of the bar.
     create_srt_file(segments, srt_path, source_lang=src,
-                    target_lang=target_lang if translating else None)
+                    target_lang=target_lang if translating else None,
+                    progress_fn=_band(progress, TRANSCRIBE_TO, 98))
     log(f"✅ Subtitles saved: {srt_path}")
     return tr
 

@@ -2613,12 +2613,21 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             try:
                 base_name = os.path.splitext(OUTPUT_FILE)[0]
 
+                # Translating a full transcript is hundreds of LLM batches — the
+                # last thing a run does and, on a long video, a long wait after
+                # the bar has already reached 95%. Give it the tail end.
+                def sub_progress(current, total, task="", details=""):
+                    frac = (current / total) if total else 0.0
+                    progress.update_progress(int(95 + max(0.0, min(1.0, frac)) * 4),
+                                             100, "Subtitles", details)
+
                 # Always create full subtitles
                 progress.update_progress(95, 100, "Pipeline", "Creating full-video subtitles...")
                 log("Creating subtitles for the full video...")
                 full_srt = f"{os.path.splitext(video_path)[0]}_{TARGET_LANG}.srt"
                 if TARGET_LANG and TARGET_LANG != SOURCE_LANG:
-                    translated = translate_segments(transcript_segments, target_lang=TARGET_LANG)
+                    translated = translate_segments(transcript_segments, target_lang=TARGET_LANG,
+                                                    progress_fn=sub_progress)
                     create_srt_file(translated, full_srt)
                 else:
                     full_srt = f"{os.path.splitext(video_path)[0]}_{SOURCE_LANG}.srt"
@@ -2636,7 +2645,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             highlight_segments=segments,
                             output_path=highlight_srt_file,
                             source_lang=SOURCE_LANG,
-                            target_lang=TARGET_LANG
+                            target_lang=TARGET_LANG,
+                            progress_fn=sub_progress
                         )
                     else:
                         highlight_srt_file = f"{base_name}_{SOURCE_LANG}.srt"
