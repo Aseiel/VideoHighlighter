@@ -700,10 +700,17 @@ class SignalTimelineWindow(QMainWindow):
         """)
         controls_layout.addWidget(self.play_btn)
 
-        # Time slider
+        # Time slider, in milliseconds rather than 0-100 percent. At 100 steps
+        # one step is 1% of the file — 36 seconds of an hour-long video — so
+        # asking for a spot near where the playhead already was landed on the
+        # value the slider already had, no valueChanged was emitted, and the
+        # seek never happened. The real range is set once the duration is known.
         self.time_slider = QSlider(Qt.Horizontal)
-        self.time_slider.setRange(0, 100)
-        self.time_slider.sliderPressed.connect(lambda: setattr(self, '_block_position_updates', True))
+        self.time_slider.setRange(0, 0)
+        self.time_slider.setSingleStep(1000)     # arrow keys: a second
+        self.time_slider.setPageStep(10000)      # page keys: ten seconds
+        self.time_slider.sliderPressed.connect(self._on_slider_pressed)
+        self.time_slider.sliderReleased.connect(self._on_slider_released)
         self.time_slider.valueChanged.connect(self.seek_video)
         controls_layout.addWidget(self.time_slider)
 
@@ -961,10 +968,11 @@ class SignalTimelineWindow(QMainWindow):
         if duration <= 0:
             return
 
-        # Update slider
-        percent = (position / duration) * 100
+        # Update slider (same milliseconds the player reports)
         self.time_slider.blockSignals(True)
-        self.time_slider.setValue(int(percent))
+        if self.time_slider.maximum() != duration:
+            self.time_slider.setRange(0, int(duration))
+        self.time_slider.setValue(int(position))
         self.time_slider.blockSignals(False)
 
         # Update time display
@@ -1106,14 +1114,31 @@ class SignalTimelineWindow(QMainWindow):
             self._active_player.play()
             self.play_btn.setText("⏸ Pause")
 
-    def seek_video(self, position):
-        """Seek video to specific position (slider value 0-100)."""
+    def _on_slider_pressed(self):
+        """Hold off position updates while the handle is held."""
+        self._block_position_updates = True
+
+    def _on_slider_released(self):
+        """Let go of the handle: seek there, and always lift the hold.
+
+        The hold used to be lifted only inside `seek_video`, which runs on
+        valueChanged — so grabbing the handle and letting go without moving it
+        far enough to change the value left updates blocked *for good*. The
+        slider, the clock and the timeline playhead all froze while the video
+        carried on playing, which read as playback having stopped.
+        """
+        self.seek_video(self.time_slider.value())
+
+    def seek_video(self, position_ms):
+        """Seek the video to a slider position, in milliseconds."""
         duration = self._active_player.duration()
         if duration <= 0:
+            # Nothing to seek within — but never leave the hold behind us.
+            self._block_position_updates = False
             return
 
         self._block_position_updates = True
-        new_position_ms = int((position / 100.0) * duration)
+        new_position_ms = max(0, min(int(position_ms), duration))
         self._active_player.setPosition(new_position_ms)
 
         # Update everything immediately — don't wait for positionChanged,
@@ -1165,7 +1190,11 @@ class SignalTimelineWindow(QMainWindow):
     def update_video_duration(self, duration):
         """Update video duration display"""
         if duration > 0:
-            self.time_slider.setRange(0, 100)
+            # Signals blocked: growing the range moves the handle, and a seek
+            # to wherever it happens to land is not what loading a file means.
+            self.time_slider.blockSignals(True)
+            self.time_slider.setRange(0, int(duration))
+            self.time_slider.blockSignals(False)
             total_seconds = duration // 1000
             mins = total_seconds // 60
             secs = total_seconds % 60
