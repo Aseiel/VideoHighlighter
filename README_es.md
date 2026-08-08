@@ -10,6 +10,9 @@ VideoHighlighter (Software gratuito)
 
 Herramienta en Python para generar automáticamente clips destacados a partir de videos, mediante detección de escenas, detección de movimiento, picos de audio, detección de objetos, reconocimiento de acciones y análisis de transcripciones.
 
+> **Es gratis.** Para no perderte las próximas versiones, pulsa el botón de
+> motivación: la ⭐ de arriba. Es el pago más barato que aceptamos.
+
 
 Funciones
 
