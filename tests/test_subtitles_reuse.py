@@ -207,6 +207,54 @@ class TestSeveralCacheFiles:
         assert subtitles["transcribed"] == 1
 
 
+class TestTheSpokenLanguageHasOneHome:
+    """The `.srt` is labelled with the language of the transcript it was written
+    from. The app used to ask "what is spoken?" twice — once in Transcript
+    Settings (what Whisper is told) and again in Subtitle Settings — and the
+    second answer could not change the audio, only mislabel the result."""
+
+    def test_srt_named_for_the_reused_transcripts_language(self, cache, subtitles):
+        cache["data"] = {"transcript": {"segments": SEGMENTS, "language": "ru"}}
+        subtitles["run"](language="auto")
+        path, _count, _kw = subtitles["srt"][0]
+        assert path.endswith("_ru.srt")
+
+    def test_transcript_language_beats_the_source_lang_argument(self, cache, subtitles):
+        cache["data"] = {"transcript": {"segments": SEGMENTS, "language": "ru"}}
+        subtitles["run"](language="auto", source_lang="en")
+        path, _count, kw = subtitles["srt"][0]
+        assert kw.get("source_lang") == "ru"
+        assert path.endswith("_ru.srt")
+
+    def test_source_lang_is_still_a_fallback(self, cache, subtitles):
+        # A transcript that records no language at all.
+        cache["data"] = {"transcript": {"segments": SEGMENTS}}
+        subtitles["run"](language=None, source_lang="pl")
+        _path, _count, kw = subtitles["srt"][0]
+        assert kw.get("source_lang") == "pl"
+
+    def test_translating_out_of_the_transcripts_language(self, cache, subtitles):
+        cache["data"] = {"transcript": {"segments": SEGMENTS, "language": "ru"}}
+        subtitles["run"](language="auto", target_lang="pl")
+        path, _count, kw = subtitles["srt"][0]
+        assert kw.get("source_lang") == "ru"
+        assert kw.get("target_lang") == "pl"
+        assert path.endswith("_pl.srt")
+
+    def test_auto_does_not_name_the_file(self, cache, subtitles):
+        # `movie_auto.srt` names nothing: "auto" is a request to Whisper.
+        cache["data"] = {}
+        subtitles["run"](language="auto")
+        path, _count, _kw = subtitles["srt"][0]
+        assert path.endswith("movie.srt")
+
+    def test_no_translation_when_target_matches_what_was_spoken(self, cache, subtitles):
+        cache["data"] = {"transcript": {"segments": SEGMENTS, "language": "pl"}}
+        subtitles["run"](language="auto", target_lang="pl")
+        _path, _count, kw = subtitles["srt"][0]
+        assert kw.get("target_lang") is None
+
+
 class TestCachedTranscriptHelper:
     def test_returns_the_cache_entry(self, cache):
         entry = {"segments": SEGMENTS, "language": "en"}

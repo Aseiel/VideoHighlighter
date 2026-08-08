@@ -482,7 +482,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         CREATE_SUBTITLES = gui_config.get("create_subtitles", False)
         TRANSCRIPT_ONLY = gui_config.get("transcript_only", False)
         TRANSCRIPT_POINTS = int(gui_config.get("transcript_points", 0))
-        SOURCE_LANG = gui_config.get("source_lang", "en")  # For subtitles
+        # Subtitles are written *from* the transcript, so their source language
+        # is the one the transcript was made in — not a second setting that can
+        # disagree with it. `source_lang` is still read for configs saved by an
+        # older build, which had its own subtitle-side dropdown.
+        SOURCE_LANG = gui_config.get("transcript_source_lang") or \
+            gui_config.get("source_lang", "en")
         TARGET_LANG = gui_config.get("target_lang", None)  # For subtitles
 
         # Avoid settings
@@ -2626,11 +2631,18 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log("Creating subtitles for the full video...")
                 full_srt = f"{os.path.splitext(video_path)[0]}_{TARGET_LANG}.srt"
                 if TARGET_LANG and TARGET_LANG != SOURCE_LANG:
-                    translated = translate_segments(transcript_segments, target_lang=TARGET_LANG,
+                    # Say which language it is translating out of: the default
+                    # here was "en" regardless of what was actually spoken.
+                    translated = translate_segments(transcript_segments,
+                                                    source_lang=SOURCE_LANG,
+                                                    target_lang=TARGET_LANG,
                                                     progress_fn=sub_progress)
                     create_srt_file(translated, full_srt)
                 else:
-                    full_srt = f"{os.path.splitext(video_path)[0]}_{SOURCE_LANG}.srt"
+                    # "auto" is a request to Whisper, not a language to name a
+                    # file after; untranslated, it is just the subtitles.
+                    suffix = "" if SOURCE_LANG == "auto" else f"_{SOURCE_LANG}"
+                    full_srt = f"{os.path.splitext(video_path)[0]}{suffix}.srt"
                     create_srt_file(transcript_segments, full_srt)
                 log(f"Full-video subtitles created: {full_srt}")
 

@@ -210,6 +210,11 @@ def run_subtitles(video_path: str, *, model: Optional[str] = None,
     transcript of that video may already be sitting in the cache from an earlier
     run — re-deriving it costs minutes to hours for a file that takes seconds to
     write. `reuse_cached=False` forces a fresh pass.
+
+    The spoken language is read off the transcript that ends up being used, so a
+    reused one is labelled with *its* language rather than with what this run
+    happened to ask for. `source_lang` is only a fallback for a transcript that
+    does not record one.
     """
     # Transcribing owns the first stretch of the bar and translating the rest;
     # a reused transcript simply starts at the boundary.
@@ -235,10 +240,12 @@ def run_subtitles(video_path: str, *, model: Optional[str] = None,
 
     from modules.transcript_srt import create_srt_file
     base = os.path.splitext(video_path)[0]
-    src = source_lang or language or tr.get("language") or "en"
+    src = tr.get("language") or language or source_lang or "en"
     translating = bool(target_lang and target_lang != src)
     out_lang = target_lang if translating else src
-    srt_path = f"{base}_{out_lang}.srt"
+    # "auto" is a request to Whisper, not a language: a file called
+    # `movie_auto.srt` names nothing. Untranslated, it is just the subtitles.
+    srt_path = f"{base}.srt" if out_lang == "auto" else f"{base}_{out_lang}.srt"
 
     if cancel is not None and cancel.is_set():
         raise _Cancelled()

@@ -1769,12 +1769,12 @@ class VideoHighlighterGUI(QWidget):
         self.subtitles_checkbox.setEnabled(transcript_cfg.get("enabled", False))
         subtitle_form.addRow("Create subtitles:", self.subtitles_checkbox)
 
-        self.subtitle_source_lang = QComboBox()
-        self.subtitle_source_lang.addItems(["en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
-        self.subtitle_source_lang.setCurrentText(subtitles_cfg.get("source_lang", "en"))
-        self.subtitle_source_lang.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
-        subtitle_form.addRow("Source language:", self.subtitle_source_lang)
-
+        # No "source language" here. What is spoken is a property of the video,
+        # it is already declared in Transcript Settings above (which is what
+        # Whisper is actually told), and asking twice only let the two answers
+        # disagree — a subtitle box saying "en" never made Russian audio English,
+        # it just mislabelled the translation and named the file wrong. When a
+        # cached transcript is reused, its own recorded language is used.
         self.subtitle_target_lang = QComboBox()
         self.subtitle_target_lang.addItems(["en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
         self.subtitle_target_lang.setCurrentText(subtitles_cfg.get("target_lang", "pl"))
@@ -3419,7 +3419,8 @@ class VideoHighlighterGUI(QWidget):
             "transcript_source_lang": self.transcript_source_lang.currentText(),
             "search_keywords": search_keywords,
             "create_subtitles": self.subtitles_checkbox.isChecked() and use_transcript,
-            "source_lang": self.subtitle_source_lang.currentText(),
+            # The spoken language has one home: Transcript Settings.
+            "source_lang": self.transcript_source_lang.currentText(),
             "target_lang": self.subtitle_target_lang.currentText(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "vr_mode": self.vr_mode_chk.isChecked(),
@@ -3991,7 +3992,9 @@ class VideoHighlighterGUI(QWidget):
             },
             "subtitles": {
                 "enabled": self.subtitles_checkbox.isChecked(),
-                "source_lang": self.subtitle_source_lang.currentText(),
+                # Mirrors transcript.source_lang so an older build (and anything
+                # still reading subtitles.source_lang) sees one answer, not two.
+                "source_lang": self.transcript_source_lang.currentText(),
                 "target_lang": self.subtitle_target_lang.currentText(),
             },
             # Detector knobs with no widget of their own. Carried through from
@@ -4064,7 +4067,6 @@ class VideoHighlighterGUI(QWidget):
         transcript_enabled = self.transcript_checkbox.isChecked()
         final_state = checked and transcript_enabled
         
-        self.subtitle_source_lang.setEnabled(final_state)
         self.subtitle_target_lang.setEnabled(final_state)
 
     # --- Labels ---
@@ -4802,7 +4804,8 @@ class VideoHighlighterGUI(QWidget):
             "transcript_source_lang": self.transcript_source_lang.currentText(),
             "search_keywords": search_keywords,
             "create_subtitles": self.subtitles_checkbox.isChecked() and use_transcript,
-            "source_lang": self.subtitle_source_lang.currentText(),
+            # The spoken language has one home: Transcript Settings.
+            "source_lang": self.transcript_source_lang.currentText(),
             "target_lang": self.subtitle_target_lang.currentText(),
             "frame_skip": int(self.frame_skip_spin.value()),
             "object_frame_skip": int(self.obj_frame_skip_spin.value()),
@@ -5017,8 +5020,10 @@ class VideoHighlighterGUI(QWidget):
         elif kind == "transcript":
             params["language"] = self.transcript_source_lang.currentText()
         elif kind == "subtitles":
+            # One spoken language, from Transcript Settings. run_subtitles takes
+            # the .srt's source from the transcript it actually used, so a reused
+            # cached one is labelled with its own language rather than this.
             params["language"] = self.transcript_source_lang.currentText()
-            params["source_lang"] = self.subtitle_source_lang.currentText()
             params["target_lang"] = self.subtitle_target_lang.currentText()
 
         # UI state — reuse the pipeline's progress row.
