@@ -1664,6 +1664,11 @@ class SignalTimelineScene(QGraphicsScene):
                 return iv
         return self._NICE_INTERVALS[-1]
 
+    #: On-screen gap between the bottom of the timeline and the top of a time
+    #: label, in viewport pixels. Big enough for the 9pt Consolas glyphs the
+    #: ruler draws, so the text sits inside the band rather than across its edge.
+    LABEL_BAND_PX = 20.0
+
     @staticmethod
     def _format_time_label(second):
         """H:MM:SS once we're past an hour, MM:SS otherwise."""
@@ -1696,6 +1701,7 @@ class SignalTimelineScene(QGraphicsScene):
         # Effective on-screen pixels per second = scene scale × view horizontal scale.
         views = self.views()
         m11 = views[0].transform().m11() if views else 1.0
+        m22 = views[0].transform().m22() if views else 1.0
         eff_pps = self.pixels_per_second * (m11 or 1.0)
         if eff_pps <= 0:
             return
@@ -1709,6 +1715,17 @@ class SignalTimelineScene(QGraphicsScene):
 
         h = self.sceneRect().height()
         duration = int(self.video_duration)
+
+        # Where the labels sit above the bottom edge. They ignore the view
+        # transform, so their glyphs stay ~16px tall however the scene is
+        # scaled vertically — but the position anchoring them is a scene
+        # coordinate, which does scale. A fixed scene offset therefore shrinks
+        # on screen as the view squashes the scene (many lanes in a short view,
+        # which is exactly a freshly opened window), until the text hangs off
+        # the bottom and is drawn cut in half. Convert the on-screen band into
+        # scene units so the gap is what it looks like, at any scale.
+        label_offset = self.LABEL_BAND_PX / (m22 or 1.0)
+        label_y = max(0.0, h - min(label_offset, h))
 
         # Minor gridlines (skip the ones that coincide with a label line).
         # Solid faint hairlines — the old dashes added a lot of visual noise
@@ -1736,7 +1753,7 @@ class SignalTimelineScene(QGraphicsScene):
             text.setDefaultTextColor(QColor(150, 150, 150))
             # Constant on-screen size + anchored at x so the zoom can't distort it.
             text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-            text.setPos(x, h - 22)
+            text.setPos(x, label_y)
             self._time_marker_items.append(text)
             second += label_iv
       
@@ -2261,6 +2278,8 @@ class SignalTimelineView(QGraphicsView):
         scale_y = view_height / scene_rect.height()
         # Only adjust vertical scale, keep horizontal untouched
         current = self.transform()
+        if current.m22() == scale_y:
+            return
         self.setTransform(
             current.__class__(
                 current.m11(), current.m12(),
@@ -2268,6 +2287,13 @@ class SignalTimelineView(QGraphicsView):
                 current.dx(),  current.dy()
             )
         )
+        # The ruler's labels are anchored a fixed number of *screen* pixels
+        # above the bottom, which is a scene distance that depends on the scale
+        # just changed. Without this they keep the spacing of whatever size the
+        # window happened to be when they were drawn — at startup, the size
+        # before the layout settled, which is why they opened cut in half.
+        if hasattr(scene, "draw_time_markers"):
+            scene.draw_time_markers()
 
     def ensure_time_visible(self, time_seconds):
         """Auto-scroll so the playhead stays visible during playback."""
