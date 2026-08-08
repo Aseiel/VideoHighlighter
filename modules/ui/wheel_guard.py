@@ -17,6 +17,11 @@ is the whole point of the change, so it should be the half that is proven.
 The event goes to the scroll area's *viewport*; sending it to the scroll area
 itself does nothing (measured, not assumed).
 
+Swallowing the event is only half of it: these widgets ship with `WheelFocus`,
+so Qt focuses them as the wheel passes — leaving a trail of boxes with their
+text selected, looking clicked-into. The guard downgrades that to `StrongFocus`
+as each one is polished, so tab and click still focus; only the wheel stops.
+
 Values still change by every deliberate means — typing, clicking the arrows,
 dragging a slider, arrow keys once focused. A widget that genuinely wants the
 wheel can opt out with `setProperty("wheelGuard", False)`.
@@ -26,7 +31,7 @@ widgets built later (rule rows, dialogs) which an install-time sweep would
 miss.
 """
 
-from PySide6.QtCore import QEvent, QObject
+from PySide6.QtCore import QEvent, QObject, Qt
 from PySide6.QtWidgets import (QAbstractScrollArea, QAbstractSpinBox, QApplication,
                                QComboBox, QSlider, QTabBar)
 
@@ -48,10 +53,33 @@ def scrolling_ancestor(widget):
     return None
 
 
+def drop_wheel_focus(widget) -> bool:
+    """Stop a widget taking keyboard focus merely because the wheel passed over.
+
+    Spin boxes and combo boxes ship with `WheelFocus`, which is `StrongFocus`
+    plus "focus me on wheel". Swallowing the wheel event is not enough on its
+    own: Qt grants that focus before the event is delivered, so scrolling down a
+    settings page left a trail of focused boxes behind the cursor, each with its
+    text selected as if the user had clicked into it. `StrongFocus` keeps tab
+    and click; only the wheel stops counting.
+    """
+    if widget.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+        widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        return True
+    return False
+
+
 class WheelGuard(QObject):
     """Application event filter: swallows wheel events on value widgets."""
 
     def eventFilter(self, obj, event):
+        # Polish is a widget's "I am about to be shown for the first time", so
+        # this reaches widgets built long after install (rule rows, dialogs).
+        if event.type() == QEvent.Type.Polish and isinstance(obj, GUARDED):
+            if obj.property("wheelGuard") is not False:
+                drop_wheel_focus(obj)
+            return False
+
         if event.type() != QEvent.Type.Wheel or not isinstance(obj, GUARDED):
             return False
         if obj.property("wheelGuard") is False:
@@ -76,4 +104,9 @@ def install(app) -> WheelGuard:
     """
     guard = WheelGuard(app)
     app.installEventFilter(guard)
+    # Anything already built — installing before or after the window is up
+    # should not change the result.
+    for widget in app.allWidgets():
+        if isinstance(widget, GUARDED) and widget.property("wheelGuard") is not False:
+            drop_wheel_focus(widget)
     return guard

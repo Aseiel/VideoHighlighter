@@ -175,12 +175,65 @@ class TestThePanelStillScrolls:
         dialog.hide(); dialog.deleteLater()
 
 
+class TestNoFocusTrailBehindTheCursor:
+    """Swallowing the wheel is only half of it.
+
+    Spin boxes and combos ship with WheelFocus, and Qt grants that focus before
+    the event is delivered — so scrolling down a settings page left every box it
+    passed focused, text selected, looking clicked-into.
+    """
+
+    def test_default_really_is_wheel_focus(self, app):
+        # The behaviour being removed; if Qt ever changes this, this test says so.
+        assert QSpinBox().focusPolicy() == Qt.FocusPolicy.WheelFocus
+
+    @pytest.mark.parametrize("name", ["spin", "dspin", "combo"])
+    def test_wheel_no_longer_counts_as_a_reason_to_focus(self, panel, guard, name):
+        area, w = panel
+        assert w[name].focusPolicy() == Qt.FocusPolicy.StrongFocus
+
+    def test_click_and_tab_still_focus(self, panel, guard):
+        area, w = panel
+        policy = w["spin"].focusPolicy()
+        assert policy & Qt.FocusPolicy.ClickFocus
+        assert policy & Qt.FocusPolicy.TabFocus
+
+    def test_widgets_built_after_the_guard_are_covered(self, app, guard):
+        holder = QWidget()
+        lay = QVBoxLayout(holder)
+        late = QSpinBox()
+        lay.addWidget(late)
+        holder.show()                      # Polish happens here
+        assert late.focusPolicy() == Qt.FocusPolicy.StrongFocus
+        holder.hide(); holder.deleteLater()
+
+    def test_widgets_built_before_the_guard_are_covered(self, app):
+        early = QSpinBox()
+        assert early.focusPolicy() == Qt.FocusPolicy.WheelFocus
+        g = wheel_guard.install(app)
+        try:
+            assert early.focusPolicy() == Qt.FocusPolicy.StrongFocus
+        finally:
+            app.removeEventFilter(g)
+        early.deleteLater()
+
+
 class TestOptOut:
     def test_a_widget_can_ask_for_its_wheel_back(self, panel, guard):
         area, w = panel
         w["spin"].setProperty("wheelGuard", False)
         wheel(w["spin"])
         assert w["spin"].value() != 50
+
+    def test_opt_out_keeps_its_wheel_focus(self, app, guard):
+        holder = QWidget()
+        lay = QVBoxLayout(holder)
+        late = QSpinBox()
+        late.setProperty("wheelGuard", False)
+        lay.addWidget(late)
+        holder.show()
+        assert late.focusPolicy() == Qt.FocusPolicy.WheelFocus
+        holder.hide(); holder.deleteLater()
 
 
 class TestWhatIsNotGuarded:
