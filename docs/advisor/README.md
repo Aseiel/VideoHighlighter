@@ -20,6 +20,7 @@ beyond these pages plus the numbers in the report.
 | `variety.md` | every clip looks the same |
 | `composition.md` | raw detections vs. composed events |
 | `training.md` | the detector cannot see it at any threshold |
+| `measuring.md` | something was said that no signal in the run measured |
 
 ## Writing rules
 

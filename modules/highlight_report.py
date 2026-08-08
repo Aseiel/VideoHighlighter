@@ -827,6 +827,23 @@ def build_report(*,
                                      .get("detected_seconds") or 0))
         except Exception as exc:                   # pragma: no cover - defensive
             print(f"⚠️ Spoken evidence skipped: {exc}")
+    # The third side of the same comparison. The gap reports words a stretch
+    # repeats; the evidence reports what was measured about the ones a class
+    # covers; this reports whole lines the page is already printing that nothing
+    # measured at all — the claim somebody makes once, which no frequency
+    # threshold can reach. Computed off the finished chapters and the class
+    # list, so the same call serves a re-narration of a saved record.
+    unmeasured = {}
+    if chapter_rows and speech_summary:
+        try:
+            from modules.uncovered_claims import summarise as _unmeasured
+            unmeasured = _unmeasured({"settings": dict(settings or {}),
+                                      "chapters": chapter_rows,
+                                      "vocabulary": vocabulary,
+                                      "speech": speech_summary})
+        except Exception as exc:                   # pragma: no cover - defensive
+            print(f"⚠️ Unmeasured claims skipped: {exc}")
+
     try:
         from modules.rule_proposal import load_checks, settle_checks
         pending = load_checks(video_path)
@@ -878,6 +895,11 @@ def build_report(*,
         # could not. The gap is what makes an unconfirmable claim visible as
         # such rather than as an absence nobody noticed.
         "vocabulary": vocabulary,
+        # Lines the page quotes that nothing in this run measured, and what it
+        # would take to measure them. Kept beside the vocabulary rather than
+        # inside it because it is a different question: the gap asks what was
+        # not watched for, this asks what to do about it.
+        "unmeasured": unmeasured,
         # Claims an earlier run added a rule to test, and whether that rule
         # fired this time. This is what closes the loop the advisor opens.
         "checks": checks,
@@ -1263,6 +1285,19 @@ a.clip:hover{color:var(--accent);border-color:var(--accent)}
 .find .fix{color:var(--text)}
 .narr{background:#191a1f;border:1px solid var(--line);border-radius:8px;
       padding:12px 14px;margin-bottom:12px;white-space:pre-wrap;font-size:13.5px}
+/* Claims nothing measured, and the routes that would */
+.claim{background:var(--card);border:1px solid var(--line);
+       border-left:3px solid var(--warm);border-radius:8px;padding:11px 14px;
+       margin-bottom:8px}
+.claim .q{font-size:14px;color:var(--text);margin:0 0 5px;line-height:1.5}
+.claim .meta{margin:0;font-size:12.5px}
+.route{border:1px solid var(--line);border-radius:8px;padding:10px 13px;
+       margin:8px 0;background:var(--card)}
+.route b{display:block;font-size:10.5px;text-transform:uppercase;
+         letter-spacing:.08em;color:var(--accent);margin-bottom:3px}
+.route .name{color:var(--text);font-size:13.5px;font-weight:600;margin:0 0 4px}
+.route p{margin:3px 0;font-size:13px;color:var(--dim)}
+.route code{font-size:12px;word-break:break-all}
 .concl{background:#191a1f;border:1px solid var(--line);border-left:3px solid var(--accent);
        border-radius:8px;padding:14px 16px 16px;margin-bottom:14px}
 .concl h2{margin:0 0 10px;font-size:15px;border:0;padding:0}
@@ -1331,7 +1366,34 @@ a.clip:hover{color:var(--accent);border-color:var(--accent)}
 .wave{display:block;width:100%;height:34px;margin-top:8px;opacity:.85}
 .wavelab{color:var(--dim);font-size:11.5px;margin-top:2px}
 .boost{margin-top:10px;font-size:12.5px;color:var(--warm)}
-h2{font-size:16px;margin:34px 0 6px}
+h2{font-size:16px;margin:34px 0 6px;scroll-margin-top:16px}
+/* Where a measurement stops and a reading of it begins */
+.group{margin:52px 0 4px;padding-top:20px;border-top:2px solid var(--line);
+       scroll-margin-top:16px}
+.group .glabel{display:block;font:700 12px/1.4 inherit;text-transform:uppercase;
+               letter-spacing:.2em;color:var(--accent)}
+.group p{margin:6px 0 0;color:var(--dim);font-size:13px;max-width:70ch}
+.group + h2{margin-top:20px}
+/* The contents rail. Hidden until the viewport is wide enough that it cannot
+   reach the text: the page is a centred 900px column, so the rail clears it
+   only while (W-900)/2 > 16+180. The scrollbar takes its own bite out of W
+   before the page is centred, so the breakpoint sits well above the width the
+   arithmetic alone gives — measured at 1340, the gap is 17px, not 26. A rail
+   that covers the text it indexes is worse than no rail at all. */
+#toc{display:none}
+@media (min-width:1340px){
+  #toc{display:block;position:fixed;top:28px;right:16px;width:180px;
+       max-height:calc(100vh - 56px);overflow:auto;font-size:12.5px;
+       line-height:1.4;scrollbar-width:thin}
+  #toc a{display:block;color:var(--dim);text-decoration:none;padding:3px 9px;
+         border-left:2px solid transparent}
+  #toc a:hover{color:var(--text)}
+  #toc a.g{color:var(--accent);font-size:10.5px;font-weight:700;
+           text-transform:uppercase;letter-spacing:.12em;margin-top:12px}
+  #toc a.s{padding-left:17px}
+  #toc a.on{color:var(--text);border-left-color:var(--accent);
+            background:var(--card)}
+}
 .note{color:var(--dim);font-size:13px;margin-bottom:14px}
 table{width:100%;border-collapse:collapse;font-size:13.5px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
@@ -1464,7 +1526,8 @@ def _overview(report: Mapping) -> str:
               '<span><i style="background:#e8a33d"></i>scored well, not kept</span>'
               '</div>')
 
-    return f'<div class="tl">{"".join(parts)}{caption}{wave}{legend}</div>'
+    return (f'<h2>Where the clips came from</h2>'
+            f'<div class="tl">{"".join(parts)}{caption}{wave}{legend}</div>')
 
 
 def _reading_block(report: Mapping) -> str:
@@ -1954,6 +2017,192 @@ def _chapters(report: Mapping) -> str:
     )
 
 
+def _group(label: str, note: str, *parts: str) -> str:
+    """A banner over the sections beneath it, or nothing when they are all empty.
+
+    The page had grown to fifteen sections of equal weight, and equal weight is
+    the problem: the reader cannot see where a measurement stops and a reading
+    of it begins, which is the one distinction this whole report is built on.
+    A rule with a word over it costs a line and answers that at a glance.
+
+    It takes the sections rather than sitting before them so it cannot outlive
+    them. A run with no transcript has nothing under "the advisor", and a banner
+    over an empty stretch of page is worse than no banner — it reads as a
+    section that failed to render.
+    """
+    body = "".join(part for part in parts if part)
+    if not body:
+        return ""
+    return (f'<div class="group"><span class="glabel">{html.escape(label)}</span>'
+            f'<p>{html.escape(note)}</p></div>{body}')
+
+
+def _section_nav() -> str:
+    """The rail down the right-hand side: where you are, and one click elsewhere.
+
+    Filled from the page's own headings at load time rather than from a list
+    kept here. Fifteen sections are assembled by fifteen independent functions,
+    several of which return nothing on a given run, and a hand-maintained
+    contents list would be wrong the first time one of them stayed silent — and
+    wrong invisibly, which is the worst kind.
+
+    Hidden below a wide viewport. It is fixed to the right edge while the page
+    itself is a centred 900px column, so under about 1340px the two would
+    overlap; a rail that covers the text it is indexing is worse than no rail,
+    and the page below that width is exactly what it is today.
+    """
+    return '<nav id="toc" aria-label="Sections"></nav>'
+
+
+def _nav_script() -> str:
+    """Build the rail, and keep it pointing at whatever is on screen.
+
+    The current section is the last heading that has passed the top of the
+    viewport, which is what a reader means by "where am I" — and it is
+    deterministic, unlike an observer firing on whichever heading happened to
+    intersect last. Jumping is a plain anchor; `scroll-margin-top` is what keeps
+    the heading off the very top edge, so no script is involved in the click.
+    """
+    return (
+        "<script>(function(){"
+        "var nav=document.getElementById('toc');if(!nav)return;"
+        # The conclusion card carries an h2 of its own and is not a section of
+        # the page -- it is the page's opening sentence.
+        "var nodes=[].slice.call(document.querySelectorAll('.group,h2'))"
+        ".filter(function(n){return !n.closest('.concl');});"
+        # Two entries is a heading, not a contents list.
+        "if(nodes.length<3){nav.remove();return;}"
+        "var rows=nodes.map(function(n,i){"
+        "if(!n.id)n.id='sec'+i;"
+        "var a=document.createElement('a');a.href='#'+n.id;"
+        "var g=n.classList.contains('group');"
+        "a.className=g?'g':'s';"
+        "a.textContent=g?n.querySelector('.glabel').textContent:n.textContent;"
+        "nav.appendChild(a);return a;});"
+        "var queued=false;"
+        "function mark(){queued=false;var best=0;"
+        "for(var i=0;i<nodes.length;i++){"
+        "if(nodes[i].getBoundingClientRect().top<=120)best=i;else break;}"
+        # The last section is usually short enough that its heading never
+        # reaches the line above -- the page runs out of scroll first -- so at
+        # the bottom the rail would point at the section before it forever.
+        "if(innerHeight+scrollY>=document.documentElement.scrollHeight-4)"
+        "best=nodes.length-1;"
+        "for(var j=0;j<rows.length;j++)"
+        "rows[j].classList.toggle('on',j===best);"
+        # A long contents list scrolls on its own, so the marked entry has to be
+        # brought back into it -- otherwise the rail stops answering the
+        # question it exists for halfway down the page.
+        "var live=rows[best];"
+        "if(live&&nav.scrollHeight>nav.clientHeight){"
+        "var t=live.offsetTop-nav.clientHeight/2;"
+        "nav.scrollTop=Math.max(0,t);}}"
+        "addEventListener('scroll',function(){"
+        "if(!queued){queued=true;requestAnimationFrame(mark);}},{passive:true});"
+        "addEventListener('resize',mark,{passive:true});"
+        # Jumping to a fragment does not reliably raise a scroll event, so the
+        # rail would move the page and then go on pointing at where the reader
+        # used to be — which is worse than not highlighting at all, because it
+        # is confidently wrong. Observed, not guessed at.
+        "nav.addEventListener('click',function(){setTimeout(mark,0);});"
+        "addEventListener('hashchange',mark);mark();"
+        "})();</script>"
+    )
+
+
+def _unmeasured(report: Mapping) -> str:
+    """Lines the page quotes that nothing measured, and what would measure them.
+
+    Printed as its own section rather than folded into the advisor findings,
+    because it is the one part of this report that is about the report's own
+    limits. Everything above says what the run found; this says what it could
+    not have found however it was configured, and names the quote it is talking
+    about so the reader can play the second and judge for themselves.
+
+    The routes are printed with their costs and their failure conditions
+    together. A recommendation without the condition it holds under is how
+    somebody spends an afternoon labelling for something a five-minute
+    prototype would have caught — see :mod:`modules.detection_routes`.
+    """
+    data = report.get("unmeasured") or {}
+    claims = data.get("claims") or []
+    routes = data.get("routes") or {}
+    if not claims:
+        return ""
+
+    rows = []
+    for claim in claims:
+        chapter = claim.get("chapter") or {}
+        watched = claim.get("measured_here") or []
+        detail = (f'chapter {chapter.get("number", "?")} · '
+                  f'{claim.get("words", 0)} words · picked out by '
+                  f'{", ".join(str(w) for w in (claim.get("unusual") or []))}')
+        if watched:
+            detail += (' · the detector was labelling '
+                       + ", ".join(str(c) for c in watched) + ' there')
+        else:
+            detail += ' · nothing was detected in that stretch at all'
+        speaker = (f'{html.escape(str(claim["speaker"]))}: '
+                   if claim.get("speaker") else "")
+        rows.append(
+            f'<div class="claim">'
+            f'<p class="q">{html.escape(str(claim.get("timestamp", "")))} '
+            f'{speaker}“{html.escape(str(claim.get("quote", "")))}”</p>'
+            f'<p class="meta">{html.escape(detail)}</p></div>')
+
+    cards = []
+    first = routes.get("first")
+    if first:
+        cards.append(
+            '<div class="route"><b>Costs nothing to rule out</b>'
+            f'<p class="name">{html.escape(str(first["name"]))}</p>'
+            f'<p>Only possible when {html.escape(str(first["holds_when"]))}. '
+            'Ask the advisor to draft the rule — “Check something that was '
+            'said…” in the AI summary menu. When the claim cannot be built '
+            'from the classes this video produced it says so, and that answer '
+            'is one model call.</p></div>')
+    probe = routes.get("probe")
+    if probe:
+        # On a build whose cheapest route is also its best test, this is not a
+        # separate errand before the recommendation — it is how you find out
+        # whether the recommendation is working.
+        lead = ("How to tell in five minutes whether it works"
+                if probe.get("same_as_fastest") else "Then, before committing")
+        cards.append(
+            f'<div class="route"><b>{lead}</b>'
+            f'<p>{html.escape(str(probe["why"]))}</p>'
+            f'<p><code>{html.escape(str(probe["how"]))}</code></p></div>')
+    for key, lead in (("fastest", "Fastest that would measure it"),
+                      ("strongest", "Most reliable"),
+                      ("interim", "Meanwhile, for nothing")):
+        route = routes.get(key)
+        if not route:
+            continue
+        cards.append(
+            f'<div class="route"><b>{lead}</b>'
+            f'<p class="name">{html.escape(str(route["name"]))}</p>'
+            f'<p>{html.escape(str(route["effort"]))}. '
+            f'Gives you {html.escape(str(route["gives"]))}.</p>'
+            f'<p>Right route when {html.escape(str(route["holds_when"]))} — '
+            f'not when {html.escape(str(route["fails_when"]))}.</p></div>')
+
+    return (
+        '<h2>Said here, measured nowhere</h2>'
+        '<p class="note">Lines this page already quotes that share no word '
+        'with any class or event this run produced. The report prints them and '
+        'says nothing about them, which reads exactly like a claim that was '
+        'checked and held — so it is said here instead. Ranked by how much '
+        'vocabulary unusual for this video each line carries; nothing below '
+        'knows what any of them mean.</p>'
+        f'{"".join(rows)}'
+        '<p class="note">What it would take to measure one of them. Which '
+        'route fits depends on what the thing actually is, which you can see '
+        'and this report cannot — so each one carries the condition it holds '
+        'under, and the case where it will waste your time.</p>'
+        f'{"".join(cards)}'
+    )
+
+
 def _advice(report: Mapping) -> str:
     """What to change, if anything diagnosed this run (see modules.advisor).
 
@@ -2432,7 +2681,7 @@ def render_html(report: Mapping, title: Optional[str] = None,
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(heading)}</title><style>{_CSS}</style></head>
-<body><div class="wrap">
+<body>{_section_nav()}<div class="wrap">
 <h1>{html.escape(heading)}</h1>
 <div class="sub">Generated {html.escape(report["generated_at"])}</div>
 <div class="sub2">{html.escape(_run_sentence(report))}</div>
@@ -2443,25 +2692,33 @@ def render_html(report: Mapping, title: Optional[str] = None,
 </div>
 {_conclusion_block(report)}
 {_reading_block(report)}
-{_overview(report)}
-{_signal_relations(report)}
-{_cut_timeline(report)}
-{_standout_summary(report)}
-{_chapters(report)}
-{_level_by_class(report)}
-{_expression_arc(report)}
-{_advice(report)}
-{_summary(report)}
-<h2>The moments, in order</h2>
-<p class="note">One row per clip that was kept. The bars are the points that
-second earned, broken down by signal; the tags are what was detected there,
-grouped by what produced them — <b>objects</b> come straight from the detector,
-<b>events</b> are combinations the composition rules recognised, <b>actions</b>
-come from the action model with their confidence.</p>
-{"".join(segs)}
-{near}
-{settings}
-</div>{_player_script(media_src)}</body></html>
+{_group("The cut",
+        "What was kept, where it came from, and what the scoring did to get "
+        "there. Measured, all of it.",
+        _overview(report), _signal_relations(report), _cut_timeline(report),
+        _standout_summary(report))}
+{_group("The footage",
+        "The video itself rather than the cut — how it divides, how it sounds, "
+        "and what the expression reading does across it.",
+        _chapters(report), _level_by_class(report), _expression_arc(report))}
+{_group("The advisor",
+        "Everything above is what this run measured. Everything here is what "
+        "to do about it — including what the run could not have measured "
+        "however it was configured.",
+        _unmeasured(report), _advice(report))}
+{_group("The record",
+        "What every claim above was computed from, clip by clip. Nothing here "
+        "is a reading; it is the arithmetic, kept so any of it can be checked.",
+        _summary(report),
+        '<h2>The moments, in order</h2>'
+        '<p class="note">One row per clip that was kept. The bars are the '
+        'points that second earned, broken down by signal; the tags are what '
+        'was detected there, grouped by what produced them — <b>objects</b> '
+        'come straight from the detector, <b>events</b> are combinations the '
+        'composition rules recognised, <b>actions</b> come from the action '
+        'model with their confidence.</p>' + "".join(segs),
+        near, settings)}
+</div>{_player_script(media_src)}{_nav_script()}</body></html>
 """
 
 

@@ -541,6 +541,15 @@ def tell_report_file(json_path: str,
         except Exception as exc:                   # pragma: no cover - defensive
             print(f"⚠️ Spoken evidence backfill skipped: {exc}")
 
+    # And the other half of it: the lines nothing measured. Same reasoning, and
+    # this path re-renders the page, so without it the section would be dropped
+    # from a report that had one.
+    try:
+        from modules.uncovered_claims import ensure
+        ensure(report)
+    except Exception as exc:                       # pragma: no cover - defensive
+        print(f"⚠️ Unmeasured claims backfill skipped: {exc}")
+
     frames_fn = None
     if use_frames:
         frames_fn = frames_from_video(str((report.get("video") or {}).get("path")

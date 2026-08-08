@@ -231,6 +231,87 @@ class TestSerialisable:
         assert json.loads(json.dumps(rep))["segments"][0]["score"] == 15.0
 
 
+class TestSectionsAndNav:
+    """The page's own structure: where measurement stops and advice begins.
+
+    Fifteen sections of equal weight is the problem the banners answer, and the
+    rail is what makes fifteen navigable. Both are built from the page rather
+    than from a list kept beside it, so what has to hold is that the page keeps
+    saying what it is: a banner over sections that exist, and never over ones
+    that do not.
+    """
+
+    def _report(self, **kw):
+        sig = _signals(object={17: 10.0}, audio={17: 5.0})
+        return build_report(
+            video_path="a.mp4", video_duration=60, score=_score(sig),
+            signals=sig, segments=[(10, 20)],
+            object_detections={17: ["bench_vice"]},
+            settings={"clip_time": 10}, **kw)
+
+    def test_the_page_is_divided_into_named_groups(self):
+        page = render_html(self._report())
+        for label in ("The cut", "The record"):
+            assert f'<span class="glabel">{label}</span>' in page
+
+    def test_a_group_with_nothing_under_it_is_not_drawn(self):
+        # A banner over an empty stretch of page reads as a section that failed
+        # to render, which is worse than no banner at all. This run has no
+        # transcript and nothing diagnosed, so the advisor has nothing to say.
+        page = render_html(self._report())
+        assert '<span class="glabel">The advisor</span>' not in page
+        assert '<span class="glabel">The footage</span>' not in page
+
+    def test_the_group_appears_once_its_sections_do(self):
+        from modules.highlight_report import _group
+
+        assert _group("Nothing", "note", "", "") == ""
+        built = _group("Something", "note", "", "<h2>Here</h2>")
+        assert '<span class="glabel">Something</span>' in built
+        assert built.endswith("<h2>Here</h2>")
+
+    def test_the_labels_are_escaped_like_everything_else(self):
+        from modules.highlight_report import _group
+
+        built = _group("<b>x</b>", "<i>y</i>", "<h2>Here</h2>")
+        assert "<b>x</b>" not in built and "&lt;b&gt;x&lt;/b&gt;" in built
+        assert "&lt;i&gt;y&lt;/i&gt;" in built
+
+    def test_the_contents_rail_is_on_the_page_and_builds_itself(self):
+        page = render_html(self._report())
+        assert 'id="toc"' in page
+        # Built from the headings at load time. A list maintained here would be
+        # wrong the first time a section returned nothing, and wrong invisibly.
+        assert "querySelectorAll('.group,h2')" in page
+
+    def test_the_conclusion_is_not_a_section_of_the_page(self):
+        # It carries an h2 and is the page's opening sentence, not a stop on
+        # the way down it.
+        page = render_html(self._report())
+        assert "!n.closest('.concl')" in page
+
+    def test_every_section_the_rail_can_reach_has_a_heading(self):
+        """No section may be silent in the contents list.
+
+        The rail indexes `h2`, so a section rendering without one is a stretch
+        of page the reader cannot navigate to — which is how "where am I"
+        stopped being answerable in the first place.
+        """
+        import re
+
+        from modules import highlight_report as mod
+
+        page = render_html(self._report())
+        headings = re.findall(r"<h2[^>]*>([^<]+)</h2>", page)
+        # The overview was the section that had none: the strip answering "did
+        # it look at the whole video" was the least skippable thing on the page
+        # and the only one you could not jump to.
+        assert "Where the clips came from" in headings
+        assert "The moments, in order" in headings
+        assert "Settings used" in headings
+        assert mod._section_nav() in page
+
+
 class TestRenderers:
     def _report(self):
         sig = _signals(object={17: 10.0}, audio={17: 5.0}, action={45: 4.0})
@@ -252,8 +333,13 @@ class TestRenderers:
     def test_html_is_self_contained(self):
         page = render_html(self._report())
         assert page.startswith("<!doctype html>")
-        # Nothing may be fetched when the file is opened.
-        for token in ("http://", "https://", "<script", "src=\"/"):
+        # Nothing may be fetched when the file is opened. The page carries
+        # inline script of its own -- the contents rail is built from the
+        # headings at load time -- so what is forbidden is a script that
+        # *fetches*, not script as such. A report is a file people mail to
+        # each other, and it must not phone anywhere when opened.
+        for token in ("http://", "https://", "src=\"/", "<link ", "@import",
+                      "<script src"):
             assert token not in page, f"external reference in report: {token}"
         assert "<style>" in page
 
@@ -392,7 +478,9 @@ class TestOverviewAndSummary:
     def test_overview_is_plain_svg_with_nothing_fetched(self):
         page = render_html(self._rep(waveform=[0.4] * 600))
         assert "<svg" in page
-        for token in ("http://", "https://", "<script"):
+        # The curve is drawn, never fetched. Inline script is allowed and
+        # present; a script with a source is what would break the promise.
+        for token in ("http://", "https://", "<script src"):
             assert token not in page
 
     def test_signal_totals_add_up_across_the_whole_cut(self):
@@ -483,8 +571,11 @@ class TestBoxes:
         cache = self._cache()
         cache[0]["objects"] = ["<script>x</script>", "table_set"]
         page = render_html(self._report(bbox_cache=cache))
-        assert "<script>" not in page
-        assert "&lt;script&gt;" in page
+        # The label, specifically. The page carries a script of its own, so
+        # "no <script> anywhere" would pass for the wrong reason once and then
+        # fail for the wrong reason forever.
+        assert "<script>x</script>" not in page
+        assert "&lt;script&gt;x&lt;/script&gt;" in page
 
     def test_no_thumbnail_means_no_overlay_and_no_crash(self):
         sig = _signals(object={17: 10.0})
@@ -985,10 +1076,15 @@ def test_the_seek_button_targets_the_loudest_second():
 
 
 def test_the_page_is_standalone_when_no_source_is_linked():
-    """Without media_src the report is exactly what it was before players."""
+    """Without media_src the report has no player and nothing wiring one up."""
     page = render_html(_player_report())
     assert "<video" not in page
-    assert "<script>" not in page
+    # Not "no script": the contents rail has one either way. What must be
+    # absent is the player's own wiring, which has nothing to drive. The class
+    # names live in the stylesheet regardless, so the test is on the code that
+    # would go looking for them.
+    assert "querySelectorAll('.seek')" not in page
+    assert "querySelectorAll('.play video')" not in page
 
 
 def test_a_missing_source_is_explained_rather_than_silent():

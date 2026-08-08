@@ -5811,13 +5811,24 @@ class VideoHighlighterGUI(QWidget):
         Was a chain of four prompts with no view of what was already configured
         and no way back from the second one.
         """
+        from PySide6.QtWidgets import QApplication
+
         from modules.llm_models import label_for
         from modules.ui.model_dialog import ModelDialog
 
         models = self._llm_models()
         active = self._active_llm_model()
-        dialog = ModelDialog(self, models=models,
-                             chosen=label_for(active) if active else None)
+        # Building it asks the Ollama server what it holds, so the dialog can
+        # offer the names instead of asking the user to remember them. That is
+        # a request with a timeout, and a server that is not running spends all
+        # of it — once per session, since the answer is cached, but the first
+        # time it should look like waiting rather than like a hang.
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            dialog = ModelDialog(self, models=models,
+                                 chosen=label_for(active) if active else None)
+        finally:
+            QApplication.restoreOverrideCursor()
         dialog.exec()
 
         self._save_llm_models(dialog.models)

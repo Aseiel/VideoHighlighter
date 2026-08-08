@@ -527,6 +527,85 @@ def _rule_unchecked_vocabulary(report) -> Optional[Finding]:
     )
 
 
+def _rule_unmeasured_claim(report) -> Optional[Finding]:
+    """A sentence the report prints, about something the run has no signal for.
+
+    The companion to :func:`_rule_unchecked_vocabulary` and not a duplicate of
+    it. That one is about *words a stretch repeats*, and its answer is a
+    composition rule over classes that already exist. This one is about a single
+    substantial line — the kind of thing somebody says once, naming what they
+    wanted or what they liked most — and its answer is usually not a rule at
+    all, because there is nothing to compose. It is a new signal or nothing, and
+    the useful part of the advice is which signal, at what cost.
+
+    Deliberately names two routes and not six. The routes themselves come from
+    :mod:`modules.detection_routes`, which knows what this run has the
+    prerequisites for; what the claim is *about* decides which of the two fits,
+    and only the person who can see their own footage knows that.
+    """
+    unmeasured = report.get("unmeasured") or {}
+    claims = unmeasured.get("claims") or []
+    routes = unmeasured.get("routes") or {}
+    if not claims:
+        return None
+
+    lead = claims[0]
+    where = lead.get("chapter") or {}
+    watched = lead.get("measured_here") or []
+    # The two cases read very differently to a user. "Nothing was detected in
+    # that stretch" is a run that did not look; "these four classes were, and
+    # none of them is this" is a run that looked and has no vocabulary for it,
+    # which is the case no threshold or weight can improve.
+    context = (f"The detector was busy in that stretch — it labelled "
+               f"{', '.join(str(c) for c in watched[:4])} there — so this is "
+               f"not a gap in coverage but a gap in vocabulary."
+               if watched else
+               "Nothing at all was detected in that stretch, so it is worth "
+               "checking whether the detector ran there before concluding "
+               "anything about what it cannot see.")
+
+    fastest = routes.get("fastest") or {}
+    strongest = routes.get("strongest") or {}
+    first = routes.get("first") or {}
+    steps = []
+    if first:
+        steps.append("First, for nothing: ask the advisor to draft a rule for "
+                     "the line. It answers that the claim cannot be built from "
+                     "the classes this video has, when it cannot, and that "
+                     "rules out the cheapest route in one call.")
+    if fastest:
+        steps.append(f"Fastest that would actually measure it: "
+                     f"{fastest['name'].lower()} — {fastest['effort']}. "
+                     f"Right route when {fastest['holds_when']}; not when "
+                     f"{fastest['fails_when']}.")
+    if strongest:
+        steps.append(f"Most reliable: {strongest['name'].lower()} — "
+                     f"{strongest['effort']}. "
+                     f"Worth it when {strongest['holds_when']}.")
+    probe = routes.get("probe") or {}
+    if probe:
+        steps.append(probe["why"])
+
+    others = len(claims) - 1
+    return Finding(
+        id="unmeasured_claim",
+        severity="medium",
+        title="Something was said that this run has no measurement for",
+        detail=(f"At {lead.get('timestamp', '?')}, in chapter "
+                f"{where.get('number', '?')}: \"{lead.get('quote', '')}\" "
+                f"No class or event this run produced shares a word with that "
+                f"line, so the report quotes it and says nothing about it — "
+                f"neither confirming nor contradicting it. {context}"
+                + (f" {others} other quoted line(s) are in the same position."
+                   if others > 0 else "")),
+        remedy=" ".join(steps) or (
+            "This run produced no detections at all, so there is nothing to "
+            "build on yet. Run object detection first, then ask again."),
+        topic="measuring",
+        evidence={"claims": claims[:3], "routes": routes},
+    )
+
+
 def _rule_pending_checks(report) -> list:
     """An earlier run added a rule to test a claim. Say how it turned out."""
     out = []
@@ -618,7 +697,7 @@ def diagnose(report: Mapping,
                  _rule_boost_never_fired, _rule_near_miss_gap,
                  _rule_dominant_tag, _rule_short_of_target,
                  _rule_expressions_unselected, _rule_expression_lopsided,
-                 _rule_unchecked_vocabulary):
+                 _rule_unchecked_vocabulary, _rule_unmeasured_claim):
         found = rule(report)
         if found:
             findings.append(found)
@@ -641,7 +720,18 @@ def attach_advice(report: dict,
                   *,
                   rejected: Optional[Sequence[Sequence[float]]] = None,
                   concern: Optional[str] = None) -> dict:
-    """Put the findings into the record, so page and model read the same list."""
+    """Put the findings into the record, so page and model read the same list.
+
+    Derives the unmeasured-claims section first when the record predates it.
+    Every path that diagnoses a run goes through here, and a finding that could
+    only fire on a freshly analysed video would be missing from precisely the
+    reports somebody came back to because they were unhappy with them.
+    """
+    try:
+        from modules.uncovered_claims import ensure
+        ensure(report)
+    except Exception as exc:                       # pragma: no cover - defensive
+        print(f"⚠️ Unmeasured claims skipped: {exc}")
     report["advice"] = [f.as_dict() for f in
                         diagnose(report, rejected=rejected, concern=concern)]
     if concern:
