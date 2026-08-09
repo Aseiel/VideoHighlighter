@@ -99,12 +99,16 @@ class SignalTimelineScene(QGraphicsScene):
         self.visual_merge_gap = 2.0  # seconds — merge frame hits within this gap
         self._extract_visual_findings()  # populate from cache_data
 
-        # Define logical groups (order matters)
+        # Define logical groups (order matters). Events lead, because that is
+        # where they are drawn — directly beneath the waveform, see
+        # build_timeline. A panel that lists rows in a different order than the
+        # timeline stacks them makes the checkbox for a row hard to find, which
+        # is the one job the panel has.
         self.group_order = [
+            ('events', [f"Event: {e}" for e in self.event_types]),
             ('transcript', ['Transcript']),
             ('actions', [f"Action: {a}" for a in self.action_types]),
             ('objects', [f"Object: {o}" for o in self.object_classes]),
-            ('events', [f"Event: {e}" for e in self.event_types]),
             ('visual_search', [f"Search: {q}" for q in self.visual_queries]),
             ('scenes', ['Scenes']),
             ('motion', ['Motion Events', 'Motion Peaks']),
@@ -516,7 +520,7 @@ class SignalTimelineScene(QGraphicsScene):
             t = item.get('timestamp') or item.get('start_time') or item.get('time')
             if t is not None:
                 ts.append(float(t))
-        return ts
+        return self._run_starts(ts, self.merge_threshold)
 
     def _nav_timestamps_objects(self):
         ts = []
@@ -526,7 +530,7 @@ class SignalTimelineScene(QGraphicsScene):
             t = item.get('timestamp') or item.get('time')
             if t is not None:
                 ts.append(float(t))
-        return ts
+        return self._run_starts(ts, self.merge_threshold)
 
     def _nav_timestamps_scenes(self):
         ts = []
@@ -618,6 +622,31 @@ class SignalTimelineScene(QGraphicsScene):
         except Exception:
             return True
 
+    def _run_starts(self, times, gap):
+        """One timestamp per drawn bar, not one per contributing detection.
+
+        The ◀ ▶ arrows and the counter beside them are supposed to step through
+        what is on screen. They were stepping through the raw hits instead, so a
+        layer whose bars are merged reported far more stops than it draws — a
+        composed event holding for two minutes counted as 120, and walking it
+        took 120 presses to cross one bar.
+
+        The gap is the caller's, so each layer groups the way it draws: events by
+        EVENT_RUN_GAP, detections by the user's merge threshold. A layer that
+        does not merge passes 0 and gets every hit back, which is still one per
+        bar.
+        """
+        ordered = sorted(float(t) for t in times if t is not None)
+        if not ordered:
+            return []
+        starts = [ordered[0]]
+        last = ordered[0]
+        for t in ordered[1:]:
+            if t - last > max(float(gap), 0.0) + 1.0:
+                starts.append(t)
+            last = t
+        return starts
+
     def _nav_timestamps_events(self):
         """Timestamps of currently-visible composed events, so ◀ ▶ navigation and
         the layer's has-data check match the bars actually drawn."""
@@ -632,7 +661,7 @@ class SignalTimelineScene(QGraphicsScene):
                     if n in composed and self.visible_events.get(n, True):
                         ts.append(item.get('timestamp', 0))
                         break
-        return sorted(ts)
+        return self._run_starts(ts, self.EVENT_RUN_GAP)
 
     def _nav_timestamps_visual_search(self):
         """Timestamps of currently-visible visual-search findings (same query +
@@ -865,7 +894,20 @@ class SignalTimelineScene(QGraphicsScene):
         # Draw waveform if visible
         if self.visible_layers.get('waveform', False) and self.waveform:
             current_y = self.draw_waveform_layer(current_y, 80)
-               
+
+        # Composed events sit directly under the waveform.
+        #
+        # They used to be drawn down beside the objects, on the reasoning that
+        # objects were what they were derived from. That reasoning expired when
+        # rules gained signal conditions: an event can now come from the audio
+        # and never touch a detection, and for those the waveform immediately
+        # above is the evidence a person checks the row against. Reading a bar
+        # against the curve that produced it is the whole reason to have both on
+        # one timeline, and it cannot be done with eight rows in between.
+        if self.visible_layers.get('events', True) and self.event_types:
+            current_y = self.draw_events_layer(current_y)
+
+
         # Draw other layers
         # Layer 1: Transcript. Special-cased vs other layers: when toggled off
         # but a transcript exists, it's drawn *greyed* rather than hidden, so a
@@ -884,11 +926,6 @@ class SignalTimelineScene(QGraphicsScene):
             current_y = self.draw_improved_objects_layer(current_y)
 
         # Layer 3.5: Visual Search Findings (LLM scans / Visual Search panel)
-        # Layer 3.4: Composition-rule events — kept adjacent to objects, since
-        # that is what they are derived from.
-        if self.visible_layers.get('events', True) and self.event_types:
-            current_y = self.draw_events_layer(current_y)
-
         if self.visible_layers.get('visual_search', True) and self.visual_findings:
             current_y = self.draw_visual_findings_layer(current_y)
         

@@ -1342,13 +1342,27 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         try:
             from modules.app_paths import composition_rules_path
             from modules.compose_events import apply_rules, write_back
+            from modules.composition_signals import gather, signal_names
 
+            _rules_path = composition_rules_path()
+            _needed = signal_names(_rules_path)
             _was = set(composed_event_names or [])
             (object_detections, object_bboxes_cache,
              composed_event_names, _hits) = apply_rules(
                 object_detections, object_bboxes_cache,
-                rules_path=composition_rules_path(),
+                rules_path=_rules_path,
                 previous_names=composed_event_names,
+                # Only the signals the rules name. The expression reading is
+                # whatever a previous run left in the scan cache: this block sits
+                # before the expression scan, and moving it after would put the
+                # engine downstream of a model load for the benefit of rule sets
+                # that mostly do not use it. A rule combining the two is applied
+                # by the "Re-apply to Cache" button, which is where a rule is
+                # iterated on anyway and where both halves are already on disk.
+                signals=(gather(processed_video_path,
+                                cache_dir=gui_config.get("cache_dir", "./cache"),
+                                needed=_needed, log_fn=log)
+                         if _needed else None),
                 log_fn=log)
             # Only on a cached pass, and only when the rule set actually moved.
             # A fresh pass writes the whole cache further down; rewriting it

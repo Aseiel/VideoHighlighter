@@ -87,6 +87,18 @@ def _paint_plus(p: QPainter) -> None:
     p.drawLine(QPointF(3.0, 8.0), QPointF(13.0, 8.0))
 
 
+def _paint_cross(p: QPainter) -> None:
+    """Two strokes through the centre — remove this row.
+
+    Drawn rather than typed. The glyph this replaces ("✕") is absent from
+    the default UI font on a stock Windows install and rendered as a hollow
+    tofu box, so the control read as an empty square in the one column whose
+    job is to look like a delete button.
+    """
+    p.drawLine(QPointF(4.4, 4.4), QPointF(11.6, 11.6))
+    p.drawLine(QPointF(11.6, 4.4), QPointF(4.4, 11.6))
+
+
 def _paint_trash(p: QPainter) -> None:
     """Lidded bin."""
     p.drawLine(QPointF(3.0, 4.6), QPointF(13.0, 4.6))
@@ -194,6 +206,12 @@ def stop(palette: Palette = DARK, color: str | None = None) -> QIcon:
 def plus(palette: Palette = DARK, color: str | None = None) -> QIcon:
     """Add. Body-text tint for quiet secondary buttons."""
     return _icon(_paint_plus, color or palette.text, width=1.8)
+
+
+def cross(palette: Palette = DARK, color: str | None = None) -> QIcon:
+    """Remove a row. Tinted with the palette's danger colour where there is one."""
+    return _icon(_paint_cross, color or getattr(palette, "danger", palette.text),
+                 width=1.6)
 
 
 def trash(palette: Palette = DARK, color: str | None = None) -> QIcon:

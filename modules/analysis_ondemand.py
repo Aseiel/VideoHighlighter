@@ -532,16 +532,76 @@ def read_cache(video_path: str) -> dict:
     return caches[0] if caches else {}
 
 
-def run_composition(video_path: str, *, log=print) -> dict:
-    """Re-apply ``composition_rules.yaml`` to boxes already in the cache.
+def _classes_in(bboxes: list) -> set:
+    """Every detection class named anywhere in a cached box list."""
+    return {str(name)
+            for entry in bboxes or []
+            for name in (entry.get("objects") or [])}
 
-    The engine is pure: it reads per-frame boxes and writes event names, and
-    never touches the video or a detector. But in ``pipeline.py`` it only runs
-    *inside* a fresh object-detection pass, so editing one rule meant
-    re-detecting the whole video to see the effect — minutes or hours for a
-    change that takes the engine milliseconds. This runs it on its own.
 
-    Returns a cache patch containing the rebuilt ``objects`` list.
+def _without_classes(bboxes: list, classes: set) -> list:
+    """A box list with every detection of *classes* removed, index-wise.
+
+    Used before folding in a fresh pass for those same classes. Whole entries
+    are not dropped, because one entry holds every class seen in that frame and
+    throwing it away would take the ones nothing re-detected with it — and the
+    engine reads co-occurrence *within* a frame, so leaving two entries at one
+    timestamp (an old one and a new one) would hide exactly the containments a
+    spatial rule is asking about.
+    """
+    out = []
+    for entry in bboxes or []:
+        names = entry.get("objects") or []
+        keep = [i for i, name in enumerate(names) if str(name) not in classes]
+        if not keep:
+            continue
+        boxes = entry.get("bboxes") or []
+        confs = entry.get("confidences") or []
+        trimmed = dict(entry)
+        trimmed["objects"] = [names[i] for i in keep]
+        trimmed["bboxes"] = [boxes[i] for i in keep if i < len(boxes)]
+        trimmed["confidences"] = [confs[i] for i in keep if i < len(confs)]
+        out.append(trimmed)
+    return out
+
+
+def fold_object_boxes(video_path: str, fresh: list, classes) -> list:
+    """A fresh pass for *classes* laid over whatever else the cache holds.
+
+    A per-class run must not cost the classes it did not look for: the cached
+    boxes may be the output of an hours-long pipeline pass, and replacing the
+    whole list because somebody re-detected one class throws that away.
+    """
+    cached = (read_cache(video_path) or {}).get("object_bboxes") or []
+    return _without_classes(cached, {str(c) for c in classes}) + list(fresh or [])
+
+
+def run_composition(video_path: str, *, cache_dir: str = "./cache",
+                    progress: ProgressFn = None, cancel=None,
+                    detect_fn=None, log=print) -> dict:
+    """Apply ``composition_rules.yaml`` to a video, measuring what it needs.
+
+    The engine is pure: it reads per-frame boxes and per-second signals and
+    writes event names, and never touches the video or a detector. But in
+    ``pipeline.py`` it only runs *inside* a fresh object-detection pass, so
+    editing one rule meant re-detecting the whole video to see the effect —
+    minutes or hours for a change that takes the engine milliseconds. This runs
+    it on its own.
+
+    It also *fetches its own inputs*, because a rule set says what it needs and
+    making the user work that out was the remaining reason this was not simply
+    a Run button. Signals named by the enabled rules are measured from the file
+    here (cached, so the second run is instant), and if those rules read
+    detection classes the cache does not have, ``detect_fn(classes, ...)`` is
+    called to go and get them. Passing no ``detect_fn`` keeps the older
+    behaviour of failing with "run object detection first" — the caller decides
+    whether starting a long pass unasked is acceptable.
+
+    Only what the *enabled* rules mention is measured, both ways round: an
+    unticked rule costs nothing.
+
+    Returns a cache patch containing the rebuilt ``objects`` list (plus
+    ``object_bboxes`` when a detection pass ran here).
 
     Idempotent by construction: every name the current rule set can emit is
     stripped from the cached seconds before the new results are folded in, so
@@ -562,31 +622,121 @@ def run_composition(video_path: str, *, log=print) -> dict:
         raise RuntimeError(
             "No composition_rules.yaml found — add rules in the Advanced tab first.")
 
-    cache = read_cache(video_path)
-    if not cache:
-        raise RuntimeError("No analysis cache for this video — run an analysis first.")
+    from modules import composition_signals
 
+    cache = read_cache(video_path) or {}
     bboxes = cache.get("object_bboxes") or []
-    if not bboxes:
-        raise RuntimeError(
-            "No object boxes in the cache — run object detection first "
-            "(the rules match against its boxes).")
+    needed = composition_signals.signal_names(rules_path)
 
     engine = CompositionEngine(rules_path)
     known = set(engine.event_names)
     if not known:
         raise RuntimeError(f"No events defined in {rules_path}.")
 
-    composed, _composed_bb = engine.run(bboxes)
+    # What the enabled rules read, and what of it is not here yet. Asked of the
+    # rules rather than of the user: the file already says which classes the
+    # spatial conditions name, so making somebody type them into the objects
+    # field and press a second button was asking them to restate it.
+    wanted_classes = set(engine.object_classes)
+    absent = sorted(wanted_classes - _classes_in(bboxes)) if wanted_classes else []
+
+    # A cache is only *required* when the rules read something out of it. Signal
+    # conditions are measured from the file itself, so a rule set built from
+    # them needs no previous analysis at all, and `merge_into_cache` seeds an
+    # entry when there is none. Demanding one anyway meant the fastest thing in
+    # the app -- applying rules that touch nothing but the audio -- was gated
+    # behind the slowest, a full detection pass whose output those rules would
+    # then ignore.
+    if not cache and not needed and not (absent and detect_fn):
+        raise RuntimeError("No analysis cache for this video — run an analysis "
+                           "first, or use rules with signal conditions, which "
+                           "need none.")
+    if not bboxes and not needed and not (absent and detect_fn):
+        raise RuntimeError(
+            "No object boxes in the cache — run object detection first "
+            "(the rules match against its boxes).")
+
+    # Detection first: it is the long half, and the bar should be showing it
+    # rather than sitting at zero through the audio measurement.
+    detect_band = (0, 70) if needed else (0, 100)
+    signal_band = (70, 100) if absent and detect_fn else (0, 100)
+
+    fresh_objects = []
+    detected = False
+    if absent and detect_fn:
+        log(f"🔍 Rules need {', '.join(absent)} — detecting "
+            f"{len(wanted_classes)} class(es) first")
+        # The whole set the rules read, not just the missing ones: a spatial
+        # rule asks whether one class sits inside another *in the same frame*,
+        # and two passes at different times produce two entries per timestamp
+        # that no rule can join across.
+        patch = detect_fn(sorted(wanted_classes),
+                          progress=_band(progress, *detect_band), cancel=cancel)
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()
+        fresh = list((patch or {}).get("object_bboxes") or [])
+        if fresh:
+            bboxes = _without_classes(bboxes, wanted_classes) + fresh
+            fresh_objects = list((patch or {}).get("objects") or [])
+            detected = True
+        else:
+            log("⚠️ Detection returned no boxes — spatial rules cannot fire.")
+
+    # Only what the rules mention. The vocal measurement decodes the audio, so
+    # gathering it for a purely spatial rule set would put a minute onto an
+    # operation whose whole reason for existing is that it takes seconds.
+    signals = {}
+    if needed:
+        # `vocal_signals` reports a bare 0..1 fraction; the on-demand bar takes
+        # (current, total, task, details).
+        band = _band(progress, *signal_band)
+        vocal_progress = (None if band is None else
+                          (lambda frac: band(int(float(frac) * 100), 100,
+                                             "Composition", "Measuring audio…")))
+        signals = composition_signals.gather(
+            video_path, cache_dir=cache_dir, needed=needed,
+            progress=vocal_progress, cancel=cancel, log_fn=log)
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()
+    missing = sorted(needed - set(signals))
+    if missing:
+        # Named rather than silent: a rule referring to a signal nothing
+        # supplied simply never fires, which is indistinguishable from a
+        # threshold set too high.
+        log(f"⚠️ No values for signal(s): {', '.join(missing)} — rules using "
+            "them cannot fire.")
+        if "expression" in missing:
+            # The one input this cannot fetch for itself. A face scan needs a
+            # model and a decode of the whole video, and starting one as a side
+            # effect of a rule mentioning `expression` is a much longer wait
+            # than anything else here does unasked.
+            log("   ↳ expression comes from a face scan — run one from the "
+                "timeline viewer first.")
+
+    # The file's own length, so a closing edge guard knows where the end is.
+    # Without it the engine falls back to how far the signals reach, which is
+    # the same number for an audio rule and short of it for a spatial one.
+    duration = ((cache.get("video_metadata") or {}).get("duration")
+                or (cache.get("video_duration") or None))
+    composed, _composed_bb = engine.run(
+        bboxes, signals, duration=float(duration) if duration else None)
 
     # Rebuild the per-second list: drop this rule set's previous output, keep
     # every real detection, then fold in the new events.
     by_sec: dict = {}
-    for entry in cache.get("objects") or []:
+    for entry in (cache.get("objects") or []):
         sec = int(entry.get("timestamp", 0))
         names = [n for n in (entry.get("objects") or []) if n not in known]
         if names:
             by_sec[sec] = names
+    # A pass run here contributes its detections too, or the classes it just
+    # found would exist as boxes and be missing from the list the timeline and
+    # the scorer read.
+    for entry in fresh_objects:
+        sec = int(entry.get("timestamp", 0))
+        names = [n for n in (entry.get("objects") or []) if n not in known]
+        if names:
+            by_sec[sec] = sorted(set(by_sec.get(sec, [])) | set(names))
     for sec, names in composed.items():
         merged = set(by_sec.get(int(sec), [])) | set(names)
         by_sec[int(sec)] = sorted(merged)
@@ -597,11 +747,17 @@ def run_composition(video_path: str, *, log=print) -> dict:
     ]
     hits = sum(len(v) for v in composed.values())
     log(f"🧩 Composition: {hits} event-hit(s) over {len(composed)} second(s) "
-        f"from {len(bboxes)} cached frames")
+        f"from {len(bboxes)} frames")
     # Also record WHICH names are derived, so the timeline can group them apart
     # from real detections. Written on every run so the list tracks the current
     # rules — a renamed or deleted rule stops being claimed as an event.
-    return {"objects": rebuilt, "composed_event_names": sorted(known)}
+    out = {"objects": rebuilt, "composed_event_names": sorted(known)}
+    if detected:
+        # Only when a pass ran here. Composed boxes are still kept out (see
+        # above); what goes back is the detector's own output, so the next run
+        # finds the classes already there and skips straight to the rules.
+        out["object_bboxes"] = bboxes
+    return out
 
 
 def merge_into_cache(video_path: str, patch: dict, *, seed: dict = None,

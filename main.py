@@ -1550,6 +1550,43 @@ class VideoHighlighterGUI(QWidget):
                 ("Loudness burst points (vs local level):",
                  self.spin_loudness_burst),
             )),
+            # Composition earns a row here rather than living only beside its
+            # editor in Advanced. Rules built from signal conditions are an
+            # analysis pass like any other on this page — they measure the file
+            # and cache a result — and they are the one kind that needs no
+            # previous run, so requiring a trip to another tab to start them put
+            # the cheapest signal behind the most navigation.
+            ("Composition rules", (
+                ("Apply saved rules:", self._rules_run_row()),
+            )),
+            ("Speech", (
+                ("Keyword points (keywords in transcript):",
+                 self.spin_keyword_points),
+                ("Transcript points (all words):", self._points_row_with_button(
+                    self.spin_transcript_points, "transcript", "Transcribe",
+                    "Transcribe every video in the list to a _transcript.txt "
+                    "sidecar and cache it (uses the model/language in the "
+                    "Transcript tab). No highlights are cut.")),
+            )),
+            ("Objects && actions", (
+                ("Object points:", self._points_row_with_button(
+                    self.spin_object, "objects", "Objects",
+                    "Detect the classes from the 'Object detection' field below, "
+                    "across every video in the list, and cache them. No "
+                    "highlights are cut.")),
+                ("Action points:", self._points_row_with_button(
+                    self.spin_action, "actions", "Actions",
+                    "Detect the actions from the 'Action keywords' field below "
+                    "(blank = all actions), across every video in the list, and "
+                    "cache them. No highlights are cut.")),
+            )),
+            ("Face expression", (
+                ("Points, and which expressions:", face_row),
+            )),
+            ("Where in the video", (
+                ("Intro (window, points):", intro_widget),
+                ("Outro (window, points):", outro_widget),
+            )),
             ("Speech", (
                 ("Keyword points (keywords in transcript):",
                  self.spin_keyword_points),
@@ -2182,32 +2219,74 @@ class VideoHighlighterGUI(QWidget):
         comp_outer.addWidget(comp_info)
 
         # Table: Event Name | Label | Source | Region | Min | Max | Window | Persist | [Del]
-        self.comp_table = QTableWidget(0, 9)
+        # Two kinds of condition share this table. A spatial one is geometry
+        # (this class inside that class); a signal one is a threshold on a
+        # per-second measurement. They need different fields, and the earlier
+        # version had no row shape for the second kind — so signal rules were
+        # invisible here and could only be edited as YAML.
+        self.COMP_MIN_UNSET = -9999.0
+        self.COMP_MAX_UNSET = 9999.0
+        self.comp_table = QTableWidget(0, 13)
         self.comp_table.setHorizontalHeaderLabels([
-            "Event Name", "Display Label", "Source Object", "Region Object",
-            "Min Count", "Max Count", "Window (s)", "Persist (s)", "",
+            "On", "Kind", "Event Name", "Display Label",
+            "Object / Signal", "Region / Equals",
+            "Min", "Max", "Sustain (s)", "Within (s)",
+            "Window (s)", "Persist (s)", "",
         ])
-        self.comp_table.horizontalHeader().setToolTip(
-            "Source Object: the object that must appear inside the Region Object\n"
-            "Min/Max Count: how many Source instances must be inside the region\n"
-            "Window: seconds of frames to smooth over (reduces single-frame flicker)\n"
-            "Persist: seconds to keep a source 'alive' after it disappears (handles occlusion)"
-        )
-        self.comp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.comp_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.Fixed)
-        self.comp_table.setColumnWidth(8, 32)
+        # chr(10) rather than an escape: this block is generated, and a
+        # literal backslash-n did not survive the round trip intact.
+        self.comp_table.horizontalHeader().setToolTip(chr(10).join([
+            "On: untick to keep a rule but stop it running",
+            "Kind - Spatial: the object in Object must be inside Region.",
+            "       Signal: the measurement in Signal must sit between Min and Max.",
+            "Min/Max: counts for Spatial, thresholds for Signal. Left at the",
+            "       extreme they mean no bound and are not written out.",
+            "Region / Equals: the containing class (Spatial), or a label the",
+            "       signal must equal, such as an expression name (Signal).",
+            "Sustain: the condition must hold this many seconds in a row (Signal).",
+            "Within: accept it if it held this many seconds either side, for",
+            "       signals not sampled at the same moments (Signal).",
+            "Window: seconds of frames to smooth over (reduces flicker)",
+            "Persist: seconds to keep a source alive after it disappears",
+        ]))
+        self.comp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.comp_table.horizontalHeader().setStretchLastSection(False)
+        for _c, _w in ((0, 34), (1, 78), (2, 140), (3, 140), (4, 150), (5, 120),
+                       (6, 70), (7, 70), (8, 80), (9, 80), (10, 80), (11, 80),
+                       (12, 32)):
+            self.comp_table.setColumnWidth(_c, _w)
         self.comp_table.setMinimumHeight(160)
         self.comp_table.setMaximumHeight(280)
         self.comp_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         comp_outer.addWidget(self.comp_table)
 
         comp_btn_row = QHBoxLayout()
-        comp_add_btn = QPushButton("+ Add Rule")
-        comp_add_btn.setToolTip("Add a new rule row")
+        comp_add_btn = QPushButton("+ Add Spatial")
+        comp_add_btn.setToolTip("Add a condition on object geometry: "
+                                "this class inside that class")
+        comp_add_signal_btn = QPushButton("+ Add Signal")
+        comp_add_signal_btn.setToolTip(
+            "Add a condition on a per-second measurement, e.g. "
+            "vocal_density_pct or waveform_peak_density. Needs no detections.")
         comp_save_btn = QPushButton("Save Rules")
         comp_save_btn.setToolTip("Save composition rules to composition_rules.yaml")
         comp_btn_row.addWidget(comp_add_btn)
+        comp_btn_row.addWidget(comp_add_signal_btn)
         comp_btn_row.addStretch()
+        # Run lives here, beside the editor, because this is where rules are
+        # changed. Applying them is seconds against what is already cached; the
+        # alternative was a full pipeline run just to see a rule edit.
+        comp_btn_row.addWidget(self._make_analyze_button(
+            "composition", "Run Rules",
+            "Run the ticked rules over every video in the list.\n\n"
+            "Fetches whatever they read that is missing: a rule naming an\n"
+            "object class the cache does not have starts a detection pass for\n"
+            "the classes the rules name, and a signal rule measures the audio\n"
+            "(cached, so only the first run pays for it). Anything already\n"
+            "there is reused, so a re-run after a threshold edit is seconds.\n\n"
+            "Save your rules first. Unticked rules are skipped and cost\n"
+            "nothing. Safe to run repeatedly: previous results for these rules\n"
+            "are replaced, not stacked."))
         comp_btn_row.addWidget(comp_save_btn)
         comp_outer.addLayout(comp_btn_row)
 
@@ -2226,107 +2305,303 @@ class VideoHighlighterGUI(QWidget):
                 except Exception:
                     pass
             self.comp_table.setRowCount(0)
+            # Only an event with neither kind of condition is unrepresentable
+            # now. Kept aside and written back untouched on save, because the
+            # table rebuilds this file from its own rows and would otherwise
+            # delete it silently.
+            self._comp_passthrough = [ev for ev in events
+                                      if not ev.get('rules') and not ev.get('signals')]
             for ev in events:
-                for rule in ev.get('rules', []):
+                common = dict(
+                    ev_name=ev.get('name', ''),
+                    ev_label=ev.get('label', ev.get('name', '')),
+                    window=ev.get('window_secs', 0.75),
+                    persist=ev.get('persist_secs', 0.5),
+                    enabled=bool(ev.get('enabled', True)),
+                )
+                for rule in ev.get('rules', []) or []:
                     _comp_add_table_row(
-                        ev.get('name', ''),
-                        ev.get('label', ev.get('name', '')),
-                        rule.get('source', ''),
-                        rule.get('region', ''),
-                        rule.get('min_count', 1),
-                        rule.get('max_count', 999),
-                        ev.get('window_secs', 0.75),
-                        ev.get('persist_secs', 0.5),
-                    )
+                        kind='Spatial',
+                        source=rule.get('source', ''),
+                        region=rule.get('region', ''),
+                        min_c=rule.get('min_count', 1),
+                        max_c=rule.get('max_count', 999),
+                        **common)
+                for cond in ev.get('signals', []) or []:
+                    equals = cond.get('equals')
+                    if equals is None and cond.get('any_of'):
+                        # any_of has no column of its own; showing the first
+                        # value would quietly drop the rest, so the row is
+                        # rendered read-only-ish by leaving Equals blank and the
+                        # condition is preserved through passthrough instead.
+                        equals = None
+                    _comp_add_table_row(
+                        kind='Signal',
+                        source=str(cond.get('signal', '')),
+                        region='' if equals is None else str(equals),
+                        min_c=cond.get('min'),
+                        max_c=cond.get('max'),
+                        sustain=cond.get('sustained_secs', 0),
+                        within=cond.get('within_secs', 0),
+                        **common)
+            if self._comp_passthrough:
+                names = ', '.join(str(ev.get('name', '?'))
+                                  for ev in self._comp_passthrough)
+                # print(), not append_log(): this runs from __init__, before the
+                # log pane exists, and calling it there took the whole
+                # application down before its first window.
+                print(f"Composition rules: {len(self._comp_passthrough)} "
+                      f"rule(s) with no conditions ({names}); preserved on save.")
+
+
+        def _comp_kind_of(row):
+            combo = self.comp_table.cellWidget(row, 1)
+            return (combo.currentText() if combo else "Spatial").strip()
+
+        def _comp_apply_kind(row):
+            """Grey the cells the chosen kind does not use.
+
+            Left editable they would look like fields that simply had not been
+            filled in, and a spatial rule carrying a Sustain value that is
+            silently dropped on save is worse than one that never offered it.
+            """
+            signal = _comp_kind_of(row) == "Signal"
+            for col in (8, 9):                       # Sustain / Within
+                w = self.comp_table.cellWidget(row, col)
+                if w:
+                    w.setEnabled(signal)
+            for col in (10, 11):                     # Window / Persist
+                w = self.comp_table.cellWidget(row, col)
+                if w:
+                    w.setEnabled(True)
+            head = self.comp_table.horizontalHeaderItem(4)
+            if head:
+                head.setText("Object / Signal")
 
         def _comp_add_table_row(ev_name='', ev_label='', source='', region='',
-                                min_c=1, max_c=999, window=0.75, persist=0.5):
+                                min_c=None, max_c=None, window=0.75, persist=0.5,
+                                enabled=True, kind='Spatial',
+                                sustain=0, within=0):
             r = self.comp_table.rowCount()
             self.comp_table.insertRow(r)
-            self.comp_table.setItem(r, 0, QTableWidgetItem(ev_name))
-            self.comp_table.setItem(r, 1, QTableWidgetItem(ev_label))
-            self.comp_table.setItem(r, 2, QTableWidgetItem(source))
-            self.comp_table.setItem(r, 3, QTableWidgetItem(region))
 
-            min_spin = QSpinBox()
-            min_spin.setRange(0, 99)
-            min_spin.setValue(int(min_c))
-            self.comp_table.setCellWidget(r, 4, min_spin)
+            # Enabled is a property of the *event*, and one event can occupy
+            # several rows. Toggling any of them moves the rest, so the table
+            # cannot be left saying a rule is both on and off.
+            on_chk = QCheckBox()
+            on_chk.setChecked(bool(enabled))
+            on_chk.setToolTip("Run this rule. Unticked keeps it in the file "
+                              "but stops it matching.")
+            def _sync(state, box=on_chk):
+                row = next((i for i in range(self.comp_table.rowCount())
+                            if self.comp_table.cellWidget(i, 0) is box), None)
+                if row is None:
+                    return
+                item = self.comp_table.item(row, 2)
+                name = item.text().strip() if item else ''
+                if not name:
+                    return
+                for i in range(self.comp_table.rowCount()):
+                    other = self.comp_table.cellWidget(i, 0)
+                    twin = self.comp_table.item(i, 2)
+                    if other is None or other is box or twin is None:
+                        continue
+                    if twin.text().strip() == name and other.isChecked() != box.isChecked():
+                        other.blockSignals(True)
+                        other.setChecked(box.isChecked())
+                        other.blockSignals(False)
+            on_chk.stateChanged.connect(_sync)
+            # In the cell directly, not inside a centring wrapper: every lookup
+            # finds it with cellWidget(row, 0), and a wrapper would return the
+            # wrapper instead.
+            self.comp_table.setCellWidget(r, 0, on_chk)
 
-            max_spin = QSpinBox()
-            max_spin.setRange(0, 999)
-            max_spin.setValue(int(max_c))
-            self.comp_table.setCellWidget(r, 5, max_spin)
+            kind_combo = QComboBox()
+            kind_combo.addItems(["Spatial", "Signal"])
+            kind_combo.setCurrentText("Signal" if str(kind) == "Signal" else "Spatial")
+            def _on_kind(_i, box=kind_combo):
+                row = next((i for i in range(self.comp_table.rowCount())
+                            if self.comp_table.cellWidget(i, 1) is box), None)
+                if row is not None:
+                    _comp_apply_kind(row)
+            kind_combo.currentIndexChanged.connect(_on_kind)
+            self.comp_table.setCellWidget(r, 1, kind_combo)
+
+            self.comp_table.setItem(r, 2, QTableWidgetItem(ev_name))
+            self.comp_table.setItem(r, 3, QTableWidgetItem(ev_label))
+            self.comp_table.setItem(r, 4, QTableWidgetItem(source))
+            self.comp_table.setItem(r, 5, QTableWidgetItem(region))
+
+            # One widget type for both kinds. Counts are whole numbers and
+            # thresholds are not, and a spin box per kind would have to be
+            # rebuilt every time the Kind cell changed; the save path rounds
+            # counts back to integers instead.
+            min_spin = QDoubleSpinBox()
+            min_spin.setDecimals(2)
+            min_spin.setRange(self.COMP_MIN_UNSET, self.COMP_MAX_UNSET)
+            min_spin.setValue(self.COMP_MIN_UNSET if min_c is None else float(min_c))
+            min_spin.setToolTip("At the minimum this means 'no lower bound' "
+                                "and is not written to the file.")
+            self.comp_table.setCellWidget(r, 6, min_spin)
+
+            max_spin = QDoubleSpinBox()
+            max_spin.setDecimals(2)
+            max_spin.setRange(self.COMP_MIN_UNSET, self.COMP_MAX_UNSET)
+            max_spin.setValue(self.COMP_MAX_UNSET if max_c is None else float(max_c))
+            max_spin.setToolTip("At the maximum this means 'no upper bound' "
+                                "and is not written to the file.")
+            self.comp_table.setCellWidget(r, 7, max_spin)
+
+            sus_spin = QSpinBox()
+            sus_spin.setRange(0, 600)
+            sus_spin.setValue(int(sustain or 0))
+            sus_spin.setToolTip("0 = not required")
+            self.comp_table.setCellWidget(r, 8, sus_spin)
+
+            win_secs_spin = QSpinBox()
+            win_secs_spin.setRange(0, 600)
+            win_secs_spin.setValue(int(within or 0))
+            win_secs_spin.setToolTip("0 = must coincide exactly")
+            self.comp_table.setCellWidget(r, 9, win_secs_spin)
 
             win_spin = QDoubleSpinBox()
-            win_spin.setRange(0.1, 10.0)
+            win_spin.setRange(0.0, 10.0)
             win_spin.setSingleStep(0.25)
             win_spin.setValue(float(window))
-            self.comp_table.setCellWidget(r, 6, win_spin)
+            self.comp_table.setCellWidget(r, 10, win_spin)
 
             per_spin = QDoubleSpinBox()
             per_spin.setRange(0.0, 10.0)
             per_spin.setSingleStep(0.25)
             per_spin.setValue(float(persist))
-            self.comp_table.setCellWidget(r, 7, per_spin)
+            self.comp_table.setCellWidget(r, 11, per_spin)
 
-            del_btn = QPushButton("✕")
+            del_btn = QPushButton()
+            del_btn.setIcon(_ui_icons.cross())
+            del_btn.setToolTip("Remove this condition")
             del_btn.setFixedWidth(28)
-            del_btn.setStyleSheet("color: #c33; border: none; font-weight: bold;")
-            # Find the row at click-time by locating this button in column 8
+            del_btn.setFlat(True)
+            del_btn.setStyleSheet("border: none;")
             def _make_del(btn):
                 def _del():
                     for i in range(self.comp_table.rowCount()):
-                        if self.comp_table.cellWidget(i, 8) is btn:
+                        if self.comp_table.cellWidget(i, 12) is btn:
                             self.comp_table.removeRow(i)
                             return
                 return _del
             del_btn.clicked.connect(_make_del(del_btn))
-            self.comp_table.setCellWidget(r, 8, del_btn)
+            self.comp_table.setCellWidget(r, 12, del_btn)
 
-        def _comp_save_rules():
-            from modules.app_paths import user_data_dir
-            import os as _os
-            # Group rows by event name (preserving order of first appearance)
+            _comp_apply_kind(r)
+
+
+        def _comp_collect_events():
+            """The table as the rules file's ``events`` list."""
+            # Group rows by event name (preserving order of first appearance).
+            # A row is one *condition*; several rows can belong to one event,
+            # and they may now be of either kind, so an event can carry spatial
+            # and signal conditions together.
             events_ordered = []
             events_map = {}
             for r in range(self.comp_table.rowCount()):
-                ev_name  = (self.comp_table.item(r, 0) or QTableWidgetItem()).text().strip()
-                ev_label = (self.comp_table.item(r, 1) or QTableWidgetItem()).text().strip()
-                source   = (self.comp_table.item(r, 2) or QTableWidgetItem()).text().strip()
-                region   = (self.comp_table.item(r, 3) or QTableWidgetItem()).text().strip()
-                min_c    = self.comp_table.cellWidget(r, 4).value()
-                max_c    = self.comp_table.cellWidget(r, 5).value()
-                window   = self.comp_table.cellWidget(r, 6).value()
-                persist  = self.comp_table.cellWidget(r, 7).value()
-                if not ev_name or not source or not region:
+                def _txt(c):
+                    it = self.comp_table.item(r, c)
+                    return it.text().strip() if it else ''
+                kind     = _comp_kind_of(r)
+                ev_name  = _txt(2)
+                ev_label = _txt(3)
+                first    = _txt(4)
+                second   = _txt(5)
+                min_v    = self.comp_table.cellWidget(r, 6).value()
+                max_v    = self.comp_table.cellWidget(r, 7).value()
+                sustain  = self.comp_table.cellWidget(r, 8).value()
+                within   = self.comp_table.cellWidget(r, 9).value()
+                window   = self.comp_table.cellWidget(r, 10).value()
+                persist  = self.comp_table.cellWidget(r, 11).value()
+                on_box   = self.comp_table.cellWidget(r, 0)
+                enabled  = True if on_box is None else bool(on_box.isChecked())
+
+                if not ev_name or not first:
                     continue
+                if kind == "Spatial" and not second:
+                    continue
+
                 if ev_name not in events_map:
-                    ev_entry = {
+                    entry = {
                         'name': ev_name,
                         'label': ev_label or ev_name,
-                        'rules': [],
+                        'enabled': enabled,
                         'window_secs': window,
                         'persist_secs': persist,
                     }
-                    events_map[ev_name] = ev_entry
-                    events_ordered.append(ev_entry)
-                events_map[ev_name]['rules'].append({
-                    'source': source,
-                    'region': region,
-                    'min_count': min_c,
-                    'max_count': max_c,
-                })
-            out = {'events': events_ordered}
+                    events_map[ev_name] = entry
+                    events_ordered.append(entry)
+                entry = events_map[ev_name]
+
+                if kind == "Signal":
+                    cond = {'signal': first}
+                    # The extremes mean "no bound". Writing them out would turn
+                    # an open-ended condition into one clamped at an arbitrary
+                    # number that happens to be this widget's range.
+                    if min_v > self.COMP_MIN_UNSET:
+                        cond['min'] = round(float(min_v), 4)
+                    if max_v < self.COMP_MAX_UNSET:
+                        cond['max'] = round(float(max_v), 4)
+                    if second:
+                        cond['equals'] = second
+                    if int(sustain) > 0:
+                        cond['sustained_secs'] = int(sustain)
+                    if int(within) > 0:
+                        cond['within_secs'] = int(within)
+                    entry.setdefault('signals', []).append(cond)
+                else:
+                    entry.setdefault('rules', []).append({
+                        'source': first,
+                        'region': second,
+                        # Counts are whole numbers; the shared spin box carries
+                        # decimals for the signal case.
+                        'min_count': int(round(min_v)) if min_v > self.COMP_MIN_UNSET else 0,
+                        'max_count': int(round(max_v)) if max_v < self.COMP_MAX_UNSET else 999,
+                    })
+
+            # Anything the table still cannot represent — an event with neither
+            # kind of condition — is written back as it was read. The table
+            # rebuilds this file from its own rows, so without this such an
+            # entry would be deleted with nothing on screen to show it going.
+            events_ordered.extend(getattr(self, '_comp_passthrough', []) or [])
+            return events_ordered
+
+        def _comp_save_rules(quiet=False):
+            """Write the table to the rules file. Returns True if it wrote.
+
+            ``quiet`` skips the write when nothing changed and reports only
+            failures — for the automatic saves (on Run, on close), where a log
+            line per close is noise and a silent loss of a ticked box is not.
+            """
+            from modules.app_paths import user_data_dir
+            import os as _os
+            out = {'events': _comp_collect_events()}
+            if quiet and out == getattr(self, '_comp_saved_state', None):
+                return False
             save_path = _os.path.join(user_data_dir(), 'composition_rules.yaml')
             try:
                 with open(save_path, 'w', encoding='utf-8') as _f:
                     yaml.dump(out, _f, allow_unicode=True, sort_keys=False, default_flow_style=False)
-                self.append_log(f"✅ Composition rules saved → {save_path}")
+                self._comp_saved_state = out
+                if not quiet:
+                    self.append_log(f"✅ Composition rules saved → {save_path}")
+                return True
             except Exception as _e:
+                # Never quiet: this is the one outcome the user has to know
+                # about, and on close it is their last chance to.
                 self.append_log(f"❌ Could not save composition rules: {_e}")
+                return False
 
-        comp_add_btn.clicked.connect(lambda: _comp_add_table_row())
+
+        comp_add_btn.clicked.connect(
+            lambda: _comp_add_table_row(kind='Spatial'))
+        comp_add_signal_btn.clicked.connect(
+            lambda: _comp_add_table_row(kind='Signal'))
         comp_save_btn.clicked.connect(_comp_save_rules)
         _comp_load_rules()
 
@@ -4982,7 +5257,12 @@ class VideoHighlighterGUI(QWidget):
         btn = QPushButton(label)
         btn.setToolTip(tooltip)
         btn.clicked.connect(lambda _=False, k=kind: self.start_signal_run(k))
-        self._analyze_buttons[kind] = btn
+        # A list, not one button per kind. Composition has two Run buttons — one
+        # beside the rules editor where rules are changed, one in the signals
+        # list beside every other on-demand run — and keying by kind alone let
+        # the second registration drop the first, leaving a live button during a
+        # run that is meant to disable them all.
+        self._analyze_buttons.setdefault(kind, []).append(btn)
         return btn
 
     def _points_group(self, title, rows):
@@ -5019,6 +5299,36 @@ class VideoHighlighterGUI(QWidget):
         self.btn_face_labels.setText(
             ", ".join(chosen) if chosen else "pick expressions…")
 
+    def _rules_run_row(self):
+        """The composition Run button plus a word on what it will actually do.
+
+        No points spinbox: composed events are not scored the way the signals
+        above are, so the row carries the button and a note instead of a number
+        nobody would set.
+        """
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        h.addWidget(self._make_analyze_button(
+            "composition", "Apply rules", chr(10).join([
+                "Run the saved composition rules over every video in the",
+                "list and cache the events.",
+                "",
+                "Fetches what the ticked rules read and the cache lacks:",
+                "signal rules measure the file directly, and a spatial rule",
+                "starts a detection pass for the classes it names. Both are",
+                "cached, so re-running after a threshold edit is seconds.",
+                "",
+                "Safe to run repeatedly: previous results for these rules",
+                "are replaced, not stacked.",
+            ])))
+        note = QLabel("edit them in Advanced → Composition Rules")
+        note.setStyleSheet("color: #888; font-size: 9pt;")
+        h.addWidget(note)
+        h.addStretch(1)
+        return w
+
     def _points_row_with_button(self, spin, kind, label, tooltip):
         """Wrap a scoring-point spinbox and its on-demand Run button into one
         form-row field: [spinbox] [Run button] [stretch]."""
@@ -5032,7 +5342,8 @@ class VideoHighlighterGUI(QWidget):
         return w
 
     def _set_analyze_buttons_enabled(self, enabled):
-        for btn in getattr(self, "_analyze_buttons", {}).values():
+        for btn in [b for group in getattr(self, "_analyze_buttons", {}).values()
+                    for b in group]:
             btn.setEnabled(enabled)
 
     def start_signal_run(self, kind):

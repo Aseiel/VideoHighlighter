@@ -234,3 +234,215 @@ class TestEventConfidence:
         confs = self._confidences(self._engine(tmp_path),
                                   self._frames(0.42, 0.55))
         assert confs and 1.0 not in confs
+
+
+# ------------------------------------------- signal rules need no cache
+
+SIGNAL_RULES = """
+events:
+  - name: loud_stretch
+    label: Loud stretch
+    signals:
+      - {signal: level, min: 5.0}
+"""
+
+
+def test_signal_rules_run_without_any_analysis_cache(tmp_path, monkeypatch):
+    """A rule measured from the file itself must not require a previous pass.
+
+    Signal conditions read nothing out of the cache, and `merge_into_cache`
+    seeds an entry when there is none — so demanding one put the fastest
+    operation in the app behind the slowest, a full detection pass whose output
+    those rules then ignore.
+    """
+    rules = tmp_path / "rules.yaml"
+    rules.write_text(SIGNAL_RULES, encoding="utf-8")
+    monkeypatch.setattr("modules.app_paths.composition_rules_path",
+                        lambda: str(rules))
+    monkeypatch.setattr(ao, "read_cache", lambda _p: {})
+    monkeypatch.setattr("modules.composition_signals.gather",
+                        lambda *a, **k: {"level": [0.0, 9.0, 9.0, 0.0]})
+
+    patch = ao.run_composition("v.mp4", log=lambda *a: None)
+    seconds = {row["timestamp"] for row in patch["objects"]}
+    assert seconds == {1, 2}
+    assert patch["composed_event_names"] == ["loud_stretch"]
+
+
+def test_spatial_rules_still_require_a_cache(tmp_path, monkeypatch):
+    """The guard is only relaxed where it was unnecessary."""
+    rules = tmp_path / "rules.yaml"
+    rules.write_text(RULES, encoding="utf-8")
+    monkeypatch.setattr("modules.app_paths.composition_rules_path",
+                        lambda: str(rules))
+    monkeypatch.setattr(ao, "read_cache", lambda _p: {})
+    with pytest.raises(RuntimeError, match="analysis"):
+        ao.run_composition("v.mp4", log=lambda *a: None)
+
+
+# ------------------------------------------- the run fetches what rules read
+
+MIXED_RULES = """
+events:
+  - name: held_object
+    label: Held object
+    rules:
+      - {source: handle, region: tool, min_count: 1}
+  - name: off_rule
+    label: Off rule
+    enabled: false
+    rules:
+      - {source: ghost, region: shelf, min_count: 1}
+    signals:
+      - {signal: vocal_density_pct, min: 90}
+"""
+
+
+@pytest.fixture
+def mixed_rules(tmp_path, monkeypatch):
+    path = tmp_path / "composition_rules.yaml"
+    path.write_text(MIXED_RULES, encoding="utf-8")
+    monkeypatch.setattr("modules.app_paths.composition_rules_path",
+                        lambda: str(path))
+    return path
+
+
+class TestFetchesItsOwnInputs:
+    """A rule set states what it reads, so the run can go and get it.
+
+    Without this, a spatial rule needed the user to work out which classes it
+    named, type them into the objects field, run *that*, and only then press
+    Run — for information already written in the rules file.
+    """
+
+    def test_missing_classes_start_a_detection_pass(self, rules_file, cached):
+        cached["cache"] = {"objects": [], "object_bboxes": []}
+        asked = {}
+
+        def detect(classes, progress=None, cancel=None):
+            asked["classes"] = classes
+            return {"objects": [{"timestamp": 0, "objects": ["tool", "handle"],
+                                 "count": 2}],
+                    "object_bboxes": _frames()}
+
+        patch = ao.run_composition("v.mp4", detect_fn=detect, log=lambda *a: None)
+
+        assert asked["classes"] == ["handle", "tool"]
+        secs = {e["timestamp"]: e["objects"] for e in patch["objects"]}
+        assert "held_object" in secs[0]
+        # what the pass found goes back too, or the classes exist as boxes and
+        # are missing from the list the timeline reads
+        assert "tool" in secs[0]
+        assert patch["object_bboxes"], "the detector's boxes are kept"
+
+    def test_cached_classes_are_not_re_detected(self, rules_file, cached):
+        cached["cache"] = {"object_bboxes": _frames(), "objects": []}
+
+        def detect(classes, progress=None, cancel=None):
+            raise AssertionError("should not re-detect what the cache holds")
+
+        patch = ao.run_composition("v.mp4", detect_fn=detect, log=lambda *a: None)
+        assert any("held_object" in e["objects"] for e in patch["objects"])
+        assert "object_bboxes" not in patch, "nothing was detected here"
+
+    def test_a_partially_cached_rule_re_detects_every_class_it_names(
+            self, rules_file, cached):
+        """Both classes, not just the absent one: a spatial rule asks whether
+        one sits inside another *in the same frame*, and two passes at
+        different times cannot be joined across."""
+        half = [dict(f, objects=["tool"], bboxes=[f["bboxes"][0]],
+                     confidences=[0.9]) for f in _frames()]
+        cached["cache"] = {"object_bboxes": half, "objects": []}
+        asked = {}
+
+        def detect(classes, progress=None, cancel=None):
+            asked["classes"] = classes
+            return {"objects": [], "object_bboxes": _frames()}
+
+        ao.run_composition("v.mp4", detect_fn=detect, log=lambda *a: None)
+        assert asked["classes"] == ["handle", "tool"]
+
+    def test_the_stale_boxes_for_those_classes_are_replaced_not_doubled(
+            self, rules_file, cached):
+        """The re-detected classes appear once, from the new pass. Two entries
+        per timestamp would leave the engine reading half a frame at a time."""
+        old = [dict(f, objects=["tool"], bboxes=[[0.8, 0.8, 0.1, 0.1]],
+                    confidences=[0.4]) for f in _frames()]
+        cached["cache"] = {"object_bboxes": old, "objects": []}
+
+        def detect(classes, progress=None, cancel=None):
+            return {"objects": [], "object_bboxes": _frames()}
+
+        patch = ao.run_composition("v.mp4", detect_fn=detect, log=lambda *a: None)
+        assert len(patch["object_bboxes"]) == len(_frames())
+        assert all(e["objects"] == ["tool", "handle"]
+                   for e in patch["object_bboxes"])
+        assert any("held_object" in e["objects"] for e in patch["objects"])
+
+    def test_boxes_of_other_classes_survive_the_pass(self, rules_file, cached):
+        """The cache may be an hours-long pipeline run; re-detecting one class
+        must not cost the rest."""
+        other = [{"timestamp": 0.0, "objects": ["tool", "unrelated"],
+                  "bboxes": [[0.2, 0.2, 0.4, 0.4], [0.7, 0.7, 0.1, 0.1]],
+                  "confidences": [0.9, 0.5]}]
+        cached["cache"] = {"object_bboxes": other, "objects": []}
+
+        def detect(classes, progress=None, cancel=None):
+            return {"objects": [], "object_bboxes": _frames()}
+
+        patch = ao.run_composition("v.mp4", detect_fn=detect, log=lambda *a: None)
+        kept = [n for e in patch["object_bboxes"] for n in e["objects"]]
+        assert "unrelated" in kept
+        assert kept.count("unrelated") == 1
+
+    def test_without_a_detect_fn_it_still_says_what_to_run(self, rules_file,
+                                                           cached):
+        """Starting a long pass unasked is the caller's decision, not this
+        function's."""
+        cached["cache"] = {"objects": [], "object_bboxes": []}
+        with pytest.raises(RuntimeError, match="object detection first"):
+            ao.run_composition("v.mp4", log=lambda *a: None)
+
+
+class TestDisabledRulesCostNothing:
+    def test_an_unticked_rule_does_not_trigger_detection(self, mixed_rules,
+                                                          cached):
+        cached["cache"] = {"object_bboxes": _frames(), "objects": []}
+
+        def detect(classes, progress=None, cancel=None):
+            raise AssertionError(f"unticked rule sent us detecting {classes}")
+
+        ao.run_composition("v.mp4", detect_fn=detect, log=lambda *a: None)
+
+    def test_an_unticked_rule_does_not_trigger_a_measurement(self, mixed_rules):
+        """The vocal measurement decodes the whole file — paying for it because
+        of a rule that is switched off is the wait this avoids."""
+        from modules import composition_signals
+
+        assert composition_signals.signal_names(str(mixed_rules)) == set()
+
+    def test_its_name_is_still_stripped(self, mixed_rules, cached):
+        """`event_names` keeps disabled events on purpose: their last output
+        has to go, or switching a rule off leaves its events on the timeline
+        for ever."""
+        cached["cache"] = {
+            "object_bboxes": _frames(),
+            "objects": [{"timestamp": 0, "objects": ["off_rule"], "count": 1}],
+        }
+        patch = ao.run_composition("v.mp4", log=lambda *a: None)
+        assert not any("off_rule" in e["objects"] for e in patch["objects"])
+
+
+class TestObjectClasses:
+    def test_the_engine_reports_the_classes_its_rules_read(self, rules_file):
+        assert CompositionEngine(str(rules_file)).object_classes == ["handle",
+                                                                    "tool"]
+
+    def test_disabled_events_are_left_out(self, mixed_rules):
+        assert CompositionEngine(str(mixed_rules)).object_classes == ["handle",
+                                                                     "tool"]
+
+    def test_a_signal_only_rule_set_needs_no_classes(self, tmp_path):
+        p = tmp_path / "signals.yaml"
+        p.write_text(SIGNAL_RULES, encoding="utf-8")
+        assert CompositionEngine(str(p)).object_classes == []

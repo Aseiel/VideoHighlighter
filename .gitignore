@@ -44,3 +44,13 @@ update_state.json
 .update-old/
 publish/
 .secrets/
+
+# User-defined composition rules and the hand labels used to tune them. The
+# event names and the spans are the user's own, about their own material, and
+# do not belong in the repository. The suffixed form is listed because a bare
+# name does not match a backup copy, and in the sibling repo two such backups
+# reached a commit before anyone noticed.
+composition_rules.yaml
+composition_rules.yaml.*
+composition_rules.*.yaml
+labels/

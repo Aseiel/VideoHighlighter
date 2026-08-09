@@ -94,12 +94,20 @@ def apply_rules(object_detections: Optional[Mapping],
                 *,
                 rules_path: Optional[str],
                 previous_names: Iterable[str] = (),
+                signals: Optional[Mapping] = None,
                 log_fn=print) -> tuple:
     """Re-derive composed events. Returns ``(detections, boxes, names, hits)``.
 
     Safe to call on a freshly detected pass and on a cached one, in that order
     or any other, any number of times: the result depends only on the detector
-    boxes and the current rules file.
+    boxes, the signals, and the current rules file.
+
+    ``signals`` carries the per-second measurements a rule can test — audio
+    curves, an expression reading — keyed by the name a rule refers to them by.
+    A rule made only of signal conditions needs no boxes at all, which is why
+    the early return below tests for signals as well: a video that was never
+    object-detected can still carry signal-only events, and returning early on
+    an empty box list would silently drop every one of them.
 
     With no rules file, the previous pass's events are still removed and nothing
     is added — a run with no rules must not report events, and leaving stale
@@ -125,14 +133,15 @@ def apply_rules(object_detections: Optional[Mapping],
 
     detections, boxes = strip_events(detections, boxes, previous | set(names))
 
-    if engine is None or not boxes:
+    signals = dict(signals or {})
+    if engine is None or (not boxes and not signals):
         if previous:
             log_fn("ℹ️ Composition engine: no rules in force; "
                    f"{len(previous)} event type(s) from the previous pass "
                    "removed.")
         return detections, boxes, names, 0
 
-    composed, composed_boxes = engine.run(boxes)
+    composed, composed_boxes = engine.run(boxes, signals)
     hits = sum(len(v) for v in composed.values())
     for sec, found in composed.items():
         sec = int(sec)

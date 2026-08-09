@@ -27,7 +27,7 @@ from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QM
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QPainter, QFont, QPainterPath,
     QLinearGradient, QRadialGradient, QCursor, QAction,
-    QPainterPath, QFontMetrics, QDrag, QPixmap
+    QPainterPath, QFontMetrics, QDrag, QPixmap, QIntValidator
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -65,6 +65,11 @@ class SignalLabelPanel(QWidget):
 
     Each row shows  ◀ LABEL ▶  — clicking the arrows seeks to the
     previous / next event of that track type.
+
+    The counter beside them ("3/17") is editable: click it, type a number, press
+    Enter, and the playhead goes to that event. Stepping is fine for the next
+    one and useless for the ninetieth, which on a track with hundreds of entries
+    is most of them.
     """
     seek_requested = Signal(float)
 
@@ -108,10 +113,21 @@ class SignalLabelPanel(QWidget):
         # scene each time would make scrubbing crawl.
         self._nav_timestamps = {}
         self._current_time_fn = None   # set by the window after construction
+        # Where each row's counter was drawn, so a click can land on it.
+        self._counter_rects = []       # [(QRect, name), ...] rebuilt in paintEvent
+        self._jump_edit = None         # live QLineEdit while typing a number
+        self._jump_track = None
 
         signal_view.verticalScrollBar().valueChanged.connect(self.update)
+        # A scroll moves the row out from under the editor, which would leave it
+        # floating over an unrelated track and applying to the one it was opened
+        # on. Closing it is the honest response to the row having moved.
+        signal_view.verticalScrollBar().valueChanged.connect(self._close_jump_editor)
 
     def refresh_labels(self):
+        # The rows are about to be rebuilt, so an open editor is anchored to a
+        # layout that no longer exists.
+        self._close_jump_editor()
         scene = self.signal_view.scene()
         if scene and hasattr(scene, 'row_labels'):
             self._labels = list(scene.row_labels)
@@ -197,6 +213,7 @@ class SignalLabelPanel(QWidget):
         p.fillRect(self.rect(), QColor(18, 18, 18))
 
         self._hit_rows = []
+        self._counter_rects = []
 
         if not self._labels:
             p.end()
@@ -234,8 +251,15 @@ class SignalLabelPanel(QWidget):
                     p.setFont(font_pos)
                     p.setPen(QColor(THEME.text_dim))
                     counter_w = fm_pos.horizontalAdvance(counter) + 4
-                    p.drawText(self.width() - self._ARROW_W - counter_w, mid_y,
-                               counter)
+                    counter_x = self.width() - self._ARROW_W - counter_w
+                    p.drawText(counter_x, mid_y, counter)
+                    # Recorded so a click can be matched to it. Padded a little
+                    # vertically: the text is 7pt and the drawn glyphs alone are
+                    # a smaller target than anyone can reliably hit.
+                    self._counter_rects.append((
+                        QRect(int(counter_x) - 2, int(top),
+                              int(counter_w) + 4, int(bot - top)),
+                        name))
 
                 p.setFont(font_lbl)
                 p.setPen(QColor(THEME.text))
@@ -258,6 +282,14 @@ class SignalLabelPanel(QWidget):
             return super().mousePressEvent(event)
 
         x, y = event.position().x(), event.position().y()
+
+        # The counter first: it sits inside the row between the two arrows, so
+        # testing arrows first would never let a click reach it.
+        point = QPoint(int(x), int(y))
+        for rect, name in self._counter_rects:
+            if rect.contains(point):
+                self._open_jump_editor(name, rect)
+                return
 
         for top, bot, name in self._hit_rows:
             if top <= y <= bot and name in self._navigable_active:
@@ -286,6 +318,12 @@ class SignalLabelPanel(QWidget):
 
     def mouseMoveEvent(self, event):
         x, y = event.position().x(), event.position().y()
+        point = QPoint(int(x), int(y))
+        if any(rect.contains(point) for rect, _ in self._counter_rects):
+            # An I-beam is the only thing that says "this number is editable";
+            # nothing else in the row distinguishes it from painted-on text.
+            self.setCursor(Qt.IBeamCursor)
+            return super().mouseMoveEvent(event)
         on_arrow = False
         for top, bot, name in self._hit_rows:
             if top <= y <= bot and name in self._navigable_active:
@@ -294,6 +332,79 @@ class SignalLabelPanel(QWidget):
                     break
         self.setCursor(Qt.PointingHandCursor if on_arrow else Qt.ArrowCursor)
         super().mouseMoveEvent(event)
+
+    # ---------------------------------------------------------- jump-to-index
+
+    def _open_jump_editor(self, name, rect):
+        """Inline box over the counter for typing an event number.
+
+        Placed over the counter rather than in a dialog because the number being
+        replaced is the answer to "which one am I on", and a dialog would cover
+        the one piece of context that makes the question answerable.
+        """
+        self._close_jump_editor()
+        total = len(self._nav_timestamps.get(name, ()))
+        if total <= 0:
+            return
+
+        edit = QLineEdit(self)
+        edit.setValidator(QIntValidator(1, total, edit))
+        edit.setPlaceholderText(f"1-{total}")
+        edit.setAlignment(Qt.AlignRight)
+        edit.setStyleSheet(
+            f"QLineEdit {{ background: {THEME.surface}; color: {THEME.text}; "
+            f"border: 1px solid {THEME.accent}; border-radius: 2px; "
+            f"padding: 0px 2px; font-size: 8pt; }}")
+        # Widened past the counter: "3/17" is narrower than the four digits a
+        # user may type into it, and a box that cannot show what was typed is
+        # worse than one that overlaps the label for a moment.
+        width = max(rect.width() + 18, 46)
+        edit.setGeometry(QRect(max(0, rect.right() - width + 2), rect.top() + 1,
+                               width, max(16, rect.height() - 2)))
+        edit.returnPressed.connect(lambda: self._commit_jump(name))
+        edit.editingFinished.connect(self._close_jump_editor)
+        edit.installEventFilter(self)
+        edit.show()
+        edit.setFocus(Qt.MouseFocusReason)
+        self._jump_edit = edit
+        self._jump_track = name
+
+    def eventFilter(self, obj, event):
+        # Escape abandons the edit. Without it the only ways out are Enter,
+        # which seeks, and clicking away, and neither is "I changed my mind".
+        if (obj is self._jump_edit and event.type() == QEvent.KeyPress
+                and event.key() == Qt.Key_Escape):
+            self._close_jump_editor()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _commit_jump(self, name):
+        edit = self._jump_edit
+        if edit is None:
+            return
+        text = edit.text().strip()
+        timestamps = self._nav_timestamps.get(name) or []
+        self._close_jump_editor()
+        if not text or not timestamps:
+            return
+        try:
+            index = int(text)
+        except ValueError:
+            return
+        # The counter reads "how many are at or before the playhead", so its
+        # numbers are 1-based and the Nth event is timestamps[N-1]. Clamped
+        # rather than ignored: a number past the end plainly means "the last
+        # one", and refusing it would only make the user retype it.
+        index = max(1, min(index, len(timestamps)))
+        self.seek_requested.emit(float(timestamps[index - 1]))
+
+    def _close_jump_editor(self):
+        if self._jump_edit is not None:
+            edit, self._jump_edit = self._jump_edit, None
+            self._jump_track = None
+            edit.removeEventFilter(self)
+            edit.hide()
+            edit.deleteLater()
 
     @staticmethod
     def _find_target(timestamps, current, direction):
@@ -1436,21 +1547,35 @@ class SignalTimelineWindow(QMainWindow):
         if events:
             layout.addWidget(self._build_event_header())
 
-        # Seconds per event, counted from the cache rather than from the drawn
-        # bars — a hidden event still needs its count shown.
-        counts = {}
+        # Counted from the cache rather than from the drawn bars — a hidden
+        # event still needs its count shown.
+        #
+        # Moments, not seconds. This used to report seconds, which disagreed
+        # with the ◀ ▶ counter beside the row for the same event: 119 against
+        # 15, both describing the same thing. The number a person acts on is how
+        # many places there are to go, so that is the one on the label; the
+        # total length is real but secondary, and lives in the tooltip.
+        times = {}
         for item in (scene.cache_data.get('objects') or []):
             for name in (item.get('objects') or []):
                 if isinstance(name, str):
                     n = name.strip().title()
                     if n in events:
-                        counts[n] = counts.get(n, 0) + 1
+                        times.setdefault(n, []).append(
+                            float(item.get('timestamp', 0)))
 
+        gap = getattr(scene, 'EVENT_RUN_GAP', 2.0)
         for event in events:
-            checkbox = QCheckBox(f"{event.replace('_', ' ')} ({counts.get(event, 0)}s)")
+            seconds = len(times.get(event, ()))
+            moments = len(scene._run_starts(times.get(event, ()), gap))
+            checkbox = QCheckBox(
+                f"{event.replace('_', ' ')} ({moments})")
             checkbox.setChecked(scene.visible_events.get(event, True))
             checkbox.setToolTip(
-                f"Show the '{event}' row, and let ◀ ▶ stop on it")
+                chr(10).join([
+                    f"{moments} moment(s), {seconds}s in total.",
+                    f"Show the '{event}' row, and let ◀ ▶ stop on it",
+                ]))
             # setChecked runs before this connect, so it can't fire the toggle.
             checkbox.stateChanged.connect(
                 lambda state, e=event: self._toggle_event(e, state)
