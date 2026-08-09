@@ -114,6 +114,15 @@ class _EventSpec:
     # overlap where all of them hold is routinely shorter than any of them.
     min_duration_secs: float = 0.0
 
+    # Upper bound on an event's length, 0 meaning none. Exists so a rule set can
+    # put short events in a row of their own instead of choosing one floor for
+    # everything: a low floor on the main rule drags a lot of brief material in
+    # with it (measured across three recordings, dropping 8s to 3s tripled the
+    # events and recovered no labelled episode), while a high floor may simply
+    # not fit material whose events are genuinely short. Two rules, two rows,
+    # and the short ones stay reviewable separately.
+    max_duration_secs: float = 0.0
+
     # Seconds to ignore at the start and at the end. Opening material is
     # titles, music beds and encoding artifacts, none of it content and all of
     # it shaped like signal; `modules/loudness_bursts.py` guards 120s for that
@@ -325,7 +334,7 @@ class CompositionEngine:
 
         # --- discard events too brief to be what was asked for ---
         for spec in active:
-            if spec.min_duration_secs <= 0:
+            if spec.min_duration_secs <= 0 and spec.max_duration_secs <= 0:
                 continue
             times = sorted(ts for ts, names in raw_events.items()
                            if spec.name in names)
@@ -347,7 +356,11 @@ class CompositionEngine:
                 # Measured the way the timeline draws it: a bar runs from the
                 # first second to the last plus one, so a lone second is 1s long
                 # rather than 0 and `min_duration_secs: 1` keeps it.
-                if (run[-1] - run[0] + 1.0) >= spec.min_duration_secs:
+                length = run[-1] - run[0] + 1.0
+                too_short = length < spec.min_duration_secs
+                too_long = (spec.max_duration_secs > 0
+                            and length > spec.max_duration_secs)
+                if not (too_short or too_long):
                     continue
                 for t in run:
                     raw_events[t].discard(spec.name)
@@ -546,6 +559,7 @@ class CompositionEngine:
             specs.append(_EventSpec(
                 enabled=bool(ev.get('enabled', True)),
                 min_duration_secs=float(ev.get('min_duration_secs', 0) or 0),
+                max_duration_secs=float(ev.get('max_duration_secs', 0) or 0),
                 ignore_start_secs=float(
                     ev.get('ignore_start_secs',
                            ev.get('ignore_edges_secs', 0)) or 0),

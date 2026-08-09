@@ -532,3 +532,34 @@ def test_ignore_edges_secs_still_sets_both(tmp_path):
         """)
     s = [5, 5] + [0] * 16 + [5, 5]
     assert engine.run([], {"s": s})[0] == {}
+
+
+def test_max_duration_bounds_an_event_from_above(tmp_path):
+    """So short events can have a row of their own, rather than forcing one
+    duration floor to suit both."""
+    engine = _rules(tmp_path, """
+        events:
+          - name: brief
+            label: Brief
+            min_duration_secs: 3
+            max_duration_secs: 6
+            signals:
+              - {signal: s, min: 1.0}
+        """)
+    # a 4s run (kept) and a 10s run (too long)
+    s = [0, 5, 5, 5, 5, 0, 0] + [5] * 10 + [0]
+    events, _ = engine.run([], {"s": s})
+    assert set(events) == {1, 2, 3, 4}
+
+
+def test_max_duration_defaults_to_no_upper_bound(tmp_path):
+    engine = _rules(tmp_path, """
+        events:
+          - name: e
+            label: E
+            min_duration_secs: 2
+            signals:
+              - {signal: s, min: 1.0}
+        """)
+    events, _ = engine.run([], {"s": [5] * 30})
+    assert len(events) == 30
