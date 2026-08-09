@@ -2311,6 +2311,14 @@ class VideoHighlighterGUI(QWidget):
             # delete it silently.
             self._comp_passthrough = [ev for ev in events
                                       if not ev.get('rules') and not ev.get('signals')]
+            # The whole original entry, by name. Saving rebuilds this file from
+            # the table's rows, so any field without a column is lost — which is
+            # how `min_duration_secs` and `ignore_edges_secs` disappeared the
+            # first time somebody pressed Save after they were added. Keeping
+            # the original and overwriting only what the table owns means a
+            # field added later survives without needing a column first.
+            self._comp_original = {str(ev.get('name', '')): dict(ev)
+                                   for ev in events if ev.get('name')}
             for ev in events:
                 common = dict(
                     ev_name=ev.get('name', ''),
@@ -2527,13 +2535,21 @@ class VideoHighlighterGUI(QWidget):
                     continue
 
                 if ev_name not in events_map:
-                    entry = {
+                    # Start from what was read, so fields this table has no
+                    # column for are carried across untouched, then overwrite
+                    # the ones it does own. `rules` and `signals` are rebuilt
+                    # from the rows below and must not survive from the
+                    # original, or a deleted condition would come back.
+                    entry = dict(getattr(self, '_comp_original', {}).get(ev_name, {}))
+                    entry.pop('rules', None)
+                    entry.pop('signals', None)
+                    entry.update({
                         'name': ev_name,
                         'label': ev_label or ev_name,
                         'enabled': enabled,
                         'window_secs': window,
                         'persist_secs': persist,
-                    }
+                    })
                     events_map[ev_name] = entry
                     events_ordered.append(entry)
                 entry = events_map[ev_name]

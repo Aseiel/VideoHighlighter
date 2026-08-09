@@ -114,13 +114,22 @@ class _EventSpec:
     # overlap where all of them hold is routinely shorter than any of them.
     min_duration_secs: float = 0.0
 
-    # Seconds at each end of the file to ignore. Opening and closing minutes
-    # carry titles, music beds and encoding artifacts, none of which are
-    # content, and all of which look like signal. `modules/loudness_bursts.py`
-    # guards 120s for the same reason and measured 18 of 48 raw candidates
-    # falling inside it. Needs the file's length, so it does nothing unless the
-    # caller passes `duration` to `run`.
-    ignore_edges_secs: float = 0.0
+    # Seconds to ignore at the start and at the end. Opening material is
+    # titles, music beds and encoding artifacts, none of it content and all of
+    # it shaped like signal; `modules/loudness_bursts.py` guards 120s for that
+    # reason and measured 18 of 48 raw candidates falling inside it.
+    #
+    # They are separate because the two ends are not alike, which cost a real
+    # detection to learn: a symmetric 120s guard threw away a hand-marked
+    # episode that ended 94 seconds before the file did. What a recording builds
+    # towards tends to sit at its end, so a closing guard discards the payload
+    # while an opening one discards the titles. Set `ignore_end_secs` only when
+    # the material genuinely has trailing junk.
+    #
+    # `ignore_edges_secs` still works and sets both, for rules written before
+    # the two were told apart.
+    ignore_start_secs: float = 0.0
+    ignore_end_secs: float = 0.0
 
     window_secs: float = 0.75   # majority-vote smoothing window
     persist_secs: float = 0.5   # keep a ghost box this long after last seen
@@ -304,10 +313,11 @@ class CompositionEngine:
         # be a worse answer than none.
         span = float(duration) if duration else float(length or 0)
         for spec in active:
-            if spec.ignore_edges_secs <= 0 or span <= 0:
+            if span <= 0 or (spec.ignore_start_secs <= 0
+                             and spec.ignore_end_secs <= 0):
                 continue
-            lo = spec.ignore_edges_secs
-            hi = span - spec.ignore_edges_secs
+            lo = spec.ignore_start_secs
+            hi = span - spec.ignore_end_secs if spec.ignore_end_secs > 0 else span
             for t in list(raw_events):
                 if (t < lo or t > hi) and spec.name in raw_events[t]:
                     raw_events[t].discard(spec.name)
@@ -536,7 +546,12 @@ class CompositionEngine:
             specs.append(_EventSpec(
                 enabled=bool(ev.get('enabled', True)),
                 min_duration_secs=float(ev.get('min_duration_secs', 0) or 0),
-                ignore_edges_secs=float(ev.get('ignore_edges_secs', 0) or 0),
+                ignore_start_secs=float(
+                    ev.get('ignore_start_secs',
+                           ev.get('ignore_edges_secs', 0)) or 0),
+                ignore_end_secs=float(
+                    ev.get('ignore_end_secs',
+                           ev.get('ignore_edges_secs', 0)) or 0),
                 name=ev['name'],
                 label=ev.get('label', ev['name']),
                 rules=rules,

@@ -497,3 +497,38 @@ def test_edge_guard_defaults_to_off(tmp_path):
         """)
     events, _ = engine.run([], {"s": [5, 0, 0, 0, 5]})
     assert set(events) == {0, 4}
+
+
+def test_the_two_ends_are_guarded_separately(tmp_path):
+    """A closing guard discards what a recording builds towards.
+
+    Learned from a real miss: a symmetric 120s guard threw away a hand-marked
+    episode that ended 94 seconds before its file did. Opening material is
+    titles; closing material is often the payload.
+    """
+    engine = _rules(tmp_path, """
+        events:
+          - name: e
+            label: E
+            ignore_start_secs: 5
+            ignore_end_secs: 0
+            signals:
+              - {signal: s, min: 1.0}
+        """)
+    s = [5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 5]
+    events, _ = engine.run([], {"s": s})
+    assert set(events) == {18, 19}, "the opening was kept or the ending dropped"
+
+
+def test_ignore_edges_secs_still_sets_both(tmp_path):
+    """Rules written before the two ends were told apart keep working."""
+    engine = _rules(tmp_path, """
+        events:
+          - name: e
+            label: E
+            ignore_edges_secs: 5
+            signals:
+              - {signal: s, min: 1.0}
+        """)
+    s = [5, 5] + [0] * 16 + [5, 5]
+    assert engine.run([], {"s": s})[0] == {}
