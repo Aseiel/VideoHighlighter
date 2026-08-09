@@ -1432,6 +1432,12 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                              "score", "timestamp_seconds", "model_type"])
 
             _last_preview_t = 0.0  # wall-clock throttle for live preview
+            _preview_failed = False
+            # Says, in the debug log, whether this run can feed the preview
+            # window at all. A caller that passes no preview_fn leaves the
+            # window on its placeholder, which looks exactly like a preview
+            # that broke.
+            print(f"🖼️ Live preview: {'on' if preview_fn is not None else 'not wired by this caller'}")
             while True:
                 if cancel_flag and cancel_flag.is_set():
                     print("⚠️ Action detection canceled by user.")
@@ -1520,8 +1526,14 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             small = cv2.resize(base, (int(fw * sc), int(fh * sc)),
                                                interpolation=cv2.INTER_AREA) if sc != 1.0 else base.copy()
                             preview_fn(small, [], int(frame_id / fps))
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # Once, not per frame. Swallowing this silently is
+                            # why an empty preview window used to be impossible
+                            # to tell apart from a preview that was never fed.
+                            if not _preview_failed:
+                                _preview_failed = True
+                                print(f"⚠️ Live preview frame failed "
+                                      f"(reported once per run): {e}")
 
                 # ---- Action recognition (sampled frames) ----
                 if frame_id % sample_rate == 0:

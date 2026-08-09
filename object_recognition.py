@@ -298,6 +298,7 @@ def run_object_detection_single(video_path, model, highlight_objects, log_fn=pri
     current_second = -1
     objects_found = 0
     _last_preview_t = 0.0  # wall-clock throttle for the live preview
+    _preview_failed = False
 
     try:
         while True:
@@ -374,8 +375,15 @@ def run_object_detection_single(video_path, model, highlight_objects, log_fn=pri
                                                           (x2 - x1) / fw, (y2 - y1) / fh,
                                                           float(conf)))
                                     preview_fn(small, boxes, sec)
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    # Once, not per frame — see the same guard
+                                    # in action_recognition: a silently dropped
+                                    # preview frame is indistinguishable from a
+                                    # preview nobody ever fed.
+                                    if not _preview_failed:
+                                        _preview_failed = True
+                                        log_fn(f"⚠️ Live preview frame failed "
+                                               f"(reported once per run): {e}")
 
                     except Exception as e:
                         log_fn(f"⚠️ Error in object detection at frame {frame_idx}: {e}")

@@ -622,6 +622,7 @@ class SignalRunWorker(QThread):
     progress = Signal(int, int, str, str)   # current, total, task, message
     log = Signal(str)
     cancelled = Signal()
+    preview = Signal(object, object, int)   # frame_bgr (ndarray), boxes, sec
 
     def __init__(self, kind, video_paths, params=None):
         super().__init__()
@@ -630,6 +631,7 @@ class SignalRunWorker(QThread):
         self.params = params or {}
         self._cancel_flag = threading.Event()
         self._is_running = False
+        self.preview_enabled = False
 
     def run(self):
         from modules import analysis_ondemand as aod
@@ -680,17 +682,30 @@ class SignalRunWorker(QThread):
         Mirrors the timeline viewer's per-kind cache keys."""
         c = self._cancel_flag
         p = self.params
+
+        # An on-demand object/action run detects over the whole video exactly as
+        # the pipeline's stage does — same detector, same length — so it feeds
+        # the preview window from the same checkbox. Without this the window
+        # opened and stayed on its placeholder for the entire run, which is the
+        # one place the wait is longest and the reassurance worth most.
+        # Checked per call so the checkbox still works mid-run.
+        def preview_fn(frame, boxes, sec):
+            if self.preview_enabled and not self._cancel_flag.is_set():
+                self.preview.emit(frame, boxes, sec)
+
         if self.kind == "motion":
             return aod.run_motion(video_path, progress=progress, cancel=c, log=self.log.emit)
         if self.kind == "audio":
             return aod.run_audio(video_path, progress=progress, cancel=c, log=self.log.emit)
         if self.kind == "objects":
             result = aod.run_objects(video_path, p.get("objects") or [],
-                                     progress=progress, cancel=c, log=self.log.emit)
+                                     progress=progress, cancel=c, log=self.log.emit,
+                                     preview_fn=preview_fn)
             return {"objects": result}
         if self.kind == "actions":
             result = aod.run_actions(video_path, interesting_actions=p.get("actions") or [],
-                                     progress=progress, cancel=c, log=self.log.emit)
+                                     progress=progress, cancel=c, log=self.log.emit,
+                                     preview_fn=preview_fn)
             return {"actions": result, "actions_all": result}
         if self.kind == "transcript":
             result = aod.run_transcript(video_path, language=p.get("language"),
@@ -960,6 +975,13 @@ class RangeSlider(QWidget):
         self._dragging = None
 
 class VideoHighlighterGUI(QWidget):
+    #: A detection frame on its way to the preview window. The Run button has
+    #: `Worker.preview` for this, but the download-and-process path calls
+    #: `run_highlighter` straight from the download worker's thread and has no
+    #: Worker to borrow a signal from — so the window owns one, and the hop to
+    #: the GUI thread happens here rather than in each caller.
+    preview_frame = Signal(object, object, int)   # frame_bgr, boxes, sec
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Video Highlighter v{__version__} {__edition__}")
@@ -1171,6 +1193,10 @@ class VideoHighlighterGUI(QWidget):
         self.live_preview_checkbox.toggled.connect(self._on_live_preview_toggled)
         layout.addWidget(self.live_preview_checkbox)
         self.preview_window = None  # DetectionPreviewWindow, created on demand
+        # Read from detection threads, so it mirrors the checkbox rather than
+        # being queried across threads (same reason Worker keeps its own copy).
+        self._preview_enabled = False
+        self.preview_frame.connect(self.on_preview_frame)
 
         # Force reprocess — the live preview only shows frames while detection
         # actually runs. If results are cached, detection is skipped and the
@@ -3305,12 +3331,25 @@ class VideoHighlighterGUI(QWidget):
                             Q_ARG(str, str(details))
                         )
 
+                    # Feed the live preview window, exactly as the Run button
+                    # does. Without this the checkbox looks like it applies to
+                    # every run, but a downloaded video processed here handed
+                    # the pipeline no preview_fn at all — so the window opened,
+                    # said "Waiting for the detection stage", and stayed on that
+                    # for the whole run. The signal makes the thread hop; the
+                    # flag is read instead of the checkbox so this stays off the
+                    # GUI thread's widgets.
+                    def preview_fn(frame, boxes, sec):
+                        if self._preview_enabled and not cancel_flag.is_set():
+                            self.preview_frame.emit(frame, boxes, sec)
+
                     result = run_highlighter(
                         filepath,
                         gui_config=config,
                         log_fn=log_fn,
                         progress_fn=progress_fn,
-                        cancel_flag=cancel_flag
+                        cancel_flag=cancel_flag,
+                        preview_fn=preview_fn,
                     )
 
                     # If pipeline returns a path, use it; otherwise fall back to our expected output_file
@@ -3345,6 +3384,11 @@ class VideoHighlighterGUI(QWidget):
                 self.append_log(f"Traceback:\n{traceback.format_exc()}")
                 return {'success': False, 'error': str(e)}
             
+        # Videos processed straight off the download feed the preview window
+        # too, so the flag those runs read has to match the checkbox before the
+        # first one starts.
+        self._preview_enabled = self.live_preview_checkbox.isChecked()
+
         # Create download worker with processing callback
         self.download_worker = DownloadWorker(
             url, save_dir, pattern,
@@ -4606,11 +4650,18 @@ class VideoHighlighterGUI(QWidget):
         else:
             if self.preview_window is not None:
                 self.preview_window.hide()
-        if hasattr(self, 'worker') and self.worker is not None:
-            try:
-                self.worker.preview_enabled = checked
-            except Exception:
-                pass
+        self._preview_enabled = checked
+        # Every kind of run that can be in flight: the pipeline, an on-demand
+        # Analyze run, and an Analyze run started in an open timeline viewer.
+        # Ticking the box mid-run starts showing frames in any of them without
+        # waiting for the next one.
+        for attr in ("worker", "_signal_worker", "timeline_window"):
+            running = getattr(self, attr, None)
+            if running is not None:
+                try:
+                    running.preview_enabled = checked
+                except (RuntimeError, AttributeError):
+                    pass   # viewer's C++ side already deleted, or no such worker
 
     @Slot(object, object, int)
     def on_preview_frame(self, frame_bgr, boxes, sec):
@@ -4874,7 +4925,8 @@ class VideoHighlighterGUI(QWidget):
 
         # Create and start worker
         self.worker = Worker(video_paths, config)
-        self.worker.preview_enabled = self.live_preview_checkbox.isChecked()
+        self._preview_enabled = self.live_preview_checkbox.isChecked()
+        self.worker.preview_enabled = self._preview_enabled
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.update_pipeline_progress)
         self.worker.finished.connect(self.pipeline_done)
@@ -5041,9 +5093,12 @@ class VideoHighlighterGUI(QWidget):
 
         self._signal_run_paths = list(video_paths)   # for live-refreshing an open viewer
         self._signal_worker = SignalRunWorker(kind, video_paths, params)
+        self._preview_enabled = self.live_preview_checkbox.isChecked()
+        self._signal_worker.preview_enabled = self._preview_enabled
         self._signal_worker.log.connect(self.append_log)
         self._signal_worker.progress.connect(self.update_pipeline_progress)
         self._signal_worker.finished.connect(self._signal_run_finished)
+        self._signal_worker.preview.connect(self.on_preview_frame)
         self._signal_worker.start()
 
     @Slot(str)
@@ -6023,6 +6078,13 @@ class VideoHighlighterGUI(QWidget):
             try:
                 # Create and show the timeline window
                 window = SignalTimelineWindow(video_path, cache_data)
+                # An Analyze run started over there detects over the whole
+                # video just as a pipeline stage does, so it feeds the preview
+                # window this side owns. Queued (the frames come off the
+                # viewer's analysis thread), and gated on the checkbox by the
+                # emitting end.
+                window.preview_frame.connect(self.on_preview_frame)
+                window.preview_enabled = self._preview_enabled
                 self.timeline_window = window
                 window.show()
             finally:

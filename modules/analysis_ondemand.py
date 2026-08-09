@@ -64,6 +64,12 @@ def analysis_defaults() -> dict:
         "object_frame_skip": int(advanced_cfg.get("object_frame_skip", 10) or 10),
         "yolo_model_size": str(advanced_cfg.get("yolo_model_size", "n") or "n"),
         "yolo_type": advanced_cfg.get("yolo_type", "standard") or "standard",
+        # Which action decoders the main window is set to. Read here so an
+        # on-demand run uses the models the user picked, rather than whatever
+        # `run_action_detection`'s own defaults happen to be.
+        "action_backend": advanced_cfg.get("action_backend") or "auto",
+        "action_models": advanced_cfg.get("action_models") or "mixed",
+        "r3d_model": advanced_cfg.get("r3d_model") or "r3d_18",
         "whisper_model": transcript_cfg.get("model", "base") or "base",
         "language": transcript_cfg.get("source_lang", "en") or "en",
         "transcript_enabled": bool(transcript_cfg.get("enabled", False)),
@@ -298,19 +304,46 @@ def _actions_to_cache(dets) -> list:
     return out
 
 
+def _r3d_flags(action_backend: str, log=print) -> tuple:
+    """`(enable_r3d, r3d_half)` for a backend choice — the same mapping the
+    pipeline applies, so an on-demand run picks the decoders a full run would."""
+    if action_backend == "openvino":
+        return False, False
+    if action_backend == "r3d_cuda":
+        return True, True       # FP16 on CUDA
+    if action_backend == "r3d_cpu":
+        return True, False      # FP32 on CPU
+    # "auto": R3D only pays off on CUDA. Without it, OpenVINO on the Intel GPU
+    # beats R3D on the CPU.
+    try:
+        from modules.device_utils import detect_best_device
+        dev = detect_best_device(log_fn=log)
+        return (True, True) if dev.pytorch_device == "cuda" else (False, False)
+    except Exception:
+        return False, False
+
+
 def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
                 interesting_actions: Optional[list] = None,
-                progress: ProgressFn = None, cancel=None, log=print) -> list:
+                progress: ProgressFn = None, cancel=None, log=print,
+                preview_fn=None) -> list:
     """Run action recognition and return the cache-shaped `actions` list
     (every detection — the timeline's "show all" source).
 
     `interesting_actions` is an optional keep-list: blank/None detects and
     keeps all actions; a list narrows the result to those names (same filter
-    the pipeline's `interesting_actions` applies)."""
+    the pipeline's `interesting_actions` applies).
+
+    `preview_fn(frame_bgr, boxes, sec)` receives ~8 frames a second for the
+    live preview window. An on-demand run is the *longest* thing this app does
+    without showing anything — it detects over the whole video, exactly like
+    the pipeline's stage, so it feeds the same window the pipeline does.
+    Omitted, it detects silently as before."""
     from action_recognition import run_action_detection
     d = analysis_defaults()
     sample_rate = sample_rate or d["sample_rate"]
     keep = [a.strip() for a in (interesting_actions or []) if a and a.strip()] or None
+    enable_r3d, r3d_half = _r3d_flags(d["action_backend"], log=log)
 
     detections, _bboxes = run_action_detection(
         video_path=video_path,
@@ -321,6 +354,15 @@ def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
         draw_bboxes=False,
         use_person_detection=True,
         include_model_type=False,
+        # The decoders the main window is set to. Left at the function's own
+        # defaults this ran 'mixed' with R3D on, whatever the user picked —
+        # so choosing "OpenVINO (Intel GPU/CPU)" still loaded the R3D model
+        # and ran it on the CPU, ~70x slower than the decoder they asked for.
+        enable_r3d=enable_r3d,
+        r3d_model_name=d["r3d_model"],
+        r3d_half=r3d_half,
+        action_models=d["action_models"],
+        preview_fn=preview_fn,
     )
     if cancel is not None and cancel.is_set():
         raise _Cancelled()
@@ -346,12 +388,14 @@ def _load_yolo(d: dict, log=print):
 
 
 def run_objects(video_path: str, objects: list, *, progress: ProgressFn = None,
-                cancel=None, log=print) -> list:
+                cancel=None, log=print, preview_fn=None) -> list:
     """Run object detection for the given class list and return the
     cache-shaped `objects` list `[{timestamp, objects, count}, ...]`.
 
     Raises ValueError if no classes were given — object detection has nothing
     to look for without a list.
+
+    `preview_fn` feeds the live preview window, as in `run_actions`.
     """
     objects = [o.strip() for o in (objects or []) if o and o.strip()]
     if not objects:
@@ -370,6 +414,7 @@ def run_objects(video_path: str, objects: list, *, progress: ProgressFn = None,
         frame_skip=d["object_frame_skip"],
         cancel_flag=cancel, draw_boxes=False,
         confidence_threshold=d["object_confidence"],
+        preview_fn=preview_fn,
     )
     if cancel is not None and cancel.is_set():
         raise _Cancelled()

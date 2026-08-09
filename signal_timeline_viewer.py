@@ -317,6 +317,12 @@ class SignalTimelineWindow(QMainWindow):
     # the connected slots run on the GUI thread via Qt's queued connection.
     analysis_progress = Signal(str, float, str)   # kind, fraction 0..1, message
     analysis_finished = Signal(str, object)       # kind, result dict | Exception
+    # Detection frames for the live preview window, which the main window owns.
+    # Emitted from the analysis worker thread; the queued connection to that
+    # window's slot is what gets them onto the GUI thread. `preview_enabled`
+    # below is the gate, set by whoever opened this viewer.
+    preview_frame = Signal(object, object, int)   # frame_bgr, boxes, sec
+    preview_enabled = False
 
     def __init__(self, video_path, cache_data=None):
         debug_log(f"SignalTimelineWindow.__init__ CALLED with video_path={video_path}")
@@ -2744,6 +2750,16 @@ class SignalTimelineWindow(QMainWindow):
             msg = f"{task}: {details}".strip(" :") if (task or details) else ""
             self.analysis_progress.emit(kind, frac, msg)
 
+        # The preview window lives in the main window, behind its own checkbox.
+        # An Analyze run here is the same detection over the same video as the
+        # pipeline's stage, so it feeds that window rather than leaving it on
+        # its placeholder — but only while the box is ticked. `preview_enabled`
+        # is set by whoever opened this viewer and kept current as the box is
+        # toggled; a viewer opened on its own leaves it False and costs nothing.
+        def preview_fn(frame, boxes, sec):
+            if getattr(self, "preview_enabled", False) and not cancel.is_set():
+                self.preview_frame.emit(frame, boxes, sec)
+
         def work():
             try:
                 if kind == "motion":
@@ -2753,10 +2769,12 @@ class SignalTimelineWindow(QMainWindow):
                 elif kind == "actions":
                     acts = [s.strip() for s in self.analyze_actions_field.text().split(",") if s.strip()]
                     result = run_actions(self.video_path, interesting_actions=acts,
-                                         progress=progress, cancel=cancel)
+                                         progress=progress, cancel=cancel,
+                                         preview_fn=preview_fn)
                 elif kind == "objects":
                     objs = [s.strip() for s in self.analyze_objects_field.text().split(",") if s.strip()]
-                    result = run_objects(self.video_path, objs, progress=progress, cancel=cancel)
+                    result = run_objects(self.video_path, objs, progress=progress, cancel=cancel,
+                                         preview_fn=preview_fn)
                 else:
                     lang = self.analyze_transcript_lang.currentData() or "en"
                     result = run_transcript(self.video_path, language=lang,
