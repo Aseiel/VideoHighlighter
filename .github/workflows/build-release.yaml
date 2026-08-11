@@ -77,6 +77,8 @@ jobs:
       - name: Build EXE
         run: >
           pyinstaller --name "VideoHighlighter"
+          --icon "assets/icon.ico"
+          --splash "assets/splash.png"
           --windowed
           --noconfirm
           --add-data "config.yaml;."
@@ -85,6 +87,7 @@ jobs:
           --add-data "assets;assets"
           --add-data "modules;modules"
           --add-data "models;models"
+          --add-data "video_ai_editor/VRVideoOutput.qml;video_ai_editor"
           --add-data "video_ai_editor/models;video_ai_editor/models"
           --hidden-import action_recognition
           --hidden-import convert_pth_to_openvino
@@ -99,6 +102,9 @@ jobs:
           --hidden-import PySide6.QtGui
           --hidden-import PySide6.QtWidgets
           --hidden-import PySide6.QtQml
+          --hidden-import PySide6.QtQuick
+          --hidden-import PySide6.QtQuickWidgets
+          --hidden-import PySide6.QtMultimedia
           --collect-submodules whisper
           --collect-submodules ultralytics
           --collect-all openvino
@@ -121,6 +127,25 @@ jobs:
         run: |
           $size = (Get-ChildItem -Recurse ./dist/VideoHighlighter | Measure-Object -Property Length -Sum).Sum / 1GB
           Write-Host "Build size: $([math]::Round($size, 2)) GB"
+      - name: Generate release manifest
+        # Every shipped file with its SHA-256, written INTO the bundle before
+        # archiving so each install carries a record of what it was given. The
+        # updater diffs the next release against it and fetches only the files
+        # that differ.
+        #
+        # Deliberately NOT signed here: the release signing key decides what
+        # executes on users' machines, so it stays offline rather than living
+        # in Actions secrets, where anyone who can edit a workflow could
+        # exfiltrate it. Sign the manifest locally, then publish the .sig.
+        run: |
+          $v = python -c "import version; print(version.__version__)"
+          $e = python -c "import version; print(version.__edition__)"
+          python tools/build_manifest.py generate --root dist/VideoHighlighter --version "$v" --edition "$e" --base-url "${{ vars.UPDATE_BASE_URL }}"
+      - name: Upload unsigned manifest (sign this locally)
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-manifest
+          path: dist/VideoHighlighter/manifest.json
       - name: Create archive
         run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z" ./dist/VideoHighlighter
       - name: Upload artifact
@@ -254,6 +279,7 @@ jobs:
             --add-data "assets:assets" \
             --add-data "modules:modules" \
             --add-data "models:models" \
+            --add-data "video_ai_editor/VRVideoOutput.qml:video_ai_editor" \
             --add-data "video_ai_editor/models:video_ai_editor/models" \
             --hidden-import action_recognition \
             --hidden-import convert_pth_to_openvino \
@@ -270,6 +296,9 @@ jobs:
             --hidden-import PySide6.QtGui \
             --hidden-import PySide6.QtWidgets \
             --hidden-import PySide6.QtQml \
+            --hidden-import PySide6.QtQuick \
+            --hidden-import PySide6.QtQuickWidgets \
+            --hidden-import PySide6.QtMultimedia \
             --collect-submodules whisper \
             --collect-submodules ultralytics \
             --collect-all openvino \

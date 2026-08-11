@@ -42,7 +42,7 @@ class TranscriptSegmentWidget(QFrame):
         self.time_label.setFixedWidth(38)
         self.time_label.setAlignment(Qt.AlignTop | Qt.AlignRight)
         self.time_label.setStyleSheet("""
-            color: #5a7faa;
+            color: #aaaaaa;
             font-family: 'Consolas', monospace;
             font-size: 10px;
             font-weight: bold;
@@ -56,7 +56,7 @@ class TranscriptSegmentWidget(QFrame):
         self.text_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.text_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self.text_label.setStyleSheet("""
-            color: #c8d4e8;
+            color: #cecece;
             font-size: 12px;
             line-height: 1.5;
             padding: 2px 0;
@@ -70,8 +70,8 @@ class TranscriptSegmentWidget(QFrame):
             bg = "#2a3f1a"
             border = "#7aff50"
         elif self._is_active:
-            bg = "#1a2a3f"
-            border = "#3a7fcd"
+            bg = "#222222"
+            border = "#2f81f7"
         elif self._is_match:
             bg = "#2a2a10"
             border = "#aaaa30"
@@ -86,8 +86,8 @@ class TranscriptSegmentWidget(QFrame):
                 border-radius: 3px;
             }}
             QFrame#transcriptSegment:hover {{
-                background-color: #1e2a3a;
-                border-left: 3px solid #5a8fcd;
+                background-color: #242424;
+                border-left: 3px solid #2f81f7;
             }}
         """)
 
@@ -162,15 +162,15 @@ class TranscriptPanel(QWidget):
         self.search_input.setClearButtonEnabled(True)
         self.search_input.setStyleSheet("""
             QLineEdit {
-                background-color: #1a1a2e;
-                color: #e0e8ff;
-                border: 1px solid #3a3a5a;
+                background-color: #141414;
+                color: #e4e4e4;
+                border: 1px solid #3a3a3a;
                 border-radius: 4px;
                 padding: 6px 10px;
                 font-size: 12px;
             }
             QLineEdit:focus {
-                border-color: #4a7fcd;
+                border-color: #2f81f7;
             }
         """)
         self.search_input.returnPressed.connect(self._next_match)
@@ -197,7 +197,7 @@ class TranscriptPanel(QWidget):
         meta_row = QHBoxLayout()
 
         self.match_label = QLabel("")
-        self.match_label.setStyleSheet("color: #7a9aaa; font-size: 10px; padding: 0 4px;")
+        self.match_label.setStyleSheet("color: #999999; font-size: 10px; padding: 0 4px;")
         meta_row.addWidget(self.match_label)
 
         meta_row.addStretch()
@@ -221,7 +221,7 @@ class TranscriptPanel(QWidget):
                 color: #60aa60;
             }
             QPushButton:!checked {
-                background: #1a1a1a;
+                background: #141414;
                 color: #666;
                 border-color: #333;
             }
@@ -236,22 +236,22 @@ class TranscriptPanel(QWidget):
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_area.setStyleSheet("""
             QScrollArea {
-                background-color: #0e0e1a;
-                border: 1px solid #2a2a3a;
+                background-color: #0e0e0e;
+                border: 1px solid #2a2a2a;
                 border-radius: 4px;
             }
             QScrollBar:vertical {
-                background: #1a1a2a;
+                background: #141414;
                 width: 8px;
                 border-radius: 4px;
             }
             QScrollBar::handle:vertical {
-                background: #3a3a5a;
+                background: #3a3a3a;
                 border-radius: 4px;
                 min-height: 20px;
             }
             QScrollBar::handle:vertical:hover {
-                background: #4a5aaa;
+                background: #2f81f7;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
                 height: 0px;
@@ -259,7 +259,7 @@ class TranscriptPanel(QWidget):
         """)
 
         self.content_widget = QWidget()
-        self.content_widget.setStyleSheet("background-color: #0e0e1a;")
+        self.content_widget.setStyleSheet("background-color: #0e0e0e;")
         self.content_layout = QVBoxLayout(self.content_widget)
         self.content_layout.setContentsMargins(4, 4, 4, 4)
         self.content_layout.setSpacing(1)
@@ -272,22 +272,22 @@ class TranscriptPanel(QWidget):
         if not self.segments:
             empty = QLabel("No transcript available.\nRun the pipeline with transcript enabled.")
             empty.setAlignment(Qt.AlignCenter)
-            empty.setStyleSheet("color: #4a5a6a; font-style: italic; padding: 20px;")
+            empty.setStyleSheet("color: #525252; font-style: italic; padding: 20px;")
             self.content_layout.insertWidget(0, empty)
 
     def _nav_btn_style(self):
         return """
             QPushButton {
-                background-color: #1a1a2e;
-                color: #7a9acd;
-                border: 1px solid #3a3a5a;
+                background-color: #141414;
+                color: #9a9a9a;
+                border: 1px solid #3a3a3a;
                 border-radius: 4px;
                 font-size: 10px;
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #2a2a4e;
-                color: #aac0ff;
+                background-color: #2a2a2a;
+                color: #b5b5b5;
             }
             QPushButton:disabled {
                 color: #333;
@@ -355,7 +355,7 @@ class TranscriptPanel(QWidget):
             self.next_btn.setEnabled(False)
         else:
             self.match_label.setText(f"{len(self.segments)} segments")
-            self.match_label.setStyleSheet("color: #7a9aaa; font-size: 10px; padding: 0 4px;")
+            self.match_label.setStyleSheet("color: #999999; font-size: 10px; padding: 0 4px;")
             self.prev_btn.setEnabled(False)
             self.next_btn.setEnabled(False)
 

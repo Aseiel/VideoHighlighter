@@ -29,7 +29,7 @@ class FilterDialog(QDialog):
         
         # Actions filter controls
         actions_header = QLabel("Filter Actions")
-        actions_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #a0c0ff;")
+        actions_header.setStyleSheet("font-weight: bold; font-size: 14px; color: #cccccc;")
         actions_layout.addWidget(actions_header)
         
         # Search box for actions
@@ -90,7 +90,47 @@ class FilterDialog(QDialog):
         objects_layout.addLayout(object_buttons)
         
         tabs.addTab(objects_tab, "Objects")
-        
+
+        # Events tab — composition-rule events. Only added when the cache has
+        # some, so a video that was never run through the rules doesn't show an
+        # empty tab implying a missing feature.
+        self.event_list = None
+        if getattr(self.scene, "event_types", None):
+            events_tab = QWidget()
+            events_layout = QVBoxLayout(events_tab)
+
+            events_header = QLabel("Filter Composed Events")
+            events_header.setStyleSheet(
+                "font-weight: bold; font-size: 14px; color: #e6b45a;")
+            events_layout.addWidget(events_header)
+
+            events_note = QLabel(
+                "Derived from your composition rules, not detected directly.")
+            events_note.setStyleSheet("color: #888888; font-size: 11px;")
+            events_note.setWordWrap(True)
+            events_layout.addWidget(events_note)
+
+            self.event_search = QLineEdit()
+            self.event_search.setPlaceholderText("Search events...")
+            self.event_search.textChanged.connect(self.filter_event_list)
+            events_layout.addWidget(self.event_search)
+
+            self.event_list = QListWidget()
+            self.event_list.setSelectionMode(QListWidget.MultiSelection)
+            self.populate_event_list()
+            events_layout.addWidget(self.event_list)
+
+            event_buttons = QHBoxLayout()
+            select_all_events = QPushButton("Select All")
+            select_all_events.clicked.connect(lambda: self.set_all_events(True))
+            deselect_all_events = QPushButton("Deselect All")
+            deselect_all_events.clicked.connect(lambda: self.set_all_events(False))
+            event_buttons.addWidget(select_all_events)
+            event_buttons.addWidget(deselect_all_events)
+            events_layout.addLayout(event_buttons)
+
+            tabs.addTab(events_tab, "Events")
+
         layout.addWidget(tabs)
         
         # Dialog buttons
@@ -106,43 +146,43 @@ class FilterDialog(QDialog):
         # Apply dark theme
         self.setStyleSheet("""
             QDialog {
-                background-color: #1a1a2a;
+                background-color: #141414;
             }
             QListWidget {
-                background-color: #2a2a3a;
+                background-color: #2a2a2a;
                 color: #ffffff;
-                border: 1px solid #444466;
+                border: 1px solid #444444;
                 border-radius: 4px;
             }
             QListWidget::item {
                 padding: 5px;
-                border-bottom: 1px solid #333344;
+                border-bottom: 1px solid #333333;
             }
             QListWidget::item:selected {
-                background-color: #3a5fcd;
+                background-color: #2f81f7;
             }
             QListWidget::item:hover {
-                background-color: #3a3a5a;
+                background-color: #3a3a3a;
             }
             QLineEdit {
-                background-color: #2a2a3a;
+                background-color: #2a2a2a;
                 color: #ffffff;
-                border: 1px solid #444466;
+                border: 1px solid #444444;
                 border-radius: 4px;
                 padding: 5px;
             }
             QTabWidget::pane {
-                border: 1px solid #444466;
-                background-color: #2a2a3a;
+                border: 1px solid #444444;
+                background-color: #2a2a2a;
             }
             QTabBar::tab {
-                background-color: #3a3a5a;
+                background-color: #3a3a3a;
                 color: #cccccc;
                 padding: 8px 16px;
                 margin-right: 2px;
             }
             QTabBar::tab:selected {
-                background-color: #4a5fcd;
+                background-color: #2f81f7;
                 color: #ffffff;
             }
         """)
@@ -163,6 +203,36 @@ class FilterDialog(QDialog):
             item.setCheckState(Qt.Checked if self.scene.visible_objects.get(obj, True) else Qt.Unchecked)
             self.object_list.addItem(item)
     
+    def populate_event_list(self):
+        """Populate the composed-event list.
+
+        Underscores are shown as spaces to match the timeline's bar labels, so
+        the stored rule name is kept on the item as UserRole rather than parsed
+        back out of the display text.
+        """
+        self.event_list.clear()
+        for ev in sorted(self.scene.event_types):
+            item = QListWidgetItem(ev.replace('_', ' '))
+            item.setData(Qt.UserRole, ev)
+            item.setCheckState(Qt.Checked
+                               if self.scene.visible_events.get(ev, True)
+                               else Qt.Unchecked)
+            self.event_list.addItem(item)
+
+    def filter_event_list(self):
+        """Filter the event list based on search text"""
+        search_text = self.event_search.text().lower()
+        for i in range(self.event_list.count()):
+            item = self.event_list.item(i)
+            item.setHidden(search_text not in item.text().lower())
+
+    def set_all_events(self, selected):
+        """Select or deselect all (visible) events"""
+        for i in range(self.event_list.count()):
+            item = self.event_list.item(i)
+            if not item.isHidden():
+                item.setCheckState(Qt.Checked if selected else Qt.Unchecked)
+
     def filter_action_list(self):
         """Filter action list based on search text"""
         search_text = self.action_search.text().lower()
@@ -204,6 +274,14 @@ class FilterDialog(QDialog):
             item = self.object_list.item(i)
             object_name = item.text()
             self.scene.set_object_filter(object_name, item.checkState() == Qt.Checked)
+
+        # Update composed-event filters (tab absent when there are none)
+        if self.event_list is not None:
+            for i in range(self.event_list.count()):
+                item = self.event_list.item(i)
+                # UserRole holds the real rule name; the label has spaces.
+                self.scene.set_event_filter(item.data(Qt.UserRole),
+                                            item.checkState() == Qt.Checked)
     
     def apply_and_close(self):
         """Apply filters and close dialog"""
@@ -224,7 +302,7 @@ class ConfidenceFilterDialog(QDialog):
         layout = QVBoxLayout(self)
 
         title = QLabel("Filter by Confidence Level")
-        title.setStyleSheet("font-weight: bold; font-size: 14px; color: #a0c0ff;")
+        title.setStyleSheet("font-weight: bold; font-size: 14px; color: #cccccc;")
         layout.addWidget(title)
 
         desc = QLabel("Adjust minimum confidence separately for actions and objects.")
@@ -298,20 +376,20 @@ class ConfidenceFilterDialog(QDialog):
         layout.addWidget(buttons)
 
         self.setStyleSheet("""
-            QDialog { background-color: #1a1a2a; }
+            QDialog { background-color: #141414; }
             QGroupBox {
-                color: #d0e0ff; border: 1px solid #3a3a50;
+                color: #d8d8d8; border: 1px solid #3a3a3a;
                 border-radius: 6px; margin-top: 14px; padding-top: 10px;
                 font-weight: bold;
             }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
-            QSlider::groove:horizontal { height: 8px; background: #3a3a5a; border-radius: 4px; }
-            QSlider::handle:horizontal { background: #3a5fcd; width: 18px; margin: -5px 0; border-radius: 9px; }
+            QSlider::groove:horizontal { height: 8px; background: #3a3a3a; border-radius: 4px; }
+            QSlider::handle:horizontal { background: #2f81f7; width: 18px; margin: -5px 0; border-radius: 9px; }
             QPushButton {
-                background-color: #2a2a44; color: white;
-                border: 1px solid #4a4a6a; padding: 6px; border-radius: 4px;
+                background-color: #2a2a2a; color: white;
+                border: 1px solid #4a4a4a; padding: 6px; border-radius: 4px;
             }
-            QPushButton:hover { background-color: #3a3a5c; }
+            QPushButton:hover { background-color: #3a3a3a; }
         """)
 
     def on_slider_changed(self):

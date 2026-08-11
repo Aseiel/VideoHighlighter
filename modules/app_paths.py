@@ -106,6 +106,169 @@ def custom_keypoint_names():
     return []
 
 
+def object_models_dir() -> str:
+    """Managed folder for custom object detectors, auto-discovered in the
+    Advanced tab. Sits next to the executable when frozen so imported models
+    survive a restart; the project root when running from source."""
+    return os.path.join(user_data_dir(), "models", "custom")
+
+
+_OBJECT_MODEL_NAMES_CACHE: dict = {}
+
+
+def object_model_names(path: str) -> list:
+    """Class names a detector reports for itself, or [] if it is not an object
+    detector or cannot be read.
+
+    Cached per (path, mtime): this loads the model, which is slow enough that
+    re-reading it every time the combo rebuilds is noticeable.
+    """
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return []
+    if key in _OBJECT_MODEL_NAMES_CACHE:
+        return _OBJECT_MODEL_NAMES_CACHE[key]
+    names = []
+    try:
+        from ultralytics import YOLO
+        model = YOLO(str(path))
+        if getattr(model, "task", "") == "detect":
+            names = [str(n) for n in model.names.values()]
+    except Exception as e:
+        print(f"⚠️ could not read classes from {os.path.basename(path)}: {e}")
+    _OBJECT_MODEL_NAMES_CACHE[key] = names
+    return names
+
+
+def discover_object_models() -> list:
+    """List custom object detectors under models/custom/, newest first, each with
+    the class names read from the model itself.
+
+    Returns [{"path": str, "name": str, "classes": list[str]}]. Empty when the
+    folder is absent or holds no detectors — callers then offer only the standard
+    option. Keypoint/pose models are skipped: they run a different code path and
+    get their names from custom_keypoint_names().
+    """
+    import glob
+    d = object_models_dir()
+    if not os.path.isdir(d):
+        return []
+    paths = []
+    for ext in ("*.pt", "*.onnx"):
+        paths.extend(glob.glob(os.path.join(d, ext)))
+    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    out = []
+    for p in paths:
+        classes = object_model_names(p)
+        if not classes:
+            continue
+        out.append({
+            "path": p,
+            "name": os.path.splitext(os.path.basename(p))[0],
+            "classes": classes,
+        })
+    return out
+
+
+def custom_action_decoder_paths() -> tuple[str, str, str]:
+    """Fixed install locations for the user's custom fine-tuned OpenVINO action
+    decoder: (xml, bin, labels_json). Same resolve-with-override rule as
+    data_file() — a copy here (written by the Advanced tab's "Import model…"
+    button) overrides the bundled default."""
+    return (
+        data_file("action_classifier_3d.xml"),
+        data_file("action_classifier_3d.bin"),
+        data_file("intel_finetuned_classifier_3d_mapping.json"),
+    )
+
+
+def import_custom_action_model(decoder_xml_src: str, labels_json_src: str = "") -> int:
+    """Install a user-trained OpenVINO action decoder (+ its .bin, + a labels
+    mapping) into the writable user-data location, so it's picked up in place
+    of the bundled default — mirrors object_models_dir()'s import flow, but
+    for the single custom-action-decoder slot (no multi-model discovery here).
+
+    ``labels_json_src`` may be omitted — a same-named ``*.json`` next to
+    ``decoder_xml_src`` is used automatically if present (what the training
+    pipeline writes alongside the decoder).
+
+    Returns the number of classes found in the installed labels file (0 if
+    none), so the caller can report/validate the import.
+    """
+    dst_xml, dst_bin, dst_labels = custom_action_decoder_paths()
+    os.makedirs(os.path.dirname(dst_xml), exist_ok=True)
+    shutil.copy2(decoder_xml_src, dst_xml)
+
+    src_bin = os.path.splitext(decoder_xml_src)[0] + ".bin"
+    if os.path.exists(src_bin):
+        shutil.copy2(src_bin, dst_bin)
+
+    if not labels_json_src:
+        candidate = os.path.splitext(decoder_xml_src)[0] + ".json"
+        if os.path.exists(candidate):
+            labels_json_src = candidate
+
+    n_classes = 0
+    if labels_json_src and os.path.exists(labels_json_src):
+        shutil.copy2(labels_json_src, dst_labels)
+        try:
+            import json
+            with open(dst_labels, "r", encoding="utf-8") as f:
+                n_classes = len(json.load(f).get("idx_to_label", {}))
+        except Exception:
+            pass
+    return n_classes
+
+
+def r3d_custom_action_paths() -> tuple[str, str]:
+    """Fixed install locations for the user's custom fine-tuned R3D (PyTorch)
+    action model: (weights_pth, mapping_json). Same resolve-with-override rule
+    as data_file()."""
+    return (
+        data_file("r3d_finetuned.pth"),
+        data_file("r3d_finetuned_mapping.json"),
+    )
+
+
+def import_r3d_action_model(weights_pth_src: str, mapping_json_src: str = "") -> tuple[int, str]:
+    """Install a user-trained R3D (PyTorch) action model (+ its mapping JSON)
+    into the writable user-data location, alongside import_custom_action_model()
+    but for the R3D slot.
+
+    Unlike the OpenVINO decoder, the mapping JSON is effectively required — it
+    carries both the class labels (``idx_to_label``) and the
+    ``metadata.model_variant`` (r3d_18 / mc3_18 / r2plus1d_18) the loader needs
+    to rebuild the right architecture before loading the weights. A same-named
+    ``*.json`` next to the ``.pth`` is used automatically if present.
+
+    Returns ``(num_classes, model_variant)`` — ``model_variant`` is ``""`` when
+    the mapping omits it, in which case the loader falls back to the UI's
+    "R3D model variant" dropdown selection.
+    """
+    dst_pth, dst_mapping = r3d_custom_action_paths()
+    os.makedirs(os.path.dirname(dst_pth), exist_ok=True)
+    shutil.copy2(weights_pth_src, dst_pth)
+
+    if not mapping_json_src:
+        candidate = os.path.splitext(weights_pth_src)[0] + ".json"
+        if os.path.exists(candidate):
+            mapping_json_src = candidate
+
+    n_classes, variant = 0, ""
+    if mapping_json_src and os.path.exists(mapping_json_src):
+        shutil.copy2(mapping_json_src, dst_mapping)
+        try:
+            import json
+            with open(dst_mapping, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            n_classes = len(data.get("idx_to_label", {}))
+            variant = (data.get("metadata") or {}).get("model_variant", "") or ""
+        except Exception:
+            pass
+    return n_classes, variant
+
+
 def ffmpeg_exe() -> str:
     """Resolve a usable ffmpeg executable.
 

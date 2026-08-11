@@ -20,6 +20,7 @@ from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 from modules.video_cutter import cut_video
 from modules.auto_segments import build_auto_segments
+from modules.highlight_select import peak_confidence_by_sec, select_fixed_window_segments
 from modules.device_utils import resolve_yolo_device
 from modules.app_paths import ffmpeg_exe
 
@@ -200,6 +201,15 @@ def check_cancellation(cancel_flag, log_fn, step_name="operation"):
         log_fn(f"⏹️ Cancelled during {step_name}")
         raise RuntimeError(f"Operation cancelled during {step_name}")
 
+def _face_label_counts(face_seconds):
+    """How many readable seconds each expression accounted for."""
+    try:
+        from modules.face_scan import label_counts
+        return {k: v for k, v in label_counts(face_seconds).items() if v}
+    except Exception:
+        return {}
+
+
 def check_gpu_availability(log_fn=print):
     """Legacy shim — the single source of truth is device_utils.detect_best_device()."""
     from modules.device_utils import detect_best_device
@@ -214,7 +224,9 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                          motion_events, motion_peaks, audio_peaks, source_lang="en",
                          waveform_data=None, keyword_segments_only=False,
                          search_keywords=None, keyword_matches=None, action_bboxes=None,
-                         object_bboxes=None, action_detections_all=None):
+                         object_bboxes=None, action_detections_all=None,
+                         composed_event_names=None, loudness_bursts=None,
+                         loudness_levels=None):
     """
     Collect all analysis results into a structured dictionary for caching.
 
@@ -306,7 +318,14 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
     # Store in a structured way for easy access
     analysis_data["audio"] = {
         "peaks": audio_peaks_clean,
-        "waveform": waveform_data
+        "waveform": waveform_data,
+        # Events, not per-second curves: the curves are six arrays the length of
+        # the video and a caller who wants them can re-measure in a few seconds.
+        "loudness_bursts": loudness_bursts or [],
+        # One float per second. Cached rather than recomputed because the
+        # report's per-class comparison needs every second, and re-deriving it
+        # means decoding the audio again on a run that otherwise touches none.
+        "loudness_levels": [float(v) for v in (loudness_levels or [])]
     }
     
     # Also keep legacy key for backward compatibility
@@ -317,6 +336,16 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
         analysis_data["action_bboxes"] = action_bboxes
     if object_bboxes:
         analysis_data["object_bboxes"] = object_bboxes
+
+    # Which names in `objects` were produced by composition rules rather than
+    # detected. Only the names are stored, not a second copy of the per-second
+    # data: composed events have to live in `objects` to be scored at all
+    # (object scoring counts names found there), so duplicating them would give
+    # two sources of truth that could disagree. This list is what lets the
+    # timeline separate derived events from real detections — without it they are
+    # indistinguishable once merged.
+    if composed_event_names:
+        analysis_data["composed_event_names"] = sorted(set(composed_event_names))
 
     return analysis_data
 
@@ -357,10 +386,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log_fn("⏹️ Batch processing cancelled")
                 break
             
-            # Update batch progress
-            batch_progress = int((idx - 1) / total_videos * 100)
-            progress.update_progress(batch_progress, 100, "Batch Processing", 
-                                   f"Video {idx}/{total_videos}")
+            # Videos finished so far, not a percentage — the GUI gives this its
+            # own row, so it survives the per-stage updates the video below emits.
+            failed = sum(1 for _, r in results if r is None)
+            detail = f"Video {idx}/{total_videos}: {os.path.basename(single_video_path)}"
+            if failed:
+                detail += f" ({failed} failed)"
+            progress.update_progress(idx - 1, total_videos, "Batch Processing", detail)
             
             # Auto-generate output filename
             video_gui_config = gui_config.copy() if gui_config else {}
@@ -400,8 +432,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             status = "✅" if output_path else "❌"
             log_fn(f"  {status} {os.path.basename(input_path)}")
         
-        progress.update_progress(100, 100, "Batch Processing", 
-                               f"Complete: {successful}/{total_videos}")
+        progress.update_progress(len(results), total_videos, "Batch Processing",
+                               f"Complete: {successful}/{total_videos} succeeded")
         return results
     
     # ========== SINGLE FILE PROCESSING ==========
@@ -437,7 +469,19 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         MAX_DURATION = gui_config.get("max_duration") or config.get("highlights", {}).get("max_duration", 420)
         EXACT_DURATION = gui_config.get("exact_duration") or config.get("highlights", {}).get("exact_duration", None)
         CLIP_TIME = gui_config.get("clip_time") or config.get("highlights", {}).get("clip_time", 10)
+        # 0.0 = take the best-scoring moments wherever they fall (the original
+        # behaviour); 1.0 = spread the cut evenly so the whole video is covered.
+        COVERAGE = gui_config.get("coverage")
+        if COVERAGE is None:
+            COVERAGE = config.get("highlights", {}).get("coverage", 0.0)
+        COVERAGE = float(COVERAGE)
         KEEP_TEMP = gui_config.get("keep_temp", config.get("highlights", {}).get("keep_temp", False))
+        # How the final clips are cut/encoded: "cpu" (libx265/libx264 re-encode,
+        # VR-safe, slow) or "gpu" (hardware re-encode, fast, may not play in some
+        # VR players).
+        RENDER_MODE = gui_config.get("render_mode", config.get("highlights", {}).get("render_mode", "cpu"))
+        if RENDER_MODE not in ("cpu", "gpu"):
+            RENDER_MODE = "cpu"
 
         # Transcript settings
         USE_TRANSCRIPT = gui_config.get("use_transcript", False) and TRANSCRIPT_AVAILABLE
@@ -447,7 +491,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         CREATE_SUBTITLES = gui_config.get("create_subtitles", False)
         TRANSCRIPT_ONLY = gui_config.get("transcript_only", False)
         TRANSCRIPT_POINTS = int(gui_config.get("transcript_points", 0))
-        SOURCE_LANG = gui_config.get("source_lang", "en")  # For subtitles
+        # Subtitles are written *from* the transcript, so their source language
+        # is the one the transcript was made in — not a second setting that can
+        # disagree with it. `source_lang` is still read for configs saved by an
+        # older build, which had its own subtitle-side dropdown.
+        SOURCE_LANG = gui_config.get("transcript_source_lang") or \
+            gui_config.get("source_lang", "en")
         TARGET_LANG = gui_config.get("target_lang", None)  # For subtitles
 
         # Avoid settings
@@ -759,12 +808,18 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 try:
                     check_cancellation(cancel_flag, log, "transcript processing")
                     transcript_segments = get_transcript_segments(
-                        processed_video_path, 
-                        model_name=TRANSCRIPT_MODEL, 
-                        progress_fn=progress_fn, 
+                        processed_video_path,
+                        model_name=TRANSCRIPT_MODEL,
+                        progress_fn=progress_fn,
                         log_fn=log,
                         language=TRANSCRIPT_SOURCE_LANG,
-                        enable_diarization=True
+                        enable_diarization=True,
+                        # Checked inside the decode loop. Without it a cancel
+                        # was noticed only once the whole transcript finished,
+                        # which on a feature-length video is the entire wait.
+                        # TranscriptionCancelled is a RuntimeError, so the
+                        # handler below already treats it as "stop the run".
+                        should_cancel=(lambda: bool(cancel_flag and cancel_flag.is_set())),
                     )
                     
                     check_cancellation(cancel_flag, log, "transcript processing")
@@ -823,16 +878,43 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         start_time = time.time()
 
         # --- 1+2 Detect scenes + motion + peaks with live progress ---
-        if not using_cache:
+        # The gate has to read exactly what the *scoring* will read, or the two
+        # disagree about the same setting. They did: this gate defaulted
+        # motion_peak_points to 0 while MOTION_PEAK_POINTS below defaults it to
+        # 3, so a config that set neither skipped the detector and then scored
+        # peaks it had never looked for. Resolved once, here, and used for both
+        # the gate and the backfill check.
+        effective_points = {
+            "scene_points": gui_config.get(
+                "scene_points", config.get("scene_points", 0)),
+            "motion_event_points": gui_config.get(
+                "motion_event_points", config.get("motion_event_points", 0)),
+            "motion_peak_points": gui_config.get(
+                "motion_peak_points", config.get("motion_peak_points", 3)),
+            "audio_peak_points": gui_config.get(
+                "audio_peak_points", config.get("audio_peak_points", 0)),
+        }
+
+        # A cached run can still be missing motion data - the points that gate
+        # the detector are scoring weights and deliberately outside the cache
+        # signature, so a cache written while they were zero holds empty lists
+        # forever. `modules.analysis_plan` owns that reasoning and the registry
+        # of which settings do this; see its docstring for why it is a module
+        # rather than a condition written out here for the third time.
+        from modules.analysis_plan import describe as _describe_backfill
+        from modules.analysis_plan import gate_is_open, needs_backfill
+        motion_wanted = gate_is_open(effective_points, "motion")
+        motion_backfill = needs_backfill(
+            "motion", effective_points, using_cache=using_cache,
+            values=(scenes, motion_events, motion_peaks))
+        if motion_backfill:
+            log(_describe_backfill("motion"))
+
+        if not using_cache or motion_backfill:
             progress.update_progress(10, 100, "Pipeline", "Detecting motion and scenes...")
-            
-            # Check if we should skip motion detection based on GUI config
-            scene_points = gui_config.get("scene_points", 0)
-            motion_event_points = gui_config.get("motion_event_points", 0) 
-            motion_peak_points = gui_config.get("motion_peak_points", 0)
 
             # Skip motion detection if all motion-related points are 0
-            if scene_points == 0 and motion_event_points == 0 and motion_peak_points == 0:
+            if not motion_wanted:
                 log("ℹ️ Skipping motion detection (all scene/motion points set to 0)")
                 scenes, motion_events, motion_peaks = [], [], []
                 progress.update_progress(25, 100, "Pipeline", "Motion detection skipped - no motion scoring enabled")
@@ -847,7 +929,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # Call the actual motion detection function with video path
                     result = detect_scenes_motion_optimized(
                         processed_video_path,
-                        scene_threshold=70.0,
+                        # Was hardcoded to 70.0, which made `scene_threshold` a
+                        # phantom setting: it sits in the analysis cache
+                        # signature, so changing it forced a full re-analysis
+                        # and then produced the identical result. The default
+                        # is unchanged, so this alters nothing until it is set.
+                        scene_threshold=float(gui_config.get(
+                            "scene_threshold", config.get("scene_threshold", 70.0))),
                         motion_threshold=100.0,
                         spike_factor=1.2,
                         freeze_seconds=4,
@@ -884,6 +972,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         audio_peaks = audio_peaks if 'audio_peaks' in locals() else []
         waveform_data = None
+        audio_backfill = False   # set below only on a cached pass; see analysis_plan
 
         def _get_cached_waveform(cached):
             if not cached:
@@ -910,6 +999,25 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             audio_peaks = _get_cached_audio_peaks(cached_data)
             waveform_data = _get_cached_waveform(cached_data)
 
+            # Same trap as motion: `audio_peak_points` gates the detector but is
+            # a scoring weight, so a cache written with it at zero holds an empty
+            # peak list that raising the weight could never refill.
+            audio_backfill = needs_backfill(
+                "audio_peaks", effective_points, using_cache=True,
+                values=(audio_peaks,))
+            if audio_backfill:
+                log(_describe_backfill("audio_peaks"))
+                try:
+                    check_cancellation(cancel_flag, log, "audio peak detection")
+                    audio_peaks = extract_audio_peaks(processed_video_path,
+                                                      cancel_flag=cancel_flag)
+                    log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
+                except RuntimeError:
+                    return None
+                except Exception as e:
+                    log(f"⚠️ Audio peak detection failed: {e}")
+                    audio_peaks = []
+
             # If waveform wasn't cached in older runs, compute it now (cheap) so timeline works
             if waveform_data is None:
                 try:
@@ -925,7 +1033,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         else:
             # Check if we should skip audio detection based on GUI config
-            audio_peak_points = gui_config.get("audio_peak_points", 0)
+            audio_peak_points = effective_points["audio_peak_points"]
 
             # Always try to compute waveform for the timeline viewer
             try:
@@ -955,6 +1063,94 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"✅ Audio peak detection done: {len(audio_peaks)} peaks")
                 except RuntimeError:
                     return None
+
+        # --- 3b Loudness bursts ---------------------------------------------
+        # Where the audio rises above its own *local* level, grouped into events.
+        # This sits beside `audio_peaks` rather than replacing it because the two
+        # answer different questions: that one thresholds at a fixed -20 dBFS,
+        # which is a property of the mastering rather than of the content, and on
+        # two files mastered 17 dB apart it cannot describe both. A z-score
+        # against a rolling median can. See modules/loudness_bursts.py.
+        LOUDNESS_BURST_POINTS = gui_config.get(
+            "loudness_burst_points",
+            config.get("scoring", {}).get("loudness_burst_points", 0))
+        loudness_bursts = []
+        # Per-second dBFS, kept because the report compares the level measured
+        # during each labelled class and that needs a value for every second,
+        # not only the ones that stood out. See modules/level_by_class.py.
+        loudness_levels = []
+        if LOUDNESS_BURST_POINTS:
+            _cached_blob = cached_data if "cached_data" in locals() else None
+            _cached_bursts = None
+            if using_cache and isinstance(_cached_blob, dict):
+                _audio_blob = _cached_blob.get("audio")
+                if isinstance(_audio_blob, dict):
+                    _cached_bursts = _audio_blob.get("loudness_bursts")
+                    loudness_levels = _audio_blob.get("loudness_levels") or []
+            if _cached_bursts:
+                loudness_bursts = _cached_bursts
+                log(f"ℹ️ Using cached loudness bursts "
+                    f"({len(loudness_bursts)} event(s))")
+            else:
+                progress.update_progress(31, 100, "Pipeline",
+                                         "Finding loudness bursts...")
+                log("🔹 Step 3b: Finding loudness bursts...")
+                try:
+                    check_cancellation(cancel_flag, log, "loudness burst detection")
+                    from modules import loudness_bursts as _lb
+                    _lb_cfg = config.get("loudness_bursts", {}) or {}
+                    _lb_result = _lb.detect(
+                        processed_video_path,
+                        z_threshold=float(_lb_cfg.get("z_threshold", _lb.DEFAULT_Z)),
+                        min_duration=float(_lb_cfg.get(
+                            "min_duration", _lb.DEFAULT_MIN_DURATION)),
+                        edge_guard=float(_lb_cfg.get(
+                            "edge_guard", _lb.DEFAULT_EDGE_GUARD)),
+                        merge_gap=float(_lb_cfg.get(
+                            "merge_gap", _lb.DEFAULT_MERGE_GAP)),
+                        include_levels=True,
+                        cancel=cancel_flag)
+                    loudness_bursts = _lb_result["events"]
+                    loudness_levels = _lb_result.get("levels") or []
+                    log(f"✅ Loudness bursts: {len(loudness_bursts)} event(s) "
+                        f"({_lb_result['events_per_hour']}/hour)")
+                except RuntimeError as e:
+                    # No audio track is a fact about the file, not a failure of
+                    # the run -- every other signal is still worth having.
+                    log(f"⚠️ Loudness burst detection skipped: {e}")
+                    loudness_bursts = []
+                except Exception as e:
+                    log(f"⚠️ Loudness burst detection failed: {e}")
+                    loudness_bursts = []
+
+        # Keep what the backfills just cost, so this is a one-off rather than a
+        # tax on every future run. Only the backfilled keys are replaced, in the
+        # blob exactly as it was loaded - rebuilding it from this run's locals
+        # would write back a transcript and detection set that a cached pass
+        # never fully populates, turning a good cache into a partial one. The
+        # signature is unchanged because the analysis *inputs* are unchanged;
+        # what was missing was an artifact, not a different run.
+        if ((motion_backfill or audio_backfill) and use_cache
+                and not (cancel_flag and cancel_flag.is_set())):
+            try:
+                if motion_backfill:
+                    cached_data["scenes"] = [{"start": float(s), "end": float(e)}
+                                             for s, e in scenes]
+                    cached_data["motion_events"] = [float(t) for t in motion_events]
+                    cached_data["motion_peaks"] = [float(t) for t in motion_peaks]
+                if audio_backfill:
+                    audio_block = cached_data.get("audio")
+                    if isinstance(audio_block, dict):
+                        audio_block["peaks"] = [float(t) for t in audio_peaks]
+                    else:                      # legacy top-level layout
+                        cached_data["audio_peaks"] = [float(t) for t in audio_peaks]
+                cache.save(processed_video_path, cached_data, params=analysis_params)
+                filled = ", ".join(n for n, on in (("motion", motion_backfill),
+                                                   ("audio peaks", audio_backfill))
+                                   if on)
+                log(f"💾 Cached the {filled} data - the next run reuses it.")
+            except Exception as e:
+                log(f"⚠️ Could not cache the backfilled data: {e}")
 
         # 4 Object detection setup
         progress.update_progress(40, 100, "Pipeline", "Setting up object detection...")
@@ -1053,6 +1249,23 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # --- Object detection ---
         object_bboxes_cache = []  # default so cache save never NameErrors when objects are skipped
+        composed_event_names = []  # same reason: set only when the engine runs
+        if using_cache:
+            # Which events the *cached* detections already carry. The engine
+            # re-runs below either way; this is what tells it what to strip
+            # first, so a rule deleted since that pass does not outlive the file
+            # it was deleted from.
+            composed_event_names = list(
+                (cached_data or {}).get("composed_event_names") or [])
+            # Same trap: the boxes are only ever appended inside the detection
+            # branch, so on a cached pass this stayed empty and the report lost
+            # both the overlay on each thumbnail and every detector confidence
+            # behind it — silently, because an empty list is a legal answer.
+            object_bboxes_cache = list(
+                (cached_data or {}).get("object_bboxes") or [])
+            if object_bboxes_cache:
+                log(f"ℹ Reusing {len(object_bboxes_cache)} cached detection "
+                    "frame(s) for the report")
         if not using_cache:
             if not highlight_objects:
                 log("ℹ Skipping object detection (no objects to highlight)")
@@ -1134,31 +1347,53 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
                 log(f"✅ Object detection complete: {len(object_detections)} seconds with objects")
 
-                # --- Composition engine: derive events from spatial relations ---
-                try:
-                    from video_ai_editor.composition_engine import CompositionEngine
-                    from modules.app_paths import composition_rules_path
-                    rules_path = composition_rules_path()
-                    if rules_path and object_bboxes_cache:
-                        engine = CompositionEngine(rules_path)
-                        composed_det, composed_bb = engine.run(object_bboxes_cache)
-                        if composed_det:
-                            for sec, names in composed_det.items():
-                                object_detections.setdefault(sec, [])
-                                object_detections[sec] = sorted(
-                                    set(object_detections[sec]) | set(names)
-                                )
-                            object_bboxes_cache += composed_bb
-                            log(f"✅ Composition engine: "
-                                f"{sum(len(v) for v in composed_det.values())} event-hits "
-                                f"over {len(composed_det)} seconds")
-                        else:
-                            log("ℹ️ Composition engine: no events matched")
-                except Exception as _ce:
-                    log(f"⚠️ Composition engine skipped: {_ce}")
-
         else:
             log(CACHE_HIT_LOG.format(kind="object"))
+
+        # --- Composition engine: derive events from spatial relations ---
+        # Outside both branches on purpose. Rules are a reading of boxes that
+        # already exist, so editing one and re-running must not require the
+        # detections to be computed again — it used to, and the symptom was a
+        # rule change that silently did nothing on a cached pass. See
+        # modules/compose_events.py; the call is idempotent.
+        try:
+            from modules.app_paths import composition_rules_path
+            from modules.compose_events import apply_rules, write_back
+            from modules.composition_signals import gather, signal_names
+
+            _rules_path = composition_rules_path()
+            _needed = signal_names(_rules_path)
+            _was = set(composed_event_names or [])
+            (object_detections, object_bboxes_cache,
+             composed_event_names, _hits) = apply_rules(
+                object_detections, object_bboxes_cache,
+                rules_path=_rules_path,
+                previous_names=composed_event_names,
+                # Only the signals the rules name. The expression reading is
+                # whatever a previous run left in the scan cache: this block sits
+                # before the expression scan, and moving it after would put the
+                # engine downstream of a model load for the benefit of rule sets
+                # that mostly do not use it. A rule combining the two is applied
+                # by the "Re-apply to Cache" button, which is where a rule is
+                # iterated on anyway and where both halves are already on disk.
+                signals=(gather(processed_video_path,
+                                cache_dir=gui_config.get("cache_dir", "./cache"),
+                                needed=_needed, log_fn=log)
+                         if _needed else None),
+                log_fn=log)
+            # Only on a cached pass, and only when the rule set actually moved.
+            # A fresh pass writes the whole cache further down; rewriting it
+            # here as well would be the same file twice. The timeline reads the
+            # cache directly, so without this it keeps showing the old layer
+            # list while the report names the new events.
+            if using_cache and _was != set(composed_event_names or []):
+                write_back(processed_video_path, cached_data,
+                           object_detections, object_bboxes_cache,
+                           composed_event_names,
+                           cache_dir=gui_config.get("cache_dir", "./cache"),
+                           params=analysis_params, log_fn=log)
+        except Exception as _ce:
+            log(f"⚠️ Composition engine skipped: {_ce}")
 
         print("Detections per second:", len(object_detections))
 
@@ -1436,6 +1671,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     keyword_matches=keyword_matches,
                     action_bboxes=action_bboxes_cache,
                     object_bboxes=object_bboxes_cache,
+                    composed_event_names=composed_event_names,
+                    loudness_bursts=loudness_bursts,
+                    loudness_levels=loudness_levels,
                 )
                 
                 # Add analysis parameters for future validation
@@ -1495,10 +1733,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         motion_event_score = np.zeros_like(score)
         motion_peak_score = np.zeros_like(score)
         audio_score = np.zeros_like(score)
+        loudness_burst_score = np.zeros_like(score)
         keyword_score = np.zeros_like(score)
         beginning_score = np.zeros_like(score)
         ending_score = np.zeros_like(score)
         object_score = np.zeros_like(score)
+        face_score = np.zeros_like(score)
         action_score = np.zeros(int(video_duration) + 1)
 
         # Scoring configuration: prefer gui overrides, else config.yaml, else defaults
@@ -1509,9 +1749,17 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         KEYWORD_POINTS = gui_config.get("keyword_points", config.get("keyword_points", 2))
         BEGINNING_POINTS = gui_config.get("beginning_points", config.get("beginning_points", 0))
         ENDING_POINTS = gui_config.get("ending_points", config.get("ending_points", 0))
+        BEGINNING_SECONDS = gui_config.get("beginning_seconds", config.get("beginning_seconds", 60))
+        ENDING_SECONDS = gui_config.get("ending_seconds", config.get("ending_seconds", 120))
         MULTI_SIGNAL_BOOST = gui_config.get("multi_signal_boost", config.get("multi_signal_boost", 1.2))
         MIN_SIGNALS_FOR_BOOST = gui_config.get("min_signals_for_boost", config.get("min_signals_for_boost", 2))
         OBJECT_POINTS = gui_config.get("object_points", config.get("object_points", 10))
+        # Expressions score only when the user names which ones matter:
+        # rewarding all five would reward every second a face is visible.
+        FACE_POINTS = gui_config.get("face_expression_points",
+                                     config.get("face_expression_points", 0))
+        FACE_LABELS = gui_config.get("face_expression_labels",
+                                     config.get("face_expression_labels", [])) or []
         ACTION_POINTS = gui_config.get("action_points", config.get("action_points", 10))
         keyword_set = set()
         if keyword_matches:
@@ -1551,7 +1799,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # Check if total possible score is zero (highlight will be empty in MAX mode)
         total_possible = (SCENE_POINTS + MOTION_PEAK_POINTS + MOTION_EVENT_POINTS +
-                        AUDIO_PEAK_POINTS + KEYWORD_POINTS + BEGINNING_POINTS +
+                        AUDIO_PEAK_POINTS + LOUDNESS_BURST_POINTS +
+                        KEYWORD_POINTS + BEGINNING_POINTS +
                         ENDING_POINTS + OBJECT_POINTS + ACTION_POINTS)
         if total_possible == 0:
             log("⚠️ WARNING: All scoring signals are set to 0. No moments will be scored and "
@@ -1577,6 +1826,15 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             idx = int(round(t))
             if 0 <= idx < len(score):
                 audio_score[idx] += AUDIO_PEAK_POINTS
+
+        # Every second an event spans, not just its peak: a loudness burst is a
+        # moment with a duration, and scoring only the peak second would make the
+        # clip-builder cut around a single instant of a two-second event.
+        from modules.loudness_bursts import event_seconds as _burst_seconds
+        loudness_burst_set = _burst_seconds(loudness_bursts)
+        for sec in loudness_burst_set:
+            if 0 <= sec < len(score):
+                loudness_burst_score[sec] += LOUDNESS_BURST_POINTS
 
         for sec in keyword_set:
             if 0 <= sec < len(keyword_score):
@@ -1645,14 +1903,60 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         log(f"✅ Object detection summary: {total_detections} detections")
 
         # Beginning & ending boost
-        for i in range(min(int(video_duration), 60)):
+        for i in range(min(int(video_duration), BEGINNING_SECONDS)):
             beginning_score[i] += BEGINNING_POINTS
-        for i in range(max(0, int(video_duration) - 120), int(video_duration)):
+        for i in range(max(0, int(video_duration) - ENDING_SECONDS), int(video_duration)):
             ending_score[i] += ENDING_POINTS
+
+        # ── Facial expressions ──
+        # Scanned only when it can change the outcome: the sweep costs real time
+        # per video, and with no weight or no labels selected every second it
+        # produced would be multiplied by zero.
+        face_seconds = {}
+        if FACE_POINTS and FACE_LABELS:
+            try:
+                from modules.face_scan import best_by_second, scan_video
+                from modules.face_emotions import to_signal as face_to_signal
+
+                face_seconds = scan_video(
+                    processed_video_path,
+                    cache_dir=gui_config.get("cache_dir", "./cache"),
+                    cancel_fn=(lambda: bool(cancel_flag and cancel_flag.is_set())),
+                    log_fn=log,
+                )
+                if face_seconds:
+                    face_score = face_to_signal(
+                        best_by_second(face_seconds), video_duration,
+                        labels=FACE_LABELS, points=FACE_POINTS)
+                    log(f"😐 Expressions: {int((face_score > 0).sum())} second(s) "
+                        f"matched {', '.join(FACE_LABELS)}")
+            except Exception as _fe:
+                log(f"⚠️ Expression scan skipped: {_fe}")
+
+        # Report-only fallback. The scan above runs solely when expressions are
+        # being *scored*, which is right for the cut — but it also meant that
+        # turning the weight off silently removed a whole section of the report
+        # for a video whose scan was already sitting in the cache. Loading it
+        # costs no model and no decode, and it cannot affect the cut: this runs
+        # after `face_score` is final, so the arithmetic is untouched either way.
+        if not face_seconds:
+            try:
+                from modules.face_scan import cache_path_for
+                from modules.face_scan import load as load_face_scan
+                _cached = load_face_scan(cache_path_for(
+                    processed_video_path, gui_config.get("cache_dir", "./cache")))
+                if _cached:
+                    face_seconds = _cached
+                    print(f"ℹ Expression scan reused for the report only "
+                          f"({len(_cached)} second(s)); it scored no points.")
+            except Exception as _fe:
+                print(f"⚠️ Cached expression scan not loaded: {_fe}")
 
         # Sum signals
         score = (scene_score + motion_event_score + motion_peak_score + audio_score +
-                 keyword_score + beginning_score + ending_score + object_score + action_score)
+                 loudness_burst_score +
+                 keyword_score + beginning_score + ending_score + object_score +
+                 action_score + face_score)
 
         # Multi-signal boost
         motion_set = set(int(t) for t in motion_events)
@@ -1666,6 +1970,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 i in motion_set,
                 i in motion_peaks_set,
                 i in audio_set,
+                i in loudness_burst_set,
                 i in keyword_set,
                 i in object_set,
                 i in action_set
@@ -1778,57 +2083,18 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             )
             
         else:
-            # ========== FIXED-WINDOW MODE (original logic) ==========
-            # Only use scored seconds depending on mode
-            if duration_mode == "EXACT":
-                candidate_indices = np.arange(len(score))
-            else:
-                candidate_indices = np.where(score > 0)[0]
-
-            candidate_scores = score[candidate_indices]
-
-            candidate_confidences = np.zeros(len(candidate_indices))
-            for idx, sec in enumerate(candidate_indices):
-                if sec in detections_by_sec:
-                    candidate_confidences[idx] = max(conf for _, conf in detections_by_sec[sec])
-
-            sorted_indices = np.lexsort((-candidate_confidences, -candidate_scores))
-            top_indices_all = candidate_indices[sorted_indices]
-
-            segments = []
-            used_seconds = set()
-
-            for sec in top_indices_all:
-                if sec in used_seconds:
-                    continue
-
-                start = max(0, sec - CLIP_TIME // 2)
-                end = min(video_duration, start + CLIP_TIME)
-
-                if end - start < CLIP_TIME and end < video_duration:
-                    end = min(video_duration, start + CLIP_TIME)
-                if end - start < CLIP_TIME and start > 0:
-                    start = max(0, end - CLIP_TIME)
-
-                if any(s in used_seconds for s in range(int(start), int(end))):
-                    continue
-
-                current_duration = sum(e - s for s, e in segments)
-                remaining = target_duration - current_duration
-                if remaining <= 0:
-                    break
-                if end - start > remaining:
-                    end = start + remaining
-
-                segments.append((start, end))
-                for s in range(int(start), int(end)):
-                    used_seconds.add(s)
-
-                current_duration = sum(e - s for s, e in segments)
-                if duration_mode == "EXACT" and current_duration >= EXACT_DURATION:
-                    break
-                elif duration_mode == "MAX" and current_duration >= MAX_DURATION:
-                    break
+            # ========== FIXED-WINDOW MODE ==========
+            segments = select_fixed_window_segments(
+                score,
+                video_duration=video_duration,
+                clip_time=CLIP_TIME,
+                target_duration=target_duration,
+                duration_mode=duration_mode,
+                confidence_by_sec=peak_confidence_by_sec(detections_by_sec),
+                coverage=COVERAGE,
+            )
+            if COVERAGE > 0:
+                log(f"🎞️ Coverage {COVERAGE:.0%} → spreading clips across the video")
 
         # Sort segments by start time (both modes)
         segments.sort(key=lambda x: x[0])
@@ -1870,6 +2136,179 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         print(f"Total segments: {len(segments)}")
         total_final_duration = sum(e - s for s, e in segments)
         print(f"Total highlight duration: {total_final_duration:.1f}s")
+
+        # ========== WHY-THESE-MOMENTS REPORT ==========
+        # The justification for every kept segment already exists at this point
+        # (the per-signal score arrays, the detections, the action percentiles);
+        # until now it was only printed to the debug log and discarded. Written
+        # here, where `segments` is final but before rendering, so the report
+        # describes the cut that is actually produced.
+        if segments and gui_config.get("write_highlight_report", True):
+            try:
+                from modules.highlight_report import build_report, write_report
+
+                def _thumb(sec, _path=processed_video_path):
+                    """One JPEG per segment peak. Opened per call rather than
+                    holding a capture across the loop: this runs once per
+                    segment, and a stray open handle on the source video is a
+                    worse trade than reopening a few times."""
+                    cap = cv2.VideoCapture(_path)
+                    try:
+                        if not cap.isOpened():
+                            return None
+                        cap.set(cv2.CAP_PROP_POS_MSEC, float(sec) * 1000.0)
+                        ok, frame = cap.read()
+                        if not ok or frame is None:
+                            return None
+                        h, w = frame.shape[:2]
+                        if w > 480:                     # keep the data URI small
+                            frame = cv2.resize(frame, (480, max(1, int(h * 480 / w))))
+                        ok, buf = cv2.imencode(".jpg", frame,
+                                               [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                        return buf.tobytes() if ok else None
+                    finally:
+                        cap.release()
+
+                # The video's own structure, so every clip can be filed under
+                # the stretch it came from and each stretch compared with the
+                # whole. Built from `scenes`, which is already in hand, plus the
+                # CLIP index *only if a previous run cached one* - see
+                # `cached_index_arrays`. Never encodes frames here, so this
+                # cannot slow a run down.
+                chapters = []
+                try:
+                    from modules.chapters import chapters_for_video
+                    chapters = chapters_for_video(video_path, scenes,
+                                                  video_duration, log_fn=print)
+                except Exception as _ce:
+                    print(f"⚠️ Chapters skipped: {_ce}")
+
+                report = build_report(
+                    video_path=video_path,
+                    video_duration=video_duration,
+                    score=score,
+                    # Per-second dBFS. The report derives both the per-clip peak
+                    # and the whole-video per-class comparison from it, the same
+                    # way it derives the chapter comparison from `chapters`.
+                    loudness_levels=loudness_levels,
+                    # Timestamps, so each clip can name the peak it was scored
+                    # on and offer to play it.
+                    motion_peaks=[float(t) for t in motion_peaks],
+                    # Where the shot changes, so every other mark can be checked
+                    # against the edit. A reading that turns on a cut is a
+                    # different shot of a face, not a face that changed, and
+                    # without these the report cannot tell the two apart.
+                    scene_cuts=[float(s) for s, _e in (scenes or [])],
+                    # What was said, when the transcript ran. Description only —
+                    # the keyword signal above is the only thing speech scores
+                    # with, so a run with the transcript enabled picks the same
+                    # clips and the two reports can be compared side by side.
+                    transcript=transcript_segments,
+                    signals={
+                        "scene": scene_score,
+                        "motion_event": motion_event_score,
+                        "motion_peak": motion_peak_score,
+                        "audio": audio_score,
+                        "loudness_burst": loudness_burst_score,
+                        "keyword": keyword_score,
+                        "object": object_score,
+                        "action": action_score,
+                        "face": face_score,
+                        "beginning": beginning_score,
+                        "ending": ending_score,
+                    },
+                    segments=segments,
+                    object_detections=object_detections,
+                    actions_by_sec=detections_by_sec,
+                    action_percentiles=action_type_percentiles,
+                    settings={
+                        "clip_time": CLIP_TIME,
+                        "duration_mode": duration_mode,
+                        "scene_points": SCENE_POINTS,
+                        "motion_event_points": MOTION_EVENT_POINTS,
+                        "motion_peak_points": MOTION_PEAK_POINTS,
+                        "audio_peak_points": AUDIO_PEAK_POINTS,
+                        "loudness_burst_points": LOUDNESS_BURST_POINTS,
+                        "keyword_points": KEYWORD_POINTS,
+                        "object_points": OBJECT_POINTS,
+                        "action_points": ACTION_POINTS,
+                        # Both, not just the weight: the advisor's rule for
+                        # "weighted but no class chosen" needs to tell an empty
+                        # selection from an absent setting, and without these
+                        # two keys it could never fire at all.
+                        "face_expression_points": FACE_POINTS,
+                        "face_expression_labels": list(FACE_LABELS),
+                        "multi_signal_boost": MULTI_SIGNAL_BOOST,
+                        "min_signals_for_boost": MIN_SIGNALS_FOR_BOOST,
+                        "coverage": COVERAGE,
+                        # The advisor compares this against what was produced:
+                        # in MAX mode a short cut means few seconds scored.
+                        "target_duration": target_duration,
+                        # What the expression scan actually saw. One class
+                        # swallowing the video is the advisor's cue that the
+                        # classifier cannot read this footage at all.
+                        "face_expression_counts": (
+                            _face_label_counts(face_seconds) if face_seconds else {}),
+                        # How much each detector actually found, regardless of
+                        # what it was worth. Scenes, motion and audio peaks are
+                        # detected whatever their weight, so without this the
+                        # report cannot tell "never fires" from "fires four
+                        # hundred times and is switched off" — and can only give
+                        # generic advice about which signal to try next.
+                        "detector_activity": {
+                            "scene": len(scenes or []),
+                            "motion_event": len(motion_events or []),
+                            "motion_peak": len(motion_peaks or []),
+                            "audio": len(audio_peaks or []),
+                            "keyword": len(keyword_matches or []),
+                            "object": len(object_detections or {}),
+                            "action": len(detections_by_sec or {}),
+                            "face": len(face_seconds or {}),
+                        },
+                    },
+                    boost_multiplier=MULTI_SIGNAL_BOOST,
+                    min_signals_for_boost=MIN_SIGNALS_FOR_BOOST,
+                    thumbnail_fn=_thumb,
+                    # So the page can tell a composed event apart from the raw
+                    # detections it was composed from — they arrive in one list.
+                    composed_event_names=composed_event_names,
+                    # Already extracted for the timeline viewer; reporting it
+                    # costs nothing and gives every clip its acoustic context,
+                    # even when audio scored no points.
+                    waveform=waveform_data,
+                    # Already normalised to 0..1, so the page draws them over the
+                    # thumbnail in CSS — no second encode, no bigger images.
+                    bbox_cache=object_bboxes_cache,
+                    # The per-second expression scan, not just its totals: with
+                    # the boxes above it is what lets a clip be compared with the
+                    # rest of the video on what was on screen rather than on what
+                    # it scored.
+                    expressions=face_seconds,
+                    chapters=chapters,
+                )
+
+                # Diagnose the run before writing it out, so the page and the
+                # JSON carry the same findings and neither can drift.
+                try:
+                    from modules.highlight_advice import attach_advice
+                    attach_advice(report)
+                    if report.get("advice"):
+                        log(f"💡 {len(report['advice'])} suggestion(s) in the "
+                            "highlight report")
+                except Exception as _ae:
+                    print(f"⚠️ Advisor skipped: {_ae}")
+
+                base = os.path.splitext(OUTPUT_FILE)[0] if OUTPUT_FILE else \
+                    os.path.splitext(video_path)[0]
+                html_path = f"{base}_why.html"
+                write_report(report, html_path, json_path=f"{base}_why.json")
+                log(f"📄 Why-these-moments report: {os.path.basename(html_path)}")
+                # The same breakdown into the debug log, from the same dict, so
+                # the two can never disagree about what happened.
+                from modules.highlight_report import render_text
+                print("\n" + render_text(report))
+            except Exception as _re:
+                log(f"⚠️ Highlight report skipped: {_re}")
 
         # ========== SAVE HIGHLIGHT SEGMENTS TO CACHE ==========
         if segments and use_cache and not (cancel_flag and cancel_flag.is_set()):
@@ -2128,6 +2567,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 motion_event_score[idx] > 0,
                 motion_peak_score[idx] > 0,
                 audio_score[idx] > 0,
+                loudness_burst_score[idx] > 0,
                 keyword_score[idx] > 0,
                 object_score[idx] > 0,
                 idx in detections_by_sec
@@ -2142,15 +2582,27 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         check_cancellation(cancel_flag, log, "segment selection")
 
+        # Report-only: everything above is analysis and scoring, all of it cheap
+        # on a cached pass. Encoding is the expensive half, and re-encoding a
+        # highlight nobody asked for is the reason tuning weights feels costly
+        # when it is not. Stop here so the settings can be tried freely.
+        if gui_config.get("report_only"):
+            log(f"📄 Report only — {len(segments)} segment(s) scored, "
+                "no video written.")
+            progress.update_progress(100, 100, "Pipeline", "Report ready")
+            return segments
+
         # Cut and concatenate
         progress.update_progress(90, 100, "Pipeline", "Creating highlight video...")
-        log("🔹 Step 7: Cutting video segments...")
+        _render_mode_label = {"cpu": "CPU re-encode (libx265/264)",
+                              "gpu": "GPU re-encode"}[RENDER_MODE]
+        log(f"🔹 Step 7: Cutting video segments... [{_render_mode_label}]")
         try:
             if len(segments) == 0:
                 log("⚠️ No segments selected — nothing to cut.")
             elif len(segments) == 1:
                 check_cancellation(cancel_flag, log, "video cutting")
-                cut_video(processed_video_path, segments[0][0], segments[0][1], OUTPUT_FILE)
+                cut_video(processed_video_path, segments[0][0], segments[0][1], OUTPUT_FILE, mode=RENDER_MODE)
             else:
                 temp_clips = []
                 # Get the directory of the output file to save temp clips in the same location
@@ -2167,7 +2619,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # Include the directory path for temp files
                     temp_name = os.path.join(output_dir, f"{video_base_name}_temp_clip_{i}.mp4")
                     log(f"  Creating temp clip: {temp_name}")
-                    cut_video(processed_video_path, s, e, temp_name)
+                    cut_video(processed_video_path, s, e, temp_name, mode=RENDER_MODE)
                     
                     # Verify the file was created
                     if not os.path.exists(temp_name):
@@ -2256,15 +2708,31 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             try:
                 base_name = os.path.splitext(OUTPUT_FILE)[0]
 
+                # Translating a full transcript is hundreds of LLM batches — the
+                # last thing a run does and, on a long video, a long wait after
+                # the bar has already reached 95%. Give it the tail end.
+                def sub_progress(current, total, task="", details=""):
+                    frac = (current / total) if total else 0.0
+                    progress.update_progress(int(95 + max(0.0, min(1.0, frac)) * 4),
+                                             100, "Subtitles", details)
+
                 # Always create full subtitles
                 progress.update_progress(95, 100, "Pipeline", "Creating full-video subtitles...")
                 log("Creating subtitles for the full video...")
                 full_srt = f"{os.path.splitext(video_path)[0]}_{TARGET_LANG}.srt"
                 if TARGET_LANG and TARGET_LANG != SOURCE_LANG:
-                    translated = translate_segments(transcript_segments, target_lang=TARGET_LANG)
+                    # Say which language it is translating out of: the default
+                    # here was "en" regardless of what was actually spoken.
+                    translated = translate_segments(transcript_segments,
+                                                    source_lang=SOURCE_LANG,
+                                                    target_lang=TARGET_LANG,
+                                                    progress_fn=sub_progress)
                     create_srt_file(translated, full_srt)
                 else:
-                    full_srt = f"{os.path.splitext(video_path)[0]}_{SOURCE_LANG}.srt"
+                    # "auto" is a request to Whisper, not a language to name a
+                    # file after; untranslated, it is just the subtitles.
+                    suffix = "" if SOURCE_LANG == "auto" else f"_{SOURCE_LANG}"
+                    full_srt = f"{os.path.splitext(video_path)[0]}{suffix}.srt"
                     create_srt_file(transcript_segments, full_srt)
                 log(f"Full-video subtitles created: {full_srt}")
 
@@ -2279,7 +2747,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             highlight_segments=segments,
                             output_path=highlight_srt_file,
                             source_lang=SOURCE_LANG,
-                            target_lang=TARGET_LANG
+                            target_lang=TARGET_LANG,
+                            progress_fn=sub_progress
                         )
                     else:
                         highlight_srt_file = f"{base_name}_{SOURCE_LANG}.srt"
@@ -2344,7 +2813,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         motion_peaks=motion_peaks,
                         audio_peaks=audio_peaks,
                         source_lang=SOURCE_LANG,
-                        waveform_data=waveform_data
+                        waveform_data=waveform_data,
+                        loudness_bursts=loudness_bursts,
+                        loudness_levels=loudness_levels
                     )
 
                 # Hand the edit timeline EXACTLY what we cut (post-subtract,

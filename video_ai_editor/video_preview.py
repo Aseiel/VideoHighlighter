@@ -19,6 +19,7 @@ from PySide6.QtCore import Qt, QUrl, Signal, Slot, QTimer, QRect, QEvent
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPixmap, QImage
+from modules.audio_device import follow_system_default
 
 class AnalysisOverlayWidget(QWidget):
     """Floating transparent overlay that draws labels on top of video.
@@ -321,7 +322,7 @@ class VideoPreviewWindow(QMainWindow):
     def init_video_player(self):
         """Initialize the media player"""
         self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
+        self.audio_output = follow_system_default(QAudioOutput())
         self.player.setAudioOutput(self.audio_output)
         self.player.setVideoOutput(self.video_widget)
         
@@ -604,45 +605,34 @@ class VideoPreviewWindow(QMainWindow):
         """Apply dark theme styling"""
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #1a1a2a;
+                background-color: #141414;
             }
             QVideoWidget {
                 background-color: black;
-                border: 2px solid #3a3a5a;
+                border: 2px solid #3a3a3a;
             }
             QPushButton {
-                background-color: #2a2a44;
+                background-color: #2a2a2a;
                 color: white;
-                border: 1px solid #4a4a6a;
+                border: 1px solid #4a4a4a;
                 padding: 6px;
                 border-radius: 4px;
                 min-width: 40px;
             }
             QPushButton:hover {
-                background-color: #3a3a5c;
+                background-color: #3a3a3a;
             }
             QCheckBox {
-                color: #e0e8ff;
+                color: #e4e4e4;
                 padding: 4px;
             }
-            QSlider::groove:horizontal {
-                height: 8px;
-                background: #3a3a5a;
-                border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: #3a5fcd;
-                width: 18px;
-                margin: -5px 0;
-                border-radius: 9px;
-            }
             QLabel {
-                color: #d0d8ff;
+                color: #d4d4d4;
             }
             QComboBox {
-                background-color: #2a2a44;
+                background-color: #2a2a2a;
                 color: white;
-                border: 1px solid #4a4a6a;
+                border: 1px solid #4a4a4a;
                 padding: 4px;
                 border-radius: 4px;
             }

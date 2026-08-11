@@ -359,9 +359,12 @@ def translate_with_llm(text, source_lang="en", target_lang="pl", model="llama3",
     return None
 
 def translate_batch_with_llm(texts, source_lang="en", target_lang="pl",
-                             model="llama3", batch_size=10, genders=None):
+                             model="llama3", batch_size=10, genders=None,
+                             progress_fn=None):
     """Translate multiple texts in batches for efficiency.
     genders: optional list of gender strings matching texts list.
+    progress_fn: optional (current, total, task, details) callback — one call
+    per batch, so a GUI can follow a translation that runs for minutes.
     """
     import subprocess
 
@@ -373,6 +376,9 @@ def translate_batch_with_llm(texts, source_lang="en", target_lang="pl",
         batch_num = i // batch_size + 1
         total_batches = (total + batch_size - 1) // batch_size
         print(f"  🦙 Batch {batch_num}/{total_batches} ({len(batch)} segments)...")
+        if progress_fn:
+            progress_fn(i, total, "Translation",
+                        f"Batch {batch_num}/{total_batches}")
 
         # Build numbered lines with gender hints per segment
         numbered_lines = []
@@ -436,6 +442,8 @@ def translate_batch_with_llm(texts, source_lang="en", target_lang="pl",
                 print(f"  ⚠️ LLM failed for segment {i+j+1}, keeping original")
                 results.append(text)
 
+    if progress_fn:
+        progress_fn(total, total, "Translation", f"{total} segments")
     return results
 
 def safe_translate(translator, text, src, dest, retries=3, delay=1.0):
@@ -455,11 +463,16 @@ def safe_translate(translator, text, src, dest, retries=3, delay=1.0):
             else:
                 return text  # fallback
 
-def translate_segments(segments, source_lang="en", target_lang="pl"):
+def translate_segments(segments, source_lang="en", target_lang="pl",
+                       progress_fn=None):
     """
     Translate subtitle segments.
     Strategy: try local LLM (llama via ollama) first for better quality,
     fall back to googletrans if LLM is unavailable.
+
+    progress_fn: optional (current, total, task, details) callback. Translation
+    is a second long pass after transcription — an hour of speech is hundreds of
+    LLM batches — so a caller with a progress bar should pass one.
     """
     if not segments:
         print("No segments to translate")
@@ -483,7 +496,8 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
         texts = [seg["text"] for seg in segments]
         genders = [seg.get("gender") for seg in segments]
         translated_texts = translate_batch_with_llm(
-            texts, source_lang, target_lang, genders=genders
+            texts, source_lang, target_lang, genders=genders,
+            progress_fn=progress_fn
         )
 
         if len(translated_texts) == len(segments):
@@ -527,6 +541,9 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
                 new_seg[key] = seg[key]
         translated_segments.append(new_seg)
         print(f"  Translated {i+1}/{len(segments)}", end='\r')
+        if progress_fn:
+            progress_fn(i + 1, len(segments), "Translation",
+                        f"{i+1}/{len(segments)} segments")
 
     print(f"\n✅ Translated {len(translated_segments)} segments via googletrans")
     return translated_segments
@@ -536,11 +553,12 @@ def translate_segments(segments, source_lang="en", target_lang="pl"):
 # --------------------------
 
 def create_srt_file(segments, output_path, source_lang="en", target_lang=None,
-                    show_speakers=False):
+                    show_speakers=False, progress_fn=None):
     """Create SRT subtitle file from transcript segments with optional translation"""
     if target_lang and target_lang != source_lang:
         print(f"Translating subtitles from {source_lang} to {target_lang}...")
-        segments = translate_segments(segments, source_lang, target_lang)
+        segments = translate_segments(segments, source_lang, target_lang,
+                                      progress_fn=progress_fn)
 
     srt_content = create_srt_content(segments, show_speakers=show_speakers)
 
@@ -549,8 +567,9 @@ def create_srt_file(segments, output_path, source_lang="en", target_lang=None,
 
     print(f"SRT file saved: {output_path}")    
 
-def create_highlight_subtitles(original_segments: List[Dict], highlight_segments: List[tuple], 
-                               output_path: str, source_lang="en", target_lang=None):
+def create_highlight_subtitles(original_segments: List[Dict], highlight_segments: List[tuple],
+                               output_path: str, source_lang="en", target_lang=None,
+                               progress_fn=None):
     """Create SRT subtitles for highlight video from original transcript segments"""
     highlight_subtitle_segments = []
     current_time_offset = 0.0
@@ -568,7 +587,9 @@ def create_highlight_subtitles(original_segments: List[Dict], highlight_segments
         highlight_subtitle_segments.extend(overlapping_segments)
         current_time_offset += (h_end - h_start)
     if target_lang:
-        highlight_subtitle_segments = translate_segments(highlight_subtitle_segments, source_lang, target_lang)
+        highlight_subtitle_segments = translate_segments(
+            highlight_subtitle_segments, source_lang, target_lang,
+            progress_fn=progress_fn)
     if highlight_subtitle_segments:
         srt_content = create_srt_content(highlight_subtitle_segments)
         with open(output_path, "w", encoding="utf-8-sig") as f:

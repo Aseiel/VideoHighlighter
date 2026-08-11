@@ -8,6 +8,7 @@ Complete Signal Timeline Viewer with Filters and Edit Timeline
 
 import sys
 import os
+import bisect
 import threading
 from pathlib import Path
 import json
@@ -16,7 +17,7 @@ from collections import defaultdict
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QGraphicsView, QGraphicsScene, 
     QVBoxLayout, QHBoxLayout, QWidget, QPushButton, QLabel,
-    QCheckBox, QGroupBox, QSplitter, QScrollArea,
+    QCheckBox, QSplitter, QScrollArea,
     QFrame, QLineEdit, QSlider, QGraphicsRectItem, QGraphicsTextItem,
     QMessageBox, QDockWidget, QMenu, QGraphicsLineItem,
     QComboBox, QListWidget, QListWidgetItem, QDialog,
@@ -26,7 +27,7 @@ from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QM
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QPainter, QFont, QPainterPath,
     QLinearGradient, QRadialGradient, QCursor, QAction,
-    QPainterPath, QFontMetrics, QDrag, QPixmap
+    QPainterPath, QFontMetrics, QDrag, QPixmap, QIntValidator
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -39,6 +40,15 @@ from datetime import datetime, timedelta
 
 
 # modules
+from modules.ui.collapsible import CollapsibleSection
+from modules.ui.theme import DARK as THEME
+from modules.ui import icons as ui_icons
+# Building this window blocks the GUI thread for several seconds, so it reports
+# what it is on. The calls are no-ops unless someone opened a splash first
+# (modules/startup_splash.py), which keeps the window's own code free of any
+# knowledge of who, if anyone, is watching.
+from modules import startup_splash
+from modules.audio_device import follow_system_default
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
 from video_ai_editor.timeline_export import TimelineExporter
@@ -56,11 +66,17 @@ class SignalLabelPanel(QWidget):
 
     Each row shows  ◀ LABEL ▶  — clicking the arrows seeks to the
     previous / next event of that track type.
+
+    The counter beside them ("3/17") is editable: click it, type a number, press
+    Enter, and the playhead goes to that event. Stepping is fine for the next
+    one and useless for the ninetieth, which on a track with hundreds of entries
+    is most of them.
     """
     seek_requested = Signal(float)
 
     # Tracks that support prev/next navigation and how to pull timestamps
     _NAVIGABLE = {
+        "AUDIO WAVEFORM": lambda scene: scene._nav_timestamps_waveform_peaks(),
         "ACTIONS":        lambda scene: scene._nav_timestamps_actions(),
         "OBJECTS":        lambda scene: scene._nav_timestamps_objects(),
         "SCENES":         lambda scene: scene._nav_timestamps_scenes(),
@@ -70,48 +86,135 @@ class SignalLabelPanel(QWidget):
         "HIGHLIGHTS":     lambda scene: scene._nav_timestamps_highlights(),
         "TRANSCRIPT":     lambda scene: scene._nav_timestamps_transcript(),
         "VISUAL SEARCH":  lambda scene: scene._nav_timestamps_visual_search(),
+        "EVENTS":         lambda scene: scene._nav_timestamps_events(),
     }
 
     _ARROW_W = 14   # px reserved for each arrow
     _ROW_H   = 20   # hit-test height per label row
+    # The column sizes itself to its content between these. A fixed width had
+    # to be wide enough for the longest label and was then wasted on every
+    # other row; adding the counters pushed "AUDIO WAVEFORM" into an ellipsis.
+    _MIN_W   = 150
+    # High enough that the measurement, not the clamp, decides on a normal
+    # setup: "AUDIO WAVEFORM" beside a four-digit counter needs about 230px,
+    # and font substitution can make that wider on someone else's machine.
+    _MAX_W   = 280
 
     def __init__(self, signal_view, parent=None):
         super().__init__(parent)
         self.signal_view = signal_view
-        self.setFixedWidth(150)
+        self.setFixedWidth(self._MIN_W)
         self.setMinimumHeight(100)
         self.setCursor(Qt.ArrowCursor)
         self._labels = []        # [(name, scene_y), ...]
         self._hit_rows = []      # [(local_y_top, local_y_bot, name), ...] rebuilt in paintEvent
         self._navigable_active = set()  # nav tracks that currently have events
+        # Sorted event times per navigable track, cached at refresh: paintEvent
+        # runs on every scroll and playhead tick, and re-deriving these from the
+        # scene each time would make scrubbing crawl.
+        self._nav_timestamps = {}
         self._current_time_fn = None   # set by the window after construction
+        # Where each row's counter was drawn, so a click can land on it.
+        self._counter_rects = []       # [(QRect, name), ...] rebuilt in paintEvent
+        self._jump_edit = None         # live QLineEdit while typing a number
+        self._jump_track = None
 
         signal_view.verticalScrollBar().valueChanged.connect(self.update)
+        # A scroll moves the row out from under the editor, which would leave it
+        # floating over an unrelated track and applying to the one it was opened
+        # on. Closing it is the honest response to the row having moved.
+        signal_view.verticalScrollBar().valueChanged.connect(self._close_jump_editor)
 
     def refresh_labels(self):
+        # The rows are about to be rebuilt, so an open editor is anchored to a
+        # layout that no longer exists.
+        self._close_jump_editor()
         scene = self.signal_view.scene()
         if scene and hasattr(scene, 'row_labels'):
             self._labels = list(scene.row_labels)
             # Only treat a track as navigable if it actually has events to jump
             # between — otherwise the ◀ ▶ arrows would do nothing.
             self._navigable_active = set()
+            self._nav_timestamps = {}
             for name, fn in self._NAVIGABLE.items():
                 try:
-                    if fn(scene):
+                    timestamps = fn(scene)
+                    if timestamps:
                         self._navigable_active.add(name)
+                        self._nav_timestamps[name] = sorted(timestamps)
                 except Exception:
                     pass
         else:
             self._labels = []
             self._navigable_active = set()
+            self._nav_timestamps = {}
+        self._fit_width()
         self.update()
+    def _fit_width(self):
+        """Widen the column so the longest row reads in full, within limits.
+
+        Sized against each track's *total*, not its live position: the counter
+        grows to its widest as playback advances, and a column that resized
+        under the cursor while you watched would be worse than one ellipsis.
+        """
+        font_lbl = QFont("Arial", 8, QFont.Weight.Bold)
+        fm_lbl = QFontMetrics(font_lbl)
+        fm_pos = QFontMetrics(QFont("Arial", 7))
+
+        widest = 0
+        for name, _scene_y in self._labels:
+            needed = fm_lbl.horizontalAdvance(name) + 6
+            if name in self._navigable_active:
+                total = len(self._nav_timestamps.get(name, ()))
+                counter = f"{total}/{total}"
+                needed += self._ARROW_W * 2 + fm_pos.horizontalAdvance(counter) + 8
+            widest = max(widest, needed)
+
+        self.setFixedWidth(max(self._MIN_W, min(self._MAX_W, widest)))
+
+    def _position_in_track(self, name):
+        """"3/17" — which event of this track the playhead has reached.
+
+        Stepping through a track with the arrows otherwise gives no sense of
+        where you are in it or how much is left. Counts events at or before the
+        playhead, so 0 means "before the first one" rather than a false 1.
+        """
+        timestamps = self._nav_timestamps.get(name)
+        if not timestamps:
+            return None
+        current = self._current_time_fn() if self._current_time_fn else 0.0
+        reached = bisect.bisect_right(timestamps, current + 0.1)
+        return f"{reached}/{len(timestamps)}"
+
+    @staticmethod
+    def _draw_chevron(p, cx, cy, direction, color):
+        """A thin ‹ / › chevron centred on (cx, cy). Stroked with a round
+        join/cap so it reads as a light navigation affordance, not a heavy
+        triangle glyph."""
+        hw, hh = 3.0, 4.0
+        path = QPainterPath()
+        if direction == "left":
+            path.moveTo(cx + hw, cy - hh)
+            path.lineTo(cx - hw, cy)
+            path.lineTo(cx + hw, cy + hh)
+        else:
+            path.moveTo(cx - hw, cy - hh)
+            path.lineTo(cx + hw, cy)
+            path.lineTo(cx - hw, cy + hh)
+        pen = QPen(color, 1.6)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), QColor(20, 20, 30))
+        p.fillRect(self.rect(), QColor(18, 18, 18))
 
         self._hit_rows = []
+        self._counter_rects = []
 
         if not self._labels:
             p.end()
@@ -119,8 +222,9 @@ class SignalLabelPanel(QWidget):
 
         view = self.signal_view
         font_lbl = QFont("Arial", 8, QFont.Weight.Bold)
-        font_arr = QFont("Arial", 9)
         fm_lbl   = QFontMetrics(font_lbl)
+        font_pos = QFont("Arial", 7)
+        fm_pos   = QFontMetrics(font_pos)
 
         for name, scene_y in self._labels:
             view_pt = view.mapFromScene(0, scene_y)
@@ -133,25 +237,44 @@ class SignalLabelPanel(QWidget):
             self._hit_rows.append((top, bot, name))
 
             if navigable:
-                # ◀  label  ▶
-                p.setFont(font_arr)
-                p.setPen(QColor(100, 180, 255))
-                p.drawText(2, mid_y, "◀")
-                p.drawText(self.width() - self._ARROW_W, mid_y, "▶")
+                # ‹  label  ›  — thin stroked chevrons, not filled triangle
+                # glyphs (those read dated and pulled in whatever Arial shipped).
+                self._draw_chevron(p, 7, local_y, "left", QColor(THEME.accent))
+                self._draw_chevron(p, self.width() - 7, local_y, "right", QColor(THEME.accent))
+
+                # Position within the track, right-aligned against the next
+                # chevron — the label elides to make room, since knowing there
+                # are 17 of these matters more than the last few characters of
+                # a name the row is already sorted under.
+                counter = self._position_in_track(name)
+                counter_w = 0
+                if counter:
+                    p.setFont(font_pos)
+                    p.setPen(QColor(THEME.text_dim))
+                    counter_w = fm_pos.horizontalAdvance(counter) + 4
+                    counter_x = self.width() - self._ARROW_W - counter_w
+                    p.drawText(counter_x, mid_y, counter)
+                    # Recorded so a click can be matched to it. Padded a little
+                    # vertically: the text is 7pt and the drawn glyphs alone are
+                    # a smaller target than anyone can reliably hit.
+                    self._counter_rects.append((
+                        QRect(int(counter_x) - 2, int(top),
+                              int(counter_w) + 4, int(bot - top)),
+                        name))
 
                 p.setFont(font_lbl)
-                p.setPen(QColor(180, 220, 255))
-                avail = self.width() - self._ARROW_W * 2 - 6
+                p.setPen(QColor(THEME.text))
+                avail = self.width() - self._ARROW_W * 2 - 6 - counter_w
                 clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
                 p.drawText(self._ARROW_W + 3, mid_y, clipped)
             else:
                 p.setFont(font_lbl)
-                p.setPen(QColor(140, 160, 190))
+                p.setPen(QColor(165, 165, 165))
                 avail = self.width() - 8
                 clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
                 p.drawText(6, mid_y, clipped)
 
-        p.setPen(QColor(60, 60, 80))
+        p.setPen(QColor(60, 60, 60))
         p.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
         p.end()
 
@@ -160,6 +283,14 @@ class SignalLabelPanel(QWidget):
             return super().mousePressEvent(event)
 
         x, y = event.position().x(), event.position().y()
+
+        # The counter first: it sits inside the row between the two arrows, so
+        # testing arrows first would never let a click reach it.
+        point = QPoint(int(x), int(y))
+        for rect, name in self._counter_rects:
+            if rect.contains(point):
+                self._open_jump_editor(name, rect)
+                return
 
         for top, bot, name in self._hit_rows:
             if top <= y <= bot and name in self._navigable_active:
@@ -188,6 +319,12 @@ class SignalLabelPanel(QWidget):
 
     def mouseMoveEvent(self, event):
         x, y = event.position().x(), event.position().y()
+        point = QPoint(int(x), int(y))
+        if any(rect.contains(point) for rect, _ in self._counter_rects):
+            # An I-beam is the only thing that says "this number is editable";
+            # nothing else in the row distinguishes it from painted-on text.
+            self.setCursor(Qt.IBeamCursor)
+            return super().mouseMoveEvent(event)
         on_arrow = False
         for top, bot, name in self._hit_rows:
             if top <= y <= bot and name in self._navigable_active:
@@ -196,6 +333,79 @@ class SignalLabelPanel(QWidget):
                     break
         self.setCursor(Qt.PointingHandCursor if on_arrow else Qt.ArrowCursor)
         super().mouseMoveEvent(event)
+
+    # ---------------------------------------------------------- jump-to-index
+
+    def _open_jump_editor(self, name, rect):
+        """Inline box over the counter for typing an event number.
+
+        Placed over the counter rather than in a dialog because the number being
+        replaced is the answer to "which one am I on", and a dialog would cover
+        the one piece of context that makes the question answerable.
+        """
+        self._close_jump_editor()
+        total = len(self._nav_timestamps.get(name, ()))
+        if total <= 0:
+            return
+
+        edit = QLineEdit(self)
+        edit.setValidator(QIntValidator(1, total, edit))
+        edit.setPlaceholderText(f"1-{total}")
+        edit.setAlignment(Qt.AlignRight)
+        edit.setStyleSheet(
+            f"QLineEdit {{ background: {THEME.surface}; color: {THEME.text}; "
+            f"border: 1px solid {THEME.accent}; border-radius: 2px; "
+            f"padding: 0px 2px; font-size: 8pt; }}")
+        # Widened past the counter: "3/17" is narrower than the four digits a
+        # user may type into it, and a box that cannot show what was typed is
+        # worse than one that overlaps the label for a moment.
+        width = max(rect.width() + 18, 46)
+        edit.setGeometry(QRect(max(0, rect.right() - width + 2), rect.top() + 1,
+                               width, max(16, rect.height() - 2)))
+        edit.returnPressed.connect(lambda: self._commit_jump(name))
+        edit.editingFinished.connect(self._close_jump_editor)
+        edit.installEventFilter(self)
+        edit.show()
+        edit.setFocus(Qt.MouseFocusReason)
+        self._jump_edit = edit
+        self._jump_track = name
+
+    def eventFilter(self, obj, event):
+        # Escape abandons the edit. Without it the only ways out are Enter,
+        # which seeks, and clicking away, and neither is "I changed my mind".
+        if (obj is self._jump_edit and event.type() == QEvent.KeyPress
+                and event.key() == Qt.Key_Escape):
+            self._close_jump_editor()
+            return True
+        return super().eventFilter(obj, event)
+
+    def _commit_jump(self, name):
+        edit = self._jump_edit
+        if edit is None:
+            return
+        text = edit.text().strip()
+        timestamps = self._nav_timestamps.get(name) or []
+        self._close_jump_editor()
+        if not text or not timestamps:
+            return
+        try:
+            index = int(text)
+        except ValueError:
+            return
+        # The counter reads "how many are at or before the playhead", so its
+        # numbers are 1-based and the Nth event is timestamps[N-1]. Clamped
+        # rather than ignored: a number past the end plainly means "the last
+        # one", and refusing it would only make the user retype it.
+        index = max(1, min(index, len(timestamps)))
+        self.seek_requested.emit(float(timestamps[index - 1]))
+
+    def _close_jump_editor(self):
+        if self._jump_edit is not None:
+            edit, self._jump_edit = self._jump_edit, None
+            self._jump_track = None
+            edit.removeEventFilter(self)
+            edit.hide()
+            edit.deleteLater()
 
     @staticmethod
     def _find_target(timestamps, current, direction):
@@ -215,6 +425,16 @@ class SignalTimelineWindow(QMainWindow):
     waveform_ready = Signal(object)
     render_finished = Signal(bool, str)
     render_progress = Signal(int)
+    # On-demand analysis (Analyze section) — emitted from a worker thread, so
+    # the connected slots run on the GUI thread via Qt's queued connection.
+    analysis_progress = Signal(str, float, str)   # kind, fraction 0..1, message
+    analysis_finished = Signal(str, object)       # kind, result dict | Exception
+    # Detection frames for the live preview window, which the main window owns.
+    # Emitted from the analysis worker thread; the queued connection to that
+    # window's slot is what gets them onto the GUI thread. `preview_enabled`
+    # below is the gate, set by whoever opened this viewer.
+    preview_frame = Signal(object, object, int)   # frame_bgr, boxes, sec
+    preview_enabled = False
 
     def __init__(self, video_path, cache_data=None):
         debug_log(f"SignalTimelineWindow.__init__ CALLED with video_path={video_path}")
@@ -312,10 +532,7 @@ class SignalTimelineWindow(QMainWindow):
         h = min(1000, screen.height() - 20)
         self.resize(w, h)
         self.move(screen.x() + (screen.width() - w) // 2, screen.y())
-        
-        # Make window semi-transparent
-        self.setWindowOpacity(0.98)
-        
+
         # Load waveform from cache - store it in instance variable
         self.waveform = self.load_waveform_from_cache()
         debug_log(f"  - waveform loaded: {self.waveform is not None}, length: {len(self.waveform) if self.waveform else 0}")
@@ -469,7 +686,7 @@ class SignalTimelineWindow(QMainWindow):
         mode_row = QHBoxLayout()
 
         mode_label = QLabel("Overlay:")
-        mode_label.setStyleSheet("color: #a0c0ff; font-weight: bold;")
+        mode_label.setStyleSheet("color: #cccccc; font-weight: bold;")
         mode_row.addWidget(mode_label)
 
         self.overlay_mode_combo = QComboBox()
@@ -486,15 +703,15 @@ class SignalTimelineWindow(QMainWindow):
         )
         self.overlay_mode_combo.setStyleSheet("""
             QComboBox {
-                background-color: #1a1a2a; color: #ddd;
-                border: 1px solid #3a3a5a; border-radius: 4px;
+                background-color: #141414; color: #ddd;
+                border: 1px solid #3a3a3a; border-radius: 4px;
                 padding: 4px 8px; min-width: 160px;
             }
-            QComboBox:hover { border-color: #5a5a8a; }
+            QComboBox:hover { border-color: #5a5a5a; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView {
-                background-color: #1a1a2a; color: #ddd;
-                selection-background-color: #3a5fcd;
+                background-color: #141414; color: #ddd;
+                selection-background-color: #2f81f7;
             }
         """)
         mode_row.addWidget(self.overlay_mode_combo)
@@ -519,7 +736,11 @@ class SignalTimelineWindow(QMainWindow):
         # create/destroy per VR toggle) makes the OSD appear twice. One persistent
         # surface == one swapchain == one OSD, on the video.
         self.video_view = VRVideoView()
-        self.video_view.setMinimumSize(320, 240)
+        # Small floor so the left dock can shrink in a non-maximized window
+        # (it shares the vertical band with the timeline; a tall floor here
+        # pushes the bottom LLM dock off-screen). The splitter still gives it a
+        # comfortable size by default.
+        self.video_view.setMinimumSize(240, 135)
         self.video_view.set_vr_mode(False)   # full-frame until VR is enabled
         self.preview_stack.addWidget(self.video_view)  # index 0
 
@@ -550,9 +771,9 @@ class SignalTimelineWindow(QMainWindow):
         self.detection_panel.setMaximumWidth(280)
         self.detection_panel.setStyleSheet("""
             QLabel {
-                background-color: #0a0a18;
-                color: #d0d8ff;
-                border: 1px solid #3a3a5a;
+                background-color: #0a0a0a;
+                color: #d4d4d4;
+                border: 1px solid #3a3a3a;
                 border-radius: 4px;
                 padding: 8px;
                 font-family: 'Consolas', monospace;
@@ -568,7 +789,7 @@ class SignalTimelineWindow(QMainWindow):
         # Media player (shared — used in Off + Precomp modes)
         # ──────────────────────────────────────────────────────────
         self.video_player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
+        self.audio_output = follow_system_default(QAudioOutput())
         self.video_player.setAudioOutput(self.audio_output)
         self.video_player.setVideoOutput(self.video_view.video_output)
         self.video_view.attach_player(self.video_player)  # crop tracks real resolution
@@ -590,17 +811,24 @@ class SignalTimelineWindow(QMainWindow):
         self.play_btn.clicked.connect(self.toggle_video_playback)
         self.play_btn.setStyleSheet("""
             QPushButton {
-                background-color: #3a5fcd; color: white; font-weight: bold;
-                padding: 8px 16px; border-radius: 4px; min-width: 80px;
+                background-color: #2f81f7; color: white; font-weight: bold;
+                padding: 4px 8px; border-radius: 4px; min-width: 80px;
             }
-            QPushButton:hover { background-color: #4a6fdd; }
+            QPushButton:hover { background-color: #4a90f5; }
         """)
         controls_layout.addWidget(self.play_btn)
 
-        # Time slider
+        # Time slider, in milliseconds rather than 0-100 percent. At 100 steps
+        # one step is 1% of the file — 36 seconds of an hour-long video — so
+        # asking for a spot near where the playhead already was landed on the
+        # value the slider already had, no valueChanged was emitted, and the
+        # seek never happened. The real range is set once the duration is known.
         self.time_slider = QSlider(Qt.Horizontal)
-        self.time_slider.setRange(0, 100)
-        self.time_slider.sliderPressed.connect(lambda: setattr(self, '_block_position_updates', True))
+        self.time_slider.setRange(0, 0)
+        self.time_slider.setSingleStep(1000)     # arrow keys: a second
+        self.time_slider.setPageStep(10000)      # page keys: ten seconds
+        self.time_slider.sliderPressed.connect(self._on_slider_pressed)
+        self.time_slider.sliderReleased.connect(self._on_slider_released)
         self.time_slider.valueChanged.connect(self.seek_video)
         controls_layout.addWidget(self.time_slider)
 
@@ -609,7 +837,7 @@ class SignalTimelineWindow(QMainWindow):
         self.preview_time_label.setStyleSheet("""
             QLabel {
                 color: #a0ffa0; font-family: 'Consolas', monospace;
-                font-weight: bold; padding: 8px; background-color: #1a1a2a;
+                font-weight: bold; padding: 8px; background-color: #141414;
                 border-radius: 4px; min-width: 120px;
                 qproperty-alignment: AlignCenter;
             }
@@ -708,6 +936,10 @@ class SignalTimelineWindow(QMainWindow):
         if self.realtime_preview is not None:
             self.realtime_preview.avoid_person_requested.connect(self._on_avoid_person)
 
+        # The live preview built its own audio output before the volume controls
+        # existed — line them all up with the slider now.
+        self._apply_audio_state()
+
         dock.setWidget(preview_widget)
         return dock
 
@@ -722,6 +954,10 @@ class SignalTimelineWindow(QMainWindow):
 
         # Pause the outgoing player
         self._active_player.pause()
+
+        # The incoming player has its own audio output — make sure it starts on
+        # the volume/mute the user set, not on whatever it was left at.
+        self._apply_audio_state()
 
         if "Live" in text:
             # ── Switch to Live real-time overlay ──
@@ -850,10 +1086,11 @@ class SignalTimelineWindow(QMainWindow):
         if duration <= 0:
             return
 
-        # Update slider
-        percent = (position / duration) * 100
+        # Update slider (same milliseconds the player reports)
         self.time_slider.blockSignals(True)
-        self.time_slider.setValue(int(percent))
+        if self.time_slider.maximum() != duration:
+            self.time_slider.setRange(0, int(duration))
+        self.time_slider.setValue(int(position))
         self.time_slider.blockSignals(False)
 
         # Update time display
@@ -941,7 +1178,7 @@ class SignalTimelineWindow(QMainWindow):
         actions.sort(key=lambda x: x[1], reverse=True)
         
         if actions:
-            lines.append('<b style="color: #80b0ff;">━━ ACTIONS ━━</b>')
+            lines.append('<b style="color: #cccccc;">━━ ACTIONS ━━</b>')
             for name, conf, model in actions[:5]:
                 # Confidence bar using block chars
                 bar_len = int(conf * 12)
@@ -995,14 +1232,31 @@ class SignalTimelineWindow(QMainWindow):
             self._active_player.play()
             self.play_btn.setText("⏸ Pause")
 
-    def seek_video(self, position):
-        """Seek video to specific position (slider value 0-100)."""
+    def _on_slider_pressed(self):
+        """Hold off position updates while the handle is held."""
+        self._block_position_updates = True
+
+    def _on_slider_released(self):
+        """Let go of the handle: seek there, and always lift the hold.
+
+        The hold used to be lifted only inside `seek_video`, which runs on
+        valueChanged — so grabbing the handle and letting go without moving it
+        far enough to change the value left updates blocked *for good*. The
+        slider, the clock and the timeline playhead all froze while the video
+        carried on playing, which read as playback having stopped.
+        """
+        self.seek_video(self.time_slider.value())
+
+    def seek_video(self, position_ms):
+        """Seek the video to a slider position, in milliseconds."""
         duration = self._active_player.duration()
         if duration <= 0:
+            # Nothing to seek within — but never leave the hold behind us.
+            self._block_position_updates = False
             return
 
         self._block_position_updates = True
-        new_position_ms = int((position / 100.0) * duration)
+        new_position_ms = max(0, min(int(position_ms), duration))
         self._active_player.setPosition(new_position_ms)
 
         # Update everything immediately — don't wait for positionChanged,
@@ -1020,26 +1274,45 @@ class SignalTimelineWindow(QMainWindow):
 
         QTimer.singleShot(200, lambda: setattr(self, '_block_position_updates', False))
 
+    def _audio_outputs(self):
+        """Every QAudioOutput the preview can play through.
+
+        The live overlay owns its own player and audio output, so the volume
+        slider and the mute button have to drive both — otherwise they do
+        nothing in Live mode (cache or real-time) and the live player just
+        keeps whatever volume it was constructed with.
+        """
+        outs = [getattr(self, 'audio_output', None)]
+        if getattr(self, 'realtime_preview', None) is not None:
+            outs.append(getattr(self.realtime_preview, 'audio_output', None))
+        return [ao for ao in outs if ao is not None]
+
+    def _apply_audio_state(self):
+        """Push the current slider + mute state onto every audio output."""
+        muted = hasattr(self, 'mute_btn') and self.mute_btn.isChecked()
+        volume = 0.0 if muted else self.volume_slider.value() / 100.0
+        for ao in self._audio_outputs():
+            ao.setVolume(volume)
+
     def set_volume(self, value):
         """Set video volume"""
-        self.audio_output.setVolume(value / 100.0)
+        self._apply_audio_state()
 
     def toggle_mute(self, muted):
         """Toggle audio mute"""
-        if muted:
-            self._pre_mute_volume = self.audio_output.volume()
-            self.audio_output.setVolume(0)
-            self.mute_btn.setText("🔇")
-            self.volume_slider.setEnabled(False)
-        else:
-            self.audio_output.setVolume(getattr(self, '_pre_mute_volume', 0.8))
-            self.mute_btn.setText("🔊")
-            self.volume_slider.setEnabled(True)
+        # The slider keeps its value while muted, so it is the pre-mute volume.
+        self.mute_btn.setText("🔇" if muted else "🔊")
+        self.volume_slider.setEnabled(not muted)
+        self._apply_audio_state()
 
     def update_video_duration(self, duration):
         """Update video duration display"""
         if duration > 0:
-            self.time_slider.setRange(0, 100)
+            # Signals blocked: growing the range moves the handle, and a seek
+            # to wherever it happens to land is not what loading a file means.
+            self.time_slider.blockSignals(True)
+            self.time_slider.setRange(0, int(duration))
+            self.time_slider.blockSignals(False)
             total_seconds = duration // 1000
             mins = total_seconds // 60
             secs = total_seconds % 60
@@ -1200,6 +1473,415 @@ class SignalTimelineWindow(QMainWindow):
             print(f"Scene not ready yet, storing waveform data")
             self._pending_waveform_data = waveform_data
 
+    def refresh_visual_query_checkboxes(self):
+        """One checkbox per searched object, under the Visual Search layer.
+
+        The scene already filters both the bars and the ◀ ▶ navigation by
+        visible_visual_queries (see SignalTimelineScene._nav_timestamps_visual_search),
+        and set_visual_query_filter already drives it — this is the control that
+        was missing, which is why the arrows walked every object at once.
+        """
+        box = getattr(self, '_visual_query_box', None)
+        scene = getattr(self, 'signal_scene', None)
+        if box is None or scene is None:
+            return
+
+        layout = box.layout()
+        while layout.count():                       # drop the previous rows
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.visual_query_checkboxes = {}
+
+        queries = list(getattr(scene, 'visual_queries', []) or [])
+        if queries:
+            layout.addWidget(self._build_visual_query_header())
+
+        for query in queries:
+            count = len(scene.get_visual_findings(query))
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+
+            checkbox = QCheckBox(f"{query} ({count})")
+            checkbox.setChecked(scene.visible_visual_queries.get(query, True))
+            checkbox.setToolTip(f"Show '{query}' bars, and let ◀ ▶ stop on them")
+            # setChecked above runs before this connect, so it can't fire the toggle.
+            checkbox.stateChanged.connect(
+                lambda state, q=query: self._toggle_visual_query(q, state)
+            )
+            row_layout.addWidget(checkbox)
+            row_layout.addStretch()
+
+            remove = self._mini_button("✕", f"Remove all '{query}' findings")
+            remove.clicked.connect(lambda _=False, q=query: self._remove_visual_query(q))
+            row_layout.addWidget(remove)
+
+            layout.addWidget(row)
+            self.visual_query_checkboxes[query] = checkbox
+
+        self._apply_visual_query_fold()
+
+    def refresh_event_checkboxes(self):
+        """One checkbox per composed event, nested under the EVENTS layer.
+
+        The scene already filters bars and ◀ ▶ navigation by visible_events; this
+        is the control for it in the Layers panel, alongside the Advanced
+        dialog's Events tab (both drive the same scene state).
+        """
+        box = getattr(self, '_event_box', None)
+        scene = getattr(self, 'signal_scene', None)
+        if box is None or scene is None:
+            return
+
+        layout = box.layout()
+        while layout.count():                       # drop the previous rows
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.event_checkboxes = {}
+
+        events = list(getattr(scene, 'event_types', []) or [])
+        if events:
+            layout.addWidget(self._build_event_header())
+
+        # Counted from the cache rather than from the drawn bars — a hidden
+        # event still needs its count shown.
+        #
+        # Moments, not seconds. This used to report seconds, which disagreed
+        # with the ◀ ▶ counter beside the row for the same event: 119 against
+        # 15, both describing the same thing. The number a person acts on is how
+        # many places there are to go, so that is the one on the label; the
+        # total length is real but secondary, and lives in the tooltip.
+        times = {}
+        for item in (scene.cache_data.get('objects') or []):
+            for name in (item.get('objects') or []):
+                if isinstance(name, str):
+                    n = name.strip().title()
+                    if n in events:
+                        times.setdefault(n, []).append(
+                            float(item.get('timestamp', 0)))
+
+        gap = getattr(scene, 'EVENT_RUN_GAP', 2.0)
+        for event in events:
+            seconds = len(times.get(event, ()))
+            moments = len(scene._run_starts(times.get(event, ()), gap))
+            checkbox = QCheckBox(
+                f"{event.replace('_', ' ')} ({moments})")
+            checkbox.setChecked(scene.visible_events.get(event, True))
+            checkbox.setToolTip(
+                chr(10).join([
+                    f"{moments} moment(s), {seconds}s in total.",
+                    f"Show the '{event}' row, and let ◀ ▶ stop on it",
+                ]))
+            # setChecked runs before this connect, so it can't fire the toggle.
+            checkbox.stateChanged.connect(
+                lambda state, e=event: self._toggle_event(e, state)
+            )
+            layout.addWidget(checkbox)
+            self.event_checkboxes[event] = checkbox
+
+        self._apply_event_fold()
+
+    def refresh_object_checkboxes(self):
+        """One checkbox per detected class, nested under the OBJECTS layer.
+
+        The same shape the EVENTS group has had since composed events arrived,
+        and the reason for it is the same: these are rows on the timeline, and
+        the Layers panel is where rows get shown and hidden. Until now the only
+        way to hide one class was the Advanced dialog — two clicks and a modal
+        to do what its neighbour does inline, which reads as the objects group
+        being broken rather than as a control living somewhere else.
+
+        Both this and the dialog drive the same scene state, so neither can
+        become the authority and they cannot disagree.
+        """
+        box = getattr(self, '_object_box', None)
+        scene = getattr(self, 'signal_scene', None)
+        if box is None or scene is None:
+            return
+
+        layout = box.layout()
+        while layout.count():                       # drop the previous rows
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.object_checkboxes = {}
+
+        # `object_classes` already excludes composed events — they are their own
+        # group, and listing them twice would make hiding one from here look
+        # like it had done nothing.
+        classes = list(getattr(scene, 'object_classes', []) or [])
+        classes = [c for c in classes if c and c != 'Unknown']
+        if classes:
+            layout.addWidget(self._build_object_header())
+
+        counts = {}
+        for item in (scene.cache_data.get('objects') or []):
+            for name in (item.get('objects') or []):
+                if isinstance(name, str):
+                    n = name.strip().title()
+                    if n in classes:
+                        counts[n] = counts.get(n, 0) + 1
+
+        for name in classes:
+            checkbox = QCheckBox(f"{name.replace('_', ' ')} ({counts.get(name, 0)}s)")
+            checkbox.setChecked(scene.visible_objects.get(name, True))
+            checkbox.setToolTip(f"Show the '{name}' row, and let ◀ ▶ stop on it")
+            # setChecked runs before this connect, so it can't fire the toggle.
+            checkbox.stateChanged.connect(
+                lambda state, o=name: self._toggle_object(o, state)
+            )
+            layout.addWidget(checkbox)
+            self.object_checkboxes[name] = checkbox
+
+        self._apply_object_fold()
+
+    def _build_object_header(self) -> QWidget:
+        """'Show: all / none' quick toggles above the object list."""
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 0, 0, 2)
+        hl.setSpacing(6)
+        label = QLabel("Show:")
+        label.setStyleSheet("color:#888;font-size:8pt;")
+        hl.addWidget(label)
+        all_btn = self._mini_button("all", "Show every object class")
+        all_btn.setFixedSize(24, 16)
+        all_btn.clicked.connect(lambda: self._set_all_object_rows(True))
+        hl.addWidget(all_btn)
+        none_btn = self._mini_button("none", "Hide every object class")
+        none_btn.setFixedSize(30, 16)
+        none_btn.clicked.connect(lambda: self._set_all_object_rows(False))
+        hl.addWidget(none_btn)
+        hl.addStretch()
+        return header
+
+    def _apply_object_fold(self):
+        """Show/hide the object list, keeping the collapsed row honest — the
+        caret carries the count whenever something is hidden, so a folded group
+        never looks the same as a complete one."""
+        box = getattr(self, '_object_box', None)
+        fold = getattr(self, '_object_fold', None)
+        if box is None or fold is None:
+            return
+        boxes = getattr(self, 'object_checkboxes', {})
+        expanded = getattr(self, '_object_rows_expanded', True)
+
+        box.setVisible(bool(boxes) and expanded)
+        fold.setVisible(bool(boxes))
+        shown = sum(1 for cb in boxes.values() if cb.isChecked())
+        total = len(boxes)
+        if expanded:
+            fold.setText("▾")
+            fold.setToolTip("Hide the object list")
+        else:
+            fold.setText("▸" if shown == total else f"▸ {shown}/{total}")
+            fold.setToolTip(f"Show the object list ({shown}/{total} visible)")
+
+    def _toggle_object_fold(self):
+        self._object_rows_expanded = not getattr(self, '_object_rows_expanded', True)
+        self._apply_object_fold()
+
+    def _toggle_object(self, name: str, state):
+        visible = (state == Qt.CheckState.Checked.value)
+        self.signal_scene.set_object_filter(name, visible)
+        self._apply_object_fold()     # the collapsed caret tracks the count
+        pretty = name.replace('_', ' ')
+        self.statusBar().showMessage(
+            f"Showing '{pretty}'" if visible
+            else f"Hiding '{pretty}' — ◀ ▶ now skip it",
+            2000,
+        )
+
+    def _set_all_object_rows(self, visible: bool):
+        """Show or hide every class at once — one rebuild, not one per class."""
+        self.signal_scene.set_all_objects_visible(visible)
+        self.refresh_object_checkboxes()
+        self.statusBar().showMessage(
+            "Showing all objects" if visible
+            else "Hid all objects — ◀ ▶ have nothing to step",
+            2000,
+        )
+
+    def _build_event_header(self) -> QWidget:
+        """'Show: all / none' quick toggles above the event list."""
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 0, 0, 2)
+        hl.setSpacing(6)
+        label = QLabel("Show:")
+        label.setStyleSheet("color:#888;font-size:8pt;")
+        hl.addWidget(label)
+        all_btn = self._mini_button("all", "Show every event")
+        all_btn.setFixedSize(24, 16)
+        all_btn.clicked.connect(lambda: self._set_all_event_rows(True))
+        hl.addWidget(all_btn)
+        none_btn = self._mini_button("none", "Hide every event")
+        none_btn.setFixedSize(30, 16)
+        none_btn.clicked.connect(lambda: self._set_all_event_rows(False))
+        hl.addWidget(none_btn)
+        hl.addStretch()
+        return header
+
+    def _apply_event_fold(self):
+        """Show/hide the event list, keeping the collapsed row honest — a hidden
+        event with the list folded would otherwise look like a broken panel, so
+        the caret carries the count whenever something is hidden."""
+        box = getattr(self, '_event_box', None)
+        fold = getattr(self, '_event_fold', None)
+        if box is None or fold is None:
+            return
+        boxes = getattr(self, 'event_checkboxes', {})
+        expanded = getattr(self, '_event_rows_expanded', True)
+
+        box.setVisible(bool(boxes) and expanded)
+        fold.setVisible(bool(boxes))
+        shown = sum(1 for cb in boxes.values() if cb.isChecked())
+        total = len(boxes)
+        if expanded:
+            fold.setText("▾")
+            fold.setToolTip("Hide the event list")
+        else:
+            fold.setText("▸" if shown == total else f"▸ {shown}/{total}")
+            fold.setToolTip(f"Show the event list ({shown}/{total} visible)")
+
+    def _toggle_event_fold(self):
+        self._event_rows_expanded = not getattr(self, '_event_rows_expanded', True)
+        self._apply_event_fold()
+
+    def _toggle_event(self, event: str, state):
+        visible = (state == Qt.CheckState.Checked.value)
+        self.signal_scene.set_event_filter(event, visible)
+        self._apply_event_fold()      # the collapsed caret tracks the count
+        pretty = event.replace('_', ' ')
+        self.statusBar().showMessage(
+            f"Showing '{pretty}'" if visible
+            else f"Hiding '{pretty}' — ◀ ▶ now skip it",
+            2000,
+        )
+
+    def _set_all_event_rows(self, visible: bool):
+        """Show or hide every event at once — one rebuild, not one per event."""
+        self.signal_scene.set_all_events_visible(visible)
+        self.refresh_event_checkboxes()
+        self.statusBar().showMessage(
+            "Showing all events" if visible
+            else "Hid all events — ◀ ▶ have nothing to step",
+            2000,
+        )
+
+    def _mini_button(self, text: str, tooltip: str) -> QPushButton:
+        """A bare, caret-sized button — the app theme's QPushButton is too heavy
+        for an inline control (see the fold caret)."""
+        btn = QPushButton(text)
+        btn.setStyleSheet(
+            "QPushButton{border:none;background:transparent;color:#888;"
+            "padding:0px;margin:0px;font-size:9pt;}"
+            "QPushButton:hover{color:#fff;}"
+        )
+        btn.setFixedSize(18, 16)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(tooltip)
+        return btn
+
+    def _build_visual_query_header(self) -> QWidget:
+        """The 'Show: all / none' quick toggles above the object list — the fast
+        path to 'walk only this one object' (none, then tick it)."""
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 0, 0, 2)
+        hl.setSpacing(6)
+        label = QLabel("Show:")
+        label.setStyleSheet("color:#888;font-size:8pt;")
+        hl.addWidget(label)
+        all_btn = self._mini_button("all", "Show every object")
+        all_btn.setFixedSize(24, 16)
+        all_btn.clicked.connect(lambda: self._set_all_visual_queries(True))
+        hl.addWidget(all_btn)
+        none_btn = self._mini_button("none", "Hide every object")
+        none_btn.setFixedSize(30, 16)
+        none_btn.clicked.connect(lambda: self._set_all_visual_queries(False))
+        hl.addWidget(none_btn)
+        hl.addStretch()
+        return header
+
+    def _apply_visual_query_fold(self):
+        """Show/hide the object list, and keep the collapsed row honest.
+
+        Folding would otherwise hide the filter: with 'dog' unticked and the
+        list collapsed, ◀ ▶ silently skip it and the panel looks broken. So the
+        caret carries the count whenever anything is hidden.
+        """
+        box = getattr(self, '_visual_query_box', None)
+        fold = getattr(self, '_visual_query_fold', None)
+        if box is None or fold is None:
+            return
+        boxes = getattr(self, 'visual_query_checkboxes', {})
+        expanded = getattr(self, '_visual_queries_expanded', True)
+
+        box.setVisible(bool(boxes) and expanded)
+        fold.setVisible(bool(boxes))
+        shown = sum(1 for cb in boxes.values() if cb.isChecked())
+        total = len(boxes)
+        if expanded:
+            fold.setText("▾")
+            fold.setToolTip("Hide the object list")
+        else:
+            # Only advertise a number when it's news — "3/3" is just noise.
+            fold.setText("▸" if shown == total else f"▸ {shown}/{total}")
+            fold.setToolTip(
+                f"Show the object list ({shown} of {total} objects visible)"
+                if shown != total else "Show the object list"
+            )
+
+    def _toggle_visual_query_fold(self):
+        self._visual_queries_expanded = not getattr(self, '_visual_queries_expanded', True)
+        self._apply_visual_query_fold()
+
+    def _toggle_visual_query(self, query: str, state):
+        visible = (state == Qt.CheckState.Checked.value)
+        self.signal_scene.set_visual_query_filter(query, visible)
+        self._apply_visual_query_fold()   # the collapsed caret tracks the count
+        self.statusBar().showMessage(
+            f"Showing '{query}'" if visible else f"Hiding '{query}' — ◀ ▶ now skip it",
+            2000,
+        )
+
+    def _set_all_visual_queries(self, visible: bool):
+        """Show or hide every object at once. One rebuild, not one per query."""
+        scene = self.signal_scene
+        for query in list(getattr(scene, 'visual_queries', []) or []):
+            scene.set_visual_query_filter(query, visible, rebuild=False)
+        scene.build_timeline()
+        self.refresh_visual_query_checkboxes()   # reflect the new state in the boxes
+        self.statusBar().showMessage(
+            "Showing all objects" if visible else "Hid all objects — ◀ ▶ have nothing to step",
+            2000,
+        )
+
+    def _remove_visual_query(self, query: str):
+        """Delete one object's findings from the timeline and the cache.
+
+        Preserves the other objects' show/hide state (see
+        SignalTimelineScene.clear_visual_findings). Re-searching '{query}'
+        brings it back.
+        """
+        scene = self.signal_scene
+        removed = len(scene.get_visual_findings(query))
+        scene.clear_visual_findings(query=query)      # rebuilds the timeline
+        if hasattr(self, 'save_visual_findings_to_cache'):
+            self.save_visual_findings_to_cache()      # else it returns on reopen
+        self.refresh_visual_query_checkboxes()
+        self.statusBar().showMessage(
+            f"Removed '{query}' ({removed} finding(s)) — re-search to bring it back",
+            3000,
+        )
+
     def add_visual_findings(self, findings: list, save: bool = True):
             """
             Public entry point for any scanner (Visual Search panel, LLM bridge, etc.)
@@ -1225,6 +1907,7 @@ class SignalTimelineWindow(QMainWindow):
             # synchronous rebuild here would defeat the coalescing and repaint
             # the whole waveform again on every streamed hit.
             self._enable_layer('visual_search', rebuild=False)
+            self.refresh_visual_query_checkboxes()   # a new object may have appeared
             if save:
                 self.save_visual_findings_to_cache()
             if hasattr(self, 'label_panel'):
@@ -1492,6 +2175,72 @@ class SignalTimelineWindow(QMainWindow):
         print(f"\n{'='*60}\n")
         return {}
     
+    def refresh_from_disk(self):
+        """Re-read this video's cache from disk and rebuild the timeline, so a
+        signal added on demand elsewhere (the main window's per-signal Run
+        buttons fold straight into the cache file) shows up here — without
+        tearing down this heavy window. Best-effort; a failed reload leaves the
+        current view untouched.
+
+        Reports stages like the initial build does: this is not the cheap path
+        it sounds like — re-ingesting the signals and redrawing the timeline is
+        seconds of blocked GUI thread on a long video, and reopening the viewer
+        runs it (see main.open_timeline_viewer, which reuses the window). The
+        calls are no-ops when nobody opened a splash, so the on-demand-analysis
+        caller is unaffected."""
+        startup_splash.stage("Re-reading the analysis cache…")
+        try:
+            fresh = self.load_cache_data()
+        except Exception as e:
+            print(f"⚠️ refresh_from_disk: cache reload failed: {e}")
+            return
+        if not fresh:
+            return
+
+        self.cache_data = fresh
+
+        # Re-ingest signals (updates cache_data, action/object type lists, redraws).
+        startup_splash.stage("Reloading signals…")
+        self.signal_scene.reload_cache_data(self.cache_data)
+        self.refresh_event_checkboxes()   # composed events may have just appeared
+        self.refresh_object_checkboxes()  # and so may object classes
+
+        # Audio waveform may have just been added.
+        try:
+            wf = self.load_waveform_from_cache()
+            if wf:
+                self.waveform = wf
+                self.signal_scene.set_waveform_data(wf)
+        except Exception as e:
+            print(f"⚠️ refresh_from_disk: waveform reload failed: {e}")
+
+        # Layers hidden at open because they had no data (see create_controls)
+        # get switched back on now that data exists — mirrors the Analyze panel's
+        # _enable_layer_and_reload.
+        for name, cb in getattr(self, 'layer_checkboxes', {}).items():
+            try:
+                if self.signal_scene.layer_has_data(name) and not cb.isChecked():
+                    cb.blockSignals(True)
+                    cb.setChecked(True)
+                    cb.setToolTip("")
+                    cb.blockSignals(False)
+                    self.signal_scene.visible_layers[name] = True
+            except Exception:
+                continue
+
+        startup_splash.stage("Redrawing the timeline…")
+        self.signal_scene.build_timeline()
+
+        # Refresh side panels + status line.
+        startup_splash.stage("Refreshing the panels…")
+        self.action_types = self.signal_scene.action_types
+        self.object_classes = self.signal_scene.object_classes
+        if hasattr(self, 'label_panel'):
+            self.label_panel.refresh_labels()
+        if hasattr(self, '_update_status'):
+            self._update_status()
+        print("🔄 Timeline refreshed from disk")
+
     def _extract_action_types(self):
         """Extract unique action names for info display"""
         actions = set()
@@ -1519,10 +2268,11 @@ class SignalTimelineWindow(QMainWindow):
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(6)
         
-        # Create info bar
-        info_bar = self.create_info_bar()
-        main_layout.addWidget(info_bar)
-        
+        # Stats + selected time go in the status bar (no info-bar row); the
+        # interaction hints become the timeline's tooltip. Recovers that height
+        # for the timeline itself.
+        self._install_status_info()
+
         # Create splitter for main content
         splitter = QSplitter(Qt.Orientation.Vertical)
         
@@ -1534,6 +2284,7 @@ class SignalTimelineWindow(QMainWindow):
         print(f"🎵 init_ui: Creating scene with waveform data ({len(self.waveform) if self.waveform else 0} points)")
         
         # Create scene with current waveform data (may be empty initially)
+        startup_splash.stage("Drawing the signal timeline…")
         self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration, waveform=self.waveform)
         # Restore ranges marked in an earlier session (see modules.manual_avoid).
         try:
@@ -1544,8 +2295,12 @@ class SignalTimelineWindow(QMainWindow):
         except Exception as e:
             print(f"⚠️ could not load manual avoid ranges: {e}")
         self.signal_view = SignalTimelineView(self.signal_scene)
-        self.signal_view.setMinimumHeight(400)
+        # Lower floor so the whole top band (preview + timeline + controls) can
+        # compress and leave room for the bottom LLM dock when not maximized.
+        # The splitter default (500) keeps it roomy at normal sizes.
+        self.signal_view.setMinimumHeight(240)
         self.signal_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.signal_view.setToolTip(self.TIMELINE_HINTS)
         
         # Enable drag and drop on the viewport
         self.signal_view.viewport().setAcceptDrops(True)
@@ -1555,6 +2310,8 @@ class SignalTimelineWindow(QMainWindow):
         self.signal_scene.add_to_edit_requested.connect(self.on_add_to_edit_requested)
         self.signal_scene.add_clip_to_edit_requested.connect(self.on_add_clip_to_edit)
         self.signal_scene.add_clips_to_edit_requested.connect(self.on_add_clips_to_edit)
+        self.signal_scene.swap_highlight_requested.connect(self.on_swap_highlight)
+        self.signal_scene.undo_highlight_swap_requested.connect(self.on_undo_highlight_swap)
         self.signal_scene.filter_changed.connect(self.on_filter_changed)
         
         # Preview follows drag
@@ -1565,7 +2322,6 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self.signal_scene, 'waveform_clicked'):
             self.signal_scene.waveform_clicked.connect(self.on_waveform_clicked)
         
-        signal_layout.addWidget(QLabel("Signal Timeline (Drag items to edit timeline below)"))
 
         # Timeline with frozen label column
         timeline_row = QHBoxLayout()
@@ -1578,9 +2334,18 @@ class SignalTimelineWindow(QMainWindow):
 
         # Refresh frozen labels whenever the scene rebuilds
         self.signal_scene.timeline_rebuilt.connect(self.label_panel.refresh_labels)
+        # Repaint, not rebuild: the per-track counters read the playhead, but
+        # re-deriving every track's events on each tick would make playback
+        # crawl. This fires for seeks too, which is what arrow navigation does.
+        self.signal_scene.current_time_changed.connect(
+            lambda _seconds: self.label_panel.update())
 
         # Wire navigation arrows
-        self.label_panel._current_time_fn = lambda: self.current_time
+        # Read the playhead from the scene, not from self.current_time: the
+        # scene is the one thing every seek path updates, whereas a caller can
+        # move the playhead and forget the window's copy.
+        self.label_panel._current_time_fn = lambda: getattr(
+            self.signal_scene, 'current_time_seconds', self.current_time)
         self.label_panel.seek_requested.connect(self.on_time_clicked)
 
         # Initial label load
@@ -1593,6 +2358,7 @@ class SignalTimelineWindow(QMainWindow):
         edit_layout = QVBoxLayout(edit_widget)
         
         # Edit timeline
+        startup_splash.stage("Building the edit timeline…")
         self.edit_scene = EditTimelineScene(self.video_path, self.video_duration, cache=self.cache, cache_data=self.cache_data)
         self.edit_view = QGraphicsView(self.edit_scene)
         self.edit_view.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1601,15 +2367,16 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_view.setFixedHeight(120)
         self.edit_view.setAcceptDrops(True)
         self.edit_view.viewport().setAcceptDrops(True)
-        self.edit_view.setStyleSheet("""
-            QGraphicsView {
-                background-color: rgba(30, 30, 40, 200);
-                border: 2px solid rgba(100, 100, 150, 150);
-                border-radius: 5px;
-            }
+        self.edit_view.setStyleSheet(f"""
+            QGraphicsView {{
+                background-color: {THEME.surface};
+                border: 1px solid {THEME.border_strong};
+                border-radius: {THEME.radius}px;
+            }}
         """)
         
         # --- LLM Chat Panel (in timeline) ---
+        startup_splash.stage("Starting the assistant…")
         try:
             from llm.llm_chat_widget import LLMChatWidget
             self.llm_chat = LLMChatWidget(parent=self, compact=True, cache_dir="./cache")
@@ -1623,6 +2390,7 @@ class SignalTimelineWindow(QMainWindow):
             llm_dock = QDockWidget("LLM Assistant", self)
             llm_dock.setWidget(self.llm_chat)
             self.addDockWidget(Qt.BottomDockWidgetArea, llm_dock)
+            self._llm_dock = llm_dock
         except ImportError:
             pass  # LLM modules not installed
 
@@ -1645,7 +2413,6 @@ class SignalTimelineWindow(QMainWindow):
         )
 
 
-        edit_layout.addWidget(QLabel("Edit Timeline (Select clips and press Delete)"))
         edit_layout.addWidget(self.edit_view)
         
         # Add edit controls
@@ -1665,6 +2432,7 @@ class SignalTimelineWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, controls_dock)
 
         # 🎬 ADD VIDEO PREVIEW DOCK
+        startup_splash.stage("Starting the video preview…")
         try:
             preview_dock = self.create_video_preview_dock()
             self.addDockWidget(Qt.LeftDockWidgetArea, preview_dock)
@@ -1672,39 +2440,65 @@ class SignalTimelineWindow(QMainWindow):
             print(f"⚠️ Could not create preview dock: {e}")
             # Continue without preview
 
-        # Transcript dock (hidden by default, toggle from View menu)
-        try:
-            transcript_dock = self.create_transcript_dock()
-            self.addDockWidget(Qt.RightDockWidgetArea, transcript_dock)
-            transcript_dock.setVisible(False)
-            # Connect the toggle button that was already added in create_controls_dock
-            if hasattr(self, 'transcript_toggle_btn'):
-                self.transcript_toggle_btn.toggled.connect(transcript_dock.setVisible)
-        except Exception as e:
-            print(f"⚠️ Could not create transcript dock: {e}")
-
-        # Search dock (hidden by default)
+        # Search + Transcript stack behind Controls as tabs of the same right
+        # column (they used to be hidden docks behind toggle buttons, which
+        # cost a second click and hid that they exist at all).
+        self.setTabPosition(Qt.RightDockWidgetArea, QTabWidget.TabPosition.North)
+        startup_splash.stage("Building the side panels…")
         try:
             search_dock = self.create_search_dock()
             self.addDockWidget(Qt.RightDockWidgetArea, search_dock)
-            search_dock.setVisible(False)
-            if hasattr(self, 'search_toggle_btn'):
-                self.search_toggle_btn.toggled.connect(search_dock.setVisible)
+            self.tabifyDockWidget(controls_dock, search_dock)
         except Exception as e:
             print(f"⚠️ Could not create search dock: {e}")
+
+        try:
+            transcript_dock = self.create_transcript_dock()
+            self._transcript_dock = transcript_dock  # kept so a transcript run can refresh it
+            self.addDockWidget(Qt.RightDockWidgetArea, transcript_dock)
+            self.tabifyDockWidget(controls_dock, transcript_dock)
+        except Exception as e:
+            print(f"⚠️ Could not create transcript dock: {e}")
+
+        # Controls is the working tab; the others wait behind it.
+        controls_dock.raise_()
 
         # Connect render signals
         self.render_finished.connect(self.on_render_finished)
         self.render_progress.connect(self.on_render_progress)
+        self.analysis_progress.connect(self._on_analysis_progress)
+        self.analysis_finished.connect(self._on_analysis_finished)
 
         # Apply dark theme
         self.apply_dark_theme()
         
         # Status bar
-        self.statusBar().showMessage(f"Video duration: {self.video_duration:.1f}s | Total edit duration: {self.edit_scene.get_total_duration():.1f}s")
+        self._update_status()
         
         # Install event filter to handle global key events
         QApplication.instance().installEventFilter(self)
+
+    def showEvent(self, event):
+        # Balance the LLM dock only once the window is actually shown, so
+        # self.height() is the real size (a singleShot from __init__ fires before
+        # the first show and reads the pre-layout height, which starved the dock).
+        super().showEvent(event)
+        if not getattr(self, "_dock_balanced", False):
+            self._dock_balanced = True
+            QTimer.singleShot(0, self._balance_bottom_dock)
+
+    def _balance_bottom_dock(self):
+        """Give the LLM dock enough height for a usable chat. Lowering the
+        top-band floors lets it fit; this forces the split so the conversation
+        area isn't crushed by the settings + search rows above it."""
+        dock = getattr(self, "_llm_dock", None)
+        if dock is None or not dock.isVisible():
+            return
+        target = max(360, int(self.height() * 0.40))
+        try:
+            self.resizeDocks([dock], [target], Qt.Orientation.Vertical)
+        except Exception:
+            pass
 
     def capture_current_frame_base64(self) -> str | None:
         """
@@ -1813,82 +2607,54 @@ class SignalTimelineWindow(QMainWindow):
 
         return super().eventFilter(obj, event)
     
-    def create_info_bar(self):
-        """Create information bar with video stats"""
-        bar = QFrame()
-        bar.setStyleSheet("""
-            QFrame {
-                background: #1e1e2c;
-                border-radius: 6px;
-                padding: 8px;
-            }
-        """)
-        
-        layout = QHBoxLayout(bar)
-        
-        # Video info
-        duration_mins = int(self.video_duration // 60)
-        duration_secs = int(self.video_duration % 60)
-        action_count = len(self.action_types)
-        object_count = len(self.object_classes)
-        
-        info_text = f"Duration: {duration_mins:02d}:{duration_secs:02d} • Actions: {action_count} • Objects: {object_count}"
-        info_label = QLabel(info_text)
-        info_label.setStyleSheet("color: #c0d0ff; font-weight: bold;")
-        
-        layout.addWidget(info_label)
-        layout.addStretch()
-        
-        # Drag and delete instructions
-        instructions = QLabel(
-            "🖱️ Drag signal bars → edit timeline  "
-            "•  Left-drag background → highlight range, then drag range → edit timeline  "
-            "•  Ctrl+click / Shift+click / Ctrl+A to multi-select, then Delete to remove"
-        )
-        instructions.setStyleSheet("color: #a0ffa0; font-style: italic; font-size: 11px; padding: 4px; background: rgba(0, 100, 0, 40); border-radius: 4px;")
-        layout.addWidget(instructions)
-        layout.addStretch()
-        
-        # Current time display
+    # Interaction hints, shown as the signal timeline's tooltip rather than a
+    # permanent bar — they're learn-once, and the bar cost a row of height.
+    TIMELINE_HINTS = (
+        "Drag signal bars → edit timeline\n"
+        "Left-drag background → highlight range, then drag range → edit timeline\n"
+        "Ctrl+click / Shift+click / Ctrl+A to multi-select, then Delete to remove"
+    )
+
+    def _install_status_info(self):
+        """Video stats + selected time live in the status bar.
+
+        Replaces the old info bar: its duration already duplicated the status
+        bar, its hints are now the timeline's tooltip, and its "Debug log" box
+        was a synced duplicate of the main GUI's (modules.debug_console keeps
+        them in step, so the one in the main window still drives it).
+        """
         self.time_label = QLabel("No time selected")
         self.time_label.setStyleSheet("color: #ff8080; font-family: Consolas; font-weight: bold;")
+        self.statusBar().addPermanentWidget(self.time_label)
 
-        layout.addWidget(self.time_label)
-
-        # Live debug-log toggle (same switch as the main GUI's checkbox —
-        # all logic lives in modules.debug_console).
+    def _update_status(self):
+        """One status line: video stats + current edit length. The old info bar
+        and the existing status message each showed duration; this merges them
+        so Actions/Objects aren't lost to whoever calls showMessage last."""
+        mins, secs = int(self.video_duration // 60), int(self.video_duration % 60)
         try:
-            from modules import debug_console as _dbg
+            edit_len = self.edit_scene.get_total_duration()
         except Exception:
-            _dbg = None
-        if _dbg is not None:
-            self.debug_log_chk = QCheckBox("Debug log")
-            self.debug_log_chk.setChecked(_dbg.is_console_visible())
-            self.debug_log_chk.setStyleSheet("color: #c0d0ff;")
-            self.debug_log_chk.setToolTip(
-                "Open a live window mirroring all app output\n"
-                "(recent output is replayed, so it works after an error too).\n"
-                f"Everything is always saved to:\n{_dbg.log_file_path()}"
-            )
-            self.debug_log_chk.toggled.connect(_dbg.set_console_visible)
-            _dbg.register_checkbox(self.debug_log_chk)
-            layout.addWidget(self.debug_log_chk)
+            edit_len = 0.0
+        self.statusBar().showMessage(
+            f"Duration: {mins:02d}:{secs:02d} • Actions: {len(self.action_types)} • "
+            f"Objects: {len(self.object_classes)} | Edit: {edit_len:.1f}s"
+        )
 
-        return bar
-    
+
     def create_filter_controls(self):
         """Create filter controls for the dock widget"""
-        filter_group = QGroupBox("Filters")
+        filter_group = CollapsibleSection("Filters", settings_key="controls/filters")
         filter_layout = QVBoxLayout()
         
         # Filter summary
         self.filter_summary = QLabel("All actions/objects visible")
-        self.filter_summary.setStyleSheet("color: #a0ffa0; font-size: 11px;")
+        self.filter_summary.setStyleSheet(f"color: {THEME.text_dim}; font-size: 11px;")
         filter_layout.addWidget(self.filter_summary)
-        
+
         # Confidence filter display
         self.confidence_label = QLabel(f"Actions: {self.signal_scene.min_action_confidence:.0%} | Objects: {self.signal_scene.min_object_confidence:.0%}")
-        self.confidence_label.setStyleSheet("color: #ffa0a0; font-size: 11px;")
+        self.confidence_label.setStyleSheet(f"color: {THEME.text_dim}; font-size: 11px;")
         filter_layout.addWidget(self.confidence_label)
         
         # Quick filter buttons
@@ -1906,79 +2672,476 @@ class SignalTimelineWindow(QMainWindow):
         quick_filter_layout.addWidget(hide_all_btn)
         filter_layout.addLayout(quick_filter_layout)
         
-        # Confidence filter button
-        self.confidence_filter_btn = QPushButton("🎚️ Confidence Filter...")
+        # Confidence + Advanced filter buttons — side by side, compact, to keep
+        # the Controls dock short (a tall dock forces the whole window past the
+        # screen bottom, hiding the LLM chat behind the taskbar).
+        _filt_style = "QPushButton { background-color: #2f81f7; padding: 4px 6px; }"
+        filter_btn_row = QHBoxLayout()
+        self.confidence_filter_btn = QPushButton("Confidence…")
+        self.confidence_filter_btn.setToolTip("Set minimum confidence for actions/objects")
         self.confidence_filter_btn.clicked.connect(self.open_confidence_filter)
-        self.confidence_filter_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #5a3fcd;
-                font-weight: bold;
-                padding: 8px;
-            }
-        """)
-        filter_layout.addWidget(self.confidence_filter_btn)
-        
-        # Advanced filters button
-        self.filter_dialog_btn = QPushButton("🎛️ Advanced Filters...")
+        self.confidence_filter_btn.setStyleSheet(_filt_style)
+        filter_btn_row.addWidget(self.confidence_filter_btn)
+
+        self.filter_dialog_btn = QPushButton("Advanced…")
+        self.filter_dialog_btn.setToolTip("Advanced per-type filters")
         self.filter_dialog_btn.clicked.connect(self.open_filter_dialog)
-        self.filter_dialog_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #3a5fcd;
-                font-weight: bold;
-                padding: 8px;
-            }
-        """)
-        filter_layout.addWidget(self.filter_dialog_btn)
+        self.filter_dialog_btn.setStyleSheet(_filt_style)
+        filter_btn_row.addWidget(self.filter_dialog_btn)
+        filter_layout.addLayout(filter_btn_row)
         
         # Current filters display
         self.current_filters_label = QLabel("")
         self.current_filters_label.setStyleSheet("color: #cccccc; font-size: 10px;")
         self.current_filters_label.setWordWrap(True)
         filter_layout.addWidget(self.current_filters_label)
-        
-        filter_group.setLayout(filter_layout)
+
+        # Lives here (not loose in the dock) because it filters the ACTIONS row.
+        self.only_highlight_actions_cb = QCheckBox("Show only highlight actions")
+        self.only_highlight_actions_cb.setChecked(False)
+        self.only_highlight_actions_cb.setToolTip(
+            "Off (default): the ACTIONS row shows every detected action.\n"
+            "On: only the actions selected into the highlight.\n"
+            "(Needs a re-analysis to populate the full list.)"
+        )
+        self.only_highlight_actions_cb.stateChanged.connect(self.on_only_highlight_actions_changed)
+        filter_layout.addWidget(self.only_highlight_actions_cb)
+
+        filter_group.setContentLayout(filter_layout)
         return filter_group
     
+    # ================= On-demand analysis (Analyze section) =================
+
+    def create_analyze_section(self):
+        """A foldable 'Analyze' section: run action / object / transcript
+        analysis on the loaded video, on demand, and fold the result into the
+        cache. Advanced knobs stay in the main GUI — these buttons run using
+        that GUI's saved settings (read from config.yaml)."""
+        section = CollapsibleSection(
+            "Analyze", expanded=False, settings_key="controls/analyze")
+        lay = QVBoxLayout()
+        lay.setSpacing(8)
+
+        # State for the single-run-at-a-time worker.
+        self._analysis_thread = None
+        self._analysis_cancel = None
+        self._analysis_running = None       # kind of the active run, or None
+        self._analyze_rows = {}             # kind -> {btn, status, label}
+
+        # Prefill the class/keep lists from the main GUI's saved settings so a
+        # run is usually one click.
+        try:
+            from modules.analysis_ondemand import analysis_defaults
+            _d = analysis_defaults()
+            obj_default = ", ".join(_d.get("object_list", []))
+            act_default = ", ".join(_d.get("action_list", []))
+            kw_default = ", ".join(_d.get("search_keywords", []))
+        except Exception:
+            obj_default = act_default = kw_default = ""
+        # Transcription always defaults to English; pick another in the row's
+        # dropdown per run. (Deliberately ignores the main GUI's saved source
+        # language, which is often a stale leftover.)
+        lang_default = "en"
+
+        # Motion & scenes / Audio: no inputs — one detector pass each, folded
+        # into the cache. Motion covers scene, motion-event and motion-peak rows.
+        lay.addLayout(self._make_analyze_row(
+            "motion", "Motion & scenes",
+            "Detect scene cuts and motion over the whole video (scene, motion "
+            "event and motion peak — one pass)."))
+        lay.addLayout(self._make_analyze_row(
+            "audio", "Audio",
+            "Detect audio peaks (and the waveform) over the whole video."))
+
+        # Actions: optional keep-list (blank = all actions).
+        self.analyze_actions_field = QLineEdit(act_default)
+        self.analyze_actions_field.setPlaceholderText("all actions (or: high kick, archery…)")
+        self.analyze_actions_field.setToolTip(
+            "Optional. Leave blank to detect every action; or list names to keep "
+            "only those. Prefilled from the main window's action keywords.")
+        lay.addLayout(self._make_analyze_row(
+            "actions", "Actions", "Run action recognition over the whole video",
+            extra=self.analyze_actions_field))
+
+        self.analyze_objects_field = QLineEdit(obj_default)
+        self.analyze_objects_field.setPlaceholderText("person, car, dog…")
+        self.analyze_objects_field.setToolTip(
+            "Comma-separated object classes to detect. Prefilled from the main "
+            "window's list; edit per run. Change the model/confidence there.")
+        lay.addLayout(self._make_analyze_row(
+            "objects", "Objects", "Detect the object classes listed above",
+            extra=self.analyze_objects_field))
+
+        # Transcript: Run transcribes; a language picker (English by default)
+        # sets the spoken language, and the keyword field marks spoken moments
+        # on the timeline (amber ticks) and points the TRANSCRIPT ◀▶ at them.
+        tr_extra = QWidget()
+        tr_v = QVBoxLayout(tr_extra)
+        tr_v.setContentsMargins(0, 0, 0, 0)
+        tr_v.setSpacing(4)
+
+        lang_row = QHBoxLayout()
+        lang_row.setContentsMargins(0, 0, 0, 0)
+        lang_row.setSpacing(4)
+        lang_row.addWidget(QLabel("Language:"))
+        self.analyze_transcript_lang = QComboBox()
+        for code in ["auto", "en", "pl", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh"]:
+            self.analyze_transcript_lang.addItem(code, code)
+        _li = self.analyze_transcript_lang.findData(lang_default)
+        if _li >= 0:
+            self.analyze_transcript_lang.setCurrentIndex(_li)
+        self.analyze_transcript_lang.setToolTip(
+            "Spoken language for transcription. Defaults to English; 'auto' "
+            "detects it. Overrides the main GUI's saved language for this run.")
+        lang_row.addWidget(self.analyze_transcript_lang)
+        lang_row.addStretch()
+        tr_v.addLayout(lang_row)
+
+        kw_row = QHBoxLayout()
+        kw_row.setContentsMargins(0, 0, 0, 0)
+        kw_row.setSpacing(4)
+        self.analyze_transcript_kw = QLineEdit(kw_default)
+        self.analyze_transcript_kw.setPlaceholderText("mark words, e.g. goal, score")
+        self.analyze_transcript_kw.setToolTip(
+            "Mark transcript moments where these words are spoken, on the "
+            "timeline. The TRANSCRIPT ◀▶ arrows then jump between the hits. "
+            "Blank clears the marking.")
+        self.analyze_transcript_kw.returnPressed.connect(self._apply_transcript_keywords)
+        kw_row.addWidget(self.analyze_transcript_kw, 1)
+        kw_btn = QPushButton()
+        kw_btn.setIcon(ui_icons.search(color=THEME.text))
+        kw_btn.setFixedWidth(30)
+        kw_btn.setToolTip("Mark these words on the timeline")
+        kw_btn.clicked.connect(self._apply_transcript_keywords)
+        kw_row.addWidget(kw_btn)
+        tr_v.addLayout(kw_row)
+
+        lay.addLayout(self._make_analyze_row(
+            "transcript", "Transcript", "Transcribe speech with Whisper",
+            extra=tr_extra))
+
+        hint = QLabel("Runs one pass on this video and folds it into the cache. "
+                      "Advanced settings live in the main window.")
+        hint.setStyleSheet(f"color: {THEME.text_mute}; font-size: 10px;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        section.setContentLayout(lay)
+        return section
+
+    def _make_analyze_row(self, kind, label, tooltip, extra=None):
+        """One Analyze row: optional input widget, a Run button, a status line."""
+        box = QVBoxLayout()
+        box.setSpacing(3)
+        if extra is not None:
+            box.addWidget(extra)
+
+        row = QHBoxLayout()
+        btn = QPushButton(f"  {label}")
+        btn.setIcon(ui_icons.play())
+        btn.setToolTip(tooltip)
+        btn.clicked.connect(lambda _=False, k=kind: self._toggle_analysis(k))
+        row.addWidget(btn)
+
+        status = QLabel("")
+        status.setStyleSheet(f"color: {THEME.text_dim}; font-size: 10px;")
+        row.addWidget(status, 1)
+        box.addLayout(row)
+
+        self._analyze_rows[kind] = {"btn": btn, "status": status, "label": label}
+        return box
+
+    def _toggle_analysis(self, kind):
+        """Run button doubles as cancel while its own analysis is active."""
+        if self._analysis_running == kind:
+            if self._analysis_cancel is not None:
+                self._analysis_cancel.set()
+            self._analyze_rows[kind]["status"].setText("cancelling…")
+            return
+        if self._analysis_running is not None:
+            self.statusBar().showMessage(
+                "Another analysis is already running — let it finish first.", 3000)
+            return
+        self._start_analysis(kind)
+
+    def _start_analysis(self, kind):
+        import threading
+        from modules.analysis_ondemand import (
+            run_actions, run_objects, run_transcript, run_motion, run_audio)
+
+        cancel = threading.Event()
+        self._analysis_cancel = cancel
+        self._analysis_running = kind
+        self._set_analyze_busy(kind, True)
+        self._analyze_rows[kind]["status"].setText("starting…")
+
+        def progress(current, total, task="", details=""):
+            try:
+                frac = float(current) / float(total) if total else 0.0
+            except Exception:
+                frac = 0.0
+            frac = max(0.0, min(1.0, frac))
+            msg = f"{task}: {details}".strip(" :") if (task or details) else ""
+            self.analysis_progress.emit(kind, frac, msg)
+
+        # The preview window lives in the main window, behind its own checkbox.
+        # An Analyze run here is the same detection over the same video as the
+        # pipeline's stage, so it feeds that window rather than leaving it on
+        # its placeholder — but only while the box is ticked. `preview_enabled`
+        # is set by whoever opened this viewer and kept current as the box is
+        # toggled; a viewer opened on its own leaves it False and costs nothing.
+        def preview_fn(frame, boxes, sec):
+            if getattr(self, "preview_enabled", False) and not cancel.is_set():
+                self.preview_frame.emit(frame, boxes, sec)
+
+        def work():
+            try:
+                if kind == "motion":
+                    result = run_motion(self.video_path, progress=progress, cancel=cancel)
+                elif kind == "audio":
+                    result = run_audio(self.video_path, progress=progress, cancel=cancel)
+                elif kind == "actions":
+                    acts = [s.strip() for s in self.analyze_actions_field.text().split(",") if s.strip()]
+                    result = run_actions(self.video_path, interesting_actions=acts,
+                                         progress=progress, cancel=cancel,
+                                         preview_fn=preview_fn)
+                elif kind == "objects":
+                    objs = [s.strip() for s in self.analyze_objects_field.text().split(",") if s.strip()]
+                    result = run_objects(self.video_path, objs, progress=progress, cancel=cancel,
+                                         preview_fn=preview_fn)
+                else:
+                    lang = self.analyze_transcript_lang.currentData() or "en"
+                    result = run_transcript(self.video_path, language=lang,
+                                            progress=progress, cancel=cancel)
+                self.analysis_finished.emit(kind, result)
+            except Exception as e:  # includes _Cancelled and ValueError (no classes)
+                self.analysis_finished.emit(kind, e)
+
+        self._analysis_thread = threading.Thread(target=work, daemon=True)
+        self._analysis_thread.start()
+
+    def _set_analyze_busy(self, kind, busy):
+        """While one run is active, its button becomes Cancel and the others
+        disable (heavy GPU work — one at a time)."""
+        for k, row in self._analyze_rows.items():
+            if k == kind:
+                row["btn"].setText("  Cancel" if busy else f"  {row['label']}")
+                row["btn"].setIcon(ui_icons.stop() if busy else ui_icons.play())
+            else:
+                row["btn"].setEnabled(not busy)
+
+    @Slot(str, float, str)
+    def _on_analysis_progress(self, kind, frac, msg):
+        row = self._analyze_rows.get(kind)
+        if not row:
+            return
+        pct = int(frac * 100)
+        row["status"].setText(f"{pct}% · {msg}" if msg else f"{pct}%")
+
+    @Slot(str, object)
+    def _on_analysis_finished(self, kind, result):
+        from modules.analysis_ondemand import _Cancelled
+        self._set_analyze_busy(kind, False)
+        self._analysis_running = None
+        self._analysis_cancel = None
+        row = self._analyze_rows.get(kind)
+
+        if isinstance(result, Exception):
+            if isinstance(result, _Cancelled):
+                if row:
+                    row["status"].setText("cancelled")
+            else:
+                if row:
+                    row["status"].setText("failed — see log")
+                self.statusBar().showMessage(
+                    f"{kind.title()} analysis failed: {str(result)[:80]}", 6000)
+                print(f"❌ {kind} analysis failed: {result}")
+            return
+
+        if kind == "motion":
+            # One pass yields three signals; fold and enable all three layers.
+            self.cache_data["scenes"] = result.get("scenes", [])
+            self.cache_data["motion_events"] = result.get("motion_events", [])
+            self.cache_data["motion_peaks"] = result.get("motion_peaks", [])
+            self._merge_into_cache_file(result)
+            for layer in ("scenes", "motion_events", "motion_peaks"):
+                self._enable_layer_and_reload(layer)
+            if row:
+                row["status"].setText(
+                    f"✓ {len(result.get('scenes', []))} scenes, "
+                    f"{len(result.get('motion_peaks', []))} peaks")
+        elif kind == "audio":
+            self.cache_data["audio_peaks"] = result.get("audio_peaks", [])
+            self.cache_data["audio"] = result.get("audio", {})
+            self._merge_into_cache_file(result)
+            wf = (result.get("audio") or {}).get("waveform")
+            if wf:
+                self.waveform = wf
+                self.signal_scene.set_waveform_data(wf)
+            self._enable_layer_and_reload("audio_peaks")
+            if row:
+                row["status"].setText(f"✓ {len(result.get('audio_peaks', []))} peaks")
+        elif kind == "actions":
+            self.cache_data["actions"] = result
+            self.cache_data["actions_all"] = result
+            self._merge_into_cache_file({"actions": result, "actions_all": result})
+            self._enable_layer_and_reload("actions")
+            if row:
+                row["status"].setText(f"✓ {len(result)} detections")
+        elif kind == "objects":
+            self.cache_data["objects"] = result
+            self._merge_into_cache_file({"objects": result})
+            self._enable_layer_and_reload("objects")
+            if row:
+                row["status"].setText(f"✓ {len(result)} seconds")
+        else:  # transcript
+            self.cache_data["transcript"] = result
+            self._merge_into_cache_file({"transcript": result})
+            self._enable_layer_and_reload("transcript")
+            self._refresh_transcript_panel(result.get("segments", []))
+            if row:
+                row["status"].setText(f"✓ {len(result.get('segments', []))} segments")
+            # If keywords were already typed, mark them on the fresh transcript.
+            if self.analyze_transcript_kw.text().strip():
+                self._apply_transcript_keywords()
+
+        # action_types / object_classes may have grown — refresh the status line.
+        self.action_types = self.signal_scene.action_types
+        self.object_classes = self.signal_scene.object_classes
+        self._update_status()
+
+    def _apply_transcript_keywords(self):
+        """Mark the transcript keywords on the timeline (or clear if blank)."""
+        kws = [s.strip() for s in self.analyze_transcript_kw.text().split(",") if s.strip()]
+        sc = self.signal_scene
+        if kws:
+            # Marks are drawn on the TRANSCRIPT row, so make sure it's visible.
+            sc.visible_layers["transcript"] = True
+            cb = getattr(self, "layer_checkboxes", {}).get("transcript")
+            if cb is not None and not cb.isChecked():
+                cb.blockSignals(True)
+                cb.setChecked(True)
+                cb.setToolTip("")
+                cb.blockSignals(False)
+        sc.set_transcript_keywords(kws)   # rebuilds the timeline
+        if hasattr(self, "label_panel"):
+            self.label_panel.refresh_labels()
+        row = self._analyze_rows.get("transcript")
+        if row:
+            if kws:
+                hits = sc._nav_timestamps_transcript()
+                row["status"].setText(f"⌕ {len(hits)} match(es)")
+            elif not row["status"].text().startswith("✓"):
+                row["status"].setText("")
+
+    def _enable_layer_and_reload(self, layer_name):
+        """Re-ingest the enlarged cache and make the new layer visible + checked."""
+        self.signal_scene.visible_layers[layer_name] = True
+        cb = getattr(self, "layer_checkboxes", {}).get(layer_name)
+        if cb is not None and not cb.isChecked():
+            cb.blockSignals(True)
+            cb.setChecked(True)
+            cb.setToolTip("")
+            cb.blockSignals(False)
+        self.signal_scene.reload_cache_data(self.cache_data)  # re-extract + rebuild
+        # A composition run can introduce events that did not exist when the
+        # Layers panel was built, so its nested list has to be rebuilt too.
+        self.refresh_event_checkboxes()
+        self.refresh_object_checkboxes()
+        if hasattr(self, "label_panel"):
+            self.label_panel.refresh_labels()
+
+    def _refresh_transcript_panel(self, segments):
+        """Rebuild the Transcript tab's panel with freshly-run segments."""
+        try:
+            dock = getattr(self, "_transcript_dock", None)
+            if dock is None or not segments:
+                return
+            panel = TranscriptPanel(segments, parent=self)
+            panel.seek_requested.connect(self.on_time_clicked)
+            dock.setWidget(panel)
+            self.transcript_panel = panel
+        except Exception as e:
+            print(f"⚠️ Could not refresh transcript panel: {e}")
+
+    def _merge_into_cache_file(self, patch: dict):
+        """Fold `patch` into this video's on-disk cache via the shared per-signal
+        fold (`analysis_ondemand.merge_into_cache`) — the one path both surfaces
+        use. It updates every matching cache file (not just the first, which
+        could be one the viewer never reads on reopen) and seeds a fresh
+        `<hash>.cache.json` from the current in-memory cache_data when there's
+        none yet."""
+        from modules.analysis_ondemand import merge_into_cache
+        merge_into_cache(self.video_path, patch, seed=self.cache_data, log=print)
+
+    @staticmethod
+    def _toolbar_separator():
+        """Thin vertical rule between button groups on the edit toolbar."""
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFixedWidth(1)
+        sep.setStyleSheet(f"background: {THEME.border_strong}; border: none; margin: 4px 2px;")
+        return sep
+
     def create_edit_controls(self):
-        """Create controls for edit timeline"""
+        """Edit toolbar — buttons grouped playback | clip ops | output, with
+        separators, so the row reads as three tools instead of nine buttons."""
         controls = QWidget()
         layout = QHBoxLayout(controls)
-        
-        # Play Edited clip
-        self.play_edit_btn = QPushButton("▶ Play Edit")
+        layout.setSpacing(6)
+        layout.setContentsMargins(4, 2, 4, 2)
+
+        # -- Playback --
+        self.play_edit_btn = QPushButton("Play Edit")
+        self.play_edit_btn.setIcon(ui_icons.play())
         self.play_edit_btn.clicked.connect(self.toggle_edit_playback)
-        self.play_edit_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2a6fcd;
-                font-weight: bold;
-                padding: 8px;
-                min-width: 100px;
-            }
+        self.play_edit_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {THEME.accent};
+                color: {THEME.on_accent};
+                font-weight: 600;
+                padding: 5px 14px;
+                min-width: 90px;
+                border: none;
+            }}
+            QPushButton:hover {{ background-color: {THEME.accent_hover}; }}
+            QPushButton:pressed {{ background-color: {THEME.accent_press}; }}
         """)
         self.play_edit_btn.setToolTip("Play all clips in the edit timeline sequentially")
         layout.addWidget(self.play_edit_btn)
-        
-        self.stop_edit_btn = QPushButton("⏹ Stop")
+
+        self.stop_edit_btn = QPushButton("Stop")
+        self.stop_edit_btn.setIcon(ui_icons.stop())
         self.stop_edit_btn.clicked.connect(self.stop_edit_playback)
         self.stop_edit_btn.setStyleSheet("""
             QPushButton {
                 background-color: #8a2a2a;
-                font-weight: bold;
-                padding: 8px;
+                color: white;
+                border: none;
+                font-weight: 600;
+                padding: 5px 12px;
             }
+            QPushButton:hover { background-color: #9c3434; }
+            QPushButton:pressed { background-color: #762222; }
         """)
         layout.addWidget(self.stop_edit_btn)
 
-        # Add clip button
-        self.add_clip_btn = QPushButton("➕ Add Clip at Current Time")
+        layout.addWidget(self._toolbar_separator())
+
+        # -- Clip operations --
+        self.add_clip_btn = QPushButton("Add Clip")
+        self.add_clip_btn.setIcon(ui_icons.plus())
+        self.add_clip_btn.setToolTip("Add a clip at the current playhead time")
         self.add_clip_btn.clicked.connect(self.on_add_clip_clicked)
-        
-        # Remove selected clips button
-        self.remove_clips_btn = QPushButton("🗑️ Delete Selected Clips")
+
+        self.remove_clips_btn = QPushButton("Delete")
+        self.remove_clips_btn.setIcon(ui_icons.trash())
+        self.remove_clips_btn.setToolTip("Delete the selected clips from the edit timeline")
         self.remove_clips_btn.clicked.connect(self.on_remove_clips_clicked)
-        
+
         # Cut Mode toggle
-        self.cut_mode_btn = QPushButton("✂️  Cut Mode")
+        self.cut_mode_btn = QPushButton("Cut Mode")
+        self.cut_mode_btn.setIcon(ui_icons.scissors())
         self.cut_mode_btn.setCheckable(True)
         self.cut_mode_btn.setToolTip(
             "Cut Mode ON:\n"
@@ -1988,59 +3151,71 @@ class SignalTimelineWindow(QMainWindow):
             "Cut Mode OFF: normal drag/select behaviour"
         )
         self.cut_mode_btn.toggled.connect(self.toggle_cut_mode)
-        self.cut_mode_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2a2a44;
-                color: #d0d8ff;
-                font-weight: bold;
-                padding: 8px 12px;
-                border: 1px solid #4a4a6a;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #3a3a5c;
-            }
-            QPushButton:checked {
+        self.cut_mode_btn.setStyleSheet(f"""
+            QPushButton:checked {{
                 background-color: #7a2a1a;
-                border: 2px solid #ff6040;
+                border: 1px solid #ff6040;
                 color: #ffccaa;
-            }
-            QPushButton:checked:hover {
-                background-color: #8a3a2a;
-            }
+            }}
+            QPushButton:checked:hover {{ background-color: #8a3a2a; }}
         """)
 
-        # Save to cache button - ADD THIS
-        self.save_cache_btn = QPushButton("💾 Save to Cache")
+        # -- Output --
+        self.save_cache_btn = QPushButton("Save")
+        self.save_cache_btn.setIcon(ui_icons.save())
         self.save_cache_btn.clicked.connect(self.on_save_cache_clicked)
         self.save_cache_btn.setToolTip("Save current edit timeline to cache for future use")
-        
-        # Export button
-        self.export_btn = QPushButton("📤 Export Edit")
+
+        self.export_btn = QPushButton("Export")
+        self.export_btn.setIcon(ui_icons.export())
+        self.export_btn.setToolTip("Export the edit timeline")
         self.export_btn.clicked.connect(self.on_export_clicked)
-        
+
         # Duration label
         self.edit_duration_label = QLabel("Edit duration: 0.0s")
-        self.edit_duration_label.setStyleSheet("color: #a0ffa0; font-weight: bold;")
-        
+        self.edit_duration_label.setStyleSheet(
+            f"color: {THEME.success}; font-weight: 600;")
+
         layout.addWidget(self.add_clip_btn)
         layout.addWidget(self.remove_clips_btn)
         layout.addWidget(self.cut_mode_btn)
+        layout.addWidget(self._toolbar_separator())
         layout.addWidget(self.save_cache_btn)
         layout.addWidget(self.export_btn)
         
-        self.render_highlight_btn = QPushButton("🎬 Render Highlight Video")
+        # Video output mode (CPU/GPU), shared with the main GUI via config.
+        # Hardware HEVC is rejected by some VR players; CPU libx265 is VR-safe.
+        self.render_mode_combo = QComboBox()
+        self.render_mode_combo.addItem("Video: CPU x265 (VR-safe, slow)", "cpu")
+        self.render_mode_combo.addItem("Video: GPU (fast, may break VR)", "gpu")
+        self.render_mode_combo.setToolTip(
+            "How the highlight video is encoded:\n"
+            "CPU x265 — re-encode on the CPU with libx265 (HEVC), matching how VR\n"
+            "   sources are authored. VR-safe, but slow at 6K.\n"
+            "GPU — re-encode with the hardware encoder. Fast, but the HEVC output\n"
+            "   may not play in VR players like HereSphere."
+        )
+        _tl_rm = self._load_render_mode_default()
+        _tl_i = self.render_mode_combo.findData(_tl_rm)
+        if _tl_i >= 0:
+            self.render_mode_combo.setCurrentIndex(_tl_i)
+        self.render_mode_combo.currentIndexChanged.connect(
+            lambda: self._save_render_mode(self.render_mode_combo.currentData()))
+        layout.addWidget(self.render_mode_combo)
+
+        self.render_highlight_btn = QPushButton("Render Highlight Video")
+        self.render_highlight_btn.setIcon(ui_icons.render())
         self.render_highlight_btn.clicked.connect(self.on_render_highlight_clicked)
         self.render_highlight_btn.setStyleSheet("""
             QPushButton {
                 background-color: #2a7a2a;
                 font-weight: bold;
-                padding: 8px;
+                padding: 4px 8px;
             }
         """)
         self.render_highlight_btn.setToolTip("Render edit timeline clips into a single highlight video file")
         layout.addWidget(self.render_highlight_btn)
-        
+
         layout.addStretch()
 
         layout.addWidget(self.edit_duration_label)
@@ -2051,7 +3226,7 @@ class SignalTimelineWindow(QMainWindow):
         from PySide6.QtWidgets import QDockWidget
         from video_ai_editor.search_panel import SearchPanel
 
-        dock = QDockWidget("🔍 Search", self)
+        dock = QDockWidget("Search", self)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         dock.setMinimumWidth(300)
 
@@ -2075,7 +3250,7 @@ class SignalTimelineWindow(QMainWindow):
         from PySide6.QtWidgets import QDockWidget
         import os
 
-        dock = QDockWidget("📝 Transcript", self)
+        dock = QDockWidget("Transcript", self)
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         dock.setMinimumWidth(260)
 
@@ -2199,13 +3374,18 @@ class SignalTimelineWindow(QMainWindow):
         
         controls_widget = QWidget()
         layout = QVBoxLayout(controls_widget)
-              
+        layout.setSpacing(8)
+
         # ADD FILTER CONTROLS
         filter_controls = self.create_filter_controls()
         layout.addWidget(filter_controls)
-        
+
+        # Run analysis on demand (fills the cache without leaving the viewer)
+        analyze_section = self.create_analyze_section()
+        layout.addWidget(analyze_section)
+
         # Layer visibility controls
-        layer_group = QGroupBox("Visible Layers")
+        layer_group = CollapsibleSection("Visible Layers", settings_key="controls/layers")
         layer_layout = QVBoxLayout()
         
         self.layer_checkboxes = {}
@@ -2224,19 +3404,116 @@ class SignalTimelineWindow(QMainWindow):
             checkbox.stateChanged.connect(
                 lambda state, name=layer_name: self.toggle_layer(name, state)
             )
-            layer_layout.addWidget(checkbox)
             self.layer_checkboxes[layer_name] = checkbox
+
+            if layer_name == 'objects':
+                # Same shape as the events group below it. Built here for the
+                # same reason: an object class is a row on the timeline, and
+                # this panel is where rows get shown and hidden.
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(4)
+                row_layout.addWidget(checkbox)
+                row_layout.addStretch()
+                self._object_fold = self._mini_button("▾", "Hide the object list")
+                self._object_fold.setFixedSize(34, 16)
+                self._object_fold.setVisible(False)   # nothing to fold until detections exist
+                self._object_fold.clicked.connect(self._toggle_object_fold)
+                row_layout.addWidget(self._object_fold)
+                layer_layout.addWidget(row)
+
+                self._object_rows_expanded = True
+                self._object_box = QWidget()
+                obj_layout = QVBoxLayout(self._object_box)
+                obj_layout.setContentsMargins(18, 0, 0, 0)   # reads as a child row
+                obj_layout.setSpacing(2)
+                self._object_box.setVisible(False)
+                layer_layout.addWidget(self._object_box)
+                continue
+
+            if layer_name == 'events':
+                # Same shape as Visual Search below: the layer checkbox means
+                # "show the group", the caret expands a checkbox per composed
+                # event. Built here rather than only in the Advanced dialog
+                # because these are rows on the timeline, and the Layers panel is
+                # where rows get shown and hidden.
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(4)
+                row_layout.addWidget(checkbox)
+                row_layout.addStretch()
+                self._event_fold = self._mini_button("▾", "Hide the event list")
+                self._event_fold.setFixedSize(34, 16)
+                self._event_fold.setVisible(False)   # nothing to fold until rules run
+                self._event_fold.clicked.connect(self._toggle_event_fold)
+                row_layout.addWidget(self._event_fold)
+                layer_layout.addWidget(row)
+
+                self._event_rows_expanded = True
+                self._event_box = QWidget()
+                ev_layout = QVBoxLayout(self._event_box)
+                ev_layout.setContentsMargins(18, 0, 0, 0)   # reads as a child row
+                ev_layout.setSpacing(2)
+                self._event_box.setVisible(False)
+                layer_layout.addWidget(self._event_box)
+                continue
+
+            if layer_name != 'visual_search':
+                layer_layout.addWidget(checkbox)
+                continue
+
+            # Visual Search owns a nested object list, so its row also carries a
+            # fold toggle. The checkbox still means "show the layer"; the caret
+            # only expands the per-object controls.
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            row_layout.addWidget(checkbox)
+            row_layout.addStretch()
+            self._visual_query_fold = QPushButton("▾")
+            # setFlat() isn't enough: the app's theme styles QPushButton with a
+            # background and padding, which turns this into a full-size button.
+            # Override it to a bare caret.
+            self._visual_query_fold.setStyleSheet(
+                "QPushButton{border:none;background:transparent;color:#888;"
+                "padding:0px;margin:0px;font-size:9pt;}"
+                "QPushButton:hover{color:#fff;}"
+            )
+            self._visual_query_fold.setFixedSize(34, 16)   # fits '▸ 2/3' without reflowing
+            self._visual_query_fold.setCursor(Qt.PointingHandCursor)
+            self._visual_query_fold.setVisible(False)   # nothing to fold until a search runs
+            self._visual_query_fold.clicked.connect(self._toggle_visual_query_fold)
+            row_layout.addWidget(self._visual_query_fold)
+            layer_layout.addWidget(row)
+
+            # One checkbox per searched object, nested under the layer.
+            # Populated after each scan — no queries exist when the UI is built.
+            self._visual_queries_expanded = True
+            self._visual_query_box = QWidget()
+            vq_layout = QVBoxLayout(self._visual_query_box)
+            vq_layout.setContentsMargins(18, 0, 0, 0)   # indent: reads as a child of the layer
+            vq_layout.setSpacing(2)
+            self._visual_query_box.setVisible(False)
+            layer_layout.addWidget(self._visual_query_box)
 
         if any_hidden:
             self.signal_scene.build_timeline()
 
-        layer_group.setLayout(layer_layout)
+        layer_group.setContentLayout(layer_layout)
         layout.addWidget(layer_group)
+        self.refresh_visual_query_checkboxes()
+        self.refresh_event_checkboxes()
+        self.refresh_object_checkboxes()
 
         # Avoid ranges — exclude a dragged-selection range from highlight selection
-        avoid_group = QGroupBox("Avoid in Highlights")
+        avoid_group = CollapsibleSection(
+            "Avoid in Highlights", expanded=False, settings_key="controls/avoid")
         avoid_layout = QHBoxLayout()
-        self.avoid_range_btn = QPushButton("🚫 Avoid selected range")
+        self.avoid_range_btn = QPushButton("Avoid selected range")
+        self.avoid_range_btn.setIcon(ui_icons.ban())
         self.avoid_range_btn.setToolTip(
             "Drag-select a range on the timeline, then click to exclude it from "
             "highlight selection on the next run."
@@ -2247,11 +3524,12 @@ class SignalTimelineWindow(QMainWindow):
         self.clear_avoid_btn.setToolTip("Remove all avoid ranges")
         self.clear_avoid_btn.clicked.connect(self._clear_avoid_ranges)
         avoid_layout.addWidget(self.clear_avoid_btn)
-        avoid_group.setLayout(avoid_layout)
+        avoid_group.setContentLayout(avoid_layout)
         layout.addWidget(avoid_group)
 
         # Merge threshold controls
-        merge_group = QGroupBox("Merge Signals")
+        merge_group = CollapsibleSection(
+            "Merge Signals", expanded=False, settings_key="controls/merge")
         merge_layout = QVBoxLayout()
 
         merge_row = QHBoxLayout()
@@ -2267,7 +3545,7 @@ class SignalTimelineWindow(QMainWindow):
         merge_row.addWidget(self.merge_slider)
 
         self.merge_value_label = QLabel("Off")
-        self.merge_value_label.setStyleSheet("color: #a0ffa0; font-weight: bold; min-width: 36px;")
+        self.merge_value_label.setStyleSheet(f"color: {THEME.accent}; font-weight: bold; min-width: 36px;")
         merge_row.addWidget(self.merge_value_label)
 
         merge_layout.addLayout(merge_row)
@@ -2277,55 +3555,54 @@ class SignalTimelineWindow(QMainWindow):
         merge_hint.setWordWrap(True)
         merge_layout.addWidget(merge_hint)
 
-        merge_group.setLayout(merge_layout)
+        merge_group.setContentLayout(merge_layout)
+        # Header shows the live value so the folded section still reads at a glance.
+        merge_group.set_hint(self.merge_value_label.text())
+        self.merge_slider.valueChanged.connect(
+            lambda _=None, g=merge_group: g.set_hint(self.merge_value_label.text()))
         layout.addWidget(merge_group)
 
-        # Actions row: show ALL detections (default) vs only highlight-selected
-        self.only_highlight_actions_cb = QCheckBox("Show only highlight actions")
-        self.only_highlight_actions_cb.setChecked(False)
-        self.only_highlight_actions_cb.setToolTip(
-            "Off (default): the ACTIONS row shows every detected action.\n"
-            "On: only the actions selected into the highlight.\n"
-            "(Needs a re-analysis to populate the full list.)"
-        )
-        self.only_highlight_actions_cb.stateChanged.connect(self.on_only_highlight_actions_changed)
-        layout.addWidget(self.only_highlight_actions_cb)
+        # Waveform peak sensitivity — controls the ◀▶ arrows + amber markers on
+        # the AUDIO WAVEFORM row (jump between loud moments).
+        wpeak_group = CollapsibleSection(
+            "Waveform Peaks", expanded=False, settings_key="controls/wpeaks")
+        wpeak_layout = QVBoxLayout()
 
-        # Playback controls
-        playback_group = QGroupBox("Playback")
+        wpeak_row = QHBoxLayout()
+        wpeak_row.addWidget(QLabel("Sensitivity:"))
+
+        self.wpeak_slider = QSlider(Qt.Orientation.Horizontal)
+        self.wpeak_slider.setMinimum(0)
+        self.wpeak_slider.setMaximum(100)   # 0..100 % → sensitivity 0.0..1.0
+        init_pct = int(round(self.signal_scene.waveform_peak_sensitivity * 100))
+        self.wpeak_slider.setValue(init_pct)
+        self.wpeak_slider.setTickInterval(25)
+        self.wpeak_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.wpeak_slider.valueChanged.connect(self.on_wpeak_sensitivity_changed)
+        wpeak_row.addWidget(self.wpeak_slider)
+
+        self.wpeak_value_label = QLabel(f"{init_pct}%")
+        self.wpeak_value_label.setStyleSheet("color: #ffc400; font-weight: bold; min-width: 36px;")
+        wpeak_row.addWidget(self.wpeak_value_label)
+
+        wpeak_layout.addLayout(wpeak_row)
+
+        wpeak_hint = QLabel("Higher = only the loudest moments. Use ◀▶ on the "
+                            "AUDIO WAVEFORM row to jump between them.")
+        wpeak_hint.setStyleSheet("color: #888; font-size: 10px;")
+        wpeak_hint.setWordWrap(True)
+        wpeak_layout.addWidget(wpeak_hint)
+
+        wpeak_group.setContentLayout(wpeak_layout)
+        wpeak_group.set_hint(self.wpeak_value_label.text())
+        self.wpeak_slider.valueChanged.connect(
+            lambda _=None, g=wpeak_group: g.set_hint(self.wpeak_value_label.text()))
+        layout.addWidget(wpeak_group)
+
+        # Playback controls. The old Transcript/Search toggle buttons are gone:
+        # those panels are now tabs on the right dock area (see init_ui).
+        playback_group = CollapsibleSection("Playback", settings_key="controls/playback")
         playback_layout = QVBoxLayout()
-        
-        # Transcript toggle — connected later in init_ui once dock exists
-        self.transcript_toggle_btn = QPushButton("📝 Transcript")
-        self.transcript_toggle_btn.setCheckable(True)
-        self.transcript_toggle_btn.setStyleSheet("""
-            QPushButton {
-                background: #1a1a2e; color: #7a9acd;
-                border: 1px solid #3a3a5a; border-radius: 3px;
-                font-size: 10px; padding: 4px 8px;
-            }
-            QPushButton:checked {
-                background: #1a2a3f; color: #aac0ff;
-                border-color: #4a7fcd;
-            }
-        """)
-        playback_layout.addWidget(self.transcript_toggle_btn)
-
-        # Search toggle
-        self.search_toggle_btn = QPushButton("🔍 Search")
-        self.search_toggle_btn.setCheckable(True)
-        self.search_toggle_btn.setStyleSheet("""
-            QPushButton {
-                background: #1a1a2e; color: #7a9acd;
-                border: 1px solid #3a3a5a; border-radius: 3px;
-                font-size: 10px; padding: 4px 8px;
-            }
-            QPushButton:checked {
-                background: #1a2a3f; color: #aac0ff;
-                border-color: #4a7fcd;
-            }
-        """)
-        playback_layout.addWidget(self.search_toggle_btn)
 
         self.follow_playhead_checkbox = QCheckBox("Follow Playhead")
         self.follow_playhead_checkbox.setChecked(True)
@@ -2334,13 +3611,29 @@ class SignalTimelineWindow(QMainWindow):
         )
         self.follow_playhead_checkbox.stateChanged.connect(self.toggle_follow_playhead)
         playback_layout.addWidget(self.follow_playhead_checkbox)
-        
-        playback_group.setLayout(playback_layout)
 
-        layout.addWidget(playback_group)     
+        playback_group.setContentLayout(playback_layout)
+
+        layout.addWidget(playback_group)
         layout.addStretch()
-        
-        dock.setWidget(controls_widget)
+
+        # Scroll the controls instead of letting them set the dock's minimum
+        # height. Set directly, this column's ~600px of groups forced the whole
+        # top band that tall, which pushed the window past the screen bottom and
+        # hid the LLM chat behind the taskbar. Scrolling drops the floor to
+        # nothing, so the window can actually fit the screen.
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setFrameShape(QScrollArea.NoFrame)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setWidget(controls_widget)
+
+        # The scroll area removes the height floor (the point), but it also drops
+        # the width floor the content used to provide — without this the dock
+        # collapses to a sliver and the labels get clipped. Same pattern as the
+        # Search/Transcript docks.
+        dock.setMinimumWidth(260)
+        dock.setWidget(controls_scroll)
         return dock
     
     def open_confidence_filter(self):
@@ -2368,8 +3661,16 @@ class SignalTimelineWindow(QMainWindow):
             
             action_text = f"{len(visible_actions)}/{total_actions} actions"
             object_text = f"{len(visible_objects)}/{total_objects} objects"
-            
-            self.filter_summary.setText(f"Showing: {action_text}, {object_text}")
+
+            parts = [action_text, object_text]
+            # Only mentioned when the video actually has composed events, so the
+            # summary doesn't read "0/0 events" for everyone who never used rules.
+            events = getattr(self.signal_scene, 'visible_events', {})
+            if events:
+                shown = sum(1 for v in events.values() if v)
+                parts.append(f"{shown}/{len(events)} events")
+
+            self.filter_summary.setText("Showing: " + ", ".join(parts))
             self.confidence_label.setText(f"Actions: {self.signal_scene.min_action_confidence:.0%} | Objects: {self.signal_scene.min_object_confidence:.0%}")
 
             # Show which specific filters are active
@@ -2395,6 +3696,81 @@ class SignalTimelineWindow(QMainWindow):
                 self.current_filters_label.setText(" | ".join(filter_details))
             else:
                 self.current_filters_label.setText("No filters applied")
+
+    # ── swap a chosen clip for the next best one ───────────────────────
+    def _swap_session(self):
+        """The session for this cut, built on first use from the saved report.
+
+        Returns ``None`` — after saying why — when there is nothing to swap
+        from. Re-choosing needs the per-second score, and only the report keeps
+        it; a cut made before reports existed, or with the report deleted, can
+        still be viewed but not re-chosen.
+        """
+        session = getattr(self, "_highlight_swap_session", None)
+        if session is not None:
+            return session
+
+        from modules.highlight_swap import SwapSession, report_path_for
+
+        path = report_path_for(self.video_path)
+        if not path:
+            self._swap_message("No highlight report was found next to this video, "
+                               "so there is nothing to re-choose from. Run the "
+                               "highlighter again to write one.")
+            return None
+        try:
+            session = SwapSession.from_report(path)
+        except Exception as exc:
+            print(f"⚠️ Could not read {path}: {exc}")
+            self._swap_message(f"The highlight report could not be read:\n{exc}")
+            return None
+        if not session.usable:
+            self._swap_message("This report was written before the score was "
+                               "saved with it. Re-run the highlighter to enable "
+                               "swapping.")
+            return None
+
+        self._highlight_swap_session = session
+        return session
+
+    def _swap_message(self, text):
+        QMessageBox.information(self, "Swap clip", text)
+
+    def _apply_swapped_segments(self, session):
+        """Push the session's segments back into the timeline and redraw."""
+        self.cache_data['highlight_segments'] = [
+            [float(start), float(end)] for start, end in session.segments
+        ]
+        # The parallel score metadata no longer lines up with the segments, and
+        # a stale score under a swapped clip is worse than no score at all.
+        self.cache_data.pop('highlight_metadata', None)
+        self.signal_scene.highlight_swaps_done = len(session.rejected)
+        self.signal_scene.cache_data = self.cache_data
+        self.signal_scene.build_timeline()
+
+    def on_swap_highlight(self, index):
+        session = self._swap_session()
+        if session is None:
+            return
+        try:
+            replaced = session.segments[index]
+        except IndexError:
+            return
+        if not session.swap(index):
+            self._swap_message("There is no other moment left to offer for this "
+                               "clip — everything else is either already in the "
+                               "highlight or has been turned down.")
+            return
+        self._apply_swapped_segments(session)
+        print(f"🔀 Swapped highlight {index + 1} "
+              f"({replaced[0]:.1f}s–{replaced[1]:.1f}s) for another moment")
+
+    def on_undo_highlight_swap(self):
+        session = getattr(self, "_highlight_swap_session", None)
+        if session is None or not session.undo():
+            return
+        self._apply_swapped_segments(session)
+        print("↩ Undid the last highlight swap")
 
     def get_highlights_from_signal_data(self):
         """Extract highlights from signal timeline cache data"""
@@ -2562,6 +3938,24 @@ class SignalTimelineWindow(QMainWindow):
         if hasattr(self, 'signal_scene') and hasattr(self, '_pending_merge_value'):
             self.signal_scene.set_merge_threshold(self._pending_merge_value)
 
+    def on_wpeak_sensitivity_changed(self, value):
+        """Waveform-peak sensitivity slider (0..100 %), debounced so a drag
+        doesn't rebuild the timeline on every step."""
+        self.wpeak_value_label.setText(f"{value}%")
+
+        if not hasattr(self, '_wpeak_timer'):
+            self._wpeak_timer = QTimer()
+            self._wpeak_timer.setSingleShot(True)
+            self._wpeak_timer.timeout.connect(self._apply_wpeak_sensitivity)
+
+        self._pending_wpeak_value = value / 100.0
+        self._wpeak_timer.start(200)   # wait 200ms after last change
+
+    def _apply_wpeak_sensitivity(self):
+        """Apply the waveform-peak sensitivity after debounce."""
+        if hasattr(self, 'signal_scene') and hasattr(self, '_pending_wpeak_value'):
+            self.signal_scene.set_waveform_peak_sensitivity(self._pending_wpeak_value)
+
     def on_only_highlight_actions_changed(self, state):
         """Toggle the ACTIONS row between all detections and highlight-only."""
         if hasattr(self, 'signal_scene'):
@@ -2623,14 +4017,6 @@ class SignalTimelineWindow(QMainWindow):
         self.play_edit_btn.setText("▶ Play Edit")
         if hasattr(self, 'play_btn'):
             self.play_btn.setText("▶ Play")
-
-    def _get_active_audio_output(self):
-        """Return the QAudioOutput attached to whichever player is currently active."""
-        if self._active_player is self.video_player:
-            return getattr(self, 'audio_output', None)
-        if self.realtime_preview and self._active_player is self.realtime_preview.player:
-            return getattr(self.realtime_preview, 'audio_output', None)
-        return None
 
     @Slot(float)
     def on_time_dragged(self, time):
@@ -2831,7 +4217,7 @@ class SignalTimelineWindow(QMainWindow):
         if items:
             last = items[-1]
             original_pen = last.pen()
-            last.setPen(QPen(QColor(100, 230, 255), 3))
+            last.setPen(QPen(QColor(47, 129, 247), 3))
             QTimer.singleShot(400, lambda: self._safe_restore_pen(last, original_pen))
 
     def _safe_restore_pen(self, item, pen):
@@ -3050,7 +4436,7 @@ class SignalTimelineWindow(QMainWindow):
         """Update edit duration display"""
         total_duration = self.edit_scene.get_total_duration()
         self.edit_duration_label.setText(f"Edit duration: {total_duration:.1f}s")
-        self.statusBar().showMessage(f"Video duration: {self.video_duration:.1f}s | Total edit duration: {total_duration:.1f}s")
+        self._update_status()
     
     def find_signal_region_around(self, time):
         """Find meaningful region around clicked time, respecting filters"""
@@ -3105,21 +4491,29 @@ class SignalTimelineWindow(QMainWindow):
     def on_filter_dialog_closed(self):
         """Update filter summary when dialog closes"""
         self.update_filter_summary()
+        # The dialog's Events and Objects tabs write the same scene state as
+        # the Layers panel's nested checkboxes, so re-read both or they
+        # disagree — which is how a class hidden in one place comes back
+        # ticked in the other.
+        self.refresh_event_checkboxes()
+        self.refresh_object_checkboxes()
     
     def show_all_filters(self):
-        """Show all actions and objects with full confidence range"""
+        """Show all actions, objects and composed events, full confidence range"""
         if hasattr(self, 'signal_scene'):
             self.signal_scene.set_all_actions_visible(True)
             self.signal_scene.set_all_objects_visible(True)
+            self.signal_scene.set_all_events_visible(True)
             self.signal_scene.set_action_confidence_filter(0.0, 1.0)
             self.signal_scene.set_object_confidence_filter(0.0, 1.0)
             self.update_filter_summary()
     
     def hide_all_filters(self):
-        """Hide all actions and objects"""
+        """Hide all actions, objects and composed events"""
         if hasattr(self, 'signal_scene'):
             self.signal_scene.set_all_actions_visible(False)
             self.signal_scene.set_all_objects_visible(False)
+            self.signal_scene.set_all_events_visible(False)
             self.update_filter_summary()
     
     def update_filter_summary(self):
@@ -3133,8 +4527,16 @@ class SignalTimelineWindow(QMainWindow):
             
             action_text = f"{len(visible_actions)}/{total_actions} actions"
             object_text = f"{len(visible_objects)}/{total_objects} objects"
-            
-            self.filter_summary.setText(f"Showing: {action_text}, {object_text}")
+
+            parts = [action_text, object_text]
+            # Only mentioned when the video actually has composed events, so the
+            # summary doesn't read "0/0 events" for everyone who never used rules.
+            events = getattr(self.signal_scene, 'visible_events', {})
+            if events:
+                shown = sum(1 for v in events.values() if v)
+                parts.append(f"{shown}/{len(events)} events")
+
+            self.filter_summary.setText("Showing: " + ", ".join(parts))
             
             # Show which specific filters are active
             if len(visible_actions) < total_actions or len(visible_objects) < total_objects:
@@ -3471,9 +4873,11 @@ class SignalTimelineWindow(QMainWindow):
         self.render_highlight_btn.setEnabled(False)
         self.render_highlight_btn.setText("⏳ Rendering… 0%")
 
-        # Store for the callback
+        # Store for the callback. Read the combo on the main thread; the worker
+        # thread must not touch Qt widgets.
         self._render_output_path = output_path
         self._render_clips = clips
+        self._render_mode = self.render_mode_combo.currentData() or "cpu"
 
         import threading
 
@@ -3559,15 +4963,55 @@ class SignalTimelineWindow(QMainWindow):
 
         threading.Thread(target=render, daemon=True).start()
 
+    def _load_render_mode_default(self):
+        """Default video-output mode, read from the shared config.yaml
+        (highlights.render_mode) so the timeline viewer agrees with the main
+        GUI's Advanced-tab setting. Falls back to 'cpu' (VR-safe)."""
+        try:
+            import yaml
+            from modules.app_paths import config_path
+            with open(config_path("config.yaml"), "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            mode = (cfg.get("highlights", {}) or {}).get("render_mode", "cpu")
+            return mode if mode in ("cpu", "gpu") else "cpu"
+        except Exception:
+            return "cpu"
+
+    def _save_render_mode(self, mode):
+        """Persist the chosen video-output mode back to config.yaml so it
+        sticks and stays in sync with the main GUI. Best-effort."""
+        if mode not in ("cpu", "gpu"):
+            return
+        try:
+            import yaml
+            from modules.app_paths import config_path
+            p = config_path("config.yaml")
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+            except FileNotFoundError:
+                cfg = {}
+            cfg.setdefault("highlights", {})["render_mode"] = mode
+            with open(p, "w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+        except Exception as e:
+            print(f"⚠️ [timeline] could not persist render_mode: {e}")
+
     def _encoder_chain(self):
         """Video-encoder fallback chain for the render, delegated to the shared
         modules.encoder_select helper (also used by the pipeline) so the codec
         decision — GPU vendor via device_utils, HEVC-for-VR by resolution,
-        libx264 fallback — lives in one place. Cached per window."""
-        if hasattr(self, '_enc_chain'):
+        libx264 fallback — lives in one place. Cached per (window, mode).
+
+        Uses the mode chosen via the Video output combo ('cpu'/'gpu'), captured
+        on the main thread into self._render_mode before the worker starts."""
+        mode = getattr(self, "_render_mode", None) or (
+            self.render_mode_combo.currentData() if hasattr(self, "render_mode_combo") else "cpu")
+        if getattr(self, "_enc_chain_mode", None) == mode and hasattr(self, "_enc_chain"):
             return self._enc_chain
         from modules.encoder_select import encoder_chain
-        self._enc_chain = encoder_chain(self.video_path)
+        self._enc_chain = encoder_chain(self.video_path, mode=mode)
+        self._enc_chain_mode = mode
         return self._enc_chain
 
     @Slot(int)
@@ -3590,80 +5034,49 @@ class SignalTimelineWindow(QMainWindow):
             QMessageBox.critical(self, "Render Failed", message)
 
     def apply_dark_theme(self):
-        """Apply modern dark theme"""
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #0f0f18;
-            }
-            QGroupBox {
-                color: #d0e0ff;
-                border: 1px solid #3a3a50;
-                border-radius: 6px;
-                margin-top: 14px;
-                padding-top: 10px;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 6px;
-            }
-            QCheckBox {
-                color: #e0e8ff;
-                spacing: 8px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 3px;
-                border: 2px solid #4a4a6a;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #3a5fcd;
-                border: 2px solid #5a7fdd;
-            }
-            QPushButton {
-                background-color: #2a2a44;
-                color: white;
-                border: 1px solid #4a4a6a;
-                padding: 8px;
-                border-radius: 5px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #3a3a5c;
-            }
-            QPushButton:pressed {
-                background-color: #1a1a34;
-            }
-            QLabel {
-                color: #d0d8ff;
-            }
-            QSlider::groove:horizontal {
-                height: 8px;
-                background: #3a3a5a;
-                border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: #3a5fcd;
-                width: 18px;
-                margin: -5px 0;
-                border-radius: 9px;
-            }
-            QDockWidget {
-                color: #d0e0ff;
-                border: 1px solid #3a3a50;
-                border-radius: 6px;
-            }
-            QDockWidget::title {
-                background: #2a2a3a;
-                padding: 6px;
-                border-radius: 4px;
-            }
-            QStatusBar {
-                color: #ffffff;
-                background-color: rgba(40, 40, 50, 180);
-            }
+        """Window-specific chrome on top of the global theme (modules.ui.theme):
+        dock title bars, the right-column dock tabs, splitter handles and the
+        status bar. Base widgets (buttons, checkboxes, sliders, inputs) come
+        from the global stylesheet, so this no longer redefines them — the old
+        per-window copies here had drifted from the theme and gave this window
+        its own grey."""
+        p = THEME
+        self.setStyleSheet(f"""
+            QMainWindow {{ background-color: {p.bg}; }}
+            QMainWindow::separator {{
+                background: {p.bg};
+                width: 4px; height: 4px;
+            }}
+            QMainWindow::separator:hover {{ background: {p.accent}; }}
+
+            QDockWidget {{ color: {p.text_dim}; font-weight: 600; }}
+            QDockWidget::title {{
+                background: {p.surface};
+                padding: 6px 10px;
+                border-radius: {p.radius}px;
+            }}
+
+            /* Dock-area tabs (Controls / Search / Transcript): flat labels
+               with an accent underline on the active one. */
+            QTabBar::tab {{
+                background: transparent;
+                color: {p.text_dim};
+                padding: 6px 14px;
+                border: none;
+                border-bottom: 2px solid transparent;
+            }}
+            QTabBar::tab:hover {{ color: {p.text}; }}
+            QTabBar::tab:selected {{
+                color: {p.text};
+                border-bottom: 2px solid {p.accent};
+            }}
+
+            QStatusBar {{
+                background: {p.surface};
+                color: {p.text_dim};
+                border-top: 1px solid {p.border};
+            }}
+            QStatusBar::item {{ border: none; }}
         """)
 
 
@@ -3721,6 +5134,13 @@ def show_timeline_viewer(video_path, cache_data=None):
     if app is None:
         debug_log("  - Creating new QApplication")
         app = QApplication(sys.argv)
+        # Standalone launch: install the central theme ourselves. (When the
+        # pipeline/main GUI launches us the app already carries it.)
+        try:
+            from modules.ui import theme as _ui_theme
+            _ui_theme.apply(app)
+        except Exception as e:
+            debug_log(f"  ⚠️ Theme apply failed: {e}")
     else:
         debug_log("  - Using existing QApplication")
     

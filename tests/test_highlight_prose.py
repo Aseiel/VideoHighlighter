@@ -1,0 +1,1484 @@
+"""Tests for `modules.highlight_prose` — measurements turned into a sentence.
+
+The property worth protecting is restraint. A sentence may only say what a
+measurement supports, and an ordinary moment has to read as ordinary — a report
+that calls every clip outstanding carries exactly as much information as one
+that says nothing at all.
+"""
+
+from __future__ import annotations
+
+from modules.highlight_prose import (
+    EXCEPTIONAL,
+    describe,
+    describe_all,
+    describe_segment_reading,
+    explain_standout,
+    summarise_expression_arc,
+    summarise_run,
+    summarise_standouts,
+)
+
+
+def _entry(percentile=50.0, breakdown=None, present=None, score=10.0, **measured):
+    m = {"score_percentile": percentile}
+    m.update(measured)
+    return {
+        "breakdown": breakdown or {},
+        "signals_present": present or [],
+        "measured": m,
+        "score": score,
+        "start": 0.0,
+        "end": 10.0,
+    }
+
+
+# Peers stand in for the rest of the cut: standing is a comparison with them,
+# not with the whole video, which a selected clip always tops by construction.
+WEAK, MID, STRONG = [1.0, 2.0, 3.0, 4.0, 20.0], 10.0, 100.0
+
+
+class TestStanding:
+    def test_the_best_clip_in_the_cut_is_named(self):
+        peers = [1.0, 2.0, 3.0, 4.0, 100.0]
+        assert describe(_entry(score=100.0), peers).startswith(
+            "The strongest clip in this highlight")
+
+    def test_the_weakest_is_not_flattered(self):
+        peers = [1.0, 2.0, 3.0, 4.0, 100.0]
+        text = describe(_entry(score=1.0, breakdown={"object": 5.0},
+                               present=["object"]), peers)
+        assert "weaker clips" in text
+        assert "strongest" not in text
+
+    def test_ranking_is_against_the_cut_not_the_video(self):
+        """A kept clip tops its own video by construction; saying so is empty."""
+        entry = _entry(percentile=99.0, score=1.0)
+        assert "strongest" not in describe(entry, [1.0, 50.0, 90.0, 100.0])
+
+    def test_without_peers_no_ranking_is_claimed(self):
+        text = describe(_entry(percentile=99.0, breakdown={"object": 5.0},
+                               present=["object"]))
+        assert "strongest" not in text and "weaker" not in text
+
+    def test_a_cut_where_everything_tied_says_so(self):
+        assert "same as every other clip" in describe(
+            _entry(score=15.0), [15.0, 15.0, 15.0, 15.0])
+
+    def test_too_few_clips_to_rank(self):
+        """No ranking claim — but the share still leads the sentence."""
+        text = describe(_entry(score=5.0, percentile=50.0), [5.0, 6.0])
+        assert "strongest" not in text and "weaker" not in text
+        assert text.startswith("Outscored 50% of the video")
+
+
+class TestEvidence:
+    def test_signals_are_named_the_way_a_person_would(self):
+        text = describe(_entry(percentile=50.0,
+                               breakdown={"audio": 4.0, "face": 3.0},
+                               present=["audio", "face"]))
+        assert "a rise in sound" in text and "a facial expression" in text
+        assert "audio_peak_points" not in text
+
+    def test_a_single_signal_is_called_out_as_alone(self):
+        text = describe(_entry(percentile=50.0, breakdown={"object": 5.0},
+                               present=["object"]))
+        assert "alone" in text
+
+    def test_several_signals_are_not_called_alone(self):
+        text = describe(_entry(percentile=50.0,
+                               breakdown={"object": 5.0, "audio": 4.0},
+                               present=["object", "audio"]))
+        assert "alone" not in text
+
+
+class TestLoudness:
+    def test_a_loud_moment_says_so_with_the_figure(self):
+        text = describe(_entry(score=100.0, loudness_percentile=99.0,
+                               loudness_dbfs=-1.0), [1.0, 2.0, 100.0])
+        assert "loudest points" in text and "-1 dBFS" in text
+
+    def test_an_averagely_loud_moment_does_not_claim_to_be_loud(self):
+        text = describe(_entry(score=100.0, loudness_percentile=50.0,
+                               loudness_dbfs=-20.0), [1.0, 2.0, 100.0])
+        assert "loudest" not in text
+
+    def test_no_audio_measurement_means_no_claim_about_sound(self):
+        assert "dBFS" not in describe(_entry(score=100.0), [1.0, 2.0, 100.0])
+
+
+class TestAgreement:
+    def test_coinciding_signals_are_the_headline(self):
+        text = describe(_entry(score=100.0, present=["audio", "object"],
+                               signals_coincide=True,
+                               signal_spread_seconds=0.0), [1.0, 2.0, 100.0])
+        assert "landing on the same second" in text
+        assert "a rise in sound" in text, "name the signals, not just the count"
+
+    def test_a_gap_is_reported_as_a_gap(self):
+        text = describe(_entry(score=100.0, present=["audio", "object"],
+                               signals_coincide=True,
+                               signal_spread_seconds=3.0), [1.0, 2.0, 100.0])
+        assert "within 3s" in text
+
+    def test_signals_that_did_not_coincide_are_not_claimed_to_have(self):
+        text = describe(_entry(score=100.0, present=["audio", "object"],
+                               signals_coincide=False,
+                               signal_spread_seconds=20.0), [1.0, 2.0, 100.0])
+        assert "not at the same instant" in text
+
+    def test_one_signal_makes_no_agreement_claim(self):
+        text = describe(_entry(score=100.0, present=["object"]), [1.0, 2.0, 100.0])
+        assert "landing on the same second" not in text
+
+
+class TestSentenceShape:
+    def test_the_ranking_and_the_evidence_are_separate_sentences(self):
+        """Was one sentence; four clauses on one breath went unread.
+
+        The seam falls after the ranking because that is where the thought
+        changes: where this clip stands, then what it was chosen on.
+        """
+        text = describe(_entry(score=100.0, present=["audio", "object"],
+                               signals_coincide=True, signal_spread_seconds=0.0,
+                               loudness_percentile=99.0, loudness_dbfs=-2.0),
+                        [1.0, 2.0, 100.0])
+        assert ". Chosen on " in text
+        assert text.endswith(".")
+        # Neither half should be a paragraph in disguise.
+        for part in text.split(". "):
+            assert len(part.split()) <= 25
+
+    def test_a_single_clause_stays_a_single_sentence(self):
+        text = describe(_entry(score=100.0), [1.0, 2.0, 100.0])
+        assert "Chosen on" not in text
+        assert text.endswith(".")
+
+    def test_detected_names_are_never_sentence_cased(self):
+        """Splitting further and capitalising each clause rewrote the data.
+
+        A detected name is the detector's output, not prose — "jumping" must
+        not come back as "Jumping" because it happened to land where a sentence
+        started.
+        """
+        entry = _entry(score=100.0)
+        entry["actions"] = [{"name": "jumping", "confidence": 0.88, "tier": None}]
+        text = describe(entry, [1.0, 2.0, 100.0])
+        assert "jumping recognised at 0.88" in text
+        assert "Jumping" not in text
+
+    def test_an_empty_entry_produces_nothing_rather_than_a_guess(self):
+        assert describe({"measured": {}, "breakdown": {}}) == ""
+
+
+class TestRunSummary:
+    def _report(self, scores, percentiles=None, duration=600.0):
+        percentiles = percentiles or [50.0] * len(scores)
+        return {
+            "video": {"duration": duration},
+            "segments": [
+                {"score": s, "start": i * 60.0, "end": i * 60.0 + 10.0,
+                 "measured": {"score_percentile": p}}
+                for i, (s, p) in enumerate(zip(scores, percentiles))
+            ],
+        }
+
+    def test_an_all_tied_run_says_the_ranking_had_nothing_to_work_with(self):
+        text = summarise_run(self._report([15.0, 15.0, 15.0, 15.0]))
+        assert "scored identically" in text
+        assert "arbitrary" in text
+
+    def test_a_varied_run_reports_the_spread(self):
+        text = summarise_run(self._report([20.0, 10.0, 5.0],
+                                          percentiles=[99.0, 95.0, 20.0]))
+        assert "above the weakest" in text
+
+    def test_it_does_not_claim_clips_were_exceptional(self):
+        """Every kept clip beat the video — saying so tells the reader nothing."""
+        text = summarise_run(self._report([20.0, 10.0, 5.0],
+                                          percentiles=[99.0, 99.0, 99.0]))
+        assert "strongest in the video" not in text
+
+    def test_describe_all_ranks_each_against_the_others(self):
+        rep = self._report([100.0, 50.0, 1.0, 2.0, 3.0])
+        lines = describe_all(rep)
+        assert "strongest clip" in lines[0]
+        assert "weaker clips" in lines[2]
+
+    def test_it_reports_how_much_of_the_video_was_drawn_from(self):
+        assert "%" in summarise_run(self._report([20.0, 10.0],
+                                                 percentiles=[99.0, 20.0]))
+
+    def test_nothing_selected_says_so(self):
+        assert summarise_run({"segments": []}) == "Nothing was selected."
+
+    def test_two_identical_clips_are_not_called_a_tied_run(self):
+        """Two is too few to conclude the ranking failed."""
+        assert "identically" not in summarise_run(self._report([15.0, 15.0]))
+
+
+class TestTies:
+    """A tie is information about the scoring, not a rank for the clip."""
+
+    def test_a_clip_tied_with_most_of_the_cut_is_not_called_weaker(self):
+        """The reported bug: 15 clips at 15.0 and one at 10.0 had the fifteen
+        top scorers described as the ones that scraped in."""
+        peers = [15.0] * 15 + [10.0]
+        text = describe(_entry(score=15.0), peers)
+        assert "weaker" not in text
+        assert "same as most of the other clips" in text
+
+    def test_the_genuinely_lower_clip_is_still_marked(self):
+        peers = [15.0] * 15 + [10.0]
+        assert "weaker" in describe(_entry(score=10.0), peers)
+
+    def test_a_small_tie_group_is_still_ranked(self):
+        peers = [1.0, 2.0, 3.0, 10.0, 10.0]
+        assert "same as most" not in describe(_entry(score=10.0), peers)
+
+    def test_an_ordinary_clip_is_not_called_weak(self):
+        peers = [1.0, 5.0, 10.0, 15.0, 20.0]
+        assert "weaker" not in describe(_entry(score=10.0), peers)
+
+
+class TestVideoShare:
+    """The number people look for first belongs in the sentence."""
+
+    def test_every_clip_states_what_it_outscored(self):
+        peers = [15.0] * 15 + [10.0]
+        for score in (15.0, 10.0):
+            text = describe(_entry(score=score, percentile=89.0), peers)
+            assert "outscored 89% of the video" in text
+
+    def test_it_is_there_even_when_nothing_else_is(self):
+        text = describe(_entry(score=15.0, percentile=94.0), [15.0] * 4)
+        assert "outscored 94% of the video" in text
+
+    def test_a_low_share_is_reported_just_as_plainly(self):
+        """Much of the video scoring comparably is worth knowing too."""
+        peers = [15.0] * 15 + [10.0]
+        assert "outscored 31% of the video" in describe(
+            _entry(score=15.0, percentile=31.0), peers)
+
+    def test_a_record_without_the_measurement_makes_no_claim(self):
+        entry = {"breakdown": {"object": 5.0}, "signals_present": ["object"],
+                 "measured": {}, "score": 5.0}
+        assert "outscored" not in describe(entry, [5.0, 6.0, 7.0])
+
+    def test_it_leads_the_evidence(self):
+        peers = [1.0, 2.0, 100.0]
+        text = describe(_entry(score=100.0, percentile=97.0,
+                               breakdown={"object": 5.0}, present=["object"]),
+                        peers)
+        assert text.index("outscored") < text.index("what was on screen")
+
+
+class TestConfidence:
+    """Points are identical whether the detector was certain or guessing."""
+
+    PEERS = [1.0, 2.0, 100.0]
+
+    def test_the_detector_confidence_is_stated(self):
+        text = describe(_entry(score=100.0, detection_confidence=0.94), self.PEERS)
+        assert "its strongest detection at 0.94" in text
+
+    def test_a_weak_detection_is_reported_just_as_plainly(self):
+        text = describe(_entry(score=100.0, detection_confidence=0.31), self.PEERS)
+        assert "0.31" in text
+
+    def test_an_action_is_named_with_its_confidence(self):
+        entry = _entry(score=100.0)
+        entry["actions"] = [{"name": "jumping", "confidence": 0.88, "tier": None}]
+        assert "jumping recognised at 0.88" in describe(entry, self.PEERS)
+
+    def test_the_confidence_tier_is_carried_through(self):
+        entry = _entry(score=100.0)
+        entry["actions"] = [{"name": "jumping", "confidence": 0.9, "tier": "bonus"}]
+        assert "(bonus)" in describe(entry, self.PEERS)
+
+    def test_the_strongest_action_is_the_one_reported(self):
+        entry = _entry(score=100.0)
+        entry["actions"] = [{"name": "weak", "confidence": 0.4, "tier": None},
+                            {"name": "strong", "confidence": 0.9, "tier": None}]
+        text = describe(entry, self.PEERS)
+        assert "strong" in text and "weak recognised" not in text
+
+    def test_an_action_is_preferred_over_a_box(self):
+        """It carries a tier and a name; a box confidence carries neither."""
+        entry = _entry(score=100.0, detection_confidence=0.94)
+        entry["actions"] = [{"name": "jumping", "confidence": 0.5, "tier": None}]
+        text = describe(entry, self.PEERS)
+        assert "jumping" in text and "strongest detection" not in text
+
+    def test_no_confidence_recorded_means_no_claim(self):
+        assert "detection at" not in describe(_entry(score=100.0), self.PEERS)
+
+
+# ---------------------------------------------------------------------------
+# The comparative reading: what was on screen, against the rest of the video.
+# ---------------------------------------------------------------------------
+
+def _subject(name="dog", **over):
+    subject = {
+        "name": name,
+        "at": 30,
+        "frame_share": 4.0,
+        "frame_share_percentile": 50.0,
+        "stretches": 40,
+        "stretch_seconds": 12,
+        "enough_samples": True,
+        "detections": 400,
+        "clip_presence_pct": 90.0,
+        "confidence": 0.9,
+        "prevalence_pct": 60.0,
+    }
+    subject.update(over)
+    return subject
+
+
+def _relative(**over):
+    relative = {"reference": "person", "at": 30, "ratio": 2.0,
+                "percentile": 96.0, "median": 1.0, "seconds_together": 240,
+                "stretches": 20, "stretch_seconds": 12, "enough_samples": True}
+    relative.update(over)
+    return relative
+
+
+def _expression(**over):
+    expression = {"label": "surprise", "at": 30, "confidence": 0.88,
+                  "confidence_percentile": 50.0, "stretches": 20,
+                  "stretch_seconds": 12, "seconds_read": 10,
+                  "clip_share_pct": 20.0, "video_share_pct": 20.0, "lift": 1.0,
+                  "label_samples": 40, "enough_samples": True,
+                  "video_dominant": "neutral", "video_dominant_share_pct": 80.0}
+    expression.update(over)
+    return expression
+
+
+def _compared(subjects=(), expression=None, timestamp="1:30"):
+    comparison = {}
+    if subjects:
+        comparison["subjects"] = list(subjects)
+    if expression:
+        comparison["expression"] = expression
+    return {"timestamp": timestamp, "score": 10.0,
+            "measured": {"comparison": comparison}}
+
+
+class TestSubjectFindings:
+    def test_an_ordinary_subject_says_nothing_at_all(self):
+        """The common case, and the one that keeps the section worth reading."""
+        assert explain_standout(_compared([_subject()])) == []
+
+    def test_a_ratio_against_something_in_frame_names_both_and_its_sample(self):
+        entry = _compared([_subject(relative=_relative())])
+        line = explain_standout(entry)[0]
+        assert "2.0× the area of the person" in line
+        assert "96% of this video's 12s stretches" in line
+        assert "a usual 1.0×" in line
+
+    def test_an_area_ratio_is_never_left_to_read_as_a_length(self):
+        """A box with twice the area is about 1.4 times as long, not twice.
+
+        "2.0×" on its own is read as the second thing every time, which turns a
+        correct measurement into an overstatement of roughly forty percent. Both
+        numbers go in the sentence, each named.
+        """
+        line = explain_standout(_compared([_subject(relative=_relative())]))[0]
+        assert "2.0× the area" in line and "1.4× across" in line
+
+    def test_bare_frame_share_admits_it_cannot_see_the_camera(self):
+        """The claim is weaker than it sounds, so the sentence has to say so."""
+        entry = _compared([_subject(frame_share_percentile=95.0)])
+        line = explain_standout(entry)[0]
+        assert "fills 4.0% of the frame" in line
+        assert "camera simply moves closer" in line
+
+    def test_a_ratio_is_preferred_over_frame_share_when_both_are_high(self):
+        entry = _compared([_subject(frame_share_percentile=95.0,
+                                    relative=_relative())])
+        line = explain_standout(entry)[0]
+        assert "2.0× the area of the person" in line
+        assert "fills" not in line
+
+    def test_too_few_detections_means_no_claim(self):
+        entry = _compared([_subject(frame_share_percentile=99.0,
+                                    stretches=2, enough_samples=False)])
+        assert explain_standout(entry) == []
+
+    def test_a_thinly_observed_pairing_makes_no_ratio_claim(self):
+        entry = _compared([_subject(
+            relative=_relative(percentile=99.0, stretches=2,
+                               enough_samples=False))])
+        assert explain_standout(entry) == []
+
+    def test_a_rare_class_is_worth_saying_on_its_own(self):
+        entry = _compared([_subject(prevalence_pct=3.0)])
+        assert "only 3% of the video's detected seconds" in explain_standout(entry)[0]
+
+    def test_rarity_is_not_gated_behind_the_size_comparison(self):
+        """The gate that would have made the finding impossible to reach.
+
+        A class the video barely shows has, by definition, few stretches to be
+        size-ranked against. Holding rarity to that count means the only classes
+        that can be called rare are the ones that are not.
+        """
+        entry = _compared([_subject(prevalence_pct=2.0, stretches=2,
+                                    enough_samples=False)])
+        assert "only 2% of the video's detected seconds" in explain_standout(entry)[0]
+
+    def test_a_class_seen_only_twice_is_unconfirmed_not_rare(self):
+        entry = _compared([_subject(prevalence_pct=1.0, detections=2)])
+        assert explain_standout(entry) == []
+
+    def test_a_flicker_carries_the_share_of_the_clip_it_held(self):
+        entry = _compared([_subject(relative=_relative(),
+                                    clip_presence_pct=6.0)])
+        assert "present for only 6% of the clip" in explain_standout(entry)[0]
+
+    def test_a_size_claim_on_a_doubtful_box_carries_the_number(self):
+        entry = _compared([_subject(relative=_relative(), confidence=0.38)])
+        assert "on a 0.38 detection" in explain_standout(entry)[0]
+
+
+class TestExpressionFindings:
+    def test_an_unremarkable_expression_says_nothing(self):
+        assert explain_standout(_compared(expression=_expression())) == []
+
+    def test_a_label_far_above_its_video_rate_is_reported_with_both_shares(self):
+        entry = _compared(expression=_expression(clip_share_pct=80.0,
+                                                 video_share_pct=8.0, lift=10.0))
+        line = explain_standout(entry)[0]
+        assert "80% of this clip" in line and "8% of the video" in line
+        assert "10.0×" in line
+
+    def test_the_claim_is_about_the_classifier_not_the_person(self):
+        """Five coarse classes and no notion of intensity cannot support more.
+
+        The wording is the safeguard: a reader told what the model reported can
+        discount it, a reader told what someone felt cannot.
+        """
+        entry = _compared(expression=_expression(lift=5.0, clip_share_pct=50.0,
+                                                 video_share_pct=10.0))
+        line = explain_standout(entry)[0]
+        assert line.startswith("The expression classifier read")
+        assert " is surprised" not in line and " was surprised" not in line
+
+    def test_a_strong_reading_is_ranked_against_that_label_alone(self):
+        entry = _compared(expression=_expression(confidence_percentile=97.0))
+        line = explain_standout(entry)[0]
+        assert "stronger than in 97% of this video's other 12s stretches" in line
+
+    def test_a_label_the_video_barely_shows_supports_no_claim(self):
+        entry = _compared(expression=_expression(lift=20.0, label_samples=2,
+                                                 enough_samples=False))
+        assert explain_standout(entry) == []
+
+    def test_what_the_video_mostly_reads_as_is_the_context_offered(self):
+        entry = _compared(expression=_expression(lift=6.0, clip_share_pct=60.0,
+                                                 video_share_pct=10.0))
+        assert "mostly neutral (80%)" in explain_standout(entry)[0]
+
+
+class TestRunLevelStandouts:
+    def test_the_clip_each_axis_singled_out_is_named_by_time(self):
+        report = {"segments": [
+            _compared([_subject()], timestamp="0:10"),
+            _compared([_subject(relative=_relative(percentile=99.0))],
+                      expression=_expression(lift=9.0), timestamp="4:20"),
+        ]}
+        line = summarise_standouts(report)
+        assert "4:20" in line and "0:10" not in line
+        assert "this video only" in line
+
+    def test_nothing_unusual_produces_no_sentence(self):
+        report = {"segments": [_compared([_subject()], expression=_expression())]}
+        assert summarise_standouts(report) == ""
+
+    def test_a_report_without_comparisons_is_not_an_error(self):
+        assert summarise_standouts({"segments": [{"score": 1.0}]}) == ""
+
+
+# ---------------------------------------------------------------------------
+# The video-level expression reading.
+# ---------------------------------------------------------------------------
+
+def _analysis(**over):
+    analysis = {
+        "coverage": {"read_seconds": 900, "duration": 1800.0, "pct": 50.0},
+        "labels": {"sad": {"seconds": 500, "share_pct": 55.6,
+                           "mean_confidence": 0.71},
+                   "happy": {"seconds": 400, "share_pct": 44.4,
+                             "mean_confidence": 0.8}},
+        "valence": {"mean": -0.2, "mean_all_read": -0.1, "positive_pct": 44.4,
+                    "negative_pct": 55.6, "unvalenced_pct": 0.0},
+        "stability": {"runs": 20, "mean_run_seconds": 45.0},
+        "arc": {"direction": "flat", "change": 0.0, "fit": 0.0,
+                "confident": False, "buckets_used": 12},
+        "shift": {},
+        "episodes": [],
+        "dispersion": {},
+        "reliability": {"level": "unflagged", "reasons": []},
+    }
+    analysis.update(over)
+    return analysis
+
+
+class TestExpressionArcProse:
+    def test_coverage_leads_because_every_share_below_depends_on_it(self):
+        lines = summarise_expression_arc(_analysis())
+        assert lines[0].startswith("A face was readable in 50% of the video")
+
+    def test_the_balance_is_given_as_a_ratio_a_person_can_hold(self):
+        analysis = _analysis(valence={"mean": -0.5, "mean_all_read": -0.3,
+                                      "positive_pct": 10.0, "negative_pct": 52.0,
+                                      "unvalenced_pct": 12.0})
+        assert any("5.2 to 1 negative" in line
+                   for line in summarise_expression_arc(analysis))
+
+    def test_a_near_even_split_is_not_dressed_up_as_a_ratio(self):
+        """55 against 44 is not "1.3 to 1", it is a video with no lean."""
+        assert any("about evenly split" in line
+                   for line in summarise_expression_arc(_analysis()))
+
+    def test_surprise_is_declared_as_counted_on_neither_side(self):
+        analysis = _analysis(valence={"mean": -0.2, "mean_all_read": -0.1,
+                                      "positive_pct": 30.0, "negative_pct": 50.0,
+                                      "unvalenced_pct": 20.0})
+        assert any("carries no direction" in line
+                   for line in summarise_expression_arc(analysis))
+
+    def test_a_split_is_reported_with_the_time_it_happens(self):
+        analysis = _analysis(shift={"at": 605.0, "before": -0.02, "after": -0.33,
+                                    "change": -0.31,
+                                    "direction": "toward negative"})
+        assert any("changes most at 10:05" in line
+                   for line in summarise_expression_arc(analysis))
+
+    def test_a_poorly_fitted_slope_is_not_stated_as_a_trend(self):
+        """The number that would otherwise be quoted as a finding.
+
+        A slope through a scatter is the easiest misleading sentence this
+        module could write, so the weak-fit case has to say so in the sentence
+        rather than leave the R² in a field nobody reads.
+        """
+        analysis = _analysis(arc={"direction": "toward negative", "change": -0.24,
+                                  "fit": 0.16, "confident": False,
+                                  "buckets_used": 12})
+        line = next(l for l in summarise_expression_arc(analysis) if "slope" in l)
+        assert "explains only 16%" in line
+        assert "not as a trend" in line
+
+    def test_a_well_fitted_slope_is_stated_plainly(self):
+        analysis = _analysis(arc={"direction": "toward positive", "change": 0.5,
+                                  "fit": 0.8, "confident": True,
+                                  "start_valence": -0.2, "end_valence": 0.3,
+                                  "buckets_used": 12})
+        assert any("drift runs toward positive" in line
+                   for line in summarise_expression_arc(analysis))
+
+    def test_negative_stretches_are_listed_as_places_to_look(self):
+        analysis = _analysis(episodes=[
+            {"start": 2870.0, "end": 2939.0, "seconds": 69.0, "sign": -1,
+             "valence": -0.79, "dominant": "sad", "read_seconds": 60},
+        ])
+        assert any("47:50–48:59" in line
+                   for line in summarise_expression_arc(analysis))
+
+    def test_every_reliability_reason_is_surfaced(self):
+        analysis = _analysis(reliability={"level": "low",
+                                          "reasons": ["only 9% had a face"]})
+        assert any(line.startswith("Caution: only 9% had a face")
+                   for line in summarise_expression_arc(analysis))
+
+    def test_the_frame_is_always_the_last_word(self):
+        """Not a disclaimer bolted on — the accurate description of the data.
+
+        It is last because that is the sentence the reader keeps, and it is
+        unconditional because there is no configuration of these numbers that
+        makes a label distribution into a record of an experience.
+        """
+        for analysis in (_analysis(), _analysis(reliability={"level": "low",
+                                                            "reasons": ["x"]})):
+            last = summarise_expression_arc(analysis)[-1]
+            assert "not what anyone felt" in last
+            assert "performed expression from a felt one" in last
+
+    def test_nothing_scanned_produces_nothing(self):
+        assert summarise_expression_arc({}) == []
+
+
+class TestSegmentReading:
+    def test_a_clip_matching_the_video_is_called_ordinary(self):
+        row = {"valence": -0.3, "delta": -0.02, "dominant": "sad",
+               "read_seconds": 10}
+        assert "in line with the rest" in describe_segment_reading(row, -0.28)
+
+    def test_a_clip_running_against_the_file_is_named_as_such(self):
+        row = {"valence": 0.4, "delta": 0.68, "dominant": "happy",
+               "read_seconds": 10}
+        assert "more positive than the video's own average" in \
+            describe_segment_reading(row, -0.28)
+
+    def test_a_clip_with_no_reading_says_nothing(self):
+        assert describe_segment_reading({"read_seconds": 0}) == ""
+
+
+class TestEffectSize:
+    """A rank without a magnitude is a true sentence that misleads.
+
+    Classes whose boxes overlap the same region of the frame sit at ratios near
+    1.0 to each other by construction, and the largest of those is still the
+    largest — 98th percentile on an eight-percent difference. The percentile is
+    correct and the sentence it licenses is worthless, so the claim needs both.
+    """
+
+    def test_a_top_ranked_but_tiny_difference_is_not_narrated(self):
+        entry = _compared([_subject(relative=_relative(
+            ratio=1.14, median=1.10, percentile=98.0))])
+        assert explain_standout(entry) == []
+
+    def test_a_real_difference_at_the_same_rank_is(self):
+        entry = _compared([_subject(relative=_relative(
+            ratio=5.60, median=1.10, percentile=98.0))])
+        assert "5.6× the area" in explain_standout(entry)[0]
+
+    def test_being_unusually_small_also_counts_as_a_difference(self):
+        entry = _compared([_subject(relative=_relative(
+            ratio=0.40, median=1.10, percentile=95.0))])
+        assert explain_standout(entry) != []
+
+    def test_a_big_ratio_that_is_simply_normal_here_is_not_a_finding(self):
+        """8.0x sounds enormous; if the video's median is 8.0 it is the baseline."""
+        entry = _compared([_subject(relative=_relative(
+            ratio=8.10, median=8.00, percentile=99.0))])
+        assert explain_standout(entry) == []
+
+
+class TestClassConditionedProse:
+    def test_a_flat_result_says_so_and_blocks_the_attribution(self):
+        """The sentence that stops a file-wide number being read as a cause."""
+        analysis = _analysis(by_class=[
+            {"name": "dog", "read_seconds": 554, "valence": -0.299,
+             "delta": 0.001, "distinguishable": False, "dominant": "sad",
+             "shares": {}},
+        ])
+        line = next(l for l in summarise_expression_arc(analysis)
+                    if "No detected class" in l)
+        assert "dog +0.00 over 554s" in line
+        assert "cannot be attributed" in line
+
+    def test_a_real_difference_is_stated_without_claiming_a_cause(self):
+        analysis = _analysis(by_class=[
+            {"name": "dog", "read_seconds": 300, "valence": 0.40,
+             "delta": 0.50, "distinguishable": True, "dominant": "happy",
+             "shares": {}},
+        ])
+        line = next(l for l in summarise_expression_arc(analysis)
+                    if "While dog is on screen" in l)
+        assert "more positive" in line
+        assert "what caused the difference is not" in line
+
+    def test_no_breakdown_adds_no_lines(self):
+        assert not any("No detected class" in l
+                       for l in summarise_expression_arc(_analysis()))
+
+
+# --- loudness prose ---------------------------------------------------------
+
+def test_describe_loudest_reaches_for_a_strong_word_only_when_earned():
+    from modules.highlight_prose import describe_loudest
+    far = describe_loudest({"loudest": {"timestamp": "47:58", "vs_video_db": 23.7,
+                                        "classes": ["class_a"]}})
+    mild = describe_loudest({"loudest": {"timestamp": "12:00", "vs_video_db": 5.0,
+                                         "classes": ["class_a"]}})
+    flat = describe_loudest({"loudest": {"timestamp": "12:00", "vs_video_db": 1.0,
+                                         "classes": ["class_a"]}})
+    assert "far above" in far
+    assert "a little above" in mild
+    assert "about as loud as the video usually is" in flat
+
+
+def test_describe_loudest_says_loud_never_why():
+    """The sentence must not name a cause: the same signature covers several."""
+    from modules.highlight_prose import describe_loudest
+    said = describe_loudest({"loudest": {"timestamp": "47:58", "vs_video_db": 23.7,
+                                         "classes": ["class_a"]}})
+    assert "on screen at that second" in said
+    for invented in ("pleasure", "enjoy", "pain", "because", "reacting"):
+        assert invented not in said.lower()
+
+
+def test_describe_loudest_agrees_with_its_subject():
+    from modules.highlight_prose import describe_loudest
+    one = describe_loudest({"loudest": {"timestamp": "1:00", "vs_video_db": 20.0,
+                                        "classes": ["class_a"]}})
+    many = describe_loudest({"loudest": {"timestamp": "1:00", "vs_video_db": 20.0,
+                                         "classes": ["class_a", "class_b"]}})
+    assert "class_a was on screen" in one
+    assert "were on screen" in many
+
+
+def test_describe_loudest_admits_an_unlabelled_peak():
+    from modules.highlight_prose import describe_loudest
+    said = describe_loudest({"loudest": {"timestamp": "1:00", "vs_video_db": 20.0,
+                                         "classes": []}})
+    assert "Nothing was labelled at that second." in said
+    assert describe_loudest({}) == ""
+
+
+def test_level_summary_refuses_to_rank_inside_the_margin():
+    from modules.highlight_prose import summarise_level_by_class
+    lines = summarise_level_by_class({
+        "classes": [{"name": "class_a"}, {"name": "class_b"}],
+        "comparison": {"louder": "class_a", "quieter": "class_b",
+                       "median_difference_db": 1.14, "min_detectable_db": 4.14,
+                       "pairs": 10, "resolvable": False},
+    })
+    body = " ".join(lines)
+    assert "inside the margin" in body
+    assert "indistinguishable in this video" in body
+    assert "not the same as saying they would be in another" in body
+
+
+def test_level_summary_states_the_difference_when_it_is_real():
+    from modules.highlight_prose import summarise_level_by_class
+    lines = summarise_level_by_class({
+        "classes": [{"name": "class_a"}, {"name": "class_b"}],
+        "comparison": {"louder": "class_a", "quieter": "class_b",
+                       "median_difference_db": 8.2, "min_detectable_db": 3.0,
+                       "pairs": 12, "resolvable": True},
+    })
+    body = " ".join(lines)
+    assert "consistently louder during class_a" in body
+    assert "not just a matter of where in the video" in body
+
+
+def test_level_summary_always_carries_the_limit():
+    """However the comparison lands, the prose must say what it does not measure."""
+    from modules.highlight_prose import summarise_level_by_class
+    for resolvable in (True, False):
+        lines = summarise_level_by_class({
+            "classes": [{"name": "a"}, {"name": "b"}],
+            "comparison": {"louder": "a", "quieter": "b",
+                           "median_difference_db": 5.0, "min_detectable_db": 1.0,
+                           "pairs": 9, "resolvable": resolvable},
+        })
+        assert "measures how loud, not why" in " ".join(lines)
+    assert summarise_level_by_class({}) == []
+
+
+# --- why a chapter contributed nothing --------------------------------------
+
+def _unselected(**kw):
+    from modules.highlight_prose import describe_chapter
+    base = {"clips": 0}
+    base.update(kw)
+    return " ".join(describe_chapter(base))
+
+
+def test_a_chapter_that_never_scored_is_not_a_weighting_problem():
+    said = _unselected(score_peak=0.0, cut_threshold=18.0)
+    assert "no detector fired in this stretch" in said
+    assert "invisible to what was run" in said
+    # Must not send the reader to the weight table for a problem it cannot fix.
+    assert "Raising" not in said
+
+
+def test_a_chapter_under_the_bar_names_the_gap_and_the_weights():
+    said = _unselected(score_peak=11.0, score_peak_second=872,
+                       cut_threshold=18.0,
+                       signals_present=["loudness_burst", "object"])
+    assert "scored 11 at 14:32" in said
+    assert "against 18" in said
+    assert "short by 7" in said
+    # Human labels, not internal keys — the reader tunes by what the table says.
+    assert "Loudness burst" in said and "Objects" in said
+    assert "loudness_burst" not in said
+
+
+def test_a_near_miss_says_so_only_when_it_is_near():
+    close = _unselected(score_peak=17.0, cut_threshold=18.0,
+                        signals_present=["object"])
+    far = _unselected(score_peak=6.0, cut_threshold=18.0,
+                      signals_present=["object"])
+    assert "Came close" in close
+    assert "Came close" not in far
+
+
+def test_a_chapter_that_cleared_the_bar_lost_to_length_not_score():
+    said = _unselected(score_peak=24.0, score_peak_second=2100,
+                       cut_threshold=18.0, signals_present=["object"])
+    assert "lost to length rather than to score" in said
+    assert "cut filled up before it" in said
+    # The opposite advice from the under-the-bar case, and it must not appear.
+    assert "would bring this stretch in" not in said
+
+
+def test_a_scoring_chapter_with_no_named_signal_asks_for_a_detector():
+    said = _unselected(score_peak=6.0, cut_threshold=18.0, signals_present=[])
+    assert "no weight to raise" in said
+    assert "needs a detector it does not have" in said
+
+
+def test_without_score_data_it_says_only_what_it_knows():
+    said = _unselected()
+    assert said.strip() == "Nothing from this chapter was selected."
+
+
+# --- relating the marked seconds to each other ------------------------------
+
+def _marks(motion, loud):
+    return {"motion_peak": {"second": motion, "timestamp": f"{motion//60}:{motion%60:02d}"},
+            "loudest": {"second": loud, "timestamp": f"{loud//60}:{loud%60:02d}"}}
+
+
+def test_the_order_of_the_two_marked_seconds_is_stated():
+    from modules.highlight_prose import describe_signal_relations
+    said = describe_signal_relations(_marks(1719, 1728))
+    assert "Movement stopped first" in said
+    assert "9s later" in said
+    # Order, never cause: one clip cannot tell a sequence from a coincidence.
+    for invented in ("because", "caused", "triggered", "in response"):
+        assert invented not in said.lower()
+
+
+def test_the_reverse_order_is_reported_as_such():
+    from modules.highlight_prose import describe_signal_relations
+    said = describe_signal_relations(_marks(1730, 1720))
+    assert "loudest point came first" in said
+
+
+def test_near_simultaneous_marks_are_not_called_a_sequence():
+    from modules.highlight_prose import describe_signal_relations
+    said = describe_signal_relations(_marks(1728, 1729))
+    assert "landed together" in said
+    assert "later" not in said
+
+
+def test_marks_far_apart_are_refused_as_a_sequence():
+    """Half a minute of unexamined footage between them is not 'one then the other'."""
+    from modules.highlight_prose import describe_signal_relations
+    said = describe_signal_relations(_marks(1600, 1728))
+    assert "separate events" in said
+
+
+def test_one_mark_alone_relates_to_nothing():
+    from modules.highlight_prose import describe_signal_relations
+    assert describe_signal_relations({"loudest": {"second": 10}}) == ""
+    assert describe_signal_relations({}) == ""
+
+
+def test_a_repeated_ordering_across_clips_becomes_a_finding():
+    from modules.highlight_prose import summarise_signal_relations
+    clips = [_marks(100, 109), _marks(200, 206), _marks(300, 312),
+             _marks(400, 405), _marks(500, 511)]
+    said = summarise_signal_relations(clips)
+    assert "5 of 5 clips" in said
+    assert "after movement has stopped" in said
+    # Still declines to say what it means.
+    assert "matter for whoever watches it" in said
+
+
+def test_clips_that_disagree_produce_no_pattern_claim():
+    from modules.highlight_prose import summarise_signal_relations
+    clips = [_marks(100, 109), _marks(206, 200), _marks(300, 312),
+             _marks(405, 400), _marks(500, 511), _marks(604, 600)]
+    said = summarise_signal_relations(clips)
+    assert "no consistent order" in said
+    assert "Nothing here links them" in said
+
+
+def test_too_few_clips_to_claim_a_pattern():
+    """Three clips agreeing is three coincidences agreeing."""
+    from modules.highlight_prose import summarise_signal_relations
+    assert summarise_signal_relations([_marks(100, 109), _marks(200, 206)]) == ""
+
+
+# --- the expression reading, related to the other marked seconds ------------
+
+def _reading(second, label="surprise", turned=True, held=4, read=12, conf=0.81):
+    return {"second": second, "timestamp": f"{second//60}:{second%60:02d}",
+            "label": label, "confidence": conf, "seconds": held,
+            "read_seconds": read, "turned": turned,
+            "from_label": "neutral" if turned else ""}
+
+
+def test_the_expression_mark_carries_what_it_rests_on():
+    from modules.highlight_prose import describe_expression_peak
+    said = describe_expression_peak({"expression_peak": _reading(1728)})
+    assert "turns from neutral to surprise at 28:48" in said
+    assert "holding 4s at 0.81" in said
+    # The reader has to be able to see how thin the evidence is.
+    assert "12 readable seconds" in said
+
+
+def test_an_unturned_reading_is_not_said_to_have_turned():
+    from modules.highlight_prose import describe_expression_peak
+    said = describe_expression_peak(
+        {"expression_peak": _reading(60, turned=False)})
+    assert "reads surprise from 1:00" in said
+    assert "turns" not in said
+
+
+def test_the_reading_is_placed_against_the_loudest_point():
+    """With only two marks the comparison names both timestamps."""
+    from modules.highlight_prose import describe_signal_relations
+    entry = {"loudest": {"second": 1728, "timestamp": "28:48"},
+             "expression_peak": _reading(1731)}
+    said = describe_signal_relations(entry)
+    assert "turns to surprise 3s after the loudest point" in said
+    for invented in ("because", "caused", "triggered", "reacted", "in response"):
+        assert invented not in said.lower()
+
+
+def test_a_reading_already_in_place_is_reported_that_way():
+    from modules.highlight_prose import describe_signal_relations
+    entry = {"loudest": {"second": 1728, "timestamp": "28:48"},
+             "expression_peak": _reading(1721)}
+    assert "7s before the loudest point" in describe_signal_relations(entry)
+
+
+def test_a_reading_landing_with_the_loudest_point_is_not_a_sequence():
+    from modules.highlight_prose import describe_signal_relations
+    entry = {"loudest": {"second": 1728, "timestamp": "28:48"},
+             "expression_peak": _reading(1729)}
+    said = describe_signal_relations(entry)
+    assert "within 1s of the loudest point" in said
+    assert "after the loudest point" not in said
+
+
+def test_a_reading_far_from_every_other_mark_is_left_unrelated():
+    from modules.highlight_prose import describe_signal_relations
+    entry = dict(_marks(1719, 1728), expression_peak=_reading(1790))
+    said = describe_signal_relations(entry)
+    assert "Movement stopped first" in said
+    assert "surprise" not in said
+
+
+# --- the clip as one sequence ----------------------------------------------
+
+def test_three_marks_are_told_as_one_sequence():
+    from modules.highlight_prose import describe_signal_relations
+    entry = dict(_marks(1719, 1728), expression_peak=_reading(1731))
+    said = describe_signal_relations(entry)
+    assert said == ("In order: movement drops away at 28:39, the loudest "
+                    "point arrives 9s later and the reading turns to surprise "
+                    "3s after that.")
+    # The sequence replaces the pairwise comparisons rather than joining them.
+    assert "Movement stopped first" not in said
+
+
+def test_the_sequence_is_an_ordering_and_says_so():
+    from modules.highlight_prose import describe_signal_relations
+    said = describe_signal_relations(
+        dict(_marks(1719, 1728), expression_peak=_reading(1731)))
+    assert said.startswith("In order:")
+    for invented in ("because", "caused", "triggered", "resulted",
+                     "reacted", "in response", "led to"):
+        assert invented not in said.lower()
+
+
+def test_a_settled_reading_is_not_said_to_turn_in_the_sequence():
+    from modules.highlight_prose import describe_sequence
+    said = describe_sequence(
+        dict(_marks(1719, 1728), expression_peak=_reading(1731, turned=False)))
+    assert "the reading settles on surprise" in said
+
+
+def test_marks_in_the_same_second_are_not_given_an_order():
+    from modules.highlight_prose import describe_sequence
+    said = describe_sequence(
+        dict(_marks(1719, 1719), expression_peak=_reading(1722)))
+    assert "in the same second" in said
+    assert "0s" not in said
+
+
+def test_a_gap_too_wide_to_examine_breaks_the_chain():
+    """A mark half a minute out is a separate event, not the end of a sequence."""
+    from modules.highlight_prose import describe_signal_relations
+    entry = dict(_marks(1600, 1728), expression_peak=_reading(1731))
+    said = describe_signal_relations(entry)
+    # Motion is stranded 128s back, so the remaining pair falls to comparison.
+    assert "In order:" not in said
+    assert "turns to surprise 3s after the loudest point" in said
+
+
+def test_the_reading_falls_back_to_the_motion_peak_without_audio():
+    from modules.highlight_prose import describe_signal_relations
+    entry = {"motion_peak": {"second": 100, "timestamp": "1:40"},
+             "expression_peak": _reading(105)}
+    assert "5s after the motion peak" in describe_signal_relations(entry)
+
+
+def test_a_reading_with_nothing_to_relate_to_says_nothing():
+    from modules.highlight_prose import describe_signal_relations
+    assert describe_signal_relations({"expression_peak": _reading(105)}) == ""
+
+
+def test_a_repeated_lag_after_the_loudest_point_becomes_a_finding():
+    from modules.highlight_prose import summarise_signal_relations
+    clips = [dict(_marks(100, 109), expression_peak=_reading(112)),
+             dict(_marks(200, 206), expression_peak=_reading(209)),
+             dict(_marks(300, 312), expression_peak=_reading(316)),
+             dict(_marks(400, 405), expression_peak=_reading(408))]
+    said = summarise_signal_relations(clips)
+    assert "settles after the loudest point in 4 of 4 clips" in said
+    assert "about 3s later" in said
+    # A repeated lag is as much about the edit as about the footage.
+    assert "how the footage was cut" in said
+
+
+def test_readings_that_scatter_are_not_given_an_ordering():
+    from modules.highlight_prose import summarise_signal_relations
+    clips = [dict(_marks(100, 109), expression_peak=_reading(112)),
+             dict(_marks(200, 206), expression_peak=_reading(200)),
+             dict(_marks(300, 312), expression_peak=_reading(318)),
+             dict(_marks(400, 405), expression_peak=_reading(396))]
+    said = summarise_signal_relations(clips)
+    assert "no consistent side of the loudest point" in said
+
+
+def test_each_pair_is_counted_on_its_own_clips():
+    """A clip with no readable face still has a loudest second."""
+    from modules.highlight_prose import summarise_signal_relations
+    clips = [dict(_marks(100, 109), expression_peak=_reading(112)),
+             _marks(200, 206), _marks(300, 312), _marks(400, 405),
+             _marks(500, 511)]
+    said = summarise_signal_relations(clips)
+    assert "5 of 5 clips" in said            # the loud/motion pair, all five
+    assert "expression reading" not in said  # one clip cannot carry a pattern
+
+
+# --- this clip against the rest of its video, as signs ----------------------
+
+def _axes(entry, reading=None):
+    from modules.highlight_prose import compare_to_video
+    return {r["name"]: r["sign"] for r in compare_to_video(entry, reading)}
+
+
+def test_above_and_below_the_video_get_opposite_signs():
+    assert _axes({"loudest": {"vs_video_db": 12.0}})["loudness"] == "+"
+    assert _axes({"loudest": {"vs_video_db": -12.0}})["loudness"] == "-"
+
+
+def test_a_clip_level_with_the_video_is_not_given_a_direction():
+    """A sign on a 1 dB difference is a claim the measurement cannot carry."""
+    assert _axes({"loudest": {"vs_video_db": 1.0}})["loudness"] == "="
+
+
+def test_the_reading_is_signed_by_valence_against_the_video():
+    warmer = _axes({}, {"delta": 0.42, "dominant": "happy"})
+    assert warmer["expression reading"] == "+"
+    colder = _axes({}, {"delta": -0.42, "dominant": "sad"})
+    assert colder["expression reading"] == "-"
+    assert _axes({}, {"delta": 0.02, "dominant": "neutral"})[
+        "expression reading"] == "="
+
+
+def test_the_reading_row_says_what_it_is_a_reading_of():
+    from modules.highlight_prose import compare_to_video
+    row = compare_to_video({}, {"delta": 0.42, "dominant": "happy"})[0]
+    assert "valence" in row["figure"] and "mostly happy" in row["figure"]
+    # Never a claim about a person: the row is the classifier's output.
+    for invented in ("enjoy", "felt", "feels", "happier", "mood"):
+        assert invented not in (row["name"] + row["figure"]).lower()
+
+
+def test_what_selected_the_clip_is_kept_out_of_the_comparison():
+    """Every kept clip outscored the video — a row of plus signs teaches nothing."""
+    entry = {"measured": {"score_percentile": 99.0,
+                          "signals": {"audio": {"percentile": 98.0}}},
+             "loudest": {"vs_video_db": 12.0}}
+    assert list(_axes(entry)) == ["loudness"]
+
+
+def test_an_unusually_small_subject_is_a_finding_too():
+    entry = {"measured": {"comparison": {"subjects": [
+        {"name": "dog", "enough_samples": True, "frame_share_percentile": 8.0}]}}}
+    assert _axes(entry)["dog on screen"] == "-"
+
+
+def test_the_subject_row_prefers_the_camera_invariant_measurement():
+    entry = {"measured": {"comparison": {"subjects": [
+        {"name": "dog", "enough_samples": True, "frame_share_percentile": 95.0},
+        {"name": "car", "enough_samples": True, "frame_share_percentile": 60.0,
+         "relative": {"enough_samples": True, "percentile": 88.0,
+                      "reference": "person"}},
+    ]}}}
+    axes = _axes(entry)
+    assert list(axes) == ["car on screen"]
+    assert axes["car on screen"] == "+"
+
+
+def test_a_clip_with_nothing_measured_against_the_video_shows_no_strip():
+    from modules.highlight_prose import compare_to_video, format_comparison
+    assert compare_to_video({}, None) == []
+    assert format_comparison([]) == ""
+
+
+def test_the_line_carries_the_figure_behind_every_sign():
+    from modules.highlight_prose import compare_to_video, format_comparison
+    said = format_comparison(compare_to_video(
+        {"loudest": {"vs_video_db": 12.0}}, {"delta": -0.42, "dominant": "sad"}))
+    assert said.startswith("vs the video:")
+    assert "+ loudness (+12 dB" in said
+    assert "- expression reading (-0.42 valence" in said
+
+
+# --- what arrives on screen, and what the other marks do around it ----------
+
+def _clip(index, onset, loud, delta=None, name="routine A"):
+    entry = {"index": index,
+             "event_onset": {"second": onset, "name": name,
+                             "timestamp": f"{onset//60}:{onset%60:02d}"},
+             "loudest": {"second": loud, "timestamp": f"{loud//60}:{loud%60:02d}"}}
+    return entry
+
+
+def _readings(deltas):
+    return {i: {"index": i, "delta": d} for i, d in enumerate(deltas, start=1)}
+
+
+def test_the_category_leads_the_sequence_when_it_arrives_first():
+    from modules.highlight_prose import describe_sequence
+    entry = dict(_marks(1719, 1728),
+                 event_onset={"second": 1715, "name": "routine A",
+                              "timestamp": "28:35"})
+    said = describe_sequence(entry)
+    assert said.startswith("In order: routine A comes on screen at 28:35")
+    assert "movement drops away 4s later" in said
+
+
+def test_a_repeated_pattern_around_a_category_is_counted_not_asserted():
+    from modules.highlight_prose import summarise_event_relations
+    clips = [_clip(1, 100, 105), _clip(2, 200, 206), _clip(3, 300, 304),
+             _clip(4, 400, 407)]
+    said = summarise_event_relations(clips, _readings([0.4, 0.5, 0.3, 0.6]))[0]
+    assert "routine A arrives in 4 of the kept clips" in said
+    assert "the loudest point follows it in 4 of them, typically about 6s later" in said
+    assert "more positive than the video's own in 4" in said
+
+
+def test_the_count_never_becomes_a_cause_or_an_experience():
+    from modules.highlight_prose import summarise_event_relations
+    clips = [_clip(1, 100, 105), _clip(2, 200, 206), _clip(3, 300, 304),
+             _clip(4, 400, 407)]
+    said = summarise_event_relations(clips, _readings([0.4, 0.5, 0.3, 0.6]))[0]
+    assert "not the same as one producing another" in said
+    assert "classifier's label rather than anyone's experience" in said
+    for invented in ("enjoy", "pleasure", "felt", "caused", "because",
+                     "reacted", "probability", "likely"):
+        assert invented not in said.lower()
+
+
+def test_a_reading_that_runs_the_other_way_is_reported_that_way():
+    from modules.highlight_prose import summarise_event_relations
+    clips = [_clip(1, 100, 105), _clip(2, 200, 206), _clip(3, 300, 304),
+             _clip(4, 400, 407)]
+    said = summarise_event_relations(clips, _readings([-0.4, -0.5, -0.3, -0.6]))[0]
+    assert "more negative than the video's own in 4" in said
+
+
+def test_a_category_in_too_few_clips_is_not_profiled():
+    from modules.highlight_prose import summarise_event_relations
+    clips = [_clip(1, 100, 105), _clip(2, 200, 206), _clip(3, 300, 304)]
+    assert summarise_event_relations(clips, _readings([0.4, 0.5, 0.3])) == []
+
+
+def test_a_detected_name_is_never_sentence_cased_by_the_summary():
+    from modules.highlight_prose import summarise_event_relations
+    clips = [_clip(i, i * 100, i * 100 + 5, name="eyeSpy") for i in range(1, 5)]
+    said = summarise_event_relations(clips, _readings([0.4] * 4))[0]
+    assert "eyeSpy arrives" in said
+    assert "EyeSpy" not in said
+
+
+# --- the run's own conclusion ------------------------------------------------
+
+def _run_report(**over):
+    report = {
+        "video": {"duration": 900.0},
+        "totals": {"segments": 5, "duration": 150.0, "coverage_pct": 16.7},
+        "segments": [],
+    }
+    report.update(over)
+    return report
+
+
+def _ordered_clips():
+    """Five clips where the category, movement, sound and reading all repeat."""
+    clips = []
+    for i in range(1, 6):
+        base = i * 100
+        clips.append({
+            "index": i,
+            "event_onset": {"second": base - 4, "name": "routine A",
+                            "timestamp": "0:00"},
+            "motion_peak": {"second": base, "timestamp": "0:00"},
+            "loudest": {"second": base + 4, "timestamp": "0:00",
+                        "vs_video_db": 21.0},
+            "expression_peak": {"second": base + 8, "label": "surprise",
+                                "timestamp": "0:00"},
+        })
+    return clips
+
+
+def _headings(sections):
+    return [s["heading"] for s in sections]
+
+
+def _said(sections):
+    return " ".join(line for s in sections for line in s["lines"])
+
+
+def test_the_conclusion_is_grouped_under_one_heading_per_signal():
+    from modules.highlight_prose import conclude
+    sections = conclude(_run_report(segments=_ordered_clips()))
+    assert _headings(sections) == ["Movement", "Sound", "On screen", "Summary"]
+
+
+def test_a_channel_with_nothing_measured_gets_no_heading():
+    """Sections are evidence-led: no scan, no expression heading."""
+    from modules.highlight_prose import conclude
+    sections = conclude(_run_report(segments=_ordered_clips()))
+    assert "Face expression" not in _headings(sections)
+    sections = conclude(_run_report(segments=_ordered_clips(), expression_arc={
+        "coverage": {"pct": 80.0}, "arc": {"direction": "flat"}}))
+    assert "Face expression" in _headings(sections)
+
+
+def test_the_conclusion_carries_no_figures():
+    """Every number behind it is a few inches away in its own section.
+
+    A description a reader has to assemble out of percentages is not one, and
+    the tiles at the top of the page already carry the totals.
+    """
+    import re
+    from modules.highlight_prose import conclude
+    sections = conclude(_run_report(segments=_ordered_clips(), expression_arc={
+        "coverage": {"pct": 41.0},
+        "arc": {"direction": "flat"},
+        "shift": {"at": 620.0, "direction": "toward negative",
+                  "before": -0.1, "after": -0.5, "change": -0.4},
+    }))
+    for section in sections:
+        for line in section["lines"]:
+            # Clock times are the exception: "around 10:20" is a place to look,
+            # not a quantity to compare.
+            bare = re.sub(r"\d+:\d\d", "", line)
+            assert not re.search(r"\d", bare), f"figure in conclusion: {line}"
+
+
+def test_the_summary_says_the_order_in_plain_words():
+    from modules.highlight_prose import conclude
+    summary = conclude(_run_report(segments=_ordered_clips()))[-1]
+    assert summary["heading"] == "Summary"
+    said = summary["lines"][0]
+    assert said.startswith("Put together, most of the kept clips run the same way:")
+    assert "routine A comes on screen" in said
+    assert "movement settles" in said
+    assert "the loudest moment follows a moment later" in said
+    assert "the face reads surprise just after" in said
+
+
+def test_the_summary_never_names_a_feeling_or_a_cause():
+    """Checked on the claim, not on the caveat.
+
+    The closing line has to be able to name what it is refusing — "whether
+    anyone felt what the face was labelled is not in the measurements" is the
+    sentence doing the work, and a blanket word ban would forbid it.
+    """
+    from modules.highlight_prose import conclude
+    sections = conclude(_run_report(segments=_ordered_clips()))
+    claims = [line for s in sections for line in s["lines"]][:-1]
+    for invented in ("enjoy", "pleasure", "excite", "felt", "feels", "reacted",
+                     "because", "caused", "resulted", "led to", "in response"):
+        assert invented not in " ".join(claims).lower()
+
+
+def test_the_summary_ends_on_what_it_cannot_say():
+    from modules.highlight_prose import conclude
+    last = conclude(_run_report(segments=_ordered_clips()))[-1]["lines"][-1]
+    # One clause now, not four sentences: a caveat nobody finishes reading
+    # loses the section and the caveat both.
+    assert "an order, not a cause" in last
+    assert "for whoever watches it" in last
+
+
+def test_one_step_is_not_a_sequence_worth_summarising():
+    from modules.highlight_prose import conclude
+    clips = [{"index": i, "motion_peak": {"second": i * 100},
+              "loudest": {"second": i * 100 + 4}} for i in range(1, 6)]
+    sections = conclude(_run_report(segments=clips))
+    # Movement and sound alone still order against each other, so this one has
+    # a summary; a run with a single mark does not.
+    bare = [{"index": i, "loudest": {"second": i * 100}} for i in range(1, 6)]
+    assert "Summary" not in _headings(conclude(_run_report(segments=bare)))
+    assert "Summary" in _headings(sections)
+
+
+def test_a_run_with_nothing_measured_concludes_nothing():
+    from modules.highlight_prose import conclude
+    assert conclude({}) == []
+    assert conclude(_run_report()) == []
+
+
+def test_the_conclusion_agrees_with_the_long_form_of_the_same_finding():
+    """Two prose paths, one measurement — they must not disagree."""
+    from modules.highlight_prose import conclude, summarise_signal_relations
+    clips = _ordered_clips()
+    said = _said(conclude(_run_report(segments=clips)))
+    long = summarise_signal_relations(clips)
+    assert "the sound arrives once the movement has stopped" in said
+    assert "the loudest point arrives after movement has stopped" in long
+
+
+# --- one clip, grouped by signal ---------------------------------------------
+
+def _full_clip():
+    """A clip carrying every channel at once."""
+    return {
+        "index": 1,
+        "breakdown": {"motion_peak": 5.0},
+        "signals_present": ["motion_peak", "audio"],
+        "measured": {"score_percentile": 90.0, "comparison": {
+            "subjects": [{"name": "guitar", "enough_samples": True,
+                          "frame_share": 9.0, "frame_share_percentile": 95.0,
+                          "stretch_seconds": 30}],
+            "expression": {"label": "surprise", "enough_samples": True,
+                           "confidence": 0.81, "confidence_percentile": 88.0,
+                           "lift": 1.0, "clip_share_pct": 40.0,
+                           "video_share_pct": 40.0, "stretch_seconds": 30},
+        }},
+        "event_onset": {"second": 100, "name": "routine A", "timestamp": "1:40"},
+        "motion_peak": {"second": 104, "timestamp": "1:44", "count": 1},
+        "loudest": {"second": 108, "timestamp": "1:48", "vs_video_db": 21.0,
+                    "level_dbfs": -6.0, "classes": ["guitar"]},
+        "expression_peak": {"second": 112, "timestamp": "1:52",
+                            "label": "surprise", "confidence": 0.81,
+                            "seconds": 4, "read_seconds": 12, "turned": True,
+                            "from_label": "neutral"},
+    }
+
+
+def test_a_clip_is_grouped_under_the_signal_each_line_came_from():
+    from modules.highlight_prose import clip_sections
+    sections = clip_sections(_full_clip())
+    assert [h for h, _ in sections] == ["Movement", "Sound", "Face expression",
+                                        "On screen", "Summary"]
+
+
+def test_each_line_sits_under_the_signal_that_produced_it():
+    from modules.highlight_prose import clip_sections
+    filed = {h: " ".join(lines) for h, lines in clip_sections(_full_clip())}
+    assert "Movement spiked" in filed["Movement"]
+    assert "Loudest at 1:48" in filed["Sound"]
+    assert "surprise" in filed["Face expression"]
+    # Sentence-cased by `_subject_line`, which leads with the class name.
+    assert "Guitar fills" in filed["On screen"]
+    assert "In order:" in filed["Summary"]
+
+
+def test_the_relation_between_signals_is_the_summary_not_a_signal():
+    """It is about more than one channel, so no single heading can own it."""
+    from modules.highlight_prose import clip_sections
+    for heading, lines in clip_sections(_full_clip()):
+        if heading != "Summary":
+            assert "In order:" not in " ".join(lines)
+
+
+def test_a_signal_that_measured_nothing_gets_no_heading():
+    from modules.highlight_prose import clip_sections
+    entry = _full_clip()
+    entry.pop("loudest")
+    entry.pop("expression_peak")
+    entry["measured"]["comparison"].pop("expression")
+    assert [h for h, _ in clip_sections(entry)] == ["Movement", "On screen",
+                                                    "Summary"]
+
+
+def test_a_motion_peak_that_scored_nothing_is_not_narrated():
+    """It is in the breakdown already; a heading would imply it drove the pick."""
+    from modules.highlight_prose import clip_sections
+    entry = _full_clip()
+    entry["breakdown"] = {"motion_peak": 0.0}
+    assert "Movement" not in [h for h, _ in clip_sections(entry)]
+
+
+def test_the_clip_reading_is_filed_with_the_rest_of_the_expression_channel():
+    from modules.highlight_prose import clip_sections
+    reading = {"index": 1, "valence": -0.1, "delta": 0.14, "dominant": "neutral",
+               "read_seconds": 12}
+    filed = {h: " ".join(lines)
+             for h, lines in clip_sections(_full_clip(), reading, -0.24)}
+    assert "Expression here is mostly neutral" in filed["Face expression"]
+
+
+def test_an_empty_clip_produces_no_sections():
+    from modules.highlight_prose import clip_sections
+    assert clip_sections({}) == []
+
+
+# --- the edit as a confound -------------------------------------------------
+
+def _turn(at_cut, label="happy", from_label="sad"):
+    return {"expression_peak": {"second": 72, "timestamp": "1:12", "label": label,
+                                "from_label": from_label, "turned": True,
+                                "confidence": 0.87, "seconds": 10,
+                                "read_seconds": 30, "at_cut": at_cut}}
+
+
+def test_a_reading_that_turns_on_a_cut_is_not_evidence_about_a_face():
+    from modules.highlight_prose import describe_reading_shot
+    said = describe_reading_shot(_turn(True))
+    assert "lands on a shot change" in said
+    assert "a face that changed from a camera that did" in said
+
+
+def test_a_reading_that_turns_inside_a_shot_is_worth_more_and_says_why():
+    from modules.highlight_prose import describe_reading_shot
+    said = describe_reading_shot(_turn(False))
+    assert "inside one continuous shot" in said
+    assert "in the picture rather than in the edit" in said
+
+
+def test_without_shot_detection_no_claim_is_made_either_way():
+    """"No cut was detected" and "no detector ran" read alike and differ."""
+    from modules.highlight_prose import describe_reading_shot
+    assert describe_reading_shot(_turn(None)) == ""
+    assert describe_reading_shot({}) == ""
+
+
+def test_an_arrival_on_a_cut_may_only_have_been_framed():
+    from modules.highlight_prose import describe_arrival_shot
+    entry = {"event_onset": {"second": 60, "name": "routine A", "at_cut": True}}
+    assert "may have been there before the camera moved" in describe_arrival_shot(entry)
+    entry["event_onset"]["at_cut"] = False
+    assert "came into a frame that was already running" in describe_arrival_shot(entry)
+    entry["event_onset"]["at_cut"] = None
+    assert describe_arrival_shot(entry) == ""
+
+
+def test_the_shot_check_is_filed_with_the_reading_it_qualifies():
+    from modules.highlight_prose import clip_sections
+    entry = dict(_turn(True), breakdown={}, measured={})
+    filed = {h: " ".join(lines) for h, lines in clip_sections(entry)}
+    assert "lands on a shot change" in filed["Face expression"]
+
+
+def test_the_loudest_moment_is_offered_as_a_place_to_look_not_a_finding():
+    from modules.highlight_prose import conclude
+    report = {"video": {"duration": 900.0},
+              "totals": {"segments": 2, "duration": 60.0, "coverage_pct": 6.7},
+              "segments": [],
+              "level_by_class": {"classes": [{"name": "a"}],
+                                 "loudest": {"timestamp": "8:58",
+                                             "classes": ["guitar"]}}}
+    sound = [s for s in conclude(report) if s["heading"] == "Sound"][0]
+    said = " ".join(sound["lines"])
+    assert "single loudest moment is at 8:58, with guitar on screen" in said
+    assert "first place to check" in said
+    assert "not a finding about what happens there" in said
+
+

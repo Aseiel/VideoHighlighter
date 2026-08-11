@@ -3,16 +3,21 @@ from collections import defaultdict
 import json
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
-    QGraphicsLineItem, QApplication, QMenu
+    QGraphicsLineItem, QGraphicsItem, QApplication, QMenu
 )
 from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QFont, QLinearGradient,
-    QFontMetrics, QCursor, QPainter, QDrag, QPixmap
+    QFontMetrics, QCursor, QPainter, QDrag, QPixmap, QPolygonF
 )
 
 class SignalTimelineScene(QGraphicsScene):
     """Improved graphics scene with filtering capabilities"""
+
+    # Seconds of gap tolerated inside one composed-event run before it is split
+    # into two bars. Object detection may sample coarser than once per second,
+    # so a strict "consecutive" test would shatter a continuous event.
+    EVENT_RUN_GAP = 2.0
     
     time_clicked = Signal(float)
     time_dragged = Signal(float)
@@ -22,6 +27,9 @@ class SignalTimelineScene(QGraphicsScene):
     filter_changed = Signal(dict)
     waveform_clicked = Signal(float, float, float)
     timeline_rebuilt = Signal()  # fired after build_timeline finishes
+    swap_highlight_requested = Signal(int)      # index of the clip to replace
+    undo_highlight_swap_requested = Signal()
+    current_time_changed = Signal(float)        # playhead moved, for any reason
     
     def __init__(self, cache_data, video_duration, parent=None, waveform=None):
         super().__init__(parent)
@@ -31,6 +39,15 @@ class SignalTimelineScene(QGraphicsScene):
         # Waveform visualization
         self.waveform = waveform or []
         self.waveform_opacity = 0.7
+
+        # Waveform peak navigation — the ◀▶ arrows on the AUDIO WAVEFORM row
+        # jump between local energy maxima whose normalized loudness clears this
+        # sensitivity (0..1, as a fraction of the robust typical→peak range that
+        # the waveform coloring uses). _min_gap collapses one loud passage into a
+        # single stop. Derived live, so it works even when pipeline peak
+        # detection was skipped (audio_peak_points == 0).
+        self.waveform_peak_sensitivity = 0.75
+        self.waveform_peak_min_gap = 1.0
 
         # Always generate colors — they're used by draw_waveform_layer
         # regardless of whether the waveform comes from the constructor
@@ -57,10 +74,15 @@ class SignalTimelineScene(QGraphicsScene):
         # Extract action and object types for better organization
         self.action_types = self._extract_action_types()
         self.object_classes = self._extract_object_classes()
-        
+        # Composition-rule events, split out of the object classes above so they
+        # get their own filterable group instead of being mixed in with real
+        # detections.
+        self.event_types = self._extract_event_types()
+
         # FILTERS: Track which actions/objects are visible
         self.visible_actions = {action: True for action in self.action_types}
         self.visible_objects = {obj: True for obj in self.object_classes}
+        self.visible_events = {ev: True for ev in self.event_types}
         
         # Confidence filters — separate for actions and objects
         self.min_action_confidence = 0.0
@@ -77,8 +99,13 @@ class SignalTimelineScene(QGraphicsScene):
         self.visual_merge_gap = 2.0  # seconds — merge frame hits within this gap
         self._extract_visual_findings()  # populate from cache_data
 
-        # Define logical groups (order matters)
+        # Define logical groups (order matters). Events lead, because that is
+        # where they are drawn — directly beneath the waveform, see
+        # build_timeline. A panel that lists rows in a different order than the
+        # timeline stacks them makes the checkbox for a row hard to find, which
+        # is the one job the panel has.
         self.group_order = [
+            ('events', [f"Event: {e}" for e in self.event_types]),
             ('transcript', ['Transcript']),
             ('actions', [f"Action: {a}" for a in self.action_types]),
             ('objects', [f"Object: {o}" for o in self.object_classes]),
@@ -98,6 +125,8 @@ class SignalTimelineScene(QGraphicsScene):
                     key = 'actions'
                 elif 'object:' in key:
                     key = 'objects'
+                elif 'event:' in key:
+                    key = 'events'
                 elif 'search:' in key:
                     key = 'visual_search'
                 elif 'final highlights' in key.lower():
@@ -106,6 +135,9 @@ class SignalTimelineScene(QGraphicsScene):
 
         # Always make visual_search toggleable, even when no findings yet
         self.visible_layers.setdefault('visual_search', True)
+        # Events appear only once composition rules have run — keep the toggle
+        # present either way so it doesn't pop in and out of the Layers panel.
+        self.visible_layers.setdefault('events', True)
         # Waveform is a regular layer — visible by default when data exists
         self.visible_layers['waveform'] = bool(self.waveform)
         
@@ -125,6 +157,9 @@ class SignalTimelineScene(QGraphicsScene):
         # Create color palettes
         self.action_colors = self._color_palette(len(self.action_types), start_hue=100)
         self.object_colors = self._color_palette(len(self.object_classes), start_hue=340)
+        # Distinct hue band from objects (340) so a derived event never looks like
+        # a detection at a glance — that distinction is the point of the group.
+        self.event_colors = self._color_palette(len(self.event_types), start_hue=45)
         
         # Merge threshold (seconds) — 0 = no merging
         self.merge_threshold = 0.0
@@ -192,7 +227,7 @@ class SignalTimelineScene(QGraphicsScene):
         # Draw waveform background
         waveform_y = y_pos
         self.addRect(0, waveform_y, self.sceneRect().width(), height, 
-                    QPen(Qt.NoPen), QBrush(QColor(10, 10, 20, 50)))
+                    QPen(Qt.NoPen), QBrush(QColor(12, 12, 12, 50)))
         
         # Draw waveform label
         self.row_labels.append(("AUDIO WAVEFORM", waveform_y))
@@ -243,7 +278,7 @@ class SignalTimelineScene(QGraphicsScene):
                     color = self.waveform_colors[amplitude_index]
                     color.setAlpha(min(255, color.alpha() + 50))
                 else:
-                    color = QColor(100, 150, 255, 200)
+                    color = QColor(47, 129, 247, 200)
                 
                 # Calculate y positions
                 y_center = waveform_y + height // 2
@@ -254,7 +289,23 @@ class SignalTimelineScene(QGraphicsScene):
                 line_width = max(2, self.pixels_per_second / (len(self.waveform) / self.video_duration))
                 pen = QPen(color, min(5, line_width))  # Cap at 5 pixels thick
                 self.addLine(x, y_min, x, y_max, pen)
-        
+
+            # Peak markers — small amber triangles above every peak the AUDIO
+            # WAVEFORM ◀▶ arrows will jump to, so the sensitivity is visible as
+            # you drag its slider.
+            marker_brush = QBrush(QColor(255, 196, 0))
+            marker_pen = QPen(Qt.NoPen)
+            for t in self._waveform_peaks():
+                px = t * self.pixels_per_second
+                if px > total_width:
+                    continue
+                tri = QPolygonF([
+                    QPointF(px - 4, waveform_y + 1),
+                    QPointF(px + 4, waveform_y + 1),
+                    QPointF(px,     waveform_y + 8),
+                ])
+                self.addPolygon(tri, marker_pen, marker_brush)
+
         return y_pos + height + self.layer_spacing
 
 
@@ -307,15 +358,78 @@ class SignalTimelineScene(QGraphicsScene):
                 actions.add(name.strip().title())
         return sorted(list(actions)) if actions else ['Unknown']
     
+    def _composed_names_normalised(self) -> set:
+        """Composition-rule event names from the cache, normalised the same way
+        object names are, so the two can be compared.
+
+        Composed events live inside `objects` because that is what object scoring
+        reads — so without this list a derived event is indistinguishable from a
+        detected class, and they end up mixed together in one OBJECTS group.
+        """
+        return {str(n).strip().title()
+                for n in (self.cache_data.get('composed_event_names') or [])
+                if isinstance(n, str) and str(n).strip()}
+
     def _extract_object_classes(self):
-        """Extract unique object classes from cache data"""
+        """Unique object classes from the cache, EXCLUDING composed events —
+        those get their own group (see _extract_event_types)."""
+        composed = self._composed_names_normalised()
         objs = set()
         for item in self.cache_data.get('objects', []):
             for obj in item.get('objects', []):
                 if isinstance(obj, str):
-                    objs.add(obj.strip().title())
+                    name = obj.strip().title()
+                    if name not in composed:
+                        objs.add(name)
         return sorted(list(objs)) if objs else ['Unknown']
+
+    def _extract_event_types(self):
+        """Composed event names that actually occur in the cache.
+
+        Filtered to what occurred rather than every rule name, so a rule that
+        matched nothing does not leave an empty row on the timeline.
+        """
+        composed = self._composed_names_normalised()
+        if not composed:
+            return []
+        seen = set()
+        for item in self.cache_data.get('objects', []):
+            for obj in item.get('objects', []):
+                if isinstance(obj, str):
+                    name = obj.strip().title()
+                    if name in composed:
+                        seen.add(name)
+        return sorted(seen)
     
+    def reload_cache_data(self, cache_data=None):
+        """Re-ingest cache_data after an on-demand analysis added detections.
+
+        The draw_* layers read `self.cache_data` live, but the derived type
+        lists and their per-type visibility maps are built once in __init__ —
+        so a freshly-run actions/objects pass wouldn't appear until these are
+        recomputed. Rebuild them (preserving any still-relevant visibility
+        choices) and redraw."""
+        if cache_data is not None:
+            self.cache_data = cache_data
+
+        prev_actions = getattr(self, "visible_actions", {})
+        prev_objects = getattr(self, "visible_objects", {})
+        prev_events = getattr(self, "visible_events", {})
+
+        self.action_types = self._extract_action_types()
+        self.object_classes = self._extract_object_classes()
+        self.event_types = self._extract_event_types()
+        # Keep prior show/hide for types that persist; default new ones to shown.
+        self.visible_actions = {a: prev_actions.get(a, True) for a in self.action_types}
+        self.visible_objects = {o: prev_objects.get(o, True) for o in self.object_classes}
+        self.visible_events = {e: prev_events.get(e, True) for e in self.event_types}
+        # Palettes are indexed by position in these lists, so they have to be
+        # rebuilt alongside them or colours shift onto the wrong rows.
+        self.object_colors = self._color_palette(len(self.object_classes), start_hue=340)
+        self.event_colors = self._color_palette(len(self.event_types), start_hue=45)
+
+        self.build_timeline()
+
     def _color_palette(self, count, start_hue=0):
         """Generate a color palette"""
         if count == 0:
@@ -328,6 +442,75 @@ class SignalTimelineScene(QGraphicsScene):
         self.merge_threshold = max(0.0, seconds)
         self.build_timeline()
 
+    # ── Waveform peak navigation ────────────────────────────────────────────
+    def _waveform_energy_series(self):
+        """(time, norm_energy) per waveform bin. Normalized against the same
+        robust percentile range the waveform coloring uses (10th → 97th), so a
+        sensitivity of e.g. 0.7 lines up with what the colors show."""
+        wf = self.waveform
+        n = len(wf)
+        if n == 0 or self.video_duration <= 0:
+            return []
+
+        def _energy(pt):
+            return pt[2] if len(pt) > 2 else (abs(pt[0]) + abs(pt[1])) / 2
+
+        energies = [_energy(pt) for pt in wf]
+        s = sorted(energies)
+
+        def _pct(p):
+            return s[min(len(s) - 1, int(len(s) * p))]
+
+        lo = _pct(0.10)
+        rng = max(_pct(0.97) - lo, 1e-6)
+
+        series = []
+        for i, e in enumerate(energies):
+            norm = (e - lo) / rng
+            norm = 0.0 if norm < 0 else (1.0 if norm > 1 else norm)
+            t = ((i + 0.5) / n) * self.video_duration   # bin center (matches draw)
+            series.append((t, norm))
+        return series
+
+    def _waveform_peaks(self):
+        """Peak times in the waveform whose normalized energy clears the
+        sensitivity threshold, after non-maximum suppression so each loud region
+        contributes a single, loudest stop (min_gap seconds apart)."""
+        series = self._waveform_energy_series()
+        if not series:
+            return []
+
+        thr = self.waveform_peak_sensitivity
+        n = len(series)
+
+        # Local maxima above threshold.
+        cands = []
+        for i, (t, norm) in enumerate(series):
+            if norm < thr:
+                continue
+            prev_n = series[i - 1][1] if i > 0 else -1.0
+            next_n = series[i + 1][1] if i < n - 1 else -1.0
+            if norm >= prev_n and norm >= next_n:
+                cands.append((t, norm))
+        if not cands:
+            return []
+
+        # Non-max suppression: loudest first, drop anything within min_gap of a
+        # peak already kept.
+        gap = self.waveform_peak_min_gap
+        cands.sort(key=lambda c: c[1], reverse=True)
+        kept = []
+        for t, _norm in cands:
+            if all(abs(t - kt) > gap for kt in kept):
+                kept.append(t)
+        kept.sort()
+        return kept
+
+    def set_waveform_peak_sensitivity(self, value):
+        """0..1 loudness cutoff for the AUDIO WAVEFORM peak arrows + markers."""
+        self.waveform_peak_sensitivity = max(0.0, min(1.0, float(value)))
+        self.build_timeline()
+
     # ── Navigation timestamp helpers ────────────────────────────────────────
     def _nav_timestamps_actions(self):
         ts = []
@@ -337,7 +520,7 @@ class SignalTimelineScene(QGraphicsScene):
             t = item.get('timestamp') or item.get('start_time') or item.get('time')
             if t is not None:
                 ts.append(float(t))
-        return ts
+        return self._run_starts(ts, self.merge_threshold)
 
     def _nav_timestamps_objects(self):
         ts = []
@@ -347,7 +530,7 @@ class SignalTimelineScene(QGraphicsScene):
             t = item.get('timestamp') or item.get('time')
             if t is not None:
                 ts.append(float(t))
-        return ts
+        return self._run_starts(ts, self.merge_threshold)
 
     def _nav_timestamps_scenes(self):
         ts = []
@@ -369,6 +552,11 @@ class SignalTimelineScene(QGraphicsScene):
     def _nav_timestamps_audio_peaks(self):
         return [float(p) if not isinstance(p, dict) else float(p.get('time', 0))
                 for p in self.cache_data.get('audio_peaks', [])]
+
+    def _nav_timestamps_waveform_peaks(self):
+        """Peak times the AUDIO WAVEFORM ◀▶ arrows jump between — derived live
+        from the waveform energy at the current sensitivity."""
+        return self._waveform_peaks()
 
     def _nav_timestamps_highlights(self):
         # Mirror draw_highlights_layer's sources + formats (pipeline writes
@@ -393,11 +581,17 @@ class SignalTimelineScene(QGraphicsScene):
         return ts
 
     def _nav_timestamps_transcript(self):
+        # With a keyword search active, the ◀▶ arrows step between the spoken
+        # hits only; otherwise between every transcript segment.
+        kws = [k.lower() for k in getattr(self, "transcript_keywords", []) if k]
         ts = []
         for seg in self.cache_data.get('transcript', {}).get('segments', []):
             t = seg.get('start')
-            if t is not None:
-                ts.append(float(t))
+            if t is None:
+                continue
+            if kws and not any(k in seg.get('text', '').lower() for k in kws):
+                continue
+            ts.append(float(t))
         return ts
 
     def layer_has_data(self, key: str) -> bool:
@@ -415,6 +609,11 @@ class SignalTimelineScene(QGraphicsScene):
             'highlights': self._nav_timestamps_highlights,
             'transcript': self._nav_timestamps_transcript,
             'visual_search': self._nav_timestamps_visual_search,
+            # NOT _nav_timestamps_events: that honours visible_events, so hiding
+            # every event would make the layer report "no detections", get
+            # switched off automatically, and be labelled as having no data. This
+            # question is whether the DATA exists, not whether it is on screen.
+            'events': lambda: self.event_types,
         }.get(key)
         if nav is None:
             return True  # unknown layer → leave it visible
@@ -422,6 +621,47 @@ class SignalTimelineScene(QGraphicsScene):
             return bool(nav())
         except Exception:
             return True
+
+    def _run_starts(self, times, gap):
+        """One timestamp per drawn bar, not one per contributing detection.
+
+        The ◀ ▶ arrows and the counter beside them are supposed to step through
+        what is on screen. They were stepping through the raw hits instead, so a
+        layer whose bars are merged reported far more stops than it draws — a
+        composed event holding for two minutes counted as 120, and walking it
+        took 120 presses to cross one bar.
+
+        The gap is the caller's, so each layer groups the way it draws: events by
+        EVENT_RUN_GAP, detections by the user's merge threshold. A layer that
+        does not merge passes 0 and gets every hit back, which is still one per
+        bar.
+        """
+        ordered = sorted(float(t) for t in times if t is not None)
+        if not ordered:
+            return []
+        starts = [ordered[0]]
+        last = ordered[0]
+        for t in ordered[1:]:
+            if t - last > max(float(gap), 0.0) + 1.0:
+                starts.append(t)
+            last = t
+        return starts
+
+    def _nav_timestamps_events(self):
+        """Timestamps of currently-visible composed events, so ◀ ▶ navigation and
+        the layer's has-data check match the bars actually drawn."""
+        composed = self._composed_names_normalised()
+        if not composed:
+            return []
+        ts = []
+        for item in self.cache_data.get('objects', []):
+            for name in item.get('objects', []):
+                if isinstance(name, str):
+                    n = name.strip().title()
+                    if n in composed and self.visible_events.get(n, True):
+                        ts.append(item.get('timestamp', 0))
+                        break
+        return self._run_starts(ts, self.EVENT_RUN_GAP)
 
     def _nav_timestamps_visual_search(self):
         """Timestamps of currently-visible visual-search findings (same query +
@@ -543,6 +783,25 @@ class SignalTimelineScene(QGraphicsScene):
                 'objects': self.visible_objects.copy()
             })
 
+    def set_event_filter(self, event_name, visible):
+        """Set visibility for a single composed event row."""
+        if event_name in self.visible_events:
+            self.visible_events[event_name] = visible
+            self.save_filters()
+            self.build_timeline()
+            self.filter_changed.emit({
+                'actions': self.visible_actions.copy(),
+                'objects': self.visible_objects.copy(),
+                'events': self.visible_events.copy(),
+            })
+
+    def set_all_events_visible(self, visible):
+        """Set every composed event visible or hidden."""
+        for event in self.visible_events:
+            self.visible_events[event] = visible
+        self.save_filters()
+        self.build_timeline()
+
     def set_all_actions_visible(self, visible):
         """Set all actions visible or hidden"""
         for action in self.visible_actions:
@@ -611,6 +870,8 @@ class SignalTimelineScene(QGraphicsScene):
                     key = 'actions'
                 elif 'object:' in key:
                     key = 'objects'
+                elif 'event:' in key:
+                    key = 'events'
                 elif 'search:' in key:
                     key = 'visual_search'
                 elif 'final highlights' in key.lower():
@@ -633,11 +894,28 @@ class SignalTimelineScene(QGraphicsScene):
         # Draw waveform if visible
         if self.visible_layers.get('waveform', False) and self.waveform:
             current_y = self.draw_waveform_layer(current_y, 80)
-               
+
+        # Composed events sit directly under the waveform.
+        #
+        # They used to be drawn down beside the objects, on the reasoning that
+        # objects were what they were derived from. That reasoning expired when
+        # rules gained signal conditions: an event can now come from the audio
+        # and never touch a detection, and for those the waveform immediately
+        # above is the evidence a person checks the row against. Reading a bar
+        # against the curve that produced it is the whole reason to have both on
+        # one timeline, and it cannot be done with eight rows in between.
+        if self.visible_layers.get('events', True) and self.event_types:
+            current_y = self.draw_events_layer(current_y)
+
+
         # Draw other layers
-        # Layer 1: Transcript
+        # Layer 1: Transcript. Special-cased vs other layers: when toggled off
+        # but a transcript exists, it's drawn *greyed* rather than hidden, so a
+        # disabled transcript still reads as a ghost track on the timeline.
         if self.visible_layers.get('transcript', True):
             current_y = self.draw_transcript_layer(current_y)
+        elif self.cache_data.get('transcript', {}).get('segments'):
+            current_y = self.draw_transcript_layer(current_y, dimmed=True)
 
         # Layer 2: Actions (with better naming)
         if self.visible_layers.get('actions', True):
@@ -671,6 +949,20 @@ class SignalTimelineScene(QGraphicsScene):
         if self.visible_layers.get('highlights', True):
             current_y = self.draw_highlights_layer(current_y)
         
+        # Alternating lane bands behind every other row, so the tracks read as
+        # lanes instead of floating in open space. Between the flat background
+        # (z=-10) and the row content (z=0).
+        band = QBrush(QColor(255, 255, 255, 7))
+        for i, (_, y) in enumerate(self.row_labels):
+            if i % 2 == 0:
+                continue
+            if i + 1 < len(self.row_labels):
+                band_h = self.row_labels[i + 1][1] - y - self.layer_spacing
+            else:
+                band_h = self.layer_height
+            r = self.addRect(0, y, width, band_h, QPen(Qt.PenStyle.NoPen), band)
+            r.setZValue(-9)
+
         # Draw time markers
         self.draw_time_markers()
         # (avoid ranges are painted in drawForeground so a repaint can't drop them)
@@ -688,6 +980,8 @@ class SignalTimelineScene(QGraphicsScene):
                 scale_factor = width / old_visible_width
                 view.setTransform(old_transform.scale(scale_factor, 1.0))
                 view.horizontalScrollBar().setValue(old_h_scroll)
+                # Zoom changed — re-pick the ruler interval for it.
+                self.draw_time_markers()
 
         print(f"✅ Timeline rebuilt successfully, final height={height}")
         self.timeline_rebuilt.emit()
@@ -713,44 +1007,79 @@ class SignalTimelineScene(QGraphicsScene):
         painter.restore()
 
     def draw_background(self):
-        """Draw gradient background with subtle grid"""
-        gradient = QLinearGradient(0, 0, 0, self.sceneRect().height())
-        gradient.setColorAt(0, QColor(20, 20, 30))
-        gradient.setColorAt(1, QColor(40, 40, 50))
-        self.addRect(self.sceneRect(), QPen(Qt.PenStyle.NoPen), QBrush(gradient))
-        
-        # Add subtle grid lines
-        for sec in range(0, int(self.video_duration) + 1, 5):
-            x = sec * self.pixels_per_second
-            pen = QPen(QColor(45, 45, 55) if sec % 30 else QColor(70, 70, 90), 1)
-            self.addLine(x, 0, x, self.sceneRect().height(), pen)
-        
-    def draw_transcript_layer(self, y_pos):
-        """Draw transcript segments with improved labeling"""
+        """Flat canvas. The old version stacked a vertical gradient plus its own
+        fixed 5s gridlines on top of draw_time_markers' adaptive grid — two grids
+        at once, and the fixed one turned into stripes when zoomed out. One flat
+        fill here; the ruler owns all gridlines. z=-10 so the lane bands
+        (build_timeline) can sit between the fill and the content."""
+        bg = self.addRect(self.sceneRect(), QPen(Qt.PenStyle.NoPen),
+                          QBrush(QColor(18, 18, 18)))
+        bg.setZValue(-10)
+
+    def set_transcript_keywords(self, keywords):
+        """Set the words to mark on the TRANSCRIPT row and rebuild. When set,
+        the row draws an amber marker over every spoken segment that contains a
+        word, and the ◀▶ arrows step between those hits (see
+        _nav_timestamps_transcript). Empty clears the marking."""
+        self.transcript_keywords = [k.strip() for k in (keywords or []) if k and k.strip()]
+        self.build_timeline()
+
+    def _transcript_keyword_hit(self, text):
+        kws = [k.lower() for k in getattr(self, "transcript_keywords", []) if k]
+        return bool(kws) and any(k in text.lower() for k in kws)
+
+    def draw_transcript_layer(self, y_pos, dimmed=False):
+        """Draw transcript segments with improved labeling.
+
+        `dimmed` renders the whole row greyed (used when the transcript layer is
+        toggled off but data exists — a disabled/ghost track). Keyword marks are
+        skipped while dimmed."""
         self.row_labels.append(("TRANSCRIPT", y_pos))
-        
+
+        keywords_active = bool(getattr(self, "transcript_keywords", [])) and not dimmed
         if 'transcript' in self.cache_data and self.cache_data['transcript'].get('segments'):
             for segment in self.cache_data['transcript']['segments']:
                 start = segment.get('start', 0)
                 end = segment.get('end', start + 1)
                 text = segment.get('text', '').strip()
-                
+
                 if text:
                     # Calculate visual weight based on text density
                     words = len(text.split())
                     duration = max(0.1, end - start)
                     density = words / duration
                     intensity = min(10, density * 2)
-                    
+
+                    # Disabled → flat grey; else transcript colour, dimming the
+                    # non-matching segments when a keyword search is active.
+                    is_hit = (not dimmed) and self._transcript_keyword_hit(text)
+                    if dimmed:
+                        color = QColor(120, 120, 120, 60)
+                    else:
+                        color = QColor(self.colors['transcript'])
+                        if keywords_active and not is_hit:
+                            color.setAlpha(70)
+
                     bar = TimelineBar(
                         start, end, y_pos, self.layer_height,
-                        self.colors['transcript'], text[:30] + "..." if len(text) > 30 else text,
+                        color, text[:30] + "..." if len(text) > 30 else text,
                         confidence=intensity,
                         metadata={'full_text': text, 'words': words}
                     )
                     self.draw_bar(bar)
                     self.bars.append(bar)
-        
+
+                    if is_hit:
+                        # Amber marker at the top of the band over the hit.
+                        x = start * self.pixels_per_second
+                        tri = QPolygonF([
+                            QPointF(x - 4, y_pos), QPointF(x + 4, y_pos),
+                            QPointF(x, y_pos + 7),
+                        ])
+                        m = self.addPolygon(tri, QPen(Qt.PenStyle.NoPen),
+                                            QBrush(QColor(255, 196, 0)))
+                        m.setZValue(60)
+
         return y_pos + self.layer_height + self.layer_spacing
     
     def draw_improved_actions_layer(self, y_pos):
@@ -919,6 +1248,87 @@ class SignalTimelineScene(QGraphicsScene):
         
         return y_pos + self.layer_height + self.layer_spacing
     
+    def draw_events_layer(self, y_pos):
+        """Draw composition-rule events as their own group, one row per event.
+
+        Reads the same `objects` list as the object layer — composed events have
+        to live there to be scored — but shows only the names the cache marks as
+        derived, which the object layer correspondingly excludes. No confidence
+        filter is applied: an event is a rule either holding or not, so the
+        confidence sliders (which threshold detector scores) do not apply to it.
+        """
+        self.row_labels.append(("EVENTS", y_pos))
+
+        composed = self._composed_names_normalised()
+        groups = defaultdict(list)
+        for obj_data in self.cache_data.get('objects', []):
+            timestamp = obj_data.get('timestamp', 0)
+            for name in obj_data.get('objects', []):
+                if not isinstance(name, str):
+                    continue
+                name = name.strip().title()
+                if name in composed and self.visible_events.get(name, True):
+                    groups[name].append(timestamp)
+
+        if not groups:
+            text = self.addText("(no composed events)", QFont("Arial", 9))
+            text.setPos(150, y_pos + 15)
+            text.setDefaultTextColor(QColor(150, 150, 150))
+            return y_pos + self.layer_height + self.layer_spacing
+
+        type_height = self.layer_height // max(1, len(groups))
+        current_type_y = y_pos
+
+        for event_type, timestamps in sorted(groups.items()):
+            try:
+                color = self.event_colors[self.event_types.index(event_type)]
+            except (ValueError, IndexError):
+                color = QColor(230, 170, 60)
+
+            # Group consecutive seconds into runs. A rule is evaluated per
+            # sampled second, so adjacent hits are one continuous event and
+            # drawing them as separate one-second bars misrepresents it. Done
+            # here rather than via _merge_intervals because that honours
+            # self.merge_threshold, which defaults to 0 (no merging) and is a
+            # display preference for detections — event contiguity is not
+            # optional. The tolerance absorbs sampling gaps when object detection
+            # ran with a frame skip coarser than one second.
+            merged = []
+            run_start = run_end = None
+            for t in sorted(timestamps):
+                if run_start is None:
+                    run_start, run_end = t, t
+                elif t - run_end <= self.EVENT_RUN_GAP:
+                    run_end = t
+                else:
+                    merged.append((run_start, run_end + 1.0, {}))
+                    run_start, run_end = t, t
+            if run_start is not None:
+                merged.append((run_start, run_end + 1.0, {}))
+
+            # Underscores are how rules are named in YAML but read badly as a
+            # label; the visibility key stays the normalised name.
+            pretty = event_type.replace('_', ' ')
+            for start, end, meta in merged:
+                span = end - start
+                bar_label = f"{pretty} ({span:.0f}s)" if span > 1.5 else pretty
+                bar = TimelineBar(
+                    start, end,
+                    current_type_y, type_height,
+                    color, bar_label,
+                    confidence=1.0,
+                    metadata={'type': event_type, 'composed': True,
+                              'duration': span}
+                )
+                # draw_bar() already appends to self.bars; the other layers pair
+                # it with a second append and so register every bar twice. Not
+                # replicated here.
+                self.draw_bar(bar)
+
+            current_type_y += type_height
+
+        return y_pos + self.layer_height + self.layer_spacing
+
     def draw_scenes_layer(self, y_pos):
         """Draw scene changes with improved labeling"""
         self.row_labels.append(("SCENES", y_pos))
@@ -1096,7 +1506,11 @@ class SignalTimelineScene(QGraphicsScene):
                 start, end, y_pos, self.layer_height,
                 self.colors['highlights'], label,
                 confidence=10,
-                metadata={'index': i, 'duration': duration, 'score': score}
+                # 'layer' marks this bar as a chosen clip rather than a
+                # detection, which is what lets the right-click menu offer to
+                # replace it.
+                metadata={'index': i, 'duration': duration, 'score': score,
+                          'layer': 'highlights'}
             )
             self.draw_bar(bar)
             self.bars.append(bar)
@@ -1272,27 +1686,113 @@ class SignalTimelineScene(QGraphicsScene):
             text_item.setToolTip(tooltip)
 
             
+    # "Nice" intervals in seconds — labels/gridlines always land on one of these
+    # so the axis stays readable at any zoom level.
+    _NICE_INTERVALS = (
+        1, 2, 5, 10, 15, 30,
+        60, 120, 300, 600, 900, 1800,
+        3600, 7200, 10800, 21600, 43200, 86400,
+    )
+
+    def _nice_interval(self, min_seconds):
+        """Smallest 'nice' interval >= min_seconds (falls back to the largest)."""
+        for iv in self._NICE_INTERVALS:
+            if iv >= min_seconds:
+                return iv
+        return self._NICE_INTERVALS[-1]
+
+    #: On-screen gap between the bottom of the timeline and the top of a time
+    #: label, in viewport pixels. Big enough for the 9pt Consolas glyphs the
+    #: ruler draws, so the text sits inside the band rather than across its edge.
+    LABEL_BAND_PX = 20.0
+
+    @staticmethod
+    def _format_time_label(second):
+        """H:MM:SS once we're past an hour, MM:SS otherwise."""
+        second = int(second)
+        h, rem = divmod(second, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h:d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
     def draw_time_markers(self):
-        """Draw time markers at regular intervals with improved formatting"""
-        for second in range(0, int(self.video_duration) + 1, 5):
+        """Draw the time ruler. The interval adapts to the *effective* zoom
+        (scene pixels-per-second × the view's horizontal scale) so labels never
+        collide when zoomed out, and the labels ignore the view transform so the
+        horizontal-only zoom can't squish the glyphs together."""
+        # Remove markers from a previous pass (this method is re-run on zoom).
+        # build_timeline's self.clear() may have already deleted the underlying
+        # C++ objects, leaving these refs dangling — hence the guard.
+        for item in getattr(self, "_time_marker_items", []):
+            try:
+                if item.scene() is self:
+                    self.removeItem(item)
+            except RuntimeError:
+                pass  # C++ object already deleted by clear()
+        self._time_marker_items = []
+
+        if self.video_duration <= 0:
+            return
+
+        # Effective on-screen pixels per second = scene scale × view horizontal scale.
+        views = self.views()
+        m11 = views[0].transform().m11() if views else 1.0
+        m22 = views[0].transform().m22() if views else 1.0
+        eff_pps = self.pixels_per_second * (m11 or 1.0)
+        if eff_pps <= 0:
+            return
+
+        # Aim for ~80px between labels and ~12px between minor gridlines.
+        label_iv = self._nice_interval(80.0 / eff_pps)
+        minor_iv = self._nice_interval(12.0 / eff_pps)
+        # Keep minors a clean subdivision of labels, and never denser than labels.
+        if minor_iv >= label_iv:
+            minor_iv = label_iv
+
+        h = self.sceneRect().height()
+        duration = int(self.video_duration)
+
+        # Where the labels sit above the bottom edge. They ignore the view
+        # transform, so their glyphs stay ~16px tall however the scene is
+        # scaled vertically — but the position anchoring them is a scene
+        # coordinate, which does scale. A fixed scene offset therefore shrinks
+        # on screen as the view squashes the scene (many lanes in a short view,
+        # which is exactly a freshly opened window), until the text hangs off
+        # the bottom and is drawn cut in half. Convert the on-screen band into
+        # scene units so the gap is what it looks like, at any scale.
+        label_offset = self.LABEL_BAND_PX / (m22 or 1.0)
+        label_y = max(0.0, h - min(label_offset, h))
+
+        # Minor gridlines (skip the ones that coincide with a label line).
+        # Solid faint hairlines — the old dashes added a lot of visual noise
+        # over a dark canvas.
+        minor_pen = QPen(QColor(255, 255, 255, 14), 0, Qt.PenStyle.SolidLine)
+        minor_pen.setCosmetic(True)  # stay 1px regardless of horizontal zoom
+        second = 0
+        while second <= duration:
+            if second % label_iv != 0:
+                x = second * self.pixels_per_second
+                line = self.addLine(x, 0, x, h, minor_pen)
+                self._time_marker_items.append(line)
+            second += minor_iv
+
+        # Major gridlines + labels.
+        major_pen = QPen(QColor(255, 255, 255, 34), 0, Qt.PenStyle.SolidLine)
+        major_pen.setCosmetic(True)
+        second = 0
+        while second <= duration:
             x = second * self.pixels_per_second
-            
-            # Draw vertical line (darker for 30-second intervals)
-            if second % 30 == 0:
-                pen = QPen(QColor(100, 100, 150, 150), 1, Qt.PenStyle.SolidLine)
-            else:
-                pen = QPen(QColor(80, 80, 120, 80), 1, Qt.PenStyle.DashLine)
-            self.addLine(x, 0, x, self.sceneRect().height(), pen)
-            
-            # Add time label for 30-second intervals
-            if second % 30 == 0:
-                minutes = second // 60
-                secs = second % 60
-                time_label = f"{minutes:02d}:{secs:02d}"
-                
-                text = self.addText(time_label, QFont("Consolas", 9))
-                text.setPos(x + 5, self.sceneRect().height() - 25)
-                text.setDefaultTextColor(QColor(200, 200, 200))
+            line = self.addLine(x, 0, x, h, major_pen)
+            self._time_marker_items.append(line)
+
+            text = self.addText(self._format_time_label(second), QFont("Consolas", 9))
+            text.setDefaultTextColor(QColor(150, 150, 150))
+            # Constant on-screen size + anchored at x so the zoom can't distort it.
+            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            text.setPos(x, label_y)
+            self._time_marker_items.append(text)
+            second += label_iv
       
     def set_zoom(self, zoom_level):
         """Change zoom level (pixels per second)"""
@@ -1302,6 +1802,11 @@ class SignalTimelineScene(QGraphicsScene):
     def set_current_time(self, seconds):
         """Set current time indicator — moves existing line instead of recreating"""
         self.current_time_seconds = seconds
+        # Ten call sites move the playhead — playback ticks, seeks, clip jumps,
+        # arrow navigation. Anything that renders relative to "where am I now"
+        # has to hear about all of them, so it is announced once from here
+        # rather than remembered at each caller.
+        self.current_time_changed.emit(float(seconds))
         
         x = seconds * self.pixels_per_second
         x = max(0, min(x, self.sceneRect().width() - 1))
@@ -1310,12 +1815,24 @@ class SignalTimelineScene(QGraphicsScene):
         # Move existing line or create if missing
         if hasattr(self, 'current_time_line') and self.current_time_line in self.items():
             self.current_time_line.setLine(x, 0, x, h)
+            self.current_time_caret.setPos(x, 0)
         else:
-            self.current_time_line = self.addLine(
-                x, 0, x, h,
-                QPen(QColor(255, 60, 60), 2, Qt.PenStyle.DashLine)
-            )
+            # Solid cosmetic hairline + caret cap: the modern editor playhead.
+            # (The old 2px dashed red line read as another gridline.)
+            line_pen = QPen(QColor(255, 70, 70, 230), 0, Qt.PenStyle.SolidLine)
+            line_pen.setCosmetic(True)   # 1px at any horizontal zoom
+            self.current_time_line = self.addLine(x, 0, x, h, line_pen)
             self.current_time_line.setZValue(100)
+
+            # Caret at the top edge. ItemIgnoresTransformations keeps its shape
+            # under the horizontal-only zoom (a plain polygon would smear).
+            caret = QPolygonF([QPointF(-5.0, 0.0), QPointF(5.0, 0.0), QPointF(0.0, 7.0)])
+            self.current_time_caret = self.addPolygon(
+                caret, QPen(Qt.PenStyle.NoPen), QBrush(QColor(255, 70, 70, 230)))
+            self.current_time_caret.setFlag(
+                QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            self.current_time_caret.setZValue(101)
+            self.current_time_caret.setPos(x, 0)
 
     def update_selection_rect(self, start_time: float, end_time: float):
         """
@@ -1336,8 +1853,8 @@ class SignalTimelineScene(QGraphicsScene):
                 and self._selection_rect_item in self.items()):
             self._selection_rect_item.setRect(x0, 0, width, height)
         else:
-            pen   = QPen(QColor(100, 200, 255, 200), 1.5)
-            brush = QBrush(QColor(80, 160, 255, 40))
+            pen   = QPen(QColor(47, 129, 247, 200), 1.5)
+            brush = QBrush(QColor(47, 129, 247, 40))
             self._selection_rect_item = self.addRect(x0, 0, width, height, pen, brush)
             self._selection_rect_item.setZValue(90)
 
@@ -1360,7 +1877,7 @@ class SignalTimelineScene(QGraphicsScene):
             self._selection_label_item.setPos(x0 + 4, 2)
         else:
             self._selection_label_item = self.addText(text, font)
-            self._selection_label_item.setDefaultTextColor(QColor(120, 220, 255))
+            self._selection_label_item.setDefaultTextColor(QColor(90, 160, 250))
             self._selection_label_item.setPos(x0 + 4, 2)
             self._selection_label_item.setZValue(91)
 
@@ -1382,8 +1899,8 @@ class SignalTimelineScene(QGraphicsScene):
         if (self._selection_rect_item is not None
                 and self._selection_rect_item in self.items()):
             # Brighter border, slightly more opaque fill
-            self._selection_rect_item.setPen(QPen(QColor(100, 220, 255, 255), 2))
-            self._selection_rect_item.setBrush(QBrush(QColor(80, 180, 255, 60)))
+            self._selection_rect_item.setPen(QPen(QColor(47, 129, 247, 255), 2))
+            self._selection_rect_item.setBrush(QBrush(QColor(47, 129, 247, 60)))
 
         # Update label to show drag hint
         x0 = min(t0, t1) * self.pixels_per_second
@@ -1453,6 +1970,7 @@ class SignalTimelineScene(QGraphicsScene):
             "max_object_confidence": self.max_object_confidence,
             "visible_actions": self.visible_actions,
             "visible_objects": self.visible_objects,
+            "visible_events": self.visible_events,
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -1480,6 +1998,10 @@ class SignalTimelineScene(QGraphicsScene):
             for k in self.visible_objects:
                 if k in saved_objects:
                     self.visible_objects[k] = bool(saved_objects[k])
+            saved_events = data.get("visible_events", {})
+            for k in self.visible_events:
+                if k in saved_events:
+                    self.visible_events[k] = bool(saved_events[k])
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -1615,7 +2137,11 @@ class SignalTimelineScene(QGraphicsScene):
             remaining = {f.get('query', '').strip() for f in self.visual_findings}
             remaining.discard('')
             self.visual_queries = sorted(remaining)
-            self.visible_visual_queries = {q: True for q in self.visual_queries}
+            # Keep each survivor's show/hide state — removing one query must not
+            # silently un-hide the others. Default new/unknown queries to visible.
+            self.visible_visual_queries = {
+                q: self.visible_visual_queries.get(q, True) for q in self.visual_queries
+            }
 
         self._rebuild_group_order_for_visual()
         self.cache_data['visual_findings'] = self.visual_findings
@@ -1748,8 +2274,8 @@ class SignalTimelineView(QGraphicsView):
         # Semi-transparent background
         self.setStyleSheet("""
             QGraphicsView {
-                background-color: rgba(18, 18, 24, 200);
-                border: 2px solid rgba(100, 100, 150, 150);
+                background-color: rgba(18, 18, 18, 200);
+                border: 2px solid rgba(90, 90, 90, 150);
                 border-radius: 5px;
             }
         """)
@@ -1789,6 +2315,8 @@ class SignalTimelineView(QGraphicsView):
         scale_y = view_height / scene_rect.height()
         # Only adjust vertical scale, keep horizontal untouched
         current = self.transform()
+        if current.m22() == scale_y:
+            return
         self.setTransform(
             current.__class__(
                 current.m11(), current.m12(),
@@ -1796,6 +2324,13 @@ class SignalTimelineView(QGraphicsView):
                 current.dx(),  current.dy()
             )
         )
+        # The ruler's labels are anchored a fixed number of *screen* pixels
+        # above the bottom, which is a scene distance that depends on the scale
+        # just changed. Without this they keep the spacing of whatever size the
+        # window happened to be when they were drawn — at startup, the size
+        # before the layout settled, which is why they opened cut in half.
+        if hasattr(scene, "draw_time_markers"):
+            scene.draw_time_markers()
 
     def ensure_time_visible(self, time_seconds):
         """Auto-scroll so the playhead stays visible during playback."""
@@ -1839,6 +2374,13 @@ class SignalTimelineView(QGraphicsView):
             self.scale(1.0 / zoom_factor, 1.0)
 
         self.setTransformationAnchor(old_anchor)
+
+        # Re-pick the ruler interval for the new effective zoom so labels stay
+        # readable and evenly spaced instead of colliding as you zoom out.
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "draw_time_markers"):
+            scene.draw_time_markers()
+
         event.accept()
     
     def _item_is_bar(self, pos) -> bool:
@@ -1897,11 +2439,24 @@ class SignalTimelineView(QGraphicsView):
         if len(row_clips) > 1:
             act_all = menu.addAction(f"➕  Add all “{group_name}” clips  ({len(row_clips)})")
 
+        # A chosen clip can also be exchanged for the best moment that lost to
+        # it. Costs a re-select, not a re-analysis, so it is offered inline.
+        act_swap = act_undo = None
+        if meta.get("layer") == "highlights" and meta.get("index") is not None:
+            menu.addSeparator()
+            act_swap = menu.addAction("🔀  Swap for the next best moment")
+            act_undo = menu.addAction("↩  Undo last swap")
+            act_undo.setEnabled(bool(getattr(scene, "highlight_swaps_done", 0)))
+
         chosen = menu.exec(event.globalPosition().toPoint())
         if chosen is act_one:
             scene.add_clip_to_edit_requested.emit(start, end)
         elif act_all is not None and chosen is act_all:
             scene.add_clips_to_edit_requested.emit(row_clips)
+        elif act_swap is not None and chosen is act_swap:
+            scene.swap_highlight_requested.emit(int(meta["index"]))
+        elif act_undo is not None and chosen is act_undo:
+            scene.undo_highlight_swap_requested.emit()
 
     # ── avoid-range context menu ───────────────────────────────────────
     def _avoid_context_menu(self, event):
@@ -2226,10 +2781,10 @@ class SignalTimelineView(QGraphicsView):
 
         # Gradient fill — same blue as the selection rect
         grad = QLinearGradient(0, 0, 0, chip_h)
-        grad.setColorAt(0, QColor(120, 200, 255, 220))
-        grad.setColorAt(1, QColor(60,  140, 220, 220))
+        grad.setColorAt(0, QColor(90, 160, 250, 220))
+        grad.setColorAt(1, QColor(47, 129, 247, 220))
         painter.setBrush(QBrush(grad))
-        painter.setPen(QPen(QColor(100, 220, 255), 1.5))
+        painter.setPen(QPen(QColor(47, 129, 247), 1.5))
         painter.drawRoundedRect(1, 1, chip_w - 2, chip_h - 2, 4, 4)
 
         # Duration label

@@ -1,26 +1,24 @@
 video:
-  paths:
-  - C:\Users\vee\Desktop\Julia_Jedrzej_Reel_v5.mp4
-  - C:\Users\vee\Downloads\100GOPRO\GX013667.MP4
+  paths: []
 download:
   last_url: ''
   save_dir: D:\movies
   auto_add: true
-  auto_process: false
   auto_combine: true
-  use_same_time_range: false
-  immediate_processing: true
+  download_mode: full
+  process_mode: immediate
   concurrent_downloads: 1
-  download_full: false
   time_range_start: 0
   time_range_end: 300
 highlights:
   clip_time: 10
-  output: GX013638_highlight.mp4
+  # 0.0 = best moments wherever they fall, 1.0 = spread evenly over the video
+  coverage: 0.0
+  output: highlight.mp4
   max_duration: 420
   exact_duration: 0
   keep_temp: false
-  skip_highlights: false
+  render_mode: cpu
   auto_min_clip: 2
   auto_max_clip: 30
   auto_merge_gap: 2
@@ -32,10 +30,19 @@ scoring:
   motion_event_points: 0
   motion_peak_points: 0
   audio_peak_points: 0
+  loudness_burst_points: 0
   keyword_points: 0
   transcript_points: 0
   object_points: 5
   action_points: 0
+  # Expressions score only for the classes named here, e.g. [happy, surprise].
+  # Scoring all five would score every second a face is visible.
+  face_expression_points: 0
+  face_expression_labels: []
+  beginning_points: 0
+  ending_points: 0
+  beginning_seconds: 60
+  ending_seconds: 120
   multi_signal_boost: 1.2
   min_signals_for_boost: 2
 actions:
@@ -73,4 +80,17 @@ visualization:
 avoid:
   face_recognition_enabled: false
 ui:
-  suppress_no_cache_warning: false
+  suppress_no_cache_warning: true
+loudness_bursts:
+  # Where the audio rises above its own local level. Every number here is a
+  # policy choice about what to surface, not a property of the audio -- see
+  # modules/loudness_bursts.py for what each was measured to do.
+  z_threshold: 2.0
+  # Seconds an excursion must hold. The single most consequential value: 1.5
+  # (which suits sustained applause) reports nothing on material whose events
+  # last a second or two.
+  min_duration: 1.0
+  # Seconds ignored at each end, where titles and music beds live.
+  edge_guard: 120
+  # Candidates closer than this become one event.
+  merge_gap: 30

@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
+from modules.audio_device import follow_system_default
 
 try:
     import psutil
@@ -104,6 +105,45 @@ def action_abbrev(name: str) -> str:
     if not words:
         return "?"
     return "".join(w[0] for w in words).upper()[:3]
+
+
+# ──────────────────────────────────────────────────────────────────
+# StickyMenu — a menu whose checkboxes don't dismiss it
+# ──────────────────────────────────────────────────────────────────
+
+class StickyMenu(QMenu):
+    """QMenu that stays open when one of its checkable items is toggled.
+
+    Qt closes the whole menu chain on any trigger, so hiding four classes
+    on the overlay filter meant reopening the filter four times. Checkable
+    items now toggle in place; plain actions ("Show all", …) still close
+    the menu the usual way.
+    """
+
+    def _sticky_action(self) -> QAction | None:
+        act = self.activeAction()
+        if act is not None and act.isEnabled() and act.isCheckable():
+            return act
+        return None
+
+    def mouseReleaseEvent(self, event):
+        act = self._sticky_action()
+        # Only swallow releases that land on the item itself — a release
+        # outside the menu still dismisses it.
+        if act is not None and self.actionGeometry(act).contains(event.position().toPoint()):
+            act.trigger()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            act = self._sticky_action()
+            if act is not None:
+                act.trigger()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -475,11 +515,24 @@ class OverlayScene(QGraphicsScene):
         super().__init__(parent)
         self.setBackgroundBrush(QBrush(QColor(0, 0, 0)))
 
-        # Video item
+        # Video item, wrapped in a clip container so VR left-eye cropping is an
+        # actual scene-graph clip (see set_vr_clip) rather than relying on the
+        # view's fitInView zoom alone — fitInView's KeepAspectRatio can reveal
+        # scene content beyond the requested rect whenever the viewport's aspect
+        # ratio doesn't match the crop's (e.g. an unmaximized/resized window),
+        # which let the right eye bleed into view.
+        self._eye_clip = QGraphicsRectItem()
+        self._eye_clip.setPen(QPen(Qt.PenStyle.NoPen))
+        self._eye_clip.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._eye_clip.setFlag(QGraphicsItem.GraphicsItemFlag.ItemClipsChildrenToShape, True)
+        self.addItem(self._eye_clip)
+        self._vr_clip_enabled = False
+
         self.video_item = QGraphicsVideoItem()
         self.video_item.setZValue(0)
+        self.video_item.setParentItem(self._eye_clip)
         self.video_item.setSize(QSizeF(1920, 1080))  # default until nativeSizeChanged
-        self.addItem(self.video_item)
+        self._eye_clip.setRect(0, 0, 1920, 1080)
         self.setSceneRect(0, 0, 1920, 1080)
 
         # Bbox items indexed by timestamp bucket (100ms buckets)
@@ -527,12 +580,25 @@ class OverlayScene(QGraphicsScene):
         scene_h = size.height() * scale
 
         self.video_item.setSize(QSizeF(scene_w, scene_h))
+        self._apply_eye_clip(scene_w, scene_h)
         self.setSceneRect(0, 0, scene_w, scene_h)
 
         # Recompute bbox geometries against the (possibly downscaled) scene size
         for item in self._all_bbox_items:
             item.update_geometry(scene_w, scene_h)
         self._resolve_label_overlaps()
+
+    def _apply_eye_clip(self, scene_w: float, scene_h: float) -> None:
+        w = scene_w / 2 if self._vr_clip_enabled else scene_w
+        self._eye_clip.setRect(0, 0, w, scene_h)
+
+    def set_vr_clip(self, enabled: bool) -> None:
+        """Hard-clip the video item to its left half (SBS left eye) at the scene
+        level. Independent of the view's zoom/fit transform, so it can't leak
+        the right eye when the view's aspect ratio doesn't match the crop."""
+        self._vr_clip_enabled = enabled
+        size = self.video_item.size()
+        self._apply_eye_clip(size.width(), size.height())
 
     def load_detections_lazy(self, bbox_loader: LazyBBoxLoader):
         """
@@ -744,6 +810,7 @@ class OverlayView(QGraphicsView):
     def set_vr_mode(self, enabled: bool):
         """Show only the left half of the scene (SBS VR videos)."""
         self._vr_mode = enabled
+        self.scene().set_vr_clip(enabled)
         self._fit_video()
 
     def resizeEvent(self, event):
@@ -916,17 +983,17 @@ class RealtimeOverlayPreview(QWidget):
 
         # Style
         self.setStyleSheet("""
-            QCheckBox { color: #d0d8ff; spacing: 6px; }
+            QCheckBox { color: #d4d4d4; spacing: 6px; }
             QCheckBox::indicator { width: 16px; height: 16px; }
-            QCheckBox::indicator:checked { background-color: #3a5fcd; border: 2px solid #5a7fdd; border-radius: 3px; }
-            QCheckBox::indicator:unchecked { border: 2px solid #4a4a6a; border-radius: 3px; }
-            QLabel { color: #d0d8ff; }
+            QCheckBox::indicator:checked { background-color: #2f81f7; border: 2px solid #2f81f7; border-radius: 3px; }
+            QCheckBox::indicator:unchecked { border: 2px solid #4a4a4a; border-radius: 3px; }
+            QLabel { color: #d4d4d4; }
         """)
 
     def _init_player(self):
         """Create media player and wire it to the graphics video item."""
         self._player = QMediaPlayer()
-        self._audio = QAudioOutput()
+        self._audio = follow_system_default(QAudioOutput())
         self._player.setAudioOutput(self._audio)
         self._player.setVideoOutput(self._scene.video_item)
         self._player.setSource(QUrl.fromLocalFile(self.video_path))
@@ -992,7 +1059,8 @@ class RealtimeOverlayPreview(QWidget):
 
         # Facial recognition is always offered — it's driven by the live face
         # worker, not the cache. Rebuilt on open so newly seen faces show up.
-        self._face_filter_menu = self._filter_menu.addMenu("🙂 Facial recognition")
+        self._face_filter_menu = StickyMenu("🙂 Facial recognition", self._filter_menu)
+        self._filter_menu.addMenu(self._face_filter_menu)
         self._face_filter_menu.aboutToShow.connect(self._rebuild_face_filter)
 
         if self._filter_actions:
@@ -1011,7 +1079,8 @@ class RealtimeOverlayPreview(QWidget):
         `names` are the raw class_name keys the scene filters on; the badge
         prefix is stripped for display only.
         """
-        sub = self._filter_menu.addMenu(title)
+        sub = StickyMenu(title, self._filter_menu)
+        self._filter_menu.addMenu(sub)
         group_actions: list[QAction] = []
 
         show_all = sub.addAction("Show all")

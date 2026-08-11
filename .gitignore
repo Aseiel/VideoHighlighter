@@ -4,6 +4,10 @@ debug.log
 debug.prev.log
 timeline_debug.log
 
+# Timeline viewer filter state (written next to the app at runtime by
+# SignalTimelineScene.save_filters) — per-machine UI state, not repo content.
+timeline_filters.json
+
 # User-imported custom object detectors ("Import model…" in the Advanced tab
 # copies them here). Weights are large and belong to the user, not the repo.
 models/custom/
@@ -55,3 +59,32 @@ analysis_stats.json
 composition_rules.yaml
 .gstack/
 timeline_filters.json
+
+# Analysis caches — CLIP frame indices, detection/bbox entries, thumbnails,
+# the face database. All rebuilt from the source video on demand, and large.
+cache/
+
+# Training output: checkpoints, logs and run directories written by training/.
+# The runs are the user's own and the weights dwarf the repo.
+training/runs/
+
+__pycache__/
+
+# Update-check state (last check, skipped version) — per install, never shared.
+update_state.json
+# Updater working dirs: files being downloaded, and the ones displaced by the
+# last update pending a sweep. Both appear in the install root at runtime.
+.update-staging/
+.update-old/
+publish/
+.secrets/
+
+# User-defined composition rules and the hand labels used to tune them. The
+# event names and the spans are the user's own, about their own material, and
+# do not belong in the repository. The suffixed form is listed because a bare
+# name does not match a backup copy, and in the sibling repo two such backups
+# reached a commit before anyone noticed.
+composition_rules.yaml
+composition_rules.yaml.*
+composition_rules.*.yaml
+labels/
