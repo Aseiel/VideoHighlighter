@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
+from modules.audio_device import follow_system_default
 
 try:
     import psutil
@@ -992,7 +993,7 @@ class RealtimeOverlayPreview(QWidget):
     def _init_player(self):
         """Create media player and wire it to the graphics video item."""
         self._player = QMediaPlayer()
-        self._audio = QAudioOutput()
+        self._audio = follow_system_default(QAudioOutput())
         self._player.setAudioOutput(self._audio)
         self._player.setVideoOutput(self._scene.video_item)
         self._player.setSource(QUrl.fromLocalFile(self.video_path))

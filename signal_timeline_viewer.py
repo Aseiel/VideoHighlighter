@@ -48,6 +48,7 @@ from modules.ui import icons as ui_icons
 # (modules/startup_splash.py), which keeps the window's own code free of any
 # knowledge of who, if anyone, is watching.
 from modules import startup_splash
+from modules.audio_device import follow_system_default
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
 from video_ai_editor.timeline_export import TimelineExporter
@@ -788,7 +789,7 @@ class SignalTimelineWindow(QMainWindow):
         # Media player (shared — used in Off + Precomp modes)
         # ──────────────────────────────────────────────────────────
         self.video_player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
+        self.audio_output = follow_system_default(QAudioOutput())
         self.video_player.setAudioOutput(self.audio_output)
         self.video_player.setVideoOutput(self.video_view.video_output)
         self.video_view.attach_player(self.video_player)  # crop tracks real resolution

@@ -19,6 +19,7 @@ from PySide6.QtCore import Qt, QUrl, Signal, Slot, QTimer, QRect, QEvent
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPixmap, QImage
+from modules.audio_device import follow_system_default
 
 class AnalysisOverlayWidget(QWidget):
     """Floating transparent overlay that draws labels on top of video.
@@ -321,7 +322,7 @@ class VideoPreviewWindow(QMainWindow):
     def init_video_player(self):
         """Initialize the media player"""
         self.player = QMediaPlayer()
-        self.audio_output = QAudioOutput()
+        self.audio_output = follow_system_default(QAudioOutput())
         self.player.setAudioOutput(self.audio_output)
         self.player.setVideoOutput(self.video_widget)
         
