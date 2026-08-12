@@ -470,12 +470,13 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
                 music_volume=float(spec.get("music_volume", 0.8)),
                 width=int(spec.get("width", 0)), height=int(spec.get("height", 0)),
                 fps=int(spec.get("fps", 0)), crf=int(spec.get("crf", 20)),
+                fill=str(spec.get("fill", "pad") or "pad"),
                 cuts=[
                     Cut(source=c["source"], start=float(c.get("start", 0.0)),
                         end=float(c.get("end", 0.0)),
                         transition=c.get("transition", "cut"),
                         transition_duration=float(c.get("transition_duration", 0.5)),
-                        label=c.get("label", ""))
+                        label=c.get("label", ""), text=c.get("text", ""))
                     for c in spec.get("cuts", [])
                 ],
             )

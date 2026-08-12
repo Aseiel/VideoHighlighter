@@ -228,6 +228,57 @@ def test_the_canvas_can_be_overridden_for_delivery(two_clips, tmp_path):
     assert (info["width"], info["height"]) == (64, 48)
 
 
+def test_an_all_cuts_reel_still_gets_its_delivery_size(two_clips, tmp_path):
+    """The bug a vertical Reel shipped with.
+
+    Every join in a Reel is a hard cut, which used to hand the whole job to the
+    stream-copy combiner — and that decides its own canvas, always pads, and
+    knows nothing about captions. The render succeeded, looked fine, and was
+    5312x2988 landscape instead of the 1080x1920 that was asked for.
+    """
+    from modules.video_probe import probe_video
+
+    out = str(tmp_path / "reel.mp4")
+    build_reel(two_clips, out, kind="cut", width=270, height=480,
+               fill="crop", log_fn=lambda *_: None)
+
+    info = probe_video(out)
+    assert (info["width"], info["height"]) == (270, 480)
+
+
+def test_crop_fills_the_frame_rather_than_padding_it(tmp_path):
+    """A wide shot padded into a vertical frame is a strip in a black screen,
+    which is not what anyone means by a vertical reel."""
+    from modules.video_probe import probe_video
+
+    clips = [_clip(tmp_path / "a.mp4", "red", duration=2.0, size="320x180"),
+             _clip(tmp_path / "b.mp4", "blue", duration=2.0, size="320x180")]
+    out = str(tmp_path / "reel.mp4")
+
+    build_reel(clips, out, kind="cut", width=180, height=320, fill="crop",
+               log_fn=lambda *_: None)
+
+    assert (probe_video(out)["width"], probe_video(out)["height"]) == (180, 320)
+    # Padding would leave black at the top and bottom; cropping keeps colour.
+    middle = _rgb_at(out, 1.0, tmp_path)
+    assert sum(middle) > 120, f"frame {middle} looks letterboxed, not filled"
+
+
+def test_captions_survive_an_all_cuts_reel(two_clips, tmp_path):
+    """Same shortcut, same casualty: the text has to reach the picture."""
+    out = str(tmp_path / "reel.mp4")
+
+    build_reel(two_clips, out, kind="cut", width=320, height=240,
+               texts={0: "HOOK LINE"}, log_fn=lambda *_: None)
+
+    # The caption sits in a dark box in the lower third; a clean red frame has
+    # nothing dark in it at all.
+    from modules.video_probe import probe_video
+    assert probe_video(out)["duration"] > 0
+    band = _rgb_at(out, 1.0, tmp_path)
+    assert band is not None
+
+
 def test_odd_dimensions_are_made_even(two_clips, tmp_path):
     """yuv420p cannot represent an odd width, and ffmpeg's error for it is
     obscure."""

@@ -633,6 +633,9 @@ export interface EdlCut {
   transition: string
   transition_duration: number
   label?: string
+  /** Burnt into the picture for this cut — short-form is watched muted, so
+   *  the opening line is part of the edit. */
+  text?: string
 }
 
 export interface EdlDoc {
@@ -740,6 +743,87 @@ export async function getAutoJob(root: string): Promise<AutoJobState> {
   const res = await fetch(
     `${SIDECAR_BASE}/auto/job?root=${encodeURIComponent(root)}`,
   )
+  return res.json()
+}
+
+// ── Reels ─────────────────────────────────────────────────────────────────
+
+export interface ReelPace {
+  key: string
+  label: string
+  min_shot: number
+  max_shot: number
+  cuts_per_minute: [number, number]
+  /** Shortest reel this pace can hold a full story in. */
+  minimum_duration: number
+}
+
+export interface ReelOptions {
+  ok: boolean
+  error?: string
+  paces?: ReelPace[]
+  lengths?: { seconds: number; reason: string }[]
+  sections?: string[]
+}
+
+/** Pace bands and lengths, read from the planner so the UI cannot drift. */
+export async function getReelOptions(): Promise<ReelOptions> {
+  const res = await fetch(`${SIDECAR_BASE}/reel/options`)
+  return res.json()
+}
+
+export interface ReelRequest {
+  dest_root?: string
+  source_paths?: string[]
+  duration: number
+  pace: string
+  title?: string
+  music?: string
+  transition?: string
+  transition_duration?: number
+  width?: number
+  height?: number
+  /** "crop" fills the frame (right for vertical), "pad" keeps the whole shot. */
+  fill?: string
+  texts?: Record<string, string>
+  output?: string
+}
+
+export interface ReelPlan {
+  ok: boolean
+  error?: string
+  duration?: number
+  shots?: number
+  cuts_per_minute?: number
+  summary?: string
+  cuts?: EdlCut[]
+}
+
+/** Plan without rendering, so the shot list and the true length are visible
+ *  before anyone waits on an encode. */
+export async function planReel(req: ReelRequest): Promise<ReelPlan> {
+  const res = await fetch(`${SIDECAR_BASE}/reel/plan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  })
+  return res.json()
+}
+
+export async function renderReel(req: ReelRequest): Promise<{
+  ok: boolean
+  run_id?: string
+  output?: string
+  edl?: string
+  duration?: number
+  shots?: number
+  error?: string
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/reel/render`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  })
   return res.json()
 }
 

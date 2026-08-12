@@ -73,6 +73,7 @@ import {
 } from "@/components/DetectionPreview"
 import { setPreview } from "@/lib/api"
 import { AutoTab } from "@/components/tabs/AutoTab"
+import { ReelTab } from "@/components/tabs/ReelTab"
 import { TimelineTab } from "@/components/tabs/TimelineTab"
 import { BasicTab } from "@/components/tabs/BasicTab"
 import { TranscriptTab } from "@/components/tabs/TranscriptTab"
@@ -128,6 +129,7 @@ export default function App() {
   const [llmModel, setLlmModel] = useState("")
   const [visionResults, setVisionResults] = useState<VisionResult[]>([])
   const [lastEdl, setLastEdl] = useState("")
+  const [lastRoot, setLastRoot] = useState("")
   const [autoStages, setAutoStages] = useState<
     Partial<Record<AutoStageName, { status: AutoStageStatus; detail: string }>>
   >({})
@@ -488,6 +490,7 @@ export default function App() {
     await beginRun()
     // No video paths yet — the pipeline discovers them by copying the card, and
     // it names the film itself, so only the scoring settings carry over.
+    setLastRoot(opts.dest_root)
     const res = await startAuto({
       ...opts,
       config: toGuiConfig(cfgRef.current, opts.output_name ?? "film.mp4", [], {
@@ -737,6 +740,7 @@ export default function App() {
       <Tabs defaultValue="basic" className="min-w-0">
         <TabsList>
           <TabsTrigger value="auto">Auto</TabsTrigger>
+          <TabsTrigger value="reel">Reel</TabsTrigger>
           <TabsTrigger value="timeline">Timeline</TabsTrigger>
           <TabsTrigger value="download">Download</TabsTrigger>
           <TabsTrigger value="basic">Basic</TabsTrigger>
@@ -754,6 +758,13 @@ export default function App() {
             stages={autoStages}
             onStart={(o) => void onAutoStart(o)}
             onCancel={() => void onCancel()}
+          />
+        </TabsContent>
+        <TabsContent value="reel" className="mt-4">
+          <ReelTab
+            running={running}
+            onCancel={() => void onCancel()}
+            suggestedRoot={lastRoot}
           />
         </TabsContent>
         <TabsContent value="timeline" className="mt-4">

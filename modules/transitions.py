@@ -276,6 +276,47 @@ def _filtergraph(transitions, durations, fps: int) -> tuple[str, str, float]:
     return ";".join(parts), "", acc
 
 
+def _normalize_filled(src: str, dst: str, width: int, height: int, fps: int,
+                      log_fn=print) -> None:
+    """Normalise like :func:`modules.combine_videos._normalize`, but *fill* the
+    canvas by cropping instead of padding to fit.
+
+    Both are right for different jobs. Padding preserves the whole frame and is
+    correct for a film, where losing the edges of a composed shot is worse than
+    a black bar. Filling is correct for a vertical Reel, where 16:9 footage
+    padded into 9:16 is a small strip in the middle of a mostly-black screen —
+    which no one watches. The sides are lost either way; this loses them to the
+    crop rather than to the letterbox.
+    """
+    from modules.combine_videos import _has_audio
+
+    with_silence = not _has_audio(src, log_fn)
+    vf = (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+          f"crop={width}:{height},setsar=1,fps={fps},setpts=N/FRAME_RATE/TB")
+    cmd = [ffmpeg_exe(), "-y", "-v", "error", "-i", src]
+    if with_silence:
+        cmd += ["-f", "lavfi", "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=48000"]
+    cmd += [
+        "-map", "0:v:0", "-map", "1:a:0" if with_silence else "0:a:0",
+        "-vf", vf, "-af", "aresample=48000,asetpts=N/SR/TB",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+        "-pix_fmt", "yuv420p", "-profile:v", "high",
+        "-g", str(fps * 2), "-keyint_min", str(fps), "-sc_threshold", "0",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-fps_mode", "cfr", "-max_muxing_queue_size", "1024",
+        "-fflags", "+genpts", "-avoid_negative_ts", "make_zero",
+    ]
+    if with_silence:
+        cmd += ["-shortest"]
+    cmd += [dst]
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=900)
+    if result.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
+        err = (result.stderr or "").strip()[-500:] or "unknown error"
+        raise RuntimeError(f"Normalization failed for {os.path.basename(src)}: {err}")
+
+
 def _font_file() -> str:
     """A font drawtext can load, or "" when none is found.
 
@@ -395,7 +436,7 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
                duration: float = DEFAULT_DURATION, width: int = 0,
                height: int = 0, fps: int = 0, crf: int = 20,
                preset: str = "medium", music=None, music_optional: bool = False,
-               texts=None, log_fn=print, progress_fn=None,
+               texts=None, fill: str = "pad", log_fn=print, progress_fn=None,
                cancel_check=None) -> str:
     """Join ``clips`` into ``output`` with transitions between them.
 
@@ -438,7 +479,15 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
     durations = [_probe_duration(c) for c in valid]
     transitions = _clamp(transitions, durations)
 
-    if len(valid) == 1 or all(t.is_cut for t in transitions):
+    # The stream-copy combiner is faster and lossless, but it decides its own
+    # canvas, always pads, and knows nothing about captions. Delegating to it
+    # when any of those were asked for silently returns something else — which
+    # is exactly what a vertical reel of hard cuts is: every join is a cut, so
+    # the shortcut fired and the 1080x1920 crop and the on-screen text both
+    # vanished from a render that otherwise looked fine.
+    plain = (not int(width) and not int(height) and not int(fps)
+             and fill != "crop" and not any((texts or {}).values()))
+    if plain and (len(valid) == 1 or all(t.is_cut for t in transitions)):
         log_fn("🎬 Every join is a cut — using the stream-copy combiner")
         from modules.combine_videos import CombineCancelled, combine_videos
         try:
@@ -493,7 +542,10 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
                     pass
             log_fn(f"⚙️ Normalizing {i + 1}/{len(valid)}: {os.path.basename(src)}")
             dst = os.path.join(temp_dir, f"n{i:03d}.mp4")
-            _normalize(src, dst, width, height, fps, log_fn)
+            if fill == "crop":
+                _normalize_filled(src, dst, width, height, fps, log_fn)
+            else:
+                _normalize(src, dst, width, height, fps, log_fn)
             caption = (texts or {}).get(i, "") if texts else ""
             if caption.strip():
                 # After normalising, so the text is drawn at delivery size and
@@ -534,28 +586,40 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
         run_durations = [_probe_duration(p) for p in pieces]
         blended = _clamp([Transition(index=i, kind=t.kind, duration=t.duration)
                           for i, t in enumerate(blended)], run_durations)
-        graph, _, expected = _filtergraph(blended, run_durations, fps)
-        lost = sum(t.duration for t in blended)
-        log_fn(f"🔗 Blending — {len(blended)} transition(s) across "
-               f"{len(pieces)} run(s), {lost:.1f}s absorbed, ~{expected:.1f}s out")
 
-        cmd = [ffmpeg_exe(), "-y", "-v", "error"]
-        for path in pieces:
-            cmd += ["-i", path]
-        cmd += [
-            "-filter_complex", graph,
-            "-map", "[vout]", "-map", "[aout]",
-            "-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)),
-            "-pix_fmt", "yuv420p", "-profile:v", "high",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-            "-movflags", "+faststart",
-            staged,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=3600)
-        if result.returncode != 0 or not os.path.exists(staged) or os.path.getsize(staged) == 0:
-            err = (result.stderr or "").strip()[-800:] or "unknown error"
-            raise RuntimeError(f"Reel build failed: {err}")
+        if not blended:
+            # Every join was a cut, and we are only here because the delivery
+            # size, the fill or a caption ruled out the stream-copy shortcut.
+            # The single run those clips joined into is already the reel; a
+            # filtergraph with nothing to blend would only re-encode it again.
+            log_fn(f"🔗 {len(valid)} clips, all cuts — no blending needed")
+            shutil.move(pieces[0], staged)
+        else:
+            lost = sum(t.duration for t in blended)
+            log_fn(f"🔗 Blending — {len(blended)} transition(s) across "
+                   f"{len(pieces)} run(s), {lost:.1f}s absorbed, ~{sum(run_durations) - lost:.1f}s out")
+            graph, _, _ = _filtergraph(blended, run_durations, fps)
+            cmd = [ffmpeg_exe(), "-y", "-v", "error"]
+            for path in pieces:
+                cmd += ["-i", path]
+            cmd += [
+                "-filter_complex", graph,
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", preset, "-crf", str(int(crf)),
+                "-pix_fmt", "yuv420p", "-profile:v", "high",
+                "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                "-movflags", "+faststart",
+                staged,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace",
+                                    timeout=3600)
+            if result.returncode != 0:
+                err = (result.stderr or "").strip()[-800:] or "unknown error"
+                raise RuntimeError(f"Reel build failed: {err}")
+
+        if not os.path.exists(staged) or os.path.getsize(staged) == 0:
+            raise RuntimeError("Reel build produced no output")
 
         if music and music.get("path"):
             if cancel_check is not None and cancel_check():

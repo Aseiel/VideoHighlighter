@@ -816,6 +816,163 @@ async def render_edl_endpoint(req: EdlRenderRequest) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+@app.get("/reel/options")
+async def reel_options() -> dict:
+    """Pace bands, lengths and the story structure, so the UI shows the same
+    numbers the planner uses rather than a copy that can drift."""
+    try:
+        from modules.reel_plan import LENGTHS, PACES, STRUCTURE, minimum_duration
+        return {
+            "ok": True,
+            "paces": [
+                {"key": p.key, "label": p.label,
+                 "min_shot": p.min_shot, "max_shot": p.max_shot,
+                 "cuts_per_minute": list(p.cuts_per_minute),
+                 "minimum_duration": round(minimum_duration(p.key), 1)}
+                for p in PACES.values()
+            ],
+            "lengths": [{"seconds": s, "reason": r} for s, r in LENGTHS],
+            "sections": [s.name for s in STRUCTURE],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class ReelRequest(BaseModel):
+    dest_root: str = ""
+    source_paths: list[str] | None = None
+    duration: float = 24.0
+    pace: str = "energetic"
+    title: str | None = "Reel"
+    music: str | None = ""
+    transition: str | None = "cut"
+    transition_duration: float | None = 0.25
+    width: int | None = 1080
+    height: int | None = 1920
+    fill: str | None = "crop"
+    texts: dict | None = None
+    output: str | None = ""
+
+
+def _reel_sources(req: "ReelRequest") -> list[str]:
+    """The clips a reel is built from: whatever the caller passed, else the
+    highlights an earlier run left in the project folder."""
+    import glob
+
+    if req.source_paths:
+        return [p for p in req.source_paths if p and os.path.exists(p)]
+    if not req.dest_root:
+        return []
+    found: list[str] = []
+    for pattern in ("*_highlight.mp4", "*/*_highlight.mp4"):
+        found.extend(glob.glob(os.path.join(req.dest_root, pattern)))
+    return sorted(set(found), key=_natural_key)
+
+
+def _build_reel_edl(req: "ReelRequest"):
+    from modules.reel_plan import plan_reel
+
+    sources = _reel_sources(req)
+    if not sources:
+        raise ValueError(
+            "no clips to work from — run the Auto tab first, or pick files")
+
+    analysis = None
+    if req.music and os.path.exists(req.music):
+        try:
+            from modules.music_analysis import analyze_music
+            analysis = analyze_music(req.music, log_fn=lambda *_: None)
+        except Exception:
+            analysis = None   # a reel without beat snapping is still a reel
+
+    edl = plan_reel(
+        sources, duration=float(req.duration), pace=req.pace or "energetic",
+        title=req.title or "Reel", music=req.music or "",
+        transition=req.transition or "cut",
+        transition_duration=float(req.transition_duration or 0.25),
+        texts=req.texts or {}, analysis=analysis,
+        width=int(req.width or 0), height=int(req.height or 0),
+        log_fn=lambda *_: None)
+    edl.fill = req.fill or "pad"
+    return edl
+
+
+@app.post("/reel/plan")
+async def reel_plan_endpoint(req: ReelRequest) -> dict:
+    """Plan without rendering, so the UI can show the shot list and the real
+    length before anyone waits on an encode."""
+    try:
+        from modules.reel_plan import cuts_per_minute, describe_plan
+
+        edl = await asyncio.to_thread(_build_reel_edl, req)
+        return {
+            "ok": True,
+            "duration": edl.duration,
+            "shots": len(edl.cuts),
+            "cuts_per_minute": round(cuts_per_minute(edl), 1),
+            "summary": describe_plan(edl),
+            "cuts": [
+                {"source": c.source, "start": c.start, "end": c.end,
+                 "duration": c.duration, "transition": c.transition,
+                 "transition_duration": c.transition_duration,
+                 "label": c.label, "text": c.text}
+                for c in edl.cuts
+            ],
+        }
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/reel/render")
+async def reel_render(req: ReelRequest) -> dict:
+    """Plan and render as a job, streaming progress like any other run."""
+    try:
+        edl = await asyncio.to_thread(_build_reel_edl, req)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+    output = req.output or os.path.join(
+        req.dest_root or os.path.dirname(edl.cuts[0].source), "reel.mp4")
+    edl_path = os.path.splitext(output)[0] + ".edl.yaml"
+    try:
+        from modules.edl import save_edl
+        save_edl(edl, edl_path)
+    except Exception:
+        edl_path = ""
+
+    job = {
+        "kind": "edl",
+        "output": output,
+        "edl_path": edl_path,
+        "edl": {
+            "title": edl.title, "music": edl.music,
+            "music_mode": edl.music_mode, "music_volume": edl.music_volume,
+            "width": edl.width, "height": edl.height, "fps": edl.fps,
+            "crf": edl.crf, "fill": edl.fill,
+            "cuts": [
+                {"source": c.source, "start": c.start, "end": c.end,
+                 "transition": c.transition,
+                 "transition_duration": c.transition_duration,
+                 "label": c.label, "text": c.text}
+                for c in edl.cuts
+            ],
+        },
+    }
+    try:
+        loop = asyncio.get_running_loop()
+        return {"ok": True, "run_id": manager.start_job(job, loop),
+                "output": output, "edl": edl_path,
+                "duration": edl.duration, "shots": len(edl.cuts)}
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 class AutoRunRequest(BaseModel):
     dest_root: str
     card_root: str | None = None

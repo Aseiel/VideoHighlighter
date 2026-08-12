@@ -60,7 +60,7 @@ EDL_VERSION = 1
 
 _TOP_KEYS = {
     "version", "title", "music", "music_mode", "music_volume",
-    "width", "height", "fps", "crf", "cuts",
+    "width", "height", "fps", "crf", "fill", "cuts",
 }
 _CUT_KEYS = {"source", "in", "out", "transition", "transition_duration",
              "label", "text"}
@@ -156,6 +156,9 @@ class Edl:
     height: int = 0
     fps: int = 0
     crf: int = 20
+    # "pad" keeps the whole frame; "crop" fills the canvas. Vertical Reels
+    # want crop, or 16:9 footage becomes a strip in a black screen.
+    fill: str = "pad"
 
     @property
     def source_duration(self) -> float:
@@ -341,6 +344,8 @@ def save_edl(edl: Edl, path: str) -> str:
         lines.append(f"fps: {edl.fps}")
     if edl.crf and edl.crf != 20:
         lines.append(f"crf: {edl.crf}")
+    if edl.fill != "pad":
+        lines.append(f"fill: {edl.fill}")
 
     lines.append("")
     lines.append("cuts:")
@@ -592,6 +597,7 @@ def render_edl(edl: Edl, output: str, *, mode: str = "gpu",
                           width=edl.width, height=edl.height, fps=edl.fps,
                           crf=edl.crf, music=music,
                           music_optional=music_optional, texts=texts,
+                          fill=edl.fill,
                           log_fn=log_fn, progress_fn=progress_fn,
                           cancel_check=cancel_check)
     finally:
