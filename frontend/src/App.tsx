@@ -57,6 +57,9 @@ import {
   revealOutput,
   scanFolder,
   combineVideos,
+  startAuto,
+  type AutoStageName,
+  type AutoStageStatus,
   type RunEvent,
 } from "@/lib/api"
 import { VideoCard } from "@/components/VideoCard"
@@ -69,6 +72,8 @@ import {
   type PreviewFrame,
 } from "@/components/DetectionPreview"
 import { setPreview } from "@/lib/api"
+import { AutoTab } from "@/components/tabs/AutoTab"
+import { TimelineTab } from "@/components/tabs/TimelineTab"
 import { BasicTab } from "@/components/tabs/BasicTab"
 import { TranscriptTab } from "@/components/tabs/TranscriptTab"
 import { AdvancedTab } from "@/components/tabs/AdvancedTab"
@@ -122,6 +127,10 @@ export default function App() {
   const [llmBackend, setLlmBackend] = useState("")
   const [llmModel, setLlmModel] = useState("")
   const [visionResults, setVisionResults] = useState<VisionResult[]>([])
+  const [lastEdl, setLastEdl] = useState("")
+  const [autoStages, setAutoStages] = useState<
+    Partial<Record<AutoStageName, { status: AutoStageStatus; detail: string }>>
+  >({})
   const wsRef = useRef<WebSocket | null>(null)
   const logEndRef = useRef<HTMLDivElement | null>(null)
   // Read inside WS callbacks, which close over the mount-time value otherwise.
@@ -311,6 +320,12 @@ export default function App() {
       case "vision_results":
         setVisionResults(e.results)
         break
+      case "stage":
+        setAutoStages((s) => ({
+          ...s,
+          [e.stage]: { status: e.status, detail: e.detail },
+        }))
+        break
       case "finished":
         appendLog(`✔ Finished: ${e.output || "(no output)"}`, "ok")
         setSessionCount((n) => n + 1)
@@ -319,6 +334,8 @@ export default function App() {
         if (/\.[a-z0-9]{2,4}$/i.test(e.output)) setLastOutput(e.output)
         // Stash produced highlights so `done` can combine them into a reel.
         if (e.outputs && e.outputs.length > 1) pendingReelRef.current = e.outputs
+        // The cut list is what makes the run editable rather than final.
+        if (e.edl) setLastEdl(e.edl)
         toast.success("Done")
         break
       case "cancelled":
@@ -462,6 +479,22 @@ export default function App() {
   const onCancel = async () => {
     await cancelRun()
     appendLog("⏹ Cancellation requested…", "err")
+  }
+
+  /** Card-to-film in one job. The engine config comes from the other tabs, so
+   *  the scoring the user already set up is what the automatic run uses. */
+  const onAutoStart = async (opts: Parameters<typeof startAuto>[0]) => {
+    setAutoStages({})
+    await beginRun()
+    // No video paths yet — the pipeline discovers them by copying the card, and
+    // it names the film itself, so only the scoring settings carry over.
+    const res = await startAuto({
+      ...opts,
+      config: toGuiConfig(cfgRef.current, opts.output_name ?? "film.mp4", [], {
+        avoidIds,
+      }),
+    })
+    if (!res.ok) failRun(res.error ?? "Failed to start the pipeline")
   }
 
   const addVideos = async () => {
@@ -703,6 +736,8 @@ export default function App() {
       {/* Tabs */}
       <Tabs defaultValue="basic" className="min-w-0">
         <TabsList>
+          <TabsTrigger value="auto">Auto</TabsTrigger>
+          <TabsTrigger value="timeline">Timeline</TabsTrigger>
           <TabsTrigger value="download">Download</TabsTrigger>
           <TabsTrigger value="basic">Basic</TabsTrigger>
           <TabsTrigger value="transcript">Transcript</TabsTrigger>
@@ -713,6 +748,21 @@ export default function App() {
           <TabsTrigger value="about">About</TabsTrigger>
         </TabsList>
 
+        <TabsContent value="auto" className="mt-4">
+          <AutoTab
+            running={running}
+            stages={autoStages}
+            onStart={(o) => void onAutoStart(o)}
+            onCancel={() => void onCancel()}
+          />
+        </TabsContent>
+        <TabsContent value="timeline" className="mt-4">
+          <TimelineTab
+            running={running}
+            onCancel={() => void onCancel()}
+            suggestedPath={lastEdl}
+          />
+        </TabsContent>
         <TabsContent value="download" className="mt-4">
           <DownloadTab
             settings={dl}

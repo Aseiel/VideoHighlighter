@@ -393,6 +393,100 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
             except combine_videos.CombineCancelled:
                 emit({"type": "cancelled"})
 
+        elif kind == "auto":
+            from modules import auto_pipeline
+
+            def stage_fn(name: str, status: str, detail: str = "") -> None:
+                # A dedicated event rather than a log line: the UI draws the
+                # pipeline as stages, and parsing prose to find out which one is
+                # running is exactly the coupling `cache_used` above exists to
+                # avoid.
+                emit({"type": "stage", "stage": name, "status": status,
+                      "detail": detail})
+
+            def auto_progress(fraction: float, detail: str = "") -> None:
+                pause_evt.wait()
+                if cancel_evt.is_set():
+                    return
+                # The engine's own progress is (current, total); this pipeline
+                # reports a fraction, so scale it onto the same 0..100 channel
+                # the UI already understands.
+                emit({"type": "progress", "current": int(fraction * 100),
+                      "total": 100, "task": "auto", "detail": detail})
+
+            card = None
+            if job.get("card_root"):
+                from modules.gopro_ingest import find_gopro_cards
+
+                root = job["card_root"]
+                cards = find_gopro_cards(extra_roots=[root], scan_mounts=False)
+                if not cards:
+                    raise RuntimeError(f"no GoPro card found at {root}")
+                card = cards[0]
+
+            try:
+                result = auto_pipeline.run_auto_pipeline(
+                    dest_root=job["dest_root"],
+                    card=card,
+                    source_paths=job.get("source_paths"),
+                    folder_name=job.get("folder_name", ""),
+                    script_path=job.get("script_path", ""),
+                    music_path=job.get("music_path", ""),
+                    config=job.get("config"),
+                    output_name=job.get("output_name") or "film.mp4",
+                    music_mode=job.get("music_mode", "replace"),
+                    music_volume=float(job.get("music_volume", 0.8)),
+                    transition=job.get("transition", "cut"),
+                    transition_duration=float(job.get("transition_duration", 0.5)),
+                    transition_bars=float(job.get("transition_bars", 0.0)),
+                    quantise=job.get("quantise", ""),
+                    width=int(job.get("width", 0)),
+                    height=int(job.get("height", 0)),
+                    fps=int(job.get("fps", 0)),
+                    crf=int(job.get("crf", 20)),
+                    resume=bool(job.get("resume", True)),
+                    verify=job.get("verify", "size"),
+                    log_fn=log_fn,
+                    progress_fn=auto_progress,
+                    stage_fn=stage_fn,
+                    cancel_check=lambda: cancel_evt.is_set(),
+                )
+                emit({"type": "finished", "output": result.output,
+                      "outputs": [result.output] if result.output else [],
+                      "ok": result.ok, "errors": result.state.errors,
+                      "edl": result.state.edl})
+            except auto_pipeline.PipelineCancelled:
+                emit({"type": "cancelled"})
+
+        elif kind == "edl":
+            from modules.edl import Cut, Edl, render_edl
+            from modules.transitions import ReelCancelled
+
+            spec = job["edl"]
+            cut_list = Edl(
+                title=spec.get("title", "Untitled"),
+                music=spec.get("music", ""),
+                music_mode=spec.get("music_mode", "replace"),
+                music_volume=float(spec.get("music_volume", 0.8)),
+                width=int(spec.get("width", 0)), height=int(spec.get("height", 0)),
+                fps=int(spec.get("fps", 0)), crf=int(spec.get("crf", 20)),
+                cuts=[
+                    Cut(source=c["source"], start=float(c.get("start", 0.0)),
+                        end=float(c.get("end", 0.0)),
+                        transition=c.get("transition", "cut"),
+                        transition_duration=float(c.get("transition_duration", 0.5)),
+                        label=c.get("label", ""))
+                    for c in spec.get("cuts", [])
+                ],
+            )
+            try:
+                out = render_edl(cut_list, job["output"], log_fn=log_fn,
+                                 progress_fn=progress_fn,
+                                 cancel_check=lambda: cancel_evt.is_set())
+                emit({"type": "finished", "output": out, "outputs": [out]})
+            except ReelCancelled:
+                emit({"type": "cancelled"})
+
         else:
             emit({"type": "error", "message": f"unknown job kind: {kind}"})
 

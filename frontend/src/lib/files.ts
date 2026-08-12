@@ -65,6 +65,20 @@ export async function pickAudioFile(): Promise<string | null> {
   return Array.isArray(selected) ? (selected[0] ?? null) : selected
 }
 
+/** Pick a script file (YAML). Returns null if cancelled. */
+export async function pickScriptFile(): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt("Paste the path to a script (.yaml):") || null
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "Script", extensions: ["yaml", "yml"] }],
+  })
+  if (!selected) return null
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected
+}
+
 export function basename(p: string): string {
   return p.split(/[\\/]/).pop() ?? p
 }

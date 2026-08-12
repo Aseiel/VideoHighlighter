@@ -12,7 +12,15 @@ export type RunEvent =
   | { type: "started"; run_id: string }
   | { type: "log"; message: string }
   | { type: "progress"; current: number; total: number; task: string; detail: string }
-  | { type: "finished"; output: string; outputs?: string[] }
+  | {
+      type: "finished"
+      output: string
+      outputs?: string[]
+      ok?: boolean
+      errors?: string[]
+      /** Cut list an auto run wrote — what makes the result editable. */
+      edl?: string
+    }
   | { type: "downloaded"; paths: string[] }
   | { type: "faces_scanned"; count: number }
   /** Detection was skipped because cached results were reused, so no preview
@@ -29,6 +37,9 @@ export type RunEvent =
   | { type: "cancelled" }
   | { type: "error"; message: string; traceback?: string }
   | { type: "done" }
+  /** Auto-pipeline stage transition. The pipeline is drawn as stages, so this
+   *  is a real event rather than something the client parses out of log prose. */
+  | { type: "stage"; stage: AutoStageName; status: AutoStageStatus; detail: string }
 
 export interface HealthResponse {
   status: string
@@ -476,6 +487,259 @@ export async function openEditor(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ video_path: videoPath ?? null }),
   })
+  return res.json()
+}
+
+// ── Camera cards, script, music, and the auto pipeline ────────────────────
+
+/** Stage names must match modules/auto_pipeline.py's STAGE_* constants — they
+ *  are the on-disk job format, not display strings. */
+export type AutoStageName =
+  | "ingest"
+  | "music"
+  | "highlight"
+  | "combine"
+  | "music_mix"
+
+export type AutoStageStatus =
+  | "pending"
+  | "running"
+  | "done"
+  | "failed"
+  | "skipped"
+
+export interface GoProCardInfo {
+  root: string
+  label: string
+  camera_type: string
+  firmware: string
+  file_count: number
+  total_bytes: number
+  take_count: number
+  chaptered_takes: number
+  suggested_folder: string
+}
+
+/** Camera cards currently mounted, with what is on each. */
+export async function listGoProCards(): Promise<{
+  ok: boolean
+  cards?: GoProCardInfo[]
+  error?: string
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/gopro/cards`)
+  return res.json()
+}
+
+export async function getScriptExample(): Promise<{
+  ok: boolean
+  text?: string
+  error?: string
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/script/example`)
+  return res.json()
+}
+
+export interface ScriptCheck {
+  ok: boolean
+  error?: string
+  title?: string
+  beats?: string[]
+  clip_count?: number
+  target_duration?: number
+  music?: string
+  warnings?: string[]
+}
+
+/** Parse a script without running anything, so the editor can report a typo
+ *  now instead of after twenty minutes of detection. */
+export async function validateScript(text: string): Promise<ScriptCheck> {
+  const res = await fetch(`${SIDECAR_BASE}/script/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  })
+  return res.json()
+}
+
+export interface MusicSection {
+  start: number
+  end: number
+  energy: number
+  label: string
+}
+
+export interface MusicAnalysisResult {
+  ok: boolean
+  error?: string
+  bpm?: number
+  duration?: number
+  beats?: number[]
+  downbeats?: number[]
+  meter?: number
+  backend?: string
+  sections?: MusicSection[]
+}
+
+export async function analyzeMusic(path: string): Promise<MusicAnalysisResult> {
+  const res = await fetch(
+    `${SIDECAR_BASE}/music/analysis?path=${encodeURIComponent(path)}`,
+  )
+  return res.json()
+}
+
+export interface AutoRunOptions {
+  dest_root: string
+  card_root?: string
+  source_paths?: string[]
+  folder_name?: string
+  script_path?: string
+  music_path?: string
+  output_name?: string
+  music_mode?: string
+  music_volume?: number
+  /** How each clip joins the next. See listTransitions(). */
+  transition?: string
+  transition_duration?: number
+  /** >0 sizes the transition from the music's bar instead of seconds. */
+  transition_bars?: number
+  /** "bar" | "beat" | "" — round clip lengths so cuts land on the music. */
+  quantise?: string
+  width?: number
+  height?: number
+  fps?: number
+  crf?: number
+  resume?: boolean
+  verify?: string
+  config?: Record<string, unknown>
+}
+
+/** Transition names the renderer accepts, so the UI can never offer one it
+ *  would refuse. */
+export async function listTransitions(): Promise<{
+  ok: boolean
+  transitions?: string[]
+  default_duration?: number
+  error?: string
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/transitions`)
+  return res.json()
+}
+
+export interface EdlCut {
+  source: string
+  start: number
+  end: number
+  duration?: number
+  transition: string
+  transition_duration: number
+  label?: string
+}
+
+export interface EdlDoc {
+  ok: boolean
+  exists?: boolean
+  error?: string
+  title?: string
+  music?: string
+  music_mode?: string
+  music_volume?: number
+  width?: number
+  height?: number
+  fps?: number
+  crf?: number
+  duration?: number
+  source_duration?: number
+  warnings?: string[]
+  cuts?: EdlCut[]
+}
+
+/** Read the cut list an automatic run produced, for the timeline. */
+export async function getEdl(path: string): Promise<EdlDoc> {
+  const res = await fetch(`${SIDECAR_BASE}/edl?path=${encodeURIComponent(path)}`)
+  return res.json()
+}
+
+export interface EdlPayload {
+  path: string
+  title?: string
+  music?: string
+  music_mode?: string
+  music_volume?: number
+  width?: number
+  height?: number
+  fps?: number
+  crf?: number
+  cuts: EdlCut[]
+}
+
+export async function saveEdl(payload: EdlPayload): Promise<{
+  ok: boolean
+  path?: string
+  duration?: number
+  warnings?: string[]
+  error?: string
+}> {
+  const res = await fetch(`${SIDECAR_BASE}/edl`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+  return res.json()
+}
+
+/** Render the timeline as a job; progress arrives on the shared socket. */
+export async function renderEdl(
+  payload: EdlPayload & { output: string },
+): Promise<{ ok: boolean; run_id?: string; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/edl/render`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+  return res.json()
+}
+
+/** Start the card-to-film pipeline. Progress arrives on the shared event
+ *  socket as `stage` and `progress` events. */
+export async function startAuto(
+  opts: AutoRunOptions,
+): Promise<{ ok: boolean; run_id?: string; error?: string }> {
+  const res = await fetch(`${SIDECAR_BASE}/auto/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+  })
+  return res.json()
+}
+
+export interface AutoJobStage {
+  name: AutoStageName
+  status: AutoStageStatus
+  detail: string
+  error: string
+  seconds: number
+  satisfied: boolean
+}
+
+export interface AutoJobState {
+  ok: boolean
+  exists?: boolean
+  error?: string
+  job_id?: string
+  created?: string
+  clips?: string[]
+  highlights?: string[]
+  reel?: string
+  final?: string
+  errors?: string[]
+  stages?: AutoJobStage[]
+}
+
+/** Saved state for a destination folder — what a resume would skip. */
+export async function getAutoJob(root: string): Promise<AutoJobState> {
+  const res = await fetch(
+    `${SIDECAR_BASE}/auto/job?root=${encodeURIComponent(root)}`,
+  )
   return res.json()
 }
 

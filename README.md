@@ -39,6 +39,28 @@ Two front ends over one engine:
   [`frontend/README.md`](frontend/README.md). It still launches the Qt window
   for the Timeline Viewer.
 
+## Card to film
+
+The **Auto** tab runs the whole thing as one resumable job: find the camera
+card, copy it off, find the highlights, build the reel, lay the music.
+
+- **Ingest** — cards are found by layout, not drive letter, and GoPro's
+  chapter-before-file-number naming is sorted back into recording order (the
+  reason a plain listing interleaves separate takes). Copies verify before they
+  land, so an interrupted transfer can't leave a short file that looks whole.
+  Re-running copies nothing. Nothing is deleted from the card.
+- **Script** — a YAML file saying what the film should contain, beat by beat,
+  so a run can express intent instead of just "the highest-scoring seconds".
+  Unknown keys are refused with a line number and a suggestion rather than
+  silently ignored.
+- **Music** — beats, downbeats, tempo and energy sections, on numpy and ffmpeg
+  alone. Cuts can then land on the beat rather than near it.
+- **Resume** — every stage records what it produced and a re-run skips whatever
+  is still on disk, because the expensive middle is exactly what gets
+  interrupted.
+
+Full detail: [docs/AUTO-PIPELINE.md](docs/AUTO-PIPELINE.md).
+
 Not sure which detector to reach for? See
 [docs/DETECTION-GUIDE.md](docs/DETECTION-GUIDE.md) — what object recognition,
 action recognition, CLIP search and the composition engine are each good at,

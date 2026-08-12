@@ -569,6 +569,368 @@ async def start_combine(req: CombineRequest) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+# ── Camera cards, script, music, and the auto pipeline ────────────────────
+# Card detection and script validation are cheap and synchronous, so they are
+# plain request/response. The pipeline itself is a job on the RunManager, like
+# every other long operation, so it shares one cancel/pause/event path.
+
+@app.get("/gopro/cards")
+async def gopro_cards() -> dict:
+    """Mounted camera cards, with what is on each one.
+
+    Detection walks the filesystem, which can block on a spun-down or
+    disconnected drive, so it runs off the event loop.
+    """
+    try:
+        from modules.gopro_ingest import find_gopro_cards, scan_card, suggest_folder_name
+
+        def probe() -> list[dict]:
+            found = []
+            for card in find_gopro_cards():
+                takes = scan_card(card)
+                found.append({
+                    "root": card.root,
+                    "label": card.label,
+                    "camera_type": card.camera_type,
+                    "firmware": card.firmware,
+                    "file_count": card.file_count,
+                    "total_bytes": card.total_bytes,
+                    "take_count": len(takes),
+                    "chaptered_takes": sum(1 for t in takes if t.is_chaptered),
+                    "suggested_folder": suggest_folder_name(card, takes),
+                })
+            return found
+
+        return {"ok": True, "cards": await asyncio.to_thread(probe)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/script/example")
+async def script_example() -> dict:
+    """A commented starter script the UI can drop into an empty editor."""
+    try:
+        from modules.script_plan import example_script
+        return {"ok": True, "text": example_script()}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class ScriptRequest(BaseModel):
+    text: str
+
+
+@app.post("/script/validate")
+async def script_validate(req: ScriptRequest) -> dict:
+    """Parse a script and report errors/warnings without running anything.
+
+    This is what makes the script editor usable: the alternative is finding out
+    a key was misspelled after twenty minutes of detection.
+    """
+    try:
+        from modules.script_plan import ScriptError, parse_script, validate_script
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    try:
+        script = parse_script(req.text or "")
+    except ScriptError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "ok": True,
+        "title": script.title,
+        "beats": [b.name for b in script.beats],
+        "clip_count": script.clip_count,
+        "target_duration": script.target_duration,
+        "music": script.music,
+        "warnings": validate_script(script),
+    }
+
+
+@app.get("/music/analysis")
+async def music_analysis(path: str) -> dict:
+    """Beat grid for a music file, for the UI's waveform/beat display."""
+    try:
+        from modules.music_analysis import analyze_music
+
+        if not path or not os.path.exists(path):
+            return {"ok": False, "error": f"not found: {path!r}"}
+        analysis = await asyncio.to_thread(analyze_music, path)
+        return {
+            "ok": True,
+            "bpm": analysis.bpm,
+            "duration": analysis.duration,
+            "beats": analysis.beats,
+            "downbeats": analysis.downbeats,
+            "meter": analysis.meter,
+            "backend": analysis.backend,
+            "sections": [
+                {"start": s.start, "end": s.end, "energy": s.energy, "label": s.label}
+                for s in analysis.sections
+            ],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/transitions")
+async def list_transitions() -> dict:
+    """The transition names the engine accepts, so the UI never offers one the
+    renderer would refuse."""
+    try:
+        from modules.transitions import DEFAULT_DURATION, TRANSITIONS
+        return {"ok": True, "transitions": sorted(TRANSITIONS),
+                "default_duration": DEFAULT_DURATION}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/edl")
+async def get_edl(path: str) -> dict:
+    """Read a cut list for the timeline editor."""
+    try:
+        from modules.edl import EdlError, load_edl, validate_edl
+
+        if not path or not os.path.exists(path):
+            return {"ok": True, "exists": False}
+        try:
+            edl = await asyncio.to_thread(load_edl, path)
+        except EdlError as exc:
+            return {"ok": False, "exists": True, "error": str(exc)}
+        return {
+            "ok": True, "exists": True, "title": edl.title,
+            "music": edl.music, "music_mode": edl.music_mode,
+            "music_volume": edl.music_volume,
+            "width": edl.width, "height": edl.height, "fps": edl.fps,
+            "crf": edl.crf, "duration": edl.duration,
+            "source_duration": edl.source_duration,
+            "warnings": validate_edl(edl),
+            "cuts": [
+                {"source": c.source, "start": c.start, "end": c.end,
+                 "duration": c.duration, "transition": c.transition,
+                 "transition_duration": c.transition_duration,
+                 "label": c.label}
+                for c in edl.cuts
+            ],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class EdlSaveRequest(BaseModel):
+    path: str
+    title: str | None = "Untitled"
+    music: str | None = ""
+    music_mode: str | None = "replace"
+    music_volume: float | None = 0.8
+    width: int | None = 0
+    height: int | None = 0
+    fps: int | None = 0
+    crf: int | None = 20
+    cuts: list[dict]
+
+
+def _edl_from_request(req: "EdlSaveRequest"):
+    from modules.edl import Cut, Edl
+
+    return Edl(
+        title=req.title or "Untitled",
+        music=req.music or "", music_mode=req.music_mode or "replace",
+        music_volume=float(req.music_volume if req.music_volume is not None else 0.8),
+        width=int(req.width or 0), height=int(req.height or 0),
+        fps=int(req.fps or 0), crf=int(req.crf or 20),
+        cuts=[
+            Cut(source=str(c.get("source", "")),
+                start=float(c.get("start", 0.0)),
+                end=float(c.get("end", 0.0)),
+                transition=str(c.get("transition", "cut")),
+                transition_duration=float(c.get("transition_duration", 0.5)),
+                label=str(c.get("label", "") or ""))
+            for c in (req.cuts or [])
+        ],
+    )
+
+
+@app.post("/edl")
+async def save_edl_endpoint(req: EdlSaveRequest) -> dict:
+    """Write the timeline back to disk. Validated first so a broken edit is
+    reported instead of overwriting a good cut list with a bad one."""
+    try:
+        from modules.edl import EdlError, parse_edl, save_edl, validate_edl
+
+        edl = _edl_from_request(req)
+        # Round-trip through the parser: it owns the rules, and writing a file
+        # that the loader would then reject is the one outcome worth ruling out.
+        try:
+            save_edl(edl, req.path)
+            parse_edl(open(req.path, encoding="utf-8").read())
+        except EdlError as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "path": req.path, "duration": edl.duration,
+                "warnings": validate_edl(edl)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class EdlRenderRequest(EdlSaveRequest):
+    output: str
+
+
+@app.post("/edl/render")
+async def render_edl_endpoint(req: EdlRenderRequest) -> dict:
+    """Render a timeline as a job, so it streams progress like any other run."""
+    if not (req.output or "").strip():
+        return {"ok": False, "error": "No output path provided"}
+    if not req.cuts:
+        return {"ok": False, "error": "The timeline is empty"}
+    try:
+        edl = _edl_from_request(req)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+    job = {
+        "kind": "edl",
+        "output": req.output,
+        "edl_path": req.path,
+        "edl": {
+            "title": edl.title, "music": edl.music,
+            "music_mode": edl.music_mode, "music_volume": edl.music_volume,
+            "width": edl.width, "height": edl.height, "fps": edl.fps,
+            "crf": edl.crf,
+            "cuts": [
+                {"source": c.source, "start": c.start, "end": c.end,
+                 "transition": c.transition,
+                 "transition_duration": c.transition_duration,
+                 "label": c.label}
+                for c in edl.cuts
+            ],
+        },
+    }
+    try:
+        loop = asyncio.get_running_loop()
+        return {"ok": True, "run_id": manager.start_job(job, loop)}
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+class AutoRunRequest(BaseModel):
+    dest_root: str
+    card_root: str | None = None
+    source_paths: list[str] | None = None
+    folder_name: str | None = ""
+    script_path: str | None = ""
+    music_path: str | None = ""
+    output_name: str | None = "film.mp4"
+    music_mode: str | None = "replace"
+    music_volume: float | None = 0.8
+    transition: str | None = "cut"
+    transition_duration: float | None = 0.5
+    transition_bars: float | None = 0.0
+    quantise: str | None = ""
+    width: int | None = 0
+    height: int | None = 0
+    fps: int | None = 0
+    crf: int | None = 20
+    resume: bool = True
+    verify: str | None = "size"
+    config: dict | None = None
+
+
+@app.post("/auto/run")
+async def start_auto(req: AutoRunRequest) -> dict:
+    """Run card-to-film as one job. Validated before the run slot is taken."""
+    if not (req.dest_root or "").strip():
+        return {"ok": False, "error": "No destination folder provided"}
+    if not req.card_root and not req.source_paths:
+        return {"ok": False, "error": "Pick a camera card or some source files"}
+    for label, path in (("Script", req.script_path), ("Music", req.music_path)):
+        if path and not os.path.exists(path):
+            return {"ok": False, "error": f"{label} file not found: {path}"}
+    # Reject an unknown transition here rather than after the detection pass:
+    # the render is the last stage, and finding out about a typo then costs the
+    # whole run.
+    try:
+        from modules.transitions import normalise_kind
+        normalise_kind(req.transition or "cut")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception:
+        pass
+    if (req.quantise or "") not in ("", "bar", "beat"):
+        return {"ok": False,
+                "error": f"unknown quantise unit {req.quantise!r} "
+                         f"(expected 'bar', 'beat' or nothing)"}
+
+    job = {
+        "kind": "auto",
+        "dest_root": req.dest_root,
+        "card_root": req.card_root or "",
+        "source_paths": [p for p in (req.source_paths or []) if p],
+        "folder_name": req.folder_name or "",
+        "script_path": req.script_path or "",
+        "music_path": req.music_path or "",
+        "output_name": req.output_name or "film.mp4",
+        "music_mode": req.music_mode or "replace",
+        "music_volume": float(req.music_volume if req.music_volume is not None else 0.8),
+        "transition": req.transition or "cut",
+        "transition_duration": float(req.transition_duration or 0.5),
+        "transition_bars": float(req.transition_bars or 0.0),
+        "quantise": req.quantise or "",
+        "width": int(req.width or 0),
+        "height": int(req.height or 0),
+        "fps": int(req.fps or 0),
+        "crf": int(req.crf or 20),
+        "resume": bool(req.resume),
+        "verify": req.verify or "size",
+        "config": req.config or {},
+    }
+    try:
+        loop = asyncio.get_running_loop()
+        return {"ok": True, "run_id": manager.start_job(job, loop)}
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/auto/job")
+async def auto_job(root: str) -> dict:
+    """Saved job state for a destination folder.
+
+    Lets the UI show what a previous run finished — and therefore what a resume
+    would skip — before anything is started.
+    """
+    try:
+        from modules.auto_pipeline import job_path, load_job
+
+        path = job_path(root)
+        if not os.path.exists(path):
+            return {"ok": True, "exists": False}
+        state = await asyncio.to_thread(load_job, path)
+        return {
+            "ok": True,
+            "exists": True,
+            "job_id": state.job_id,
+            "created": state.created,
+            "clips": state.clips,
+            "highlights": state.highlights,
+            "reel": state.reel,
+            "final": state.final,
+            "errors": state.errors,
+            "stages": [
+                {"name": s.name, "status": s.status, "detail": s.detail,
+                 "error": s.error, "seconds": s.seconds,
+                 "satisfied": s.is_satisfied}
+                for s in state.stages.values()
+            ],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 # ── Download ──────────────────────────────────────────────────────────────
 # Reuses the run manager's event stream so the UI's log/progress panel shows
 # download output exactly like a pipeline run.
