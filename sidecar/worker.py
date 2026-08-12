@@ -476,6 +476,7 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
                         end=float(c.get("end", 0.0)),
                         transition=c.get("transition", "cut"),
                         transition_duration=float(c.get("transition_duration", 0.5)),
+                        easing=c.get("easing", "linear"),
                         label=c.get("label", ""), text=c.get("text", ""))
                     for c in spec.get("cuts", [])
                 ],

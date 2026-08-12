@@ -90,12 +90,17 @@ class Section:
     ``share`` values are taken from where the sections actually fall in a
     24-second reel — hook 0–2 s, context 2–6 s, escalation 6–20 s, payoff the
     last 4 — so they scale to any length without the structure changing shape.
+
+    ``prefers`` names the framing this section reads best in, as a soft
+    preference rather than a filter: a shoot that is all wide shots still gets
+    a payoff. See :mod:`modules.shot_type` for what the names mean.
     """
     name: str
     share: float
     pace_scale: float
     min_shots: int
     max_shots: int = 99
+    prefers: tuple = ()
 
     def shot_length(self, pace: Pace) -> float:
         return max(0.2, pace.typical * self.pace_scale)
@@ -103,12 +108,20 @@ class Section:
 
 STRUCTURE: tuple[Section, ...] = (
     # One shot, slightly longer than the body's rhythm: the opening frame has
-    # to be understood before the cutting starts, or the rest is noise.
-    Section("Hook", 0.08, 1.15, min_shots=1, max_shots=1),
-    Section("Context", 0.17, 0.95, min_shots=2),
+    # to be understood before the cutting starts, or the rest is noise. A face
+    # stops a scroll better than a landscape does, so it is preferred here.
+    Section("Hook", 0.08, 1.15, min_shots=1, max_shots=1,
+            prefers=("close_subject",)),
+    # Establishing: where this is and what is happening, which is what a wide
+    # shot is for.
+    Section("Context", 0.17, 0.95, min_shots=2, prefers=("wide",)),
+    # No preference — the body is where alternating matters more than any
+    # particular kind.
     Section("Escalation", 0.58, 0.85, min_shots=3),
-    # Held: an ending cut at the body's rhythm does not read as an ending.
-    Section("Payoff", 0.17, 1.9, min_shots=1, max_shots=2),
+    # Held, and a face if there is one: an ending on a person lands, and an
+    # ending cut at the body's rhythm does not read as an ending at all.
+    Section("Payoff", 0.17, 1.9, min_shots=1, max_shots=2,
+            prefers=("close_subject",)),
 )
 
 # The three lengths worth testing, and what each is for.
@@ -130,6 +143,7 @@ class Shot:
     duration: float
     section: str
     text: str = ""
+    kind: str = ""            # framing, so the next pick can alternate
 
 
 @dataclass
@@ -139,6 +153,7 @@ class _Source:
     score: float = 0.0
     taken: float = 0.0        # how much of it is already spoken for
     order: int = 0
+    kind: str = ""            # framing, from modules.shot_type
 
 
 def _sections_for(duration: float, pace: Pace, structure=STRUCTURE,
@@ -199,33 +214,52 @@ def _sections_for(duration: float, pace: Pace, structure=STRUCTURE,
     return plan
 
 
-def _pick(sources: list[_Source], want: float, *, allow_reuse: bool) -> _Source | None:
+def _pick(sources: list[_Source], want: float, *, allow_reuse: bool,
+          prefers: tuple = (), avoid_kind: str = "") -> _Source | None:
     """The next source with room for a ``want``-second shot.
 
-    Prefers one that has not been used at all, so a reel spreads across the
-    footage before it starts taking a second slice from anything. Falling back
-    to reuse matters more than it sounds: a 24-second reel wants a dozen shots
-    and a short shoot may only have five clips.
+    Ranked rather than filtered, because every one of these is a preference
+    that a small shoot has to be able to override:
+
+    - **Not yet used**, so a reel spreads across the footage before taking a
+      second slice of anything.
+    - **The framing this section reads best in** (see :class:`Section`).
+    - **Not the same framing as the shot before it.** This is the one that
+      shows: six selfies followed by six landscapes is two edits stuck end to
+      end, and alternating them is most of what makes a sequence feel
+      arranged. It is a tie-break rather than a rule, so a shoot with only one
+      kind still cuts.
+    - **Shooting order**, to keep the progression forward.
     """
-    fresh = [s for s in sources if s.taken == 0 and s.duration - s.taken >= want]
-    if fresh:
-        return fresh[0]
-    if not allow_reuse:
-        return None
-    usable = [s for s in sources if s.duration - s.taken >= want]
-    if usable:
-        return min(usable, key=lambda s: (s.taken, s.order))
-    # Nothing has a full shot left; take from whatever has the most remaining
-    # rather than dropping the shot and coming up short.
-    remaining = [s for s in sources if s.duration - s.taken > MIN_SHOT]
-    return max(remaining, key=lambda s: s.duration - s.taken) if remaining else None
+    usable = [s for s in sources if s.duration - s.taken >= want
+              and (allow_reuse or s.taken == 0)]
+    if not usable:
+        if not allow_reuse:
+            return None
+        # Nothing has a full shot left; take from whatever has the most
+        # remaining rather than dropping the shot and coming up short.
+        remaining = [s for s in sources if s.duration - s.taken > MIN_SHOT]
+        return max(remaining, key=lambda s: s.duration - s.taken) if remaining else None
+
+    def rank(source: _Source) -> tuple:
+        return (
+            0 if source.taken == 0 else 1,
+            0 if (prefers and source.kind in prefers) else 1,
+            1 if (avoid_kind and source.kind == avoid_kind) else 0,
+            source.taken,
+            source.order,
+        )
+
+    return min(usable, key=rank)
 
 
 def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
               structure=STRUCTURE, scores=None, title: str = "Reel",
               transition: str = "cut", transition_duration: float = 0.25,
+              easing: str = "linear",
               texts=None, music: str = "", width: int = 0, height: int = 0,
-              analysis=None, quantise: bool = True, log_fn=print) -> Edl:
+              analysis=None, quantise: bool = True, shots_by_kind=None,
+              classify: bool = True, log_fn=print) -> Edl:
     """Arrange ``sources`` into a reel and return it as a cut list.
 
     ``sources`` are clip paths — usually the engine's highlight files, which are
@@ -263,10 +297,33 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
     if not pool:
         raise ValueError("no usable clips to build a reel from")
 
-    # The hook is the most striking thing available, not the earliest. Without
-    # scores that is unknowable, so the first clip stands in rather than the
-    # module inventing a judgement the engine already owns.
-    hook = max(pool, key=lambda s: (s.score, -s.order)) if scores else pool[0]
+    # Framing, so the sections can prefer the kind of shot they read best in
+    # and the body can alternate. Optional in both directions: a caller that
+    # already classified passes it in, and a caller that cannot afford the
+    # measurement turns it off and gets the old order-only behaviour.
+    kinds = dict(shots_by_kind or {})
+    if classify and not kinds:
+        try:
+            from modules.shot_type import classify_all
+            kinds = {p: s.kind for p, s in
+                     classify_all([s.path for s in pool], log_fn=log_fn).items()}
+        except Exception as exc:
+            log_fn(f"⚠️ Could not classify framing ({exc}); "
+                   f"picking on order alone")
+    for source in pool:
+        source.kind = str(kinds.get(source.path, "") or "")
+
+    # The hook is the most striking thing available, not the earliest. With
+    # scores that is what they say; without them, a close shot stops a scroll
+    # better than a landscape, so framing decides — and failing both, the
+    # first clip stands in rather than the module inventing a judgement the
+    # engine already owns.
+    hook_prefers = STRUCTURE[0].prefers if STRUCTURE else ()
+    if scores:
+        hook = max(pool, key=lambda s: (s.score, -s.order))
+    else:
+        preferred = [s for s in pool if s.kind in hook_prefers]
+        hook = preferred[0] if preferred else pool[0]
     rest = [s for s in pool if s is not hook]
 
     unit = _musical_unit(analysis, band.typical) if (analysis and quantise) else 0.0
@@ -277,17 +334,22 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
     shots: list[Shot] = []
     for section, target, count in _sections_for(duration, band, structure, unit):
         for n in range(count):
-            candidates = [hook] if (section.name == "Hook" and n == 0) else rest
-            picked = _pick(candidates, target, allow_reuse=section.name != "Hook")
+            is_hook = section.name == "Hook" and n == 0
+            candidates = [hook] if is_hook else rest
+            previous = shots[-1].kind if shots else ""
+            picked = _pick(candidates, target, allow_reuse=not is_hook,
+                           prefers=section.prefers, avoid_kind=previous)
             if picked is None:
-                picked = _pick(pool, target, allow_reuse=True)
+                picked = _pick(pool, target, allow_reuse=True,
+                               prefers=section.prefers, avoid_kind=previous)
             if picked is None:
                 break
             available = picked.duration - picked.taken
             length = max(MIN_SHOT, min(target, available))
             shots.append(Shot(source=picked.path, start=picked.taken,
                               duration=length, section=section.name,
-                              text=texts.get(section.name, "") if n == 0 else ""))
+                              text=texts.get(section.name, "") if n == 0 else "",
+                              kind=picked.kind))
             picked.taken += length
 
     if not shots:
@@ -301,6 +363,7 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
             end=shot.start + shot.duration,
             transition="cut" if last else transition,
             transition_duration=0.0 if last else transition_duration,
+            easing=easing,
             label=shot.section, text=shot.text))
 
     reel = Edl(title=title, cuts=cuts, music=music,

@@ -63,7 +63,7 @@ _TOP_KEYS = {
     "width", "height", "fps", "crf", "fill", "cuts",
 }
 _CUT_KEYS = {"source", "in", "out", "transition", "transition_duration",
-             "label", "text"}
+             "easing", "label", "text"}
 
 # Accepts S, S.s, M:SS, M:SS.s, H:MM:SS, H:MM:SS.s — and nothing else.
 _TIME = re.compile(r"^(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?)$")
@@ -134,6 +134,9 @@ class Cut:
     end: float = 0.0
     transition: str = "cut"
     transition_duration: float = 0.5
+    # How the blend moves. Linear is what xfade does on its own; anything else
+    # is what makes it look designed rather than applied.
+    easing: str = "linear"
     label: str = ""
     # Burnt into the picture for the length of this cut. Short-form video is
     # mostly watched muted, so the opening line has to be readable rather than
@@ -265,6 +268,7 @@ def parse_edl(data) -> Edl:
 
         cuts.append(Cut(source=str(source), start=start, end=end,
                         transition=kind, transition_duration=hold,
+                        easing=str(entry.get("easing", "linear") or "linear"),
                         label=str(entry.get("label", "") or ""),
                         text=str(entry.get("text", "") or "")))
 
@@ -358,6 +362,8 @@ def save_edl(edl: Edl, path: str) -> str:
             lines.append(f"    transition: {cut.transition}")
             if cut.transition != "cut":
                 lines.append(f"    transition_duration: {cut.transition_duration:g}")
+                if cut.easing != "linear":
+                    lines.append(f"    easing: {cut.easing}")
         if cut.label:
             lines.append(f"    label: {cut.label}")
         if cut.text:
@@ -508,7 +514,7 @@ def quantise_to_music(edl: Edl, analysis, *, unit: str = "bar",
                         transition=kind,
                         transition_duration=(hold or cut.transition_duration)
                         if kind != "cut" else cut.transition_duration,
-                        label=cut.label, text=cut.text))
+                        easing=cut.easing, label=cut.label, text=cut.text))
     if unblended:
         log_fn(f"✂️ {unblended} clip(s) had no room for the blend on top of a "
                f"bar and cut hard instead, to keep the grid")
@@ -586,7 +592,8 @@ def render_edl(edl: Edl, output: str, *, mode: str = "gpu",
             pieces.append(piece)
 
         transitions = [
-            Transition(index=i, kind=c.transition, duration=c.transition_duration)
+            Transition(index=i, kind=c.transition,
+                       duration=c.transition_duration, easing=c.easing)
             for i, c in enumerate(edl.cuts[:-1])
         ]
         music = ({"path": edl.music, "mode": edl.music_mode,

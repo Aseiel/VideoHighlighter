@@ -679,8 +679,15 @@ async def list_transitions() -> dict:
     """The transition names the engine accepts, so the UI never offers one the
     renderer would refuse."""
     try:
-        from modules.transitions import DEFAULT_DURATION, TRANSITIONS
-        return {"ok": True, "transitions": sorted(TRANSITIONS),
+        from modules.transitions import (CURATED, DEFAULT_DURATION, EASINGS,
+                                          TRANSITIONS)
+        return {"ok": True,
+                # Curated first, then the rest: a list of fifty-seven is a menu
+                # nobody reads, but forbidding the others helps no one.
+                "transitions": list(CURATED) + sorted(
+                    set(TRANSITIONS) - set(CURATED)),
+                "curated": list(CURATED),
+                "easings": sorted(EASINGS),
                 "default_duration": DEFAULT_DURATION}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -847,6 +854,7 @@ class ReelRequest(BaseModel):
     music: str | None = ""
     transition: str | None = "cut"
     transition_duration: float | None = 0.25
+    easing: str | None = "linear"
     width: int | None = 1080
     height: int | None = 1920
     fill: str | None = "crop"
@@ -890,6 +898,7 @@ def _build_reel_edl(req: "ReelRequest"):
         title=req.title or "Reel", music=req.music or "",
         transition=req.transition or "cut",
         transition_duration=float(req.transition_duration or 0.25),
+        easing=req.easing or "linear",
         texts=req.texts or {}, analysis=analysis,
         width=int(req.width or 0), height=int(req.height or 0),
         log_fn=lambda *_: None)
@@ -957,7 +966,7 @@ async def reel_render(req: ReelRequest) -> dict:
                 {"source": c.source, "start": c.start, "end": c.end,
                  "transition": c.transition,
                  "transition_duration": c.transition_duration,
-                 "label": c.label, "text": c.text}
+                 "easing": c.easing, "label": c.label, "text": c.text}
                 for c in edl.cuts
             ],
         },

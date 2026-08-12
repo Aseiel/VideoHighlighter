@@ -21,6 +21,10 @@ import pytest
 
 from modules.app_paths import ffmpeg_exe
 from modules.transitions import (
+    CURATED,
+    EASINGS,
+    eased_expression,
+    normalise_easing,
     DEFAULT_DURATION,
     MIN_DURATION,
     TRANSITIONS,
@@ -277,6 +281,105 @@ def test_captions_survive_an_all_cuts_reel(two_clips, tmp_path):
     assert probe_video(out)["duration"] > 0
     band = _rgb_at(out, 1.0, tmp_path)
     assert band is not None
+
+
+# ---------------------------------------------------------------------------
+# Easing
+# ---------------------------------------------------------------------------
+
+def _blue_share(path, t, tmp_path) -> float:
+    """How far a red-to-blue blend has got, 0..1."""
+    r, _, b = _rgb_at(path, t, tmp_path)
+    return b / (r + b + 1)
+
+
+def _eased_reel(clips, tmp_path, easing):
+    out = str(tmp_path / f"e_{easing}.mp4")
+    build_reel(clips, out, transitions=[Transition(0, "crossfade", 1.0, easing=easing)],
+               log_fn=lambda *_: None)
+    return out
+
+
+@pytest.mark.parametrize("easing", list(EASINGS))
+def test_every_easing_runs_forwards(two_clips, tmp_path, easing):
+    """The bug this exists to catch, and it is not a subtle one.
+
+    xfade's progress variable P runs from 1 down to 0, not 0 to 1. Writing an
+    easing in P directly — which is the obvious thing to do — produces a
+    transition that plays backwards: the first version of this ran blue to red
+    on a red-to-blue cut and looked entirely plausible until the pixels were
+    measured.
+    """
+    out = _eased_reel(two_clips, tmp_path, easing)
+
+    quarter = _blue_share(out, 2.25, tmp_path)
+    half = _blue_share(out, 2.5, tmp_path)
+    three = _blue_share(out, 2.75, tmp_path)
+
+    assert quarter <= half <= three, f"{easing} does not progress forwards"
+    assert _blue_share(out, 0.5, tmp_path) < 0.1, "starts on the wrong clip"
+    assert _blue_share(out, 4.5, tmp_path) > 0.9, "ends on the wrong clip"
+
+
+def test_the_easings_are_actually_different_curves(two_clips, tmp_path):
+    """A named easing that measures the same as linear is a label, not a
+    curve. Each is checked against what its name claims at the midpoint."""
+    midpoints = {
+        e: _blue_share(_eased_reel(two_clips, tmp_path, e), 2.5, tmp_path)
+        for e in ("linear", "ease_in", "ease_out", "ease_in_out", "snap")
+    }
+
+    # Slow start: behind linear halfway through.
+    assert midpoints["ease_in"] < midpoints["linear"] - 0.1
+    # Fast start: ahead of it.
+    assert midpoints["ease_out"] > midpoints["linear"] + 0.1
+    assert midpoints["snap"] > midpoints["linear"] + 0.1
+    # Slow at both ends, so it passes through roughly the middle either way.
+    assert 0.2 < midpoints["ease_in_out"] < 0.8
+
+
+def test_a_linear_easing_uses_the_built_in_transition():
+    """The built-in already is linear, and is cheaper than an expression."""
+    assert eased_expression("crossfade", "linear") == ""
+    assert eased_expression("crossfade", "ease_in_out") != ""
+
+
+def test_transitions_that_need_a_neighbouring_pixel_stay_built_in():
+    """A custom expression only sees the two pixels at its own coordinate, so
+    a slide — which needs the pixel a hundred columns over — cannot be written
+    as one and must not pretend to be eased."""
+    assert eased_expression("slide_left", "ease_in_out") == ""
+    assert eased_expression("zoom_in", "ease_out") == ""
+    assert eased_expression("wipe_left", "ease_in_out") != ""
+
+
+def test_an_unknown_easing_is_refused():
+    with pytest.raises(ValueError, match="unknown easing"):
+        normalise_easing("wobble")
+
+
+@pytest.mark.parametrize("kind", ["wipe_left", "wipe_right", "wipe_up",
+                                  "wipe_down", "circle_open", "circle_close"])
+def test_eased_wipes_and_circles_render(two_clips, tmp_path, kind):
+    """These are hand-written expressions rather than built-ins, so each one
+    is a chance to get the geometry wrong."""
+    from modules.video_probe import probe_video
+
+    out = str(tmp_path / f"w_{kind}.mp4")
+    build_reel(two_clips, out,
+               transitions=[Transition(0, kind, 1.0, easing="ease_in_out")],
+               log_fn=lambda *_: None)
+
+    assert probe_video(out)["duration"] == pytest.approx(5.0, abs=0.3)
+    assert _blue_share(out, 0.5, tmp_path) < 0.1
+    assert _blue_share(out, 4.5, tmp_path) > 0.9
+
+
+def test_every_curated_transition_is_a_real_one():
+    """The UI offers CURATED; offering a name the renderer would refuse is the
+    one thing this list must not do."""
+    for name in CURATED:
+        assert name in TRANSITIONS
 
 
 def test_odd_dimensions_are_made_even(two_clips, tmp_path):

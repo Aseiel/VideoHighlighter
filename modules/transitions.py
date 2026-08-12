@@ -92,7 +92,96 @@ TRANSITIONS: dict[str, str] = {
     "circle_open": "circleopen",
     "circle_close": "circleclose",
     "radial": "radial",
+    # The rest of what this ffmpeg's xfade offers. Kept out of the curated set
+    # above — which is what the UI shows first — but available by name, because
+    # "no reason to expose it" and "no reason to forbid it" are different.
+    "circle_crop": "circlecrop",
+    "rect_crop": "rectcrop",
+    "distance": "distance",
+    "vert_open": "vertopen",
+    "vert_close": "vertclose",
+    "horz_open": "horzopen",
+    "horz_close": "horzclose",
+    "pixelize": "pixelize",
+    "diag_tl": "diagtl",
+    "diag_tr": "diagtr",
+    "diag_bl": "diagbl",
+    "diag_br": "diagbr",
+    "hl_slice": "hlslice",
+    "hr_slice": "hrslice",
+    "vu_slice": "vuslice",
+    "vd_slice": "vdslice",
+    "blur": "hblur",
+    "fade_grays": "fadegrays",
+    "wipe_tl": "wipetl",
+    "wipe_tr": "wipetr",
+    "wipe_bl": "wipebl",
+    "wipe_br": "wipebr",
+    "squeeze_h": "squeezeh",
+    "squeeze_v": "squeezev",
+    "zoom_in": "zoomin",
+    "fade_fast": "fadefast",
+    "fade_slow": "fadeslow",
+    "smooth_up": "smoothup",
+    "smooth_down": "smoothdown",
+    "wind_left": "hlwind",
+    "wind_right": "hrwind",
+    "wind_up": "vuwind",
+    "wind_down": "vdwind",
+    "cover_left": "coverleft",
+    "cover_right": "coverright",
+    "cover_up": "coverup",
+    "cover_down": "coverdown",
+    "reveal_left": "revealleft",
+    "reveal_right": "revealright",
+    "reveal_up": "revealup",
+    "reveal_down": "revealdown",
 }
+
+# The ones worth offering first. The rest are reachable by name but a list of
+# fifty-seven is a menu nobody reads, and half of them (pixelize, squeeze,
+# hlwind) read as a video-editor demo rather than as film grammar.
+CURATED = (
+    "cut", "crossfade", "dissolve", "dip_to_black", "dip_to_white",
+    "wipe_left", "wipe_right", "wipe_up", "wipe_down",
+    "slide_left", "slide_right", "slide_up", "slide_down",
+    "cover_left", "cover_up", "reveal_left", "reveal_up",
+    "smooth_left", "smooth_right", "circle_open", "circle_close",
+    "zoom_in", "blur", "radial",
+)
+
+# Easing curves, written in terms of T: elapsed fraction of the transition,
+# 0 at the start and 1 at the end.
+#
+# This is the difference between a transition that looks applied and one that
+# looks designed. xfade moves linearly: the blend starts and stops at the same
+# rate it runs at, so the eye catches both ends. Every motion system in use —
+# CSS, iOS, Material — eases instead, and for the same reason.
+#
+# T is a placeholder, substituted at build time, because xfade's own progress
+# variable P runs the other way — from 1 down to 0. Writing these in P directly
+# is the obvious thing to do and produces transitions that play backwards: the
+# first version of this ran blue-to-red on a red-to-blue cut, and looked
+# entirely plausible until the pixels were measured.
+EASINGS: dict[str, str] = {
+    "linear": "T",
+    # Slow start, full speed out — the incoming shot arrives with intent.
+    "ease_in": "(T*T*T)",
+    # Fast start, gentle landing. The safest general-purpose choice.
+    "ease_out": "(1-pow(1-T,3))",
+    # Slow at both ends. Reads as deliberate.
+    "ease_in_out": "(if(lt(T,0.5), 4*T*T*T, 1-pow(-2*T+2,3)/2))",
+    # Smoothstep — gentler than cubic, closest to a hand-drawn fade.
+    "smooth": "(T*T*(3-2*T))",
+    # Most of the move happens immediately, then it settles. Good on fast cuts
+    # where a symmetric ease would waste the little time there is.
+    "snap": "pow(T,0.45)",
+}
+
+# What T becomes in a real expression. See the note above.
+PROGRESS = "(1-P)"
+
+DEFAULT_EASING = "linear"
 
 DEFAULT_DURATION = 0.5
 
@@ -125,6 +214,7 @@ class Transition:
     index: int
     kind: str = "crossfade"
     duration: float = DEFAULT_DURATION
+    easing: str = DEFAULT_EASING
 
     @property
     def is_cut(self) -> bool:
@@ -144,6 +234,50 @@ def normalise_kind(kind: str) -> str:
             f"unknown transition {kind!r} — expected one of "
             f"{', '.join(sorted(TRANSITIONS))}")
     return key
+
+
+def normalise_easing(easing: str) -> str:
+    """Accept an easing name, or raise with the real ones."""
+    key = (easing or "linear").strip().lower().replace("-", "_").replace(" ", "_")
+    if key not in EASINGS:
+        raise ValueError(f"unknown easing {easing!r} — expected one of "
+                         f"{', '.join(sorted(EASINGS))}")
+    return key
+
+
+def eased_expression(kind: str, easing: str) -> str:
+    """An xfade ``custom`` expression for ``kind`` with ``easing`` applied, or
+    "" when this transition cannot be written as one.
+
+    xfade's custom mode gives an expression the progress ``P`` and the two
+    source pixels ``A`` and ``B`` at the current coordinate — and nothing at
+    any other coordinate. So a fade, which only mixes the two pixels in front
+    of it, and a wipe, which only asks which side of a moving line it is on,
+    can both be written; a slide, which needs the pixel a hundred columns over,
+    cannot. Those keep their built-in linear form rather than being faked.
+    """
+    kind = normalise_kind(kind)
+    easing = normalise_easing(easing)
+    if easing == "linear":
+        return ""   # the built-in already is this, and is cheaper
+    progress = EASINGS[easing].replace("T", PROGRESS)
+
+    mixes = {
+        "crossfade": f"A*(1-{progress})+B*{progress}",
+        "dissolve": f"A*(1-{progress})+B*{progress}",
+        # Wipes: which side of the moving edge this pixel is on.
+        "wipe_left": f"if(gt(X, W*(1-{progress})), B, A)",
+        "wipe_right": f"if(lt(X, W*{progress}), B, A)",
+        "wipe_up": f"if(gt(Y, H*(1-{progress})), B, A)",
+        "wipe_down": f"if(lt(Y, H*{progress}), B, A)",
+        # Circles: distance from the centre against a growing/shrinking radius.
+        # hypot() is available in ffmpeg's expression evaluator.
+        "circle_open":
+            f"if(lt(hypot(X-W/2,Y-H/2), {progress}*hypot(W/2,H/2)), B, A)",
+        "circle_close":
+            f"if(gt(hypot(X-W/2,Y-H/2), (1-{progress})*hypot(W/2,H/2)), B, A)",
+    }
+    return mixes.get(kind, "")
 
 
 def duration_for_bars(analysis, *, bars: float = 0.5,
@@ -167,7 +301,8 @@ def duration_for_bars(analysis, *, bars: float = 0.5,
 
 def plan_transitions(count: int, *, kind: str = "crossfade",
                      duration: float = DEFAULT_DURATION,
-                     every: int = 1, other: str = "cut") -> list[Transition]:
+                     every: int = 1, other: str = "cut",
+                     easing: str = DEFAULT_EASING) -> list[Transition]:
     """Transitions for ``count`` clips — that is ``count - 1`` joins.
 
     ``every`` places the named transition on every Nth join and ``other`` on
@@ -180,7 +315,7 @@ def plan_transitions(count: int, *, kind: str = "crossfade",
     return [
         Transition(index=i,
                    kind=kind if i % step == 0 else other,
-                   duration=duration)
+                   duration=duration, easing=easing)
         for i in range(max(0, count - 1))
     ]
 
@@ -203,7 +338,8 @@ def _clamp(transitions, durations) -> list[Transition]:
         room = min(durations[t.index], durations[t.index + 1]) * MAX_CLIP_FRACTION
         duration = min(float(t.duration), room)
         kind = t.kind if duration >= MIN_DURATION else "cut"
-        out.append(Transition(index=t.index, kind=kind, duration=duration))
+        out.append(Transition(index=t.index, kind=kind, duration=duration,
+                              easing=getattr(t, "easing", DEFAULT_EASING)))
     return out
 
 
@@ -262,8 +398,15 @@ def _filtergraph(transitions, durations, fps: int) -> tuple[str, str, float]:
         nxt = i + 1
         out_v, out_a = f"v{nxt}", f"a{nxt}"
         offset = max(0.0, acc - t.duration)
+        expr = eased_expression(t.kind, getattr(t, "easing", DEFAULT_EASING))
+        if expr:
+            # ' is the filtergraph's own quote, so the expression is wrapped in
+            # it and must not contain one; none of the easings do.
+            spec = f"transition=custom:expr='{expr}'"
+        else:
+            spec = f"transition={TRANSITIONS[t.kind]}"
         parts.append(
-            f"[{v_label}][x{nxt}]xfade=transition={TRANSITIONS[t.kind]}"
+            f"[{v_label}][x{nxt}]xfade={spec}"
             f":duration={t.duration:.3f}:offset={offset:.3f}[{out_v}]")
         parts.append(
             f"[{a_label}][y{nxt}]acrossfade=d={t.duration:.3f}"
@@ -436,8 +579,8 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
                duration: float = DEFAULT_DURATION, width: int = 0,
                height: int = 0, fps: int = 0, crf: int = 20,
                preset: str = "medium", music=None, music_optional: bool = False,
-               texts=None, fill: str = "pad", log_fn=print, progress_fn=None,
-               cancel_check=None) -> str:
+               texts=None, fill: str = "pad", easing: str = DEFAULT_EASING,
+               log_fn=print, progress_fn=None, cancel_check=None) -> str:
     """Join ``clips`` into ``output`` with transitions between them.
 
     ``transitions`` is a list of :class:`Transition` (one per join); when it is
@@ -468,11 +611,13 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
         raise ValueError("No valid input files to build a reel from")
 
     if transitions is None:
-        transitions = plan_transitions(len(valid), kind=kind, duration=duration)
+        transitions = plan_transitions(len(valid), kind=kind, duration=duration,
+                                       easing=easing)
     else:
         transitions = [
             Transition(index=t.index, kind=normalise_kind(t.kind),
-                       duration=float(t.duration))
+                       duration=float(t.duration),
+                       easing=normalise_easing(getattr(t, "easing", easing)))
             for t in transitions
         ]
 
@@ -584,7 +729,8 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
                 pass
 
         run_durations = [_probe_duration(p) for p in pieces]
-        blended = _clamp([Transition(index=i, kind=t.kind, duration=t.duration)
+        blended = _clamp([Transition(index=i, kind=t.kind, duration=t.duration,
+                                     easing=getattr(t, "easing", easing))
                           for i, t in enumerate(blended)], run_durations)
 
         if not blended:
