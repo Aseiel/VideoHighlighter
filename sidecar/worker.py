@@ -477,6 +477,7 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
                         transition=c.get("transition", "cut"),
                         transition_duration=float(c.get("transition_duration", 0.5)),
                         easing=c.get("easing", "linear"),
+                        feather=float(c.get("feather", 0.0)),
                         label=c.get("label", ""), text=c.get("text", ""))
                     for c in spec.get("cuts", [])
                 ],

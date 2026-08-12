@@ -63,7 +63,7 @@ _TOP_KEYS = {
     "width", "height", "fps", "crf", "fill", "cuts",
 }
 _CUT_KEYS = {"source", "in", "out", "transition", "transition_duration",
-             "easing", "label", "text"}
+             "easing", "feather", "label", "text"}
 
 # Accepts S, S.s, M:SS, M:SS.s, H:MM:SS, H:MM:SS.s — and nothing else.
 _TIME = re.compile(r"^(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?)$")
@@ -137,6 +137,10 @@ class Cut:
     # How the blend moves. Linear is what xfade does on its own; anything else
     # is what makes it look designed rather than applied.
     easing: str = "linear"
+    # How soft the transition's edge is, 0..1 of its length. Only means
+    # anything for a transition that has an edge — a wipe, an iris, blinds. 0
+    # is the hard edge ffmpeg draws by default.
+    feather: float = 0.0
     label: str = ""
     # Burnt into the picture for the length of this cut. Short-form video is
     # mostly watched muted, so the opening line has to be readable rather than
@@ -225,7 +229,7 @@ def parse_edl(data) -> Edl:
     if not raw_cuts:
         raise EdlError("a cut list needs at least one cut")
 
-    from modules.transitions import normalise_kind
+    from modules.transitions import normalise_feather, normalise_kind
 
     cuts: list[Cut] = []
     for i, entry in enumerate(raw_cuts, start=1):
@@ -266,9 +270,15 @@ def parse_edl(data) -> Edl:
             raise EdlError(f"cut {i} ({source}): transition_duration must be a "
                            f"finite, non-negative number of seconds")
 
+        try:
+            soft = normalise_feather(entry.get("feather", 0.0))
+        except ValueError as exc:
+            raise EdlError(f"cut {i} ({source}): {exc}") from None
+
         cuts.append(Cut(source=str(source), start=start, end=end,
                         transition=kind, transition_duration=hold,
                         easing=str(entry.get("easing", "linear") or "linear"),
+                        feather=soft,
                         label=str(entry.get("label", "") or ""),
                         text=str(entry.get("text", "") or "")))
 
@@ -364,6 +374,8 @@ def save_edl(edl: Edl, path: str) -> str:
                 lines.append(f"    transition_duration: {cut.transition_duration:g}")
                 if cut.easing != "linear":
                     lines.append(f"    easing: {cut.easing}")
+                if cut.feather:
+                    lines.append(f"    feather: {cut.feather:g}")
         if cut.label:
             lines.append(f"    label: {cut.label}")
         if cut.text:
@@ -593,7 +605,8 @@ def render_edl(edl: Edl, output: str, *, mode: str = "gpu",
 
         transitions = [
             Transition(index=i, kind=c.transition,
-                       duration=c.transition_duration, easing=c.easing)
+                       duration=c.transition_duration, easing=c.easing,
+                       feather=c.feather)
             for i, c in enumerate(edl.cuts[:-1])
         ]
         music = ({"path": edl.music, "mode": edl.music_mode,

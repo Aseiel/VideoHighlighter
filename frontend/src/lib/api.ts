@@ -632,6 +632,10 @@ export interface EdlCut {
   duration?: number
   transition: string
   transition_duration: number
+  /** How the blend moves across its length. */
+  easing?: string
+  /** How soft the transition's edge is, 0–1 of its length. */
+  feather?: number
   label?: string
   /** Burnt into the picture for this cut — short-form is watched muted, so
    *  the opening line is part of the edit. */
@@ -758,12 +762,29 @@ export interface ReelPace {
   minimum_duration: number
 }
 
+export interface ReelTransition {
+  key: string
+  /** Has an edge, so its softness control means something. Fades and slides
+   *  do not: there is nothing to feather. */
+  maskable: boolean
+  /** Mixes the whole frame rather than moving an edge across it. */
+  blend: boolean
+}
+
 export interface ReelOptions {
   ok: boolean
   error?: string
   paces?: ReelPace[]
   lengths?: { seconds: number; reason: string }[]
   sections?: string[]
+  /** Every name the renderer accepts. */
+  transitions?: ReelTransition[]
+  /** The ones worth offering first. */
+  curated?: string[]
+  /** Grouped for a menu — wipes apart from shapes, and so on. */
+  families?: { name: string; items: ReelTransition[] }[]
+  easings?: string[]
+  default_feather?: number
 }
 
 /** Pace bands and lengths, read from the planner so the UI cannot drift. */
@@ -781,6 +802,18 @@ export interface ReelRequest {
   music?: string
   transition?: string
   transition_duration?: number
+  /** How the blend moves. Linear is what ffmpeg does unaided. */
+  easing?: string
+  /** How soft the transition's edge is, 0–1 of its length. */
+  feather?: number
+  /** Let shots start later than frame zero when the camera is still being
+   *  placed at the top of a clip. */
+  settle?: boolean
+  /** Keep the reel off the same view twice: one shot per spot before any is
+   *  reused, and never two near-identical pictures. */
+  spread?: boolean
+  /** Optional GPX file, used to place clips whose own metadata has no GPS. */
+  track?: string
   width?: number
   height?: number
   /** "crop" fills the frame (right for vertical), "pad" keeps the whole shot. */
@@ -797,6 +830,14 @@ export interface ReelPlan {
   cuts_per_minute?: number
   summary?: string
   cuts?: EdlCut[]
+  /** How many shots start later than the top of their clip, and how far in
+   *  the latest one begins. */
+  trimmed?: number
+  trimmed_max?: number
+  /** How many distinct spots the reel visits, and how many clips were
+   *  available to choose from. */
+  places?: number
+  clips_seen?: number
 }
 
 /** Plan without rendering, so the shot list and the true length are visible

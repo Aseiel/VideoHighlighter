@@ -50,9 +50,20 @@ reel about 1.5 GB. Rendering the reel at 1080p is a delivery decision, not a
 quality loss in the source, and it belongs here because this is the only stage
 that re-encodes everything anyway.
 
+Masks and softness
+==================
+Every transition with an edge — wipes, irises, barn doors, blinds, clock
+sweeps, film grain — is one expression over a *mask*: a field giving each pixel
+the moment it changes hands. That makes a new shape a one-line addition, and it
+makes every shape feather-able, which is the difference between a wipe with a
+hard stair-stepped edge and one that looks like it was made on purpose. See
+:data:`MASKS` and :func:`mask_expression`.
+
 Public API
 ==========
-    TRANSITIONS                      -> the names this module accepts
+    TRANSITIONS / CURATED / FAMILIES -> the names this module accepts
+    MASKS / EASINGS                  -> the shapes and the curves
+    mask_expression(kind, ...)       -> str
     build_reel(clips, output, ...)   -> str
     duration_for_bars(analysis, ...) -> float
     plan_transitions(n, ...)         -> list[Transition]
@@ -138,8 +149,116 @@ TRANSITIONS: dict[str, str] = {
     "reveal_down": "revealdown",
 }
 
+# Masks
+# =====
+# A mask is the shape of the join, written as an *arrival time*: for every
+# pixel, the fraction of the transition at which that pixel stops showing the
+# outgoing clip and starts showing the incoming one. A left-to-right wipe is
+# ``X/W`` — the left edge arrives at 0, the right edge at 1. A circular iris is
+# the distance from the centre. Everything below is that one idea with a
+# different field.
+#
+# Writing it this way buys two things a list of hard-coded transitions cannot.
+# Any new shape is one line, and — because the field is a number rather than a
+# branch — every shape can be *feathered*: instead of a pixel flipping when
+# progress passes its arrival time, it ramps over a band of them, which is the
+# difference between a wipe with a jagged stair-stepped edge and one with a
+# soft edge. See :func:`mask_expression`.
+#
+# The fields are written in X, Y, W and H because that is all an xfade custom
+# expression can see, and they are *inlined* rather than assigned to a slot
+# with ``st()``. That is not a style choice. ffmpeg evaluates this expression
+# on several slices of the frame at once and the ``st()``/``ld()`` registers
+# are shared between those threads, so a field stored in slot 0 by one row is
+# read back by another mid-write: measured, an st()/ld() version of the soft
+# wipe below produced 0.48, 0.07, 0.11, 0.00, 0.72 … across a frame that should
+# have ramped smoothly from 1 to 0. The inlined form measures 1.00, 0.73, 0.49,
+# 0.24, 0.00. Sub-expressions therefore appear more than once here on purpose.
+_RADIUS = "(hypot(X/W-0.5,Y/H-0.5)/0.70711)"
+# Clockwise from twelve. The +2*PI/mod pair turns atan2's -PI..PI into 0..2*PI
+# without naming the angle twice, which at two trig calls per pixel is worth
+# the trick.
+_ANGLE = "(mod(atan2(X/W-0.5,0.5-Y/H)+2*PI,2*PI)/(2*PI))"
+# A hash, not a random: an expression is evaluated per pixel with no memory, so
+# the grain has to be a repeatable function of position or it would crawl.
+_HASH = "(mod(abs(sin(X*12.9898+Y*78.233))*43758.5453,1))"
+
+MASKS: dict[str, str] = {
+    # Straight edges.
+    "wipe_left": "(1-X/W)",
+    "wipe_right": "(X/W)",
+    "wipe_up": "(1-Y/H)",
+    "wipe_down": "(Y/H)",
+    "wipe_tl": "((X/W+Y/H)/2)",
+    "wipe_tr": "((1-X/W+Y/H)/2)",
+    "wipe_bl": "((X/W+1-Y/H)/2)",
+    "wipe_br": "((2-X/W-Y/H)/2)",
+    # Shapes opening from, or closing onto, the middle of the frame.
+    "circle_open": _RADIUS,
+    "circle_close": f"(1-{_RADIUS})",
+    "iris_open": _RADIUS,
+    "iris_close": f"(1-{_RADIUS})",
+    "diamond_open": "(abs(X/W-0.5)+abs(Y/H-0.5))",
+    "diamond_close": "(1-abs(X/W-0.5)-abs(Y/H-0.5))",
+    "box_open": "(max(abs(X/W-0.5),abs(Y/H-0.5))*2)",
+    "box_close": "(1-max(abs(X/W-0.5),abs(Y/H-0.5))*2)",
+    # Barn doors: one axis only, so the incoming shot arrives as a widening
+    # band rather than as a shape.
+    "barn_open": "(abs(X/W-0.5)*2)",
+    "barn_close": "(1-abs(X/W-0.5)*2)",
+    "barn_up": "(abs(Y/H-0.5)*2)",
+    "barn_down": "(1-abs(Y/H-0.5)*2)",
+    # A hand sweeping round the dial.
+    "clock": _ANGLE,
+    "clock_back": f"(1-{_ANGLE})",
+    # Bands that all travel together. The count is baked into the name rather
+    # than exposed as a parameter: six and fourteen are two different looks,
+    # and every value between them is the same look slightly off.
+    "blinds": "(mod(Y*6/H,1))",
+    "blinds_fine": "(mod(Y*14/H,1))",
+    "blinds_v": "(mod(X*6/W,1))",
+    "blinds_v_fine": "(mod(X*14/W,1))",
+    # Alternating squares, leaning left-to-right so it reads as a direction
+    # rather than as a flicker.
+    "checker": "((mod(floor(X*8/W)+floor(Y*8/H),2)+X/W)/2)",
+    # Every pixel on its own schedule — the film-lab dissolve, and the one
+    # shape that does not read as a graphic.
+    "grain": _HASH,
+    # A dissolve that starts in the middle and spreads.
+    "grain_iris": f"(({_RADIUS}+{_HASH})/2)",
+    # An iris with a wave in its edge.
+    "ripple": f"(clip({_RADIUS}+0.09*sin({_RADIUS}*28),0,1))",
+    "spiral": f"(clip({_RADIUS}*0.55+{_ANGLE}*0.45,0,1))",
+}
+
+# Masks with no xfade equivalent, which therefore always render as a custom
+# expression — including at linear easing with no feather, where a mask that
+# *does* have a built-in would hand the job back to ffmpeg's own.
+MASK_ONLY: frozenset = frozenset(MASKS) - frozenset(TRANSITIONS)
+
+for _name in sorted(MASK_ONLY):
+    # Reachable by name like any other transition. The empty string marks
+    # "there is no built-in for this" — see _filtergraph.
+    TRANSITIONS[_name] = ""
+
+# The two that are a straight mix of the whole frame rather than a shape, and
+# so have no mask and cannot be feathered: there is no edge to soften.
+BLENDS: frozenset = frozenset({"crossfade", "dissolve"})
+
+# How wide the soft edge is, as a fraction of the transition. 0 is a hard edge
+# — every pixel flips the instant progress passes it — which is what xfade does
+# and what makes an unfeathered wipe look like a slide show. 0.25 is a good
+# general default when softness is wanted.
+DEFAULT_FEATHER = 0.0
+MAX_FEATHER = 1.0
+
+# Below this the band is thinner than a pixel's worth of progress and the
+# expression divides by something near zero, so it degrades to the hard edge it
+# is indistinguishable from anyway.
+MIN_FEATHER = 0.01
+
 # The ones worth offering first. The rest are reachable by name but a list of
-# fifty-seven is a menu nobody reads, and half of them (pixelize, squeeze,
+# eighty is a menu nobody reads, and a good few of them (pixelize, squeeze,
 # hlwind) read as a video-editor demo rather than as film grammar.
 CURATED = (
     "cut", "crossfade", "dissolve", "dip_to_black", "dip_to_white",
@@ -148,6 +267,33 @@ CURATED = (
     "cover_left", "cover_up", "reveal_left", "reveal_up",
     "smooth_left", "smooth_right", "circle_open", "circle_close",
     "zoom_in", "blur", "radial",
+    # Shapes, which only exist as masks.
+    "iris_open", "iris_close", "diamond_open", "box_open",
+    "barn_open", "barn_close", "clock",
+    "blinds", "blinds_v", "checker", "grain", "grain_iris", "ripple",
+)
+
+# Grouped for a menu, so a picker can show "shapes" apart from "wipes" instead
+# of one alphabetical wall. Every name here is a key of TRANSITIONS; anything
+# not listed is still reachable by typing it.
+FAMILIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Cut", ("cut",)),
+    ("Fades", ("crossfade", "dissolve", "dip_to_black", "dip_to_white",
+               "fade_grays", "fade_fast", "fade_slow", "blur")),
+    ("Wipes", ("wipe_left", "wipe_right", "wipe_up", "wipe_down",
+               "wipe_tl", "wipe_tr", "wipe_bl", "wipe_br")),
+    ("Shapes", ("iris_open", "iris_close", "circle_open", "circle_close",
+                "diamond_open", "diamond_close", "box_open", "box_close",
+                "clock", "clock_back", "ripple", "spiral", "radial")),
+    ("Bands", ("barn_open", "barn_close", "barn_up", "barn_down",
+               "blinds", "blinds_fine", "blinds_v", "blinds_v_fine",
+               "checker")),
+    ("Grain", ("grain", "grain_iris")),
+    ("Slides", ("slide_left", "slide_right", "slide_up", "slide_down",
+                "cover_left", "cover_right", "cover_up", "cover_down",
+                "reveal_left", "reveal_right", "reveal_up", "reveal_down",
+                "smooth_left", "smooth_right", "smooth_up", "smooth_down",
+                "zoom_in", "squeeze_h", "squeeze_v")),
 )
 
 # Easing curves, written in terms of T: elapsed fraction of the transition,
@@ -215,6 +361,9 @@ class Transition:
     kind: str = "crossfade"
     duration: float = DEFAULT_DURATION
     easing: str = DEFAULT_EASING
+    # How wide the mask's soft edge is, as a fraction of the transition. Only
+    # means anything for a transition that has an edge — see MASKS.
+    feather: float = DEFAULT_FEATHER
 
     @property
     def is_cut(self) -> bool:
@@ -245,39 +394,75 @@ def normalise_easing(easing: str) -> str:
     return key
 
 
-def eased_expression(kind: str, easing: str) -> str:
-    """An xfade ``custom`` expression for ``kind`` with ``easing`` applied, or
-    "" when this transition cannot be written as one.
+def normalise_feather(feather) -> float:
+    """A softness in 0..1, or raise. Anything below :data:`MIN_FEATHER` comes
+    back as 0, which is the hard edge it would be indistinguishable from."""
+    try:
+        value = float(feather or 0.0)
+    except (TypeError, ValueError):
+        raise ValueError(f"feather must be a number between 0 and 1, got "
+                         f"{feather!r}") from None
+    if value != value or value < 0 or value > MAX_FEATHER:
+        raise ValueError(f"feather must be between 0 and {MAX_FEATHER:g}, got "
+                         f"{feather!r}")
+    return 0.0 if value < MIN_FEATHER else value
+
+
+def mask_expression(kind: str, easing: str = DEFAULT_EASING,
+                    feather: float = DEFAULT_FEATHER) -> str:
+    """An xfade ``custom`` expression for ``kind``, or "" to use the built-in.
 
     xfade's custom mode gives an expression the progress ``P`` and the two
     source pixels ``A`` and ``B`` at the current coordinate — and nothing at
-    any other coordinate. So a fade, which only mixes the two pixels in front
-    of it, and a wipe, which only asks which side of a moving line it is on,
-    can both be written; a slide, which needs the pixel a hundred columns over,
-    cannot. Those keep their built-in linear form rather than being faked.
+    any other coordinate. So a fade, which mixes the two pixels in front of it,
+    and any mask, which only asks whether this pixel's turn has come, can both
+    be written; a slide, which needs the pixel a hundred columns over, cannot.
+    Those keep their built-in linear form rather than being faked.
+
+    Three things can put a transition on this path: a mask with no built-in at
+    all, an easing curve, or a feather. Otherwise "" is returned and ffmpeg's
+    own implementation does the work, which is both faster and exactly what was
+    asked for.
+
+    The feathered form is the interesting one::
+
+        A + (B-A) * clip((progress*(1+f) - arrival) / f, 0, 1)
+
+    A pixel whose arrival time is well past the progress gets 0 and stays on
+    A; one well behind gets 1 and is fully B; the band of width ``f`` between
+    them ramps. Scaling progress by ``(1+f)`` is what guarantees the frame is
+    fully handed over at the end rather than a feather's width short of it.
     """
     kind = normalise_kind(kind)
     easing = normalise_easing(easing)
-    if easing == "linear":
-        return ""   # the built-in already is this, and is cheaper
+    feather = normalise_feather(feather)
     progress = EASINGS[easing].replace("T", PROGRESS)
 
-    mixes = {
-        "crossfade": f"A*(1-{progress})+B*{progress}",
-        "dissolve": f"A*(1-{progress})+B*{progress}",
-        # Wipes: which side of the moving edge this pixel is on.
-        "wipe_left": f"if(gt(X, W*(1-{progress})), B, A)",
-        "wipe_right": f"if(lt(X, W*{progress}), B, A)",
-        "wipe_up": f"if(gt(Y, H*(1-{progress})), B, A)",
-        "wipe_down": f"if(lt(Y, H*{progress}), B, A)",
-        # Circles: distance from the centre against a growing/shrinking radius.
-        # hypot() is available in ffmpeg's expression evaluator.
-        "circle_open":
-            f"if(lt(hypot(X-W/2,Y-H/2), {progress}*hypot(W/2,H/2)), B, A)",
-        "circle_close":
-            f"if(gt(hypot(X-W/2,Y-H/2), (1-{progress})*hypot(W/2,H/2)), B, A)",
-    }
-    return mixes.get(kind, "")
+    if kind == "cut":
+        return ""
+    if kind in BLENDS:
+        # No edge to soften, so feather is not applicable — only easing can
+        # take a fade off the built-in path.
+        return "" if easing == "linear" else f"A+(B-A)*{progress}"
+
+    field = MASKS.get(kind)
+    if not field:
+        # A built-in with no mask (slides, zooms, winds). Easing cannot be
+        # applied to these — see the docstring — so they keep their own form
+        # rather than silently becoming something else.
+        return ""
+    if easing == "linear" and not feather and kind not in MASK_ONLY:
+        return ""
+
+    if not feather:
+        return f"if(gte({progress},{field}),B,A)"
+    return (f"A+(B-A)*clip(({progress}*{1.0 + feather:.4f}-{field})"
+            f"/{feather:.4f},0,1)")
+
+
+# The name this had before masks existed. Kept because a caller asking for an
+# eased expression is asking for exactly this.
+eased_expression = mask_expression
 
 
 def duration_for_bars(analysis, *, bars: float = 0.5,
@@ -302,7 +487,8 @@ def duration_for_bars(analysis, *, bars: float = 0.5,
 def plan_transitions(count: int, *, kind: str = "crossfade",
                      duration: float = DEFAULT_DURATION,
                      every: int = 1, other: str = "cut",
-                     easing: str = DEFAULT_EASING) -> list[Transition]:
+                     easing: str = DEFAULT_EASING,
+                     feather: float = DEFAULT_FEATHER) -> list[Transition]:
     """Transitions for ``count`` clips — that is ``count - 1`` joins.
 
     ``every`` places the named transition on every Nth join and ``other`` on
@@ -311,11 +497,12 @@ def plan_transitions(count: int, *, kind: str = "crossfade",
     """
     kind = normalise_kind(kind)
     other = normalise_kind(other)
+    feather = normalise_feather(feather)
     step = max(1, int(every))
     return [
         Transition(index=i,
                    kind=kind if i % step == 0 else other,
-                   duration=duration, easing=easing)
+                   duration=duration, easing=easing, feather=feather)
         for i in range(max(0, count - 1))
     ]
 
@@ -339,7 +526,8 @@ def _clamp(transitions, durations) -> list[Transition]:
         duration = min(float(t.duration), room)
         kind = t.kind if duration >= MIN_DURATION else "cut"
         out.append(Transition(index=t.index, kind=kind, duration=duration,
-                              easing=getattr(t, "easing", DEFAULT_EASING)))
+                              easing=getattr(t, "easing", DEFAULT_EASING),
+                              feather=getattr(t, "feather", DEFAULT_FEATHER)))
     return out
 
 
@@ -398,13 +586,17 @@ def _filtergraph(transitions, durations, fps: int) -> tuple[str, str, float]:
         nxt = i + 1
         out_v, out_a = f"v{nxt}", f"a{nxt}"
         offset = max(0.0, acc - t.duration)
-        expr = eased_expression(t.kind, getattr(t, "easing", DEFAULT_EASING))
+        expr = mask_expression(t.kind, getattr(t, "easing", DEFAULT_EASING),
+                               getattr(t, "feather", DEFAULT_FEATHER))
         if expr:
             # ' is the filtergraph's own quote, so the expression is wrapped in
-            # it and must not contain one; none of the easings do.
+            # it and must not contain one; no easing or mask does.
             spec = f"transition=custom:expr='{expr}'"
         else:
-            spec = f"transition={TRANSITIONS[t.kind]}"
+            # A mask-only name should never reach here without an expression,
+            # but a built-in that is missing from this ffmpeg would fail deep
+            # inside the encode rather than here, so it falls back instead.
+            spec = f"transition={TRANSITIONS[t.kind] or 'fade'}"
         parts.append(
             f"[{v_label}][x{nxt}]xfade={spec}"
             f":duration={t.duration:.3f}:offset={offset:.3f}[{out_v}]")
@@ -580,6 +772,7 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
                height: int = 0, fps: int = 0, crf: int = 20,
                preset: str = "medium", music=None, music_optional: bool = False,
                texts=None, fill: str = "pad", easing: str = DEFAULT_EASING,
+               feather: float = DEFAULT_FEATHER,
                log_fn=print, progress_fn=None, cancel_check=None) -> str:
     """Join ``clips`` into ``output`` with transitions between them.
 
@@ -612,12 +805,14 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
 
     if transitions is None:
         transitions = plan_transitions(len(valid), kind=kind, duration=duration,
-                                       easing=easing)
+                                       easing=easing, feather=feather)
     else:
         transitions = [
             Transition(index=t.index, kind=normalise_kind(t.kind),
                        duration=float(t.duration),
-                       easing=normalise_easing(getattr(t, "easing", easing)))
+                       easing=normalise_easing(getattr(t, "easing", easing)),
+                       feather=normalise_feather(
+                           getattr(t, "feather", feather)))
             for t in transitions
         ]
 
@@ -664,8 +859,9 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
     width, height = max(2, width - width % 2), max(2, height - height % 2)
 
     named = ", ".join(sorted({t.kind for t in transitions if not t.is_cut}))
+    softest = max((t.feather for t in transitions if not t.is_cut), default=0.0)
     log_fn(f"🎬 Building a reel of {len(valid)} clips at {width}x{height} @ {fps}fps "
-           f"({named})")
+           f"({named}{f', soft edge {softest:.0%}' if softest else ''})")
 
     temp_dir = tempfile.mkdtemp(prefix="vh_reel_")
     _, ext = os.path.splitext(output)
@@ -730,7 +926,8 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
 
         run_durations = [_probe_duration(p) for p in pieces]
         blended = _clamp([Transition(index=i, kind=t.kind, duration=t.duration,
-                                     easing=getattr(t, "easing", easing))
+                                     easing=getattr(t, "easing", easing),
+                                     feather=getattr(t, "feather", feather))
                           for i, t in enumerate(blended)], run_durations)
 
         if not blended:

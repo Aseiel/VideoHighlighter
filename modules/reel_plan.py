@@ -46,6 +46,7 @@ Public API
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from modules.edl import Cut, Edl
@@ -144,6 +145,7 @@ class Shot:
     section: str
     text: str = ""
     kind: str = ""            # framing, so the next pick can alternate
+    place: int = -1           # the spot it was shot from, so a reel can spread
 
 
 @dataclass
@@ -151,9 +153,82 @@ class _Source:
     path: str
     duration: float
     score: float = 0.0
-    taken: float = 0.0        # how much of it is already spoken for
+    cursor: float = 0.0       # nothing before this is still free
+    used: float = 0.0         # how much has actually been taken
     order: int = 0
     kind: str = ""            # framing, from modules.shot_type
+    windows: object = None    # modules.shot_window.ClipWindows, when measured
+    place: int = -1           # which spot it was shot from, from shot_place
+    look: object = None       # modules.shot_look.Look, when measured
+
+    @property
+    def free(self) -> float:
+        """How much of the clip has not been spoken for yet."""
+        return max(0.0, self.duration - self.cursor)
+
+    @property
+    def graded(self) -> bool:
+        return bool(getattr(self.windows, "measured", False))
+
+    def quality(self, want: float) -> float:
+        """How good the best unused ``want`` seconds of this clip are, 0..1.
+
+        Zero for an unmeasured clip, which makes every clip equal and leaves
+        whatever ranking the caller does to fall through to its later keys.
+        """
+        if not self.graded:
+            return 0.0
+        return float(self.windows.best(want, after=self.cursor).score)
+
+    def take(self, want: float, unit: float = 0.0) -> tuple[float, float]:
+        """Reserve the next shot and return where it starts and how long it is.
+
+        This is the whole point of the module's use of
+        :mod:`modules.shot_window`. Before it, a shot began wherever the last
+        one ended — which for the *first* slice of a clip means frame zero, and
+        frame zero is where the camera is still being raised, swung round, or
+        pulled out of a pocket. The clip is fine; its opening second is not.
+
+        Forward-only on purpose. Windows are searched from the cursor rather
+        than across the whole clip so two slices of one source can never
+        overlap, which would show as the reel repeating itself.
+
+        ``unit`` is the musical grid, when there is one. It matters here
+        because skipping past an unsteady opening leaves the cursor at an
+        arbitrary offset, so the *last* slice of a clip can end up with less
+        room than a full shot needs. Truncating it to whatever is left puts
+        that one shot off the beat and takes the whole reel with it; rounding
+        down to a whole unit instead keeps the grid, at the cost of a fraction
+        of a second the reel was already allowed to come in short by.
+        """
+        room = self.free
+        if self.graded and room > 0:
+            window = self.windows.best(want, after=self.cursor)
+            start, length = window.start, window.duration
+        else:
+            start, length = self.cursor, min(want, room)
+
+        left = max(0.0, self.duration - start)
+        length = min(want, left)
+        if unit and length < want - 1e-6:
+            whole = math.floor(length / unit + 1e-6) * unit
+            if whole >= MIN_SHOT:
+                length = whole
+        if length < MIN_SHOT:
+            length = min(MIN_SHOT, left)
+
+        # Rounded because the arithmetic above accumulates: a start that came
+        # off the sample grid, subtracted from a probed duration, leaves a
+        # length like 2.9999999999999996 rather than 3. Nothing downstream
+        # cares about the difference except the beat grid, where a shot a
+        # quadrillionth under the unit is no longer a whole number of beats
+        # and the reel stops landing on the music. Six places is far below
+        # the millisecond the cut list is written to.
+        start = round(start, 6)
+        length = round(min(length, max(0.0, self.duration - start)), 6)
+        self.cursor = start + length
+        self.used += length
+        return start, length
 
 
 def _sections_for(duration: float, pace: Pace, structure=STRUCTURE,
@@ -215,12 +290,32 @@ def _sections_for(duration: float, pace: Pace, structure=STRUCTURE,
 
 
 def _pick(sources: list[_Source], want: float, *, allow_reuse: bool,
-          prefers: tuple = (), avoid_kind: str = "") -> _Source | None:
+          prefers: tuple = (), avoid_kind: str = "",
+          place_use: dict = None, avoid_place: int = None,
+          avoid_looks: list = None) -> _Source | None:
     """The next source with room for a ``want``-second shot.
 
     Ranked rather than filtered, because every one of these is a preference
     that a small shoot has to be able to override:
 
+    - **From a spot the reel has not used yet.** The strongest of these, and
+      the one that stops a montage reading as one shot with hiccups: standing
+      still and pressing record twice is the commonest way a reel repeats
+      itself, and no amount of picking better moments fixes it, because the
+      moments are genuinely good and genuinely of the same thing. It is first
+      because it is the coarsest — with more places than shots every candidate
+      scores zero here and the preferences below do all the work, and it only
+      speaks up to break a tie against showing the same view again.
+    - **Not the same spot as the shot before it**, for when there are fewer
+      places than shots and something has to be repeated. Repeating a view
+      later is a montage; repeating it immediately is a mistake.
+    - **Not the same picture as the shot before it.** Position cannot catch a
+      landmark filmed from half a kilometre away — by position those are
+      different places, which they are, and the viewer still sees the same
+      lake twice. So the two are compared directly, and only against the
+      immediately preceding shot: the comparison is reliable enough to say
+      "these two are the same view" and not reliable enough to prune a whole
+      reel on. See :mod:`modules.shot_look`.
     - **Not yet used**, so a reel spreads across the footage before taking a
       second slice of anything.
     - **The framing this section reads best in** (see :class:`Section`).
@@ -231,22 +326,44 @@ def _pick(sources: list[_Source], want: float, *, allow_reuse: bool,
       kind still cuts.
     - **Shooting order**, to keep the progression forward.
     """
-    usable = [s for s in sources if s.duration - s.taken >= want
-              and (allow_reuse or s.taken == 0)]
+    usable = [s for s in sources if s.free >= want
+              and (allow_reuse or s.used == 0)]
     if not usable:
         if not allow_reuse:
             return None
         # Nothing has a full shot left; take from whatever has the most
         # remaining rather than dropping the shot and coming up short.
-        remaining = [s for s in sources if s.duration - s.taken > MIN_SHOT]
-        return max(remaining, key=lambda s: s.duration - s.taken) if remaining else None
+        remaining = [s for s in sources if s.free > MIN_SHOT]
+        return max(remaining, key=lambda s: s.free) if remaining else None
+
+    def looks_repeated(source: _Source) -> int:
+        """2 when this repeats the shot before it, 1 when it repeats one
+        earlier in the reel, 0 otherwise.
+
+        Both are worth avoiding and they are not worth the same. Two shots of
+        one view side by side read as a stutter; the same two a few seconds
+        apart read as a montage that came back to something. Graded rather
+        than forbidden because this is a preference like the rest — a shoot
+        with nothing else to offer still cuts.
+        """
+        if source.look is None or not avoid_looks:
+            return 0
+        from modules.shot_look import same_view
+        if avoid_looks[-1] is not None and same_view(source.look, avoid_looks[-1]):
+            return 2
+        return 1 if any(same_view(source.look, seen)
+                        for seen in avoid_looks[:-1] if seen is not None) else 0
 
     def rank(source: _Source) -> tuple:
         return (
-            0 if source.taken == 0 else 1,
+            (place_use or {}).get(source.place, 0),
+            1 if (avoid_place is not None and source.place == avoid_place
+                  and source.place >= 0) else 0,
+            looks_repeated(source),
+            0 if source.used == 0 else 1,
             0 if (prefers and source.kind in prefers) else 1,
             1 if (avoid_kind and source.kind == avoid_kind) else 0,
-            source.taken,
+            source.used,
             source.order,
         )
 
@@ -256,10 +373,12 @@ def _pick(sources: list[_Source], want: float, *, allow_reuse: bool,
 def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
               structure=STRUCTURE, scores=None, title: str = "Reel",
               transition: str = "cut", transition_duration: float = 0.25,
-              easing: str = "linear",
+              easing: str = "linear", feather: float = 0.0,
               texts=None, music: str = "", width: int = 0, height: int = 0,
               analysis=None, quantise: bool = True, shots_by_kind=None,
-              classify: bool = True, log_fn=print) -> Edl:
+              classify: bool = True, windows=None, settle: bool = True,
+              places=None, track: str = "", spread: bool = True,
+              log_fn=print) -> Edl:
     """Arrange ``sources`` into a reel and return it as a cut list.
 
     ``sources`` are clip paths — usually the engine's highlight files, which are
@@ -273,8 +392,27 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
     them — the beat rather than the bar, because at 66 BPM a bar is 3.6 s and
     an energetic reel wants shots half that long.
 
+    ``settle`` decides where inside each clip a shot begins. On (the default)
+    every source is measured by :mod:`modules.shot_window` and each shot takes
+    the best window it can still reach, rather than starting at frame zero —
+    which is where the camera is very often still being raised or pulled out.
+    Off, and shots begin at the first unused frame as they always did.
+    ``windows`` accepts an already-measured ``{path: ClipWindows}`` so a caller
+    that has paid for the measurement does not pay twice.
+
+    ``spread`` keeps the reel off the same view twice. Clips are grouped by
+    where and when they were shot (see :mod:`modules.shot_place`) and the reel
+    takes one shot per spot before it reuses any — which is what stops four
+    shots of one valley, filmed over ten minutes of standing still, all
+    reaching the same edit. ``track`` optionally names a GPX file, used to
+    place clips whose own metadata carries no GPS; ``places`` accepts an
+    already-computed ``{path: place number}``.
+
     Everything after the hook keeps the order it was given, which is shooting
-    order when the caller passes the engine's output unchanged.
+    order when the caller passes the engine's output unchanged. Settling moves
+    the in-*point* of a shot, never its place in the running order: what makes
+    a sequence read as a story is the progression, and reordering by picture
+    quality would trade the story for a slightly cleaner frame.
     """
     from modules.video_probe import probe_video
 
@@ -313,17 +451,66 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
     for source in pool:
         source.kind = str(kinds.get(source.path, "") or "")
 
+    # Where inside each clip the camera has actually settled. Optional in both
+    # directions for the same reasons framing is: a caller that already
+    # measured passes it in, and a caller that cannot afford it turns it off
+    # and every shot starts at the first unused frame as before.
+    graded = dict(windows or {})
+    if settle and not graded:
+        try:
+            from modules.shot_window import profile_all
+            graded = profile_all([s.path for s in pool], log_fn=log_fn)
+        except Exception as exc:
+            log_fn(f"⚠️ Could not measure camera settling ({exc}); "
+                   f"shots will start at the top of each clip")
+    if settle:
+        for source in pool:
+            source.windows = graded.get(source.path)
+
+    # Which spot each clip was shot from, so the reel can visit each once
+    # before repeating any. Same bargain as the two measurements above: a
+    # caller can supply it, and a shoot whose files carry neither a time nor a
+    # position still cuts — every clip simply lands in a place of its own.
+    numbered = dict(places or {})
+    if spread and not numbered:
+        try:
+            from modules.shot_place import group, locate, read_track
+            found = locate([s.path for s in pool],
+                           track=read_track(track, log_fn=log_fn) if track else None,
+                           log_fn=log_fn)
+            numbered = group(found, log_fn=log_fn)
+        except Exception as exc:
+            log_fn(f"⚠️ Could not work out where the clips were shot ({exc}); "
+                   f"the reel may show the same view twice")
+    if spread:
+        for source in pool:
+            source.place = int(numbered.get(source.path, -1))
+
+        # And what each one looks like, for the repeats position cannot see.
+        try:
+            from modules.shot_look import look_all
+            appearance = look_all([s.path for s in pool], log_fn=log_fn)
+            for source in pool:
+                source.look = appearance.get(source.path)
+        except Exception as exc:
+            log_fn(f"⚠️ Could not compare how the clips look ({exc}); "
+                   f"two shots of the same view may end up side by side")
+
     # The hook is the most striking thing available, not the earliest. With
     # scores that is what they say; without them, a close shot stops a scroll
-    # better than a landscape, so framing decides — and failing both, the
-    # first clip stands in rather than the module inventing a judgement the
+    # better than a landscape, so framing decides — and among equally framed
+    # clips, the one whose opening is actually watchable. Failing all of that,
+    # the first clip stands in rather than the module inventing a judgement the
     # engine already owns.
     hook_prefers = STRUCTURE[0].prefers if STRUCTURE else ()
     if scores:
         hook = max(pool, key=lambda s: (s.score, -s.order))
     else:
-        preferred = [s for s in pool if s.kind in hook_prefers]
-        hook = preferred[0] if preferred else pool[0]
+        preferred = [s for s in pool if s.kind in hook_prefers] or pool
+        # Rounded, so only a clip that is *clearly* steadier jumps the queue
+        # and a field of near-identical clips still opens on the earliest one.
+        hook = max(preferred,
+                   key=lambda s: (round(s.quality(1.0), 2), -s.order))
     rest = [s for s in pool if s is not hook]
 
     unit = _musical_unit(analysis, band.typical) if (analysis and quantise) else 0.0
@@ -332,25 +519,39 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
                f"({'beat' if unit < 2.0 else 'bar'})")
 
     shots: list[Shot] = []
+    # How many shots the reel has already taken from each spot. The first key
+    # _pick ranks on, so every place is visited once before any is repeated.
+    place_use: dict[int, int] = {}
+    last_place: int | None = None
+    used_looks: list = []
+
     for section, target, count in _sections_for(duration, band, structure, unit):
         for n in range(count):
             is_hook = section.name == "Hook" and n == 0
             candidates = [hook] if is_hook else rest
             previous = shots[-1].kind if shots else ""
             picked = _pick(candidates, target, allow_reuse=not is_hook,
-                           prefers=section.prefers, avoid_kind=previous)
+                           prefers=section.prefers, avoid_kind=previous,
+                           place_use=place_use, avoid_place=last_place,
+                           avoid_looks=used_looks)
             if picked is None:
                 picked = _pick(pool, target, allow_reuse=True,
-                               prefers=section.prefers, avoid_kind=previous)
+                               prefers=section.prefers, avoid_kind=previous,
+                               place_use=place_use, avoid_place=last_place,
+                           avoid_looks=used_looks)
             if picked is None:
                 break
-            available = picked.duration - picked.taken
-            length = max(MIN_SHOT, min(target, available))
-            shots.append(Shot(source=picked.path, start=picked.taken,
+            start, length = picked.take(target, unit)
+            if length <= 0:
+                continue
+            shots.append(Shot(source=picked.path, start=start,
                               duration=length, section=section.name,
                               text=texts.get(section.name, "") if n == 0 else "",
-                              kind=picked.kind))
-            picked.taken += length
+                              kind=picked.kind, place=picked.place))
+            if picked.place >= 0:
+                place_use[picked.place] = place_use.get(picked.place, 0) + 1
+                last_place = picked.place
+            used_looks.append(picked.look)
 
     if not shots:
         raise ValueError("could not place any shots — clips are too short")
@@ -363,13 +564,35 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
             end=shot.start + shot.duration,
             transition="cut" if last else transition,
             transition_duration=0.0 if last else transition_duration,
-            easing=easing,
+            easing=easing, feather=float(feather),
             label=shot.section, text=shot.text))
 
     reel = Edl(title=title, cuts=cuts, music=music,
                width=int(width), height=int(height))
     log_fn(f"🎬 {title}: {len(cuts)} shots, {reel.duration:.0f}s, "
            f"{cuts_per_minute(reel):.0f} cuts/min ({band.label})")
+
+    # Worth saying out loud: an in-point the user did not choose is the kind of
+    # thing that looks like a bug until you know why it happened.
+    moved = [c for c in cuts if c.start > 0.25]
+    if moved:
+        latest = max(c.start for c in moved)
+        log_fn(f"✂️ {len(moved)} of {len(cuts)} shots start later than frame "
+               f"zero (up to {latest:.1f}s in) — the camera was still being "
+               f"placed at the top of those clips")
+
+    # A repeated spot is the thing the viewer notices and the log never
+    # mentioned, so say it either way: that the reel is all different views,
+    # or that there was not enough footage for that and which ones doubled up.
+    if spread and shots and any(s.place >= 0 for s in shots):
+        visited = [s.place for s in shots if s.place >= 0]
+        repeated = len(visited) - len(set(visited))
+        if repeated:
+            log_fn(f"📍 {len(set(visited))} different spot(s) across "
+                   f"{len(visited)} shots — {repeated} had to be shown twice, "
+                   f"which is what a shoot with fewer places than shots costs")
+        else:
+            log_fn(f"📍 Every shot is from a different spot")
     if reel.duration > duration * 1.12:
         # Not a rounding miss: the structure has a floor of one hook, two
         # context shots, three of escalation and a held payoff, and at a slow

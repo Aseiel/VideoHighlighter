@@ -753,7 +753,12 @@ def _edl_from_request(req: "EdlSaveRequest"):
                 end=float(c.get("end", 0.0)),
                 transition=str(c.get("transition", "cut")),
                 transition_duration=float(c.get("transition_duration", 0.5)),
-                label=str(c.get("label", "") or ""))
+                # Dropping these here is how an edit silently loses its look:
+                # the timeline round-trips through this on every save.
+                easing=str(c.get("easing", "linear") or "linear"),
+                feather=float(c.get("feather", 0.0) or 0.0),
+                label=str(c.get("label", "") or ""),
+                text=str(c.get("text", "") or ""))
             for c in (req.cuts or [])
         ],
     )
@@ -804,12 +809,13 @@ async def render_edl_endpoint(req: EdlRenderRequest) -> dict:
             "title": edl.title, "music": edl.music,
             "music_mode": edl.music_mode, "music_volume": edl.music_volume,
             "width": edl.width, "height": edl.height, "fps": edl.fps,
-            "crf": edl.crf,
+            "crf": edl.crf, "fill": edl.fill,
             "cuts": [
                 {"source": c.source, "start": c.start, "end": c.end,
                  "transition": c.transition,
                  "transition_duration": c.transition_duration,
-                 "label": c.label}
+                 "easing": c.easing, "feather": c.feather,
+                 "label": c.label, "text": c.text}
                 for c in edl.cuts
             ],
         },
@@ -825,10 +831,27 @@ async def render_edl_endpoint(req: EdlRenderRequest) -> dict:
 
 @app.get("/reel/options")
 async def reel_options() -> dict:
-    """Pace bands, lengths and the story structure, so the UI shows the same
-    numbers the planner uses rather than a copy that can drift."""
+    """Pace bands, lengths, story structure and the transition catalogue, so
+    the UI shows the same names and numbers the renderer uses rather than a
+    copy that can drift out of step with it."""
     try:
         from modules.reel_plan import LENGTHS, PACES, STRUCTURE, minimum_duration
+        from modules.transitions import (
+            BLENDS, CURATED, DEFAULT_FEATHER, EASINGS, FAMILIES, MASKS,
+            TRANSITIONS,
+        )
+
+        def described(name: str) -> dict:
+            return {
+                "key": name,
+                # A transition with a mask has an edge, and only something with
+                # an edge can be softened. The UI uses this to enable or grey
+                # out the softness control instead of offering it on a fade,
+                # where it would do nothing.
+                "maskable": name in MASKS,
+                "blend": name in BLENDS,
+            }
+
         return {
             "ok": True,
             "paces": [
@@ -840,6 +863,14 @@ async def reel_options() -> dict:
             ],
             "lengths": [{"seconds": s, "reason": r} for s, r in LENGTHS],
             "sections": [s.name for s in STRUCTURE],
+            "transitions": [described(n) for n in sorted(TRANSITIONS)],
+            "curated": list(CURATED),
+            "families": [{"name": name,
+                          "items": [described(n) for n in items
+                                    if n in TRANSITIONS]}
+                         for name, items in FAMILIES],
+            "easings": sorted(EASINGS),
+            "default_feather": DEFAULT_FEATHER,
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -855,6 +886,15 @@ class ReelRequest(BaseModel):
     transition: str | None = "cut"
     transition_duration: float | None = 0.25
     easing: str | None = "linear"
+    feather: float | None = 0.0
+    # Whether shots may start later than frame zero when the camera is still
+    # being placed at the top of a clip. See modules.shot_window.
+    settle: bool | None = True
+    # Whether the reel avoids showing the same spot, or the same picture,
+    # twice. See modules.shot_place and modules.shot_look.
+    spread: bool | None = True
+    # A GPX file, for placing clips whose own metadata carries no GPS.
+    track: str | None = ""
     width: int | None = 1080
     height: int | None = 1920
     fill: str | None = "crop"
@@ -899,6 +939,10 @@ def _build_reel_edl(req: "ReelRequest"):
         transition=req.transition or "cut",
         transition_duration=float(req.transition_duration or 0.25),
         easing=req.easing or "linear",
+        feather=float(req.feather or 0.0),
+        settle=True if req.settle is None else bool(req.settle),
+        spread=True if req.spread is None else bool(req.spread),
+        track=req.track or "",
         texts=req.texts or {}, analysis=analysis,
         width=int(req.width or 0), height=int(req.height or 0),
         log_fn=lambda *_: None)
@@ -924,9 +968,19 @@ async def reel_plan_endpoint(req: ReelRequest) -> dict:
                 {"source": c.source, "start": c.start, "end": c.end,
                  "duration": c.duration, "transition": c.transition,
                  "transition_duration": c.transition_duration,
+                 "easing": c.easing, "feather": c.feather,
                  "label": c.label, "text": c.text}
                 for c in edl.cuts
             ],
+            # What the settling pass actually did, so the UI can say why a shot
+            # does not start at the top of its clip rather than leaving it
+            # looking like an off-by-something.
+            "trimmed": sum(1 for c in edl.cuts if c.start > 0.25),
+            "trimmed_max": round(max((c.start for c in edl.cuts), default=0.0), 2),
+            # How much of the shoot the reel actually spans, so the UI can say
+            # whether a repeated view was a choice or all there was.
+            "places": len({c.source for c in edl.cuts}),
+            "clips_seen": len(_reel_sources(req)),
         }
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
@@ -966,7 +1020,8 @@ async def reel_render(req: ReelRequest) -> dict:
                 {"source": c.source, "start": c.start, "end": c.end,
                  "transition": c.transition,
                  "transition_duration": c.transition_duration,
-                 "easing": c.easing, "label": c.label, "text": c.text}
+                 "easing": c.easing, "feather": c.feather,
+                 "label": c.label, "text": c.text}
                 for c in edl.cuts
             ],
         },

@@ -23,8 +23,13 @@ from modules.app_paths import ffmpeg_exe
 from modules.transitions import (
     CURATED,
     EASINGS,
+    FAMILIES,
+    MASK_ONLY,
+    MASKS,
     eased_expression,
+    mask_expression,
     normalise_easing,
+    normalise_feather,
     DEFAULT_DURATION,
     MIN_DURATION,
     TRANSITIONS,
@@ -429,8 +434,53 @@ def test_transition_names_are_accepted_loosely():
 
 
 def test_every_named_transition_maps_to_something_ffmpeg_knows():
+    """Every name has to reach ffmpeg somehow — either as one of its own xfade
+    transitions or as a custom expression. A name that maps to neither renders
+    as ``transition=`` with nothing after it, which fails in the encode rather
+    than at the point somebody typed it."""
     assert TRANSITIONS["cut"] == ""
-    assert all(v for k, v in TRANSITIONS.items() if k != "cut")
+    for name, builtin in TRANSITIONS.items():
+        if name == "cut":
+            continue
+        assert builtin or mask_expression(name), (
+            f"{name} has no built-in and produces no expression")
+
+
+def test_mask_only_transitions_always_produce_an_expression():
+    """The ones with no xfade equivalent cannot fall back to a built-in, so
+    they must render as an expression even at linear easing with a hard edge —
+    the case where everything else hands the job back to ffmpeg."""
+    assert MASK_ONLY
+    for name in MASK_ONLY:
+        assert mask_expression(name, "linear", 0.0)
+        assert TRANSITIONS[name] == ""
+
+
+def test_a_built_in_is_preferred_when_nothing_is_asked_of_it():
+    """Linear easing and a hard edge is exactly what xfade already does, so
+    asking for it should cost no expression — the built-in is faster and is
+    the reference implementation of the look."""
+    for name in ("wipe_left", "circle_open", "crossfade", "slide_left"):
+        assert mask_expression(name, "linear", 0.0) == ""
+
+
+def test_feather_puts_a_wipe_on_the_custom_path():
+    """A soft edge is the one thing xfade cannot do, so any feather has to
+    take a maskable transition off the built-in."""
+    assert mask_expression("wipe_left", "linear", 0.3)
+    # A fade has no edge to soften, so feather alone must not change it.
+    assert mask_expression("crossfade", "linear", 0.3) == ""
+    # Nor can a slide be masked — it needs pixels this expression cannot see.
+    assert mask_expression("slide_left", "linear", 0.3) == ""
+
+
+def test_feather_is_bounded():
+    for bad in (-0.1, 1.5, "soft"):
+        with pytest.raises(ValueError, match="feather"):
+            normalise_feather(bad)
+    # Below the minimum it is the hard edge it is indistinguishable from.
+    assert normalise_feather(0.001) == 0.0
+    assert normalise_feather(0.5) == 0.5
 
 
 def test_no_valid_inputs_raises(tmp_path):
@@ -481,3 +531,156 @@ def test_bar_timing_falls_back_without_a_tempo():
     assert duration_for_bars(_Analysis(0)) == DEFAULT_DURATION
     assert duration_for_bars(None) == DEFAULT_DURATION
     assert duration_for_bars(_Analysis(120), bars=0.0) == MIN_DURATION
+
+
+# --- Masks -----------------------------------------------------------------
+#
+# The expression can be well-formed and draw nothing, or draw the shape
+# backwards, and neither shows up in a duration check — the same trap the
+# easing curves fell into. So these render through real ffmpeg and measure the
+# frame.
+
+def _mask_frame(name, feather, at=1.5, easing="linear", size=200):
+    """One frame from the middle of a black-to-white transition, as a
+    ``size x size`` array of luma.
+
+    Written out as raw gray and read with numpy rather than through an image
+    library: ``cv2`` is one of the heavy dependencies conftest replaces with a
+    MagicMock, so an ``imread`` here silently returns a mock and every
+    comparison against it raises a TypeError several lines later.
+    """
+    import tempfile
+
+    import numpy as np
+
+    expr = mask_expression(name, easing, feather)
+    spec = (f"transition=custom:expr='{expr}'" if expr
+            else f"transition={TRANSITIONS[name]}")
+    out = os.path.join(tempfile.mkdtemp(), "frame.gray")
+    result = subprocess.run(
+        [FFMPEG, "-y", "-v", "error",
+         "-f", "lavfi", "-i", f"color=c=black:s={size}x{size}:r=30:d=2",
+         "-f", "lavfi", "-i", f"color=c=white:s={size}x{size}:r=30:d=2",
+         "-filter_complex",
+         f"[0:v][1:v]xfade={spec}:duration=1:offset=1[v]",
+         "-map", "[v]", "-ss", str(at), "-frames:v", "1",
+         "-f", "rawvideo", "-pix_fmt", "gray", out],
+        capture_output=True, text=True)
+    assert result.returncode == 0, f"{name} failed to render: {result.stderr[-300:]}"
+    data = open(out, "rb").read()
+    assert len(data) == size * size, f"{name} rendered no frame"
+    return np.frombuffer(data, dtype=np.uint8).reshape(size, size)
+
+
+def _soft_pixels(frame) -> int:
+    """Pixels that are neither of the two source clips — i.e. the soft edge."""
+    return int(((frame > 25) & (frame < 230)).sum())
+
+
+@pytest.mark.parametrize("name", sorted(MASKS))
+def test_every_mask_is_partway_through_at_its_midpoint(name):
+    """The failure this catches is a mask that renders cleanly and does
+    nothing — all black or all white halfway through, which is a transition
+    that is really a cut with extra steps."""
+    share = _mask_frame(name, 0.0 if TRANSITIONS[name] == "" else 0.25).mean() / 255
+    assert 0.1 < share < 0.9, f"{name} is {share:.0%} handed over at its midpoint"
+
+
+@pytest.mark.parametrize("name", sorted(MASKS))
+def test_every_mask_finishes(name):
+    """A mask that never reaches 1 leaves a sliver of the outgoing clip on
+    screen for ever. Scaling progress by (1+feather) is what prevents it, and
+    it is exactly the kind of thing that is right in the algebra and wrong in
+    the code."""
+    frame = _mask_frame(name, 0.4, at=1.99)
+    assert frame.mean() / 255 > 0.97, "the outgoing clip is still visible at the end"
+
+
+@pytest.mark.parametrize("name", ["wipe_left", "wipe_down", "iris_open",
+                                  "diamond_open", "clock", "blinds", "checker"])
+def test_feather_widens_the_edge(name):
+    """The point of the whole mask mechanism: a hard edge has no in-between
+    pixels and a feathered one has a band of them."""
+    hard = _soft_pixels(_mask_frame(name, 0.0))
+    soft = _soft_pixels(_mask_frame(name, 0.35))
+    assert soft > hard * 3 + 500, f"{name}: hard {hard}px, soft {soft}px"
+
+
+def test_a_wipe_moves_the_way_its_name_says():
+    """The bug that survives every other check: a mask written in P rather
+    than in (1-P) plays backwards and looks entirely plausible. A left wipe
+    must be showing the incoming clip on the *right* of the frame halfway
+    through."""
+    frame = _mask_frame("wipe_left", 0.0, at=1.5)
+    left = frame[:, : frame.shape[1] // 4].mean()
+    right = frame[:, -frame.shape[1] // 4:].mean()
+    assert right > left + 100, "wipe_left is running the wrong way"
+
+    frame = _mask_frame("wipe_right", 0.0, at=1.5)
+    left = frame[:, : frame.shape[1] // 4].mean()
+    right = frame[:, -frame.shape[1] // 4:].mean()
+    assert left > right + 100, "wipe_right is running the wrong way"
+
+
+def test_an_iris_opens_from_the_middle():
+    frame = _mask_frame("iris_open", 0.0, at=1.5)
+    h, w = frame.shape
+    centre = frame[h // 2 - 10:h // 2 + 10, w // 2 - 10:w // 2 + 10].mean()
+    corner = frame[:20, :20].mean()
+    assert centre > corner + 100, "the iris is not opening from the centre"
+    # ...and the closing one does the opposite.
+    frame = _mask_frame("iris_close", 0.0, at=1.5)
+    centre = frame[h // 2 - 10:h // 2 + 10, w // 2 - 10:w // 2 + 10].mean()
+    corner = frame[:20, :20].mean()
+    assert corner > centre + 100, "the closing iris is not closing inwards"
+
+
+def test_grain_is_stable_rather_than_crawling():
+    """The dissolve mask is a hash of position, not a random: an expression is
+    evaluated per pixel with no memory, so anything actually random would
+    boil. Two renders of the same frame must be identical."""
+    import numpy as np
+
+    first = _mask_frame("grain", 0.0, at=1.5)
+    second = _mask_frame("grain", 0.0, at=1.5)
+    assert np.array_equal(first, second)
+
+
+def _runs_of_incoming(column) -> int:
+    """How many separate stretches of the incoming clip a column passes
+    through — which for a banded mask is the number of bands."""
+    import numpy as np
+
+    white = (column > 128).astype(int)
+    # A run starts wherever white begins, counting the top of the frame.
+    return int(white[0]) + int(((np.diff(white)) == 1).sum())
+
+
+@pytest.mark.parametrize("name,bands", [("blinds", 6), ("blinds_fine", 14),
+                                        ("blinds_v", 6), ("blinds_v_fine", 14)])
+def test_blinds_have_the_bands_their_name_claims(name, bands):
+    """Each band hands over on its own, so a line across the frame passes
+    through one stretch of the incoming clip per band. This is what separates
+    a blind from a plain wipe, and nothing about the length of the render
+    would show the difference."""
+    frame = _mask_frame(name, 0.0, at=1.5, size=240)
+    line = frame[:, 120] if name.startswith("blinds") and "_v" not in name \
+        else frame[120, :]
+    assert _runs_of_incoming(line) == bands
+
+
+def test_the_families_only_name_real_transitions():
+    """The UI builds its menu from these, so a typo here is a menu entry that
+    fails at render time rather than at import."""
+    for _, items in FAMILIES:
+        for name in items:
+            assert name in TRANSITIONS, f"{name} is not a transition"
+
+
+def test_a_reel_actually_builds_with_a_feathered_mask(three_clips, tmp_path):
+    """End to end: the expression has to survive being embedded in a
+    filtergraph, quoted, alongside everything else build_reel does."""
+    out = str(tmp_path / "masked.mp4")
+    build_reel(three_clips, out, kind="iris_open", duration=0.6, feather=0.3,
+               log_fn=lambda *_: None)
+    assert os.path.exists(out) and os.path.getsize(out) > 0
