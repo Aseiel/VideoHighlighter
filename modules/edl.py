@@ -62,7 +62,8 @@ _TOP_KEYS = {
     "version", "title", "music", "music_mode", "music_volume",
     "width", "height", "fps", "crf", "cuts",
 }
-_CUT_KEYS = {"source", "in", "out", "transition", "transition_duration", "label"}
+_CUT_KEYS = {"source", "in", "out", "transition", "transition_duration",
+             "label", "text"}
 
 # Accepts S, S.s, M:SS, M:SS.s, H:MM:SS, H:MM:SS.s — and nothing else.
 _TIME = re.compile(r"^(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?)$")
@@ -134,6 +135,10 @@ class Cut:
     transition: str = "cut"
     transition_duration: float = 0.5
     label: str = ""
+    # Burnt into the picture for the length of this cut. Short-form video is
+    # mostly watched muted, so the opening line has to be readable rather than
+    # spoken — which makes this part of the edit, not a decoration on it.
+    text: str = ""
 
     @property
     def duration(self) -> float:
@@ -257,7 +262,8 @@ def parse_edl(data) -> Edl:
 
         cuts.append(Cut(source=str(source), start=start, end=end,
                         transition=kind, transition_duration=hold,
-                        label=str(entry.get("label", "") or "")))
+                        label=str(entry.get("label", "") or ""),
+                        text=str(entry.get("text", "") or "")))
 
     def _int(key):
         try:
@@ -349,6 +355,11 @@ def save_edl(edl: Edl, path: str) -> str:
                 lines.append(f"    transition_duration: {cut.transition_duration:g}")
         if cut.label:
             lines.append(f"    label: {cut.label}")
+        if cut.text:
+            # Quoted: a caption routinely contains a colon, which YAML would
+            # otherwise read as the start of a nested mapping.
+            escaped = cut.text.replace('"', '\\"')
+            lines.append(f'    text: "{escaped}"')
     text = "\n".join(lines) + "\n"
 
     if os.path.dirname(path):
@@ -492,7 +503,7 @@ def quantise_to_music(edl: Edl, analysis, *, unit: str = "bar",
                         transition=kind,
                         transition_duration=(hold or cut.transition_duration)
                         if kind != "cut" else cut.transition_duration,
-                        label=cut.label))
+                        label=cut.label, text=cut.text))
     if unblended:
         log_fn(f"✂️ {unblended} clip(s) had no room for the blend on top of a "
                f"bar and cut hard instead, to keep the grid")
@@ -576,10 +587,12 @@ def render_edl(edl: Edl, output: str, *, mode: str = "gpu",
         music = ({"path": edl.music, "mode": edl.music_mode,
                   "volume": edl.music_volume} if edl.music else None)
 
+        texts = {i: c.text for i, c in enumerate(edl.cuts) if c.text.strip()}
         return build_reel(pieces, output, transitions=transitions,
                           width=edl.width, height=edl.height, fps=edl.fps,
                           crf=edl.crf, music=music,
-                          music_optional=music_optional, log_fn=log_fn,
-                          progress_fn=progress_fn, cancel_check=cancel_check)
+                          music_optional=music_optional, texts=texts,
+                          log_fn=log_fn, progress_fn=progress_fn,
+                          cancel_check=cancel_check)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

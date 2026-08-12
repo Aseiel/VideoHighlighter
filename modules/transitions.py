@@ -276,6 +276,83 @@ def _filtergraph(transitions, durations, fps: int) -> tuple[str, str, float]:
     return ";".join(parts), "", acc
 
 
+def _font_file() -> str:
+    """A font drawtext can load, or "" when none is found.
+
+    Returned already escaped for a filter argument: on Windows the path
+    contains a drive colon, which ffmpeg's parser reads as the end of an
+    option value unless it is backslash-escaped, and the resulting error names
+    the font rather than the syntax.
+    """
+    candidates = [
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path.replace("\\", "/").replace(":", r"\:")
+    return ""
+
+
+def _escape_text(text: str) -> str:
+    """Escape a caption for drawtext's own mini-language.
+
+    Backslash first or it would double-escape what the later rules add. The
+    characters that matter are the ones that end an option (``:``), separate
+    filters (``,``) or quote a value — an apostrophe in "I didn't" is enough to
+    make ffmpeg fail with a syntax error about something else entirely.
+    """
+    out = text.replace("\\", r"\\\\")
+    for ch in (":", ",", "'", "%", "[", "]", ";"):
+        out = out.replace(ch, "\\" + ch)
+    return out.replace("\n", " ")
+
+
+def burn_text(src: str, dst: str, text: str, *, height: int,
+              position: str = "lower", log_fn=print) -> str:
+    """Burn ``text`` into ``src``, or copy it through when that is not possible.
+
+    Degrading to a copy is deliberate. A caption is worth a lot on a reel and
+    is still not worth failing a finished render for: no font on the machine,
+    or a string drawtext will not take, should cost the words rather than the
+    film.
+    """
+    font = _font_file()
+    if not text.strip() or not font:
+        if not text.strip():
+            shutil.copy2(src, dst)
+            return dst
+        log_fn("⚠️ No usable font found; on-screen text skipped")
+        shutil.copy2(src, dst)
+        return dst
+
+    size = max(18, int(height * 0.055))
+    pad = max(12, int(height * 0.03))
+    y = f"h-th-{pad * 3}" if position == "lower" else str(pad * 2)
+    graph = (
+        f"drawtext=fontfile='{font}':text='{_escape_text(text)}'"
+        f":fontcolor=white:fontsize={size}"
+        f":x=(w-tw)/2:y={y}"
+        f":box=1:boxcolor=black@0.55:boxborderw={max(6, size // 4)}"
+        f":line_spacing={max(4, size // 6)}"
+    )
+    result = subprocess.run(
+        [ffmpeg_exe(), "-y", "-v", "error", "-i", src, "-vf", graph,
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+         "-pix_fmt", "yuv420p", "-c:a", "copy", dst],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=900)
+    if result.returncode != 0 or not os.path.exists(dst):
+        tail = (result.stderr or "").strip().splitlines()[-1:] or ["unknown error"]
+        log_fn(f"⚠️ Could not draw text ({tail[0]}); the clip keeps its picture")
+        shutil.copy2(src, dst)
+    return dst
+
+
 def _join_run(paths: list[str], out: str, fps: int) -> str:
     """Join a run of hard-cut clips into one continuous file for xfade.
 
@@ -318,7 +395,8 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
                duration: float = DEFAULT_DURATION, width: int = 0,
                height: int = 0, fps: int = 0, crf: int = 20,
                preset: str = "medium", music=None, music_optional: bool = False,
-               log_fn=print, progress_fn=None, cancel_check=None) -> str:
+               texts=None, log_fn=print, progress_fn=None,
+               cancel_check=None) -> str:
     """Join ``clips`` into ``output`` with transitions between them.
 
     ``transitions`` is a list of :class:`Transition` (one per join); when it is
@@ -416,6 +494,15 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
             log_fn(f"⚙️ Normalizing {i + 1}/{len(valid)}: {os.path.basename(src)}")
             dst = os.path.join(temp_dir, f"n{i:03d}.mp4")
             _normalize(src, dst, width, height, fps, log_fn)
+            caption = (texts or {}).get(i, "") if texts else ""
+            if caption.strip():
+                # After normalising, so the text is drawn at delivery size and
+                # scales with it rather than being resized along with the
+                # picture.
+                lettered = os.path.join(temp_dir, f"t{i:03d}.mp4")
+                log_fn(f"🔤 Text on clip {i + 1}: {caption[:48]}")
+                dst = burn_text(dst, lettered, caption, height=height,
+                                log_fn=log_fn)
             normalized.append(dst)
 
         # Re-probe: normalising resamples to a constant frame rate, so the
