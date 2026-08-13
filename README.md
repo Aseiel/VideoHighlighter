@@ -47,8 +47,9 @@ and where each one falls down.
 ## Timeline Viewer
 ![Timeline Viewer](assets/TimelineViewer.png)
 
-## Action Recognition
-![Action Recognition](assets/power_rangers_actions_annotated.gif)
+## Demo
+
+https://github.com/user-attachments/assets/5c85af94-9228-4537-926a-1ed7a91fa5ee
 
 ## Workflow Stages
 ![Workflow Stages](assets/workflow_stages.png)
