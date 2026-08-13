@@ -63,7 +63,7 @@ _TOP_KEYS = {
     "width", "height", "fps", "crf", "fill", "cuts",
 }
 _CUT_KEYS = {"source", "in", "out", "transition", "transition_duration",
-             "easing", "feather", "label", "text"}
+             "easing", "feather", "motion", "label", "text"}
 
 # Accepts S, S.s, M:SS, M:SS.s, H:MM:SS, H:MM:SS.s — and nothing else.
 _TIME = re.compile(r"^(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?)$")
@@ -141,6 +141,9 @@ class Cut:
     # anything for a transition that has an edge — a wipe, an iris, blinds. 0
     # is the hard edge ffmpeg draws by default.
     feather: float = 0.0
+    # A move on the ends of this cut — a punch, a shake, a roll. Unlike a
+    # transition, which lives on the join, this belongs to the clip.
+    motion: str = "none"
     label: str = ""
     # Burnt into the picture for the length of this cut. Short-form video is
     # mostly watched muted, so the opening line has to be readable rather than
@@ -246,6 +249,7 @@ def parse_edl(data) -> Edl:
     if not raw_cuts:
         raise EdlError("a cut list needs at least one cut")
 
+    from modules.motion import normalise_motion
     from modules.transitions import normalise_feather, normalise_kind
 
     cuts: list[Cut] = []
@@ -292,10 +296,15 @@ def parse_edl(data) -> Edl:
         except ValueError as exc:
             raise EdlError(f"cut {i} ({source}): {exc}") from None
 
+        try:
+            move = normalise_motion(entry.get("motion", "none"))
+        except ValueError as exc:
+            raise EdlError(f"cut {i} ({source}): {exc}") from None
+
         cuts.append(Cut(source=str(source), start=start, end=end,
                         transition=kind, transition_duration=hold,
                         easing=str(entry.get("easing", "linear") or "linear"),
-                        feather=soft,
+                        feather=soft, motion=move,
                         label=str(entry.get("label", "") or ""),
                         text=str(entry.get("text", "") or "")))
 
@@ -393,6 +402,8 @@ def save_edl(edl: Edl, path: str) -> str:
                     lines.append(f"    easing: {cut.easing}")
                 if cut.feather:
                     lines.append(f"    feather: {cut.feather:g}")
+        if cut.motion and cut.motion != "none":
+            lines.append(f"    motion: {cut.motion}")
         if cut.label:
             lines.append(f"    label: {cut.label}")
         if cut.text:
@@ -675,7 +686,12 @@ def render_edl(edl: Edl, output: str, *, mode: str = "gpu",
                   "volume": edl.music_volume} if edl.music else None)
 
         texts = {i: c.text for i, c in enumerate(edl.cuts) if c.text.strip()}
+        # A motion belongs to a clip rather than to a join, so it is passed
+        # per index rather than as one setting for the reel.
+        motions = {i: c.motion for i, c in enumerate(edl.cuts)
+                   if c.motion and c.motion != "none"}
         built = build_reel(pieces, output, transitions=transitions,
+                           motions=motions or None,
                            width=edl.width, height=edl.height, fps=edl.fps,
                            crf=edl.crf, music=music,
                            music_optional=music_optional, texts=texts,

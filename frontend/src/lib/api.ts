@@ -636,6 +636,8 @@ export interface EdlCut {
   easing?: string
   /** How soft the transition's edge is, 0–1 of its length. */
   feather?: number
+  /** A move on the ends of this cut. */
+  motion?: string
   label?: string
   /** Burnt into the picture for this cut — short-form is watched muted, so
    *  the opening line is part of the edit. */
@@ -784,6 +786,8 @@ export interface ReelOptions {
   /** Grouped for a menu — wipes apart from shapes, and so on. */
   families?: { name: string; items: ReelTransition[] }[]
   easings?: string[]
+  /** Moves that can be put on the ends of a shot. */
+  motions?: { key: string; label: string }[]
   default_feather?: number
   /** Graphics that can be drawn over the finished reel. */
   overlays?: { key: string; label: string; needs_track: boolean }[]
@@ -808,6 +812,8 @@ export interface ReelRequest {
   easing?: string
   /** How soft the transition's edge is, 0–1 of its length. */
   feather?: number
+  /** A move on the ends of each shot — punch, pull, shake, roll, glitch. */
+  motion?: string
   /** Let shots start later than frame zero when the camera is still being
    *  placed at the top of a clip. */
   settle?: boolean

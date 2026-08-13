@@ -906,7 +906,8 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
                height: int = 0, fps: int = 0, crf: int = 20,
                preset: str = "medium", music=None, music_optional: bool = False,
                texts=None, fill: str = "pad", easing: str = DEFAULT_EASING,
-               feather: float = DEFAULT_FEATHER,
+               feather: float = DEFAULT_FEATHER, motion: str = "none",
+               motions=None,
                log_fn=print, progress_fn=None, cancel_check=None) -> str:
     """Join ``clips`` into ``output`` with transitions between them.
 
@@ -1021,6 +1022,17 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
                 _normalize_filled(src, dst, width, height, fps, log_fn)
             else:
                 _normalize(src, dst, width, height, fps, log_fn)
+            # A move on the ends of the clip, which is the half of a
+            # transition a mask cannot express — see modules.motion.
+            wanted = (motions or {}).get(i, motion) if motions else motion
+            if wanted and wanted != "none":
+                from modules.motion import apply_motion
+                moved = os.path.join(temp_dir, f"m{i:03d}.mp4")
+                dst = apply_motion(
+                    dst, moved, wanted, duration=_probe_duration(dst),
+                    width=width, height=height, fps=fps,
+                    head=i > 0, tail=i < len(valid) - 1, log_fn=log_fn)
+
             caption = (texts or {}).get(i, "") if texts else ""
             if caption.strip():
                 # After normalising, so the text is drawn at delivery size and

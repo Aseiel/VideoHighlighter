@@ -103,6 +103,16 @@ const prettyName = (key: string) =>
   TRANSITION_LABELS[key] ??
   key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase())
 
+// What each move does. These are not transitions — they happen on the ends of
+// a shot rather than on the join, so they stack with whatever the join is.
+const MOTION_HINTS: Record<string, string> = {
+  punch: "The frame grows into the cut and settles after it. The most useful one.",
+  pull: "The reverse — the frame is largest away from the cut and eases back.",
+  shake: "A short kick either side of the join. Good on a beat.",
+  roll: "A few degrees of tilt into the cut and out of it.",
+  glitch: "Shake with the colour channels split for the length of the move.",
+}
+
 // What each curve does, in the terms someone choosing one is thinking in.
 const EASING_HINTS: Record<string, string> = {
   linear: "Even throughout — what ffmpeg does unaided",
@@ -162,6 +172,8 @@ export function ReelTab({ running, onCancel, suggestedRoot }: Props) {
   const [transitionSeconds, setTransitionSeconds] = useState(0.35)
   const [easing, setEasing] = useState("ease_out")
   const [feather, setFeather] = useState(0)
+  // A move on the ends of each shot — the half of a transition a mask cannot do.
+  const [motion, setMotion] = useState("none")
   const [showEveryTransition, setShowEveryTransition] = useState(false)
   // Whether a shot may start later than the top of its clip.
   const [settle, setSettle] = useState(true)
@@ -207,6 +219,7 @@ export function ReelTab({ running, onCancel, suggestedRoot }: Props) {
       transition_duration: transitionSeconds,
       easing,
       feather: softenable ? feather : 0,
+      motion,
       settle,
       spread,
       track,
@@ -228,6 +241,7 @@ export function ReelTab({ running, onCancel, suggestedRoot }: Props) {
       easing,
       feather,
       softenable,
+      motion,
       settle,
       spread,
       track,
@@ -488,6 +502,28 @@ export function ReelTab({ running, onCancel, suggestedRoot }: Props) {
                   : (EASING_HINTS[easing] ?? "How the blend moves across its length.")}
               </p>
             </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Move on the cut</Label>
+            <Select value={motion} onValueChange={setMotion}>
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(options?.motions ?? [{ key: "none", label: "Still" }]).map((m) => (
+                  <SelectItem key={m.key} value={m.key}>
+                    {m.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="max-w-prose text-xs text-muted-foreground">
+              {motion === "none"
+                ? "Every transition above is a shape moving over two still pictures, which is why they can start to feel alike. This moves the picture itself on the ends of each shot."
+                : (MOTION_HINTS[motion] ??
+                  "Applied to the ends of each shot, so it stacks with the transition.")}
+            </p>
           </div>
 
           <div className="grid gap-4 md:grid-cols-2">

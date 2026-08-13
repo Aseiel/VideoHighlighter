@@ -688,6 +688,7 @@ async def list_transitions() -> dict:
                     set(TRANSITIONS) - set(CURATED)),
                 "curated": list(CURATED),
                 "easings": sorted(EASINGS),
+            "motions": _motion_options(),
                 "default_duration": DEFAULT_DURATION}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -815,6 +816,7 @@ async def render_edl_endpoint(req: EdlRenderRequest) -> dict:
                  "transition": c.transition,
                  "transition_duration": c.transition_duration,
                  "easing": c.easing, "feather": c.feather,
+                 "motion": c.motion,
                  "label": c.label, "text": c.text}
                 for c in edl.cuts
             ],
@@ -827,6 +829,15 @@ async def render_edl_endpoint(req: EdlRenderRequest) -> dict:
         return {"ok": False, "error": str(exc)}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
+
+
+def _motion_options() -> list:
+    """The moves that can be put on the ends of a clip, named for a menu."""
+    try:
+        from modules.motion import MOTION_LABELS, MOTIONS
+        return [{"key": k, "label": MOTION_LABELS.get(k, k)} for k in MOTIONS]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _overlay_options() -> list:
@@ -886,6 +897,7 @@ async def reel_options() -> dict:
                                     if n in TRANSITIONS]}
                          for name, items in FAMILIES],
             "easings": sorted(EASINGS),
+            "motions": _motion_options(),
             "default_feather": DEFAULT_FEATHER,
             "overlays": _overlay_options(),
         }
@@ -904,6 +916,8 @@ class ReelRequest(BaseModel):
     transition_duration: float | None = 0.25
     easing: str | None = "linear"
     feather: float | None = 0.0
+    # A move on the ends of each clip. See modules.motion.
+    motion: str | None = "none"
     # Whether shots may start later than frame zero when the camera is still
     # being placed at the top of a clip. See modules.shot_window.
     settle: bool | None = True
@@ -960,6 +974,7 @@ def _build_reel_edl(req: "ReelRequest"):
         transition_duration=float(req.transition_duration or 0.25),
         easing=req.easing or "linear",
         feather=float(req.feather or 0.0),
+        motion=req.motion or "none",
         settle=True if req.settle is None else bool(req.settle),
         spread=True if req.spread is None else bool(req.spread),
         track=req.track or "",
@@ -989,6 +1004,7 @@ async def reel_plan_endpoint(req: ReelRequest) -> dict:
                  "duration": c.duration, "transition": c.transition,
                  "transition_duration": c.transition_duration,
                  "easing": c.easing, "feather": c.feather,
+                 "motion": c.motion,
                  "label": c.label, "text": c.text}
                 for c in edl.cuts
             ],
@@ -1043,6 +1059,7 @@ async def reel_render(req: ReelRequest) -> dict:
                  "transition": c.transition,
                  "transition_duration": c.transition_duration,
                  "easing": c.easing, "feather": c.feather,
+                 "motion": c.motion,
                  "label": c.label, "text": c.text}
                 for c in edl.cuts
             ],
