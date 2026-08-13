@@ -785,6 +785,8 @@ export interface ReelOptions {
   families?: { name: string; items: ReelTransition[] }[]
   easings?: string[]
   default_feather?: number
+  /** Graphics that can be drawn over the finished reel. */
+  overlays?: { key: string; label: string; needs_track: boolean }[]
 }
 
 /** Pace bands and lengths, read from the planner so the UI cannot drift. */
@@ -812,8 +814,11 @@ export interface ReelRequest {
   /** Keep the reel off the same view twice: one shot per spot before any is
    *  reused, and never two near-identical pictures. */
   spread?: boolean
-  /** Optional GPX file, used to place clips whose own metadata has no GPS. */
+  /** Optional GPX file, used to place clips whose own metadata has no GPS,
+   *  and the series the graphics are drawn from. */
   track?: string
+  /** Graphics drawn over the finished reel. */
+  overlays?: string[]
   width?: number
   height?: number
   /** "crop" fills the frame (right for vertical), "pad" keeps the whole shot. */

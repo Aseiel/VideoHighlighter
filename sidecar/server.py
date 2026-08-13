@@ -829,6 +829,22 @@ async def render_edl_endpoint(req: EdlRenderRequest) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def _overlay_options() -> list:
+    """The graphics the renderer can draw, named for a menu.
+
+    Read off the renderer's own registry rather than listed here, so a UI
+    cannot offer something that no longer exists — the same reason the pace
+    bands and the transition names are served rather than copied.
+    """
+    try:
+        from modules.overlay import ELEMENTS
+        return [{"key": key, "label": getattr(cls, "label", key),
+                 "needs_track": key in ("elevation", "route", "readout")}
+                for key, cls in sorted(ELEMENTS.items())]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 @app.get("/reel/options")
 async def reel_options() -> dict:
     """Pace bands, lengths, story structure and the transition catalogue, so
@@ -871,6 +887,7 @@ async def reel_options() -> dict:
                          for name, items in FAMILIES],
             "easings": sorted(EASINGS),
             "default_feather": DEFAULT_FEATHER,
+            "overlays": _overlay_options(),
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -893,8 +910,11 @@ class ReelRequest(BaseModel):
     # Whether the reel avoids showing the same spot, or the same picture,
     # twice. See modules.shot_place and modules.shot_look.
     spread: bool | None = True
-    # A GPX file, for placing clips whose own metadata carries no GPS.
+    # A GPX file, for placing clips whose own metadata carries no GPS — and
+    # the series the graphics below are drawn from.
     track: str | None = ""
+    # Graphics drawn over the finished reel. See modules.overlay.
+    overlays: list | None = None
     width: int | None = 1080
     height: int | None = 1920
     fill: str | None = "crop"
@@ -1011,6 +1031,8 @@ async def reel_render(req: ReelRequest) -> dict:
         "kind": "edl",
         "output": output,
         "edl_path": edl_path,
+        "overlays": [str(o) for o in (req.overlays or [])],
+        "track": req.track or "",
         "edl": {
             "title": edl.title, "music": edl.music,
             "music_mode": edl.music_mode, "music_volume": edl.music_volume,

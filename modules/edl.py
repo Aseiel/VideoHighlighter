@@ -583,14 +583,59 @@ def validate_edl(edl: Edl) -> list[str]:
     return warnings
 
 
+def _draw_overlays(edl: Edl, built: str, overlays, track: str, temp_dir: str,
+                   *, log_fn=print, cancel_check=None) -> str:
+    """Draw the named graphics over a finished reel, in place.
+
+    Every failure costs the graphics and keeps the reel: the expensive work is
+    all behind us by this point, and throwing away a finished render because a
+    GPX file was malformed would be absurd.
+    """
+    try:
+        from modules.overlay import build_scene, burn_overlay, make_elements
+        from modules.shot_place import locate, read_track
+        from modules.video_probe import probe_video
+
+        gps = read_track(track, log_fn=log_fn) if track else None
+        places = locate([c.source for c in edl.cuts], track=gps, log_fn=log_fn)
+        # The delivery size and frame rate are whatever the build settled on,
+        # not what the cut list asked for — it may have left them at 0.
+        info = probe_video(built)
+        scene = build_scene(edl, gps, places,
+                            width=int(info.get("width") or 0),
+                            height=int(info.get("height") or 0))
+        elements = make_elements(overlays, scene, gps)
+        if not elements:
+            log_fn("⚠️ None of the graphics could be drawn from this footage")
+            return built
+
+        drawn = os.path.join(temp_dir, "overlaid.mp4")
+        burn_overlay(built, drawn, scene, elements,
+                     fps=int(round(float(info.get("fps") or 30))) or 30,
+                     log_fn=log_fn, cancel_check=cancel_check)
+        if os.path.exists(drawn) and os.path.getsize(drawn) > 0:
+            shutil.move(drawn, built)
+    except Exception as exc:  # noqa: BLE001
+        log_fn(f"⚠️ Could not draw the graphics ({exc}); "
+               f"the reel is finished without them")
+    return built
+
+
 def render_edl(edl: Edl, output: str, *, mode: str = "gpu",
-               music_optional: bool = False, log_fn=print,
-               progress_fn=None, cancel_check=None) -> str:
+               music_optional: bool = False, overlays=None, track: str = "",
+               log_fn=print, progress_fn=None, cancel_check=None) -> str:
     """Cut every entry from its source and join them into ``output``.
 
     The pieces are extracted into a temp directory and removed afterwards: an
     EDL render is reproducible from the cut list plus the sources, so keeping
     the intermediates costs disk for something that can always be rebuilt.
+
+    ``overlays`` names the graphics to draw over the finished reel (see
+    :mod:`modules.overlay`) and ``track`` is an optional GPX file they read
+    from. They are applied *after* the reel is assembled rather than per clip,
+    because their timing is expressed in reel seconds — an elevation profile
+    that fills as the reel plays has to know how long the reel turned out to
+    be, which is only settled once the transitions have taken their share.
     """
     if not edl.cuts:
         raise EdlError("nothing to render — the cut list is empty")
@@ -630,12 +675,16 @@ def render_edl(edl: Edl, output: str, *, mode: str = "gpu",
                   "volume": edl.music_volume} if edl.music else None)
 
         texts = {i: c.text for i, c in enumerate(edl.cuts) if c.text.strip()}
-        return build_reel(pieces, output, transitions=transitions,
-                          width=edl.width, height=edl.height, fps=edl.fps,
-                          crf=edl.crf, music=music,
-                          music_optional=music_optional, texts=texts,
-                          fill=edl.fill,
-                          log_fn=log_fn, progress_fn=progress_fn,
-                          cancel_check=cancel_check)
+        built = build_reel(pieces, output, transitions=transitions,
+                           width=edl.width, height=edl.height, fps=edl.fps,
+                           crf=edl.crf, music=music,
+                           music_optional=music_optional, texts=texts,
+                           fill=edl.fill,
+                           log_fn=log_fn, progress_fn=progress_fn,
+                           cancel_check=cancel_check)
+        if overlays:
+            built = _draw_overlays(edl, built, overlays, track, temp_dir,
+                                   log_fn=log_fn, cancel_check=cancel_check)
+        return built
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

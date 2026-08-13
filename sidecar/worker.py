@@ -484,6 +484,8 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
             )
             try:
                 out = render_edl(cut_list, job["output"], log_fn=log_fn,
+                                 overlays=job.get("overlays") or None,
+                                 track=job.get("track") or "",
                                  progress_fn=progress_fn,
                                  cancel_check=lambda: cancel_evt.is_set())
                 emit({"type": "finished", "output": out, "outputs": [out]})

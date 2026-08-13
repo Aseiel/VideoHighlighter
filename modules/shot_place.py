@@ -91,6 +91,11 @@ _ISO6709 = re.compile(r"^([+-]\d+(?:\.\d+)?)([+-]\d+(?:\.\d+)?)")
 
 EARTH_RADIUS = 6371000.0
 
+# Metres a climb has to accumulate to before it counts as one. Chosen against
+# a watch's own figure for the same route: 2 m gives 1030, 3 m gives 1007, 5 m
+# gives 945, against the 1012 the watch reported.
+CLIMB_THRESHOLD = 3.0
+
 
 @dataclass
 class Place:
@@ -110,16 +115,98 @@ class Place:
 
 @dataclass
 class Track:
-    """A GPS track: times and positions, in time order."""
+    """A GPS track: ``(time, latitude, longitude, elevation)`` in time order.
+
+    Elevation is carried because it is the one series a viewer recognises
+    instantly — an elevation profile *is* the shape of the route, and drawing
+    it is most of what :mod:`modules.overlay` exists for. It is the fourth
+    element rather than a parallel list so a point stays one thing.
+    """
     points: list = None
     path: str = ""
 
     def __post_init__(self):
         if self.points is None:
             self.points = []
+        self._distances = None
 
     def __bool__(self) -> bool:
         return bool(self.points)
+
+    @property
+    def elevations(self) -> list:
+        """Metres above sea level at each point, 0 where the file had none."""
+        return [(p[3] if len(p) > 3 and p[3] is not None else 0.0)
+                for p in self.points]
+
+    @property
+    def distances(self) -> list:
+        """Metres travelled by each point, cumulative from the start.
+
+        Computed once and kept: a four-hour track is fifteen thousand points
+        and every overlay frame asks for this.
+        """
+        if self._distances is None:
+            running = 0.0
+            out = [0.0]
+            for a, b in zip(self.points, self.points[1:]):
+                running += _haversine(a[1], a[2], b[1], b[2])
+                out.append(running)
+            self._distances = out
+        return self._distances
+
+    @property
+    def length(self) -> float:
+        """How far the route runs, in metres."""
+        return self.distances[-1] if self.points else 0.0
+
+    @property
+    def climb(self) -> float:
+        """Total ascent in metres.
+
+        Accumulated with hysteresis rather than by summing every positive
+        step, because a barometer standing still still wanders by centimetres
+        and a track sampled once a second has fifteen thousand chances to add
+        that up. Summing raw positives gives 1281 m on a route the watch
+        recorded as 1012; discarding steps under a metre individually gives 3,
+        since at one hertz almost every step *is* under a metre. Banking the
+        run only once it clears :data:`CLIMB_THRESHOLD` gives 1007.
+        """
+        total = 0.0
+        running = 0.0
+        heights = self.elevations
+        for a, b in zip(heights, heights[1:]):
+            running += b - a
+            if running >= CLIMB_THRESHOLD:
+                total += running
+                running = 0.0
+            elif running < 0:
+                running = 0.0
+        return total
+
+    def index_at(self, when: dt.datetime,
+                 tolerance: float = TRACK_TOLERANCE_SECONDS):
+        """Which point is nearest ``when``, or None when out of range."""
+        if not self.points or when is None:
+            return None
+        when = _as_utc(when)
+        best = min(range(len(self.points)),
+                   key=lambda i: abs((self.points[i][0] - when).total_seconds()))
+        if abs((self.points[best][0] - when).total_seconds()) > tolerance:
+            return None
+        return best
+
+    def progress_at(self, when: dt.datetime) -> float:
+        """How far into the route ``when`` falls, 0..1 by *distance*.
+
+        Distance rather than time, because a route is a shape rather than a
+        schedule: an hour spent climbing one hill should not put the marker
+        halfway along a profile it barely moved through.
+        """
+        index = self.index_at(when)
+        if index is None or self.length <= 0:
+            return 0.0
+        return self.distances[index] / self.length
 
     def at(self, when: dt.datetime,
            tolerance: float = TRACK_TOLERANCE_SECONDS):
@@ -146,16 +233,21 @@ def _as_utc(when: dt.datetime) -> dt.datetime:
     return when.astimezone(dt.timezone.utc)
 
 
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Metres between two coordinates."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    h = (math.sin(dp / 2) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
+    return 2 * EARTH_RADIUS * math.asin(math.sqrt(min(1.0, h)))
+
+
 def distance(a: Place, b: Place) -> float:
     """Metres between two located places, or ``inf`` when either is not."""
     if not (a.located and b.located):
         return float("inf")
-    p1, p2 = math.radians(a.latitude), math.radians(b.latitude)
-    dp = p2 - p1
-    dl = math.radians(b.longitude - a.longitude)
-    h = (math.sin(dp / 2) ** 2
-         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2)
-    return 2 * EARTH_RADIUS * math.asin(math.sqrt(min(1.0, h)))
+    return _haversine(a.latitude, a.longitude, b.latitude, b.longitude)
 
 
 def read_track(path: str, *, log_fn=print) -> Track:
@@ -183,13 +275,21 @@ def read_track(path: str, *, log_fn=print) -> Track:
                 latitude = element.get("lat")
                 longitude = element.get("lon")
                 stamp = None
+                height = None
                 for child in element:
-                    if child.tag.rsplit("}", 1)[-1] == "time":
+                    name = child.tag.rsplit("}", 1)[-1]
+                    if name == "time":
                         stamp = (child.text or "").strip()
+                    elif name == "ele":
+                        try:
+                            height = float((child.text or "").strip())
+                        except ValueError:
+                            height = None
                 if stamp and latitude and longitude:
                     when = _parse_iso(stamp)
                     if when is not None:
-                        points.append((when, float(latitude), float(longitude)))
+                        points.append((when, float(latitude), float(longitude),
+                                       height))
                 element.clear()
         points.sort(key=lambda p: p[0])
         track.points = points

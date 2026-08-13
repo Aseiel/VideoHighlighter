@@ -20,6 +20,7 @@ import {
   MapPin,
   Scissors,
   Shapes,
+  Spline,
   Type,
 } from "lucide-react"
 
@@ -29,6 +30,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
 import {
@@ -166,6 +168,8 @@ export function ReelTab({ running, onCancel, suggestedRoot }: Props) {
   // Whether the reel avoids showing the same spot, or the same picture, twice.
   const [spread, setSpread] = useState(true)
   const [track, setTrack] = useState("")
+  // Graphics drawn over the finished reel.
+  const [overlays, setOverlays] = useState<string[]>([])
 
   useEffect(() => {
     void getReelOptions().then((r) => {
@@ -206,6 +210,7 @@ export function ReelTab({ running, onCancel, suggestedRoot }: Props) {
       settle,
       spread,
       track,
+      overlays,
       width: SHAPES[shape].width,
       height: SHAPES[shape].height,
       fill: SHAPES[shape].fill,
@@ -226,6 +231,7 @@ export function ReelTab({ running, onCancel, suggestedRoot }: Props) {
       settle,
       spread,
       track,
+      overlays,
     ],
   )
 
@@ -614,6 +620,46 @@ export function ReelTab({ running, onCancel, suggestedRoot }: Props) {
             <p className="text-xs text-muted-foreground">
               Only needed when your clips have no GPS of their own — the reel
               still spreads across the shoot without one, using the times.
+              A track also draws the graphics below.
+            </p>
+          </div>
+
+          <Separator />
+
+          <div className="space-y-2">
+            <Label className="flex items-center gap-1.5 text-xs">
+              <Spline className="size-3.5" /> Graphics
+            </Label>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {(options?.overlays ?? []).map((item) => {
+                const blocked = item.needs_track && !track
+                return (
+                  <label
+                    key={item.key}
+                    className={`flex items-center gap-2 text-xs ${
+                      blocked ? "opacity-50" : "cursor-pointer"
+                    }`}
+                    title={blocked ? "Needs a GPS track" : undefined}
+                  >
+                    <Checkbox
+                      checked={overlays.includes(item.key)}
+                      disabled={blocked}
+                      onCheckedChange={(on) =>
+                        setOverlays((current) =>
+                          on
+                            ? [...current, item.key]
+                            : current.filter((k) => k !== item.key),
+                        )
+                      }
+                    />
+                    {item.label}
+                  </label>
+                )
+              })}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Drawn over the finished reel. The profile and the route come from
+              the track, and the marker jumps to wherever each shot was filmed.
             </p>
           </div>
         </CardContent>
