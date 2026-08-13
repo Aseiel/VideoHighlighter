@@ -652,6 +652,118 @@ def _normalize_filled(src: str, dst: str, width: int, height: int, fps: int,
         raise RuntimeError(f"Normalization failed for {os.path.basename(src)}: {err}")
 
 
+def _font_path() -> str:
+    """A bold sans on this machine, or "" — the raw path.
+
+    Kept separate from the escaped form because the fitting below has to hand
+    it to a font library, which wants the path as the filesystem spells it.
+    """
+    for path in (
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ):
+        if os.path.exists(path):
+            return path
+    return ""
+
+
+def _escape_path(path: str) -> str:
+    """A path drawtext will accept as an option value. On Windows it contains
+    a drive colon, which ffmpeg's parser reads as the end of the value unless
+    it is backslash-escaped — and the resulting error names the font rather
+    than the syntax."""
+    return path.replace("\\", "/").replace(":", r"\:")
+
+
+# Share of the frame width a caption may occupy. Short-form is watched on a
+# phone held at arm's length; text running to the very edge reads as broken
+# even when every glyph is on screen.
+TEXT_WIDTH = 0.86
+
+# Lines a caption may wrap to before it is shrunk instead. Four lines of a
+# hook is already more reading than anybody does in two seconds.
+TEXT_LINES = 3
+
+
+def fit_caption(text: str, width: int, height: int,
+                font_path: str = "") -> tuple[list, int]:
+    """Wrap ``text`` to the frame and pick a size for it: (lines, points).
+
+    drawtext has no notion of a text box. It draws one line at whatever size
+    it is given and centres it, so a caption wider than the frame simply hangs
+    off both sides — which is what "21 clips. One morning." did at 105 points
+    on a 1080-wide reel, losing a word at each end of every render.
+
+    Measured with a real font rather than by counting characters: proportional
+    glyphs vary by a factor of four between an 'i' and a 'W', so a character
+    count either wraps far too early on narrow text or not at all on wide.
+    Falls back to a conservative estimate when no font library is available,
+    because a caption that wraps a little early is a great deal better than one
+    that runs off the screen.
+    """
+    words = " ".join((text or "").split())
+    if not words:
+        return [], 0
+
+    limit = max(1.0, width * TEXT_WIDTH)
+    size = max(18, int(height * 0.055))
+    measure = _measurer(font_path)
+
+    while size >= 16:
+        lines = _wrap(words, limit, size, measure)
+        if len(lines) <= TEXT_LINES and all(
+                measure(line, size) <= limit for line in lines):
+            return lines, size
+        size = int(size * 0.92)
+    return _wrap(words, limit, 16, measure), 16
+
+
+def _measurer(font_path: str):
+    """A function giving the rendered width of a string at a size, in pixels."""
+    try:
+        from PIL import ImageFont
+
+        cache: dict = {}
+
+        def measure(line: str, size: int) -> float:
+            font = cache.get(size)
+            if font is None:
+                font = ImageFont.truetype(font_path, size)
+                cache[size] = font
+            return float(font.getlength(line))
+
+        if font_path:
+            measure("M", 20)     # fail here rather than mid-wrap
+            return measure
+    except Exception:
+        pass
+    # No font library, or a font it will not open. 0.58 em per character is a
+    # deliberate over-estimate for a bold sans, so this wraps early rather
+    # than late.
+    return lambda line, size: len(line) * size * 0.58
+
+
+def _wrap(words: str, limit: float, size: int, measure) -> list:
+    """Greedy word wrap. A single word too wide for the frame is left on its
+    own line, where the caller's shrink loop deals with it."""
+    lines: list[str] = []
+    current = ""
+    for word in words.split(" "):
+        candidate = f"{current} {word}".strip()
+        if current and measure(candidate, size) > limit:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
 def _font_file() -> str:
     """A font drawtext can load, or "" when none is found.
 
@@ -685,10 +797,14 @@ def _escape_text(text: str) -> str:
     out = text.replace("\\", r"\\\\")
     for ch in (":", ",", "'", "%", "[", "]", ";"):
         out = out.replace(ch, "\\" + ch)
-    return out.replace("\n", " ")
+    # Newlines survive: they are how a wrapped caption gets its line breaks,
+    # and drawtext reads a literal one in the value as exactly that.
+    # Collapsing them to spaces — which this used to do — undoes the wrapping
+    # and puts the caption back off the side of the frame.
+    return out
 
 
-def burn_text(src: str, dst: str, text: str, *, height: int,
+def burn_text(src: str, dst: str, text: str, *, height: int, width: int = 0,
               position: str = "lower", log_fn=print) -> str:
     """Burn ``text`` into ``src``, or copy it through when that is not possible.
 
@@ -696,9 +812,13 @@ def burn_text(src: str, dst: str, text: str, *, height: int,
     is still not worth failing a finished render for: no font on the machine,
     or a string drawtext will not take, should cost the words rather than the
     film.
+
+    The caption is wrapped and sized to fit ``width`` — see :func:`fit_caption`
+    for why that cannot be left to drawtext, which has no text box and will
+    happily draw a line twice as wide as the frame.
     """
-    font = _font_file()
-    if not text.strip() or not font:
+    raw_font = _font_path()
+    if not text.strip() or not raw_font:
         if not text.strip():
             shutil.copy2(src, dst)
             return dst
@@ -706,11 +826,25 @@ def burn_text(src: str, dst: str, text: str, *, height: int,
         shutil.copy2(src, dst)
         return dst
 
-    size = max(18, int(height * 0.055))
+    font = _escape_path(raw_font)
+    if not width:
+        # Nothing was said about the frame, so assume the narrow case rather
+        # than the wide one: guessing 16:9 on a vertical reel is how the text
+        # ran off the screen in the first place.
+        width = int(height * 9 / 16)
+    lines, size = fit_caption(text, width, height, raw_font)
+    if not lines:
+        shutil.copy2(src, dst)
+        return dst
+    if len(lines) > 1:
+        log_fn(f"🔤 Caption wrapped to {len(lines)} lines at {size}px to fit "
+               f"{width}px")
+
     pad = max(12, int(height * 0.03))
     y = f"h-th-{pad * 3}" if position == "lower" else str(pad * 2)
+    drawn = "\n".join(lines)
     graph = (
-        f"drawtext=fontfile='{font}':text='{_escape_text(text)}'"
+        f"drawtext=fontfile='{font}':text='{_escape_text(drawn)}'"
         f":fontcolor=white:fontsize={size}"
         f":x=(w-tw)/2:y={y}"
         f":box=1:boxcolor=black@0.55:boxborderw={max(6, size // 4)}"
@@ -895,7 +1029,7 @@ def build_reel(clips, output, *, transitions=None, kind: str = "crossfade",
                 lettered = os.path.join(temp_dir, f"t{i:03d}.mp4")
                 log_fn(f"🔤 Text on clip {i + 1}: {caption[:48]}")
                 dst = burn_text(dst, lettered, caption, height=height,
-                                log_fn=log_fn)
+                                width=width, log_fn=log_fn)
             normalized.append(dst)
 
         # Re-probe: normalising resamples to a constant frame rate, so the

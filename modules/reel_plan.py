@@ -289,6 +289,43 @@ def _sections_for(duration: float, pace: Pace, structure=STRUCTURE,
     return plan
 
 
+def _footage_for(duration: float, pace: Pace, structure, unit: float,
+                 transition: str, transition_duration: float) -> float:
+    """How much *footage* a reel needs to run for ``duration`` on screen.
+
+    Every transition overlaps the two shots it joins, so the reel is shorter
+    than the sum of its parts by the total of every overlap. Planning straight
+    to the requested number therefore delivers something visibly shorter — a
+    24-second request with eleven 0.4-second joins came out at 19.8, and the
+    cut list said so in its header while the planner carried on as though it
+    had not.
+
+    Solved by iteration rather than algebra because the shot count depends on
+    the target and the overlap depends on the shot count. Three passes is
+    plenty: each one moves the answer by the difference the last one left, and
+    the sequence converges immediately for any sane transition length.
+    """
+    if transition == "cut" or transition_duration <= 0:
+        return duration
+
+    target = duration
+    for _ in range(3):
+        lengths: list[float] = []
+        for section, length, count in _sections_for(target, pace, structure, unit):
+            lengths.extend([length] * count)
+        if len(lengths) < 2:
+            return duration
+        # The same clamp modules.transitions applies: a transition may not eat
+        # more than a third of either shot it sits between.
+        absorbed = sum(min(transition_duration, min(a, b) / 3.0)
+                       for a, b in zip(lengths, lengths[1:]))
+        moved = duration + absorbed
+        if abs(moved - target) < 0.05:
+            return moved
+        target = moved
+    return target
+
+
 def _pick(sources: list[_Source], want: float, *, allow_reuse: bool,
           prefers: tuple = (), avoid_kind: str = "",
           place_use: dict = None, avoid_place: int = None,
@@ -518,6 +555,14 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
         log_fn(f"🎼 Snapping shots to {unit:.2f}s "
                f"({'beat' if unit < 2.0 else 'bar'})")
 
+    # Plan enough footage that the reel runs for as long as was asked *after*
+    # the transitions have taken their share of it.
+    footage = _footage_for(duration, band, structure, unit,
+                           transition, transition_duration)
+    if footage > duration + 0.05:
+        log_fn(f"⏱️ Planning {footage:.1f}s of footage so the reel runs "
+               f"{duration:.0f}s once the transitions overlap")
+
     shots: list[Shot] = []
     # How many shots the reel has already taken from each spot. The first key
     # _pick ranks on, so every place is visited once before any is repeated.
@@ -525,7 +570,7 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
     last_place: int | None = None
     used_looks: list = []
 
-    for section, target, count in _sections_for(duration, band, structure, unit):
+    for section, target, count in _sections_for(footage, band, structure, unit):
         for n in range(count):
             is_hook = section.name == "Hook" and n == 0
             candidates = [hook] if is_hook else rest
@@ -602,6 +647,12 @@ def plan_reel(sources, *, duration: float = 24.0, pace: str = DEFAULT_PACE,
         log_fn(f"⚠️ {duration:.0f}s is shorter than a {band.label.lower()} "
                f"story fits into ({reel.duration:.0f}s is the least it can be)"
                + (f" — try the {PACES[faster].label.lower()} pace" if faster else ""))
+    elif reel.duration < duration * 0.9:
+        # The other direction, and a different cause: the structure fitted, the
+        # footage did not. Worth naming because the fix is more clips rather
+        # than a different setting.
+        log_fn(f"⚠️ Came up short at {reel.duration:.0f}s of the {duration:.0f}s "
+               f"asked for — there is not enough usable footage to fill it")
     return reel
 
 

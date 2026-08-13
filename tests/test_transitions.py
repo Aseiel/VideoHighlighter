@@ -36,6 +36,7 @@ from modules.transitions import (
     ReelCancelled,
     Transition,
     build_reel,
+    burn_text,
     duration_for_bars,
     normalise_kind,
     plan_transitions,
@@ -684,3 +685,113 @@ def test_a_reel_actually_builds_with_a_feathered_mask(three_clips, tmp_path):
     build_reel(three_clips, out, kind="iris_open", duration=0.6, feather=0.3,
                log_fn=lambda *_: None)
     assert os.path.exists(out) and os.path.getsize(out) > 0
+
+
+# --- Captions that fit ------------------------------------------------------
+
+def test_a_long_caption_is_wrapped_rather_than_run_off_the_frame():
+    """drawtext has no text box: it draws one line at the size it is given and
+    centres it, so a caption wider than the frame hangs off both sides. On a
+    1080-wide reel at the default size that starts at about twelve
+    characters, which is shorter than any real hook."""
+    from modules.transitions import TEXT_LINES, TEXT_WIDTH, fit_caption
+
+    lines, size = fit_caption("21 clips. One morning.", 1080, 1920,
+                              _font_or_skip())
+
+    assert len(lines) > 1, "this is too wide for one line at the default size"
+    assert len(lines) <= TEXT_LINES
+    assert _widest(lines, size) <= 1080 * TEXT_WIDTH
+
+
+def test_a_short_caption_is_left_on_one_line():
+    from modules.transitions import fit_caption
+
+    lines, _ = fit_caption("One morning.", 1080, 1920, _font_or_skip())
+
+    assert lines == ["One morning."]
+
+
+def test_a_word_too_wide_to_wrap_is_shrunk_instead():
+    """Wrapping cannot help a single long word, so the size has to give."""
+    from modules.transitions import TEXT_WIDTH, fit_caption
+
+    word = "Supercalifragilisticexpialidocious"
+    lines, size = fit_caption(word, 1080, 1920, _font_or_skip())
+    _, plain = fit_caption("Hi", 1080, 1920, _font_or_skip())
+
+    assert lines == [word]
+    assert size < plain
+    assert _widest(lines, size) <= 1080 * TEXT_WIDTH
+
+
+def test_fitting_survives_having_no_font_library():
+    """The fallback estimate must wrap early rather than late — a caption a
+    little narrower than it could be is invisible, and one that overflows is
+    not."""
+    from modules.transitions import TEXT_WIDTH, fit_caption
+
+    lines, size = fit_caption("21 clips. One morning.", 1080, 1920, "")
+
+    assert lines and len(lines) > 1
+    assert max(len(line) for line in lines) * size * 0.58 <= 1080 * TEXT_WIDTH
+
+
+def test_an_empty_caption_asks_for_nothing():
+    from modules.transitions import fit_caption
+
+    assert fit_caption("", 1080, 1920, "") == ([], 0)
+    assert fit_caption("   ", 1080, 1920, "") == ([], 0)
+
+
+def test_line_breaks_survive_escaping():
+    """The wrapping is expressed as newlines, and _escape_text used to
+    collapse them to spaces — which put the caption straight back off the
+    side of the frame."""
+    from modules.transitions import _escape_text
+
+    assert "\n" in _escape_text("two\nlines")
+
+
+def _font_or_skip() -> str:
+    from modules.transitions import _font_path
+
+    path = _font_path()
+    if not path:
+        pytest.skip("no font on this machine")
+    return path
+
+
+def _widest(lines, size) -> float:
+    from PIL import ImageFont
+
+    font = ImageFont.truetype(_font_or_skip(), size)
+    return max(font.getlength(line) for line in lines)
+
+
+def test_a_caption_stays_inside_the_frame_when_rendered(tmp_path):
+    """The end-to-end version: burn a caption that used to overflow and check
+    no lit pixel reaches the edge of the picture."""
+    import numpy as np
+
+    src = str(tmp_path / "src.mp4")
+    subprocess.run(
+        [FFMPEG, "-y", "-v", "error", "-f", "lavfi",
+         "-i", "color=c=black:s=1080x1920:r=30:d=1",
+         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+         "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+         src], check=True, capture_output=True)
+
+    out = str(tmp_path / "lettered.mp4")
+    burn_text(src, out, "21 clips. One morning.", height=1920, width=1080,
+              log_fn=lambda *_: None)
+
+    raw = str(tmp_path / "frame.gray")
+    subprocess.run([FFMPEG, "-y", "-v", "error", "-i", out, "-frames:v", "1",
+                    "-f", "rawvideo", "-pix_fmt", "gray", raw],
+                   check=True, capture_output=True)
+    frame = np.frombuffer(open(raw, "rb").read(), dtype=np.uint8).reshape(1920, 1080)
+
+    assert frame.max() > 200, "no caption was drawn at all"
+    edges = np.concatenate([frame[:, :4], frame[:, -4:]], axis=1)
+    assert int((edges > 200).sum()) == 0, "the caption reaches the frame edge"

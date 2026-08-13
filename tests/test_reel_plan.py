@@ -593,3 +593,25 @@ def test_spreading_costs_a_sweep_rather_than_the_order(clips):
     runs.append(current)
     for run in runs:
         assert run == sorted(run), f"a sweep runs backwards: {run}"
+
+
+def test_the_reel_runs_for_as_long_as_was_asked_with_transitions(clips):
+    """Every transition overlaps the two shots it joins, so planning straight
+    to the requested number delivers something visibly shorter — a 24-second
+    request with eleven 0.4s joins came out at 19.8. The footage target has to
+    carry the overlap."""
+    for kind, held in (("cut", 0.0), ("iris_open", 0.4), ("crossfade", 0.8)):
+        reel = plan_reel(clips, duration=24, pace="energetic", classify=False,
+                         settle=False, transition=kind,
+                         transition_duration=held, log_fn=lambda *_: None)
+
+        assert reel.duration == pytest.approx(24, rel=0.12), (
+            f"{kind} at {held}s came out at {reel.duration:.1f}s")
+
+
+def test_a_blended_reel_needs_more_footage_than_it_runs(clips):
+    reel = plan_reel(clips, duration=24, pace="energetic", classify=False,
+                     settle=False, transition="crossfade",
+                     transition_duration=0.6, log_fn=lambda *_: None)
+
+    assert reel.source_duration > reel.duration + 1.0

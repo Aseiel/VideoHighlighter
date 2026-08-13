@@ -179,9 +179,26 @@ class Edl:
         Every transition overlaps two clips, so the reel is shorter than the
         sum of its cuts. Reporting the sum instead is how a 90-second target
         quietly delivers 84.
+
+        The overlap is the *clamped* length, not the requested one, because
+        that is what the renderer will use: a transition may not eat more than
+        a third of either cut it joins, and one shorter than a couple of frames
+        degrades to a hard cut with no overlap at all. Subtracting the raw
+        request instead reports a two-second dissolve between two one-second
+        shots as taking two seconds out of the reel, when the renderer will
+        only ever take a third of a second — which made a reel of long
+        transitions read as several seconds shorter than it renders.
         """
-        overlap = sum(c.transition_duration for c in self.cuts[:-1]
-                      if c.transition != "cut")
+        from modules.transitions import MAX_CLIP_FRACTION, MIN_DURATION
+
+        overlap = 0.0
+        for cut, following in zip(self.cuts, self.cuts[1:]):
+            if cut.transition == "cut":
+                continue
+            room = min(cut.duration, following.duration) * MAX_CLIP_FRACTION
+            held = min(float(cut.transition_duration), room)
+            if held >= MIN_DURATION:
+                overlap += held
         return max(0.0, self.source_duration - overlap)
 
 

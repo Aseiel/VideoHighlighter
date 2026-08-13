@@ -613,3 +613,35 @@ def test_an_unknown_unit_is_refused():
     with pytest.raises(EdlError, match="unknown quantise unit"):
         quantise_to_music(Edl(cuts=[Cut("a.mp4", 0, 4)]), _Analysis(120),
                           unit="phrase", log_fn=lambda *_: None)
+
+
+def test_duration_uses_the_transition_length_that_will_actually_be_used():
+    """A transition may not eat more than a third of either cut it joins, and
+    the renderer clamps it. Reporting the raw request instead says a 2s
+    dissolve between two 1s shots takes 2s out of the reel, when only a third
+    of a second will ever be taken — which made a reel of long transitions
+    read as seconds shorter than it renders."""
+    from modules.edl import Cut, Edl
+
+    edl = Edl(cuts=[
+        Cut(source="a.mp4", start=0, end=1.0, transition="crossfade",
+            transition_duration=2.0),
+        Cut(source="b.mp4", start=0, end=1.0, transition="cut"),
+    ])
+
+    # 2s of footage, and the overlap is clamped to a third of a 1s shot.
+    assert edl.duration == pytest.approx(2.0 - 1.0 / 3.0, abs=0.01)
+
+
+def test_a_transition_too_short_to_render_takes_no_time():
+    """Below a couple of frames it degrades to a hard cut, so it cannot also
+    be subtracted from the running time."""
+    from modules.edl import Cut, Edl
+
+    edl = Edl(cuts=[
+        Cut(source="a.mp4", start=0, end=2.0, transition="crossfade",
+            transition_duration=0.001),
+        Cut(source="b.mp4", start=0, end=2.0, transition="cut"),
+    ])
+
+    assert edl.duration == pytest.approx(4.0, abs=0.01)
