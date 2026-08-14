@@ -3252,7 +3252,7 @@ class VideoHighlighterGUI(QWidget):
         legal_group = QGroupBox("Legal")
         legal_layout = QVBoxLayout(legal_group)
         legal = QLabel(
-            "© 2026 Przemysław Kreft and contributors.<br>"
+            "© 2026 Przemysław Kreft and Meric Donmezer.<br>"
             "VideoHighlighter is free software licensed under the "
             f'<a href="{REPO_URL}/blob/main/LICENSE">GNU AGPLv3</a>. '
             f'Contributions are accepted under a <a href="{REPO_URL}/blob/main/CLA.md">CLA</a>.<br>'
