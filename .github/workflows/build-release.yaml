@@ -245,8 +245,28 @@ jobs:
           name: mac-build
           path: VideoHighlighter-${{ needs.version.outputs.slug }}.dmg
 
+  bootstrap:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build Windows bootstrap zip
+        run: |
+          python tools/build_bootstrap_zip.py \
+            --edition free \
+            --tag "${{ needs.version.outputs.slug }}" \
+            --out packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
+      - name: Upload bootstrap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-zip
+          path: packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
+
   release:
-    needs: [version, build-windows, build-mac]
+    needs: [version, build-windows, build-mac, bootstrap]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -257,5 +277,16 @@ jobs:
           tag: ${{ needs.version.outputs.slug }}
           name: VideoHighlighter ${{ needs.version.outputs.slug }}
           draft: true
-          artifacts: "windows-build/*,mac-build/*"
+          body: |
+            ## Windows — recommended
+
+            Download **`VideoHighlighter-Windows-Setup.zip`** (first asset below),
+            extract it anywhere, and double-click **`Install-VideoHighlighter.bat`**.
+            The script fetches both archive parts and unpacks them automatically.
+
+            **Manual:** grab both `VideoHighlighter-Windows-*.7z.001` and `.002`,
+            same folder, extract the `.001` with 7-Zip.
+
+            **macOS:** `.dmg` only.
+          artifacts: "windows-build/*,mac-build/*,bootstrap-zip/*"
           token: ${{ secrets.GITHUB_TOKEN }}

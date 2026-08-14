@@ -79,9 +79,15 @@ This edition remains free and AGPL-3.0 licensed.
 ## Installation
 
 ### Windows (recommended)
-Download the latest `.exe` from [Releases](https://github.com/Aseiel/VideoHighlighter/releases) — no Python or dependencies required.
+1. **One-click:** download [`VideoHighlighter-Windows-Setup.zip`](https://github.com/Aseiel/VideoHighlighter/releases/latest/download/VideoHighlighter-Windows-Setup.zip) from [Releases](https://github.com/Aseiel/VideoHighlighter/releases), extract it, and double-click **`Install-VideoHighlighter.bat`**. It downloads both archive parts and unpacks them (~4 GB download).
+2. **Manual:** download **both** `VideoHighlighter-Windows-*.7z.001` and `.7z.002` into the same folder, then extract the `.001` file with [7-Zip](https://www.7-zip.org/).
 
-### Linux / Building from Source
+No Python or dependencies required — run `VideoHighlighter.exe` inside the extracted folder.
+
+### macOS
+Download the `.dmg` from [Releases](https://github.com/Aseiel/VideoHighlighter/releases).
+
+### Linux / building from source
 1. **Python & FFmpeg**
    FFmpeg must be installed and available in your system PATH.
 
