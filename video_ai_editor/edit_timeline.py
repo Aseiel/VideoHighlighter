@@ -501,6 +501,10 @@ class EditClipItem(QGraphicsRectItem):
                     pix = scene.thumb_cache.request(
                         source_time, HOVER_PREVIEW_HEIGHT, priority=PRIORITY_HOVER
                     )
+                    # Remember a miss, so the frame can be delivered when it
+                    # decodes rather than only on the next mouse move — see
+                    # EditTimelineScene._deliver_hover_frame.
+                    scene._hover_wanted = None if pix is not None else source_time
                     scene._hover_preview.show_at(
                         event.screenPos(),
                         pix,
@@ -517,6 +521,9 @@ class EditClipItem(QGraphicsRectItem):
         if scene is not None:
             scene._hide_cut_indicator()
             scene._hover_source_time = None
+            # Nothing is waiting on a frame once the popup is gone; a stale
+            # want would otherwise repaint a hidden popup on the next arrival.
+            scene._hover_wanted = None
             if hasattr(scene, '_hover_preview') and scene._hover_preview is not None:
                 scene._hover_preview.hide_preview()
 
@@ -561,6 +568,9 @@ class EditTimelineScene(QGraphicsScene):
         except Exception as e:
             print(f"⚠️ HoverPreview init failed: {e}")
             self._hover_preview = None
+        # Source time the popup is showing "loading…" for, or None when it has
+        # its frame. Read by _deliver_hover_frame.
+        self._hover_wanted = None
 
         # Visual feedback for drop target
         self.drop_indicator = None
@@ -604,6 +614,39 @@ class EditTimelineScene(QGraphicsScene):
                 continue
             if item.start_time <= time_seconds <= item.end_time:
                 item.update()
+
+        self._deliver_hover_frame(height)
+
+    def _deliver_hover_frame(self, height):
+        """Hand a just-arrived frame to the hover popup if it is waiting for one.
+
+        Without this the popup is only ever updated by mouse movement, so a
+        cursor resting on a clip whose frame had not been decoded yet stayed on
+        "loading…" for as long as it was held still. Hovering elsewhere and
+        coming back appeared to fix it, but only because that second request
+        found the frame in the cache.
+
+        The wanted frame is re-requested rather than compared against the
+        `time_seconds` just emitted: the cache buckets times into 100ms keys and
+        emits the *bucket*, so a float comparison against the exact hovered time
+        almost never matches. Asking the cache again applies the same bucketing
+        and is a dictionary lookup, since whatever arrived is now in memory.
+        """
+        wanted = getattr(self, '_hover_wanted', None)
+        popup = getattr(self, '_hover_preview', None)
+        if wanted is None or popup is None or not popup.isVisible():
+            return
+        # Filmstrip frames come through here too, at a different height; only a
+        # hover-sized one can possibly be what the popup is waiting for.
+        if int(height) != HOVER_PREVIEW_HEIGHT:
+            return
+        cache = getattr(self, 'thumb_cache', None)
+        if cache is None:
+            return
+        pix = cache.request(wanted, HOVER_PREVIEW_HEIGHT, priority=PRIORITY_HOVER)
+        if pix is not None:
+            popup.set_pixmap(pix)
+            self._hover_wanted = None
 
     # ── clean shutdown hook (call from SignalTimelineWindow.closeEvent) ──
     def cleanup(self):
