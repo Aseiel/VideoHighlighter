@@ -22,7 +22,14 @@ class SignalTimelineScene(QGraphicsScene):
     # into two bars. Object detection may sample coarser than once per second,
     # so a strict "consecutive" test would shatter a continuous event.
     EVENT_RUN_GAP = 2.0
-    
+
+    # Scene units left clear above the first lane and below the last one. The
+    # bottom strip is where the ruler's labels live (see LABEL_BAND_PX, which is
+    # the same band measured in screen pixels — it is a little larger here so
+    # the labels still clear the last lane once the view scales the scene down).
+    TOP_MARGIN = 40
+    RULER_BAND = 34
+
     time_clicked = Signal(float)
     time_dragged = Signal(float)
     add_to_edit_requested = Signal(float)
@@ -900,43 +907,27 @@ class SignalTimelineScene(QGraphicsScene):
         # Calculate width based on video duration
         width = self.video_duration * self.pixels_per_second
         
-        # Start with base height for time ruler
-        height = 50  # Time ruler and labels
-        
-        # ONLY add waveform height if it's visible AND has data
-        if self.visible_layers.get('waveform', False) and self.waveform:
-            height += 80 + self.layer_spacing  # Waveform height with spacing after waveform
-        
-        # Add height for other visible layers
-        for _, tracks in self.group_order:
-            for track in tracks:
-                key = track.lower().replace(' ', '_')
-                if 'action:' in key:
-                    key = 'actions'
-                elif 'object:' in key:
-                    key = 'objects'
-                elif 'event:' in key:
-                    key = 'events'
-                elif 'search:' in key:
-                    key = 'visual_search'
-                elif 'final highlights' in key.lower():
-                    key = 'highlights'
-                
-                if self.visible_layers.get(key, True):
-                    # The filmstrip needs enough height for a frame to be worth
-                    # looking at; every other lane only has to fit a bar.
-                    height += ((FILMSTRIP_LANE_HEIGHT if key == 'filmstrip'
-                                else self.layer_height) + self.layer_spacing)
-        
-        self.setSceneRect(0, 0, width, height)
+        # The scene is sized from what the layers actually drew — see the
+        # setSceneRect after them. It used to be sized from a height budget
+        # computed up here, which was a second copy of the layout and drifted
+        # from the first: the budget reserved a lane per *track name* (one per
+        # object class, per action, per query), while the drawing collapses each
+        # of those groups into a single lane. A run with a dozen detected
+        # classes therefore claimed several hundred pixels that nothing was ever
+        # drawn in, and _fit_vertical dutifully squashed the real lanes to fit a
+        # scene that was mostly padding — rows stacked on top of each other
+        # under a huge empty band, with the ruler stranded at the bottom of it.
+        # Deriving the height from the drawing is the only version of this that
+        # cannot drift again.
+        #
+        # Only the width matters while drawing (the waveform spans it), so the
+        # height in this first rect is a placeholder.
+        self.setSceneRect(0, 0, width, self.TOP_MARGIN)
         self.clear()
         self.bars = []
-        
-        # Draw background
-        self.draw_background()
-        
+
         # Start drawing below time markers
-        current_y = 40
+        current_y = self.TOP_MARGIN
         self.row_labels = []
         
         # Draw waveform if visible
@@ -1001,7 +992,18 @@ class SignalTimelineScene(QGraphicsScene):
         # timeline below — the two then read as one continuous strip.
         if self.visible_layers.get('filmstrip', True):
             current_y = self.draw_filmstrip_layer(current_y, width)
-        
+
+        # Now that the lanes exist, the scene is exactly as tall as they made it,
+        # plus a strip at the bottom for the ruler's labels — those hang below
+        # the content, and without room reserved for them they would be painted
+        # over the last lane.
+        self.setSceneRect(0, 0, width, current_y + self.RULER_BAND)
+
+        # Background last of the full-width fills, but z=-10 keeps it behind
+        # everything; it has to come after the rect above, since it is sized
+        # from it.
+        self.draw_background()
+
         # Alternating lane bands behind every other row, so the tracks read as
         # lanes instead of floating in open space. Between the flat background
         # (z=-10) and the row content (z=0).
@@ -1036,7 +1038,8 @@ class SignalTimelineScene(QGraphicsScene):
                 # Zoom changed — re-pick the ruler interval for it.
                 self.draw_time_markers()
 
-        print(f"✅ Timeline rebuilt successfully, final height={height}")
+        print(f"✅ Timeline rebuilt successfully, "
+              f"{len(self.row_labels)} lanes, final height={self.sceneRect().height()}")
         self.timeline_rebuilt.emit()
 
     def _ensure_thumb_cache(self):
@@ -2396,7 +2399,16 @@ class SignalTimelineScene(QGraphicsScene):
 
 class SignalTimelineView(QGraphicsView):
     """Custom view with smooth zooming and panning"""
-    
+
+    # A lane may be scaled down to fit the viewport, but not into a smear. The
+    # row names are painted in the gutter beside the timeline at a fixed font
+    # size, so they do not shrink along with the lanes they label: past a
+    # certain pitch they simply overlap each other, and the timeline becomes
+    # unreadable at exactly the moment you have enabled enough signals to want
+    # it. Below this the view scrolls instead — the vertical scrollbar is always
+    # on and drag-panning already moves vertically.
+    MIN_LANE_PITCH_PX = 28.0
+
     def __init__(self, scene, parent=None):
         super().__init__(scene, parent)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -2469,7 +2481,7 @@ class SignalTimelineView(QGraphicsView):
         self._fit_vertical()
 
     def _fit_vertical(self):
-        """Scale scene to fit view height exactly"""
+        """Scale scene to fit view height, down to MIN_LANE_PITCH_PX per lane"""
         scene = self.scene()
         if not scene:
             return
@@ -2478,6 +2490,12 @@ class SignalTimelineView(QGraphicsView):
             return
         view_height = self.viewport().height()
         scale_y = view_height / scene_rect.height()
+        # Squashing stops where the rows would start colliding; scrolling takes
+        # over from there.
+        pitch = (getattr(scene, 'layer_height', 40)
+                 + getattr(scene, 'layer_spacing', 10))
+        if pitch > 0:
+            scale_y = max(scale_y, self.MIN_LANE_PITCH_PX / pitch)
         # Only adjust vertical scale, keep horizontal untouched
         current = self.transform()
         if current.m22() == scale_y:
