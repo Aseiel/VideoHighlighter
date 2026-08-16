@@ -2243,6 +2243,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     chapters=chapters,
                 )
 
+                # Order, interval, and the questions this run cannot answer.
+                # Before the advisor, which reads what this attaches.
+                try:
+                    from modules.sequence_findings import attach as _seq_attach
+                    _seq_attach(report)
+                except Exception as _fe:
+                    print(f"⚠️ Sequence findings skipped: {_fe}")
+
                 # Diagnose the run before writing it out, so the page and the
                 # JSON carry the same findings and neither can drift.
                 try:
