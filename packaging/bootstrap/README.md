@@ -46,8 +46,13 @@ cd packaging\bootstrap
 powershell -ExecutionPolicy Bypass -File .\Install-VideoHighlighter.ps1
 ```
 
-Default `config.json` points at the **public Free** 0.9.0 Windows split.
-Change `repo` / `tag` / `assets` for Pro or a newer tag when testing.
+Default `config.json` points at the **public Free** Windows split for the
+version in `version.py`. Do not edit the tag by hand — it is generated, and a
+test fails when it drifts from `version.py`. After a version bump:
+
+```powershell
+python tools/build_bootstrap_zip.py --edition free --write-config
+```
 
 ## Requirements on the machine
 

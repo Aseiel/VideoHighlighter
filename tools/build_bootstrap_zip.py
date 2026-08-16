@@ -3,10 +3,17 @@
 The zip is tiny (~10 KB): double-click Install-VideoHighlighter.bat on Windows,
 and the script downloads both split 7z volumes plus extracts them.
 
+The tag defaults to version.py, so bumping the app bumps what the installer
+asks for. It used to be typed in by hand in two places -- the CI argument and
+the committed config.json -- and the committed copy simply went stale: it still
+named 0.9.0 several releases later, which is the version the installer falls
+back to whenever the GitHub API cannot be reached.
+
 Usage::
 
-    python tools/build_bootstrap_zip.py --edition free --tag 0.9.0
+    python tools/build_bootstrap_zip.py --edition free
     python tools/build_bootstrap_zip.py --edition pro --tag 0.9.0-Pro
+    python tools/build_bootstrap_zip.py --edition free --write-config
 """
 from __future__ import annotations
 
@@ -26,6 +33,30 @@ ZIP_MEMBERS = (
 
 FREE_REPO = "Aseiel/VideoHighlighter"
 PRO_REPO = "Aseiel/VideoHighlighter-pro"
+
+# The committed configs, one per edition. These are what someone gets when they
+# run the installer straight from a checkout, and what the offline fallback in a
+# shipped zip is copied from -- so they have to track version.py rather than be
+# remembered.
+CONFIG_PATHS = {
+    "free": BOOTSTRAP / "config.json",
+    "pro": BOOTSTRAP / "config.pro.example.json",
+}
+
+
+def default_tag(edition: str) -> str:
+    """The tag this checkout would release under, per version.py.
+
+    Mirrors the slug the release workflow computes: the Free tag is the bare
+    version, Pro appends its edition. Deriving it here means the installer and
+    the app can no longer disagree about which release is current.
+    """
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    import version
+
+    return (f"{version.__version__}-Pro" if edition.lower() == "pro"
+            else version.__version__)
 
 
 def _windows_assets(tag: str, *, pro: bool) -> tuple[str, ...]:
@@ -61,6 +92,30 @@ def make_config(*, edition: str, tag: str) -> dict:
             else "use_latest asks the GitHub API for the current release."
         ),
     }
+
+
+def write_config(*, edition: str, tag: str) -> Path:
+    """Rewrite the committed config for `edition` at the given tag.
+
+    Only the version-bearing fields are regenerated. The hand-written `notes`
+    is kept as it is -- the Pro one carries the command for running the
+    installer against that config, which no generator knows about.
+    """
+    path = CONFIG_PATHS[edition.lower()]
+    if not path.exists():
+        raise SystemExit(f"no committed config for {edition}: {path}")
+
+    config = make_config(edition=edition, tag=tag)
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        existing = {}
+    if existing.get("notes"):
+        config["notes"] = existing["notes"]
+
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    print(f"OK {path} (tag={tag})")
+    return path
 
 
 def build_zip(*, edition: str, tag: str, out: Path) -> Path:
@@ -108,8 +163,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--tag",
-        required=True,
-        help="Release tag, e.g. 0.9.0 or 0.9.0-Pro.",
+        default=None,
+        help="Release tag, e.g. 0.9.0 or 0.9.0-Pro. Defaults to version.py.",
+    )
+    parser.add_argument(
+        "--write-config",
+        action="store_true",
+        help="Rewrite the committed bootstrap config for this edition instead "
+             "of building the zip. Run this after bumping version.py.",
     )
     parser.add_argument(
         "--out",
@@ -118,7 +179,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Output zip path.",
     )
     args = parser.parse_args(argv)
-    build_zip(edition=args.edition, tag=args.tag, out=args.out.resolve())
+    tag = args.tag or default_tag(args.edition)
+    if args.write_config:
+        write_config(edition=args.edition, tag=tag)
+    else:
+        build_zip(edition=args.edition, tag=tag, out=args.out.resolve())
     return 0
 
 
