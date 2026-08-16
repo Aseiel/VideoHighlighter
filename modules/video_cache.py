@@ -123,6 +123,34 @@ def atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
+# The keys `collect_analysis_data` writes on every full run, whatever the video
+# turned out to contain: a silent clip with no detections still gets `transcript`
+# and `scenes`, as empty containers. So *presence* rather than truthiness is what
+# separates a finished analysis from an entry seeded by a single-signal run.
+_ANALYSIS_KEYS = frozenset({
+    "video_metadata", "transcript", "scenes", "motion_events", "motion_peaks",
+    "actions", "actions_all", "audio", "audio_peaks", "pipeline_version",
+    "cache_flags",
+})
+
+
+def holds_analysis(cache_data: Dict[str, Any]) -> bool:
+    """Whether a cache entry is a real analysis rather than a single-signal stub.
+
+    On-demand runs and the timeline's visual search both seed a cache file when
+    a video has none yet, holding just the one signal they produced. Stamping
+    such a file `cache_complete` makes `load` hand it to the pipeline, which
+    sets `using_cache` from it and then skips transcript, objects and actions —
+    so a stub holding one key silently stands in for a run that takes hours, and
+    the user's only way out is to force a reprocess.
+
+    Deliberately *any* rather than *all*: caches written by older versions
+    predate some of these keys, and rejecting one of those would cause exactly
+    the re-run this is meant to prevent. A single-signal stub has none of them.
+    """
+    return bool(_ANALYSIS_KEYS & cache_data.keys())
+
+
 @dataclass
 class HighlightSegment:
     """A single highlight segment with metadata"""
@@ -392,6 +420,16 @@ class VideoAnalysisCache:
                     self.stats["misses"] += 1
                     return None
 
+                # The flag alone is not enough, because entries stamped with it
+                # by older builds are already sitting on users' disks holding a
+                # single on-demand signal. Handing one of those back makes the
+                # pipeline skip every stage it thinks is cached, which is the
+                # "results vanished, had to re-run" report.
+                if not holds_analysis(cache_data):
+                    print("⚠ Cache holds no analysis (single-signal stub), will re-process")
+                    self.stats["misses"] += 1
+                    return None
+
                 # Extra safety: if params were passed, ensure signature matches too
                 if params is not None and cache_data.get("analysis_signature") != signature:
                     self.stats["misses"] += 1
@@ -520,7 +558,25 @@ class VideoAnalysisCache:
             
             # Get existing data or create new - USE self.load() instead of self.base_cache.load()
             print(f"  🔄 Loading existing cache data for {video_path}")
-            cache_data = self.load(video_path, params=analysis_params) or {}
+            cache_data = self.load(video_path, params=analysis_params)
+            if cache_data is None:
+                # `load` returns None for two very different situations: nothing
+                # is cached yet, or an entry *is* there and was refused -- the
+                # video was re-encoded, the signature moved on, the JSON was
+                # truncated by an earlier non-atomic write. Defaulting to {} here
+                # (as this did) treats the second case as the first and writes
+                # back an entry holding only the three highlight keys. `save`
+                # then stamps it `cache_complete: True`, so the stub passes the
+                # completeness gate on the next `load`, the pipeline sets
+                # `using_cache` from it and skips transcript, objects and
+                # actions -- a full analysis replaced by a file that still looks
+                # valid. Refuse instead: a highlight run that fails to record
+                # itself is cheap next to the run it would have eaten.
+                if self.exists(video_path, params=analysis_params):
+                    print("  ⚠️ An analysis cache exists but could not be read; "
+                          "refusing to overwrite it with a highlights-only entry")
+                    return False
+                cache_data = {}
             print(f"  ✓ Loaded cache_data with keys: {cache_data.keys() if cache_data else 'empty dict'}")
             
             # Initialize or update highlight history

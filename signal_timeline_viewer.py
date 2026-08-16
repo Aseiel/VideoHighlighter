@@ -1943,6 +1943,8 @@ class SignalTimelineWindow(QMainWindow):
             from pathlib import Path
             import json
 
+            from modules.video_cache import atomic_write_json
+
             if not self.cache_data:
                 self.cache_data = {}
             findings = (self.signal_scene.visual_findings
@@ -1973,11 +1975,24 @@ class SignalTimelineWindow(QMainWindow):
                 disk_data = dict(self.cache_data)
                 disk_data.setdefault('video_path', str(self.video_path))
                 disk_data['video_hash'] = video_hash
-                disk_data['cache_complete'] = True
+                # Only claim completeness if what we are about to write really
+                # is an analysis. A findings-only file that says otherwise gets
+                # handed to the pipeline as a finished run, which then skips the
+                # stages it believes are cached. load_cache_data() below reads
+                # this file directly and ignores the flag, so the findings
+                # survive a restart regardless.
+                from modules.video_cache import holds_analysis
+                disk_data['cache_complete'] = holds_analysis(disk_data)
 
             disk_data['visual_findings'] = findings
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(disk_data, f)
+            # Never a plain open(..., "w"): that truncates a cache which can be
+            # several MB before a byte of the new content lands, so anything
+            # killing the process inside that window -- a crash in the repaint
+            # this write races with, a cancel, power loss -- leaves a mangled
+            # file where the full analysis used to be, and the run is gone. The
+            # findings being saved here are cheap; the transcript and boxes
+            # sharing the file took hours. Same rule as merge_into_cache().
+            atomic_write_json(Path(cache_file), disk_data)
 
             print(f"💾 Saved {len(findings)} visual findings → {cache_file.name}")
             return True
@@ -1998,6 +2013,8 @@ class SignalTimelineWindow(QMainWindow):
             # Find and update the actual cache file on disk
             from pathlib import Path
             import json
+
+            from modules.video_cache import atomic_write_json
 
             cache_dir = Path("./cache")
             if not cache_dir.exists():
@@ -2025,8 +2042,9 @@ class SignalTimelineWindow(QMainWindow):
                 disk_data['audio'] = {}
             disk_data['audio']['waveform'] = waveform_data
 
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(disk_data, f)
+            # Atomic for the same reason as the findings write above: this
+            # rewrites the whole analysis entry to add one key.
+            atomic_write_json(Path(cache_file), disk_data)
 
             print(f"💾 Saved waveform to disk ({len(waveform_data)} points) → {cache_file.name}")
 
