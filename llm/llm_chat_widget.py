@@ -518,6 +518,15 @@ class _VisualSearchWorker(QObject):
             return
         candidates = scored[:self.top_k]
         print(f"CLIP+LLM: confirming top {len(candidates)} candidates with the VLM")
+        # Mark the handoff in the UI too. Without it the funnel is invisible:
+        # the scan's progress and the confirms' progress read identically, and
+        # a Top-K at or above the number of sampled frames (short video, coarse
+        # interval) silently degrades to "the model sees everything" — which is
+        # the same run, but worth being able to tell apart.
+        self.progress.emit(0, max(1, len(candidates)),
+                           float(candidates[0][0]) if candidates else 0.0,
+                           f"CLIP ranked {len(scored)} frames → VLM confirms top "
+                           f"{len(candidates)}")
 
         stage_totals = defaultdict(list)
         results = []
@@ -1301,10 +1310,18 @@ class LLMChatWidget(QWidget):
 
     @Slot(int, int, float, str)
     def _on_search_progress(self, current: int, total: int, timestamp: float, preview: str):
-        """Update search progress."""
-        percent = (current / total) * 100
+        """Update search progress.
+
+        `preview` names the *phase* ("CLIP scan 240s", "VLM confirm 240s
+        (CLIP 0.42)"). Dropping it made the two-stage engines unreadable: the
+        CLIP+LLM funnel scans every frame first and only then sends the top-K to
+        the model, but the label showed the same "Searching: n/total" for both,
+        so a slow scan looked like the model running on every frame.
+        """
+        percent = (current / total * 100) if total else 0.0
+        head = f"{preview} — " if preview else "Searching: "
         self.search_progress.setText(
-            f"Searching: {current}/{total} ({percent:.1f}%) - {timestamp:.1f}s"
+            f"{head}{current}/{total} ({percent:.1f}%)"
         )
 
     @Slot(float, str, str, bool, float)
