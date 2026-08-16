@@ -136,3 +136,51 @@ class TestTheStalePlayheadIsCaught:
         # This runs on every playback tick; a line per tick would bury the one
         # line that matters under a log nobody can read.
         assert len(_lines(trace)) == before
+
+
+class TestTheRulerLetsGoOfWhatTheRebuildDeleted:
+    """The same mistake as the playhead's, and this one was caught in the act.
+
+    `repaint_trace.log` holds an access violation whose current frame is
+    `draw_time_markers`, on the loop that removes the previous pass's markers —
+    a rebuild had just deleted every one of them in `clear()`. The loop guards
+    against that with `except RuntimeError`, which only helps when PySide
+    noticed the deletion; when it does not, asking a corpse for its `scene()`
+    is undefined behaviour, and there it killed the process.
+    """
+
+    def test_clear_leaves_the_marker_references_dangling(self, trace, app):
+        scene = SignalTimelineScene({}, 60.0)
+        scene.build_timeline()
+        assert scene._time_marker_items, "the ruler drew no markers to lose"
+        scene._marker = scene._time_marker_items[0]
+
+        scene.clear()
+
+        assert repaint_trace.probe(scene, "_marker") == {"_marker": "dangling"}
+
+    def test_a_rebuild_removes_nothing_it_has_already_deleted(self, trace, app):
+        scene = SignalTimelineScene({}, 60.0)
+        scene.build_timeline()             # first pass leaves a full list
+
+        seen = []
+        original = scene.draw_time_markers
+        scene.draw_time_markers = lambda: (
+            seen.append(list(scene._time_marker_items)), original())[1]
+        scene.build_timeline()
+
+        # The list the ruler finds on the first pass after clear() must be
+        # empty. Anything in it is an item the rebuild has already destroyed.
+        assert seen and seen[0] == []
+
+    def test_the_ruler_still_clears_its_own_markers_on_a_zoom(self, trace, app):
+        # Dropping the list is only safe where clear() has run. Redrawing the
+        # ruler on its own — which is what a zoom does — must still take the
+        # previous markers off the scene rather than stacking a second set.
+        scene = SignalTimelineScene({}, 60.0)
+        scene.build_timeline()
+        before = len(scene.items())
+
+        scene.draw_time_markers()
+
+        assert len(scene.items()) == before

@@ -893,6 +893,14 @@ class SignalTimelineScene(QGraphicsScene):
         # Same reason: clear() deletes the lane, and a thumbnail arriving after
         # that would otherwise repaint through a dead wrapper.
         self._filmstrip_item = None
+        # And the ruler's, which is where this actually killed the process:
+        # repaint_trace.log has an access violation inside draw_time_markers,
+        # on the loop that removes the previous pass's markers. clear() had
+        # already deleted them, and the RuntimeError guard there only catches
+        # the case where PySide noticed — when it doesn't, asking a corpse for
+        # its scene() is undefined behaviour, and here it was fatal. Nothing
+        # below needs the old list: clear() has taken every one of them.
+        self._time_marker_items = []
 
         # If we have a view connected, store its current transform
         views = self.views()
