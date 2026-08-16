@@ -3,6 +3,7 @@
 debug.log
 debug.prev.log
 timeline_debug.log
+repaint_trace.log
 
 # Timeline viewer filter state (written next to the app at runtime by
 # SignalTimelineScene.save_filters) — per-machine UI state, not repo content.

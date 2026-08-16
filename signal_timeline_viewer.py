@@ -5107,6 +5107,18 @@ debug_log(f"Python version: {sys.version}")
 debug_log(f"Current working directory: {os.getcwd()}")
 debug_log(f"Script location: {__file__}")
 
+# The repaint crash kills the process inside Qt, so `debug_log` above is no help
+# for it: that reopens the file per call and there is nothing holding a
+# descriptor at the moment it matters. Arming here keeps one open and puts
+# faulthandler behind it, so a hard crash writes a C-level traceback instead of
+# vanishing. See modules/repaint_trace.py.
+try:
+    from modules import repaint_trace as _repaint_trace
+    if _repaint_trace.arm():
+        debug_log(f"🩺 Repaint trace → {_repaint_trace.default_path()}")
+except Exception as _e:
+    debug_log(f"⚠️ Repaint trace unavailable: {_e}")
+
 
 
 def show_timeline_viewer(video_path, cache_data=None):

@@ -1,6 +1,8 @@
 from .timeline_bars import TimelineBar, DraggableTimelineBar
 from collections import defaultdict
 import json
+
+from modules import repaint_trace
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
     QGraphicsLineItem, QGraphicsItem, QApplication, QMenu
@@ -834,13 +836,38 @@ class SignalTimelineScene(QGraphicsScene):
     
     def build_timeline(self):
         """Rebuild the timeline with waveform"""
+        with repaint_trace.rebuild("build_timeline",
+                                   duration=self.video_duration,
+                                   pps=self.pixels_per_second):
+            self._build_timeline()
+
+    def _build_timeline(self):
         print(f"🔄 SignalTimelineScene.build_timeline() called")
         print(f"   - Waveform data: {self.waveform is not None}, length: {len(self.waveform)}")
-        
+
+        # Which references into the scene are still backed by a live C++ object
+        # *before* clear() runs. Anything reported dangling here outlived a
+        # previous rebuild, and is a crash already queued up rather than one
+        # about to be caused.
+        repaint_trace.note("rebuild.items_before", **repaint_trace.probe(
+            self, "current_time_line", "current_time_caret",
+            "_selection_rect_item", "_selection_label_item"))
+
         # Clear selection state — items are about to be wiped by self.clear()
         self._selection_rect_item  = None
         self._selection_label_item = None
         self._selection_active     = False
+
+        # The playhead needs the same treatment, and used not to get it. clear()
+        # deletes the C++ objects behind these two but leaves the attributes
+        # pointing at the corpses, and the rebuild below repositions the playhead
+        # before it returns — so every confidence adjustment reached through a
+        # dead wrapper. Touching a deleted QGraphicsItem is undefined behaviour
+        # rather than a defined no-op: it survived on some builds, which is why
+        # this took a crash with no traceback to find. Dropping the references
+        # makes set_current_time recreate the playhead instead of resurrecting it.
+        self.current_time_line = None
+        self.current_time_caret = None
 
         # If we have a view connected, store its current transform
         views = self.views()
@@ -1812,8 +1839,20 @@ class SignalTimelineScene(QGraphicsScene):
         x = max(0, min(x, self.sceneRect().width() - 1))
         h = self.sceneRect().height()
         
-        # Move existing line or create if missing
-        if hasattr(self, 'current_time_line') and self.current_time_line in self.items():
+        # Silent on the happy path — this runs on every playback tick. But
+        # `current_time_line` is not among the references build_timeline resets,
+        # so after a rebuild's clear() it can point at a deleted C++ object, and
+        # the membership test below is the first thing to touch it. Recording
+        # the state *first* means the breadcrumb is already on disk even when
+        # that touch is what ends the process.
+        _items = repaint_trace.probe(self, "current_time_line", "current_time_caret")
+        if any(state == "dangling" for state in _items.values()):
+            repaint_trace.note("playhead.stale_item", seconds=seconds, **_items)
+
+        # Move existing line or create if missing. None is now an expected state
+        # rather than an absent attribute — build_timeline drops the reference
+        # when it wipes the scene — so test for it directly.
+        if getattr(self, 'current_time_line', None) is not None and self.current_time_line in self.items():
             self.current_time_line.setLine(x, 0, x, h)
             self.current_time_caret.setPos(x, 0)
         else:
@@ -1942,12 +1981,18 @@ class SignalTimelineScene(QGraphicsScene):
     def set_action_confidence_filter(self, min_conf, max_conf=1.0):
         self.min_action_confidence = max(0.0, min(min_conf, 1.0))
         self.max_action_confidence = min(1.0, max(max_conf, 0.0))
+        repaint_trace.note("filter.action_confidence",
+                           min=self.min_action_confidence,
+                           max=self.max_action_confidence)
         self.save_filters()
         self.build_timeline()
 
     def set_object_confidence_filter(self, min_conf, max_conf=1.0):
         self.min_object_confidence = max(0.0, min(min_conf, 1.0))
         self.max_object_confidence = min(1.0, max(max_conf, 0.0))
+        repaint_trace.note("filter.object_confidence",
+                           min=self.min_object_confidence,
+                           max=self.max_object_confidence)
         self.save_filters()
         self.build_timeline()
 
