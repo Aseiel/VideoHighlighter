@@ -41,6 +41,7 @@ from datetime import datetime, timedelta
 
 # modules
 from modules.ui.collapsible import CollapsibleSection
+from modules.ui.fit import fit_icon_button, fit_width
 from modules.ui.theme import DARK as THEME
 from modules.ui import icons as ui_icons
 # Building this window blocks the GUI thread for several seconds, so it reports
@@ -2473,6 +2474,14 @@ class SignalTimelineWindow(QMainWindow):
         # Controls is the working tab; the others wait behind it.
         controls_dock.raise_()
 
+        # Qt elides a tabified dock's title to make it fit, and in a narrow
+        # right column it cut them past the point of reading: "Contr…", "Sea…",
+        # "Transcr…". Elision is the wrong trade here — the titles are one word
+        # each, so there is nothing to shorten to. Turned off, the bar keeps the
+        # whole name and grows scroll arrows if the column is genuinely too
+        # narrow, which at least leaves them legible one at a time.
+        self._keep_dock_tab_titles_whole()
+
         # Connect render signals
         self.render_finished.connect(self.on_render_finished)
         self.render_progress.connect(self.on_render_progress)
@@ -2820,7 +2829,7 @@ class SignalTimelineWindow(QMainWindow):
         kw_row.addWidget(self.analyze_transcript_kw, 1)
         kw_btn = QPushButton()
         kw_btn.setIcon(ui_icons.search(color=THEME.text))
-        kw_btn.setFixedWidth(30)
+        fit_icon_button(kw_btn)
         kw_btn.setToolTip("Mark these words on the timeline")
         kw_btn.clicked.connect(self._apply_transcript_keywords)
         kw_row.addWidget(kw_btn)
@@ -3231,6 +3240,22 @@ class SignalTimelineWindow(QMainWindow):
         layout.addWidget(self.edit_duration_label)
         
         return controls
+
+    def _keep_dock_tab_titles_whole(self):
+        """Stop the dock tab bar from eliding one-word panel names.
+
+        The tab bars only exist once the docks are tabified, and Qt recreates
+        them when docks are moved, so this is best-effort and safe to call
+        again. Scroll buttons are the deliberate fallback: a name you can reach
+        beats a name that has been shortened to "Sea…".
+        """
+        try:
+            from PySide6.QtWidgets import QTabBar
+            for bar in self.findChildren(QTabBar):
+                bar.setElideMode(Qt.TextElideMode.ElideNone)
+                bar.setUsesScrollButtons(True)
+        except Exception as e:
+            print(f"⚠️ Could not adjust dock tab titles: {e}")
 
     def create_search_dock(self):
         from PySide6.QtWidgets import QDockWidget

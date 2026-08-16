@@ -2316,12 +2316,41 @@ class SignalTimelineView(QGraphicsView):
         # Start with no drag mode (we'll handle it manually)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         
-        # Semi-transparent background
+        # Semi-transparent background.
+        #
+        # The horizontal bar is deliberately fatter than the app-wide 10px in
+        # theme.py. That width is right for a panel you scroll occasionally
+        # with the wheel; this is the one people *drag*, repeatedly, to move
+        # along a video that can be hours long, and a 10px target is a hard
+        # thing to catch and an easy thing to lose halfway through a drag. The
+        # handle also gets a real minimum length, so a long video cannot shrink
+        # it to a sliver that is impossible to grab at all.
         self.setStyleSheet("""
             QGraphicsView {
                 background-color: rgba(18, 18, 18, 200);
                 border: 2px solid rgba(90, 90, 90, 150);
                 border-radius: 5px;
+            }
+            QScrollBar:horizontal {
+                background: rgba(28, 28, 28, 200);
+                height: 18px;
+                margin: 0;
+                border-radius: 9px;
+            }
+            QScrollBar::handle:horizontal {
+                background: rgba(130, 130, 130, 220);
+                border-radius: 7px;
+                min-width: 48px;
+                margin: 2px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: rgba(180, 180, 180, 240);
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0; height: 0;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: transparent;
             }
         """)
         

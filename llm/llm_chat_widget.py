@@ -29,6 +29,7 @@ from PySide6.QtCore import Qt, Signal, Slot, QThread, QSettings, QObject
 from PySide6.QtGui import QTextCursor
 
 from modules.ui.collapsible import CollapsibleSection
+from modules.ui.fit import fit_width
 from modules.ui.theme import DARK as THEME
 from modules.ui import icons as ui_icons
 
@@ -672,7 +673,7 @@ class LLMChatWidget(QWidget):
         row1.addWidget(self.model_combo)
 
         self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.setFixedWidth(60)
+        fit_width(self.refresh_btn)
         self.refresh_btn.clicked.connect(self._refresh_models)
         row1.addWidget(self.refresh_btn)
 
@@ -743,13 +744,13 @@ class LLMChatWidget(QWidget):
         row4.addWidget(self.reasoning_checkbox)
 
         self.reasoning_stats_btn = QPushButton("Stats")
-        self.reasoning_stats_btn.setFixedWidth(60)
+        fit_width(self.reasoning_stats_btn)
         self.reasoning_stats_btn.setToolTip("Show reasoning statistics")
         self.reasoning_stats_btn.clicked.connect(self._show_reasoning_stats)
         row4.addWidget(self.reasoning_stats_btn)
 
         self.reasoning_save_btn = QPushButton("Save")
-        self.reasoning_save_btn.setFixedWidth(60)
+        fit_width(self.reasoning_save_btn)
         self.reasoning_save_btn.setToolTip("Save inferred facts to cache")
         self.reasoning_save_btn.clicked.connect(self._save_reasoning_facts)
         row4.addWidget(self.reasoning_save_btn)

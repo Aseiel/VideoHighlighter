@@ -60,6 +60,17 @@ class Palette:
     radius_card: int   # cards
 
 
+# Horizontal room a QPushButton spends on itself before any text is drawn:
+# `padding: 6px 14px` on each side plus the 1px border. Named because sizing a
+# button by hand means adding this to the width of its label, and guessing it
+# is how "Refresh" ended up in a 60px button rendering as "efres" — 39px of
+# text and 30px of chrome do not fit, and a centred label loses a little from
+# each end rather than visibly running off. See modules/ui/fit.py.
+BUTTON_PADDING_H = 14
+BUTTON_BORDER = 1
+BUTTON_CHROME_H = 2 * (BUTTON_PADDING_H + BUTTON_BORDER)
+
+
 # Graphite + one crisp blue — the look the inline de-blueing already converged on.
 DARK = Palette(
     bg="#141414",
@@ -134,7 +145,7 @@ def build_qss(p: Palette = DARK) -> str:
         color: {p.text};
         border: 1px solid {p.border_strong};
         border-radius: {p.radius}px;
-        padding: 6px 14px;
+        padding: 6px {BUTTON_PADDING_H}px;
     }}
     QPushButton:hover {{ background-color: {p.surface_hi}; border-color: {p.accent}; }}
     QPushButton:pressed {{ background-color: {p.bg}; }}
