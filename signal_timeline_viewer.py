@@ -2304,7 +2304,8 @@ class SignalTimelineWindow(QMainWindow):
         
         # Create scene with current waveform data (may be empty initially)
         startup_splash.stage("Drawing the signal timeline…")
-        self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration, waveform=self.waveform)
+        self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration, waveform=self.waveform,
+                                                video_path=self.video_path)
         self.signal_view = SignalTimelineView(self.signal_scene)
         # Lower floor so the whole top band (preview + timeline + controls) can
         # compress and leave room for the bottom LLM dock when not maximized.

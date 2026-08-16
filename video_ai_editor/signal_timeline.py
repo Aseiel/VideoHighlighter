@@ -3,6 +3,8 @@ from collections import defaultdict
 import json
 
 from modules import repaint_trace
+from .filmstrip_lane import LANE_HEIGHT as FILMSTRIP_LANE_HEIGHT
+from .filmstrip_lane import FilmstripLane
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
     QGraphicsLineItem, QGraphicsItem, QApplication, QMenu
@@ -33,10 +35,19 @@ class SignalTimelineScene(QGraphicsScene):
     undo_highlight_swap_requested = Signal()
     current_time_changed = Signal(float)        # playhead moved, for any reason
     
-    def __init__(self, cache_data, video_duration, parent=None, waveform=None):
+    def __init__(self, cache_data, video_duration, parent=None, waveform=None,
+                 video_path=None):
         super().__init__(parent)
         self.cache_data = cache_data
         self.video_duration = max(video_duration, 1.0)
+
+        # Where the filmstrip lane gets its frames. Falls back to the path the
+        # cache was written for, so a scene built without one still finds the
+        # video it is describing.
+        self.video_path = video_path or (cache_data or {}).get('video_path')
+        self._thumb_cache = None
+        self._filmstrip_item = None
+        self._filmstrip_repaint_pending = False
         
         # Waveform visualization
         self.waveform = waveform or []
@@ -115,7 +126,11 @@ class SignalTimelineScene(QGraphicsScene):
             ('scenes', ['Scenes']),
             ('motion', ['Motion Events', 'Motion Peaks']),
             ('audio', ['Audio Peaks']),
-            ('highlights', ['Final Highlights'])
+            ('highlights', ['Final Highlights']),
+            # Last, so it sits at the bottom of the stack — as close as the
+            # signal timeline gets to the edit timeline directly beneath it,
+            # which is the strip you are comparing it against.
+            ('filmstrip', ['Filmstrip']),
         ]
         
         # Layer visibility - initialize all to visible
@@ -868,6 +883,9 @@ class SignalTimelineScene(QGraphicsScene):
         # makes set_current_time recreate the playhead instead of resurrecting it.
         self.current_time_line = None
         self.current_time_caret = None
+        # Same reason: clear() deletes the lane, and a thumbnail arriving after
+        # that would otherwise repaint through a dead wrapper.
+        self._filmstrip_item = None
 
         # If we have a view connected, store its current transform
         views = self.views()
@@ -905,7 +923,10 @@ class SignalTimelineScene(QGraphicsScene):
                     key = 'highlights'
                 
                 if self.visible_layers.get(key, True):
-                    height += self.layer_height + self.layer_spacing
+                    # The filmstrip needs enough height for a frame to be worth
+                    # looking at; every other lane only has to fit a bar.
+                    height += ((FILMSTRIP_LANE_HEIGHT if key == 'filmstrip'
+                                else self.layer_height) + self.layer_spacing)
         
         self.setSceneRect(0, 0, width, height)
         self.clear()
@@ -975,6 +996,11 @@ class SignalTimelineScene(QGraphicsScene):
         # Layer 8: Highlight Segments
         if self.visible_layers.get('highlights', True):
             current_y = self.draw_highlights_layer(current_y)
+
+        # Layer 9: the footage itself, last so it sits nearest the edit
+        # timeline below — the two then read as one continuous strip.
+        if self.visible_layers.get('filmstrip', True):
+            current_y = self.draw_filmstrip_layer(current_y, width)
         
         # Alternating lane bands behind every other row, so the tracks read as
         # lanes instead of floating in open space. Between the flat background
@@ -1012,6 +1038,71 @@ class SignalTimelineScene(QGraphicsScene):
 
         print(f"✅ Timeline rebuilt successfully, final height={height}")
         self.timeline_rebuilt.emit()
+
+    def _ensure_thumb_cache(self):
+        """The shared thumbnail source for the filmstrip lane, built on demand.
+
+        Deferred rather than built in __init__ because a scene is constructed
+        before anyone knows whether the lane will be shown, and opening the
+        video costs a decoder. Failure is not fatal: the lane simply draws
+        placeholders, which is a better outcome than a timeline that will not
+        open because a thumbnail source could not start.
+        """
+        if getattr(self, '_thumb_cache', None) is not None:
+            return self._thumb_cache
+        if not getattr(self, 'video_path', None):
+            return None
+        try:
+            from .thumbnail_cache import ThumbnailCache
+            self._thumb_cache = ThumbnailCache(self.video_path)
+            # A frame arriving late has to repaint the strip, or it stays a
+            # placeholder until something else happens to invalidate it.
+            self._thumb_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
+        except Exception as e:
+            print(f"⚠️ Filmstrip disabled — no thumbnail source: {e}")
+            self._thumb_cache = None
+        return self._thumb_cache
+
+    def _on_thumbnail_ready(self, *_args):
+        """Coalesce arriving frames into one repaint.
+
+        Thumbnails land one at a time and a screenful is a few dozen, so
+        repainting per frame means dozens of full-lane repaints in a second,
+        each re-walking every visible slot. Collapsing them into a single
+        deferred update makes the strip fill in visibly without competing with
+        the interaction that is drawing it.
+        """
+        if getattr(self, '_filmstrip_item', None) is None:
+            return
+        if getattr(self, '_filmstrip_repaint_pending', False):
+            return
+        self._filmstrip_repaint_pending = True
+        QTimer.singleShot(120, self._repaint_filmstrip)
+
+    def _repaint_filmstrip(self):
+        self._filmstrip_repaint_pending = False
+        item = getattr(self, '_filmstrip_item', None)
+        if item is None:
+            return
+        try:
+            item.update()
+        except RuntimeError:
+            # Deleted by a rebuild's clear() between the request and the frame
+            # coming back. The new lane will ask again for what it needs.
+            self._filmstrip_item = None
+
+    def draw_filmstrip_layer(self, y_pos, width):
+        """Thumbnails of the whole video, as the bottom lane."""
+        self.row_labels.append(("FILMSTRIP", y_pos))
+        cache = self._ensure_thumb_cache()
+        item = FilmstripLane(width, self.video_duration, cache,
+                             height=FILMSTRIP_LANE_HEIGHT)
+        item.setPos(0, y_pos)
+        # Under the playhead and the bars, above the background bands.
+        item.setZValue(-5)
+        self.addItem(item)
+        self._filmstrip_item = item
+        return y_pos + FILMSTRIP_LANE_HEIGHT + self.layer_spacing
 
     def drawForeground(self, painter, rect):
         """Paint user-marked avoid ranges on every repaint. Painting (rather than
