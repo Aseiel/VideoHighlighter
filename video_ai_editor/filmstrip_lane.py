@@ -70,6 +70,18 @@ class FilmstripLane(QGraphicsItem):
     def boundingRect(self) -> QRectF:
         return QRectF(0.0, 0.0, self._width, self._height)
 
+    def set_aspect(self, aspect: float):
+        """Reshape the slots — the VR crop halves the frame the cache returns.
+
+        The lane keeps its bounds; only how many frames fit along it changes,
+        so a repaint is the whole of it.
+        """
+        aspect = float(aspect)
+        if aspect <= 0.0 or aspect == self._aspect:
+            return
+        self._aspect = aspect
+        self.update()
+
     def slot_width(self) -> float:
         """Width of one thumbnail slot, matching filmstrip_painter's maths.
 

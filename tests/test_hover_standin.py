@@ -39,13 +39,16 @@ def _pix(w=96, h=54):
     return pix
 
 
-def _cache(entries):
+def _cache(entries, vr_mode=False):
     """A ThumbnailCache with only its memory dict populated."""
     cache = ThumbnailCache.__new__(ThumbnailCache)
     cache._mem = OrderedDict()
     cache.mem_limit = 300
-    for (t_ms, height) in entries:
-        cache._mem[(t_ms, height)] = _pix(h=height)
+    cache._vr_mode = vr_mode
+    for entry in entries:
+        t_ms, height = entry[0], entry[1]
+        vr = entry[2] if len(entry) > 2 else False
+        cache._mem[(t_ms, height, vr)] = _pix(h=height)
     return cache
 
 
@@ -78,6 +81,13 @@ class TestPeekNearest:
 
     def test_an_empty_cache_is_fine(self, app):
         assert _cache([]).peek_nearest(1.0) is None
+
+    def test_the_other_crop_is_not_a_stand_in(self, app):
+        # A whole side-by-side frame is not a lower-resolution version of the
+        # left eye, it is a different picture — standing one in for the other
+        # would put the seam between the eyes under the cursor.
+        cache = _cache([(12300, 54, False)], vr_mode=True)
+        assert cache.peek_nearest(12.30) is None
 
     def test_it_never_queues_work(self, app):
         # A stand-in is for showing *now*. If this could enqueue, moving the

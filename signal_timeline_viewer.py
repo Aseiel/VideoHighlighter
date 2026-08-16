@@ -1134,6 +1134,38 @@ class SignalTimelineWindow(QMainWindow):
             self._det_panel_saved_sizes = splitter.sizes()
             self.detection_panel.setVisible(False)
 
+    def _detect_vr_layout(self):
+        """Tick the VR box ourselves when the footage is side-by-side.
+
+        The box was always there, and every view already knew how to crop —
+        what was missing was anyone noticing. Left untouched on VR footage the
+        filmstrip is the worst offender, because a thumbnail slot centre-crops
+        onto the seam between the eyes and shows the one strip of the frame
+        with nothing in it.
+
+        Ticking the real checkbox rather than setting a flag is deliberate: it
+        runs the same path as a click, so nothing can be reached by the
+        detector that a person cannot reach by unticking it. Never overrides a
+        box already ticked, and says on the status bar what it did.
+        """
+        checkbox = getattr(self, 'vr_mode_checkbox', None)
+        if checkbox is None or checkbox.isChecked():
+            return
+        try:
+            from modules.vr_detect import probe
+            layout = probe(self.video_path)
+        except Exception as e:
+            print(f"⚠️ Could not check the frame layout: {e}")
+            return
+
+        print(f"🥽 Frame layout: {layout.reason}")
+        if not layout.side_by_side:
+            return
+        checkbox.setChecked(True)          # fires _toggle_vr_mode, as a click would
+        self.statusBar().showMessage(
+            "🥽 Side-by-side VR — showing the left eye. "
+            "Untick “VR Half-Frame” for the whole frame.", 10000)
+
     @Slot(int)
     def _toggle_vr_mode(self, state):
         enabled = bool(state)
@@ -1148,6 +1180,11 @@ class SignalTimelineWindow(QMainWindow):
         # Thumbnails + live overlay view + face controller follow the same flag.
         if hasattr(self, 'edit_scene') and self.edit_scene is not None:
             self.edit_scene.set_vr_mode(enabled)
+        # The signal timeline's filmstrip lane draws from a cache of its own,
+        # and used to be the one view left showing both eyes with the seam
+        # down the middle of every thumbnail.
+        if getattr(self, 'signal_scene', None) is not None:
+            self.signal_scene.set_vr_mode(enabled)
         if hasattr(self, 'realtime_preview') and self.realtime_preview is not None:
             self.realtime_preview._view.set_vr_mode(enabled)
             if self.realtime_preview._live_face is not None:
@@ -2491,9 +2528,14 @@ class SignalTimelineWindow(QMainWindow):
 
         # Apply dark theme
         self.apply_dark_theme()
-        
+
         # Status bar
         self._update_status()
+
+        # Last, because it works by ticking the VR checkbox, and that has to
+        # reach every view that was just built.
+        startup_splash.stage("Checking how the frames are packed…")
+        self._detect_vr_layout()
         
         # Install event filter to handle global key events
         QApplication.instance().installEventFilter(self)

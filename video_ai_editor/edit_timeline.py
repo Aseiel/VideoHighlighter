@@ -17,7 +17,7 @@ from .timeline_bars import TimelineBar
 # ── thumbnail / hover modules ─────────────────────────────────────
 from .thumbnail_cache import ThumbnailCache, PRIORITY_HOVER
 from .hover_preview import HoverPreview
-from .filmstrip_painter import paint_filmstrip
+from .filmstrip_painter import DEFAULT_ASPECT, paint_filmstrip
 
 
 # Hover preview pulls a larger thumb than the filmstrip slots. Which also means
@@ -143,6 +143,7 @@ class EditClipItem(QGraphicsRectItem):
                 self.start_time,
                 self.end_time,
                 scene.thumb_cache,
+                aspect=scene.thumb_aspect,
             )
 
         # 3. Label backdrop — Premiere-style dark pill behind the text
@@ -633,6 +634,20 @@ class EditTimelineScene(QGraphicsScene):
         self.setSceneRect(0, 0, 1000, self.clip_height + 40)
         self.build_timeline()
 
+    @property
+    def thumb_aspect(self) -> float:
+        """Shape of the thumbnails the cache is handing out.
+
+        A side-by-side frame cropped to one eye is square, not 16:9, and the
+        slot it is drawn into has to know — otherwise the clip lays out slots
+        for a picture that never arrives and pads the one that does. Read from
+        the cache each time rather than stored, so the crop and the layout
+        cannot drift apart; paint and prefetch then agree by construction.
+        """
+        cache = self.thumb_cache
+        aspect = cache.frame_aspect() if cache is not None else None
+        return aspect or DEFAULT_ASPECT
+
     def set_vr_mode(self, enabled: bool):
         """Crop thumbnails to left half for side-by-side VR videos."""
         if self.thumb_cache is not None:
@@ -1037,8 +1052,7 @@ class EditTimelineScene(QGraphicsScene):
         else:
             lo, hi = float("-inf"), float("inf")
 
-        aspect = 16 / 9
-        target_slot_w = max(40, int(self.clip_height * aspect))
+        target_slot_w = max(40, int(self.clip_height * self.thumb_aspect))
         for item in self.clip_items:
             box = item.sceneBoundingRect()
             if box.right() < lo or box.left() > hi:

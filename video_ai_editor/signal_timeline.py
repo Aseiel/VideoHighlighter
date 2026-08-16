@@ -5,6 +5,7 @@ import json
 from modules import repaint_trace
 from .filmstrip_lane import LANE_HEIGHT as FILMSTRIP_LANE_HEIGHT
 from .filmstrip_lane import FilmstripLane
+from .filmstrip_painter import DEFAULT_ASPECT as DEFAULT_FILMSTRIP_ASPECT
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
     QGraphicsLineItem, QGraphicsItem, QApplication, QMenu
@@ -55,6 +56,10 @@ class SignalTimelineScene(QGraphicsScene):
         self._thumb_cache = None
         self._filmstrip_item = None
         self._filmstrip_repaint_pending = False
+        # Side-by-side footage shows the left eye only, like every other view of
+        # a frame in the app. Set from the window's VR checkbox (which the
+        # detector in modules/vr_detect ticks for itself when it can tell).
+        self._vr_mode = False
         
         # Waveform visualization
         self.waveform = waveform or []
@@ -1065,7 +1070,8 @@ class SignalTimelineScene(QGraphicsScene):
             return None
         try:
             from .thumbnail_cache import ThumbnailCache
-            self._thumb_cache = ThumbnailCache(self.video_path)
+            self._thumb_cache = ThumbnailCache(self.video_path,
+                                               vr_mode=self._vr_mode)
             # A frame arriving late has to repaint the strip, or it stays a
             # placeholder until something else happens to invalidate it.
             self._thumb_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
@@ -1073,6 +1079,39 @@ class SignalTimelineScene(QGraphicsScene):
             print(f"⚠️ Filmstrip disabled — no thumbnail source: {e}")
             self._thumb_cache = None
         return self._thumb_cache
+
+    def set_vr_mode(self, enabled: bool):
+        """Show the left eye of side-by-side footage in the filmstrip.
+
+        Two things have to move together. The cache has to crop, or the strip
+        is every moment twice at half the size — and the slots have to be
+        reshaped, or they stay 16:9 while the frames arriving are square, and
+        the painter fills the difference with placeholder bars.
+        """
+        enabled = bool(enabled)
+        if self._vr_mode == enabled:
+            return
+        self._vr_mode = enabled
+        if self._thumb_cache is not None:
+            self._thumb_cache.set_vr_mode(enabled)
+        item = self._filmstrip_item
+        if item is not None:
+            try:
+                item.set_aspect(self._filmstrip_aspect())
+            except RuntimeError:
+                # Deleted by a rebuild since it was drawn; the next one asks
+                # the cache for the shape itself.
+                self._filmstrip_item = None
+
+    def _filmstrip_aspect(self) -> float:
+        """Shape of the frames the strip will be drawing.
+
+        Asked of the cache rather than remembered here, so the crop and the
+        slot it is drawn into cannot disagree.
+        """
+        cache = self._thumb_cache
+        aspect = cache.frame_aspect() if cache is not None else None
+        return aspect or DEFAULT_FILMSTRIP_ASPECT
 
     def _on_thumbnail_ready(self, *_args):
         """Coalesce arriving frames into one repaint.
@@ -1107,7 +1146,8 @@ class SignalTimelineScene(QGraphicsScene):
         self.row_labels.append(("FILMSTRIP", y_pos))
         cache = self._ensure_thumb_cache()
         item = FilmstripLane(width, self.video_duration, cache,
-                             height=FILMSTRIP_LANE_HEIGHT)
+                             height=FILMSTRIP_LANE_HEIGHT,
+                             aspect=self._filmstrip_aspect())
         item.setPos(0, y_pos)
         # Under the playhead and the bars, above the background bands.
         item.setZValue(-5)
