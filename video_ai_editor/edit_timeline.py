@@ -20,8 +20,17 @@ from .hover_preview import HoverPreview
 from .filmstrip_painter import paint_filmstrip
 
 
-# Hover preview pulls a larger thumb than the filmstrip slots.
+# Hover preview pulls a larger thumb than the filmstrip slots. Which also means
+# it shares no cache key with them — (time, height) — so the frame under the
+# cursor has to be decoded again at this size even when the strip already drew
+# that exact moment. Hence the prefetch below and the stand-in in hoverMoveEvent.
 HOVER_PREVIEW_HEIGHT = 180
+
+# Frames to warm along a clip when the cursor enters it. Twelve covers a scrub
+# across a clip at roughly the spacing an eye notices, and stays a fixed cost:
+# per-second sampling would queue hundreds of decodes on a long clip and starve
+# the one the cursor is actually over.
+HOVER_PREFETCH_SLOTS = 12
 
 
 def _fmt_time(seconds: float) -> str:
@@ -373,6 +382,22 @@ class EditClipItem(QGraphicsRectItem):
             f"Duration: {duration:.1f}s\n"
             f"Drag to reorder · Double-click to play · Right-click for menu"
         )
+
+        # Start decoding hover-sized frames along this clip the moment the
+        # cursor arrives, so scrubbing across it mostly finds them ready. At
+        # PRIORITY_PREFETCH they queue behind anything on screen, and the frame
+        # actually hovered is promoted to the front when it is asked for. A
+        # fixed slot count rather than a fixed interval, so a long clip costs
+        # the same as a short one instead of queueing hundreds of decodes.
+        scene = self.scene()
+        if scene is not None and getattr(scene, 'thumb_cache', None) is not None:
+            try:
+                scene.thumb_cache.prefetch_range(
+                    self.start_time, self.end_time,
+                    HOVER_PREVIEW_HEIGHT, HOVER_PREFETCH_SLOTS)
+            except Exception as e:
+                print(f"⚠️ Hover prefetch skipped: {e}")
+
         super().hoverEnterEvent(event)
 
     def contextMenuEvent(self, event):
@@ -505,6 +530,14 @@ class EditClipItem(QGraphicsRectItem):
                     # decodes rather than only on the next mouse move — see
                     # EditTimelineScene._deliver_hover_frame.
                     scene._hover_wanted = None if pix is not None else source_time
+                    if pix is None:
+                        # Rather than the word "loading", put up whatever is
+                        # already decoded nearest this moment — usually the
+                        # filmstrip's own thumb of the same frame at a smaller
+                        # size. Upscaled and soft for a moment, then replaced by
+                        # the real one. Showing the right moment blurry reads as
+                        # the preview resolving; showing nothing reads as broken.
+                        pix = scene.thumb_cache.peek_nearest(source_time)
                     scene._hover_preview.show_at(
                         event.screenPos(),
                         pix,

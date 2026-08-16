@@ -212,6 +212,39 @@ class ThumbnailCache(QObject):
         time_ms, height = key
         return self.disk_dir / f"{time_ms}_{height}.jpg"
 
+    def peek_nearest(self, time_seconds: float, max_delta: float = 1.5):
+        """The closest frame already in memory, at any height, or None.
+
+        Never decodes and never queues: this is only ever a stand-in to put on
+        screen *now*, while the frame actually wanted is extracted.
+
+        It exists because the cache key is (time, height) and the same moment
+        is routinely already decoded at a different size — the filmstrips ask
+        for ~54px thumbs all along a clip, the hover popup asks for 180px, and
+        those never share a key. So the frame a hover wants has usually been
+        read off disk seconds ago at another size, and showing it upscaled beats
+        showing the word "loading".
+
+        Ranked by distance in time first and height second, so an exact-moment
+        frame at the wrong size always beats a nearby moment at the right one:
+        soft is a much smaller lie than showing a different part of the video.
+        """
+        target_ms = int(time_seconds * 1000)
+        window_ms = int(max_delta * 1000)
+        best = None
+        best_rank = None
+        # A snapshot, matching how request() reads _mem: the dict is only
+        # mutated from the GUI thread, and a stale entry here would at worst
+        # cost one stand-in.
+        for (t_ms, height), pix in list(self._mem.items()):
+            delta = abs(t_ms - target_ms)
+            if delta > window_ms:
+                continue
+            rank = (delta, -int(height))
+            if best_rank is None or rank < best_rank:
+                best_rank, best = rank, pix
+        return best
+
     def _add_to_mem(self, key: tuple, pixmap: QPixmap):
         self._mem[key] = pixmap
         self._mem.move_to_end(key)
