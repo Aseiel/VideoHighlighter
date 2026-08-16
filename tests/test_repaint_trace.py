@@ -8,9 +8,14 @@ do not serialise.
 
 from __future__ import annotations
 
+import os
+import time
+
 import pytest
 
 from modules import repaint_trace
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(repaint_trace.__file__)))
 
 
 @pytest.fixture(autouse=True)
@@ -128,3 +133,83 @@ class TestProbeIsSafeOnTheThingItInspects:
 class TestThreadCheck:
     def test_without_a_qapplication_it_declines_rather_than_guessing(self):
         assert repaint_trace.on_gui_thread() in {"yes", "no", "unknown"}
+
+
+class TestQtsOwnDiagnosticsAreCaptured:
+    """Qt's messages went nowhere, which is where these crashes went too.
+
+    `qWarning`/`qFatal` are written to the C-level stderr, not to the Python
+    object `debug_console` replaced — so the tee never saw them, and in a
+    `--windowed` build that descriptor is not connected to anything. A Qt fatal
+    prints one explanatory line and calls abort, and both halves were invisible.
+    """
+
+    def test_arming_installs_a_handler(self, trace):
+        qtcore = pytest.importorskip("PySide6.QtCore")
+        # qInstallMessageHandler returns the handler it replaced, so installing
+        # a throwaway one and getting ours back proves it was in place.
+        previous = qtcore.qInstallMessageHandler(None)
+        try:
+            assert previous is not None
+        finally:
+            qtcore.qInstallMessageHandler(previous)
+
+    def test_a_qt_warning_reaches_the_trace(self, trace):
+        qtcore = pytest.importorskip("PySide6.QtCore")
+        qtcore.qWarning("d3d device removed")
+
+        text = trace.read_text(encoding="utf-8")
+        assert "qt" in text and "d3d device removed" in text
+        assert "level='warning'" in text
+
+    def test_the_handler_cannot_take_the_process_down(self, trace):
+        qtcore = pytest.importorskip("PySide6.QtCore")
+        repaint_trace.reset_for_tests()      # handler still installed, file gone
+        qtcore.qWarning("after the handle closed")   # must not raise
+
+
+class TestATraceThatEndsWithoutAGoodbye:
+    def test_a_clean_shutdown_is_recorded(self, tmp_path):
+        # The line matters less than its absence: without it a trace that stops
+        # says only that the process stopped, not whether it was closed or
+        # killed. Run in a real subprocess, because the fact under test is that
+        # it happens at interpreter exit.
+        import subprocess
+        import sys
+
+        path = tmp_path / "trace.log"
+        subprocess.run(
+            [sys.executable, "-c",
+             f"import sys; sys.path.insert(0, r'{_REPO_ROOT}');"
+             "from modules import repaint_trace;"
+             f"repaint_trace.arm(r'{path}')"],
+            check=True, timeout=60)
+
+        assert "session.exit" in path.read_text(encoding="utf-8")
+
+    def test_a_killed_process_leaves_none(self, tmp_path):
+        import signal
+        import subprocess
+        import sys
+
+        path = tmp_path / "trace.log"
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             f"import sys, time; sys.path.insert(0, r'{_REPO_ROOT}');"
+             "from modules import repaint_trace;"
+             f"repaint_trace.arm(r'{path}');"
+             "repaint_trace.note('working'); time.sleep(30)"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if path.exists() and "working" in path.read_text(encoding="utf-8"):
+                    break
+                time.sleep(0.05)
+            proc.kill()
+        finally:
+            proc.wait(timeout=30)
+
+        text = path.read_text(encoding="utf-8")
+        assert "working" in text, "the child never got going"
+        assert "session.exit" not in text

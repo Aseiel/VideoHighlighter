@@ -87,11 +87,74 @@ def arm(path: str | None = None) -> bool:
                 faulthandler.enable(file=_fh)
             except Exception:
                 pass
+            _install_qt_message_handler()
+            _note_the_exit()
             _armed = True
             return True
         except Exception:
             _fh = None
             return False
+
+
+def _note_the_exit() -> None:
+    """Write one line on a normal shutdown.
+
+    Its absence is the evidence. Two of the crashes chased here left a trace
+    ending on a completed rebuild and nothing else — which says only that the
+    process stopped, not whether it was closed or killed. With this, a trace
+    that ends without `session.exit` was a death, and one that ends with it was
+    a person closing the window.
+    """
+    try:
+        import atexit
+        atexit.register(lambda: note("session.exit"))
+    except Exception:
+        pass
+
+
+def _install_qt_message_handler() -> None:
+    """Route Qt's own diagnostics into the trace.
+
+    Qt writes qWarning/qCritical/qFatal to the C-level stderr, which is not the
+    object `debug_console` replaced — so its tee never sees them, and in a
+    `--windowed` build that file descriptor goes nowhere at all. That is a
+    blind spot exactly where these crashes live: a Qt fatal (a lost D3D device,
+    an RHI or decoder failure under a heavy 8K load) prints its one explanatory
+    line and calls abort, and today both halves are invisible — the line
+    because nothing captures it, the abort because it is not a signal
+    faulthandler reports on Windows.
+
+    Messages also go to `print`, so they reach `debug.log` and the live log
+    window the way everything else does.
+    """
+    try:
+        from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+    except Exception:
+        return
+
+    levels = {
+        QtMsgType.QtDebugMsg: "debug",
+        QtMsgType.QtInfoMsg: "info",
+        QtMsgType.QtWarningMsg: "warning",
+        QtMsgType.QtCriticalMsg: "critical",
+        QtMsgType.QtFatalMsg: "fatal",
+    }
+
+    def handler(mode, context, message):
+        level = levels.get(mode, "unknown")
+        try:
+            note("qt", level=level, message=str(message))
+            # The interesting ones are worth seeing in the ordinary log too;
+            # Qt debug chatter would drown it.
+            if level in ("warning", "critical", "fatal"):
+                print(f"🧩 Qt {level}: {message}")
+        except Exception:
+            pass
+
+    try:
+        qInstallMessageHandler(handler)
+    except Exception:
+        pass
 
 
 def note(event: str, **fields) -> None:
