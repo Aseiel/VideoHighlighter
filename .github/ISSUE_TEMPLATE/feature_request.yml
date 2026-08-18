@@ -1,0 +1,18 @@
+name: Feature request
+description: Suggest a feature for the free/public app
+title: "[free] "
+labels:
+  - idea
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution (optional)
+    validations:
+      required: false
