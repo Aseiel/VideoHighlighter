@@ -163,6 +163,21 @@ def _check_cancel(cancel_token: Optional[CancellationToken]):
 # ---------------------------------------------------------------------------
 # Ollama backend
 # ---------------------------------------------------------------------------
+# What to give a model that reasons before it answers: no cap at all.
+#
+# Ollama reads a negative `num_predict` as "generate until the model stops", so
+# the reasoning ends where the model ends it rather than where a budget cut it
+# off. That is deliberate. The reasoning is not overhead to be minimised - a
+# narrator's job is to connect what the run measured to what the frames show,
+# and a model that works that through before writing is doing the thing that
+# was wanted. Capping it buys a faster run by making it dumber.
+#
+# The cost is real and is the user's to accept: measured against the clip brief
+# on `qwen3-vl:8b`, reasoning runs into thousands of tokens for a two-sentence
+# paragraph, so a run on such a model takes minutes per clip.
+THINKING_BUDGET = -1
+
+
 class _OllamaBackend(_LLMBackend):
     """Talks to a local Ollama server (http://localhost:11434)."""
 
@@ -170,6 +185,10 @@ class _OllamaBackend(_LLMBackend):
         self.model = model
         self.base_url = base_url.rstrip("/")
         self._loaded = False
+        # Whether this model reasons before it answers. Read from the server at
+        # load() where the server will say, and otherwise discovered by the
+        # first call that comes back as reasoning only.
+        self._thinks = False
 
     @staticmethod
     def available() -> bool:
@@ -194,6 +213,32 @@ class _OllamaBackend(_LLMBackend):
                     f"Run: ollama pull {self.model}"
                 )
             self._loaded = True
+
+            # Ollama lists `thinking` among a model's capabilities, so the
+            # budget can be right on the first call instead of after one spent
+            # discovering it. That wasted call is not free: a reasoning-only
+            # reply costs its whole budget, and on a CPU-bound server that is
+            # over a minute of a run buying nothing but a log line.
+            #
+            # Best-effort: an older server, a proxy, or a model without the
+            # field leaves the flag alone and the retry below covers it. Only
+            # the asking is guarded - wrapping the logging too would report a
+            # console that cannot encode the message as a failure to read the
+            # capability, which is a true sentence about the wrong thing.
+            capabilities = None
+            try:
+                shown = requests.post(f"{self.base_url}/api/show",
+                                      json={"model": self.model}, timeout=5)
+                if shown.ok:
+                    capabilities = shown.json().get("capabilities") or []
+            except Exception as exc:
+                print(f"   (could not read capabilities for {self.model}: {exc})")
+
+            if capabilities is not None:
+                self._thinks = "thinking" in capabilities
+                if self._thinks:
+                    print(f"[thinking] '{self.model}' reasons before answering; "
+                          f"its replies are uncapped and will take longer.")
         except requests.ConnectionError:
             raise RuntimeError(
                 "Cannot connect to Ollama at "
@@ -212,11 +257,21 @@ class _OllamaBackend(_LLMBackend):
         import json as _json
         import time as _time
 
+        # Discovered once, applied for the rest of the run: a model that
+        # reasons gets the uncapped budget on every later call, instead of
+        # every clip paying a wasted call to find out again.
+        if self._thinks:
+            max_tokens = THINKING_BUDGET
+
         payload = {
             "model": self.model,
             "prompt": prompt,
             "system": system,
             "stream": True,  # Always stream internally so we can cancel + capture timing
+            # Reasoning tags think by default. Ollama ignores this on models
+            # that cannot think - and, measured on `qwen3-vl:8b`, on some that
+            # can, which is what the retry below exists for.
+            "think": False,
             "options": {
                 "num_predict": max_tokens,
                 "num_ctx": 2048,
@@ -237,6 +292,7 @@ class _OllamaBackend(_LLMBackend):
 
         # ── Phase 2: send request and stream response ──
         full_text = []
+        thought_text = []
         final_chunk = None
         t_send_start = _time.perf_counter()
         t_headers_received = None
@@ -258,6 +314,13 @@ class _OllamaBackend(_LLMBackend):
                     t_first_byte = _time.perf_counter()
                 _check_cancel(cancellation_token)
                 chunk = _json.loads(line)
+                # A thinking model streams its reasoning in a separate field
+                # and leaves `response` empty until it is done. Collected only
+                # to tell "spent the budget thinking" apart from "had nothing
+                # to say" below; it is never part of the answer.
+                thinking = chunk.get("thinking", "")
+                if thinking:
+                    thought_text.append(thinking)
                 token = chunk.get("response", "")
                 if token:
                     full_text.append(token)
@@ -311,10 +374,221 @@ class _OllamaBackend(_LLMBackend):
             )
 
         raw = "".join(full_text)
+
+        # `think: False` is a request, not a guarantee. Measured on
+        # `qwen3-vl:8b` against Ollama 0.17.1: the flag is ignored, `/no_think`
+        # in the prompt and in the system message are both ignored, and the
+        # model reasons for thousands of tokens before it begins to answer.
+        # Under a narration-sized budget `response` is therefore empty on every
+        # call - which reaches the caller as a clip that simply had no
+        # paragraph, and a whole run of them as a report with nothing in it to
+        # summarise, after paying for every call.
+        if not raw.strip() and thought_text:
+            thought_n = len("".join(thought_text))
+
+            if max_tokens != THINKING_BUDGET:
+                self._thinks = True
+                print(f"[thinking] '{self.model}' spent all {max_tokens} "
+                      f"tokens reasoning; retrying with no cap, and leaving it "
+                      f"uncapped for the rest of this run.")
+                # Terminates: the retry is made with THINKING_BUDGET, so this
+                # branch cannot be taken twice for the same call.
+                return self.generate(
+                    prompt, system=system, max_tokens=THINKING_BUDGET,
+                    temperature=temperature,
+                    stream_callback=stream_callback, images=images,
+                    cancellation_token=cancellation_token)
+
+            raise RuntimeError(
+                f"'{self.model}' reasoned for {thought_n} characters without "
+                f"an answer, uncapped, so it ran out of context rather than of "
+                f"budget. Reasoning scales with what it was asked to satisfy: "
+                f"a shorter brief leaves room for the reply.")
+
         return sanitize_response(raw)
 
     def unload(self):
         self._loaded = False
+
+
+# ---------------------------------------------------------------------------
+# OpenVINO backend (Intel GPU / NPU / CPU, in-process)
+# ---------------------------------------------------------------------------
+# Why this exists beside Ollama, measured on an Arc A750 over the same frames
+# and the same brief: 41 tok/s against 4.9 with a picture in the context, and
+# an image encode of about a second against forty-six. The encode is the
+# structural half — the vision tower is an OpenVINO graph and runs on the GPU,
+# where llama.cpp falls back to the CPU for it whichever backend is chosen.
+# See `docs/INTEL-GPU.md`.
+#
+# The cost is that models arrive as OpenVINO IR rather than GGUF, so there is
+# no `pull`: the path below is a directory the user had to obtain or convert.
+# That is a setup step this backend cannot hide, only explain.
+
+# A thinking model's reasoning comes back inline here, where Ollama puts it in
+# a field of its own. It is terminated by this and — because the chat template
+# opens the block in the prompt — is NOT preceded by an opening tag, so the
+# obvious `<think>.*?</think>` strip matches nothing and would publish the
+# model's private deliberation as the description. Split on the last close.
+THINK_CLOSE = "</think>"
+
+
+class _OpenVINOBackend(_LLMBackend):
+    """Runs a vision-language model in-process through OpenVINO GenAI."""
+
+    def __init__(self, model_path: str, device: str = "GPU"):
+        self.model_path = model_path
+        self.device = device
+        self._pipe = None
+        # Read off the chat template at load, rather than discovered by a
+        # wasted call: a build whose template carries the think tags reasons
+        # before it answers, and one whose template does not, does not.
+        self._thinks = False
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            import openvino_genai  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
+    def devices() -> list:
+        """Which OpenVINO devices this machine offers, e.g. ['CPU', 'GPU']."""
+        try:
+            import openvino as ov
+            return list(ov.Core().available_devices)
+        except Exception:
+            return []
+
+    def load(self, **kwargs):
+        if not os.path.isdir(self.model_path):
+            raise FileNotFoundError(
+                f"No OpenVINO model directory at {self.model_path}. This "
+                f"backend needs a converted model (OpenVINO IR), not a GGUF "
+                f"and not an Ollama tag - see docs/INTEL-GPU.md.")
+        import openvino_genai as ov_genai
+
+        template = os.path.join(self.model_path, "chat_template.jinja")
+        try:
+            with open(template, encoding="utf-8") as fh:
+                self._thinks = THINK_CLOSE in fh.read()
+        except OSError:
+            self._thinks = False
+
+        print(f"[OpenVINO] loading {os.path.basename(self.model_path)} on "
+              f"{self.device}"
+              + (" (reasons before answering)" if self._thinks else ""))
+        self._pipe = ov_genai.VLMPipeline(self.model_path, self.device)
+
+    def is_loaded(self) -> bool:
+        return self._pipe is not None
+
+    def accepts_images(self) -> bool:
+        return True
+
+    def unload(self):
+        self._pipe = None
+
+    def _tensors(self, images):
+        """base64 strings, as the rest of this module passes them, to Tensors.
+
+        Returns before importing anything when there are no frames. Pillow and
+        numpy are only needed to turn a picture into a tensor, so a text-only
+        call must not require them to be installed - CI has neither, and an
+        unconditional import there failed ten tests that never passed an image.
+        """
+        frames = [raw for raw in (images or []) if raw]
+        if not frames:
+            return []
+
+        import base64 as _b64
+        import io as _io
+
+        import numpy as _np
+        import openvino as ov
+        from PIL import Image
+
+        out = []
+        for raw in frames:
+            img = Image.open(_io.BytesIO(_b64.b64decode(raw))).convert("RGB")
+            out.append(ov.Tensor(_np.array(img)[None]))
+        return out
+
+    def generate(self, prompt: str, system: str = "", max_tokens: int = 1024,
+                 temperature: float = 0.7, stream_callback: Optional[Callable] = None,
+                 images: list[str] | None = None,
+                 cancellation_token: Optional[CancellationToken] = None,
+                 seed: Optional[int] = None) -> str:
+        if self._pipe is None:
+            raise RuntimeError("OpenVINO backend used before load()")
+        import openvino_genai as ov_genai
+
+        config = ov_genai.GenerationConfig()
+        # Left at its default, which is unbounded, whenever the model reasons -
+        # the same decision as the Ollama backend and for the same reason: a cap
+        # is spent on the reasoning first and the answer never arrives.
+        if not self._thinks and max_tokens and max_tokens > 0:
+            config.max_new_tokens = int(max_tokens)
+        config.do_sample = bool(temperature and temperature > 0)
+        if config.do_sample:
+            config.temperature = float(temperature)
+        if seed is not None:
+            config.rng_seed = int(seed)
+
+        full = []
+        answering = [not self._thinks]
+
+        def _streamer(chunk):
+            """Forward the answer only, and stop early when cancelled.
+
+            The reasoning is deliberately not streamed. Ollama's `thinking`
+            never reached a caller either, and a live pane filling with the
+            model talking to itself about rule four is not what this is for.
+            """
+            full.append(chunk)
+            if cancellation_token and cancellation_token.is_cancelled:
+                return True
+            if stream_callback:
+                if answering[0]:
+                    stream_callback(chunk)
+                elif THINK_CLOSE in "".join(full):
+                    answering[0] = True
+                    tail = "".join(full).rsplit(THINK_CLOSE, 1)[-1]
+                    if tail:
+                        stream_callback(tail)
+            return False
+
+        tensors = self._tensors(images)
+        kwargs = {"generation_config": config, "streamer": _streamer}
+        if tensors:
+            kwargs["images"] = tensors
+        full_prompt = f"{system}\n\n{prompt}" if system else prompt
+        self._pipe.generate(full_prompt, **kwargs)
+
+        _check_cancel(cancellation_token)
+
+        text = "".join(full)
+        if THINK_CLOSE in text:
+            answer = text.rsplit(THINK_CLOSE, 1)[-1].strip()
+        elif self._thinks:
+            # A model that reasons and never closed the block was still
+            # reasoning when it stopped, so every character of this is
+            # deliberation. Falling through to `text` here would publish it as
+            # the description - the exact failure this split exists to prevent.
+            answer = ""
+        else:
+            answer = text.strip()
+
+        if not answer and self._thinks and text.strip():
+            raise RuntimeError(
+                f"'{os.path.basename(self.model_path)}' reasoned for "
+                f"{len(text)} characters without an answer. Reasoning scales "
+                f"with what it was asked to satisfy: a shorter brief leaves "
+                f"room for the reply.")
+
+        return sanitize_response(answer)
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +1125,7 @@ class LLMModule:
         n_ctx: int = 4096,
         n_gpu_layers: int = -1,
         log_fn: Callable = print,
+        device: str = "GPU",
     ):
         self.backend_name = backend
         self.log_fn = log_fn
@@ -865,6 +1140,10 @@ class LLMModule:
                 n_ctx=n_ctx,
                 n_gpu_layers=n_gpu_layers
             )
+        elif backend == "openvino":
+            # `model_path` is a converted-model directory here, not a file, and
+            # `device` is an OpenVINO device string rather than a layer count.
+            self._backend = _OpenVINOBackend(model_path=model_path, device=device)
         else:
             raise ValueError(f"Unknown backend: {backend}. Use 'ollama' or 'llama-cpp'.")
 
