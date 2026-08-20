@@ -2799,6 +2799,17 @@ class VideoHighlighterGUI(QWidget):
         self.keep_temp_chk.clicked.connect(lambda: self.keep_temp_chk.setText(
             "Keep temp clips: ON" if self.keep_temp_chk.isChecked() else "Keep temp clips: OFF"))
 
+        _export_on = bool(highlights_cfg.get("export_separate_clips", False))
+        self.export_clips_chk = QPushButton(
+            "Export clips: ON" if _export_on else "Export clips: OFF")
+        self.export_clips_chk.setCheckable(True)
+        self.export_clips_chk.setChecked(_export_on)
+        self.export_clips_chk.clicked.connect(lambda: self.export_clips_chk.setText(
+            "Export clips: ON" if self.export_clips_chk.isChecked() else "Export clips: OFF"))
+        self.export_clips_chk.setToolTip(
+            "Also write each scored segment as its own file under\n"
+            "<video>_clips/ next to the concatenated highlight reel.")
+
         self.timeline_btn = QPushButton("Timeline Viewer")
         self.timeline_btn.setStyleSheet("QPushButton { background-color: #2f81f7; color: white; font-weight: bold; padding: 8px; }")
         self.timeline_btn.clicked.connect(self.open_timeline_viewer)
@@ -2850,6 +2861,7 @@ class VideoHighlighterGUI(QWidget):
 
         ctrl_layout.addWidget(self.cancel_btn)
         ctrl_layout.addWidget(self.keep_temp_chk)
+        ctrl_layout.addWidget(self.export_clips_chk)
         ctrl_layout.addWidget(self.timeline_btn)
         ctrl_layout.addWidget(self.why_report_btn)
         ctrl_layout.addWidget(self.ai_summary_btn)
@@ -3745,6 +3757,7 @@ class VideoHighlighterGUI(QWidget):
             "multi_signal_boost": 1.2,
             "min_signals_for_boost": 2,
             "keep_temp": self.keep_temp_chk.isChecked(),
+            "export_separate_clips": self.export_clips_chk.isChecked(),
             "render_mode": self.render_mode_combo.currentData(),
             "highlight_objects": highlight_objects,
             "interesting_actions": interesting_actions,
@@ -4280,6 +4293,7 @@ class VideoHighlighterGUI(QWidget):
                 "max_duration": int(self.spin_max_duration.value()),
                 "exact_duration": int(self.spin_exact_duration.value()),
                 "keep_temp": self.keep_temp_chk.isChecked(),
+                "export_separate_clips": self.export_clips_chk.isChecked(),
                 "render_mode": self.render_mode_combo.currentData(),
                 "auto_min_clip": int(self.spin_auto_min_clip.value()),
                 "auto_max_clip": int(self.spin_auto_max_clip.value()),
@@ -5136,6 +5150,7 @@ class VideoHighlighterGUI(QWidget):
             "multi_signal_boost": 1.2,
             "min_signals_for_boost": 2,
             "keep_temp": self.keep_temp_chk.isChecked(),
+            "export_separate_clips": self.export_clips_chk.isChecked(),
             "render_mode": self.render_mode_combo.currentData(),
             "output_file": output_file,
             "highlight_objects": highlight_objects,

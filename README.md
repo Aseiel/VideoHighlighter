@@ -8,7 +8,9 @@ VideoHighlighter (Freeware)
 **English** | [中文](./README_zh-CN.md) | [日本語](./README_ja.md) | [Español](./README_es.md)
 <!-- hy-mt2-i18n:end -->
 
-A Python tool to automatically generate highlight clips from videos using scene detection, motion detection, audio peaks, object detection, action recognition, and transcript analysis.
+**Find and explain the moments that matter in footage you won't upload — then export a cut, on your machine.**
+
+A local desktop tool: drop raw video, score strong moments (scene, motion, audio, objects, actions, transcript), see *why* they scored on a signal timeline and report, then export a highlight reel and separate clips. Nothing is uploaded for analysis.
 
 > **It's free.** To make sure you see new releases in future, please click the
 > motivation button: the ⭐ at the top of the page. It's the cheapest payment we
@@ -24,8 +26,8 @@ Detects:
 - Actions
 - Audio peaks.
 
-Generates transcript subtitles via OpenAI Whisper.
-Cuts and merges top scoring segments into a highlight video.
+Generates transcript subtitles via OpenAI Whisper (local).
+Cuts top-scoring segments into a highlight video and optional separate clips.
 Fully configurable: frame skip, highlight duration, keywords.
 Optional GUI for easy interaction.
 
@@ -85,16 +87,20 @@ This edition remains free and AGPL-3.0 licensed.
 No Python or dependencies required — run `VideoHighlighter.exe` inside the extracted folder.
 
 ### macOS
-Download the `.dmg` from [Releases](https://github.com/Aseiel/VideoHighlighter/releases).
+**Not a supported product download.** The prebuilt app we sell and support is
+Windows-only. You can try building from source on macOS if you know the stack;
+we do not ship or support a Mac release yet.
 
 ### Linux / building from source
 1. **Python & FFmpeg**
    FFmpeg must be installed and available in your system PATH.
 
 ## Usage
-Linux: python main.py 
-Windows: run Videohighlighter.exe
-Mac: I think not working, will fix it one day. DMG file is still generated
+- **Windows:** run `VideoHighlighter.exe` from the extracted build.
+- **From source (Linux / advanced):** `python main.py`
+
+Footage, transcripts, and local models stay on disk. Analysis does not require
+an API key for the basic pipeline.
 
 ## Discord
 VideoHighlighter occasionally has feelings about your footage. When it does:
@@ -119,6 +125,6 @@ This repository is released under the GNU Affero General Public License v3.0 (AG
 
 This project started as a personal tool to automatically generate subtitles for videos, for my young 7 years old son. Over time, it evolved into a highlights generator for movies, sports, and personal videos.
 
-The primary goal remains practical: speed up video analysis, generate highlights, and create accessible subtitles automatically.
+The primary goal remains practical: speed up video analysis, generate highlights you can explain, and create accessible subtitles automatically — without uploading footage you would rather keep local.
 
 ![Stars History](assets/star-history-2026630.png)

@@ -467,6 +467,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             COVERAGE = config.get("highlights", {}).get("coverage", 0.0)
         COVERAGE = float(COVERAGE)
         KEEP_TEMP = gui_config.get("keep_temp", config.get("highlights", {}).get("keep_temp", False))
+        EXPORT_CLIPS = bool(gui_config.get(
+            "export_separate_clips",
+            config.get("highlights", {}).get("export_separate_clips", False)))
         # How the final clips are cut/encoded: "cpu" (libx265/libx264 re-encode,
         # VR-safe, slow) or "gpu" (hardware re-encode, fast, may not play in some
         # VR players).
@@ -2562,79 +2565,91 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                               "gpu": "GPU re-encode"}[RENDER_MODE]
         log(f"🔹 Step 7: Cutting video segments... [{_render_mode_label}]")
         try:
+            from modules.clip_export import (
+                clips_directory, sanitize_base_name, segment_clip_path,
+            )
+            import re
+            import shutil
+
             if len(segments) == 0:
                 log("⚠️ No segments selected — nothing to cut.")
-            elif len(segments) == 1:
+            elif len(segments) == 1 and not EXPORT_CLIPS:
                 check_cancellation(cancel_flag, log, "video cutting")
-                cut_video(processed_video_path, segments[0][0], segments[0][1], OUTPUT_FILE, mode=RENDER_MODE)
+                cut_video(
+                    processed_video_path, segments[0][0], segments[0][1],
+                    OUTPUT_FILE, mode=RENDER_MODE)
+                log(f"✅ Highlight saved: {OUTPUT_FILE}, duration {total_duration:.1f}s")
             else:
-                temp_clips = []
-                # Get the directory of the output file to save temp clips in the same location
-                output_dir = os.path.dirname(OUTPUT_FILE)
-                video_base_name = os.path.splitext(os.path.basename(processed_video_path))[0]
-                
-                # Sanitize the base name to avoid issues with special characters
-                import re
-                video_base_name = re.sub(r"['\"]", "", video_base_name)
-                video_base_name = re.sub(r"[@#$%^&*()]", "_", video_base_name)
-                
+                output_dir = os.path.dirname(OUTPUT_FILE) or "."
+                video_base_name = sanitize_base_name(
+                    os.path.splitext(os.path.basename(processed_video_path))[0])
+                clip_paths = []
+                clips_dir = None
+                if EXPORT_CLIPS:
+                    clips_dir = clips_directory(OUTPUT_FILE, video_base_name)
+                    os.makedirs(clips_dir, exist_ok=True)
+                    log(f"📁 Separate clips → {clips_dir}")
+
                 for i, (s, e) in enumerate(segments):
                     check_cancellation(cancel_flag, log, f"video cutting clip {i+1}")
-                    # Include the directory path for temp files
-                    temp_name = os.path.join(output_dir, f"{video_base_name}_temp_clip_{i}.mp4")
-                    log(f"  Creating temp clip: {temp_name}")
-                    cut_video(processed_video_path, s, e, temp_name, mode=RENDER_MODE)
-                    
-                    # Verify the file was created
-                    if not os.path.exists(temp_name):
-                        raise Exception(f"Failed to create temp clip: {temp_name}")
-                    
-                    temp_clips.append(temp_name)
-                    # Update progress for each clip
-                    progress.update_progress(90 + (i+1) * 5 // len(segments), 100, "Pipeline", f"Cut clip {i+1}/{len(segments)}")
-                
-                check_cancellation(cancel_flag, log, "video concatenation")
-                
-                concat_file = os.path.join(output_dir, "concat_list.txt")
-                log(f"📝 Writing concat file: {concat_file}")
-                with open(concat_file, "w", encoding='utf-8') as f:
-                    for t in temp_clips:
-                        # Use absolute path and convert to forward slashes
-                        abs_path = os.path.abspath(t).replace('\\', '/')
-                        f.write(f"file '{abs_path}'\n")
-                
-                # DEBUG: Print concat file contents
-                log("📋 Concat file contents:")
-                with open(concat_file, "r", encoding='utf-8') as f:
-                    log(f.read())
-                
-                # Normalize concat file path
-                concat_file_normalized = concat_file.replace('\\', '/')
-                
-                # Sanitize OUTPUT_FILE name too
-                output_filename = os.path.basename(OUTPUT_FILE)
-                output_filename_clean = re.sub(r"['\"]", "", output_filename)
-                output_filename_clean = re.sub(r"[@#$%^&*()]", "_", output_filename_clean)
-                OUTPUT_FILE_CLEAN = os.path.join(output_dir, output_filename_clean)
-                
-                log(f"🎬 Running FFmpeg concatenation to: {OUTPUT_FILE_CLEAN}")
-                subprocess.run([ffmpeg_exe(), "-y", "-v", "error", "-f", "concat", "-safe", "0",
-                                "-i", concat_file_normalized, "-c", "copy", OUTPUT_FILE_CLEAN], check=True)
-                
-                # Update OUTPUT_FILE to the cleaned version
-                OUTPUT_FILE = OUTPUT_FILE_CLEAN
-                
-                if not KEEP_TEMP:
-                    for t in temp_clips:
+                    if EXPORT_CLIPS:
+                        clip_path = segment_clip_path(
+                            OUTPUT_FILE, video_base_name, i + 1, s, e)
+                    else:
+                        clip_path = os.path.join(
+                            output_dir, f"{video_base_name}_temp_clip_{i}.mp4")
+                    log(f"  Creating clip: {clip_path}")
+                    cut_video(processed_video_path, s, e, clip_path, mode=RENDER_MODE)
+                    if not os.path.exists(clip_path):
+                        raise Exception(f"Failed to create clip: {clip_path}")
+                    clip_paths.append(clip_path)
+                    progress.update_progress(
+                        90 + (i + 1) * 5 // len(segments), 100,
+                        "Pipeline", f"Cut clip {i+1}/{len(segments)}")
+
+                if len(segments) == 1:
+                    os.makedirs(output_dir, exist_ok=True)
+                    shutil.copy2(clip_paths[0], OUTPUT_FILE)
+                else:
+                    check_cancellation(cancel_flag, log, "video concatenation")
+                    concat_file = os.path.join(output_dir, "concat_list.txt")
+                    log(f"📝 Writing concat file: {concat_file}")
+                    with open(concat_file, "w", encoding="utf-8") as f:
+                        for t in clip_paths:
+                            abs_path = os.path.abspath(t).replace("\\", "/")
+                            f.write(f"file '{abs_path}'\n")
+
+                    concat_file_normalized = concat_file.replace("\\", "/")
+                    output_filename = os.path.basename(OUTPUT_FILE)
+                    output_filename_clean = re.sub(r"['\"]", "", output_filename)
+                    output_filename_clean = re.sub(
+                        r"[@#$%^&*()]", "_", output_filename_clean)
+                    OUTPUT_FILE_CLEAN = os.path.join(output_dir, output_filename_clean)
+
+                    log(f"🎬 Running FFmpeg concatenation to: {OUTPUT_FILE_CLEAN}")
+                    subprocess.run([
+                        ffmpeg_exe(), "-y", "-v", "error", "-f", "concat",
+                        "-safe", "0", "-i", concat_file_normalized,
+                        "-c", "copy", OUTPUT_FILE_CLEAN,
+                    ], check=True)
+                    OUTPUT_FILE = OUTPUT_FILE_CLEAN
+
+                    if not KEEP_TEMP:
+                        try:
+                            os.remove(concat_file)
+                        except Exception:
+                            pass
+
+                if not EXPORT_CLIPS and not KEEP_TEMP:
+                    for t in clip_paths:
                         try:
                             os.remove(t)
                         except Exception:
                             pass
-                    try:
-                        os.remove(concat_file)
-                    except Exception:
-                        pass
-            log(f"✅ Highlight saved: {OUTPUT_FILE}, duration {total_duration:.1f}s")
+
+                if EXPORT_CLIPS and clips_dir:
+                    log(f"✅ {len(clip_paths)} separate clip(s) in {clips_dir}")
+                log(f"✅ Highlight saved: {OUTPUT_FILE}, duration {total_duration:.1f}s")
         except RuntimeError:
             return None
         except Exception as e:
