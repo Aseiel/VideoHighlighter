@@ -1,6 +1,11 @@
 from .timeline_bars import TimelineBar, DraggableTimelineBar
 from collections import defaultdict
 import json
+
+from modules import repaint_trace
+from .filmstrip_lane import LANE_HEIGHT as FILMSTRIP_LANE_HEIGHT
+from .filmstrip_lane import FilmstripLane
+from .filmstrip_painter import DEFAULT_ASPECT as DEFAULT_FILMSTRIP_ASPECT
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
     QGraphicsLineItem, QGraphicsItem, QApplication, QMenu
@@ -18,7 +23,14 @@ class SignalTimelineScene(QGraphicsScene):
     # into two bars. Object detection may sample coarser than once per second,
     # so a strict "consecutive" test would shatter a continuous event.
     EVENT_RUN_GAP = 2.0
-    
+
+    # Scene units left clear above the first lane and below the last one. The
+    # bottom strip is where the ruler's labels live (see LABEL_BAND_PX, which is
+    # the same band measured in screen pixels — it is a little larger here so
+    # the labels still clear the last lane once the view scales the scene down).
+    TOP_MARGIN = 40
+    RULER_BAND = 34
+
     time_clicked = Signal(float)
     time_dragged = Signal(float)
     add_to_edit_requested = Signal(float)
@@ -31,10 +43,23 @@ class SignalTimelineScene(QGraphicsScene):
     undo_highlight_swap_requested = Signal()
     current_time_changed = Signal(float)        # playhead moved, for any reason
     
-    def __init__(self, cache_data, video_duration, parent=None, waveform=None):
+    def __init__(self, cache_data, video_duration, parent=None, waveform=None,
+                 video_path=None):
         super().__init__(parent)
         self.cache_data = cache_data
         self.video_duration = max(video_duration, 1.0)
+
+        # Where the filmstrip lane gets its frames. Falls back to the path the
+        # cache was written for, so a scene built without one still finds the
+        # video it is describing.
+        self.video_path = video_path or (cache_data or {}).get('video_path')
+        self._thumb_cache = None
+        self._filmstrip_item = None
+        self._filmstrip_repaint_pending = False
+        # Side-by-side footage shows the left eye only, like every other view of
+        # a frame in the app. Set from the window's VR checkbox (which the
+        # detector in modules/vr_detect ticks for itself when it can tell).
+        self._vr_mode = False
         
         # Waveform visualization
         self.waveform = waveform or []
@@ -113,7 +138,11 @@ class SignalTimelineScene(QGraphicsScene):
             ('scenes', ['Scenes']),
             ('motion', ['Motion Events', 'Motion Peaks']),
             ('audio', ['Audio Peaks']),
-            ('highlights', ['Final Highlights'])
+            ('highlights', ['Final Highlights']),
+            # Last, so it sits at the bottom of the stack — as close as the
+            # signal timeline gets to the edit timeline directly beneath it,
+            # which is the strip you are comparing it against.
+            ('filmstrip', ['Filmstrip']),
         ]
         
         # Layer visibility - initialize all to visible
@@ -834,13 +863,49 @@ class SignalTimelineScene(QGraphicsScene):
     
     def build_timeline(self):
         """Rebuild the timeline with waveform"""
+        with repaint_trace.rebuild("build_timeline",
+                                   duration=self.video_duration,
+                                   pps=self.pixels_per_second):
+            self._build_timeline()
+
+    def _build_timeline(self):
         print(f"🔄 SignalTimelineScene.build_timeline() called")
         print(f"   - Waveform data: {self.waveform is not None}, length: {len(self.waveform)}")
-        
+
+        # Which references into the scene are still backed by a live C++ object
+        # *before* clear() runs. Anything reported dangling here outlived a
+        # previous rebuild, and is a crash already queued up rather than one
+        # about to be caused.
+        repaint_trace.note("rebuild.items_before", **repaint_trace.probe(
+            self, "current_time_line", "current_time_caret",
+            "_selection_rect_item", "_selection_label_item"))
+
         # Clear selection state — items are about to be wiped by self.clear()
         self._selection_rect_item  = None
         self._selection_label_item = None
         self._selection_active     = False
+
+        # The playhead needs the same treatment, and used not to get it. clear()
+        # deletes the C++ objects behind these two but leaves the attributes
+        # pointing at the corpses, and the rebuild below repositions the playhead
+        # before it returns — so every confidence adjustment reached through a
+        # dead wrapper. Touching a deleted QGraphicsItem is undefined behaviour
+        # rather than a defined no-op: it survived on some builds, which is why
+        # this took a crash with no traceback to find. Dropping the references
+        # makes set_current_time recreate the playhead instead of resurrecting it.
+        self.current_time_line = None
+        self.current_time_caret = None
+        # Same reason: clear() deletes the lane, and a thumbnail arriving after
+        # that would otherwise repaint through a dead wrapper.
+        self._filmstrip_item = None
+        # And the ruler's, which is where this actually killed the process:
+        # repaint_trace.log has an access violation inside draw_time_markers,
+        # on the loop that removes the previous pass's markers. clear() had
+        # already deleted them, and the RuntimeError guard there only catches
+        # the case where PySide noticed — when it doesn't, asking a corpse for
+        # its scene() is undefined behaviour, and here it was fatal. Nothing
+        # below needs the old list: clear() has taken every one of them.
+        self._time_marker_items = []
 
         # If we have a view connected, store its current transform
         views = self.views()
@@ -855,40 +920,27 @@ class SignalTimelineScene(QGraphicsScene):
         # Calculate width based on video duration
         width = self.video_duration * self.pixels_per_second
         
-        # Start with base height for time ruler
-        height = 50  # Time ruler and labels
-        
-        # ONLY add waveform height if it's visible AND has data
-        if self.visible_layers.get('waveform', False) and self.waveform:
-            height += 80 + self.layer_spacing  # Waveform height with spacing after waveform
-        
-        # Add height for other visible layers
-        for _, tracks in self.group_order:
-            for track in tracks:
-                key = track.lower().replace(' ', '_')
-                if 'action:' in key:
-                    key = 'actions'
-                elif 'object:' in key:
-                    key = 'objects'
-                elif 'event:' in key:
-                    key = 'events'
-                elif 'search:' in key:
-                    key = 'visual_search'
-                elif 'final highlights' in key.lower():
-                    key = 'highlights'
-                
-                if self.visible_layers.get(key, True):
-                    height += self.layer_height + self.layer_spacing
-        
-        self.setSceneRect(0, 0, width, height)
+        # The scene is sized from what the layers actually drew — see the
+        # setSceneRect after them. It used to be sized from a height budget
+        # computed up here, which was a second copy of the layout and drifted
+        # from the first: the budget reserved a lane per *track name* (one per
+        # object class, per action, per query), while the drawing collapses each
+        # of those groups into a single lane. A run with a dozen detected
+        # classes therefore claimed several hundred pixels that nothing was ever
+        # drawn in, and _fit_vertical dutifully squashed the real lanes to fit a
+        # scene that was mostly padding — rows stacked on top of each other
+        # under a huge empty band, with the ruler stranded at the bottom of it.
+        # Deriving the height from the drawing is the only version of this that
+        # cannot drift again.
+        #
+        # Only the width matters while drawing (the waveform spans it), so the
+        # height in this first rect is a placeholder.
+        self.setSceneRect(0, 0, width, self.TOP_MARGIN)
         self.clear()
         self.bars = []
-        
-        # Draw background
-        self.draw_background()
-        
+
         # Start drawing below time markers
-        current_y = 40
+        current_y = self.TOP_MARGIN
         self.row_labels = []
         
         # Draw waveform if visible
@@ -948,7 +1000,23 @@ class SignalTimelineScene(QGraphicsScene):
         # Layer 8: Highlight Segments
         if self.visible_layers.get('highlights', True):
             current_y = self.draw_highlights_layer(current_y)
-        
+
+        # Layer 9: the footage itself, last so it sits nearest the edit
+        # timeline below — the two then read as one continuous strip.
+        if self.visible_layers.get('filmstrip', True):
+            current_y = self.draw_filmstrip_layer(current_y, width)
+
+        # Now that the lanes exist, the scene is exactly as tall as they made it,
+        # plus a strip at the bottom for the ruler's labels — those hang below
+        # the content, and without room reserved for them they would be painted
+        # over the last lane.
+        self.setSceneRect(0, 0, width, current_y + self.RULER_BAND)
+
+        # Background last of the full-width fills, but z=-10 keeps it behind
+        # everything; it has to come after the rect above, since it is sized
+        # from it.
+        self.draw_background()
+
         # Alternating lane bands behind every other row, so the tracks read as
         # lanes instead of floating in open space. Between the flat background
         # (z=-10) and the row content (z=0).
@@ -983,8 +1051,109 @@ class SignalTimelineScene(QGraphicsScene):
                 # Zoom changed — re-pick the ruler interval for it.
                 self.draw_time_markers()
 
-        print(f"✅ Timeline rebuilt successfully, final height={height}")
+        print(f"✅ Timeline rebuilt successfully, "
+              f"{len(self.row_labels)} lanes, final height={self.sceneRect().height()}")
         self.timeline_rebuilt.emit()
+
+    def _ensure_thumb_cache(self):
+        """The shared thumbnail source for the filmstrip lane, built on demand.
+
+        Deferred rather than built in __init__ because a scene is constructed
+        before anyone knows whether the lane will be shown, and opening the
+        video costs a decoder. Failure is not fatal: the lane simply draws
+        placeholders, which is a better outcome than a timeline that will not
+        open because a thumbnail source could not start.
+        """
+        if getattr(self, '_thumb_cache', None) is not None:
+            return self._thumb_cache
+        if not getattr(self, 'video_path', None):
+            return None
+        try:
+            from .thumbnail_cache import ThumbnailCache
+            self._thumb_cache = ThumbnailCache(self.video_path,
+                                               vr_mode=self._vr_mode)
+            # A frame arriving late has to repaint the strip, or it stays a
+            # placeholder until something else happens to invalidate it.
+            self._thumb_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
+        except Exception as e:
+            print(f"⚠️ Filmstrip disabled — no thumbnail source: {e}")
+            self._thumb_cache = None
+        return self._thumb_cache
+
+    def set_vr_mode(self, enabled: bool):
+        """Show the left eye of side-by-side footage in the filmstrip.
+
+        Two things have to move together. The cache has to crop, or the strip
+        is every moment twice at half the size — and the slots have to be
+        reshaped, or they stay 16:9 while the frames arriving are square, and
+        the painter fills the difference with placeholder bars.
+        """
+        enabled = bool(enabled)
+        if self._vr_mode == enabled:
+            return
+        self._vr_mode = enabled
+        if self._thumb_cache is not None:
+            self._thumb_cache.set_vr_mode(enabled)
+        item = self._filmstrip_item
+        if item is not None:
+            try:
+                item.set_aspect(self._filmstrip_aspect())
+            except RuntimeError:
+                # Deleted by a rebuild since it was drawn; the next one asks
+                # the cache for the shape itself.
+                self._filmstrip_item = None
+
+    def _filmstrip_aspect(self) -> float:
+        """Shape of the frames the strip will be drawing.
+
+        Asked of the cache rather than remembered here, so the crop and the
+        slot it is drawn into cannot disagree.
+        """
+        cache = self._thumb_cache
+        aspect = cache.frame_aspect() if cache is not None else None
+        return aspect or DEFAULT_FILMSTRIP_ASPECT
+
+    def _on_thumbnail_ready(self, *_args):
+        """Coalesce arriving frames into one repaint.
+
+        Thumbnails land one at a time and a screenful is a few dozen, so
+        repainting per frame means dozens of full-lane repaints in a second,
+        each re-walking every visible slot. Collapsing them into a single
+        deferred update makes the strip fill in visibly without competing with
+        the interaction that is drawing it.
+        """
+        if getattr(self, '_filmstrip_item', None) is None:
+            return
+        if getattr(self, '_filmstrip_repaint_pending', False):
+            return
+        self._filmstrip_repaint_pending = True
+        QTimer.singleShot(120, self._repaint_filmstrip)
+
+    def _repaint_filmstrip(self):
+        self._filmstrip_repaint_pending = False
+        item = getattr(self, '_filmstrip_item', None)
+        if item is None:
+            return
+        try:
+            item.update()
+        except RuntimeError:
+            # Deleted by a rebuild's clear() between the request and the frame
+            # coming back. The new lane will ask again for what it needs.
+            self._filmstrip_item = None
+
+    def draw_filmstrip_layer(self, y_pos, width):
+        """Thumbnails of the whole video, as the bottom lane."""
+        self.row_labels.append(("FILMSTRIP", y_pos))
+        cache = self._ensure_thumb_cache()
+        item = FilmstripLane(width, self.video_duration, cache,
+                             height=FILMSTRIP_LANE_HEIGHT,
+                             aspect=self._filmstrip_aspect())
+        item.setPos(0, y_pos)
+        # Under the playhead and the bars, above the background bands.
+        item.setZValue(-5)
+        self.addItem(item)
+        self._filmstrip_item = item
+        return y_pos + FILMSTRIP_LANE_HEIGHT + self.layer_spacing
 
     def drawForeground(self, painter, rect):
         """Paint user-marked avoid ranges on every repaint. Painting (rather than
@@ -1812,8 +1981,20 @@ class SignalTimelineScene(QGraphicsScene):
         x = max(0, min(x, self.sceneRect().width() - 1))
         h = self.sceneRect().height()
         
-        # Move existing line or create if missing
-        if hasattr(self, 'current_time_line') and self.current_time_line in self.items():
+        # Silent on the happy path — this runs on every playback tick. But
+        # `current_time_line` is not among the references build_timeline resets,
+        # so after a rebuild's clear() it can point at a deleted C++ object, and
+        # the membership test below is the first thing to touch it. Recording
+        # the state *first* means the breadcrumb is already on disk even when
+        # that touch is what ends the process.
+        _items = repaint_trace.probe(self, "current_time_line", "current_time_caret")
+        if any(state == "dangling" for state in _items.values()):
+            repaint_trace.note("playhead.stale_item", seconds=seconds, **_items)
+
+        # Move existing line or create if missing. None is now an expected state
+        # rather than an absent attribute — build_timeline drops the reference
+        # when it wipes the scene — so test for it directly.
+        if getattr(self, 'current_time_line', None) is not None and self.current_time_line in self.items():
             self.current_time_line.setLine(x, 0, x, h)
             self.current_time_caret.setPos(x, 0)
         else:
@@ -1942,12 +2123,18 @@ class SignalTimelineScene(QGraphicsScene):
     def set_action_confidence_filter(self, min_conf, max_conf=1.0):
         self.min_action_confidence = max(0.0, min(min_conf, 1.0))
         self.max_action_confidence = min(1.0, max(max_conf, 0.0))
+        repaint_trace.note("filter.action_confidence",
+                           min=self.min_action_confidence,
+                           max=self.max_action_confidence)
         self.save_filters()
         self.build_timeline()
 
     def set_object_confidence_filter(self, min_conf, max_conf=1.0):
         self.min_object_confidence = max(0.0, min(min_conf, 1.0))
         self.max_object_confidence = min(1.0, max(max_conf, 0.0))
+        repaint_trace.note("filter.object_confidence",
+                           min=self.min_object_confidence,
+                           max=self.max_object_confidence)
         self.save_filters()
         self.build_timeline()
 
@@ -2260,7 +2447,16 @@ class SignalTimelineScene(QGraphicsScene):
 
 class SignalTimelineView(QGraphicsView):
     """Custom view with smooth zooming and panning"""
-    
+
+    # A lane may be scaled down to fit the viewport, but not into a smear. The
+    # row names are painted in the gutter beside the timeline at a fixed font
+    # size, so they do not shrink along with the lanes they label: past a
+    # certain pitch they simply overlap each other, and the timeline becomes
+    # unreadable at exactly the moment you have enabled enough signals to want
+    # it. Below this the view scrolls instead — the vertical scrollbar is always
+    # on and drag-panning already moves vertically.
+    MIN_LANE_PITCH_PX = 28.0
+
     def __init__(self, scene, parent=None):
         super().__init__(scene, parent)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -2271,12 +2467,41 @@ class SignalTimelineView(QGraphicsView):
         # Start with no drag mode (we'll handle it manually)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         
-        # Semi-transparent background
+        # Semi-transparent background.
+        #
+        # The horizontal bar is deliberately fatter than the app-wide 10px in
+        # theme.py. That width is right for a panel you scroll occasionally
+        # with the wheel; this is the one people *drag*, repeatedly, to move
+        # along a video that can be hours long, and a 10px target is a hard
+        # thing to catch and an easy thing to lose halfway through a drag. The
+        # handle also gets a real minimum length, so a long video cannot shrink
+        # it to a sliver that is impossible to grab at all.
         self.setStyleSheet("""
             QGraphicsView {
                 background-color: rgba(18, 18, 18, 200);
                 border: 2px solid rgba(90, 90, 90, 150);
                 border-radius: 5px;
+            }
+            QScrollBar:horizontal {
+                background: rgba(28, 28, 28, 200);
+                height: 18px;
+                margin: 0;
+                border-radius: 9px;
+            }
+            QScrollBar::handle:horizontal {
+                background: rgba(130, 130, 130, 220);
+                border-radius: 7px;
+                min-width: 48px;
+                margin: 2px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: rgba(180, 180, 180, 240);
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0; height: 0;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: transparent;
             }
         """)
         
@@ -2304,7 +2529,7 @@ class SignalTimelineView(QGraphicsView):
         self._fit_vertical()
 
     def _fit_vertical(self):
-        """Scale scene to fit view height exactly"""
+        """Scale scene to fit view height, down to MIN_LANE_PITCH_PX per lane"""
         scene = self.scene()
         if not scene:
             return
@@ -2313,6 +2538,12 @@ class SignalTimelineView(QGraphicsView):
             return
         view_height = self.viewport().height()
         scale_y = view_height / scene_rect.height()
+        # Squashing stops where the rows would start colliding; scrolling takes
+        # over from there.
+        pitch = (getattr(scene, 'layer_height', 40)
+                 + getattr(scene, 'layer_spacing', 10))
+        if pitch > 0:
+            scale_y = max(scale_y, self.MIN_LANE_PITCH_PX / pitch)
         # Only adjust vertical scale, keep horizontal untouched
         current = self.transform()
         if current.m22() == scale_y:

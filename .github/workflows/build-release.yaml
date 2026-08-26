@@ -28,8 +28,19 @@ jobs:
           OVERRIDE: ${{ github.event.inputs.release_version }}
         run: |
           RAW="$OVERRIDE"
+          PY=$(python3 -c "import version; print(version.__version__)")
           if [ -z "$RAW" ]; then
-            RAW=$(python3 -c "import version; print(version.__version__)")
+            RAW="$PY"
+          elif [ "${RAW%% *}" != "$PY" ]; then
+            # The override names the tag and the archives; version.py is what the
+            # app reports about itself and what the update manifest is stamped
+            # with. Nothing used to check that the two agreed, so a release could
+            # be tagged 0.9.1 while every file inside it still said 0.9.0 -- the
+            # About box understates the build, and the updater keeps offering
+            # 0.9.1 to people who already have it, because the manifest they
+            # installed claims otherwise.
+            echo "::error::Override '$RAW' does not agree with __version__ '$PY' in version.py. Bump version.py and commit it, or drop the override."
+            exit 1
           fi
           echo "slug=${RAW// /-}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${RAW// /-}"
@@ -336,13 +347,33 @@ jobs:
           name: mac-build
           path: VideoHighlighter-${{ needs.version.outputs.slug }}.dmg
 
+  bootstrap:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build Windows bootstrap zip
+        run: |
+          python tools/build_bootstrap_zip.py \
+            --edition free \
+            --tag "${{ needs.version.outputs.slug }}" \
+            --out packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
+      - name: Upload bootstrap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-zip
+          path: packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
+
   release:
     # `version` must be listed even though no build step needs its output
     # directly: needs.version.outputs.slug resolves to an empty string in a job
     # that does not depend on it, which would publish an untagged release.
     # build-web-windows ships the Tauri installers, so the release waits on it
     # too rather than silently omitting half the product.
-    needs: [version, build-windows, build-web-windows, build-mac]
+    needs: [version, build-windows, build-web-windows, build-mac, bootstrap]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -353,5 +384,45 @@ jobs:
           tag: ${{ needs.version.outputs.slug }}
           name: VideoHighlighter ${{ needs.version.outputs.slug }}
           draft: true
-          artifacts: "windows-build/*,web-windows-build/*,mac-build/*"
+          body: |
+            ## Windows — recommended
+
+            Download **`VideoHighlighter-Windows-Setup.zip`** (first asset below),
+            extract it anywhere, and double-click **`Install-VideoHighlighter.bat`**.
+            The script fetches both archive parts and unpacks them automatically.
+
+            **Manual:** grab both `VideoHighlighter-Windows-*.7z.001` and `.002`,
+            same folder, extract the `.001` with 7-Zip.
+
+            ## Windows — web UI (portable)
+
+            `VideoHighlighter-Web-Windows-*.7z.001` and `.002` are the Tauri shell
+            around the React frontend, with the Python engine bundled. Same folder,
+            extract the `.001` with 7-Zip, then run the app — no installer, because
+            no installer can hold a 1.7 GB sidecar.
+
+            **macOS:** `.dmg` only.
+          artifacts: "windows-build/*,web-windows-build/*,mac-build/*,bootstrap-zip/*"
           token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Say what still has to happen
+        # A green run reads as "shipped", and it is not: the release is a draft,
+        # which GitHub hides from `releases/latest` and gives no git tag until
+        # somebody presses Publish. A build sat unpublished once while the
+        # bootstrap installer went on handing out the previous version, and
+        # nothing in the run said so. Now it does.
+        env:
+          SLUG: ${{ needs.version.outputs.slug }}
+        run: |
+          {
+            echo "### $SLUG is a DRAFT — nobody can get it yet"
+            echo ""
+            echo "Until you press **Publish** on the release page:"
+            echo ""
+            echo "* \`releases/latest\` keeps returning the previous version, so the"
+            echo "  bootstrap installer downloads the old build;"
+            echo "* the in-app updater sees no new release;"
+            echo "* no git tag \`$SLUG\` exists, so the re-release guard cannot"
+            echo "  protect this version number yet."
+            echo ""
+            echo "Sign \`manifest.json\` locally, attach the \`.sig\`, then publish."
+          } >> "$GITHUB_STEP_SUMMARY"

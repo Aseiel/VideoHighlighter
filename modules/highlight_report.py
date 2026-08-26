@@ -2110,6 +2110,58 @@ def _nav_script() -> str:
     )
 
 
+def _closing(report: Mapping) -> str:
+    """The last word: observed, asserted, and neither — kept apart.
+
+    Last on the page because it is a closing, and because a reader who has gone
+    through the measurements is the one it is written for. The three parts are
+    visually separate for the reason they are separate in the record: a summary
+    that runs them together is how a sentence somebody said becomes a sentence
+    the report appears to stand behind.
+
+    It reaches no conclusion, and it is not an oversight that it does not. What
+    a sequence of observations means is the reader's to decide, and a page that
+    decided for them would be the button this whole report exists instead of.
+    """
+    summary = report.get("closing_summary") or {}
+    if not summary:
+        try:
+            from modules.sequence_findings import closing_summary
+            summary = closing_summary(report)
+        except Exception:
+            return ""
+    if not summary:
+        return ""
+
+    # No heading of its own: `_group` supplies one, and a second directly under
+    # it read as two sections with nothing between them.
+    parts = []
+    parts.append(f'<p class="note"><b>What this run observed.</b> '
+                 f'{html.escape(str(summary.get("observed_sentence") or ""))}</p>')
+
+    quotes = summary.get("quotes") or []
+    if quotes:
+        rows = "".join(
+            f'<tr><td>{html.escape(str(q.get("at") or ""))}</td>'
+            f'<td>{html.escape(str(q.get("text") or ""))}</td></tr>'
+            for q in quotes)
+        parts.append(f'<p class="note"><b>What was said, and by whom.</b> '
+                     f'{html.escape(str(summary.get("quoted_note") or ""))}</p>')
+        parts.append('<div class="scroll"><table><thead><tr><th>Time</th>'
+                     f'<th>Said</th></tr></thead><tbody>{rows}</tbody></table></div>')
+
+    limits = summary.get("not_established") or []
+    if limits:
+        items = "".join(f'<li>{html.escape(str(x))}</li>' for x in limits)
+        parts.append('<p class="note"><b>What this run could not determine.</b> '
+                     'Listed rather than left to silence, because a report that '
+                     'stops at what it found invites its gaps to be read as '
+                     'absence.</p>')
+        parts.append(f'<ul class="note">{items}</ul>')
+
+    return "".join(parts)
+
+
 def _unmeasured(report: Mapping) -> str:
     """Lines the page quotes that nothing measured, and what would measure them.
 
@@ -2718,6 +2770,11 @@ def render_html(report: Mapping, title: Optional[str] = None,
         'composition rules recognised, <b>actions</b> come from the action '
         'model with their confidence.</p>' + "".join(segs),
         near, settings)}
+{_group("In closing",
+        "What the run observed, what was only asserted, and what it could not "
+        "determine — kept apart, because running them together is how the "
+        "third quietly becomes the first.",
+        _closing(report))}
 </div>{_player_script(media_src)}{_nav_script()}</body></html>
 """
 

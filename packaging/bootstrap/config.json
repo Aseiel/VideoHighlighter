@@ -1,0 +1,14 @@
+{
+  "product_name": "VideoHighlighter",
+  "edition": "Free",
+  "repo": "Aseiel/VideoHighlighter",
+  "use_latest": true,
+  "asset_pattern": "^VideoHighlighter-Windows-.*\\.7z\\.\\d{3}$",
+  "tag": "0.10.0",
+  "assets": [
+    "VideoHighlighter-Windows-0.10.0.7z.001",
+    "VideoHighlighter-Windows-0.10.0.7z.002"
+  ],
+  "base_url": "https://github.com/Aseiel/VideoHighlighter/releases/download/0.10.0",
+  "notes": "use_latest asks the GitHub API for the current release and takes every asset matching asset_pattern. tag/assets/base_url below are the fallback used when the API cannot be reached."
+}

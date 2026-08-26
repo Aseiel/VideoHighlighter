@@ -18,6 +18,7 @@ highlights:
   max_duration: 420
   exact_duration: 0
   keep_temp: false
+  export_separate_clips: false
   render_mode: cpu
   auto_min_clip: 2
   auto_max_clip: 30

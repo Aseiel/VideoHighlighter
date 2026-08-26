@@ -17,11 +17,20 @@ from .timeline_bars import TimelineBar
 # ── thumbnail / hover modules ─────────────────────────────────────
 from .thumbnail_cache import ThumbnailCache, PRIORITY_HOVER
 from .hover_preview import HoverPreview
-from .filmstrip_painter import paint_filmstrip
+from .filmstrip_painter import DEFAULT_ASPECT, paint_filmstrip
 
 
-# Hover preview pulls a larger thumb than the filmstrip slots.
+# Hover preview pulls a larger thumb than the filmstrip slots. Which also means
+# it shares no cache key with them — (time, height) — so the frame under the
+# cursor has to be decoded again at this size even when the strip already drew
+# that exact moment. Hence the prefetch below and the stand-in in hoverMoveEvent.
 HOVER_PREVIEW_HEIGHT = 180
+
+# Frames to warm along a clip when the cursor enters it. Twelve covers a scrub
+# across a clip at roughly the spacing an eye notices, and stays a fixed cost:
+# per-second sampling would queue hundreds of decodes on a long clip and starve
+# the one the cursor is actually over.
+HOVER_PREFETCH_SLOTS = 12
 
 
 def _fmt_time(seconds: float) -> str:
@@ -134,6 +143,7 @@ class EditClipItem(QGraphicsRectItem):
                 self.start_time,
                 self.end_time,
                 scene.thumb_cache,
+                aspect=scene.thumb_aspect,
             )
 
         # 3. Label backdrop — Premiere-style dark pill behind the text
@@ -373,6 +383,22 @@ class EditClipItem(QGraphicsRectItem):
             f"Duration: {duration:.1f}s\n"
             f"Drag to reorder · Double-click to play · Right-click for menu"
         )
+
+        # Start decoding hover-sized frames along this clip the moment the
+        # cursor arrives, so scrubbing across it mostly finds them ready. At
+        # PRIORITY_PREFETCH they queue behind anything on screen, and the frame
+        # actually hovered is promoted to the front when it is asked for. A
+        # fixed slot count rather than a fixed interval, so a long clip costs
+        # the same as a short one instead of queueing hundreds of decodes.
+        scene = self.scene()
+        if scene is not None and getattr(scene, 'thumb_cache', None) is not None:
+            try:
+                scene.thumb_cache.prefetch_range(
+                    self.start_time, self.end_time,
+                    HOVER_PREVIEW_HEIGHT, HOVER_PREFETCH_SLOTS)
+            except Exception as e:
+                print(f"⚠️ Hover prefetch skipped: {e}")
+
         super().hoverEnterEvent(event)
 
     def contextMenuEvent(self, event):
@@ -501,6 +527,18 @@ class EditClipItem(QGraphicsRectItem):
                     pix = scene.thumb_cache.request(
                         source_time, HOVER_PREVIEW_HEIGHT, priority=PRIORITY_HOVER
                     )
+                    # Remember a miss, so the frame can be delivered when it
+                    # decodes rather than only on the next mouse move — see
+                    # EditTimelineScene._deliver_hover_frame.
+                    scene._hover_wanted = None if pix is not None else source_time
+                    if pix is None:
+                        # Rather than the word "loading", put up whatever is
+                        # already decoded nearest this moment — usually the
+                        # filmstrip's own thumb of the same frame at a smaller
+                        # size. Upscaled and soft for a moment, then replaced by
+                        # the real one. Showing the right moment blurry reads as
+                        # the preview resolving; showing nothing reads as broken.
+                        pix = scene.thumb_cache.peek_nearest(source_time)
                     scene._hover_preview.show_at(
                         event.screenPos(),
                         pix,
@@ -517,6 +555,9 @@ class EditClipItem(QGraphicsRectItem):
         if scene is not None:
             scene._hide_cut_indicator()
             scene._hover_source_time = None
+            # Nothing is waiting on a frame once the popup is gone; a stale
+            # want would otherwise repaint a hidden popup on the next arrival.
+            scene._hover_wanted = None
             if hasattr(scene, '_hover_preview') and scene._hover_preview is not None:
                 scene._hover_preview.hide_preview()
 
@@ -561,6 +602,9 @@ class EditTimelineScene(QGraphicsScene):
         except Exception as e:
             print(f"⚠️ HoverPreview init failed: {e}")
             self._hover_preview = None
+        # Source time the popup is showing "loading…" for, or None when it has
+        # its frame. Read by _deliver_hover_frame.
+        self._hover_wanted = None
 
         # Visual feedback for drop target
         self.drop_indicator = None
@@ -590,6 +634,20 @@ class EditTimelineScene(QGraphicsScene):
         self.setSceneRect(0, 0, 1000, self.clip_height + 40)
         self.build_timeline()
 
+    @property
+    def thumb_aspect(self) -> float:
+        """Shape of the thumbnails the cache is handing out.
+
+        A side-by-side frame cropped to one eye is square, not 16:9, and the
+        slot it is drawn into has to know — otherwise the clip lays out slots
+        for a picture that never arrives and pads the one that does. Read from
+        the cache each time rather than stored, so the crop and the layout
+        cannot drift apart; paint and prefetch then agree by construction.
+        """
+        cache = self.thumb_cache
+        aspect = cache.frame_aspect() if cache is not None else None
+        return aspect or DEFAULT_ASPECT
+
     def set_vr_mode(self, enabled: bool):
         """Crop thumbnails to left half for side-by-side VR videos."""
         if self.thumb_cache is not None:
@@ -604,6 +662,39 @@ class EditTimelineScene(QGraphicsScene):
                 continue
             if item.start_time <= time_seconds <= item.end_time:
                 item.update()
+
+        self._deliver_hover_frame(height)
+
+    def _deliver_hover_frame(self, height):
+        """Hand a just-arrived frame to the hover popup if it is waiting for one.
+
+        Without this the popup is only ever updated by mouse movement, so a
+        cursor resting on a clip whose frame had not been decoded yet stayed on
+        "loading…" for as long as it was held still. Hovering elsewhere and
+        coming back appeared to fix it, but only because that second request
+        found the frame in the cache.
+
+        The wanted frame is re-requested rather than compared against the
+        `time_seconds` just emitted: the cache buckets times into 100ms keys and
+        emits the *bucket*, so a float comparison against the exact hovered time
+        almost never matches. Asking the cache again applies the same bucketing
+        and is a dictionary lookup, since whatever arrived is now in memory.
+        """
+        wanted = getattr(self, '_hover_wanted', None)
+        popup = getattr(self, '_hover_preview', None)
+        if wanted is None or popup is None or not popup.isVisible():
+            return
+        # Filmstrip frames come through here too, at a different height; only a
+        # hover-sized one can possibly be what the popup is waiting for.
+        if int(height) != HOVER_PREVIEW_HEIGHT:
+            return
+        cache = getattr(self, 'thumb_cache', None)
+        if cache is None:
+            return
+        pix = cache.request(wanted, HOVER_PREVIEW_HEIGHT, priority=PRIORITY_HOVER)
+        if pix is not None:
+            popup.set_pixmap(pix)
+            self._hover_wanted = None
 
     # ── clean shutdown hook (call from SignalTimelineWindow.closeEvent) ──
     def cleanup(self):
@@ -961,8 +1052,7 @@ class EditTimelineScene(QGraphicsScene):
         else:
             lo, hi = float("-inf"), float("inf")
 
-        aspect = 16 / 9
-        target_slot_w = max(40, int(self.clip_height * aspect))
+        target_slot_w = max(40, int(self.clip_height * self.thumb_aspect))
         for item in self.clip_items:
             box = item.sceneBoundingRect()
             if box.right() < lo or box.left() > hi:

@@ -817,8 +817,17 @@ def merge_into_cache(video_path: str, patch: dict, *, seed: dict = None,
             disk = dict(seed) if seed else {}
             disk.setdefault("video_path", str(video_path))
             disk["video_hash"] = video_hash
-            disk["cache_complete"] = True
             disk.update(patch)
+            # `cache_complete` is what VideoAnalysisCache.load trusts when it
+            # decides the pipeline may skip a stage, so a file seeded from one
+            # on-demand signal must not claim it: the next full run would skip
+            # transcript, objects and actions on the strength of a single key,
+            # and the user would see an empty result they can only fix by
+            # forcing a reprocess. The timeline viewer reads these files itself
+            # and never consults the flag, so the signal still survives a
+            # restart either way -- which is what the seed is for.
+            from modules.video_cache import holds_analysis
+            disk["cache_complete"] = holds_analysis(disk)
             atomic_write_json(cache_file, disk)
             log(f"💾 Analysis merged → {cache_file.name}")
             return True

@@ -494,6 +494,12 @@ def load_llm(backend: str = "ollama", model: str = "llama3",
             llm = LLMModule(backend=backend, model_path=model,
                             mmproj_path=(mmproj if vision else None),
                             n_ctx=n_ctx)
+        elif backend == "openvino":
+            # `model` is a converted-model directory here. Same argument as the
+            # llama-cpp branch above: a path goes to `model_path`, and passing
+            # it as `model` would leave the backend with an empty path and an
+            # error naming no file.
+            llm = LLMModule(backend="openvino", model_path=model, device="GPU")
         else:
             llm = LLMModule(backend=backend, model=model)
         llm.load()

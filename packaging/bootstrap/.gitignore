@@ -1,0 +1,6 @@
+out/
+*.7z
+*.7z.*
+*.zip
+7zr.exe
+*.log

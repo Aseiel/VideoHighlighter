@@ -35,6 +35,7 @@ class HoverPreview(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self._pixmap: QPixmap | None = None
         self._caption = ""
+        self._last_pos = QPoint(0, 0)
         self.hide()
 
     # ── Public API ────────────────────────────────────────────────────
@@ -43,6 +44,9 @@ class HoverPreview(QWidget):
         """Show (or move) the popup near `global_pos` with given content."""
         self._pixmap = pixmap if pixmap is not None and not pixmap.isNull() else None
         self._caption = caption or ""
+        # Kept so a frame arriving later can be dropped in without the caller
+        # having to remember where the popup was put. See set_pixmap.
+        self._last_pos = global_pos
 
         # Compute popup dimensions from the pixmap's aspect (or 16:9 fallback)
         if self._pixmap is not None:
@@ -61,6 +65,24 @@ class HoverPreview(QWidget):
             self.show()
         else:
             self.update()  # force repaint when only content changed
+
+    def set_pixmap(self, pixmap: QPixmap | None):
+        """Drop in a frame that arrived after the popup was already showing.
+
+        The popup opens before its thumbnail exists — a cache miss paints
+        "loading…" — and nothing else would ever replace that, because
+        `show_at` runs only on mouse *movement*. A cursor held still therefore
+        sat on "loading…" indefinitely, long after the frame was decoded, and
+        the apparent cure of moving away and hovering again worked only because
+        the second visit hit the cache.
+
+        Routed through `show_at` so the popup is resized and repositioned for
+        the real frame: the placeholder is drawn at a 16:9 guess, and footage
+        that is not 16:9 would otherwise be letterboxed into the wrong box.
+        """
+        if pixmap is None or pixmap.isNull() or not self.isVisible():
+            return
+        self.show_at(self._last_pos, pixmap, self._caption)
 
     def hide_preview(self):
         self.hide()

@@ -1,0 +1,29 @@
+name: Bug report
+description: Something broken in the free/public app
+title: "[free] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For **VideoHighlighter Pro**, contact support or use the private team backlog.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      placeholder: "0.9.0"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+    validations:
+      required: true

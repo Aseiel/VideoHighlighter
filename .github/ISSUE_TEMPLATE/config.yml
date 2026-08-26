@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Team backlog (private Pro repo)
+    url: https://github.com/Aseiel/VideoHighlighter-pro/issues
+    about: Internal ideas and pro/commercial work — use [free] / [pro] in titles
+  - name: Public discussions
+    url: https://github.com/Aseiel/VideoHighlighter/discussions
+    about: Community Q&A when enabled; otherwise open an issue here

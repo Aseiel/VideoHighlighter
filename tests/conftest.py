@@ -70,3 +70,26 @@ _HEAVY_DEPS = [
 for _name in _HEAVY_DEPS:
     if _name not in sys.modules:
         sys.modules[_name] = MagicMock()
+
+
+def real_opencv():
+    """The installed OpenCV, or None — for tests that need actual pixels.
+
+    A MagicMock cannot encode a frame or measure one: under the shim above,
+    every video a test writes is 1×1 and every comparison of one is vacuous.
+    Tests about what real pixels do borrow the real module through this and
+    hand the shim straight back, because the rest of the suite is written
+    against the shim and must keep getting it.
+    """
+    shim = sys.modules.pop("cv2", None)
+    if shim is not None and not isinstance(shim, MagicMock):
+        sys.modules["cv2"] = shim
+        return shim
+    try:
+        import cv2 as real
+        return real
+    except Exception:
+        return None
+    finally:
+        if shim is not None:
+            sys.modules["cv2"] = shim
