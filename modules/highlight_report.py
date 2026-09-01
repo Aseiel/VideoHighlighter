@@ -2929,6 +2929,19 @@ def media_src_for(report: Mapping, html_path: str) -> Optional[str]:
     return quote(rel.replace(os.sep, "/"))
 
 
+def _url_name(path: str) -> str:
+    """The file name out of a path written for either operating system.
+
+    ``os.path.basename`` splits on the *host's* separator. These paths arrive
+    from a report record rather than off this machine's disk, so a report
+    written on Windows and rendered anywhere else keeps the entire drive-letter
+    path as its "file name" and links at something that cannot exist. Both
+    separators are treated as one, so the link is the same wherever the page is
+    built.
+    """
+    return str(path).replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def serve_url_for(serve_base: Optional[str], html_path: str) -> Optional[str]:
     """This report's own address under ``serve_base``, or nothing.
 
@@ -2941,7 +2954,7 @@ def serve_url_for(serve_base: Optional[str], html_path: str) -> Optional[str]:
     base = str(serve_base or "").strip()
     if not base:
         return None
-    return base.rstrip("/") + "/" + quote(os.path.basename(html_path))
+    return base.rstrip("/") + "/" + quote(_url_name(html_path))
 
 
 def media_url_for(media_base: Optional[str], report: Mapping) -> Optional[str]:
@@ -2957,7 +2970,7 @@ def media_url_for(media_base: Optional[str], report: Mapping) -> Optional[str]:
     source = (report.get("video") or {}).get("path")
     if not base or not source:
         return None
-    return base.rstrip("/") + "/" + quote(os.path.basename(str(source)))
+    return base.rstrip("/") + "/" + quote(_url_name(source))
 
 
 def write_report(report: Mapping, html_path: str,
