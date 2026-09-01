@@ -204,8 +204,21 @@ class CutDirective:
         """
         if not self.sources:
             return True
-        name = os.path.basename(str(path)).casefold()
-        return any(os.path.basename(str(s)).casefold() == name for s in self.sources)
+        name = _base_name(path)
+        return any(_base_name(s) == name for s in self.sources)
+
+
+def _base_name(path: str) -> str:
+    """The file name out of a path written for either operating system.
+
+    ``os.path.basename`` splits on the *host's* separator, so a Windows path
+    handed to a process running on Linux comes back whole and two spellings of
+    the same file stop matching. A script is a portable document — written on
+    the machine that holds the footage, run wherever the engine happens to be,
+    including CI — so both separators are treated as one here rather than
+    leaving the answer to depend on which machine asked.
+    """
+    return str(path).replace("\\", "/").rsplit("/", 1)[-1].casefold()
 
 
 # ---------------------------------------------------------------------------
