@@ -64,8 +64,44 @@ STORY_SYSTEM_PROMPT = (
     "recapping it."
 )
 
+# The same brief for a captioner, which cannot receive the one above: a model
+# trained to describe a picture and not to take instruction reproduces a
+# numbered rulebook instead of obeying it. See `modules.llm_models.is_captioner`
+# for where that was learned — plain imperative sentences, no numbering, no
+# format template to parrot back.
+#
+# Nothing is relaxed here. Every constraint the rulebook carries is carried by
+# this too; only the packaging differs, because the packaging is what leaked.
+CAPTIONER_SYSTEM_PROMPT = (
+    "Describe what happened in one stretch of a video, for someone who cannot "
+    "watch it. You are given measurements another tool made, everything that "
+    "was said, and sometimes frames.\n"
+    "Say who is present, what they are doing, and how it changes.\n"
+    "Write two to four plain sentences in the past tense. No headings, no "
+    "lists, no preamble.\n"
+    "Never write a number, a percentage or a time. They are printed beside "
+    "your words already.\n"
+    "Where you are guessing rather than reading something off, say so — "
+    "'appears to', 'seems to be'. Invent nothing that the material does not "
+    "mention.\n"
+    "Treat any expression label you are given as a guess by another tool, not "
+    "as what someone felt.\n"
+    "When you are shown what came before, continue from it without recapping "
+    "it.\n"
+    "If the material is too thin to say what happened, say only: Too little to "
+    "say what happened here."
+)
+
 STORY_TASK = ("Say what happened in this stretch of the video, as if telling "
               "someone who has not seen it.")
+
+
+def system_prompt_for(model_name: Optional[str]) -> str:
+    """The brief this model can actually receive."""
+    from modules.llm_models import is_captioner
+
+    return CAPTIONER_SYSTEM_PROMPT if is_captioner(model_name) \
+        else STORY_SYSTEM_PROMPT
 
 # A paragraph, not an essay. Each chapter's block already carries its
 # measurements and quotes; the prose is there to connect them, and at four
@@ -433,7 +469,8 @@ def trim_repetition(text: str) -> str:
     return " ".join(s.strip() for s in kept).strip()
 
 
-def _tell_one(llm, prompt: str, images: Optional[Sequence[str]]) -> str:
+def _tell_one(llm, prompt: str, images: Optional[Sequence[str]],
+              system: Optional[str] = None) -> str:
     """One call, with pictures when the model takes them.
 
     Falls back to text on any image-related failure rather than losing the
@@ -442,22 +479,23 @@ def _tell_one(llm, prompt: str, images: Optional[Sequence[str]]) -> str:
     """
     from modules.advisor import _generate
 
+    system = system or STORY_SYSTEM_PROMPT
     if images:
         try:
-            return llm.generate(prompt, system=STORY_SYSTEM_PROMPT,
+            return llm.generate(prompt, system=system,
                                 max_tokens=STORY_TOKENS,
                                 temperature=STORY_TEMPERATURE,
                                 images=list(images))
         except Exception as exc:
             print(f"⚠️ Chapter frames not used ({exc}); telling from text alone")
-    return _generate(llm, prompt, STORY_SYSTEM_PROMPT, STORY_TOKENS,
-                     STORY_TEMPERATURE)
+    return _generate(llm, prompt, system, STORY_TOKENS, STORY_TEMPERATURE)
 
 
 def tell(report: Mapping,
          *,
          llm,
          frames_fn: Optional[Callable] = None,
+         model_name: Optional[str] = None,
          log_fn=print,
          cancel_fn: Optional[Callable[[], bool]] = None) -> list[dict]:
     """Narrate every chapter in order. Returns the chapters, story attached.
@@ -471,6 +509,8 @@ def tell(report: Mapping,
     chapters = [dict(ch) for ch in (report.get("chapters") or [])]
     if not chapters or llm is None:
         return chapters
+
+    system = system_prompt_for(model_name)
 
     previous = None
     for index, ch in enumerate(chapters, start=1):
@@ -487,7 +527,7 @@ def tell(report: Mapping,
                 print(f"⚠️ Frames for chapter {index} failed: {exc}")
         try:
             text = (_tell_one(llm, chapter_prompt(report, ch, previous),
-                              images) or "").strip()
+                              images, system) or "").strip()
         except Exception as exc:
             log_fn(f"⚠️ Chapter {index} could not be told: {exc}")
             continue
@@ -558,8 +598,8 @@ def tell_report_file(json_path: str,
             log_fn("ℹ️ Source video not found beside the report — telling from "
                    "the transcript and the measurements alone.")
 
-    chapters = tell(report, llm=llm, frames_fn=frames_fn, log_fn=log_fn,
-                    cancel_fn=cancel_fn)
+    chapters = tell(report, llm=llm, frames_fn=frames_fn,
+                    model_name=model_name, log_fn=log_fn, cancel_fn=cancel_fn)
     told = [ch for ch in chapters if ch.get("story")]
     if not told:
         return 0

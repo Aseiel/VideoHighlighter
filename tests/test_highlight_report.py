@@ -1068,6 +1068,25 @@ def test_each_clip_gets_a_player_seeked_to_its_own_range():
     assert 'preload="none"' in page
 
 
+def test_a_player_works_where_the_media_fragment_is_ignored():
+    """The bounds survive a browser that drops `#t=`, which is most mobile ones.
+
+    A report is read away from the machine that wrote it more often than on it,
+    so the fragment cannot be the only thing carrying the clip's start and end.
+    `playsinline` belongs to the same problem: a player that seizes the screen
+    on tap is no longer beside the figures it exists to let a reader check.
+    """
+    from modules.highlight_report import media_src_for
+    rep = _player_report()
+    page = render_html(rep, media_src=media_src_for(rep, os.path.join(MEDIA_DIR, "o.html")))
+    assert page.count("playsinline") == 2
+    assert re.findall(r'data-start="([0-9.]+)"', page) == ["10.00", "40.00"]
+    assert re.findall(r'data-end="([0-9.]+)"', page) == ["20.00", "50.00"]
+    # Both halves, or the fallback only fixes where the clip starts and lets it
+    # run on into footage the claim beside it was never about.
+    assert "loadedmetadata" in page and "timeupdate" in page
+
+
 def test_the_seek_button_targets_the_loudest_second():
     from modules.highlight_report import media_src_for
     rep = _player_report()
@@ -1397,3 +1416,118 @@ class TestConversation:
 
     def test_a_report_nobody_asked_anything_shows_no_thread(self):
         assert "Asked of this report" not in render_html(_player_report())
+
+
+class TestServeLink:
+    """Where to go when the players are dead.
+
+    A report is read away from its footage more often than beside it, and there
+    the page is fully true and fully unplayable at once — which reads as broken
+    rather than as displaced. The link is the difference.
+    """
+
+    def test_no_link_when_nothing_says_where_it_is_served(self):
+        page = render_html(_player_report())
+        assert "open this report over the network" not in page
+
+    def test_the_link_points_at_this_report_not_the_folder(self, tmp_path):
+        from modules.highlight_report import serve_url_for
+        url = serve_url_for("http://192.168.0.10:8000/", r"D:\m\a b&c_why.html")
+        # Landing on a directory listing means reading the filename off a phone
+        # screen, which is the thing this exists to avoid.
+        assert url == "http://192.168.0.10:8000/a%20b%26c_why.html"
+
+    def test_a_base_without_a_trailing_slash_still_works(self):
+        from modules.highlight_report import serve_url_for
+        assert serve_url_for("http://h:8000", "x_why.html") == \
+            "http://h:8000/x_why.html"
+
+    def test_an_empty_base_is_not_a_link(self):
+        from modules.highlight_report import serve_url_for
+        assert serve_url_for("", "x_why.html") is None
+        assert serve_url_for("   ", "x_why.html") is None
+        assert serve_url_for(None, "x_why.html") is None
+
+    def test_the_standalone_copy_carries_it_too(self):
+        """The copy with no players is the one that most needs the address."""
+        page = render_html(_player_report(), serve_url="http://h:8000/r.html")
+        assert "<video" not in page
+        assert "open this report over the network" in page
+        assert 'href="http://h:8000/r.html"' in page
+
+    def test_a_re_render_from_the_record_keeps_the_link(self):
+        """Both narration passes re-render from the record and know nothing
+        about serving, so the record has to carry it."""
+        rep = dict(_player_report())
+        rep["serve_url"] = "http://h:8000/r.html"
+        assert "open this report over the network" in render_html(rep)
+
+    def test_write_report_records_it_for_those_re_renders(self, tmp_path):
+        from modules.highlight_report import write_report
+        rep = dict(_player_report())
+        out = tmp_path / "r_why.html"
+        write_report(rep, str(out), link_media=False,
+                     serve_base="http://h:8000/")
+        assert rep["serve_url"] == "http://h:8000/r_why.html"
+        assert "open this report over the network" in out.read_text(encoding="utf-8")
+
+
+class TestMediaLink:
+    """The fallback that needs nothing running.
+
+    A browser cannot fetch `smb://`, but it can hand one to a player app, so a
+    report read off a share can still reach its footage. What it cannot do is
+    carry a position — which the page has to say, or the reader wonders why the
+    clip they were promised is not what started playing.
+    """
+
+    def test_no_link_without_a_base(self):
+        page = render_html(_player_report())
+        assert "open the source in a player app" not in page
+
+    def test_the_link_points_at_the_video_not_the_report(self):
+        from modules.highlight_report import media_url_for
+        rep = _player_report()
+        url = media_url_for("smb://192.168.0.10/movies/", rep)
+        assert url.startswith("smb://192.168.0.10/movies/")
+        assert url.endswith(".mp4"), "a share link to the HTML would open a viewer"
+
+    def test_the_base_may_or_may_not_end_in_a_slash(self):
+        from modules.highlight_report import media_url_for
+        rep = _player_report()
+        assert media_url_for("smb://h/m", rep) == media_url_for("smb://h/m/", rep)
+
+    def test_nothing_without_a_base_or_a_source(self):
+        from modules.highlight_report import media_url_for
+        assert media_url_for("", _player_report()) is None
+        assert media_url_for(None, _player_report()) is None
+        assert media_url_for("smb://h/m/", {"video": {}}) is None
+
+    def test_every_clip_carries_it_and_says_where_to_seek(self):
+        rep = _player_report()
+        page = render_html(rep, media_url="smb://h/m/v.mp4")
+        assert page.count("open the source in a player app") == 2
+        # The position cannot ride along in the URL, so it has to be in words.
+        assert "seek to" in page
+        assert "smb://h/m/v.mp4" in page
+
+    def test_it_survives_in_the_standalone_copy(self):
+        """The copy with no players is the one this exists for."""
+        page = render_html(_player_report(), media_src=None,
+                           media_url="smb://h/m/v.mp4")
+        assert "<video" not in page
+        assert "open the source in a player app" in page
+
+    def test_a_re_render_from_the_record_keeps_it(self):
+        rep = dict(_player_report())
+        rep["media_url"] = "smb://h/m/v.mp4"
+        assert "open the source in a player app" in render_html(rep)
+
+    def test_write_report_records_it(self, tmp_path):
+        from modules.highlight_report import write_report
+        rep = dict(_player_report())
+        out = tmp_path / "r_why.html"
+        write_report(rep, str(out), link_media=False,
+                     media_base="smb://h/movies/")
+        assert rep["media_url"].startswith("smb://h/movies/")
+        assert "open the source in a player app" in out.read_text(encoding="utf-8")

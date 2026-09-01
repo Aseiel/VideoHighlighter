@@ -2657,6 +2657,81 @@ class VideoHighlighterGUI(QWidget):
             "browser and sendable to a client. A matching .json holds the same data.")
         bbox_layout.addWidget(self.why_report_chk)
 
+        # The narration passes, which used to be reachable only from the
+        # AI-summary menu after the run had already finished. On by default: a
+        # clip on footage nobody speaks over has nothing on its card about what
+        # is in the picture, and a chapter is the same question one scale up.
+        self.narrate_clips_chk = QCheckBox("…and describe each clip")
+        self.narrate_clips_chk.setChecked(
+            visualization_cfg.get("narrate_clips", True))
+        self.narrate_clips_chk.setToolTip(
+            "Asks the chosen model to describe every kept clip from its frames,\n"
+            "at the end of the run.\n\n"
+            "One model call per clip, so it adds a minute or two — and it needs a\n"
+            "model with a vision half. The clip cards are written from the\n"
+            "pictures; without this they carry only what was measured.")
+        bbox_layout.addWidget(self.narrate_clips_chk)
+
+        # The label carries the warning the default cannot: this is the slowest
+        # thing the report does, so the user needs to know what it costs at the
+        # moment they could turn it off, not after the run has spent it.
+        self.narrate_chapters_chk = QCheckBox("…and tell each chapter (slow)")
+        self.narrate_chapters_chk.setChecked(
+            visualization_cfg.get("narrate_chapters", True))
+        self.narrate_chapters_chk.setToolTip(
+            "Asks the chosen model to narrate every chapter of the video, at the\n"
+            "end of the run.\n\n"
+            "One model call per chapter — minutes, not seconds, and the slowest\n"
+            "pass here. A chapter can be told from its transcript, so this adds\n"
+            "least on footage that already has speech in it.")
+        bbox_layout.addWidget(self.narrate_chapters_chk)
+
+        for _chk in (self.narrate_clips_chk, self.narrate_chapters_chk):
+            # Both narrate the report, so neither means anything without one.
+            self.why_report_chk.toggled.connect(_chk.setEnabled)
+            _chk.setEnabled(self.why_report_chk.isChecked())
+
+        # Where the output folder is reachable over the network. A report read
+        # on a phone has dead players — a browser cannot reach a sibling file
+        # from a `content://` origin, nor seek one without HTTP range requests —
+        # and every figure on the page stays true, which is what makes that
+        # confusing rather than obviously broken. Given this, the page carries
+        # the address where it can be played.
+        self.serve_base_input = QLineEdit(
+            str(visualization_cfg.get("report_serve_base", "") or ""))
+        self.serve_base_input.setPlaceholderText("http://192.168.0.10:8000/")
+        self.serve_base_input.setToolTip(
+            "Optional. If you serve the output folder over HTTP, put its base URL\n"
+            "here and every report gets a link back to its playable self.\n\n"
+            "Leave empty for the usual behaviour. This only adds a link — it does\n"
+            "not start a server; see tools/serve_report.py for one that supports\n"
+            "the range requests seeking needs.")
+        self.why_report_chk.toggled.connect(self.serve_base_input.setEnabled)
+        self.serve_base_input.setEnabled(self.why_report_chk.isChecked())
+        bbox_layout.addWidget(QLabel("Served at (optional):"))
+        bbox_layout.addWidget(self.serve_base_input)
+
+        # The other half, and the one that survives with nothing running: where
+        # the *footage* lives on a share. A browser cannot play `smb://` — no
+        # browser implements the scheme — but tapping a link to one hands it to
+        # a player app, which is enough to check a moment. A share is mounted
+        # all day where an ad-hoc web server is not, so this is the fallback the
+        # HTTP link needs rather than a duplicate of it.
+        self.media_base_input = QLineEdit(
+            str(visualization_cfg.get("report_media_base", "") or ""))
+        self.media_base_input.setPlaceholderText("smb://192.168.0.10/movies/")
+        self.media_base_input.setToolTip(
+            "Optional. Where the video folder is reachable from other devices —\n"
+            "an SMB share, usually. Each clip then carries a link that opens the\n"
+            "source in a player app.\n\n"
+            "The position cannot survive the hand-off, so the clip opens at the\n"
+            "start and the link says which timestamp to seek to. Use the HTTP\n"
+            "field above instead when you want playback to land on the moment.")
+        self.why_report_chk.toggled.connect(self.media_base_input.setEnabled)
+        self.media_base_input.setEnabled(self.why_report_chk.isChecked())
+        bbox_layout.addWidget(QLabel("Video reachable at (optional):"))
+        bbox_layout.addWidget(self.media_base_input)
+
         bbox_box.setLayout(bbox_layout)
         advanced_layout.addWidget(bbox_box, 1, 1)
 
@@ -3887,6 +3962,7 @@ class VideoHighlighterGUI(QWidget):
             "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
             "draw_object_boxes": self.bbox_objects_chk.isChecked(),
             "write_highlight_report": self.why_report_chk.isChecked(),
+            **self._report_config(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
             "action_backend": self.action_backend_combo.currentData(),
             "r3d_model": self.r3d_model_combo.currentData(),
@@ -4261,6 +4337,7 @@ class VideoHighlighterGUI(QWidget):
             "visualization": {
                 "draw_object_boxes": self.bbox_objects_chk.isChecked(),
                 "write_highlight_report": self.why_report_chk.isChecked(),
+                **self._report_config(),
                 "draw_action_labels": self.bbox_actions_chk.isChecked(),
             },
             "avoid": {
@@ -5070,6 +5147,7 @@ class VideoHighlighterGUI(QWidget):
             "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
             "draw_object_boxes": self.bbox_objects_chk.isChecked(),
             "write_highlight_report": self.why_report_chk.isChecked(),
+            **self._report_config(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
             "action_backend": self.action_backend_combo.currentData(),
             "r3d_model": self.r3d_model_combo.currentData(),
@@ -5734,6 +5812,27 @@ class VideoHighlighterGUI(QWidget):
         if not entry:
             return ("ollama", "llama3")
         return (entry["backend"], entry["model"])
+
+    def _report_config(self):
+        """What the run needs to write the report the way this window is set up.
+
+        The model goes into the run's config rather than being read from
+        settings inside the pipeline, so that a run narrates with the model that
+        was chosen when it started — the menu can be used to pick a different
+        one while a long analysis is still going, and a run that changed model
+        halfway would be very hard to explain from the report afterwards.
+
+        Built in one place because three call sites assemble a config dict, and
+        three copies of these keys is three chances for one to be forgotten and
+        for the setting to appear to do nothing.
+        """
+        return {
+            "narrate_clips": self.narrate_clips_chk.isChecked(),
+            "narrate_chapters": self.narrate_chapters_chk.isChecked(),
+            "narration_model": self._active_llm_model() or {},
+            "report_serve_base": self.serve_base_input.text().strip(),
+            "report_media_base": self.media_base_input.text().strip(),
+        }
 
     def _llm_models(self):
         """Every configured model, oldest single-model setting folded in."""

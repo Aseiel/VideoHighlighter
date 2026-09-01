@@ -2312,12 +2312,34 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 base = os.path.splitext(OUTPUT_FILE)[0] if OUTPUT_FILE else \
                     os.path.splitext(video_path)[0]
                 html_path = f"{base}_why.html"
-                write_report(report, html_path, json_path=f"{base}_why.json")
+                write_report(report, html_path, json_path=f"{base}_why.json",
+                             serve_base=gui_config.get("report_serve_base"),
+                             media_base=gui_config.get("report_media_base"))
                 log(f"📄 Why-these-moments report: {os.path.basename(html_path)}")
                 # The same breakdown into the debug log, from the same dict, so
                 # the two can never disagree about what happened.
                 from modules.highlight_report import render_text
                 print("\n" + render_text(report))
+
+                # Narrate what was just written, if the run asked for it. Here
+                # rather than on the button it used to live behind: this is a
+                # worker thread, so the several minutes it costs are minutes the
+                # window stays alive and cancellable, where the menu path ran it
+                # on the GUI thread and froze everything until it finished.
+                #
+                # After `write_report` and reading the file back, not before and
+                # not from `report`, because both passes re-render the page from
+                # the record they update — the page and the JSON must not be
+                # able to disagree about what the model said.
+                try:
+                    from modules.story_run import narrate_report_file
+
+                    narrate_report_file(
+                        f"{base}_why.json", config=gui_config, log_fn=log,
+                        cancel_fn=(lambda: bool(cancel_flag
+                                                and cancel_flag.is_set())))
+                except Exception as _ne:
+                    log(f"⚠️ Narration skipped: {_ne}")
             except Exception as _re:
                 log(f"⚠️ Highlight report skipped: {_re}")
 
