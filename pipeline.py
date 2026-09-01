@@ -2622,7 +2622,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 cut_video(
                     processed_video_path, segments[0][0], segments[0][1],
                     OUTPUT_FILE, mode=RENDER_MODE)
-                log(f"✅ Highlight saved: {OUTPUT_FILE}, duration {total_duration:.1f}s")
             else:
                 output_dir = os.path.dirname(OUTPUT_FILE) or "."
                 video_base_name = sanitize_base_name(
@@ -2693,33 +2692,38 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
                 if EXPORT_CLIPS and clips_dir:
                     log(f"✅ {len(clip_paths)} separate clip(s) in {clips_dir}")
-            log(f"✅ Highlight saved: {OUTPUT_FILE}, duration {total_duration:.1f}s")
+            # Nothing was cut when no segment survived selection: neither the
+            # success line nor the music bed may fire, or a run that produced
+            # no file still reports one (and would mux music onto a stale
+            # highlight left over from an earlier run).
+            if segments:
+                log(f"✅ Highlight saved: {OUTPUT_FILE}, duration {total_duration:.1f}s")
 
-            # ── Music bed ────────────────────────────────────────────────────
-            # Mux the chosen track onto the finished highlight. Applied to a
-            # temp file next to the output then os.replace'd on: a bad music
-            # file logs a warning and leaves the original highlight untouched,
-            # never killing a run that already produced a video.
-            if MUSIC_PATH and OUTPUT_FILE and os.path.exists(OUTPUT_FILE):
-                try:
-                    from modules.music_track import apply_music
-
-                    music_root, music_ext = os.path.splitext(OUTPUT_FILE)
-                    music_tmp = f"{music_root}_music{music_ext or '.mp4'}"
-                    log(f"🎵 Applying music: {os.path.basename(MUSIC_PATH)}")
-                    apply_music(
-                        OUTPUT_FILE, MUSIC_PATH, music_tmp,
-                        mode=MUSIC_MODE, music_volume=MUSIC_VOLUME, log_fn=log,
-                    )
-                    os.replace(music_tmp, OUTPUT_FILE)
-                    log("🎵 Music applied to highlight")
-                except Exception as e:
-                    log(f"⚠️ Could not apply music (left highlight as-is): {e}")
+                # ── Music bed ────────────────────────────────────────────────────
+                # Mux the chosen track onto the finished highlight. Applied to a
+                # temp file next to the output then os.replace'd on: a bad music
+                # file logs a warning and leaves the original highlight untouched,
+                # never killing a run that already produced a video.
+                if MUSIC_PATH and OUTPUT_FILE and os.path.exists(OUTPUT_FILE):
                     try:
-                        if os.path.exists(music_tmp):
-                            os.remove(music_tmp)
-                    except Exception:
-                        pass
+                        from modules.music_track import apply_music
+
+                        music_root, music_ext = os.path.splitext(OUTPUT_FILE)
+                        music_tmp = f"{music_root}_music{music_ext or '.mp4'}"
+                        log(f"🎵 Applying music: {os.path.basename(MUSIC_PATH)}")
+                        apply_music(
+                            OUTPUT_FILE, MUSIC_PATH, music_tmp,
+                            mode=MUSIC_MODE, music_volume=MUSIC_VOLUME, log_fn=log,
+                        )
+                        os.replace(music_tmp, OUTPUT_FILE)
+                        log("🎵 Music applied to highlight")
+                    except Exception as e:
+                        log(f"⚠️ Could not apply music (left highlight as-is): {e}")
+                        try:
+                            if os.path.exists(music_tmp):
+                                os.remove(music_tmp)
+                        except Exception:
+                            pass
         except RuntimeError:
             return None
         except Exception as e:

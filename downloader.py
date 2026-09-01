@@ -1121,14 +1121,14 @@ def _fetch_listing_html(url: str, log_fn: Callable = print, browser: bool = Fals
 _VIDEO_LINK_CANDIDATES = [
     "/video/", "/videos/", "/watch/", "/watch", "/embed/", "/v/",
     "/scene/", "/scenes/", "/movie/", "/movies/", "/clip/", "/clips/",
-    "/view/", "/play/", "/media/", "/porn/", "/gallery/",
+    "/view/", "/play/", "/media/", "/gallery/",
 ]
 
 # First-path-segments that are navigation/taxonomy, not individual videos — used
 # to reject the generic fallback guess.
 _NAV_SEGMENTS = {
     "search", "tag", "tags", "category", "categories", "channel", "channels",
-    "model", "models", "pornstar", "pornstars", "studio", "studios", "album",
+    "model", "models", "studio", "studios", "album",
     "albums", "photo", "photos", "page", "login", "signup", "register", "upload",
     "live", "best", "popular", "latest", "top", "new", "trending", "home",
     "about", "contact", "terms", "privacy", "dmca", "help", "faq", "c", "s",

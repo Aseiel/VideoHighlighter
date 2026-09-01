@@ -12,6 +12,9 @@ numpy
 fastapi>=0.115
 pydantic>=2
 httpx
+pillow        # tests/test_overlay.py and test_transitions.py draw real
+              # frames and assert on the pixels they put down; a mocked
+              # PIL would make those assertions vacuous.
 pyyaml        # real parser for the composition-rules tests (not shimmed): a
               # mocked safe_load returns a MagicMock, so rules parse to nothing
               # and the tests pass against an empty rule set
