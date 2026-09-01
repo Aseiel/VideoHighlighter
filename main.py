@@ -43,6 +43,7 @@ from downloader import download_videos_with_immediate_processing, extract_video_
 startup_splash.stage("Loading the assistant…")
 from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+from modules import analysis_stats
 from modules.ui import icons as _ui_icons, theme as _ui_theme
 # The five classes the expression scan can report. Imported for the Basic
 # tab's picker; the module itself loads no model until something asks it to scan.
@@ -528,6 +529,7 @@ class Worker(QThread):
     log = Signal(str)
     cancelled = Signal()
     preview = Signal(object, object, int)   # frame_bgr (ndarray), boxes (list), sec
+    timeline_requested = Signal(str, object)  # video_path, analysis_data
 
     def __init__(self, video_path, gui_config=None):
         super().__init__()
@@ -578,6 +580,9 @@ class Worker(QThread):
                 progress_fn=pausing_progress,
                 cancel_flag=self._cancel_flag,
                 preview_fn=preview_gate,
+                # Qt widgets may only be built on the main thread; emitting
+                # hands the request off to the GUI's reuse-aware handler.
+                timeline_fn=lambda path, data: self.timeline_requested.emit(str(path), data),
             )
 
             if self._cancel_flag.is_set():
@@ -2782,6 +2787,9 @@ class VideoHighlighterGUI(QWidget):
         # --- Tab: About & Contact ---
         tabs.addTab(self._scrollable(self._build_about_tab()), "About")
 
+        # --- Tab: About & Contact ---
+        tabs.addTab(self._build_about_tab(), "ℹ️ About")
+
         # Defer first populate until after __init__ finishes (so log_output exists)
         QTimer.singleShot(0, self.refresh_avoid_list)
         # Let the window finish painting first — the check is never urgent, and
@@ -2876,6 +2884,15 @@ class VideoHighlighterGUI(QWidget):
         self.debug_console_chk.toggled.connect(debug_console.set_console_visible)
         debug_console.register_checkbox(self.debug_console_chk)
         ctrl_layout.addWidget(self.debug_console_chk)
+        self.session_analyzed_count = 0
+        self.analyzed_counter_label = QLabel()
+        self.analyzed_counter_label.setStyleSheet("color: #2196F3; font-weight: bold;")
+        self.analyzed_counter_label.setToolTip(
+            "Videos successfully analyzed by the pipeline.\n"
+            f"Lifetime total persists in:\n{analysis_stats.stats_path()}"
+        )
+        self.update_analyzed_counter()
+        ctrl_layout.addWidget(self.analyzed_counter_label)
         ctrl_layout.addStretch()
         ctrl_layout.addWidget(self.report_only_btn)
         ctrl_layout.addWidget(self.run_btn)
@@ -3265,6 +3282,94 @@ class VideoHighlighterGUI(QWidget):
         legal_layout = QVBoxLayout(legal_group)
         legal = QLabel(
             "© 2026 Przemysław Kreft and Meric Donmezer.<br>"
+            "VideoHighlighter is free software licensed under the "
+            f'<a href="{REPO_URL}/blob/main/LICENSE">GNU AGPLv3</a>. '
+            f'Contributions are accepted under a <a href="{REPO_URL}/blob/main/CLA.md">CLA</a>.<br>'
+            "Includes third-party components (e.g. PySide6, FFmpeg) under their "
+            "respective licenses."
+        )
+        legal.setOpenExternalLinks(True)
+        legal.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        legal.setWordWrap(True)
+        legal_layout.addWidget(legal)
+        layout.addWidget(legal_group)
+
+        layout.addStretch()
+        return outer
+
+    # --- About / Contact tab ---
+    def _build_about_tab(self):
+        """A read-only About & Contact panel: version, support links, licensing."""
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        outer_layout.addWidget(scroll)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        scroll.setWidget(content)
+
+        # Header
+        title = QLabel(f"🎬 Video Highlighter ({__edition__})")
+        title.setStyleSheet("font-size: 16pt; font-weight: bold;")
+        layout.addWidget(title)
+
+        subtitle = QLabel(f"Version {__version__} — free & open source (AGPLv3)")
+        subtitle.setStyleSheet("color: #888;")
+        subtitle.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(subtitle)
+
+        # --- Upgrade to Pro ---
+        pro_group = QGroupBox("VideoHighlighter Pro")
+        pro_layout = QVBoxLayout(pro_group)
+        pro_line = QLabel(
+            "You're running the free, open-source edition. "
+            "<b>Pro</b> adds faster detection backends and extra features, "
+            "and supports continued development.<br>"
+            f'👉 <a href="{WEBSITE_URL}">Learn more / Get Pro</a>'
+        )
+        pro_line.setOpenExternalLinks(True)
+        pro_line.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        pro_line.setWordWrap(True)
+        pro_layout.addWidget(pro_line)
+        layout.addWidget(pro_group)
+
+        # --- Contact & support ---
+        support_group = QGroupBox("Contact & Support")
+        support_layout = QVBoxLayout(support_group)
+        intro = QLabel("Need help, found a bug, or have a feature request? Reach us here:")
+        intro.setWordWrap(True)
+        support_layout.addWidget(intro)
+
+        links = QLabel(
+            f'📧 Email: <a href="mailto:{SUPPORT_EMAIL}?subject=VideoHighlighter%20support">{SUPPORT_EMAIL}</a><br>'
+            f'💬 Discord: <a href="{DISCORD_URL}">{DISCORD_URL}</a><br>'
+            f'🌐 Website: <a href="{WEBSITE_URL}">{WEBSITE_URL}</a><br>'
+            f'⭐ Source code: <a href="{REPO_URL}">{REPO_URL}</a>'
+        )
+        links.setOpenExternalLinks(True)
+        links.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        links.setWordWrap(True)
+        support_layout.addWidget(links)
+
+        tip = QLabel(
+            "💡 When reporting a bug, please include your OS and the debug log "
+            "(toggle “Debug log” next to Run) — it speeds up diagnosis."
+        )
+        tip.setStyleSheet("color: #888; font-size: 9pt;")
+        tip.setWordWrap(True)
+        support_layout.addWidget(tip)
+        layout.addWidget(support_group)
+
+        # --- Legal ---
+        legal_group = QGroupBox("Legal")
+        legal_layout = QVBoxLayout(legal_group)
+        legal = QLabel(
+            "© 2026 Przemysław Kreft and contributors.<br>"
             "VideoHighlighter is free software licensed under the "
             f'<a href="{REPO_URL}/blob/main/LICENSE">GNU AGPLv3</a>. '
             f'Contributions are accepted under a <a href="{REPO_URL}/blob/main/CLA.md">CLA</a>.<br>'
@@ -4014,244 +4119,34 @@ class VideoHighlighterGUI(QWidget):
         return [self.file_list.item(i).text() for i in range(self.file_list.count())]
     
     def combine_highlights(self, highlight_files, output_path):
-        """Combine multiple highlight videos into one with robust resolution/framerate handling"""
+        """Combine multiple highlight videos into one.
+
+        Thin delegate to modules.combine_videos.combine_videos (the same engine
+        the sidecar drives), keeping this method's original contract for the Qt
+        callers: None when there is nothing to combine, the lone file passed
+        straight through when there is only one, otherwise the combined output
+        path. All engine logging is routed through append_log."""
         if not highlight_files:
             self.append_log("⚠️ No highlight files to combine")
             return None
-        
+
+        # Filter out None values and non-existent files
+        valid_files = [f for f in highlight_files if f and os.path.exists(f)]
+
+        if not valid_files:
+            self.append_log("⚠️ No valid highlight files found")
+            return None
+
+        if len(valid_files) == 1:
+            self.append_log("ℹ️ Only one highlight file, no combining needed")
+            return valid_files[0]
+
         try:
-            # Filter out None values and non-existent files
-            valid_files = [f for f in highlight_files if f and os.path.exists(f)]
-            
-            if not valid_files:
-                self.append_log("⚠️ No valid highlight files found")
-                return None
-            
-            if len(valid_files) == 1:
-                self.append_log("ℹ️ Only one highlight file, no combining needed")
-                return valid_files[0]
-            
-            self.append_log(f"🎬 Combining {len(valid_files)} highlights into one video...")
-            
-            # Analyze all input videos to determine target specs
-            self.append_log("🔍 Analyzing input videos...")
-            video_specs = []
-            for video_file in valid_files:
-                try:
-                    cmd = [
-                        "ffprobe", "-v", "error",
-                        "-select_streams", "v:0",
-                        "-show_entries", "stream=width,height,r_frame_rate",
-                        "-of", "json",
-                        video_file
-                    ]
-                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                    import json
-                    info = json.loads(result.stdout)
-                    
-                    if 'streams' in info and len(info['streams']) > 0:
-                        stream = info['streams'][0]
-                        width = stream.get('width', 1920)
-                        height = stream.get('height', 1080)
-                        fps_str = stream.get('r_frame_rate', '30/1')
-                        
-                        # Parse fps fraction (e.g., "30000/1001" or "30/1")
-                        if '/' in fps_str:
-                            num, den = fps_str.split('/')
-                            fps = float(num) / float(den)
-                        else:
-                            fps = float(fps_str)
-                        
-                        video_specs.append({
-                            'file': video_file,
-                            'width': width,
-                            'height': height,
-                            'fps': fps
-                        })
-                        self.append_log(f"  {os.path.basename(video_file)}: {width}x{height} @ {fps:.2f}fps")
-                except Exception as e:
-                    self.append_log(f"  ⚠️ Could not analyze {os.path.basename(video_file)}: {e}")
-            
-            if not video_specs:
-                self.append_log("❌ Could not analyze any input videos")
-                return None
-            
-            # Determine target resolution (use most common or largest)
-            widths = [s['width'] for s in video_specs]
-            heights = [s['height'] for s in video_specs]
-            target_width = max(set(widths), key=widths.count)  # Most common width
-            target_height = max(set(heights), key=heights.count)  # Most common height
-            target_fps = 30  # Standard fps
-            
-            self.append_log(f"🎯 Target format: {target_width}x{target_height} @ {target_fps}fps")
-            
-            # Create output directory if it doesn't exist
-            output_dir = os.path.dirname(output_path)
-            if output_dir and not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
-            
-            # Create temp directory for normalized files
-            temp_dir = os.path.join(output_dir or ".", "temp_combine")
-            os.makedirs(temp_dir, exist_ok=True)
-            
-            # Normalize each video to common format
-            self.append_log("⚙️ Normalizing all videos to common format...")
-            normalized_files = []
-            
-            for i, spec in enumerate(video_specs):
-                video_file = spec['file']
-                temp_file = os.path.join(temp_dir, f"normalized_{i:03d}.mp4")
-                normalized_files.append(temp_file)
-                
-                self.append_log(f"  Processing {i+1}/{len(video_specs)}: {os.path.basename(video_file)}")
-                
-                # Normalize: scale, pad, set fps, and re-encode
-                cmd = [
-                    "ffmpeg", "-y", "-i", video_file,
-                    # VIDEO: Scale to fit, pad to exact size, set fps, ensure proper timestamps
-                    "-vf", f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
-                        f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
-                        f"setsar=1,fps={target_fps},setpts=N/FRAME_RATE/TB",
-                    # AUDIO: Resample and re-timestamp
-                    "-af", "aresample=48000,asetpts=N/SR/TB",
-                    # VIDEO CODEC: Consistent encoding settings
-                    "-c:v", "libx264",
-                    "-preset", "medium",
-                    "-crf", "23",
-                    "-pix_fmt", "yuv420p",
-                    "-profile:v", "high",
-                    "-level", "4.0",
-                    "-g", str(target_fps * 2),  # GOP size = 2 seconds
-                    "-keyint_min", str(target_fps),
-                    "-sc_threshold", "0",
-                    # AUDIO CODEC
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-ar", "48000",
-                    # TIMING & SYNC
-                    "-vsync", "cfr",  # Constant frame rate
-                    "-async", "1",  # Audio sync
-                    "-max_muxing_queue_size", "1024",
-                    "-fflags", "+genpts",
-                    "-avoid_negative_ts", "make_zero",
-                    temp_file
-                ]
-                
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        text=True,
-                        timeout=300,  # 5 minute timeout per file
-                        check=True
-                    )
-                    
-                    # Verify the normalized file
-                    if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
-                        self.append_log(f"    ✅ Normalized successfully")
-                    else:
-                        raise Exception("Normalized file is empty or missing")
-                        
-                except subprocess.CalledProcessError as e:
-                    self.append_log(f"    ❌ Normalization failed: {e.stderr[:200]}")
-                    raise
-                except Exception as e:
-                    self.append_log(f"    ❌ Error: {e}")
-                    raise
-            
-            # Now concatenate the normalized files
-            self.append_log("🔗 Concatenating normalized videos...")
-            concat_file = os.path.join(temp_dir, "concat_list.txt")
-            with open(concat_file, "w", encoding="utf-8") as f:
-                for temp_file in normalized_files:
-                    abs_path = os.path.abspath(temp_file).replace('\\', '/')
-                    f.write(f"file '{abs_path}'\n")
-            
-            # Simple concatenation (copy) since all files now have identical format
-            cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_file,
-                "-c", "copy",  # Direct copy - no re-encoding
-                "-movflags", "+faststart",
-                output_path
-            ]
-            
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    check=True
-                )
-                
-                # Verify output
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                    self.append_log(f"✅ Combined video saved: {output_path}")
-                    
-                    # Get final info
-                    try:
-                        cmd = [
-                            "ffprobe", "-v", "error",
-                            "-select_streams", "v:0",
-                            "-show_entries", "stream=r_frame_rate,width,height",
-                            "-show_entries", "format=duration,size",
-                            "-of", "json",
-                            output_path
-                        ]
-                        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                        import json
-                        info = json.loads(result.stdout)
-                        
-                        if 'streams' in info and len(info['streams']) > 0:
-                            stream = info['streams'][0]
-                            width = stream.get('width', 'N/A')
-                            height = stream.get('height', 'N/A')
-                            fps = stream.get('r_frame_rate', 'N/A')
-                            
-                        if 'format' in info:
-                            format_info = info['format']
-                            duration = float(format_info.get('duration', 0))
-                            size = int(format_info.get('size', 0)) / (1024 * 1024)  # MB
-                            
-                            self.append_log(f"📊 Final: {width}x{height}, {fps} fps, {duration:.1f}s, {size:.1f}MB")
-                            
-                    except Exception as e:
-                        pass  # Info is optional
-                    
-                    # Clean up temp files
-                    try:
-                        os.remove(concat_file)
-                        for temp_file in normalized_files:
-                            if os.path.exists(temp_file):
-                                os.remove(temp_file)
-                        os.rmdir(temp_dir)
-                    except Exception as e:
-                        self.append_log(f"⚠️ Could not clean up temp files: {e}")
-                    
-                    return output_path
-                else:
-                    raise Exception("Output file is empty or missing")
-                    
-            except Exception as e:
-                self.append_log(f"❌ Failed to concatenate: {e}")
-                
-                # Clean up on failure
-                try:
-                    if os.path.exists(concat_file):
-                        os.remove(concat_file)
-                    for temp_file in normalized_files:
-                        if os.path.exists(temp_file):
-                            os.remove(temp_file)
-                    if os.path.exists(temp_dir):
-                        os.rmdir(temp_dir)
-                except:
-                    pass
-                
-                return None
-                
+            from modules.combine_videos import combine_videos
+
+            return combine_videos(
+                valid_files, output_path, log_fn=self.append_log,
+            )
         except Exception as e:
             self.append_log(f"❌ Failed to combine highlights: {e}")
             import traceback
@@ -5238,6 +5133,7 @@ class VideoHighlighterGUI(QWidget):
         self.worker.finished.connect(self.pipeline_done)
         self.worker.cancelled.connect(self.pipeline_cancelled)
         self.worker.preview.connect(self.on_preview_frame)
+        self.worker.timeline_requested.connect(self.on_timeline_requested)
         
         # Start status checking timer
         self.status_timer.start(100)  # Check every 100ms
@@ -5516,6 +5412,13 @@ class VideoHighlighterGUI(QWidget):
             self.pipeline_cleanup()
             self._show_progress(False)
 
+    def update_analyzed_counter(self):
+        """Refresh the analyzed-videos counter label (lifetime + this session)."""
+        total = analysis_stats.get_analyzed_count()
+        self.analyzed_counter_label.setText(
+            f"📈 Analyzed videos: {total} (session: {self.session_analyzed_count})"
+        )
+
     def pipeline_done(self, output_file):
         """Handle pipeline completion"""
         self.status_timer.stop()
@@ -5588,7 +5491,7 @@ class VideoHighlighterGUI(QWidget):
                 
                 # Check for additional files
                 base_name = os.path.splitext(output_file)[0]
-                srt_file = f"{base_name}_{self.target_lang_combo.currentText()}.srt"
+                srt_file = f"{base_name}_{self.subtitle_target_lang.currentText()}.srt"
                 transcript_file = f"{base_name}_transcript.txt"
                 
                 if os.path.exists(srt_file): 
@@ -5596,6 +5499,15 @@ class VideoHighlighterGUI(QWidget):
                 if os.path.exists(transcript_file): 
                     self.append_log(f"📄 Transcript file: {transcript_file}")
                 
+            newly_analyzed = len(highlight_files) if isinstance(output_file, list) else 1
+            if newly_analyzed:
+                self.session_analyzed_count += newly_analyzed
+                total_analyzed = analysis_stats.increment_analyzed(newly_analyzed)
+                self.update_analyzed_counter()
+                self.append_log(
+                    f"📈 Analyzed videos: +{newly_analyzed} this run — lifetime total: {total_analyzed}"
+                )
+
             self.task_label.setText("✅ Complete!")
             self.task_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
         elif not was_cancelled:
@@ -5693,16 +5605,58 @@ class VideoHighlighterGUI(QWidget):
             self.worker = None
 
     def _get_manual_avoid_ranges(self):
-        """Manual avoid ranges marked on the timeline (same process, so read them
-        straight off the live timeline window). Safe if it's closed/absent."""
+        """Manual avoid ranges marked on the timeline.
+
+        Prefer the live window (same process, always current). Fall back to the
+        shared store so ranges still apply after the viewer is closed, or when
+        they were marked in an earlier session. Safe if neither exists."""
         tw = getattr(self, "timeline_window", None)
         if tw is not None and hasattr(tw, "get_avoid_ranges"):
             try:
                 return tw.get_avoid_ranges()
             except Exception:
                 pass
+        try:
+            from modules.manual_avoid import load_ranges
+            paths = self.get_file_list()
+            if paths:
+                return [list(r) for r in load_ranges(paths[0])]
+        except Exception:
+            pass
         return []
 
+    def on_timeline_requested(self, video_path, analysis_data):
+        """Open the timeline viewer at the pipeline's request.
+
+        Runs on the main thread (the worker emits timeline_requested), so it is
+        safe to build Qt widgets here. Reuses an already-open window for the same
+        video rather than constructing a second one — each SignalTimelineWindow
+        pins itself in memory and can't be torn down, so a fresh one per run
+        leaks ~2.5GB. See open_timeline_viewer() for the same guard.
+        """
+        try:
+            existing = getattr(self, 'timeline_window', None)
+            if existing is not None:
+                try:
+                    if getattr(existing, 'video_path', None) == video_path:
+                        existing.show()
+                        existing.raise_()
+                        existing.activateWindow()
+                        self.append_log("📊 Reusing open timeline viewer.")
+                        return
+                except RuntimeError:
+                    # Underlying C++ object was deleted — fall through.
+                    self.timeline_window = None
+
+            from signal_timeline_viewer import SignalTimelineWindow
+            self.append_log(f"📊 Opening timeline viewer for: {os.path.basename(video_path)}")
+            self.timeline_window = SignalTimelineWindow(video_path, analysis_data)
+            self.timeline_window.show()
+            self.llm_chat.set_timeline_window(self.timeline_window)
+            self.llm_chat.set_video_path(video_path)
+            self.llm_chat.load_cache_for_video(video_path)
+        except Exception as e:
+            self.append_log(f"❌ Failed to open timeline viewer: {e}")
     def _why_report_candidates(self) -> list:
         """Where a report for the current selection could be, newest first.
 
@@ -6501,7 +6455,21 @@ if __name__ == "__main__":
     # noisy warnings even though playback still works via software decoding.
     os.environ.setdefault("QT_FFMPEG_DECODING_HWACCEL", "none")
     os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.ffmpeg=false")
+
+    # Give Windows an explicit AppUserModelID so the taskbar groups this app
+    # under our own icon instead of the generic python.exe host. Must run
+    # before any window is created.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "VideoHighlighter.App"
+            )
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+
     # Central theme: one graphite + accent stylesheet for all base widgets.
     # Additive — screens with their own inline styles still override it.
     _ui_theme.apply(app)
@@ -6523,6 +6491,25 @@ if __name__ == "__main__":
     if os.path.exists(_icon_path):
         from PySide6.QtGui import QIcon
         app.setWindowIcon(QIcon(_icon_path))
+
+    # `--timeline <video>` opens just the Signal Timeline viewer for one video
+    # instead of the full GUI. The packaged build is a single exe, so this is how
+    # another process (the web UI's sidecar) asks for the viewer — without it,
+    # the only way in was to launch the whole application.
+    #
+    # Placed after the theme, wheel guard and window icon are installed on the
+    # QApplication: the viewer is a window like any other, and launching it
+    # ahead of that setup shipped it unthemed and carrying the old mark.
+    if "--timeline" in sys.argv:
+        idx = sys.argv.index("--timeline")
+        video = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else ""
+        if not video or not os.path.exists(video):
+            print(f"--timeline needs an existing video path (got {video!r})")
+            _hard_exit(2)
+        from signal_timeline_viewer import SignalTimelineWindow
+        win = SignalTimelineWindow(video)
+        win.show()
+        _hard_exit(app.exec())
 
     # Hand over from the bootloader's splash to the Qt one, which can keep
     # reporting through the window build (the remaining seconds) and follows

@@ -111,16 +111,26 @@ def detect_scenes_motion_optimized(video_path,
                     frame = cv2.resize(frame, (new_width, new_height), 
                                      interpolation=cv2.INTER_AREA)
                 
-                try:
-                    frame_queue.put((frame_idx, frame.copy()), timeout=1)
-                except queue.Full:
-                    # Check cancellation when queue is full
+                # Retry until the consumer drains the queue, rather than
+                # dropping the frame after a single 1s timeout.
+                while not stop_loading.is_set():
                     if cancel_flag and cancel_flag.is_set():
                         break
-                    pass
+                    try:
+                        frame_queue.put((frame_idx, frame.copy()), timeout=1)
+                        break
+                    except queue.Full:
+                        continue
+                if stop_loading.is_set() or (cancel_flag and cancel_flag.is_set()):
+                    break
             ret, frame = cap.read()
             frame_idx += 1
-        frame_queue.put((None, None))
+        # Sentinel: never block forever here, or this thread outlives the
+        # release-guard in finally and the capture leaks every run.
+        try:
+            frame_queue.put((None, None), timeout=1)
+        except queue.Full:
+            pass
 
     def process_frame_batch_hybrid(frames_batch):
         """Fast GPU processing for scene detection with cancellation checks"""
@@ -141,15 +151,21 @@ def detect_scenes_motion_optimized(video_path,
             frame_tensor = torch.from_numpy(frame).float()
             if device != "cpu":
                 frame_tensor = frame_tensor.to(device, non_blocking=True)
-            
+
             # Convert to grayscale on GPU
-            gray_weights = torch.tensor([0.114, 0.587, 0.299], 
+            gray_weights = torch.tensor([0.114, 0.587, 0.299],
                                       device=device if device != "cpu" else None)
             gray_scene = torch.sum(frame_tensor * gray_weights, dim=2)
-            
-            # Store both for motion detection
-            results.append((frame_idx, gray_scene.cpu().numpy(), frame_tensor))
-        
+
+            # Keep only the single-channel grayscale plane, not the 3-channel
+            # float32 frame. Downstream motion detection only ever diffs the
+            # greyscale, but retaining frame_tensor held ~48MB per entry on a
+            # 5.3K source — ~9.5GB across the 200-entry buffer, which exhausts
+            # the heap mid-run and faults inside torch (0xC0000005).
+            gray_np = gray_scene.cpu().numpy()
+            del frame_tensor
+            results.append((frame_idx, gray_np, gray_scene))
+
         return results
 
     def motion_detection_hybrid(frame_tuples):
@@ -184,31 +200,27 @@ def detect_scenes_motion_optimized(video_path,
                 if cancel_flag and cancel_flag.is_set():
                     break
                     
-                prev_tensor = batch_pairs[j][2]  # frame tensor
+                # Already single-channel greyscale (H, W) — the weighted RGB
+                # sum happened once in process_frame_batch_hybrid.
+                prev_tensor = batch_pairs[j][2]
                 curr_tensor = batch_pairs[j + 1][2]
-                
+
                 if device != "cpu":
                     prev_tensor = prev_tensor.to(device, non_blocking=True)
                     curr_tensor = curr_tensor.to(device, non_blocking=True)
-                
-                prev_frames.append(prev_tensor.permute(2, 0, 1))  # CHW
-                curr_frames.append(curr_tensor.permute(2, 0, 1))
-            
+
+                prev_frames.append(prev_tensor)
+                curr_frames.append(curr_tensor)
+
             if not prev_frames or (cancel_flag and cancel_flag.is_set()):
                 continue
-                
-            # Batch difference on GPU
+
+            # Batch difference on GPU — (N, H, W)
             prev_batch = torch.stack(prev_frames)
             curr_batch = torch.stack(curr_frames)
-            
-            diff_batch = torch.abs(prev_batch - curr_batch)
-            
-            # RGB to grayscale
-            gray_weights = torch.tensor([0.114, 0.587, 0.299], 
-                                      device=device if device != "cpu" else None,
-                                      dtype=diff_batch.dtype)
-            gray_diff_batch = torch.sum(diff_batch * gray_weights.view(1, 3, 1, 1), dim=1)
-            
+
+            gray_diff_batch = torch.abs(prev_batch - curr_batch)
+
             # Blur operation
             gray_diff_batch = gray_diff_batch.unsqueeze(1)
             blur_batch = F.avg_pool2d(gray_diff_batch, kernel_size=5, stride=1, padding=2)
@@ -239,7 +251,7 @@ def detect_scenes_motion_optimized(video_path,
                 motion_results.append((frame_idx, total_motion_area))
             
             # Cleanup GPU memory
-            del prev_batch, curr_batch, diff_batch, gray_diff_batch, blur_batch, motion_mask
+            del prev_batch, curr_batch, gray_diff_batch, blur_batch, motion_mask
             if device != "cpu":
                 if device == "xpu":
                     torch.xpu.empty_cache()
@@ -247,6 +259,8 @@ def detect_scenes_motion_optimized(video_path,
                     torch.cuda.empty_cache()
         
         return motion_results
+
+    loader_thread = None
 
     try:
         # Start async frame loading
@@ -307,9 +321,13 @@ def detect_scenes_motion_optimized(video_path,
                             if motion_level > 0:
                                 motion_events.append(frame_idx / fps)
                     
-                    # Memory management
-                    if len(processed_frames) > 200:
-                        processed_frames = processed_frames[-100:]
+                    # Memory management. Only the last batch_size+1 entries are
+                    # ever read (see the slice passed to motion_detection_hybrid
+                    # above), so retaining 200 just pinned frames nothing would
+                    # look at again — costly on high-resolution sources.
+                    keep = batch_size + 1
+                    if len(processed_frames) > keep:
+                        processed_frames = processed_frames[-keep:]
                     
                     pbar.update(len(batch_results))
                     sampled_done += len(batch_results)
@@ -451,7 +469,28 @@ def detect_scenes_motion_optimized(video_path,
         # Cleanup
         try:
             stop_loading.set()
-            cap.release()
+            # The loader thread calls cap.read() in a loop; releasing the
+            # VideoCapture out from under it frees the decoder while it is
+            # mid-read, which faults inside OpenCV (0xC0000005). stop_loading
+            # only takes effect between reads, so we must wait for the thread
+            # to actually exit before releasing. Drain the queue so a loader
+            # blocked in put() can reach its next stop_loading check.
+            if loader_thread is not None:
+                for _ in range(50):  # ~5s worst case
+                    if not loader_thread.is_alive():
+                        break
+                    try:
+                        while True:
+                            frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    loader_thread.join(timeout=0.1)
+                if loader_thread.is_alive():
+                    # Never release a capture a live thread may still read from.
+                    print("⚠️ Frame loader did not stop; leaking VideoCapture to avoid a crash")
+                    cap = None
+            if cap is not None:
+                cap.release()
             if device != "cpu":
                 if device == "xpu":
                     torch.xpu.empty_cache()

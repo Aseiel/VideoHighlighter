@@ -1,0 +1,110 @@
+// Video file picking. Uses the native Tauri dialog when running inside the app,
+// and falls back to nothing outside it (browser dev can't read absolute paths).
+
+import { convertFileSrc } from "@tauri-apps/api/core"
+
+export function isTauri(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
+}
+
+const VIDEO_EXTS = ["mp4", "mov", "mkv", "avi", "webm", "m4v", "MP4", "MOV"]
+
+export async function pickVideos(): Promise<string[]> {
+  if (!isTauri()) {
+    // Browser dev: prompt for a path manually so the flow is still testable.
+    const manual = window.prompt(
+      "Running in browser (no native picker). Paste an absolute video path:",
+    )
+    return manual ? [manual] : []
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const selected = await open({
+    multiple: true,
+    filters: [{ name: "Video", extensions: VIDEO_EXTS }],
+  })
+  if (!selected) return []
+  return Array.isArray(selected) ? selected : [selected]
+}
+
+/** Pick a folder (download destination). Returns null if cancelled. */
+export async function pickDirectory(): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt("Paste a destination folder path:") || null
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const selected = await open({ directory: true, multiple: false })
+  if (!selected) return null
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected
+}
+
+/** Pick a custom YOLO model (.pt/.onnx), loaded natively by ultralytics. */
+export async function pickModelFile(): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt("Paste the path to a .pt/.onnx model:") || null
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "YOLO models", extensions: ["pt", "onnx"] }],
+  })
+  if (!selected) return null
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected
+}
+
+/** Pick a music track for the reel. Returns null if cancelled. */
+export async function pickAudioFile(): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt("Paste the path to an audio file:") || null
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "Audio", extensions: ["mp3", "wav", "m4a", "flac", "ogg", "aac"] }],
+  })
+  if (!selected) return null
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected
+}
+
+/** Pick a script file (YAML). Returns null if cancelled. */
+export async function pickScriptFile(): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt("Paste the path to a script (.yaml):") || null
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "Script", extensions: ["yaml", "yml"] }],
+  })
+  if (!selected) return null
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected
+}
+
+/** A GPS track, for placing clips that carry no location of their own.
+ *  GPX rather than a watch maker's own format: everyone exports it, so this
+ *  works with a Garmin, a Coros, a Strava export or a phone. */
+export async function pickTrackFile(): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt("Paste the path to a GPS track (.gpx):") || null
+  }
+  const { open } = await import("@tauri-apps/plugin-dialog")
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "GPS track", extensions: ["gpx"] }],
+  })
+  if (!selected) return null
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected
+}
+
+export function basename(p: string): string {
+  return p.split(/[\\/]/).pop() ?? p
+}
+
+/**
+ * A URL the webview can load for a local file, via Tauri's asset protocol.
+ * Returns null in browser dev, where absolute paths aren't reachable — callers
+ * fall back to a placeholder rather than requesting a URL that can't resolve.
+ */
+export function fileSrc(path: string): string | null {
+  if (!isTauri()) return null
+  return convertFileSrc(path)
+}

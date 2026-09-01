@@ -1,8 +1,20 @@
 # Test-only dependencies. The suite shims heavy ML libs (torch, cv2, openvino,
-# whisper, …) in tests/conftest.py, so running the tests needs only pytest + numpy
-# (~5 MB) rather than the full requirements.txt (~1.9 GB).
+# whisper, …) in tests/conftest.py, so running the tests needs only this short
+# list (~20 MB) rather than the full requirements.txt (~1.9 GB).
 pytest
 numpy
+
+# The sidecar tests (test_combine_endpoint, test_scan_folder, …) import
+# sidecar/server.py, which imports FastAPI at module scope. These are small pure
+# -Python wheels, and the tests exercise real request/response behaviour through
+# TestClient — shimming them with MagicMock would make the assertions vacuous.
+# httpx is what starlette's TestClient runs on.
+fastapi>=0.115
+pydantic>=2
+httpx
+pillow        # tests/test_overlay.py and test_transitions.py draw real
+              # frames and assert on the pixels they put down; a mocked
+              # PIL would make those assertions vacuous.
 pyyaml        # real parser for the composition-rules tests (not shimmed): a
               # mocked safe_load returns a MagicMock, so rules parse to nothing
               # and the tests pass against an empty rule set

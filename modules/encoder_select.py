@@ -96,9 +96,18 @@ def probe_video_size(video_path, ffmpeg=None):
              "-show_entries", "stream=width,height",
              "-of", "csv=p=0:s=x", video_path],
             capture_output=True, text=True, timeout=15)
-        parts = (out.stdout or "").strip().split("x")
-        if len(parts) >= 2:
-            w, h = int(parts[0]), int(parts[1])
+        # Parse the first non-empty line only. Some files (e.g. GoPro HEVC) make
+        # ffprobe emit the entry more than once, plus a blank line, even under
+        # -select_streams v:0. Splitting the whole blob on "x" then yields
+        # ['5312', '2988\r\n\r\n5312', '2988'] and int() blows up on element 1.
+        for line in (out.stdout or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("x")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                w, h = int(parts[0]), int(parts[1])
+                break
     except Exception as e:
         print(f"⚠️ [encoder_select] ffprobe size probe failed: {e}")
     if not (w and h):

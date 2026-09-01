@@ -2343,6 +2343,14 @@ class SignalTimelineWindow(QMainWindow):
         startup_splash.stage("Drawing the signal timeline…")
         self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration, waveform=self.waveform,
                                                 video_path=self.video_path)
+        # Restore ranges marked in an earlier session (see modules.manual_avoid).
+        try:
+            from modules.manual_avoid import load_ranges
+            saved = load_ranges(self.video_path)
+            if saved:
+                self.signal_scene.avoid_ranges = [tuple(r) for r in saved]
+        except Exception as e:
+            print(f"⚠️ could not load manual avoid ranges: {e}")
         self.signal_view = SignalTimelineView(self.signal_scene)
         # Lower floor so the whole top band (preview + timeline + controls) can
         # compress and leave room for the bottom LLM dock when not maximized.
@@ -3966,6 +3974,7 @@ class SignalTimelineWindow(QMainWindow):
         scene.avoid_ranges = ranges
         scene.clear_selection()
         scene.build_timeline()
+        self._persist_avoid_ranges()
         self.statusBar().showMessage(
             f"🚫 Avoiding {lo:.1f}s–{hi:.1f}s — {len(ranges)} range(s) excluded from highlights",
             5000)
@@ -3973,7 +3982,20 @@ class SignalTimelineWindow(QMainWindow):
     def _clear_avoid_ranges(self):
         self.signal_scene.avoid_ranges = []
         self.signal_scene.build_timeline()
+        self._persist_avoid_ranges()
         self.statusBar().showMessage("Cleared all avoid ranges", 3000)
+
+    def _persist_avoid_ranges(self):
+        """Write the ranges to the shared store so consumers outside this
+        process (the web UI's sidecar, a later session) can see them. The main
+        window still reads the live scene directly, so in-process behaviour is
+        unchanged. Never let a storage problem interrupt editing."""
+        try:
+            from modules.manual_avoid import save_ranges
+            save_ranges(self.video_path,
+                        getattr(self.signal_scene, "avoid_ranges", []))
+        except Exception as e:
+            print(f"⚠️ could not save manual avoid ranges: {e}")
 
     def get_avoid_ranges(self):
         """Used by the main window to feed manual avoid ranges into the pipeline."""

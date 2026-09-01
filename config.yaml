@@ -27,14 +27,14 @@ highlights:
   range_start_pct: 0
   range_end_pct: 100
 scoring:
-  scene_points: 0
+  scene_points: 1
   motion_event_points: 0
   motion_peak_points: 0
   audio_peak_points: 0
   loudness_burst_points: 0
   keyword_points: 0
   transcript_points: 0
-  object_points: 0
+  object_points: 5
   action_points: 0
   # Expressions score only for the classes named here, e.g. [happy, surprise].
   # Scoring all five would score every second a face is visible.
@@ -69,9 +69,9 @@ advanced:
   vr_mode: false
   object_frame_skip: 10
   sample_rate: 5
-  yolo_type: custom
+  yolo_type: standard
   yolo_model_size: n
-  yolo_custom_model_path: D:\VideoHighlighter\models\custom\best.pt
+  yolo_custom_model_path: ''
   action_backend: auto
   r3d_model: r3d_18
   action_models: intel_only

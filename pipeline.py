@@ -25,6 +25,11 @@ from modules.device_utils import resolve_yolo_device
 from modules.app_paths import ffmpeg_exe
 
 
+# Emitted when detection is skipped because cached results were reused. The
+# sidecar matches this line to tell the web UI no preview frames are coming
+# (sidecar/worker.py), so the wording is a contract, not just prose — change it
+# here and the worker follows.
+CACHE_HIT_LOG = "ℹ️ Using cached {kind} detections"
 
 # Keep warnings about CUDA quiet
 warnings.filterwarnings("ignore", message="torch.cuda")
@@ -346,7 +351,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
 
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log_fn=print, progress_fn=None, cancel_flag=None,
-                    preview_fn=None):
+                    preview_fn=None, timeline_fn=None):
     """
     Process single video or multiple videos for highlight generation.
     
@@ -357,7 +362,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         log_fn: Logging function
         progress_fn: Progress callback function
         cancel_flag: Threading event for cancellation
-    
+        timeline_fn: Optional callback(video_path, analysis_data) used to open
+            the timeline viewer. The GUI passes one that marshals to the Qt main
+            thread; when omitted (CLI/sidecar) the viewer is opened inline.
+
     Returns:
         str (single output path) or list of tuples [(input_path, output_path), ...]
     """
@@ -401,6 +409,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     progress_fn=progress_fn,
                     cancel_flag=cancel_flag,
                     preview_fn=preview_fn,
+                    timeline_fn=timeline_fn,
                 )
                 results.append((single_video_path, result))
                 
@@ -499,6 +508,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         AVOID_METHOD = gui_config.get("avoid_method", "skip")   # "skip" | "crop" | "crop_then_skip"
         forbidden_ranges = []          # [(start_sec, end_sec), ...] where an avoided id appears
         forbidden_boxes_by_frame = {}  # {frame_idx: [(x1,y1,x2,y2), ...]} avoided ids only
+
+        # Quality gate + music bed (wired from gui_config; safe defaults so a
+        # config that predates these keys behaves exactly as before).
+        QUALITY_GATE = bool(gui_config.get("quality_gate", False))
+        QUALITY_THRESHOLD = float(gui_config.get("quality_threshold", 60.0))
+        MUSIC_PATH = gui_config.get("music_path", "") or ""
+        MUSIC_MODE = gui_config.get("music_mode", "replace") or "replace"
+        MUSIC_VOLUME = float(gui_config.get("music_volume", 0.8))  # 0..1
 
         keyword_matches = []
 
@@ -1334,7 +1351,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log(f"✅ Object detection complete: {len(object_detections)} seconds with objects")
 
         else:
-            log("ℹ️ Using cached object detections")
+            log(CACHE_HIT_LOG.format(kind="object"))
 
         # --- Composition engine: derive events from spatial relations ---
         # Outside both branches on purpose. Rules are a reading of boxes that
@@ -1616,7 +1633,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log(f"Full error: {traceback.format_exc()}")
                 action_detections = []
         elif using_cache:
-            log("ℹ️ Using cached action detections")
+            log(CACHE_HIT_LOG.format(kind="action"))
             # action_detections already loaded from cache - ensure it's in 5-element format
             if action_detections and len(action_detections) > 0:
                 first_det = action_detections[0]
@@ -2084,6 +2101,33 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # Sort segments by start time (both modes)
         segments.sort(key=lambda x: x[0])
+
+        # ── Quality gate: penalize blurry clips ───────────────────────────────
+        # Sample sharpness once per SELECTED clip (never per candidate-second):
+        # at most len(segments) VideoCaptures open, regardless of clip length.
+        # A blurry clip has its per-second score in [start, end) knocked down to
+        # 30% so the cache/reporting reflects it; None (unreadable) never
+        # penalizes and never crashes the run.
+        if QUALITY_GATE and segments:
+            try:
+                from modules.clip_quality import sample_sharpness, is_blurry
+
+                penalized = 0
+                for seg_start, seg_end in segments:
+                    score_val = sample_sharpness(
+                        processed_video_path, float(seg_start), float(seg_end),
+                        samples=3,
+                    )
+                    if is_blurry(score_val, QUALITY_THRESHOLD):
+                        penalized += 1
+                        lo = max(0, int(seg_start))
+                        hi = min(len(score), int(seg_end))
+                        if hi > lo:
+                            score[lo:hi] = score[lo:hi] * 0.3
+                log(f"🩹 Quality gate: {penalized} of {len(segments)} clips "
+                    f"penalized as blurry")
+            except Exception as e:
+                log(f"⚠️ Quality gate skipped: {e}")
 
         # AVOID(skip, hard): guarantee no forbidden time survives into the cut
         if forbidden_ranges and (manual_avoid or (AVOID_ENABLED and AVOID_METHOD in ("skip", "crop_then_skip"))):
@@ -2578,7 +2622,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 cut_video(
                     processed_video_path, segments[0][0], segments[0][1],
                     OUTPUT_FILE, mode=RENDER_MODE)
-                log(f"✅ Highlight saved: {OUTPUT_FILE}, duration {total_duration:.1f}s")
             else:
                 output_dir = os.path.dirname(OUTPUT_FILE) or "."
                 video_base_name = sanitize_base_name(
@@ -2649,7 +2692,38 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
                 if EXPORT_CLIPS and clips_dir:
                     log(f"✅ {len(clip_paths)} separate clip(s) in {clips_dir}")
+            # Nothing was cut when no segment survived selection: neither the
+            # success line nor the music bed may fire, or a run that produced
+            # no file still reports one (and would mux music onto a stale
+            # highlight left over from an earlier run).
+            if segments:
                 log(f"✅ Highlight saved: {OUTPUT_FILE}, duration {total_duration:.1f}s")
+
+                # ── Music bed ────────────────────────────────────────────────────
+                # Mux the chosen track onto the finished highlight. Applied to a
+                # temp file next to the output then os.replace'd on: a bad music
+                # file logs a warning and leaves the original highlight untouched,
+                # never killing a run that already produced a video.
+                if MUSIC_PATH and OUTPUT_FILE and os.path.exists(OUTPUT_FILE):
+                    try:
+                        from modules.music_track import apply_music
+
+                        music_root, music_ext = os.path.splitext(OUTPUT_FILE)
+                        music_tmp = f"{music_root}_music{music_ext or '.mp4'}"
+                        log(f"🎵 Applying music: {os.path.basename(MUSIC_PATH)}")
+                        apply_music(
+                            OUTPUT_FILE, MUSIC_PATH, music_tmp,
+                            mode=MUSIC_MODE, music_volume=MUSIC_VOLUME, log_fn=log,
+                        )
+                        os.replace(music_tmp, OUTPUT_FILE)
+                        log("🎵 Music applied to highlight")
+                    except Exception as e:
+                        log(f"⚠️ Could not apply music (left highlight as-is): {e}")
+                        try:
+                            if os.path.exists(music_tmp):
+                                os.remove(music_tmp)
+                        except Exception:
+                            pass
         except RuntimeError:
             return None
         except Exception as e:
@@ -2750,9 +2824,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # ========== TIMELINE VISUALIZATION ==========
         if gui_config.get("create_timeline_viewer", False):
             try:
-                from signal_timeline_viewer import show_timeline_viewer
                 log("🎨 Launching Signal Timeline Viewer...")
-                
+
                 # Create analysis_data if not already created for cache
                 if 'analysis_data' not in locals() or analysis_data is None:
                     analysis_data = collect_analysis_data(
@@ -2776,15 +2849,19 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # so avoided-person splits are preserved) instead of letting it
                 # reload a stale highlight-history entry.
                 analysis_data['final_segments'] = [[float(s), float(e)] for s, e in segments]
-                
-                # Launch in separate thread/process so it doesn't block
-                import threading
-                timeline_thread = threading.Thread(
-                    target=show_timeline_viewer,
-                    args=(processed_video_path, analysis_data),
-                    daemon=True
-                )
-                timeline_thread.start()
+
+                # Hand the request to the GUI instead of building the window
+                # here. Qt widgets may only be created on the main thread, and
+                # this runs on the pipeline worker thread. Going through the GUI
+                # also means the viewer goes via the reuse guard in
+                # open_timeline_viewer() rather than constructing a second
+                # window (each one pins ~2.5GB and can't be torn down).
+                if timeline_fn is not None:
+                    timeline_fn(processed_video_path, analysis_data)
+                else:
+                    # No GUI attached (CLI/headless): own the event loop here.
+                    from signal_timeline_viewer import show_timeline_viewer
+                    show_timeline_viewer(processed_video_path, analysis_data)
             except Exception as e:
                 log(f"⚠️ Timeline viewer failed: {e}")
         # ============================================

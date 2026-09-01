@@ -5,17 +5,57 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A newer push to the same branch makes an in-flight run obsolete.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is what the release build ships; 3.11 is what several contributors
+        # have locally. Both must stay green.
+        python-version: ['3.11', '3.12']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
       - name: Install test dependencies
         run: pip install -r requirements-dev.txt
       - name: Run unit tests
         # conftest.py shims the heavy ML deps, so this runs in seconds with no
-        # GPU / torch / opencv / openvino install.
+        # GPU / torch / opencv / openvino install. pytest.ini pins testpaths to
+        # tests/ so build output is never collected.
         run: pytest -q
+
+  frontend:
+    # The React/Tauri shell is half the app now; a type error here breaks the
+    # release build just as hard as a failing Python test.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: frontend
+      - name: Lint
+        run: pnpm lint
+        working-directory: frontend
+      - name: Typecheck and build
+        # `pnpm build` runs `tsc -b && vite build`, so this covers typechecking
+        # and catches bundler-level breakage before the Tauri packaging step.
+        run: pnpm build
+        working-directory: frontend

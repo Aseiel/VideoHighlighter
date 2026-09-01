@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Override version (blank = use version.py, e.g. "0.8.2")'
+        description: 'Override version (blank = use version.py, e.g. "0.9.0")'
         required: false
         default: ''
 
@@ -13,13 +13,14 @@ permissions:
 
 jobs:
   # Single source of truth for the release version. Defaults to version.py so
-  # the release always matches what the app reports about itself; the manual
-  # input can still override it. Gates the build jobs, so a forgotten bump
-  # fails here in seconds instead of after an hour of PyInstaller.
+  # the release always matches what the app reports about itself (/health on the
+  # sidecar, the window title in the Qt app); the manual input can still
+  # override it. Gates the build jobs, so a forgotten bump fails here in seconds
+  # instead of after an hour of PyInstaller.
   version:
     runs-on: ubuntu-latest
     outputs:
-      slug: ${{ steps.compute.outputs.slug }}        # e.g. 0.8.2
+      slug: ${{ steps.compute.outputs.slug }}        # e.g. 0.9.0
     steps:
       - uses: actions/checkout@v4
       - id: compute
@@ -54,6 +55,13 @@ jobs:
             exit 1
           fi
           echo "Tag $SLUG is free."
+      - name: Check the shipped version strings agree
+        # tests/test_version_sync.py asserts version.py, package.json,
+        # tauri.conf.json, Cargo.toml and Cargo.lock all match. A mismatch here
+        # means the installer would advertise a version the app disagrees with.
+        run: |
+          pip install -r requirements-dev.txt
+          pytest tests/test_version_sync.py -q
 
   build-windows:
     needs: version
@@ -156,6 +164,89 @@ jobs:
         with:
           name: windows-build
           path: "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z*"
+
+  # The web UI: a Tauri shell around the React frontend, with the Python engine
+  # bundled as a PyInstaller sidecar. Independent of the Qt build above — both
+  # ship from the same engine source.
+  build-web-windows:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri
+      - name: Install Python dependencies
+        run: |
+          pip install numpy==2.2.6 mkl mkl-include
+          pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install openvino==2026.2.1
+          pip install -r requirements.txt
+          pip install -r sidecar/requirements.txt
+          pip install pyinstaller
+      - name: Pre-convert CLIP to OpenVINO IR
+        run: python -m tools.export_clip_ov
+      - name: Build the sidecar
+        run: >
+          pyinstaller packaging/vh-sidecar.spec --noconfirm
+          --distpath dist-sidecar --workpath build-sidecar
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: frontend
+      - name: Build the app
+        # Compiles the exe only — bundle.active is false in tauri.conf.json.
+        #
+        # Neither Windows installer format can package this app: the sidecar
+        # resource is ~1.7 GB (CUDA torch + OpenVINO + the pre-converted CLIP
+        # IR), and both installer compilers are 32-bit processes that run out of
+        # address space on it. WiX's light.exe ground for 16 minutes and died
+        # with no error code; makensis failed with "error mmapping file
+        # (1994782295, 33554432) is out of range" — that number is ~1.86 GB.
+        #
+        # So ship portable, exactly like the Qt build above: a split 7z the user
+        # unzips. No code change is needed for this — on Windows Tauri resolves
+        # BaseDirectory::Resource to the executable's own directory, so
+        # video-highlighter.exe with vh-sidecar/ beside it finds the engine at
+        # the same relative path an installer would have created.
+        run: pnpm tauri build
+        working-directory: frontend
+      - name: Assemble the portable app
+        # Lay out exe + engine as the app expects to find them at runtime.
+        run: |
+          $stage = "dist-web/VideoHighlighter"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "frontend/src-tauri/target/release/video-highlighter.exe" $stage
+          Copy-Item -Recurse "dist-sidecar/vh-sidecar" "$stage/vh-sidecar"
+          # WebView2Loader.dll sits next to the exe when Tauri emits it; ship it
+          # if present so the app does not depend on a system-wide copy.
+          $loader = "frontend/src-tauri/target/release/WebView2Loader.dll"
+          if (Test-Path $loader) { Copy-Item $loader $stage }
+          if (-not (Test-Path "$stage/vh-sidecar/vh-sidecar.exe")) {
+            throw "vh-sidecar.exe missing from the staged app - the layout is wrong."
+          }
+          $size = (Get-ChildItem -Recurse $stage | Measure-Object -Property Length -Sum).Sum / 1GB
+          Write-Host "Portable app size: $([math]::Round($size, 2)) GB"
+      - name: Create archive
+        run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z" ./dist-web/VideoHighlighter
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-windows-build
+          # Fail loudly rather than uploading nothing if the path drifts again.
+          if-no-files-found: error
+          path: "VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z*"
 
   build-mac:
     needs: version
@@ -277,7 +368,12 @@ jobs:
           path: packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
 
   release:
-    needs: [version, build-windows, build-mac, bootstrap]
+    # `version` must be listed even though no build step needs its output
+    # directly: needs.version.outputs.slug resolves to an empty string in a job
+    # that does not depend on it, which would publish an untagged release.
+    # build-web-windows ships the Tauri installers, so the release waits on it
+    # too rather than silently omitting half the product.
+    needs: [version, build-windows, build-web-windows, build-mac, bootstrap]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -298,8 +394,15 @@ jobs:
             **Manual:** grab both `VideoHighlighter-Windows-*.7z.001` and `.002`,
             same folder, extract the `.001` with 7-Zip.
 
+            ## Windows — web UI (portable)
+
+            `VideoHighlighter-Web-Windows-*.7z.001` and `.002` are the Tauri shell
+            around the React frontend, with the Python engine bundled. Same folder,
+            extract the `.001` with 7-Zip, then run the app — no installer, because
+            no installer can hold a 1.7 GB sidecar.
+
             **macOS:** `.dmg` only.
-          artifacts: "windows-build/*,mac-build/*,bootstrap-zip/*"
+          artifacts: "windows-build/*,web-windows-build/*,mac-build/*,bootstrap-zip/*"
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Say what still has to happen
         # A green run reads as "shipped", and it is not: the release is a draft,
