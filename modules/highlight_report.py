@@ -2487,6 +2487,49 @@ def _spoken(entry: Mapping) -> str:
             f'{_quote_lines(lines, seekable=True)}</div>')
 
 
+def _clip_story(entry: Mapping) -> str:
+    """What a model read off this clip's frames, when one was asked.
+
+    Above the measurements it was written from and inside the same card, for the
+    reason the chapter paragraph is: a reader who doubts a sentence has to find
+    the figures without leaving it. Marked at both ends — a class the stylesheet
+    sets apart, and the word "read" in the label — because a reading presented
+    as a measurement is worse than no reading at all.
+
+    It shares the chapter block's ``.story`` styling deliberately. The two are
+    the same kind of claim at two scales, and giving them two looks would imply
+    a difference in standing that does not exist.
+    """
+    text = str(entry.get("story") or "").strip()
+    if not text:
+        return ""
+    return (f'<div class="story"><span class="lab">read from this clip</span>'
+            f'<p>{html.escape(text)}</p></div>')
+
+
+def _clip_story_note(report: Mapping) -> str:
+    """Which model wrote the per-clip paragraphs, and when.
+
+    The chapter block has always said this and the clip cards never did, which
+    left the one part of a report most likely to be wrong as the one part whose
+    author could not be identified. It matters off this machine: a report
+    arriving from someone else is unreadable as evidence unless it says what
+    produced the prose, and the models differ enough that the same footage
+    reads differently depending on which one ran.
+    """
+    read = report.get("clip_story") or {}
+    if not read:
+        return ""
+    when = str(read.get("at") or "")
+    return (f'<p class="note">The paragraph inside each card was written by '
+            f'{html.escape(str(read.get("model") or "a local model"))} from '
+            f'that clip\'s own frames'
+            + (f', {html.escape(when)}' if when else '')
+            + '. Those paragraphs are a reading, not a measurement — every '
+              'figure beside them was computed before any model saw the '
+              'footage.</p>')
+
+
 def _shot(entry: Mapping, composed: frozenset) -> str:
     """The thumbnail, with what the detector saw drawn over it.
 
@@ -2539,6 +2582,21 @@ def _player_script(media_src: Optional[str]) -> str:
         "if(v){v.currentTime=parseFloat(b.dataset.t);v.play();"
         "v.scrollIntoView({block:'nearest'});}});});"
         "document.querySelectorAll('.play video').forEach(function(v){"
+        # Both halves of what `#t=start,end` promises, for the browsers that
+        # ignore it — chiefly the mobile ones, which is where a report is read
+        # away from the machine that made it. Where the fragment *was* honoured
+        # the player is already at the right second, so the guard below leaves
+        # it alone rather than seeking twice.
+        "var a=parseFloat(v.dataset.start||'0'),b=parseFloat(v.dataset.end||'0');"
+        "v.addEventListener('loadedmetadata',function(){"
+        "if(!v.dataset.cued&&a>0&&Math.abs(v.currentTime-a)>0.5){"
+        "v.dataset.cued='1';try{v.currentTime=a;}catch(e){}}});"
+        # And stopping where the clip does. Without this a browser that dropped
+        # the fragment plays on into the next scene, which is worse than
+        # starting late: the reader is then checking a claim against footage the
+        # claim was never about.
+        "v.addEventListener('timeupdate',function(){"
+        "if(b>a&&v.currentTime>b){v.pause();}});"
         "v.addEventListener('error',function(){"
         "var bar=v.closest('.play').querySelector('.playbar');"
         "if(bar&&!bar.dataset.warned){bar.dataset.warned='1';"
@@ -2590,8 +2648,19 @@ def _player(entry: Mapping, media_src: Optional[str]) -> str:
         f'<button class="seek" data-t="{float(sec):.0f}">▶ {html.escape(label)}'
         f' ({html.escape(str(stamp))})</button>'
         for label, sec, stamp in marks)
+    # `playsinline` because iOS otherwise takes the tap as a request to go
+    # fullscreen, and a player that hijacks the screen is no longer beside the
+    # figures it is there to let the reader check.
+    #
+    # The bounds are repeated as data attributes rather than left to the media
+    # fragment alone. The fragment is the better mechanism where it works — the
+    # browser fetches only the range asked for — but mobile browsers honour it
+    # inconsistently, and one that ignores it starts the clip at zero and plays
+    # to the end of the file. Duplicating the numbers costs nothing and lets the
+    # script put back both halves of what the fragment promises.
     return (f'<div class="play">'
-            f'<video controls preload="none" '
+            f'<video controls playsinline preload="none" '
+            f'data-start="{start:.2f}" data-end="{end:.2f}" '
             f'src="{html.escape(media_src)}#t={start:.0f},{end:.0f}"></video>'
             f'<div class="playbar">{jump}'
             f'<span class="dim">plays the source file in place</span></div></div>')
@@ -2640,8 +2709,58 @@ def _segment_wave(report: Mapping, entry: Mapping) -> str:
     )
 
 
+def _media_link(entry: Mapping, media_url: Optional[str]) -> str:
+    """A hand-off to whatever app on this device can open the footage.
+
+    The inline player needs HTTP: a browser cannot fetch `smb://` — no browser
+    implements the scheme — and cannot seek anything without range requests. But
+    a *link* is not a fetch. Android hands `smb://` to whichever app claimed the
+    scheme, and X-plore or VLC opens the file. So a report read from a share can
+    still reach its footage, with nothing serving it.
+
+    What cannot survive the hand-off is the position: there is no agreed way to
+    tell another app to start at 1:19:04, so the video opens at zero. Hence the
+    timestamp in the link text rather than in the URL — the reader seeks by hand,
+    which is worth saying plainly instead of letting them wonder why the clip
+    they were promised is not what started playing.
+    """
+    if not media_url:
+        return ""
+    stamp = str(entry.get("timestamp") or "").strip()
+    at = f" — seek to {html.escape(stamp)}" if stamp else ""
+    return (f'<div class="playbar"><a href="{html.escape(media_url, quote=True)}">'
+            f'▶ open the source in a player app</a>'
+            f'<span class="dim">{at}, since a hand-off cannot carry a '
+            f'position</span></div>')
+
+
+def _serve_link(serve_url):
+    """A way back to the copy of this report that can play its footage.
+
+    A report read away from its video is the normal case, not the exception: it
+    gets copied to a phone, or onto a share, and there the players are dead
+    because a browser cannot reach a sibling file from a `content://` origin and
+    cannot seek one without HTTP range requests. Every measurement on the page
+    is still true, which is precisely what makes the dead players confusing.
+
+    So the page carries the address where it *can* be played, put there when it
+    was written. One line, at the top, where somebody wondering why nothing
+    plays will find it before they conclude the report is broken.
+    """
+    if not serve_url:
+        return ""
+    url = str(serve_url).strip()
+    if not url:
+        return ""
+    return (f'<div class="sub">Footage lives elsewhere — '
+            f'<a href="{html.escape(url, quote=True)}">open this report over '
+            f'the network</a> to play the clips.</div>')
+
+
 def render_html(report: Mapping, title: Optional[str] = None,
-                media_src: Optional[str] = None) -> str:
+                media_src: Optional[str] = None,
+                serve_url: Optional[str] = None,
+                media_url: Optional[str] = None) -> str:
     """A page with inline CSS and embedded thumbnails.
 
     ``media_src`` is a URL — normally a relative path — to the source video. Pass
@@ -2650,6 +2769,10 @@ def render_html(report: Mapping, title: Optional[str] = None,
     media is deliberately never embedded: a dozen clips would add tens of
     megabytes to a file whose entire value is that it opens instantly.
     """
+    if serve_url is None:
+        serve_url = report.get("serve_url")
+    if media_url is None:
+        media_url = report.get("media_url")
     video = report["video"]
     totals = report["totals"]
     heading = title or f"Why these moments — {video['name']}"
@@ -2668,6 +2791,7 @@ def render_html(report: Mapping, title: Optional[str] = None,
     for e in report["segments"]:
         thumb = _shot(e, composed)
         tags = _tag_rows(e)
+        story = _clip_story(e)
         # The clip's own expression reading now sits under the Face expression
         # heading with the rest of that signal, rather than adrift at the foot
         # of the card where it read as an afterthought.
@@ -2691,11 +2815,13 @@ def render_html(report: Mapping, title: Optional[str] = None,
             f'<div class="meta">peak at {html.escape(e["timestamp"])} · '
             f'{e["duration"]:.0f}s long{from_chapter}</div>'
             f'{_bars(e, max_points)}'
+            f'{story}'
             f'{_measurements(e, peer_scores, readings, video_valence)}'
             f'{tags}'
             f'{_spoken(e)}'
             f'{_segment_wave(report, e)}'
             f'{_player(e, media_src)}'
+            f'{_media_link(e, media_url)}'
             f'{boost}</div></div>'
         )
 
@@ -2736,6 +2862,7 @@ def render_html(report: Mapping, title: Optional[str] = None,
 <body>{_section_nav()}<div class="wrap">
 <h1>{html.escape(heading)}</h1>
 <div class="sub">Generated {html.escape(report["generated_at"])}</div>
+{_serve_link(serve_url)}
 <div class="sub2">{html.escape(_run_sentence(report))}</div>
 <div class="totals">
   <div><span class="n">{totals["segments"]}</span><span class="l">segments kept</span></div>
@@ -2768,7 +2895,8 @@ def render_html(report: Mapping, title: Optional[str] = None,
         'was detected there, grouped by what produced them — <b>objects</b> '
         'come straight from the detector, <b>events</b> are combinations the '
         'composition rules recognised, <b>actions</b> come from the action '
-        'model with their confidence.</p>' + "".join(segs),
+        'model with their confidence.</p>'
+        + _clip_story_note(report) + "".join(segs),
         near, settings)}
 {_group("In closing",
         "What the run observed, what was only asserted, and what it could not "
@@ -2801,10 +2929,56 @@ def media_src_for(report: Mapping, html_path: str) -> Optional[str]:
     return quote(rel.replace(os.sep, "/"))
 
 
+def _url_name(path: str) -> str:
+    """The file name out of a path written for either operating system.
+
+    ``os.path.basename`` splits on the *host's* separator. These paths arrive
+    from a report record rather than off this machine's disk, so a report
+    written on Windows and rendered anywhere else keeps the entire drive-letter
+    path as its "file name" and links at something that cannot exist. Both
+    separators are treated as one, so the link is the same wherever the page is
+    built.
+    """
+    return str(path).replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def serve_url_for(serve_base: Optional[str], html_path: str) -> Optional[str]:
+    """This report's own address under ``serve_base``, or nothing.
+
+    The base names where the folder is served from -- ``http://192.168.0.10:8000/``
+    -- and the report is at its own filename beneath it. Built here rather than
+    left to the reader because the whole point is landing on *this* report; a
+    bare base drops them on a directory listing holding a filename nobody wants
+    to read off a phone screen.
+    """
+    base = str(serve_base or "").strip()
+    if not base:
+        return None
+    return base.rstrip("/") + "/" + quote(_url_name(html_path))
+
+
+def media_url_for(media_base: Optional[str], report: Mapping) -> Optional[str]:
+    """The source video's address under ``media_base``, or nothing.
+
+    The base names where the *folder* is reachable —
+    ``smb://192.168.0.10/movies/`` — and the video keeps the name it has on
+    disk. Deliberately not scheme-aware: `smb://` is the case this was built
+    for, but nothing here knows or cares, so an `nfs://` or a `ftp://` share
+    works the same way without this function learning about it.
+    """
+    base = str(media_base or "").strip()
+    source = (report.get("video") or {}).get("path")
+    if not base or not source:
+        return None
+    return base.rstrip("/") + "/" + quote(_url_name(source))
+
+
 def write_report(report: Mapping, html_path: str,
                  json_path: Optional[str] = None,
                  title: Optional[str] = None,
-                 link_media: bool = True) -> None:
+                 link_media: bool = True,
+                 serve_base: Optional[str] = None,
+                 media_base: Optional[str] = None) -> None:
     """Write the page, and the record it was rendered from.
 
     The JSON is not a debugging leftover: it is the structured form a later
@@ -2815,8 +2989,19 @@ def write_report(report: Mapping, html_path: str,
     off for a page that has to survive being moved away from the footage.
     """
     src = media_src_for(report, html_path) if link_media else None
+    url = serve_url_for(serve_base, html_path)
+    media = media_url_for(media_base, report)
+    # Into the record, so the JSON carries them and every later re-render finds
+    # them. Only when one was given: writing a null would make a report that had
+    # never been served look like one whose address had been cleared.
+    if isinstance(report, dict):
+        if url:
+            report["serve_url"] = url
+        if media:
+            report["media_url"] = media
     with open(html_path, "w", encoding="utf-8") as fh:
-        fh.write(render_html(report, title=title, media_src=src))
+        fh.write(render_html(report, title=title, media_src=src,
+                             serve_url=url, media_url=media))
     if json_path:
         with open(json_path, "w", encoding="utf-8") as fh:
             json.dump(report, fh, indent=1)

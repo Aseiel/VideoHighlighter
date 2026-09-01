@@ -26,6 +26,29 @@ from typing import Mapping, Optional, Sequence
 # a menu only moves the failure to the point where the user has waited for it.
 BACKENDS = ("ollama", "llama-cpp")
 
+# Models that caption a picture rather than follow an instruction. The
+# distinction is not a nicety: handed a numbered rulebook, a captioner
+# reproduces it as its answer instead of obeying it — JoyCaption echoed
+# "1. WATCH THE FACE AND HANDS, NOTHING ELSE." back verbatim on every frame.
+# Every narration pass needs the same fork, so which models need it is recorded
+# once, here, beside everything else that is known about a model.
+#
+# Matched as substrings rather than exact names because the name that arrives
+# carries a tag or a vendor prefix (`joycaption:q4`, `ollama/joycaption`) and an
+# exact set would silently miss every real one.
+CAPTIONER_MODELS = ("joycaption", "joy-caption", "joy_caption")
+
+
+def is_captioner(model_name: Optional[str]) -> bool:
+    """Whether `model_name` names a captioner, and so needs a flat prompt.
+
+    Unknown names are treated as instruction-followers: that is what the prompts
+    were written for, so an unrecognised model gets the behaviour this code has
+    always had rather than a quietly different one.
+    """
+    name = (model_name or "").lower()
+    return any(tag in name for tag in CAPTIONER_MODELS)
+
 
 def _clean(entry: Mapping) -> Optional[dict]:
     """One stored entry, or ``None`` when it cannot be used."""
