@@ -89,6 +89,60 @@ https://github.com/user-attachments/assets/5c85af94-9228-4537-926a-1ed7a91fa5ee
 ## Workflow Stages
 ![Workflow Stages](assets/workflow_stages.png)
 
+## Why these moments
+
+Every run writes a report next to the highlight — one self-contained HTML file
+you can open or email. Nothing is fetched when it loads; the thumbnails are
+embedded.
+
+It is not a summary. It is the arithmetic: for each moment kept, the per-signal
+point breakdown, which objects and actions fired, the confidence tier each one
+landed in, and whether the multi-signal boost applied. Around that sit the clips
+in cut order, the video in chapters, the moments that scored well and still did
+not make it, and the exact settings the run used.
+
+Two sections earn it its keep:
+
+- **Said here, measured nowhere** — lines from the transcript that no class or
+  event this run produced shares a word with. The report quotes them and states
+  that it has no measurement for them, rather than quietly scoring them as
+  though it did.
+- **What to try next** — worked out from that run's own numbers, each point
+  backed by the figures shown beside it rather than by a guess about what you
+  meant. It reads like this:
+
+  > **The highlight came out shorter than you asked for.** You asked for up to
+  > 46s and got 30s. In MAX mode the cut stops when it runs out of moments that
+  > scored anything at all — not when it runs out of budget. *Try:* lower the
+  > detector thresholds so more moments score, give another signal a weight, or
+  > accept the shorter cut — padding it means including moments nothing was
+  > detected in.
+
+Explanation is never a paid feature. The report, the findings and the advisor
+are identical in both editions. A cloud tool gives you a button and a result you
+cannot interrogate; answering "why", locally, is what this is instead.
+
+## Composition rules
+
+The detectors report what is on screen. A composition rule says what a
+*combination* of those readings means for your footage, and scores it.
+
+A rule names the signals it tests and the window it tests them over. Available
+signals include the per-second audio and vocal measurements (`audio_level`,
+`vocal_effort`, `vocal_density`), scene and motion events, and any class the
+detectors produced. A match becomes an event under a name you choose, and that
+name then appears in the report like any other signal.
+
+Rules live in `composition_rules.yaml` beside the executable, or in the project
+root when running from source. There is no built-in set and the file is not
+tracked by git: the vocabulary is yours, and the engine is skipped entirely when
+the file is absent.
+
+They run on **every** pass, over whatever detections are already to hand — a
+rule is a reading of boxes that already exist, not a second detection. So
+editing one and re-running costs milliseconds and never invalidates the cache.
+The loop is: change a threshold, re-run, read the report, change it again.
+
 ## Pro edition
 
 This edition already includes live face detection, VR side-by-side playback and
