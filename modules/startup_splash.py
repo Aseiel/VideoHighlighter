@@ -57,6 +57,15 @@ def _pyi():
     build made without --splash, so every call site has to tolerate None."""
     if not getattr(sys, "frozen", False):
         return None
+    # pyi_splash reads this variable at import time and, when it is missing,
+    # prints "The environment does not allow connecting to the splash screen.
+    # Did bootloader fail to initialize it?" plus a traceback before raising -
+    # all of it straight into debug.log. It is missing from every build made
+    # without --splash, and on macOS, where PyInstaller has no splash at all.
+    # The except below already made that harmless; checking first also keeps
+    # the false alarm out of the log we ask users to send us.
+    if not os.environ.get("_PYI_SPLASH_IPC"):
+        return None
     try:
         import pyi_splash
         return pyi_splash if pyi_splash.is_alive() else None
