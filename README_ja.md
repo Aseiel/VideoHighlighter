@@ -92,6 +92,8 @@ Google Translate APIは任意です。非公式ライブラリ（googletrans）�
 
 ## ライセンス
 
+Copyright (C) 2026 Przemysław Kreft, Meric Donmezer.
+
 このリポジトリはGNU Affero General Public License v3.0（AGPLv3）の下で公開されています。コードを自由に利用、修正、配布することができますが、ネットワーク経由で提供されるものを含むすべての修正版については、同じライセンスの下でその完全なソースコードを公開しなければなりません。
 
 

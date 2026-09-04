@@ -151,7 +151,11 @@ This project does not include any paid API keys. Users must provide their own if
 
 ## License
 
-This repository is released under the GNU Affero General Public License v3.0 (AGPLv3). You are free to use, modify, and distribute the code, provided that any modified versions, including those offered over a network, make their complete source code available under the same license.
+Copyright (C) 2026 Przemysław Kreft and Meric Donmezer.
+
+This repository is released under the GNU Affero General Public License v3.0 (AGPLv3). You are free to use, modify, and distribute the code, provided that any modified versions, including those offered over a network, make their complete source code available under the same license. The full text is in [LICENSE](LICENSE); the copyright notice is in [COPYRIGHT](COPYRIGHT).
+
+Contributors keep copyright in their own work — see [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). VideoHighlighter is also offered under a separate commercial license by the copyright holders.
 
 
 ## Project Background

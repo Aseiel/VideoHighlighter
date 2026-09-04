@@ -93,6 +93,8 @@ Este proyecto no incluye claves API de pago. Los usuarios deben proporcionar las
 
 ## Licencia
 
+Copyright (C) 2026 Przemysław Kreft y Meric Donmezer.
+
 Este repositorio se publica bajo la licencia GNU Affero General Public License v3.0 (AGPLv3). Puede utilizar, modificar y distribuir el código libremente, siempre y cuando cualquier versión modificada, incluidas las ofrecidas a través de una red, haga disponible su código fuente completo bajo la misma licencia.
 
 

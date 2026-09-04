@@ -92,6 +92,8 @@ Google Translate API 是可选的。如果使用非官方库（googletrans），
 
 ## 许可证
 
+版权所有 (C) 2026 Przemysław Kreft、Meric Donmezer。
+
 本仓库遵循 GNU Affero General Public License v3.0（AGPLv3）发布。您可自由使用、修改及分发该代码，前提是所有修改后的版本，包括通过网络提供的版本，都必须以相同许可证公开其完整的源代码。
 
 
