@@ -174,9 +174,24 @@ This edition remains free and AGPL-3.0 licensed.
 No Python or dependencies required — run `VideoHighlighter.exe` inside the extracted folder.
 
 ### macOS
-**Not a supported product download.** The prebuilt app we sell and support is
-Windows-only. You can try building from source on macOS if you know the stack;
-we do not ship or support a Mac release yet.
+Download the `.dmg` from [Releases](https://github.com/Aseiel/VideoHighlighter/releases)
+and drag **VideoHighlighter** into Applications.
+
+The app is ad-hoc signed and **not notarised**, so macOS quarantines it and the
+first launch fails — usually as *"VideoHighlighter is damaged and can't be
+opened"*. Nothing is damaged: that is Gatekeeper reacting to the missing
+notarisation, and it says the same thing about a perfectly good download. Clear
+the quarantine flag once, in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/VideoHighlighter.app
+```
+
+Then open it normally. Repeat it after each update, since the flag comes back
+with the new download.
+
+Mac builds get far less testing than Windows — please [open an
+issue](https://github.com/Aseiel/VideoHighlighter/issues) when something breaks.
 
 ### Linux / building from source
 1. **Python & FFmpeg**
@@ -184,6 +199,8 @@ we do not ship or support a Mac release yet.
 
 ## Usage
 - **Windows:** run `VideoHighlighter.exe` from the extracted build.
+- **macOS:** open **VideoHighlighter** from Applications, after clearing the
+  quarantine flag above.
 - **From source (Linux / advanced):** `python main.py`
 
 Footage, transcripts, and local models stay on disk. Analysis does not require
