@@ -5166,23 +5166,39 @@ class SignalTimelineWindow(QMainWindow):
         """)
 
 
-# Also write to a debug file
-DEBUG_FILE = "timeline_debug.log"
+# Also write to a debug file - beside `debug.log`, not in the working directory.
+# Launched from /Applications (or a mounted .dmg) the CWD is `/`, and a relative
+# name here made the open() below raise `OSError: [Errno 30] Read-only file
+# system` at import time, taking the whole timeline viewer down with it. Same
+# reason modules/repaint_trace.py resolves its path this way.
+def _debug_file_path() -> str:
+    try:
+        from modules.app_paths import user_data_dir
+        return os.path.join(user_data_dir(), "timeline_debug.log")
+    except Exception:
+        return "timeline_debug.log"
+
+
+DEBUG_FILE = _debug_file_path()
 
 
 def debug_log(msg):
     """Write debug message to both console and file"""
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     full_msg = f"[{timestamp}] {msg}"
-    
+
     # Use the original print function directly
     import builtins
     builtins.print(full_msg, flush=True)
-    
-    # Write to file
-    with open(DEBUG_FILE, "a", encoding="utf-8") as f:
-        f.write(full_msg + "\n")
-        f.flush()
+
+    # Write to file. Losing the log is not a reason to lose the window: a
+    # read-only install directory must degrade to console-only, not raise.
+    try:
+        with open(DEBUG_FILE, "a", encoding="utf-8") as f:
+            f.write(full_msg + "\n")
+            f.flush()
+    except OSError:
+        pass
 
 # Keep original print safe
 original_print = print
