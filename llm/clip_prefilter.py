@@ -126,9 +126,48 @@ def cuda_device() -> Optional[str]:
     return None
 
 
+def directml_device() -> Optional[str]:
+    """The torch device string for a usable DirectML GPU, else None.
+
+    The one place this module reaches into `modules/` — deliberately, and it
+    does not break the self-containment the block above describes:
+    `modules.directml_device` imports nothing but `os` and `typing` at module
+    scope, so it costs the same as the local probe it would otherwise be. The
+    reason not to inline it is that DirectML has genuine footguns (the backend
+    name changed between releases; the import is what registers the backend at
+    all) and a copy of that reasoning per module is a copy that goes stale.
+    """
+    try:
+        from modules import directml_device as dml
+    except Exception:  # noqa: BLE001 — absent module means "no DirectML"
+        return None
+    try:
+        return dml.device_string()
+    except Exception as e:  # noqa: BLE001 — a probe must never break the caller
+        print(f"⚠️  CLIP: DirectML probe failed ({type(e).__name__}: {e})")
+        return None
+
+
+def _is_directml(device: str) -> bool:
+    try:
+        from modules import directml_device as dml
+        return dml.is_directml(device)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _device_name(device: str) -> str:
     """The GPU's marketing name for the log, or the bare device string. Cosmetic
     only — never let a failed lookup here cost us the GPU."""
+    if _is_directml(device):
+        # torch.cuda.get_device_name() raises on a DirectML device, and the
+        # name matters more here than on CUDA: DirectML enumerates the
+        # integrated GPU and the software renderer alongside the real card.
+        try:
+            from modules import directml_device as dml
+            return dml.probe().name() or device
+        except Exception:  # noqa: BLE001
+            return device
     try:
         import torch
 
@@ -142,9 +181,19 @@ def resolve_device(requested: str) -> tuple[str, str]:
 
     backend is "torch" or "openvino"; device is that backend's own device string.
 
-        "AUTO"/"GPU" -> CUDA if present, else OpenVINO GPU (Intel), else CPU
+        "AUTO"/"GPU" -> CUDA, else DirectML (AMD), else OpenVINO GPU (Intel),
+                        else CPU
         "CUDA"/"cuda:N" -> torch CUDA, falling back to OpenVINO if absent
+        "DML"/"directml"/"privateuseone:N" -> torch DirectML, falling back to
+                        OpenVINO if this machine cannot provide one
         anything else ("CPU", "GPU.1", "NPU", ...) -> OpenVINO, passed through
+
+    DirectML is tried after CUDA and before OpenVINO because the OpenVINO GPU
+    plugin is Intel-only: on an AMD box "openvino", "GPU" silently means the
+    CPU, so DirectML is competing with the processor there, not with a GPU. On
+    an Intel box the order never matters, since CUDA is absent and DirectML is
+    only reached if `modules.directml_device` says yes — and on stock installs
+    torch-directml is not there to say anything.
     """
     req = (requested or "AUTO").strip()
 
@@ -152,8 +201,20 @@ def resolve_device(requested: str) -> tuple[str, str]:
         dev = cuda_device()
         if dev:
             return "torch", dev
-        # No NVIDIA: hand OpenVINO the Intel GPU. load() drops to CPU if the
-        # plugin won't take it, so "GPU" stays safe on a machine with neither.
+        dev = directml_device()
+        if dev:
+            return "torch", dev
+        # No NVIDIA and no DirectML: hand OpenVINO the Intel GPU. load() drops
+        # to CPU if the plugin won't take it, so "GPU" stays safe on a machine
+        # with neither.
+        return "openvino", "GPU"
+
+    if _is_directml(req):
+        dev = directml_device()
+        if dev:
+            return "torch", dev
+        print(f"⚠️  CLIP: {req!r} requested but DirectML is unavailable; "
+              f"using OpenVINO.")
         return "openvino", "GPU"
 
     if req.lower().startswith("cuda"):
@@ -213,9 +274,17 @@ class ClipFramePrefilter:
 
         Only the backend that would actually be used is checked, so a CUDA-only
         install without optimum-intel isn't told CLIP is unavailable."""
-        backend, _ = resolve_device(device)
-        mods = (("torch",) if backend == "torch" else ("optimum.intel",)) + \
-               ("transformers", "PIL")
+        backend, resolved = resolve_device(device)
+        if backend != "torch":
+            mods = ("optimum.intel",)
+        elif _is_directml(resolved):
+            # torch alone is not enough on this path: importing torch_directml
+            # is what registers the backend, so without it the resolved device
+            # string is one torch will reject.
+            mods = ("torch", "torch_directml")
+        else:
+            mods = ("torch",)
+        mods = mods + ("transformers", "PIL")
         for mod in mods:
             try:
                 __import__(mod)
@@ -238,9 +307,9 @@ class ClipFramePrefilter:
         self._load_openvino("GPU" if backend == "torch" else device)
 
     def _load_torch(self, device: str) -> bool:
-        """Load CLIP on an NVIDIA GPU via torch. True on success; False means
-        the caller should fall back to OpenVINO (rather than lose search over,
-        say, a GPU that's out of memory).
+        """Load CLIP on an NVIDIA or DirectML GPU via torch. True on success;
+        False means the caller should fall back to OpenVINO (rather than lose
+        search over, say, a GPU that's out of memory).
 
         Unlike the OpenVINO path this needs the *torch* weights, which are not
         in the bundled IR — so a first run fetches them to the HF cache. Offline,
@@ -269,6 +338,28 @@ class ClipFramePrefilter:
             # is bandwidth-bound and fp16 halves the traffic. Don't "fix" this
             # to a capability check without measuring on the card in question.
             dtype = torch.float16
+
+            if _is_directml(device):
+                from modules import directml_device as dml
+
+                # Registering the backend. `import torch_directml` is what
+                # teaches torch what "privateuseone" means; without it the
+                # .to() below raises, and the string alone gives no hint why.
+                if not dml.ensure_backend(device):
+                    raise RuntimeError(
+                        f"DirectML device {device!r} is no longer available: "
+                        f"{dml.unavailable_reason()}")
+                import torch_directml  # noqa: F401 — imported for the side effect
+
+                # fp32 unless the user opted in. The paragraph above measured
+                # fp16 on CUDA; DirectML is a different backend with uneven
+                # half-precision coverage per operator, and a layer that falls
+                # back converts on every call instead of saving bandwidth.
+                # ViT-B/32 in fp32 is ~600 MB, which fits the cards this path
+                # exists for.
+                if not dml.prefer_float16():
+                    dtype = torch.float32
+
             model = CLIPModel.from_pretrained(self.model_id, torch_dtype=dtype)
             self._model = model.to(device).eval()
             # The OV export dir carries the processor files, so prefer it and

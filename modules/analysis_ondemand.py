@@ -305,22 +305,30 @@ def _actions_to_cache(dets) -> list:
 
 
 def _r3d_flags(action_backend: str, log=print) -> tuple:
-    """`(enable_r3d, r3d_half)` for a backend choice — the same mapping the
-    pipeline applies, so an on-demand run picks the decoders a full run would."""
+    """`(enable_r3d, r3d_half, r3d_device)` for a backend choice — the same
+    mapping the pipeline applies, so an on-demand run picks the decoders a full
+    run would. `r3d_device` is None for "use whatever this machine reports"."""
     if action_backend == "openvino":
-        return False, False
+        return False, False, None
     if action_backend == "r3d_cuda":
-        return True, True       # FP16 on CUDA
+        return True, True, "cuda"       # FP16 on CUDA
     if action_backend == "r3d_cpu":
-        return True, False      # FP32 on CPU
-    # "auto": R3D only pays off on CUDA. Without it, OpenVINO on the Intel GPU
-    # beats R3D on the CPU.
+        return True, False, "cpu"       # FP32 on the CPU, on every machine
+    # "auto": R3D needs a GPU to be worth it. On Intel it stays off, because
+    # OpenVINO on the Intel GPU beats R3D on the CPU. On AMD there is no such
+    # GPU path to protect — OpenVINO's plugin is Intel-only — so DirectML is
+    # competing with the processor and R3D goes there, at fp32, with the
+    # wrapper's warm-up free to demote it back if the backend cannot run it.
     try:
         from modules.device_utils import detect_best_device
         dev = detect_best_device(log_fn=log)
-        return (True, True) if dev.pytorch_device == "cuda" else (False, False)
+        if dev.pytorch_device == "cuda":
+            return True, True, "cuda"
+        if dev.dml_device:
+            return True, False, dev.dml_device
     except Exception:
-        return False, False
+        pass
+    return False, False, None
 
 
 def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
@@ -343,7 +351,7 @@ def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
     d = analysis_defaults()
     sample_rate = sample_rate or d["sample_rate"]
     keep = [a.strip() for a in (interesting_actions or []) if a and a.strip()] or None
-    enable_r3d, r3d_half = _r3d_flags(d["action_backend"], log=log)
+    enable_r3d, r3d_half, r3d_device = _r3d_flags(d["action_backend"], log=log)
 
     detections, _bboxes = run_action_detection(
         video_path=video_path,
@@ -361,6 +369,7 @@ def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
         enable_r3d=enable_r3d,
         r3d_model_name=d["r3d_model"],
         r3d_half=r3d_half,
+        r3d_device=r3d_device,
         action_models=d["action_models"],
         preview_fn=preview_fn,
     )

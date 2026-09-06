@@ -1,5 +1,11 @@
 numpy
 torch
+# AMD GPUs go through DirectML, and `torch-directml` is deliberately NOT listed
+# here. It pins an exact torch version, so pip satisfies it by *replacing* the
+# installed torch, which silently removes Arc (+xpu) or CUDA (+cu124) support on
+# any machine that had it. It is opt-in, user-installed, into its own virtualenv.
+# (Also: there is no `torch-directml>=1.13`; releases are dated dev builds like
+# 0.2.5.dev240914, so a normal version floor matches nothing.) See docs/AMD-GPU.md.
 pyyaml
 opencv-python>=4.7  # FaceDetectorYN (YuNet) + FaceRecognizerSF (SFace) need >=4.5.4
 tqdm

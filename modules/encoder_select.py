@@ -38,11 +38,34 @@ _size_cache = {}
 _chain_cache = {}
 
 
+def _vendor_from_name(name):
+    """'nvidia' | 'intel' | 'amd' | None from any string naming a GPU."""
+    name = (name or "").lower()
+    if "nvidia" in name or "geforce" in name or "cuda" in name or "rtx" in name:
+        return "nvidia"
+    if "intel" in name or "arc(tm)" in name or " arc " in name or "xpu" in name:
+        return "intel"
+    if "amd" in name or "radeon" in name:
+        return "amd"
+    return None
+
+
 def preferred_gpu_vendor():
-    """'nvidia' | 'intel' | None — the machine's GPU vendor from
+    """'nvidia' | 'intel' | 'amd' | None — the machine's GPU vendor from
     modules.device_utils.detect_best_device(). Cached. Returns None on
-    CPU-only or if detection fails (device_utils does not detect AMD, so an
-    AMD box reports None and the caller keeps the full candidate list)."""
+    CPU-only or if detection fails, and the caller then keeps the full
+    candidate list.
+
+    AMD is answered by the DirectML adapter name, not by the backend label.
+    The label is a constant ("DirectML (AMD/DX12)") because DirectML runs on
+    any DX12 card, so reading the vendor off it would pick AMF encoders on an
+    NVIDIA machine that had DirectML forced on for testing — losing nvenc for
+    an unrelated reason. The adapter name is the actual card.
+
+    An AMD box without torch-directml installed still reports None, exactly as
+    before: no detection, full candidate list, h264_amf still gets its turn.
+    """
+
     global _vendor_cache
     if _vendor_cache is not _UNSET:
         return _vendor_cache
@@ -55,6 +78,12 @@ def preferred_gpu_vendor():
             vendor = "nvidia"
         elif "intel" in name or "xpu" in name:
             vendor = "intel"
+        elif getattr(info, "dml_device", None):
+            from modules import directml_device
+            for adapter in directml_device.adapter_names():
+                vendor = _vendor_from_name(adapter)
+                if vendor:
+                    break
     except Exception as e:
         print(f"⚠️ [encoder_select] device probe failed: {e}")
     _vendor_cache = vendor
@@ -135,8 +164,9 @@ def encoder_chain(video_path, ffmpeg=None, mode="gpu"):
 
     HEVC is used for high-res/VR sources (>4096px, what VR players expect);
     H.264 otherwise. When the GPU vendor is known only that vendor's encoder
-    is kept (+ libx264); when unknown (CPU-only / AMD) the full candidate list
-    is kept so h264_amf/hevc_amf still gets a chance."""
+    is kept (+ libx264); when unknown (CPU-only, or an AMD box with no
+    DirectML installed to name the card) the full candidate list is kept so
+    h264_amf/hevc_amf still gets a chance."""
     cache_key = (video_path, mode)
     if cache_key in _chain_cache:
         return _chain_cache[cache_key]

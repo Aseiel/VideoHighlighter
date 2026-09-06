@@ -1,0 +1,249 @@
+# AMD GPUs, via DirectML (experimental)
+
+An AMD card runs everything in this app on the processor. There is now an
+opt-in path that changes that on Windows, and it is genuinely experimental:
+the mechanism is in the repo and covered by tests, but **none of it has been
+measured on an AMD machine by us.** Treat the numbers you get as the only
+numbers, and `tools/check_directml.py` as the way to get them.
+
+## Why not ROCm
+
+ROCm is AMD's own stack and it is the faster answer where it applies. It does
+not apply here:
+
+- It is Linux-first. Requiring it would mean telling a Windows user to install
+  Linux to use a Windows desktop app.
+- AMD dropped consumer GPUs from it early. Polaris (RX 470/570/580) has had no
+  support since ROCm 4.5, and the Windows HIP SDK reports "no ROCm-capable
+  device detected" on exactly the cards most likely to be sitting in a machine
+  that would benefit from this.
+
+ZLUDA (a CUDA translation layer) is the other route people try, and it is a
+dependency maze that we would then own.
+
+DirectML is Microsoft's compute backend on top of DirectX 12. Anything with a
+DX12 driver can run it — every AMD GPU since Polaris, and Intel and NVIDIA
+cards too — on stock Windows with no vendor SDK. It is slower than CUDA or
+ROCm and it implements a *subset* of torch's operators, which is why nothing
+here is on by default and every consumer keeps the fallback it already had.
+
+## Installing it, and the two traps
+
+```bash
+pip install torch-directml
+```
+
+**Do that in its own virtualenv.** `torch-directml` pins an exact `torch`
+version, and pip satisfies that by *replacing* whatever torch is installed. On
+a machine carrying a `+xpu` build (Arc) or a `+cu124` build (CUDA), that
+silently removes Arc or CUDA support and the app then looks broken for a reason
+that has nothing to do with AMD. `CLAUDE.local.md` describes the same class of
+accident from the other direction.
+
+**There is no `torch-directml>=1.13`.** Releases are dated dev builds —
+`0.2.5.dev240914` — so a requirement line with a normal-looking version floor
+resolves to nothing at all and reports a package that does not exist. Pin an
+exact version or none.
+
+Python 3.11 is the safest interpreter for this: the published wheels target it,
+and 3.12+ has been reported to need workarounds.
+
+`torch-directml` is MIT. It is deliberately **not** in `requirements.txt` and
+**not** in any packaged build — partly because of the destructive install
+above, and partly because keeping it out means the project is not
+redistributing a dependency it has not audited for that.
+
+## Turning it on
+
+Nothing to configure. With `torch-directml` importable, the app picks DirectML
+up automatically **only where the alternative was the processor** — it can
+never displace CUDA or an Intel path.
+
+Two environment variables exist for the cases where that is not what you want:
+
+| Variable | Values | Effect |
+| --- | --- | --- |
+| `VH_DIRECTML` | `off` / `auto` (default) / `force` | `off` disables DirectML entirely, including the import. `force` puts it ahead of CUDA and Intel — for testing it on a machine that has something better. |
+| `VH_DIRECTML_FP16` | `1` to enable | Run DirectML models in fp16. Off by default; see *Precision* below. |
+
+## Check it before trusting it
+
+```bash
+python -m tools.check_directml
+```
+
+This exists because DirectML's failure modes are quiet. It reports a device and
+runs, so "it works" is easy to believe while the run is slower than the CPU it
+replaced. Three different things look identical from outside:
+
+1. **It picked the wrong adapter.** DirectML enumerates *every* DX12 adapter,
+   including the integrated GPU and Microsoft's software renderer (WARP, a CPU
+   implementation of D3D12). Device 0 is not necessarily the card you bought.
+   The app therefore **skips software renderers** when choosing an adapter, and
+   treats a machine whose *only* adapter is one as having no DirectML at all —
+   running on WARP is slower than the CPU path it replaced, with nothing
+   reporting a fault. `VH_DIRECTML=force` overrides that. The checker names
+   every adapter and marks the one in use.
+2. **It has the card but not its memory.** A backend working in a fraction of
+   the real VRAM swaps to disk on every batch: the system saturates, the GPU
+   sits idle and cool, and nothing anywhere reports an error. The checker
+   allocates in doubling blocks until one fails and prints the largest that
+   succeeded — compare it against the card's advertised VRAM. Where this has
+   been chased down in other DirectML applications, the cause was usually a
+   memory-limiting launch flag (a `--lowvram`-style option, or forced fp32)
+   rather than the driver; removing such flags restored full VRAM detection and
+   a large speedup. If this app ever grows one, that is the first place to look.
+3. **It is simply slower than the CPU here.** DirectML falls back per operator,
+   so on a weak card with a strong processor the CPU can win. That is a
+   legitimate outcome: set `VH_DIRECTML=off` and lose nothing.
+
+The checker exits non-zero on any of those, so it works as a smoke test rather
+than only as a printout.
+
+## Testing it without an AMD card
+
+```bash
+python -m tools.simulate_directml --all
+```
+
+`tools/simulate_directml.py` fakes the hardware: it installs a stand-in
+`torch_directml`, hides this machine's real accelerators so the AMD branch is
+the one actually taken, and redirects the simulated device onto the CPU so
+tensors genuinely move and genuinely run. Then it prints every decision the app
+makes — the pipeline backend, all four `resolve_device` results, the encoder
+vendor — for each of ten simulated machines: a working RX 570, one where
+DirectML sees 1 GB of an 8 GB card, one where the software renderer enumerates
+first, one where the first forward pass hits an unimplemented operator, an
+0.1.x install where the backend is called `dml`, and so on.
+
+`--run-diagnostic` runs `tools/check_directml.py` itself under the simulation,
+end to end.
+
+**What it proves and what it does not.** It exercises the plumbing: which
+backend each probe picks, whether a device string survives normalisation and
+backend registration, whether the fallbacks fire, what the encoder chain does.
+Those are real defect classes and all of them are otherwise invisible until
+somebody with an AMD card runs the app — the software-renderer rule above was
+found this way, by a simulation showing the app routing models onto WARP.
+
+It proves nothing about DirectML itself. Speed, memory behaviour and above all
+operator coverage — the risk that actually matters — are settled only by real
+hardware. Under simulation the "GPU" *is* the CPU, so the diagnostic's speed
+check always reports a sub-1x speedup and a red verdict; that is the simulation,
+not a finding.
+
+## What actually uses it
+
+| Feature | On DirectML | Notes |
+| --- | --- | --- |
+| Visual search (CLIP prefilter) | yes | Falls back to OpenVINO/CPU if the load fails. |
+| Video encoding (AMF) | yes, indirectly | See *The win that needs no model*. |
+| Action recognition (R3D) | yes, verified at load | 3D convolution is DirectML's least certain area, so this is proven, not assumed — see below. |
+| Action recognition (Intel encoder/decoder) | no | Deliberate: it is small enough that moving it buys nothing, and it exists only as OpenVINO IR. |
+| **Object detection** | **no** | Ultralytics has no DirectML backend. See below. |
+| Face, motion | no | Unchanged: OpenVINO on the CPU. |
+
+**R3D action recognition proves itself at load.** `pytorch_device` in
+`modules/device_utils.py` carries the DirectML string on an AMD box, which is
+what routes R3D there, and `auto` enables it — on AMD there is no faster path
+being displaced, because OpenVINO's GPU plugin is Intel-only and that branch is
+the processor.
+
+R3D is a 3D CNN, though, and 3D convolution is the least certain corner of
+DirectML's operator coverage. So this is not taken on trust:
+`R3DModelWrapper._warmup()` runs a real forward pass at the actual clip shape
+when the model loads, and moves the model to the CPU if the backend cannot
+execute it. The `.cpu()` on that pass is load-bearing — DirectML dispatches
+asynchronously, so without it a failing operator surfaces later, somewhere
+unrelated, and the fallback never sees it.
+
+The worst case is therefore the behaviour the app already had, plus one line
+saying why. The failure lands at load, not an hour into a job.
+
+**The Intel action encoder/decoder stays on OpenVINO.** `action-recognition-0001`
+is small enough that moving it would buy nothing, and it ships as OpenVINO IR
+only — Open Model Zoo publishes no ONNX for it, so there is no artifact
+DirectML could run even if it were worth doing.
+
+**Object detection does not use DirectML.** YOLO runs through Ultralytics,
+which has no DirectML backend, so `resolve_yolo_device()` answers a DirectML
+request with `cpu` on purpose — handing Ultralytics `privateuseone:0` would
+trade a slow run for a failed one. Moving detection to an AMD GPU would mean a
+different runtime under it (ONNX Runtime's DirectML execution provider, reading
+an ONNX export), which is separate work. It is also the largest remaining win
+on an AMD machine, since detection is the heaviest per-frame stage.
+
+### The win that needs no model
+
+Detecting the card at all means `modules/encoder_select.py` can finally answer
+"amd" and prefer `h264_amf` / `hevc_amf` when re-encoding clips. That is
+hardware video encoding, it has nothing to do with machine learning, and it
+works whether or not a single model ever runs on DirectML. It is likely the
+largest practical speedup on this list.
+
+The vendor comes from the *adapter name*, not from the backend label: DirectML
+runs on any DX12 card, so reading the vendor off the label would pick AMF
+encoders on an NVIDIA box that had `VH_DIRECTML=force` set for testing, and
+lose nvenc for an unrelated reason.
+
+## Precision
+
+fp16 is **off** by default on DirectML, which is the opposite of the CUDA path,
+where fp16 is unconditional and measured to be free.
+
+DirectML implements half precision unevenly across operators. A model whose
+layers mostly support it but which falls back for one pays a conversion on
+every call instead of saving bandwidth, and the result is slower than fp32
+while looking like an optimisation. The models routed here are small enough
+that fp32 fits the cards this exists for. `VH_DIRECTML_FP16=1` opts in — do it
+with `tools/check_directml.py` open, not on principle.
+
+R3D follows the same rule from the other direction: `R3DModelWrapper` keeps
+fp16 gated on CUDA specifically, so the `auto` backend requests fp32 on
+DirectML. The "R3D + CUDA (NVIDIA GPU)" and "R3D + CPU (PyTorch, slow)" choices
+in the main window now each name their own device, so the CPU one means the CPU
+on an AMD machine too rather than quietly becoming DirectML.
+
+## When it goes wrong
+
+**"The operator aten::… is not currently implemented for the DirectML
+backend."** Operator coverage, not a bug in the app. R3D catches this at
+load — its warm-up runs a real forward pass and moves the model to the CPU —
+and the CLIP loader falls back the same way. Elsewhere it will surface as a
+traceback in `debug.log`.
+
+**A crash under load, or a driver reset.** Windows set to the *High
+Performance* power plan together with AMD Adrenalin's workload mode set to
+*Compute* has been reported as an unstable combination for sustained DirectML
+work; reverting both to their defaults (Balanced, and the *Graphics* workload)
+resolved it. Worth trying before suspecting the app.
+
+**A device string that torch rejects.** `import torch_directml` is what
+registers the backend with torch — the string `privateuseone:0` means nothing
+until it has happened, in *that* process. Every call site here imports it
+before the first `.to()`, and `modules/directml_device.py:ensure_backend()` is
+the helper for any new one. A device string arriving from a worker process, a
+CLI flag or a stale config is the case that catches this out.
+
+**The backend is not called what you expect.** torch-directml 0.1.x called it
+`dml`; 0.2.x calls it `privateuseone`. Nothing here hardcodes either — the name
+is read off the device object the installed package hands back. Use
+`modules.directml_device.device_string()` rather than a literal.
+
+## Where the code is
+
+- `modules/directml_device.py` — everything DirectML-specific: the opt-in, the
+  probe, device-string normalisation, backend registration. Imports nothing but
+  `os` and `typing`, so any module can use it without dragging in machinery.
+- `modules/device_utils.py` — the pipeline-wide decision. DirectML sits after
+  the Intel probes and before the CPU fallback.
+- `llm/clip_prefilter.py` — visual search, with its own `resolve_device` (it
+  explains why it does not use `device_utils`).
+- `action_recognition.py` — `R3DModelWrapper`, whose warm-up is the guard.
+- `modules/encoder_select.py` — the AMF encoder preference.
+- `tools/check_directml.py` — the diagnostic, for a real AMD machine.
+- `tools/simulate_directml.py` — the fake AMD machine, for every other one.
+- `tests/test_directml_device.py`, `tests/test_directml_routing.py`,
+  `tests/test_r3d_directml.py`, `tests/test_directml_simulation.py` — the probe,
+  the orderings, R3D's fallback, and the simulator's own restore-everything
+  contract. None need an AMD card or the package installed.

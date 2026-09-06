@@ -1483,31 +1483,54 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 action_backend = gui_config.get("action_backend", "auto")
                 r3d_model = gui_config.get("r3d_model", "r3d_18")
 
+                # r3d_device is passed explicitly so the two "R3D" choices below
+                # mean what their labels say on every machine. Without it the
+                # device came from whatever the machine reported, and "R3D + CPU
+                # (PyTorch, slow)" would quietly become DirectML on an AMD box.
+                r3d_device = None
                 if action_backend == "openvino":
                     enable_r3d = False
                     r3d_half = False
                 elif action_backend == "r3d_cuda":
                     enable_r3d = True
                     r3d_half = True   # FP16 on CUDA
+                    r3d_device = "cuda"
                 elif action_backend == "r3d_cpu":
                     enable_r3d = True
                     r3d_half = False  # FP32 on CPU
+                    r3d_device = "cpu"
                 else:  # "auto"
-                    # Only enable R3D when CUDA is actually present. On Intel/CPU
-                    # systems R3D can only run on CPU (slow), so we disable it and
-                    # let OpenVINO use the Intel GPU (load_models AUTO → GPU).
+                    # R3D needs a GPU to be worth it. On Intel it stays off —
+                    # R3D there could only run on the CPU, and OpenVINO on the
+                    # Intel GPU beats that (load_models AUTO → GPU).
+                    #
+                    # AMD is the case that changed. OpenVINO's GPU plugin is
+                    # Intel-only, so on an AMD box the "let OpenVINO have it"
+                    # branch *is* the CPU — there is no faster path being
+                    # protected, and DirectML competes with the processor rather
+                    # than with a GPU. R3D is a 3D CNN and DirectML's coverage
+                    # there is the open question, so this is not taken on faith:
+                    # R3DModelWrapper runs a real forward pass at load and demotes
+                    # itself to the CPU if the backend cannot execute it, leaving
+                    # the machine exactly where it was before.
                     from modules.device_utils import detect_best_device
                     _dev = detect_best_device(log_fn=log)
                     if _dev.pytorch_device == "cuda":
                         enable_r3d = True
                         r3d_half = True
+                        r3d_device = _dev.pytorch_device
                         log(f"🎯 Auto backend → CUDA detected, using R3D ({_dev.backend_name})")
+                    elif _dev.dml_device:
+                        enable_r3d = True
+                        r3d_half = False  # FP16 is uneven on DirectML
+                        r3d_device = _dev.dml_device
+                        log(f"🎯 Auto backend → DirectML detected, using R3D on "
+                            f"{_dev.dml_device} ({_dev.backend_name}); it falls "
+                            f"back to the CPU if the backend cannot run it")
                     else:
                         enable_r3d = False
                         r3d_half = False
                         log(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
-
-                log(f"🎯 Action backend: {action_backend} | R3D model: {r3d_model} | enable_r3d: {enable_r3d}")
 
                 action_models_selection = gui_config.get("action_models", "mixed") or "mixed"
                 all_action_detections, action_bboxes_cache = run_action_detection(
@@ -1525,6 +1548,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     enable_r3d=enable_r3d,
                     r3d_model_name=r3d_model,
                     r3d_half=r3d_half,
+                    r3d_device=r3d_device,
                     action_models=action_models_selection,
                     preview_fn=preview_fn,
                 )

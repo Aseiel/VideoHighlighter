@@ -427,6 +427,81 @@ R3D_IMAGENET_STD = [0.22803, 0.22145, 0.216989]
 # =============================
 # R3D CUDA Model Wrapper
 # =============================
+def _r3d_device_name(wrapper) -> str:
+    """The card R3D actually ran on, for the timing summary.
+
+    Reads it off the wrapper rather than off `CUDA_AVAILABLE`, because the
+    wrapper's device is the only one that reflects what happened: a DirectML
+    load that failed its warm-up has already demoted itself to the CPU, and a
+    summary sourced from the module-level flag would report the device that was
+    *asked for*.
+    """
+    device = getattr(wrapper, "device", None)
+    if device is None:
+        return "CPU"
+    if device.type == 'cuda':
+        try:
+            return torch.cuda.get_device_name(0)
+        except Exception:  # noqa: BLE001
+            return "CUDA"
+    if _is_directml_device(device):
+        try:
+            from modules import directml_device as dml
+            return f"{dml.probe().name() or 'DirectML'} (DirectML)"
+        except Exception:  # noqa: BLE001
+            return "DirectML"
+    return "CPU"
+
+
+def _is_directml_device(device) -> bool:
+    """True if `device` (string or torch.device) names the DirectML backend."""
+    try:
+        from modules import directml_device as dml
+        return dml.is_directml(str(device))
+    except Exception:  # noqa: BLE001 — absent module means "no DirectML"
+        return False
+
+
+def _resolve_r3d_device(device_str):
+    """A requested device string -> a torch.device R3D can actually be put on.
+
+    The old form of this was `torch.device(device_str if torch.cuda.is_available()
+    else 'cpu')`, which collapsed *every* non-NVIDIA machine to the processor.
+    That was correct while CUDA was the only accelerator R3D had, and it is the
+    single line that made an AMD card impossible: a DirectML device string
+    handed in here was silently discarded, with nothing logged.
+
+    Never raises — an unusable request becomes the CPU, which is slow rather
+    than broken.
+    """
+    if _is_directml_device(device_str):
+        from modules import directml_device as dml
+
+        resolved = dml.normalize(str(device_str))
+        if not resolved:
+            print(f"⚠️ R3D: DirectML requested but unusable "
+                  f"({dml.unavailable_reason()}); using CPU")
+            return torch.device('cpu')
+        try:
+            # The import *is* the backend registration; without it torch does
+            # not know what "privateuseone" means and .to() fails on a string
+            # that looks perfectly valid.
+            import torch_directml  # noqa: F401 — imported for the side effect
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ R3D: torch-directml will not import "
+                  f"({type(e).__name__}: {e}); using CPU")
+            return torch.device('cpu')
+        return torch.device(resolved)
+
+    if str(device_str).startswith('cuda') and not torch.cuda.is_available():
+        return torch.device('cpu')
+    try:
+        return torch.device(device_str)
+    except Exception:  # noqa: BLE001 — an unparseable string is not worth a crash
+        print(f"⚠️ R3D: unrecognised device {device_str!r}; using CPU")
+        return torch.device('cpu')
+
+
 class R3DModelWrapper:
     """
     Wraps a torchvision R3D model for use alongside OpenVINO models.
@@ -446,13 +521,17 @@ class R3DModelWrapper:
         """
         Args:
             model_name: One of 'r3d_18', 'mc3_18', 'r2plus1d_18'
-            device_str: 'cuda' or 'cpu'
+            device_str: 'cuda', 'cpu', or a DirectML device ('privateuseone:0')
             half_precision: Use FP16 on CUDA for faster inference
             custom_weights: Path to .pth file with fine-tuned weights (optional)
             custom_num_classes: Number of classes in custom model (required if custom_weights)
         """
         self.model_name = model_name
-        self.device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
+        self.device = _resolve_r3d_device(device_str)
+        # FP16 stays CUDA-only. On DirectML half precision is implemented
+        # unevenly per operator, so a 3D CNN that falls back for one layer pays
+        # a conversion on every call instead of saving bandwidth — see
+        # modules/directml_device.py and docs/AMD-GPU.md.
         self.half = half_precision and self.device.type == 'cuda'
         self.num_classes = custom_num_classes or 400  # default Kinetics-400
 
@@ -484,10 +563,22 @@ class R3DModelWrapper:
             print(f"   ✓ Loaded custom weights: {custom_num_classes} classes")
 
         self.model.eval()
+        self._place_on_device()
+
+        # Warm-up inference to trigger CUDA kernel compilation — and, on
+        # DirectML, to find out whether this model can run there at all.
+        self._warmup()
+        print(f"✓ {model_name} loaded and warmed up on {self.device}")
+
+    def _place_on_device(self):
+        """Move the model and the normalisation constants to self.device.
+
+        Separate from __init__ because it has to be repeatable: the warm-up may
+        decide the chosen device cannot run this model and redo it on the CPU.
+        """
         self.model.to(self.device)
         if self.half:
             self.model.half()
-
 
         # Pre-build normalization tensors on device for speed
         self.mean = torch.tensor(R3D_IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1, 1)
@@ -496,20 +587,53 @@ class R3DModelWrapper:
             self.mean = self.mean.half()
             self.std = self.std.half()
 
-        # Warm-up inference to trigger CUDA kernel compilation
-        self._warmup()
-        print(f"✓ {model_name} loaded and warmed up on {self.device}")
-
     def _warmup(self):
-        """Run a dummy forward pass to warm up CUDA kernels."""
+        """Run a dummy forward pass — and on DirectML, treat it as a test.
+
+        On CUDA this only ever warmed kernels, and a failure was a real fault
+        worth raising. On DirectML it is load-bearing: DirectML implements a
+        *subset* of torch's operators, R3D is a 3D CNN, and 3D convolution is
+        the least certain corner of that subset. The failure would otherwise
+        surface on the first real clip — an hour into a job, as an "operator is
+        not currently implemented" traceback that reads like a bug in the app.
+
+        So the dummy pass is run *at load*, with the real clip shape, and a
+        DirectML failure demotes the model to the CPU instead of propagating.
+        The run is then slow, which is exactly what it was before DirectML
+        existed, and one line says why. Anything not on DirectML still raises,
+        because there a broken warm-up is a fault, not a hardware limit.
+        """
+        try:
+            self._forward_dummy()
+            return
+        except Exception as e:  # noqa: BLE001 — narrowed immediately below
+            if not _is_directml_device(self.device):
+                raise
+            print(f"⚠️ R3D: DirectML cannot run {self.model_name} "
+                  f"({type(e).__name__}: {e})")
+            print("   Falling back to the CPU for action recognition. This is "
+                  "slower but correct; see docs/AMD-GPU.md.")
+
+        self.device = torch.device('cpu')
+        self.half = False
+        self._place_on_device()
+        self._forward_dummy()
+
+    def _forward_dummy(self):
+        """One forward pass at the real clip shape, on whatever self.device is."""
         dummy = torch.zeros(1, 3, R3D_CLIP_LENGTH, R3D_INPUT_SIZE, R3D_INPUT_SIZE,
                             device=self.device)
         if self.half:
             dummy = dummy.half()
         with torch.no_grad():
-            _ = self.model(dummy)
+            out = self.model(dummy)
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
+        # .cpu() forces the queue to drain. DirectML dispatches asynchronously,
+        # so without it a failing operator can raise later, on an unrelated
+        # line, and the fallback above would never see it.
+        return out.cpu()
+
 
     def preprocess_clip(self, raw_frames, roi=None):
         """
@@ -780,7 +904,7 @@ def compile_with_fallback(ie, model, preferred_device, model_name="model"):
 
 def load_models(device="AUTO", openvino_threads=None,
                 enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True,
-                action_models='mixed'):
+                action_models='mixed', r3d_device=None):
     """
     Load models based on action_models selection.
 
@@ -885,7 +1009,12 @@ def load_models(device="AUTO", openvino_threads=None,
     r3d_wrapper = None
     if load_r3d_pre and enable_r3d and TORCH_AVAILABLE:
         try:
-            r3d_device = _PYTORCH_DEVICE
+            # An explicit request wins; otherwise take the machine's own
+            # torch device. That is "cuda" on NVIDIA, a DirectML string on an
+            # AMD box, and "cpu" everywhere else. The caller passes one so that
+            # the "R3D + CPU" backend choice means the CPU on every machine,
+            # rather than quietly becoming DirectML on an AMD one.
+            r3d_device = r3d_device or _PYTORCH_DEVICE
             print(f"🔄 Initializing R3D pretrained model on {r3d_device}...")
             r3d_wrapper = R3DModelWrapper(
                 model_name=r3d_model_name,
@@ -909,7 +1038,7 @@ def load_models(device="AUTO", openvino_threads=None,
     if load_r3d_custom and enable_r3d and TORCH_AVAILABLE:
         if R3D_CUSTOM_LABELS and R3D_CUSTOM_WEIGHTS_PATH.exists():
             try:
-                r3d_custom_device = 'cuda' if CUDA_AVAILABLE else 'cpu'
+                r3d_custom_device = r3d_device or _PYTORCH_DEVICE
                 custom_variant = (R3D_CUSTOM_META or {}).get('model_variant') or r3d_model_name
                 num_classes = len(R3D_CUSTOM_LABELS)
                 print(f"🔄 Initializing R3D custom model ({num_classes} classes, "
@@ -1138,7 +1267,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                          warm_up_seconds=2, include_model_type=False,
                          openvino_threads=None, preprocess_workers=2,
                          enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True,
-                         action_models='mixed', preview_fn=None):
+                         action_models='mixed', preview_fn=None,
+                         r3d_device=None):
     """
     Run action recognition — OPTIMIZED version with R3D/CUDA support.
 
@@ -1210,7 +1340,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
      models_info, actual_device, r3d_wrapper) = \
         load_models(device, openvino_threads=openvino_threads,
                     enable_r3d=enable_r3d, r3d_model_name=r3d_model_name,
-                    r3d_half=r3d_half, action_models=action_models)  # ← passed through
+                    r3d_half=r3d_half, action_models=action_models,
+                    r3d_device=r3d_device)  # ← passed through
 
     encoder_engine = AsyncBatchedInferenceEngine(
         compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)
@@ -1939,7 +2070,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     print(f"CPU cores:            {os.cpu_count()}")
     print(f"OpenVINO threads:     {openvino_threads}")
     if r3d_wrapper:
-        device_name = torch.cuda.get_device_name(0) if CUDA_AVAILABLE else "CPU"
+        device_name = _r3d_device_name(r3d_wrapper)
         print(f"R3D device:           {device_name}")
     print(f"Actions detected:     {detection_count}")
     print("=" * 60)
