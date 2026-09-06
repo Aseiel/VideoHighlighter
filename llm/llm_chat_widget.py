@@ -38,6 +38,10 @@ from .llm_module import (
     VideoSeekAnalyzer, CancellationToken, GenerationCancelled,
 )
 from .llm_reasoning import ReasoningLLMIntegration
+from .ollama_host import (
+    DEFAULT_BASE_URL as OLLAMA_DEFAULT_URL, is_remote as ollama_is_remote,
+    remember as remember_ollama_host, resolve as resolve_ollama_host,
+)
 
 # timeline bridge (only available when timeline viewer is present)
 try:
@@ -700,6 +704,31 @@ class LLMChatWidget(QWidget):
         row1.addStretch()
         settings_layout.addLayout(row1)
 
+        # Row 1b: which Ollama server. Hidden for llama-cpp, which has no
+        # server to point anywhere. It sits next to Backend rather than in a
+        # preferences dialog because this is the row where "connect to what"
+        # is already being answered, and because a run that fails with "model
+        # not found" needs the machine that was asked to be on screen.
+        self.ollama_row_widget = QWidget()
+        ollama_inner = QHBoxLayout()
+        ollama_inner.setContentsMargins(0, 0, 0, 0)
+        ollama_inner.addWidget(QLabel("Ollama host:"))
+        self.ollama_host_input = QLineEdit()
+        self.ollama_host_input.setPlaceholderText(OLLAMA_DEFAULT_URL)
+        self.ollama_host_input.setToolTip(
+            "Where Ollama is running. Blank means " + OLLAMA_DEFAULT_URL + ".\n"
+            "A machine on the network works too - 192.168.1.50, or\n"
+            "http://box.lan:11434. That server has to have been started with\n"
+            "OLLAMA_HOST=0.0.0.0 for anything but itself to reach it.\n"
+            "The whole app follows this: chat, report, narration and advisor."
+        )
+        # editingFinished, not textChanged: normalising while somebody is still
+        # typing an address rewrites the field under the cursor.
+        self.ollama_host_input.editingFinished.connect(self._on_ollama_host_edited)
+        ollama_inner.addWidget(self.ollama_host_input)
+        self.ollama_row_widget.setLayout(ollama_inner)
+        settings_layout.addWidget(self.ollama_row_widget)
+
         # Row 2: GGUF path (hidden by default)
         self.gguf_row_widget = QWidget()
         gguf_inner = QHBoxLayout()
@@ -733,6 +762,10 @@ class LLMChatWidget(QWidget):
         settings = QSettings(self.SETTINGS_KEY, "LLMChat")
         self.gguf_path_input.setText(settings.value("last_gguf_path", ""))
         self.mmproj_path_input.setText(settings.value("last_mmproj_path", ""))
+        # Shows the server that would actually be used, including one inherited
+        # from OLLAMA_HOST in the environment - a field that reads "localhost"
+        # while the run goes somewhere else is worse than no field.
+        self.ollama_host_input.setText(resolve_ollama_host())
 
 
         # Row 4: context indicator + reasoning controls + Load Cache + Show Context.
@@ -1771,6 +1804,7 @@ class LLMChatWidget(QWidget):
     def _on_backend_changed(self, _index):
         backend = self.backend_combo.currentData()
         is_gguf = backend == "llama-cpp"
+        self.ollama_row_widget.setVisible(not is_gguf)
         self.gguf_row_widget.setVisible(is_gguf)
         self.mmproj_row_widget.setVisible(is_gguf)
         self.refresh_btn.setVisible(not is_gguf)
@@ -1779,6 +1813,24 @@ class LLMChatWidget(QWidget):
         if is_gguf:
             self._populate_recent_gguf()
         else:
+            self._refresh_models()
+
+    def _on_ollama_host_edited(self):
+        """Store the new server and ask *it* what models it has.
+
+        Storing here rather than at Connect is deliberate: the model dropdown
+        beside this field is filled from the server, so a host typed and left
+        alone must already be the one being listed, or the user picks a tag from
+        the old machine and connects to the new one.
+        """
+        url = remember_ollama_host(self.ollama_host_input.text())
+        self.ollama_host_input.setText(url or resolve_ollama_host())
+        try:
+            from modules.llm_discovery import forget_ollama_models
+            forget_ollama_models()
+        except Exception:                       # pragma: no cover - defensive
+            pass
+        if self.backend_combo.currentData() == "ollama":
             self._refresh_models()
 
     def _populate_recent_gguf(self):
@@ -1817,16 +1869,23 @@ class LLMChatWidget(QWidget):
             return
             
         if backend == "ollama":
-            models = get_ollama_models()
+            host = resolve_ollama_host()
+            # Named only when it is not the default: on localhost the URL is
+            # noise, and on another machine it is the whole answer.
+            where = f" at {host}" if ollama_is_remote(host) else ""
+            models = get_ollama_models(host)
             if models:
                 for m in models:
                     self.model_combo.addItem(m)
-                self.status_label.setText(f"Found {len(models)} Ollama models")
+                self.status_label.setText(
+                    f"Found {len(models)} Ollama models{where}")
                 self.status_label.setStyleSheet("color:#4CAF50;font-style:italic;")
             else:
                 for m in ["llama3.2", "llama3.2-vision", "llava", "bakllava", "llava-llama3"]:
                     self.model_combo.addItem(m)
-                self.status_label.setText("Ollama not running - showing defaults (vision models recommended)")
+                self.status_label.setText(
+                    f"No Ollama answered{where or ' on this machine'} - showing "
+                    "defaults (vision models recommended)")
                 self.status_label.setStyleSheet("color:#ff9800;font-style:italic;")
 
     def _browse_gguf(self):
@@ -1857,7 +1916,9 @@ class LLMChatWidget(QWidget):
 
         try:
             if backend == "ollama":
-                self._llm = LLMModule(backend="ollama", model=model, log_fn=self._log)
+                self._llm = LLMModule(backend="ollama", model=model,
+                                      base_url=resolve_ollama_host(),
+                                      log_fn=self._log)
             elif backend == "llama-cpp":
                 gguf_path = self.gguf_path_input.text().strip()
                 if not gguf_path:

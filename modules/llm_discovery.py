@@ -38,6 +38,11 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from llm.ollama_host import resolve as resolve_ollama_host
+
+# Kept as a name because callers and tests refer to it; the *decision* about
+# which server to ask lives in :mod:`llm.ollama_host`, so a user who moved
+# Ollama to another machine moves this list with it.
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 
 # The chat panel's own store, matched exactly: QSettings(organisation,
@@ -54,15 +59,21 @@ MAX_RECENT_GGUF = 10
 _cache: dict = {}
 
 
-def ollama_models(base_url: str = DEFAULT_OLLAMA_URL,
+def ollama_models(base_url: Optional[str] = None,
                   refresh: bool = False) -> list:
-    """The models the local Ollama server holds, or ``[]`` if it cannot be asked.
+    """The models the configured Ollama server holds, or ``[]`` if it cannot be asked.
 
     An empty list is not an error and must not be shown as one: a user who has
     not started Ollama yet, or who only uses GGUF files, is in a perfectly
     ordinary state. The caller says "not reachable" and leaves the field
     typable.
+
+    ``base_url=None`` is the server the user configured (localhost unless they
+    said otherwise). The cache is keyed by the resolved URL, so pointing the app
+    at a different machine asks that machine rather than replaying the answer
+    the old one gave.
     """
+    base_url = resolve_ollama_host(base_url)
     if not refresh and base_url in _cache:
         return list(_cache[base_url])
     try:

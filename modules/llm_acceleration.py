@@ -128,15 +128,19 @@ def dir_reasons(model_dir: str) -> bool:
         return False
 
 
-def tag_reasons(tag: str, base_url: str = "http://localhost:11434"):
+def tag_reasons(tag: str, base_url: Optional[str] = None):
     """Whether an Ollama tag reasons, or None when the server cannot say.
 
     Best-effort and never fatal: this runs at preflight, and a missing server is
     already reported elsewhere with a better message than this could give.
+    ``base_url=None`` asks whichever server the user configured, which is the
+    same one the run itself will use.
     """
     try:
         import requests
-        resp = requests.post(f"{base_url}/api/show", json={"model": tag},
+        from llm.ollama_host import resolve as resolve_ollama_host
+        resp = requests.post(f"{resolve_ollama_host(base_url)}/api/show",
+                             json={"model": tag},
                              timeout=5)
         if not resp.ok:
             return None

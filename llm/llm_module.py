@@ -38,6 +38,14 @@ except ImportError:
     HAS_CV2 = False
     print("⚠️ OpenCV not installed. VideoSeekAnalyzer will not work. Install with: pip install opencv-python")
 
+# Which Ollama server to talk to is decided in one place, so the chat panel, the
+# report and the advisor cannot end up pointed at two different machines. The
+# fallback is for running this file directly, which the header still documents.
+try:
+    from llm.ollama_host import resolve as resolve_ollama_host
+except ImportError:  # pragma: no cover - standalone/dev fallback
+    from ollama_host import resolve as resolve_ollama_host
+
 
 # ---------------------------------------------------------------------------
 # Cancellation token — allows external code to abort generation mid-stream
@@ -178,12 +186,35 @@ def _check_cancel(cancel_token: Optional[CancellationToken]):
 THINKING_BUDGET = -1
 
 
-class _OllamaBackend(_LLMBackend):
-    """Talks to a local Ollama server (http://localhost:11434)."""
+def _unreachable_hint(base_url: str) -> str:
+    """What to try next when nothing answered at ``base_url``.
 
-    def __init__(self, model: str = "llama3.2", base_url: str = "http://localhost:11434"):
+    Two different pieces of advice, because the usual cause differs: locally the
+    server is simply not started, while a remote one is nearly always running
+    and bound to its own localhost - the default - where the network cannot see
+    it. Telling a user to start a server they can watch running is the kind of
+    help that makes them stop reading the message.
+    """
+    try:
+        from llm.ollama_host import is_remote
+    except ImportError:  # pragma: no cover - standalone/dev fallback
+        from ollama_host import is_remote
+    if is_remote(base_url):
+        return ("On that machine, start it as OLLAMA_HOST=0.0.0.0 ollama serve "
+                "and let port 11434 through its firewall.")
+    return "Start with: ollama serve"
+
+
+class _OllamaBackend(_LLMBackend):
+    """Talks to an Ollama server - localhost by default, wherever it was set.
+
+    ``base_url=None`` means "ask :mod:`llm.ollama_host`", which is how a server
+    on another machine reaches every caller at once instead of one at a time.
+    """
+
+    def __init__(self, model: str = "llama3.2", base_url: Optional[str] = None):
         self.model = model
-        self.base_url = base_url.rstrip("/")
+        self.base_url = resolve_ollama_host(base_url)
         self._loaded = False
         # Whether this model reasons before it answers. Read from the server at
         # load() where the server will say, and otherwise discovered by the
@@ -240,10 +271,13 @@ class _OllamaBackend(_LLMBackend):
                     print(f"[thinking] '{self.model}' reasons before answering; "
                           f"its replies are uncapped and will take longer.")
         except requests.ConnectionError:
+            # A remote server that refuses the connection has almost always
+            # been started bound to localhost, which is the default and is
+            # invisible from any other machine. "Is it running?" sends the
+            # user there to check the one thing that is already true.
             raise RuntimeError(
                 "Cannot connect to Ollama at "
-                f"{self.base_url}. Is it running?\n"
-                "Start with: ollama serve"
+                f"{self.base_url}. Is it running?\n" + _unreachable_hint(self.base_url)
             )
 
     def is_loaded(self) -> bool:
@@ -1121,7 +1155,7 @@ class LLMModule:
         model: str = "llama3.2",
         model_path: str = "",
         mmproj_path: str = None,
-        base_url: str = "http://localhost:11434",
+        base_url: Optional[str] = None,
         n_ctx: int = 4096,
         n_gpu_layers: int = -1,
         log_fn: Callable = print,
@@ -1348,11 +1382,15 @@ def get_available_backends() -> list[str]:
     return backends
 
 
-def get_ollama_models(base_url: str = "http://localhost:11434") -> list[str]:
-    """Query Ollama for available models. Returns empty list on failure."""
+def get_ollama_models(base_url: Optional[str] = None) -> list[str]:
+    """Query Ollama for available models. Returns empty list on failure.
+
+    ``None`` means the configured server (:mod:`llm.ollama_host`), which is
+    localhost unless the user has pointed the app somewhere else.
+    """
     try:
         import requests
-        resp = requests.get(f"{base_url}/api/tags", timeout=3)
+        resp = requests.get(f"{resolve_ollama_host(base_url)}/api/tags", timeout=3)
         resp.raise_for_status()
         return [m["name"] for m in resp.json().get("models", [])]
     except Exception:
