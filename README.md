@@ -131,11 +131,11 @@ silence, because a report that stops at what it found invites its gaps to be
 read as absence. A model writes the chapter prose, but every boundary and figure
 it is handed was computed before it saw them.
 
-A whole report, unedited, is in the repo:
-[`docs/examples/escalated_highlight_why.html`](docs/examples/escalated_highlight_why.html)
-— 6 clips out of a minute of footage. GitHub will not render it in place, so
-download it and open it in a browser; the six inline players stay empty unless
-the source video sits beside the file.
+A whole report, unedited:
+**[open the example](https://aseiel.github.io/VideoHighlighter-site/example-report.html)**
+— 6 clips out of a minute of footage. The file itself is in the repo at
+[`docs/examples/escalated_highlight_why.html`](docs/examples/escalated_highlight_why.html);
+its six inline players stay empty there unless the source video sits beside it.
 
 Explanation is never a paid feature. The report, the findings and the advisor
 are identical in both editions. A cloud tool gives you a button and a result you
