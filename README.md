@@ -101,7 +101,7 @@ landed in, and whether the multi-signal boost applied. Around that sit the clips
 in cut order, the video in chapters, the moments that scored well and still did
 not make it, and the exact settings the run used.
 
-Two sections earn it its keep:
+Three sections earn it its keep:
 
 - **Said here, measured nowhere** — lines from the transcript that no class or
   event this run produced shares a word with. The report quotes them and states
@@ -117,6 +117,25 @@ Two sections earn it its keep:
   > detector thresholds so more moments score, give another signal a weight, or
   > accept the shorter cut — padding it means including moments nothing was
   > detected in.
+
+- **In closing** — what the run observed, what was only asserted and by whom,
+  and what it could not determine, kept apart, because running them together is
+  how the third quietly becomes the first:
+
+![In closing: what the run observed, what was said and by whom, and what it could not determine](assets/ai-summary-report.png)
+
+Detections are the run's own observations. A transcript is one speaker's
+account, and may describe things that never appear in the frame — so it is
+attributed, not merged in. And the limits are listed rather than left to
+silence, because a report that stops at what it found invites its gaps to be
+read as absence. A model writes the chapter prose, but every boundary and figure
+it is handed was computed before it saw them.
+
+A whole report, unedited, is in the repo:
+[`docs/examples/escalated_highlight_why.html`](docs/examples/escalated_highlight_why.html)
+— 6 clips out of a minute of footage. GitHub will not render it in place, so
+download it and open it in a browser; the six inline players stay empty unless
+the source video sits beside the file.
 
 Explanation is never a paid feature. The report, the findings and the advisor
 are identical in both editions. A cloud tool gives you a button and a result you
