@@ -2,7 +2,7 @@
   <img src="assets/icon.png" alt="VideoHighlighter" width="160">
 </p>
 
-VideoHighlighter (Freeware)
+# VideoHighlighter
 
 <!-- hy-mt2-i18n:start -->
 **English** | [中文](./README_zh-CN.md) | [日本語](./README_ja.md) | [Español](./README_es.md)
@@ -11,6 +11,15 @@ VideoHighlighter (Freeware)
 **Find and explain the moments that matter in footage you won't upload — then export a cut, on your machine.**
 
 A local desktop tool: drop raw video, score strong moments (scene, motion, audio, objects, actions, transcript), see *why* they scored on a signal timeline and report, then export a highlight reel and separate clips. Nothing is uploaded for analysis.
+
+Two things separate it from the rest of the "AI highlights" shelf:
+
+- **[Every run explains itself](#why-these-moments)** — the report is the
+  arithmetic behind each kept moment, and it names the claims that came from
+  the transcript and were never measured instead of scoring them anyway.
+- **[Composition rules](#composition-rules)** — you say what a *combination* of
+  detections means for your footage, and because a rule re-reads detections
+  that already exist, editing one and re-running costs milliseconds.
 
 > **It's free.** To make sure you see new releases in future, please click the
 > motivation button: the ⭐ at the top of the page. It's the cheapest payment we
@@ -164,11 +173,13 @@ The loop is: change a threshold, re-run, read the report, change it again.
 
 ## Pro edition
 
-This edition already includes live face detection, VR side-by-side playback and
-rendering, offline analysis, CLIP search, the composition engine, and the
-training scripts.
+**VideoHighlighter — this repository — is free software under AGPL-3.0**, and
+stays that way. It already includes live face detection, VR side-by-side
+playback and rendering, offline analysis, CLIP search, the composition engine,
+and the training scripts.
 
-[VideoHighlighter Pro](https://aseiel.github.io/VideoHighlighter-site/) adds:
+**[VideoHighlighter Pro](https://aseiel.github.io/VideoHighlighter-site/) is a
+separate paid, closed-source edition.** On top of everything above, it adds:
 
 - **Live object and action overlays** — real-time detection during playback,
   including on side-by-side VR footage.
@@ -182,7 +193,8 @@ training scripts.
   every tick proves an event, so Pro can show which real moments the detector
   missed.
 
-This edition remains free and AGPL-3.0 licensed.
+Explanation is not among them: the report, the findings and the advisor are
+identical in both editions.
 
 ## Installation
 
