@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox, QListWidget, QListWidgetItem, QDialog,
     QDialogButtonBox, QFormLayout, QTabWidget
 )
-from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData, QLoggingCategory, QUrl
+from PySide6.QtCore import Qt, QRect, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData, QLoggingCategory, QUrl, QEvent
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QPainter, QFont, QPainterPath,
     QLinearGradient, QRadialGradient, QCursor, QAction,
