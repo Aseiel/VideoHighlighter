@@ -85,6 +85,19 @@ datas += ov_datas
 binaries += ov_binaries
 hiddenimports += ov_hidden
 
+# ONNX Runtime, for the DirectML detection path (modules/onnx_detector.py). It
+# is imported inside a function rather than at module scope, and its providers
+# are native libraries, so collect it explicitly rather than trusting the graph.
+# Absent on any platform without the wheel — a sidecar built there simply has
+# no DirectML, which is already what that machine gets.
+try:
+    ort_datas, ort_binaries, ort_hidden = collect_all("onnxruntime")
+    datas += ort_datas
+    binaries += ort_binaries
+    hiddenimports += ort_hidden
+except Exception:
+    pass
+
 # imageio_ffmpeg ships the ffmpeg binary the pipeline falls back to when none is
 # on PATH (see app_paths.ffmpeg_exe).
 from PyInstaller.utils.hooks import collect_dynamic_libs

@@ -26,6 +26,15 @@ try:
 except Exception:  # noqa: BLE001
     _dml = None
 
+# The other DirectML runtime. ONNX Runtime's provider needs no particular torch,
+# so unlike `directml_device` it survives into a packaged build — which is the
+# only reason an AMD user running the exe can have a GPU at all. Detection is
+# what it drives; see modules/onnx_detector.py.
+try:
+    from modules import ort_directml as _ort_dml
+except Exception:  # noqa: BLE001
+    _ort_dml = None
+
 
 # ---------------------------------------------------------------------------
 # Primary entry point — call this once at the top of pipeline.py
@@ -149,7 +158,17 @@ def detect_best_device(log_fn=print):
             return info
         reason = _dml.unavailable_reason()
         if reason and _dml.enabled():
-            log_fn(f"ℹ️ DirectML not used: {reason}")
+            log_fn(f"ℹ️ DirectML not used for torch models: {reason}")
+
+    # ---- DirectML for detection only, through ONNX Runtime ------------------
+    # Reached when torch has no DirectML but ONNX Runtime does, which is every
+    # packaged build: `torch-directml` pins an exact torch and so can never be
+    # bundled beside the CUDA one, while `onnxruntime-directml` depends on no
+    # torch at all. Detection is the heaviest per-frame stage, so this is the
+    # larger half of the win even though it moves fewer models.
+    info = _onnx_dml_info(log_fn)
+    if info is not None:
+        return info
 
     # ---- CPU fallback -------------------------------------------------------
     log_fn("ℹ️ No GPU found — using CPU")
@@ -208,7 +227,45 @@ def _directml_info(log_fn=print):
         dml_device=device,
         use_openvino_yolo=True,
         gpu_available=True,
+        # A source install can have both runtimes. If ONNX Runtime is one of
+        # them, detection goes to the GPU too rather than staying on the CPU
+        # because Ultralytics has no DirectML backend.
+        onnx_dml_yolo=(_ort_dml is not None and _ort_dml.available()),
         backend_name="DirectML (AMD/DX12)",
+    )
+
+
+def _onnx_dml_info(log_fn=print):
+    """DeviceInfo for a machine whose GPU only ONNX Runtime can reach, or None.
+
+    Everything torch touches stays on the processor — that is the honest answer
+    when there is no torch build for this card. What changes is `onnx_dml_yolo`:
+    the object detector may load an ONNX export and run it on the GPU, which is
+    where most of a run's per-frame time goes.
+
+    `gpu_available` is True for the same reason it is on the Intel/OpenVINO
+    branch above: a GPU *is* doing work, just not through torch, and
+    `modules/encoder_select.py` reads the backend name to prefer the AMF video
+    encoders on an AMD box.
+    """
+    if _ort_dml is None or not _ort_dml.available():
+        return None
+    probe = _ort_dml.probe()
+    log_fn(f"✅ DirectML via ONNX Runtime {probe.version or ''}".rstrip())
+    log_fn("   object detection only — torch models stay on the CPU "
+           "(see docs/AMD-GPU.md)")
+    return DeviceInfo(
+        yolo_pt_device="cpu",
+        yolo_ov_device="cpu",
+        # OpenVINO's GPU plugin is Intel-only; asking for it here buys a failed
+        # plugin load rather than acceleration.
+        openvino_device="CPU",
+        pytorch_device="cpu",
+        motion_device="cpu",
+        use_openvino_yolo=True,
+        gpu_available=True,
+        onnx_dml_yolo=True,
+        backend_name="DirectML (ONNX Runtime)",
     )
 
 
@@ -267,12 +324,13 @@ class DeviceInfo:
         "yolo_pt_device", "yolo_ov_device", "openvino_device",
         "pytorch_device", "motion_device", "dml_device",
         "use_openvino_yolo", "gpu_available", "backend_name",
+        "onnx_dml_yolo",
     )
 
     # Every slot gets a default. __slots__ leaves an unset attribute *missing*
     # rather than None, so a field added later (dml_device was) would raise
     # AttributeError on every DeviceInfo built by the branches that predate it.
-    _DEFAULTS = {"dml_device": None}
+    _DEFAULTS = {"dml_device": None, "onnx_dml_yolo": False}
 
     def __init__(self, **kwargs):
         for k, v in self._DEFAULTS.items():

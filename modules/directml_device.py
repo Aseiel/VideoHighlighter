@@ -52,6 +52,7 @@ Never raises. A probe that throws is a probe that costs somebody their GPU.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional
 
 # Opt-in switch. "auto" (the default) uses DirectML only when no CUDA and no
@@ -152,6 +153,23 @@ def prefer_float16() -> bool:
 # The probe
 # ---------------------------------------------------------------------------
 
+def _missing_package_reason(exc) -> str:
+    """Why the package is not here, in words the reader can act on.
+
+    A packaged build never has it and never can (see the module docstring), so
+    telling that user it "is not installed" reads as an instruction they have no
+    way to follow: there is no pip inside an exe. They are not stuck, either —
+    object detection still reaches a DX12 card through ONNX Runtime — so the
+    message says which half they have rather than implying they have none.
+    """
+    if getattr(sys, "frozen", False):
+        return ("packaged builds cannot ship torch-directml (it pins an exact "
+                "torch), so action recognition stays on the CPU here — object "
+                "detection still uses the GPU via ONNX Runtime. A source "
+                "install lifts the rest: see docs/AMD-GPU.md")
+    return f"torch-directml is not installed ({type(exc).__name__}: {exc})"
+
+
 class DirectMLProbe:
     """What one look at this machine's DirectML support found.
 
@@ -229,8 +247,7 @@ def probe(refresh: bool = False) -> DirectMLProbe:
     try:
         dml = _import_torch_directml()
     except Exception as e:  # noqa: BLE001 -- a missing package is a normal answer
-        _probe_cache = DirectMLProbe(
-            reason=f"torch-directml is not installed ({type(e).__name__}: {e})")
+        _probe_cache = DirectMLProbe(reason=_missing_package_reason(e))
         return _probe_cache
 
     try:

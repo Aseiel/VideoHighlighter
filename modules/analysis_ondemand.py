@@ -381,14 +381,27 @@ def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
 # --------------------------------------------------------------------------- #
 # Objects
 # --------------------------------------------------------------------------- #
-def _load_yolo(d: dict, log=print):
+def _load_yolo(d: dict, log=print, devices=None):
     """Load an ultralytics YOLO detector the way the pipeline does: prefer a
     pre-exported OpenVINO folder for the chosen size, else the .pt (ultralytics
-    fetches the weights if they aren't present)."""
+    fetches the weights if they aren't present).
+
+    `devices` is the already-probed DeviceInfo when the caller has one, so the
+    probe (and its log lines) happen once per run rather than once per stage.
+    """
     from ultralytics import YOLO
     size = d["yolo_model_size"]
     ov_folder = f"yolo11{size}_openvino_model/"
     pt_path = f"yolo11{size}.pt"
+
+    # A GPU only ONNX Runtime can reach: run the export rather than Ultralytics,
+    # which has no DirectML backend and would sit on the processor instead.
+    if devices is not None and getattr(devices, "onnx_dml_yolo", False):
+        from modules import yolo_onnx
+        detector = yolo_onnx.load_detector(pt_path, log=log)
+        if detector is not None:
+            return detector
+
     if os.path.isdir(ov_folder):
         log(f"✅ Object detector: YOLO OpenVINO ({ov_folder})")
         return YOLO(ov_folder, task="detect")
@@ -411,9 +424,10 @@ def run_objects(video_path: str, objects: list, *, progress: ProgressFn = None,
         raise ValueError("No object classes given — type at least one (e.g. person, car).")
 
     from object_recognition import run_object_detection_single
+    from modules.device_utils import detect_best_device
     d = analysis_defaults()
 
-    model = _load_yolo(d, log)
+    model = _load_yolo(d, log, devices=detect_best_device(log_fn=log))
     if model is None:
         raise RuntimeError("Object detector unavailable — could not load a YOLO model.")
 

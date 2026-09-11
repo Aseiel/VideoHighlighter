@@ -1234,7 +1234,19 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # Standard YOLO11 (supports OpenVINO)
                 from modules.device_utils import detect_best_device, resolve_yolo_device
                 devices = detect_best_device(log_fn=log)
-                if devices.use_openvino_yolo:
+                # A DX12 card that torch cannot address still runs an ONNX
+                # export under ONNX Runtime. Detection is the heaviest
+                # per-frame stage, so this is where the GPU is worth having.
+                if getattr(devices, "onnx_dml_yolo", False):
+                    from modules import yolo_onnx
+                    dml_detector = yolo_onnx.load_detector(yolo_pt_path, log=log)
+                else:
+                    dml_detector = None
+
+                if dml_detector is not None:
+                    yolo_model = dml_detector
+                    yolo_device_for_inference = "cpu"
+                elif devices.use_openvino_yolo:
                     yolo_model = YOLO(openvino_model_folder, task="detect")
                     yolo_device_for_inference = "cpu"
                     log(f"✅ YOLO OpenVINO model loaded (OpenVINO manages device)")

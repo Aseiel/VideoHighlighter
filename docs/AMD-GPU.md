@@ -165,13 +165,51 @@ is small enough that moving it would buy nothing, and it ships as OpenVINO IR
 only — Open Model Zoo publishes no ONNX for it, so there is no artifact
 DirectML could run even if it were worth doing.
 
-**Object detection does not use DirectML.** YOLO runs through Ultralytics,
-which has no DirectML backend, so `resolve_yolo_device()` answers a DirectML
-request with `cpu` on purpose — handing Ultralytics `privateuseone:0` would
-trade a slow run for a failed one. Moving detection to an AMD GPU would mean a
-different runtime under it (ONNX Runtime's DirectML execution provider, reading
-an ONNX export), which is separate work. It is also the largest remaining win
-on an AMD machine, since detection is the heaviest per-frame stage.
+**Object detection uses DirectML through ONNX Runtime, not torch.** YOLO
+runs through Ultralytics, which has no DirectML backend, so
+`resolve_yolo_device()` still answers a DirectML request with `cpu` — handing
+Ultralytics `privateuseone:0` would trade a slow run for a failed one. Instead
+the detector is exported to ONNX and run under ONNX Runtime's DirectML
+execution provider, which is a different runtime with no opinion about torch.
+
+Detection is the heaviest per-frame stage, so this is the larger half of the
+win. It is also the half that reaches people who did not install anything: see
+the next section.
+
+## The packaged build, and why ONNX Runtime is the one that ships
+
+`torch-directml` cannot be bundled. It pins an exact torch — 2.4.1 for the
+current release — and pip satisfies that by replacing whatever torch is there,
+so a build carrying it could not also carry the CUDA torch the NVIDIA path
+needs. One process, one torch. That is why everything above is a source
+install, and why an AMD user running the exe had the processor and a log line
+telling them to install a package an exe cannot install.
+
+`onnxruntime-directml` has no such coupling: it declares no torch dependency at
+all, so it sits in `requirements.txt` beside the CUDA torch and reaches every
+Windows build. The wheels are Windows-only, hence the marker on that line, and
+it must stay the *only* onnxruntime in there — `onnxruntime` and
+`onnxruntime-gpu` install the same package and overwrite each other.
+
+This is the arrangement AnimeJaNai ships for the same reason: one release, ONNX
+models, and a backend per vendor (TensorRT for NVIDIA, DirectML for the rest).
+The model format is the common denominator, not the framework.
+
+So there are two DirectML paths, with different reach:
+
+| | torch-directml | ONNX Runtime DirectML |
+|---|---|---|
+| In the packaged build | no, and cannot be | yes |
+| Drives | R3D action recognition, visual search | object detection |
+| Switch | `VH_DIRECTML` | the same `VH_DIRECTML` |
+
+`modules/device_utils.py` reflects that: when torch has a DirectML device it is
+used as before, and when it does not — every exe on an AMD box — the probe
+falls through to a detection-only branch that reports
+`DirectML (ONNX Runtime)` and leaves every torch model on the processor.
+
+The export itself is made once, next to the weights, the first time a machine
+needs it. It costs tens of seconds and no other machine ever makes one.
 
 ### The win that needs no model
 
@@ -232,9 +270,17 @@ is read off the device object the installed package hands back. Use
 
 ## Where the code is
 
-- `modules/directml_device.py` — everything DirectML-specific: the opt-in, the
-  probe, device-string normalisation, backend registration. Imports nothing but
-  `os` and `typing`, so any module can use it without dragging in machinery.
+- `modules/directml_device.py` — everything torch-DirectML-specific: the
+  opt-in, the probe, device-string normalisation, backend registration. Imports
+  nothing but `os` and `typing`, so any module can use it without dragging in
+  machinery.
+- `modules/ort_directml.py` — the same questions asked of ONNX Runtime: is the
+  provider here, which adapter, what session. Shares the `VH_DIRECTML` switch.
+- `modules/onnx_detector.py` — the detector that runs an ONNX export, with its
+  own letterbox and NMS and no Ultralytics import, so the Pro edition can use
+  it with a different export in front.
+- `modules/yolo_onnx.py` — the free edition's export half (Ultralytics does the
+  converting), kept apart from the runner for that reason.
 - `modules/device_utils.py` — the pipeline-wide decision. DirectML sits after
   the Intel probes and before the CPU fallback.
 - `llm/clip_prefilter.py` — visual search, with its own `resolve_device` (it
@@ -247,3 +293,7 @@ is read off the device object the installed package hands back. Use
   `tests/test_r3d_directml.py`, `tests/test_directml_simulation.py` — the probe,
   the orderings, R3D's fallback, and the simulator's own restore-everything
   contract. None need an AMD card or the package installed.
+- `tests/test_ort_directml.py`, `tests/test_onnx_detector.py`,
+  `tests/test_onnx_dml_routing.py` — the provider probe, the box arithmetic
+  that replaces Ultralytics' own, and the rule that a present DirectML provider
+  never takes work away from CUDA or an Intel GPU. None need ONNX Runtime.

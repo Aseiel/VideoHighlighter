@@ -52,6 +52,9 @@ cache/
 object_log.csv
 yolo11n.pt
 yolo11n_openvino_model/
+# The ONNX export made on demand for the DirectML detection path, beside the
+# weights it came from (modules/yolo_onnx.py).
+yolo11*.onnx
 highlight.mp4
 analysis_stats.json
 

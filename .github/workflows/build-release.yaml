@@ -119,6 +119,7 @@ jobs:
           --collect-submodules whisper
           --collect-submodules ultralytics
           --collect-all openvino
+          --collect-all onnxruntime
           --collect-data whisper
           --collect-data ultralytics
           --collect-binaries imageio_ffmpeg

@@ -14,6 +14,8 @@ Those are the parts of the real package this code is allowed to depend on.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from modules import directml_device as dml
@@ -139,6 +141,18 @@ def test_a_missing_package_is_a_reason_not_an_exception(no_directml):
     assert "not installed" in probe.reason
     assert dml.device_string() is None
     assert dml.adapter_names() == []
+
+
+def test_a_packaged_build_is_told_what_it_actually_has(no_directml, monkeypatch):
+    """Inside an exe there is no pip, so "not installed" reads as an instruction
+    the reader cannot follow — and it is not the whole truth either, because
+    detection still reaches the card through ONNX Runtime."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    reason = dml.probe(refresh=True).reason
+
+    assert "not installed" not in reason
+    assert "ONNX Runtime" in reason
+    assert "docs/AMD-GPU.md" in reason
 
 
 def test_an_installed_package_with_no_device_says_so_differently(amd_box):
