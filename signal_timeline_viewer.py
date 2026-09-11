@@ -41,6 +41,7 @@ from datetime import datetime, timedelta
 
 # modules
 from modules.ui.collapsible import CollapsibleSection
+from modules.ui import fit
 from modules.ui.fit import fit_icon_button, fit_width
 from modules.ui.theme import DARK as THEME
 from modules.ui import icons as ui_icons
@@ -3290,8 +3291,12 @@ class SignalTimelineWindow(QMainWindow):
         layout.addStretch()
 
         layout.addWidget(self.edit_duration_label)
-        
-        return controls
+
+        # Nine controls plus a combo need more width than a window on a scaled
+        # display always has, and a QHBoxLayout that runs out of room stops
+        # drawing rather than shrinking — "Edit duration" was reported cut in
+        # half at the right edge. Scrolling keeps every control reachable.
+        return fit.scrollable_row(controls)
 
     def _keep_dock_tab_titles_whole(self):
         """Stop the dock tab bar from eliding one-word panel names.

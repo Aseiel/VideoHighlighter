@@ -47,3 +47,36 @@ def fit_icon_button(widget, *, side: int = 30) -> int:
     widget.setMinimumWidth(side)
     widget.setMinimumHeight(side)
     return side
+
+
+def scrollable_row(row):
+    """Wrap a toolbar row so a narrow window scrolls it instead of clipping it.
+
+    A QHBoxLayout given less width than its contents need does not shrink them
+    past their minimum — it simply stops drawing what does not fit, and the
+    controls at the right end become unreachable with no indication that they
+    exist. Reported from a 4K screen where "Edit duration" was cut in half at
+    the edge of the edit toolbar.
+
+    Scrolling rather than wrapping, for the same reason the dock tab bars use
+    scroll buttons: a control you can reach beats one that has been folded onto
+    a second line the splitter above it then has to give up height for.
+
+    The height reserves room for the scrollbar whether or not it is showing, so
+    the row does not lose a few pixels off its buttons at the moment the bar
+    appears.
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QFrame, QScrollArea
+
+    scroller = QScrollArea()
+    scroller.setWidget(row)
+    scroller.setWidgetResizable(True)
+    scroller.setFrameShape(QFrame.NoFrame)
+    scroller.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroller.setStyleSheet("QScrollArea { background: transparent; }")
+
+    bar = scroller.horizontalScrollBar().sizeHint().height()
+    scroller.setFixedHeight(row.sizeHint().height() + bar)
+    return scroller
