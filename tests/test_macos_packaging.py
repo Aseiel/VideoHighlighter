@@ -41,13 +41,32 @@ class TestTheLibraryOpenVINONeeds:
             "the macOS build deletes the library OpenVINO loads: "
             f"{offenders}. Sign it instead — see the build step's comment.")
 
-    def test_it_is_added_to_the_bundle(self):
-        """Collected explicitly, because the loader looks for it at the root of
-        Frameworks rather than inside the openvino package."""
+    def test_it_is_left_unsigned_for_pyinstaller(self):
+        """PyInstaller signs every binary it collects, and the wheel's copy
+        fails with "internal error in Code Signing subsystem" while *replacing*
+        a signature. Signing a file with none works, so the build step ends by
+        removing the signature rather than by adding one.
+
+        PyInstaller puts the copy at the root of Frameworks itself — the build
+        log shows it doing exactly that for libtbbmalloc — so nothing here
+        needs --add-binary, which would collide with that symlink.
+        """
+        text = open(WORKFLOW, encoding="utf-8").read()
+        libtbb_lines = [line.strip() for line in text.splitlines()
+                        if "$LIB" in line and "codesign" in line]
+
+        assert libtbb_lines, "nothing prepares libtbb for signing"
+        assert "remove-signature" in libtbb_lines[-1], (
+            "the last thing done to libtbb must be removing its signature; "
+            f"found: {libtbb_lines[-1]}")
+
+    def test_there_is_a_fallback_when_it_cannot_be_signed(self):
+        """The wheel's library may be unsignable however it is handled. Rather
+        than fail the build, substitute Homebrew's build of the same soname."""
         text = open(WORKFLOW, encoding="utf-8").read()
 
-        assert "libtbb.12.dylib" in text, "nothing puts libtbb in the bundle"
-        assert "--add-binary" in text
+        assert "brew install tbb" in text
+        assert "brew --prefix tbb" in text
 
     def test_the_numa_pieces_are_still_dropped(self):
         """tbbbind links Homebrew's libhwloc by absolute path — a path no user
