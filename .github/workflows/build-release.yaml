@@ -264,20 +264,35 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
       - name: Pre-convert CLIP to OpenVINO IR
-        # Must run before the libtbb removal below — the export imports openvino,
-        # which needs libtbb.12.dylib at runtime; that lib is stripped afterwards
-        # only for the frozen bundle.
         run: python -m tools.export_clip_ov
-      - name: Fix OpenVINO problematic libraries
+      - name: Prepare OpenVINO's libraries for an ad-hoc signed bundle
+        # libtbb.12.dylib used to be deleted here, along with the rest. It was
+        # removed because it could not be ad-hoc signed — but OpenVINO links
+        # against it: `_pyopenvino` fails to load with "Library not loaded:
+        # @rpath/libtbb.12.dylib", which takes the whole pipeline with it, since
+        # action_recognition imports openvino at module scope. A macOS build
+        # without it cannot analyse anything.
+        #
+        # So keep it and make it signable instead: quarantine and other extended
+        # attributes are what make `codesign` refuse, and a fresh ad-hoc
+        # signature gives PyInstaller a clean input to re-sign.
+        #
+        # libtbbbind and libhwloc stay deleted. tbbbind is TBB's optional NUMA
+        # binding layer and it links Homebrew's libhwloc by absolute path — a
+        # path no user has. TBB runs without it.
         run: |
           OV_LIBS=$(python -c "import openvino; import os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs'))")
           rm -f "$OV_LIBS"/libtbbbind*
-          rm -f "$OV_LIBS"/libtbbmalloc*
-          rm -f "$OV_LIBS"/libtbb.12.dylib
-          rm -f "$OV_LIBS"/libtbb.dylib
           rm -f "$OV_LIBS"/libhwloc*
+          # The unversioned symlink is not what anything links against, and a
+          # symlink is one more thing for the bundler to get wrong.
+          rm -f "$OV_LIBS"/libtbb.dylib
+          xattr -cr "$OV_LIBS" || true
+          for lib in "$OV_LIBS"/*.dylib; do
+            codesign --force --sign - "$lib" || echo "could not sign $lib"
+          done
           echo "Remaining libs:"
-          ls "$OV_LIBS"
+          ls -la "$OV_LIBS"
       - name: Clear PyInstaller cache
         run: rm -rf ~/Library/Application\ Support/pyinstaller
       - name: Build APP
@@ -293,6 +308,7 @@ jobs:
             --add-data "models:models" \
             --add-data "video_ai_editor/VRVideoOutput.qml:video_ai_editor" \
             --add-data "video_ai_editor/models:video_ai_editor/models" \
+            --add-binary "$(python -c "import openvino, os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs', 'libtbb.12.dylib'))"):." \
             --hidden-import action_recognition \
             --hidden-import convert_pth_to_openvino \
             --hidden-import crop_actions \
