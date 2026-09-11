@@ -1106,7 +1106,8 @@ class SignalTimelineWindow(QMainWindow):
             self.current_time = time_seconds
             self.signal_scene.set_current_time(self.current_time)
             if hasattr(self, 'signal_view'):
-                self.signal_view.ensure_time_visible(self.current_time)
+                self.signal_view.ensure_time_visible(self.current_time,
+                                                     during_playback=True)
         
         # Sync transcript panel
         if hasattr(self, 'transcript_panel'):
@@ -4801,7 +4802,7 @@ class SignalTimelineWindow(QMainWindow):
         self.current_time = play_pos
         self.signal_scene.set_current_time(play_pos)
         if hasattr(self, 'signal_view'):
-            self.signal_view.ensure_time_visible(play_pos)
+            self.signal_view.ensure_time_visible(play_pos, during_playback=True)
 
         self._active_player.setPosition(int(play_pos * 1000))
         self._active_player.play()

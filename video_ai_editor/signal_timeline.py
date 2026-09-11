@@ -2523,6 +2523,19 @@ class SignalTimelineView(QGraphicsView):
         self.follow_margin_left = 0.10  # scroll when playhead < 10% from left
         self.follow_margin_right = 0.85 # scroll when playhead > 85% from left
 
+        # Edge auto-scroll while drawing a range selection: holding the cursor
+        # near/past a viewport edge keeps the view scrolling so the selection
+        # can grow beyond what's visible (the standard editor behaviour).
+        # Timer-driven, because a held-still mouse produces no move events —
+        # move-driven scrolling would stall exactly when the user parks the
+        # cursor at the edge and waits.
+        self._edge_scroll_zone = 28     # px from the viewport edge
+        self._edge_scroll_dx = 0        # px per tick; sign = direction
+        self._edge_scroll_timer = QTimer(self)
+        self._edge_scroll_timer.setInterval(30)
+        self._edge_scroll_timer.timeout.connect(self._edge_scroll_tick)
+        self._last_move_pos = QPoint()
+
     def resizeEvent(self, event):
         """When view is resized, fit the scene vertically"""
         super().resizeEvent(event)
@@ -2563,9 +2576,24 @@ class SignalTimelineView(QGraphicsView):
         if hasattr(scene, "draw_time_markers"):
             scene.draw_time_markers()
 
-    def ensure_time_visible(self, time_seconds):
-        """Auto-scroll so the playhead stays visible during playback."""
+    def ensure_time_visible(self, time_seconds, during_playback=False):
+        """Auto-scroll so the playhead stays visible. Two regimes:
+
+        * ``during_playback=True`` — the classic follow: pre-scroll via the
+          comfort-zone margins so the view flips before the playhead walks off
+          the right edge while watching.
+        * user seeks (clicks, nav arrows, search jumps) — scroll ONLY if the
+          target is actually off-screen. A click on a visible spot must never
+          move the view: the old behaviour re-centred on any click landing in
+          the outer margins, which yanked the timeline mid-drag and made
+          selecting a range near either edge impossible.
+
+        Never scrolls while a range selection/drag is in progress, whatever the
+        regime — the view shifting under an active selection breaks it.
+        """
         if not self.follow_playhead:
+            return
+        if getattr(self, '_range_selecting', False) or getattr(self, '_range_dragging', False):
             return
         scene = self.scene()
         if not scene:
@@ -2583,9 +2611,14 @@ class SignalTimelineView(QGraphicsView):
 
         rel = (playhead_x - left) / width
 
-        # Inside comfort zone → do nothing
-        if self.follow_margin_left <= rel <= self.follow_margin_right:
-            return
+        if during_playback:
+            # Inside comfort zone → do nothing
+            if self.follow_margin_left <= rel <= self.follow_margin_right:
+                return
+        else:
+            # Visible at all → do nothing
+            if 0.0 <= rel <= 1.0:
+                return
 
         # Use Qt's centerOn — keep vertical position, shift horizontal
         center_y = self.mapToScene(vp.center()).y()
@@ -2593,7 +2626,22 @@ class SignalTimelineView(QGraphicsView):
         self.centerOn(playhead_x + width * 0.15, center_y)
 
     def wheelEvent(self, event):
-        """Zoom with mouse wheel, anchored at cursor position"""
+        """Wheel = zoom (anchored at cursor); Shift+wheel = horizontal scroll.
+
+        Shift+wheel is the standard timeline nudge (Premiere/Resolve/Audacity
+        all ship it). It replaces what edge-click re-centring used to do by
+        accident — moving the view along — without stealing clicks from range
+        selection.
+        """
+        if event.modifiers() & Qt.ShiftModifier:
+            bar = self.horizontalScrollBar()
+            # Most wheels still report the delta on y with Shift held; some
+            # trackpads/tilt-wheels use x — take whichever is non-zero.
+            delta = event.angleDelta().y() or event.angleDelta().x()
+            bar.setValue(bar.value() - delta)
+            event.accept()
+            return
+
         zoom_factor = 1.15
 
         old_anchor = self.transformationAnchor()
@@ -2809,12 +2857,18 @@ class SignalTimelineView(QGraphicsView):
 
         # ── 3. Pan ────────────────────────────────────────────────────
         if event.button() in (Qt.RightButton, Qt.MiddleButton):
-            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            # Manual panning via self.panning (handled in mouseMoveEvent), NOT
+            # Qt's ScrollHandDrag: that mode only drags with the LEFT button,
+            # so setting it here showed the hand cursor and then ignored the
+            # right/middle drag entirely — pan looked armed but did nothing.
+            self.panning          = True
+            self.last_pan_point   = event.pos()
+            self.setCursor(QCursor(Qt.ClosedHandCursor))
             self._follow_was_on   = self.follow_playhead
             self.follow_playhead  = False
             self._range_selecting = False
             self._range_dragging  = False
-            super().mousePressEvent(event)
+            event.accept()
             return
 
         # ── 4. Background — start range selection ─────────────────────
@@ -2878,10 +2932,27 @@ class SignalTimelineView(QGraphicsView):
         # ── Drawing the range selection rect ──────────────────────────
         if self._range_selecting:
             if scene and hasattr(self, '_range_start_time'):
+                # Near/past an edge? Arm the auto-scroll: speed scales with how
+                # deep into the zone the cursor sits, clamped so a fling past
+                # the edge doesn't teleport. The timer does the scrolling (and
+                # keeps updating the rect) even while the mouse holds still.
+                vp = self.viewport().rect()
+                x = event.pos().x()
+                zone = self._edge_scroll_zone
+                if x > vp.right() - zone:
+                    self._edge_scroll_dx = min(40, max(4, x - (vp.right() - zone)))
+                elif x < vp.left() + zone:
+                    self._edge_scroll_dx = -min(40, max(4, (vp.left() + zone) - x))
+                else:
+                    self._edge_scroll_dx = 0
+                self._last_move_pos = event.pos()
+                if self._edge_scroll_dx and not self._edge_scroll_timer.isActive():
+                    self._edge_scroll_timer.start()
+
                 scene_pos = self.mapToScene(event.pos())
                 current_t = scene_pos.x() / scene.pixels_per_second
                 scene.update_selection_rect(self._range_start_time, current_t)
-                
+
                 # Update video preview during drag (throttled to ~20fps)
                 import time as _time
                 now = _time.time()
@@ -2913,8 +2984,32 @@ class SignalTimelineView(QGraphicsView):
 
         super().mouseMoveEvent(event)
 
+    def _edge_scroll_tick(self):
+        """One auto-scroll step while a selection drag sits at a viewport edge.
+
+        Scroll, then re-extend the selection to the (stationary) cursor — the
+        scroll moved the scene under it, so the same widget position now maps to
+        a later/earlier time. Stops itself when the drag ends, the cursor leaves
+        the zone, or the scrollbar hits its end stop.
+        """
+        if not self._range_selecting or self._edge_scroll_dx == 0:
+            self._edge_scroll_timer.stop()
+            return
+        bar = self.horizontalScrollBar()
+        old = bar.value()
+        bar.setValue(old + self._edge_scroll_dx)
+        if bar.value() == old:          # end of the timeline — nothing to scroll
+            self._edge_scroll_timer.stop()
+            return
+        scene = self.scene()
+        if scene and self._range_start_time is not None:
+            current_t = self.mapToScene(self._last_move_pos).x() / scene.pixels_per_second
+            scene.update_selection_rect(self._range_start_time, current_t)
+
     def mouseReleaseEvent(self, event):
         scene = self.scene()
+        self._edge_scroll_dx = 0
+        self._edge_scroll_timer.stop()
 
         if event.button() == Qt.LeftButton:
 
@@ -2969,12 +3064,15 @@ class SignalTimelineView(QGraphicsView):
             event.accept()
             return
 
-        # Right / middle — reset scroll-hand drag
-        if self.dragMode() == QGraphicsView.DragMode.ScrollHandDrag:
-            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        # Right / middle — end the manual pan and restore playhead-follow
+        if event.button() in (Qt.RightButton, Qt.MiddleButton) and self.panning:
+            self.panning = False
+            self.setCursor(QCursor(Qt.ArrowCursor))
             if hasattr(self, '_follow_was_on'):
                 self.follow_playhead = self._follow_was_on
                 del self._follow_was_on
+            event.accept()
+            return
 
         super().mouseReleaseEvent(event)
 
