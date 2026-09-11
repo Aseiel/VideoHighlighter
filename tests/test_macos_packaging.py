@@ -41,24 +41,27 @@ class TestTheLibraryOpenVINONeeds:
             "the macOS build deletes the library OpenVINO loads: "
             f"{offenders}. Sign it instead — see the build step's comment.")
 
-    def test_it_is_left_unsigned_for_pyinstaller(self):
-        """PyInstaller signs every binary it collects, and the wheel's copy
-        fails with "internal error in Code Signing subsystem" while *replacing*
-        a signature. Signing a file with none works, so the build step ends by
-        removing the signature rather than by adding one.
+    def test_every_dylib_is_left_unsigned_for_pyinstaller(self):
+        """PyInstaller signs every binary it collects, and these fail with
+        "internal error in Code Signing subsystem" while *replacing* a
+        signature. Signing a file that has none works, so each one is left
+        unsigned.
 
-        PyInstaller puts the copy at the root of Frameworks itself — the build
-        log shows it doing exactly that for libtbbmalloc — so nothing here
-        needs --add-binary, which would collide with that symlink.
+        Applied to every dylib rather than to libtbb alone: narrowing it is how
+        the second attempt failed — libtbb.12 passed and libtbbmalloc.2, which
+        still carried the wheel's signature, died in the same place.
         """
         text = open(WORKFLOW, encoding="utf-8").read()
-        libtbb_lines = [line.strip() for line in text.splitlines()
-                        if "$LIB" in line and "codesign" in line]
 
-        assert libtbb_lines, "nothing prepares libtbb for signing"
-        assert "remove-signature" in libtbb_lines[-1], (
-            "the last thing done to libtbb must be removing its signature; "
-            f"found: {libtbb_lines[-1]}")
+        assert 'for lib in "$OV_LIBS"/*.dylib' in text, (
+            "the signature treatment must cover every dylib, not one by name")
+
+        codesigns = [line.strip() for line in text.splitlines()
+                     if "codesign" in line and "$lib" in line]
+        assert codesigns, "nothing prepares the libraries for signing"
+        assert "remove-signature" in codesigns[-1], (
+            "the last codesign in the loop must remove a signature, not add "
+            f"one; found: {codesigns[-1]}")
 
     def test_there_is_a_fallback_when_it_cannot_be_signed(self):
         """The wheel's library may be unsignable however it is handled. Rather

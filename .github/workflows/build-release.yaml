@@ -273,7 +273,7 @@ jobs:
         # openvino at module scope. Deleting it is not an option; making it
         # signable is the job.
         #
-        # The wheel's copy makes codesign fail with "internal error in Code
+        # The wheel's copies make codesign fail with "internal error in Code
         # Signing subsystem" while *replacing an existing signature*, and
         # PyInstaller signs every binary it collects, so the build dies rather
         # than the app. Two steps, in order of how little they change:
@@ -285,13 +285,16 @@ jobs:
         # Either way the file is left UNSIGNED, so PyInstaller signs it fresh
         # rather than replacing anything, which is the operation that failed.
         #
+        # Every dylib here gets that treatment, not just libtbb. Narrowing it to
+        # one file is how the second attempt failed: libtbb.12 passed and
+        # libtbbmalloc.2 — which kept the wheel's signature — died in exactly
+        # the same place.
+        #
         # libtbbbind and libhwloc stay deleted: tbbbind is TBB's optional NUMA
         # layer and links Homebrew's libhwloc by absolute path, which no user
-        # has. TBB runs without it. libtbbmalloc is kept — PyInstaller resolves
-        # it on its own and signs it without complaint.
+        # has. TBB runs without it.
         run: |
           OV_LIBS=$(python -c "import openvino; import os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs'))")
-          LIB="$OV_LIBS/libtbb.12.dylib"
           rm -f "$OV_LIBS"/libtbbbind*
           rm -f "$OV_LIBS"/libhwloc*
           # The unversioned symlink is not what anything links against, and a
@@ -299,20 +302,26 @@ jobs:
           rm -f "$OV_LIBS"/libtbb.dylib
           xattr -cr "$OV_LIBS" || true
 
-          codesign --remove-signature "$LIB" || true
-          if codesign --force --sign - "$LIB"; then
-            echo "the wheel's libtbb signs cleanly once its signature is gone"
-          else
-            echo "the wheel's libtbb cannot be signed at all — using Homebrew's"
+          for lib in "$OV_LIBS"/*.dylib; do
+            base=$(basename "$lib")
+            codesign --remove-signature "$lib" || true
+            if codesign --force --sign - "$lib"; then
+              # It signs. Hand PyInstaller an unsigned file anyway: it signs
+              # what it collects, and replacing a signature is what errors.
+              codesign --remove-signature "$lib" || true
+              continue
+            fi
+            echo "::warning::$base cannot be ad-hoc signed; trying Homebrew's"
             brew install tbb
-            cp -f "$(brew --prefix tbb)/lib/libtbb.12.dylib" "$LIB"
-            xattr -c "$LIB" || true
-            codesign --remove-signature "$LIB" || true
-            codesign --force --sign - "$LIB"
-          fi
-          # Hand PyInstaller an unsigned file: it signs what it collects, and
-          # replacing a signature is the operation that errors.
-          codesign --remove-signature "$LIB" || true
+            replacement="$(brew --prefix tbb)/lib/$base"
+            if [ ! -f "$replacement" ]; then
+              echo "::error::no replacement for $base, and OpenVINO needs it"
+              exit 1
+            fi
+            cp -f "$replacement" "$lib"
+            xattr -c "$lib" || true
+            codesign --remove-signature "$lib" || true
+          done
 
           echo "Remaining libs:"
           ls -la "$OV_LIBS"
