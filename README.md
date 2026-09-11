@@ -169,10 +169,30 @@ way. It describes a relation between detections — one class inside another,
 counted, holding steady over a window — so the event is whatever that relation
 means in your footage, under the name you gave it.
 
+A goal, for instance, is a ball whose centre is inside the net:
+
+```yaml
+events:
+  - name: ball_in_net
+    label: Ball in net
+    window_secs: 0.3        # it is only in there briefly — smooth less
+    persist_secs: 0.2
+    rules:
+      - {source: sports ball, region: goal_mouth, min_count: 1}
+```
+
+`sports ball` is one of the 80 classes the stock detector already knows. The
+goal mouth is not, so that single class is what you label and train — one
+primitive, reusable, rather than a "goal" class the network would have to infer
+from pixels that do not contain the distinction. The rule supplies the meaning.
+See `docs/DETECTION-GUIDE.md` on training primitives instead of categories.
+
 The confidence follows from that. A composed event is only as sure as the
 weakest detection it matched, so it carries *detector* confidence rather than a
-classifier's guess at a class it was never taught: in practice 80–100%, for
-moments an action label would score far lower and often name wrongly.
+classifier's guess at a class it was never taught. In the rule above, a ball
+found at 0.91 inside a goal mouth found at 0.87 scores 0.87 — and 80–100% is
+the ordinary case, for moments an action label would score far lower and often
+name wrongly.
 
 Composed events get their own rows on the timeline, directly under the
 waveform, one row per rule that actually fired, filterable separately from
