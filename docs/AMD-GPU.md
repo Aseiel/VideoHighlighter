@@ -224,6 +224,53 @@ runs on any DX12 card, so reading the vendor off the label would pick AMF
 encoders on an NVIDIA box that had `VH_DIRECTML=force` set for testing, and
 lose nvenc for an unrelated reason.
 
+## Measured, once, on the wrong card
+
+**2026-09-11, and the only numbers anyone here has.** A Ryzen 5 5600 with an
+Intel Arc A750 on Windows 11, in the app's interpreter (miniconda 3.13.11,
+`onnxruntime-directml` 1.24.4, `openvino` 2026.2.1), running a `yolo11n` ONNX
+export at 640 — thirty inferences after three warm-ups, timing `session.run`
+alone:
+
+| backend | per frame |
+|---|---|
+| OpenVINO, Arc GPU | 3.8 ms |
+| OpenVINO, processor | 14.9 ms |
+| ONNX Runtime, processor | 26.9 ms |
+| ONNX Runtime, DirectML | 73.1 ms |
+
+End to end through `OnnxDetector` — letterbox and decode included — DirectML
+took 84.7 ms against 36.1 ms for the same runtime on the processor. The
+detections were identical either way, to the pixel: the provider computes the
+right answer, slowly.
+
+Two caveats about *this* measurement. It is an Intel card, which is not the
+hardware the path exists for, and on it the routing never chooses DirectML
+anyway — OpenVINO wins by a factor of nineteen and is probed first. And the
+adapter is not certain: device ids 0 and 1 both bound and performed the same,
+Windows lists only a virtual display device and the Arc, and ONNX Runtime
+offers no way to ask a session which adapter it took. Ids above 1 do not exist,
+and ORT falls back to the processor without saying so in any readable way (the
+error it prints is mojibake), which is why `session_backend()` reads the
+provider back off the live session rather than trusting the request.
+
+### The open question
+
+On an AMD machine, DirectML is not competing with doing nothing. The fallback
+there is OpenVINO on the processor, which is the 14.9 ms column above, and it is
+a *good* fallback. So a DirectML path that is 3× slower than the same runtime on
+the processor would be a regression dressed as an optimisation, and nothing in
+the code currently notices.
+
+The answer, when someone gets to it, is the pattern `R3DModelWrapper._warmup()`
+already uses for the torch backend: time a handful of frames on both providers
+when the detector loads, keep whichever wins, and log the numbers. It costs
+under a second, it turns this assumption into a measurement on each user's own
+hardware, and it means the worst case is the speed they already had.
+
+Until then: an AMD user who wants to know should run the same comparison rather
+than assume the GPU is helping.
+
 ## Precision
 
 fp16 is **off** by default on DirectML, which is the opposite of the CUDA path,
