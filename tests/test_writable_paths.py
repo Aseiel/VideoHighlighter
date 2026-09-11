@@ -119,6 +119,24 @@ class TestWorkingDirectory:
         assert "Application Support" in seen[0]
         assert result == seen[0]
 
+    def test_an_elevated_launch_does_not_leave_the_cache_in_system32(
+            self, frozen_windows, monkeypatch):
+        r"""Windows hands an elevated process C:\WINDOWS\system32 as its working
+        directory, so `./cache` resolved there — a folder only an administrator
+        can write, which is what made "run as administrator" look like the fix
+        and then made it compulsory. Observed in a user's log:
+        "Cache directory: C:\WINDOWS\system32\cache".
+        """
+        seen = []
+        monkeypatch.setattr(app_paths.os, "chdir", lambda p: seen.append(p))
+        monkeypatch.setattr(app_paths.os, "getcwd",
+                            lambda: seen[-1] if seen else r"C:\WINDOWS\system32")
+
+        result = app_paths.use_writable_cwd()
+
+        assert seen == [str(frozen_windows)]
+        assert "system32" not in result.lower()
+
     def test_running_from_source_changes_nothing(self, monkeypatch):
         """A developer's shell is their own; `python main.py` must not move it."""
         monkeypatch.setattr(sys, "frozen", False, raising=False)

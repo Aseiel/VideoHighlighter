@@ -74,6 +74,33 @@ def extract_waveform_data(video_path, num_points=1000):
         if os.path.exists(wav_file):
             os.remove(wav_file)
 
+def peaks_in_chunk(chunk, threshold_linear):
+    """Samples louder than the threshold and at least as loud as both
+    neighbours. Returns (offsets within the chunk, magnitudes).
+
+    **The widening to int32 is the point.** The samples arrive as int16, whose
+    range is -32768..32767, so ``abs(-32768)`` does not fit and numpy wraps it
+    back to -32768 with an "overflow encountered in scalar absolute" warning.
+    The effect is not cosmetic: a sample at full negative scale reads as a
+    *negative* magnitude, fails the threshold test, and is dropped — so the one
+    thing this function exists to find, the loudest moment in clipped audio,
+    was the one thing it could not see.
+
+    Vectorised for a second reason. This runs per sample over the whole
+    soundtrack — 274 million iterations for a 1.7 hour recording — and as a
+    Python loop it took ten minutes of a run that has better things to do.
+    """
+    if len(chunk) < 3:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int32)
+    magnitude = np.abs(np.asarray(chunk).astype(np.int32))
+    inner = magnitude[1:-1]
+    is_peak = ((inner > threshold_linear)
+               & (inner >= magnitude[:-2])
+               & (inner >= magnitude[2:]))
+    offsets = np.nonzero(is_peak)[0] + 1
+    return offsets, magnitude[offsets]
+
+
 def extract_audio_peaks(video_path, threshold_db=-20, chunk_duration_ms=10, merge_distance_ms=50, cancel_flag=None):
     """Extract precise audio peaks with proper event detection"""
     
@@ -142,18 +169,12 @@ def extract_audio_peaks(video_path, threshold_db=-20, chunk_duration_ms=10, merg
                 pbar.update(1)
                 continue
             
-            # Find local maxima within this chunk
-            # Simple peak detection: find samples where amplitude exceeds threshold
-            # and is greater than neighbors
-            for i in range(1, len(chunk)-1):
-                if abs(chunk[i]) > threshold_linear:
-                    # Check if it's a local peak (greater than neighbors)
-                    if abs(chunk[i]) >= abs(chunk[i-1]) and abs(chunk[i]) >= abs(chunk[i+1]):
-                        # Calculate exact timestamp
-                        exact_sample = chunk_start + i
-                        exact_time = exact_sample / rate
-                        amplitude = abs(chunk[i])
-                        raw_peaks.append((exact_time, amplitude))
+            # Local maxima above the threshold, in one pass — see peaks_in_chunk
+            # on why this is not a per-sample loop and not int16 arithmetic.
+            offsets, magnitudes = peaks_in_chunk(chunk, threshold_linear)
+            for offset, magnitude in zip(offsets, magnitudes):
+                exact_time = (chunk_start + int(offset)) / rate
+                raw_peaks.append((exact_time, int(magnitude)))
             
             pbar.update(1)
         
