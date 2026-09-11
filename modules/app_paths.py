@@ -6,6 +6,7 @@ and when bundled into a PyInstaller executable.
   user-editable config lives next to the executable so edits persist.
 """
 
+import functools
 import os
 import sys
 import shutil
@@ -14,6 +15,43 @@ import shutil
 def _project_root() -> str:
     # modules/app_paths.py -> parent of the modules/ dir is the project root
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@functools.lru_cache(maxsize=8)
+def _is_writable(path: str) -> bool:
+    """Can this process create a file in ``path``?
+
+    Asked rather than assumed, and asked by *trying*: on Windows,
+    ``os.access(path, os.W_OK)`` answers from the read-only attribute and says
+    yes for a directory whose ACL will refuse the write. Cached, because this
+    is consulted on every path lookup in the app.
+    """
+    probe = os.path.join(path, f".vh-write-test-{os.getpid()}")
+    try:
+        with open(probe, "w"):
+            pass
+    except OSError:
+        return False
+    try:
+        os.remove(probe)
+    except OSError:
+        pass
+    return True
+
+
+def _per_user_dir() -> str:
+    """Where this platform keeps an application's own files, created if needed."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(
+            r"~\AppData\Local")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+            "~/.local/share")
+    target = os.path.join(base, "VideoHighlighter")
+    os.makedirs(target, exist_ok=True)
+    return target
 
 
 def resource_path(filename: str) -> str:
@@ -26,29 +64,42 @@ def resource_path(filename: str) -> str:
 
 
 def user_data_dir() -> str:
-    """Persistent, writable directory: next to the exe when frozen, else project root.
+    """Persistent, writable directory for everything the app keeps: the analysis
+    cache, the debug log, stats, custom models, composition rules.
 
-    **macOS is the exception.** There ``sys.executable`` lives inside
-    ``VideoHighlighter.app/Contents/MacOS``, and an .app bundle is not a place
-    to write: it is read-only under Gatekeeper's translocation, writing into it
-    breaks the code signature, and an app in /Applications need not be writable
-    by the user at all. Everything the app keeps — the analysis cache, the debug
-    log, stats, custom models — goes to Application Support instead, which is
-    where macOS expects it and which always exists.
+    Beside the executable when that folder can be written to, which keeps a
+    portable install self-contained — copy the folder, keep your caches. When it
+    cannot, the platform's own per-user location is used instead.
+
+    **That fallback is not a nicety.** Where the install folder refuses writes,
+    every one of those fails, and the app then only works when it is started as
+    an administrator — something a user discovers by accident and then has to
+    remember forever. Elevation is not required by anything this app does; it
+    was only ever a way of making the writes land somewhere.
+
+    **macOS never writes beside the executable.** There ``sys.executable`` lives
+    inside ``VideoHighlighter.app/Contents/MacOS``, and a bundle is read-only
+    under Gatekeeper's translocation, breaks its own signature when written to,
+    and need not be writable by the user at all.
     """
-    if getattr(sys, "frozen", False):
-        if sys.platform == "darwin":
-            base = os.path.expanduser(
-                "~/Library/Application Support/VideoHighlighter")
-            try:
-                os.makedirs(base, exist_ok=True)
-                return base
-            except OSError:
-                # A home we cannot write to is not worth crashing over here;
-                # the caller's own failure will say more than a guess would.
-                return os.path.dirname(sys.executable)
-        return os.path.dirname(sys.executable)
-    return _project_root()
+    if not getattr(sys, "frozen", False):
+        return _project_root()
+
+    if sys.platform == "darwin":
+        try:
+            return _per_user_dir()
+        except OSError:
+            # A home we cannot write to is not worth crashing over here; the
+            # caller's own failure will say more than a guess would.
+            return os.path.dirname(sys.executable)
+
+    beside_exe = os.path.dirname(sys.executable)
+    if _is_writable(beside_exe):
+        return beside_exe
+    try:
+        return _per_user_dir()
+    except OSError:
+        return beside_exe
 
 
 def use_writable_cwd() -> str:

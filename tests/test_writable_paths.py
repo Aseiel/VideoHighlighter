@@ -57,10 +57,38 @@ class TestUserDataDir:
         assert ".app" not in target
         assert os.path.isdir(target), "the directory must exist, not just resolve"
 
-    def test_windows_still_writes_beside_the_exe(self, frozen_windows):
-        """Unchanged on the platform where it already worked — moving it would
-        strand every existing user's cache and config."""
+    def test_windows_writes_beside_the_exe_when_it_can(self, frozen_windows):
+        """A portable install stays self-contained: copy the folder, keep the
+        caches. Moving that unconditionally would strand every existing user's
+        cache and config."""
         assert app_paths.user_data_dir() == str(frozen_windows)
+
+    def test_an_unwritable_install_falls_back_instead_of_needing_admin(
+            self, frozen_windows, monkeypatch, tmp_path):
+        """Where the install folder refuses writes, every write beside the exe
+        fails, and the app then only works when started as an administrator —
+        something the user discovers by accident and then has to remember.
+        Nothing here needs elevation; it was only ever a way of making the
+        writes land somewhere."""
+        local = tmp_path / "AppData" / "Local"
+        local.mkdir(parents=True)
+        monkeypatch.setenv("LOCALAPPDATA", str(local))
+        monkeypatch.setattr(app_paths, "_is_writable", lambda path: False)
+
+        target = app_paths.user_data_dir()
+
+        assert target == str(local / "VideoHighlighter")
+        assert os.path.isdir(target)
+
+    def test_writability_is_decided_by_trying(self, tmp_path):
+        """os.access answers from the read-only attribute on Windows and says
+        yes for a directory whose ACL will refuse the write, so the probe
+        actually creates a file."""
+        app_paths._is_writable.cache_clear()
+
+        assert app_paths._is_writable(str(tmp_path)) is True
+        assert app_paths._is_writable(str(tmp_path / "does-not-exist")) is False
+        assert not list(tmp_path.iterdir()), "the probe left something behind"
 
     def test_from_source_it_is_the_project_root(self, monkeypatch):
         monkeypatch.setattr(sys, "frozen", False, raising=False)

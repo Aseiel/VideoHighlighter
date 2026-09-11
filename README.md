@@ -293,6 +293,18 @@ VideoHighlighter occasionally has feelings about your footage. When it does:
 
 ## Notes
 
+**Where it writes.** Beside the executable, so a portable install stays
+self-contained: copy the folder and your caches come with it. When that folder
+refuses writes, it uses your local app data folder instead, rather than
+requiring you to start the app as an administrator. macOS always uses `~/Library/Application Support/VideoHighlighter`,
+because a bundle is not a place to write.
+
+**Interface too large?** A 55" 4K panel is scaled by the system for a
+television, not for an app at desk distance. Set `ui_scale` in `config.yaml`
+(or the `VH_UI_SCALE` environment variable) to a multiplier applied on top of
+the system's own: `0.75` on a 200% display gives you 150%. It is read once at
+startup, so restart the app after changing it.
+
 OpenAI Whisper is MIT licensed — freely usable.
 
 Google Translate API is optional. If using unofficial libraries (googletrans), no API key is needed, but results may break if Google changes endpoints.

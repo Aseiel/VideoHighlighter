@@ -17,6 +17,13 @@ debug_console.install()
 from modules.app_paths import use_writable_cwd
 print(f"📂 Working directory: {use_writable_cwd()}")
 
+# Interface size, if the user set one. Qt reads QT_SCALE_FACTOR when the
+# QApplication is constructed and never again, so this has to happen before the
+# Qt imports below — on a 55" 4K panel the OS scale is right for a television
+# and far too large for an app at desk distance.
+from modules import ui_scale
+ui_scale.apply()
+
 # Progress reporting for the launch itself. Imported here, before the heavy
 # imports below, because in a frozen build *they* are the slow part — several
 # seconds of decompressing and initialising cv2/OpenVINO/transformers before
@@ -1010,7 +1017,14 @@ class VideoHighlighterGUI(QWidget):
         self.resize(w, h)
         self.move(screen.x() + (screen.width() - w) // 2, screen.y())
 
-        
+        # Coalesced, because a drag-resize fires dozens of these a second and a
+        # log full of intermediate sizes hides the one that matters — the last
+        # size before a crash that leaves no traceback of its own.
+        self._size_log_timer = QTimer(self)
+        self._size_log_timer.setSingleShot(True)
+        self._size_log_timer.setInterval(400)
+        self._size_log_timer.timeout.connect(self._log_size)
+
         self.worker = None
 
         self.config_data = self.load_config()
@@ -3038,6 +3052,23 @@ class VideoHighlighterGUI(QWidget):
         pidx = self.process_mode_combo.findData(pmode)
         self.process_mode_combo.setCurrentIndex(pidx if pidx >= 0 else 0)
         self.on_process_mode_changed()  # sync spinner enabled
+
+    def resizeEvent(self, event):
+        """Record where a resize settled.
+
+        Resizing to fill a large, heavily scaled display has been reported to
+        kill the process, and a crash below the Python frame writes no
+        traceback — so the last line in debug.log is the evidence. See
+        modules/display_info.py.
+        """
+        super().resizeEvent(event)
+        timer = getattr(self, "_size_log_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _log_size(self):
+        from modules import display_info
+        display_info.log_window_size(self, "Main window")
 
     # --- About / Contact tab ---
     @staticmethod
@@ -6485,6 +6516,12 @@ if __name__ == "__main__":
             pass
 
     app = QApplication(sys.argv)
+
+    # What we are drawing on, written down before anything draws. A window that
+    # dies while being resized on a large scaled display leaves no traceback, so
+    # the screen geometry and scale factors are the evidence.
+    from modules import display_info
+    display_info.log(app)
 
     # Central theme: one graphite + accent stylesheet for all base widgets.
     # Additive — screens with their own inline styles still override it.
