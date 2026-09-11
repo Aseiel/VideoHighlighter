@@ -46,8 +46,11 @@ class DownloadResult:
 def _default_opener(url: str, headers: dict):
     import urllib.request
 
+    from modules import https_certs
+
     request = urllib.request.Request(url, headers=headers or {}, method="GET")
-    return urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS)
+    return urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS,
+                                  **https_certs.opener_kwargs())
 
 
 def file_url(base_url: str, entry: dict, layout: str = "content") -> str:

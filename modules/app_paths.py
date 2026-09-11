@@ -26,10 +26,57 @@ def resource_path(filename: str) -> str:
 
 
 def user_data_dir() -> str:
-    """Persistent, writable directory: next to the exe when frozen, else project root."""
+    """Persistent, writable directory: next to the exe when frozen, else project root.
+
+    **macOS is the exception.** There ``sys.executable`` lives inside
+    ``VideoHighlighter.app/Contents/MacOS``, and an .app bundle is not a place
+    to write: it is read-only under Gatekeeper's translocation, writing into it
+    breaks the code signature, and an app in /Applications need not be writable
+    by the user at all. Everything the app keeps — the analysis cache, the debug
+    log, stats, custom models — goes to Application Support instead, which is
+    where macOS expects it and which always exists.
+    """
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            base = os.path.expanduser(
+                "~/Library/Application Support/VideoHighlighter")
+            try:
+                os.makedirs(base, exist_ok=True)
+                return base
+            except OSError:
+                # A home we cannot write to is not worth crashing over here;
+                # the caller's own failure will say more than a guess would.
+                return os.path.dirname(sys.executable)
         return os.path.dirname(sys.executable)
     return _project_root()
+
+
+def use_writable_cwd() -> str:
+    """Move the process into :func:`user_data_dir` when frozen; returns the cwd.
+
+    Dozens of call sites default to a relative path — ``./cache`` most of all —
+    and a relative path is only as good as the directory the process happens to
+    be in. macOS launches an .app with the working directory set to ``/``, which
+    is read-only, so every one of them failed with ``[Errno 30] Read-only file
+    system: 'cache'`` the moment a video was opened.
+
+    Windows launches an exe from its own folder, so this is a no-op there in
+    practice; doing it explicitly keeps it true however the app was started — a
+    shortcut with its own "Start in", a file association, a terminal somewhere
+    else.
+
+    Bundled resources are unaffected: they resolve through
+    :func:`resource_path`, which is absolute.
+    """
+    if not getattr(sys, "frozen", False):
+        return os.getcwd()
+    target = user_data_dir()
+    try:
+        os.makedirs(target, exist_ok=True)
+        os.chdir(target)
+    except OSError as e:
+        print(f"⚠️ could not work from {target}: {e}")
+    return os.getcwd()
 
 
 def data_file(name: str) -> str:

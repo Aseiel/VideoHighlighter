@@ -190,6 +190,8 @@ def _get_json(url: str) -> dict:
     """
     import urllib.request
 
+    from modules import https_certs
+
     request = urllib.request.Request(
         url,
         headers={
@@ -199,7 +201,11 @@ def _get_json(url: str) -> dict:
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+    # The CA bundle matters here: a frozen macOS build has no usable platform
+    # trust store, and without one this fails as "no manifest" — which reads to
+    # the user as "you are up to date". See modules/https_certs.py.
+    with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS,
+                                **https_certs.opener_kwargs()) as response:
         return json.loads(response.read().decode("utf-8"))
 
 

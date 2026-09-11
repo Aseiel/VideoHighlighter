@@ -51,9 +51,12 @@ def staging_dir(root: str) -> str:
 def _fetch_bytes(url: str) -> bytes:
     import urllib.request
 
+    from modules import https_certs
+
     request = urllib.request.Request(
         url, headers={"Accept": "*/*"}, method="GET")
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=30,
+                                **https_certs.opener_kwargs()) as response:
         return response.read()
 
 

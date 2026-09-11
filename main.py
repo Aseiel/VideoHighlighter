@@ -9,6 +9,14 @@ import sys
 from modules import debug_console
 debug_console.install()
 
+# Every relative path in the app — `./cache` above all — resolves against the
+# working directory, and a packaged app does not get to choose what that is.
+# macOS starts an .app in `/`, which is read-only, so the first cache write
+# failed with "[Errno 30] Read-only file system: 'cache'". Do this before
+# anything opens a file.
+from modules.app_paths import use_writable_cwd
+print(f"📂 Working directory: {use_writable_cwd()}")
+
 # Progress reporting for the launch itself. Imported here, before the heavy
 # imports below, because in a frozen build *they* are the slow part — several
 # seconds of decompressing and initialising cv2/OpenVINO/transformers before
