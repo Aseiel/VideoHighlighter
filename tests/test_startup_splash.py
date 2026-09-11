@@ -13,6 +13,8 @@ no way to dismiss it.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from modules import startup_splash
@@ -48,6 +50,75 @@ class TestStageIsAlwaysSafe:
         startup_splash.stage("late arrival")
 
         assert not startup_splash.active()
+
+
+class _FakeNativeSplash:
+    """Stands in for PyInstaller's pyi_splash, which only exists inside a
+    frozen build."""
+
+    def __init__(self):
+        self.closed = False
+        self.texts = []
+
+    def is_alive(self):
+        return not self.closed
+
+    def update_text(self, text):
+        self.texts.append(text)
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def frozen_with_native_splash(monkeypatch):
+    """A frozen build whose bootloader splash is up and already imported — and
+    whose _PYI_SPLASH_IPC is therefore gone, because pyi_splash deletes the
+    variable as it reads it."""
+    native = _FakeNativeSplash()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setitem(sys.modules, "pyi_splash", native)
+    monkeypatch.delenv("_PYI_SPLASH_IPC", raising=False)
+    return native
+
+
+class TestNativeSplash:
+    """The bootloader's splash is always-on-top and outlives the import phase,
+    so the only thing that takes it down is us asking it to."""
+
+    def test_it_closes_once_the_ipc_variable_is_gone(self, frozen_with_native_splash):
+        startup_splash.close_native_splash()
+
+        assert frozen_with_native_splash.closed
+
+    def test_stage_still_reaches_it_after_the_first_call(self, frozen_with_native_splash):
+        """main.py stages several times during the import phase. The first of
+        those consumes the variable; the rest must still find the splash."""
+        startup_splash.stage("Loading the video engine…")
+        startup_splash.stage("Loading the detection runtime…")
+
+        assert frozen_with_native_splash.texts == [
+            "Loading the video engine…", "Loading the detection runtime…",
+        ]
+
+    def test_a_closed_splash_is_left_alone(self, frozen_with_native_splash):
+        frozen_with_native_splash.close()
+
+        startup_splash.close_native_splash()
+        startup_splash.stage("late arrival")
+
+        assert frozen_with_native_splash.texts == []
+
+    def test_no_import_is_attempted_without_the_variable(self, monkeypatch):
+        """A build made without --splash has neither the variable nor the
+        module, and probing for it must not try to import one."""
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.delitem(sys.modules, "pyi_splash", raising=False)
+        monkeypatch.delenv("_PYI_SPLASH_IPC", raising=False)
+
+        startup_splash.close_native_splash()      # must not raise
+
+        assert "pyi_splash" not in sys.modules
 
 
 # The panel itself needs a QApplication; the rest of the module does not.

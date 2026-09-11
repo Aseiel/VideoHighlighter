@@ -57,18 +57,28 @@ def _pyi():
     build made without --splash, so every call site has to tolerate None."""
     if not getattr(sys, "frozen", False):
         return None
-    # pyi_splash reads this variable at import time and, when it is missing,
-    # prints "The environment does not allow connecting to the splash screen.
-    # Did bootloader fail to initialize it?" plus a traceback before raising -
-    # all of it straight into debug.log. It is missing from every build made
-    # without --splash, and on macOS, where PyInstaller has no splash at all.
-    # The except below already made that harmless; checking first also keeps
-    # the false alarm out of the log we ask users to send us.
-    if not os.environ.get("_PYI_SPLASH_IPC"):
-        return None
+    # Already imported? Then use it, and do not go near the environment. The
+    # probe below is strictly a *first-contact* test: pyi_splash reads the
+    # variable at import time and then deletes it, so that subprocesses do not
+    # inherit the port. Asking again later therefore always says "no splash" -
+    # which is how close_native_splash() came to be a no-op for the rest of the
+    # launch, leaving the bootloader's logo on top of the running app.
+    native = sys.modules.get("pyi_splash")
+    if native is None:
+        # Missing from every build made without --splash, and from macOS, where
+        # PyInstaller has no splash at all. Importing pyi_splash without it logs
+        # "The environment does not allow connecting to the splash screen. Did
+        # bootloader fail to initialize it?" and a traceback straight into
+        # debug.log; the except below already made that harmless, and checking
+        # first keeps the false alarm out of the log we ask users to send us.
+        if not os.environ.get("_PYI_SPLASH_IPC"):
+            return None
+        try:
+            import pyi_splash as native
+        except Exception:
+            return None
     try:
-        import pyi_splash
-        return pyi_splash if pyi_splash.is_alive() else None
+        return native if native.is_alive() else None
     except Exception:
         return None
 
