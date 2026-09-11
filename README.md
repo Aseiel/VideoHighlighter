@@ -181,6 +181,10 @@ events:
       - {source: sports ball, region: net, min_count: 1}
 ```
 
+The same rules in the app, where they are edited and run:
+
+![Composition rules editor: a spatial rule firing when a sports ball is inside a net, a second for a ball at a player, and a signal rule on vocal density](assets/Composition_Engine.png)
+
 `sports ball` is one of the 80 classes the stock detector already knows. The
 net is not, so that single class is what you label and train — one primitive,
 reusable, rather than a "goal" class the network would have to infer from
@@ -207,9 +211,9 @@ objects and actions.
 
 Rules live in `composition_rules.yaml` in your user data folder — beside the
 executable on Windows, `~/Library/Application Support/VideoHighlighter` on
-macOS, the project root when running from source. There is no built-in set and
-the file is not tracked by git: the vocabulary is yours, and the engine is
-skipped entirely when the file is absent.
+macOS, the project root when running from source. Nothing ships with a rule
+set, and the file is gitignored, so the events you define stay on your machine.
+With no file present the engine is skipped entirely.
 
 They run on **every** pass, over whatever detections are already to hand — a
 rule is a reading of boxes that already exist, not a second detection. So

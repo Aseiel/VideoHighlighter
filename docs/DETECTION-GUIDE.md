@@ -144,6 +144,32 @@ a *state* test, evaluated per frame. It answers "is this true now", not "did
 this just start". For something that appears and then stays on screen, a rule
 will keep firing for as long as it remains visible.
 
+### Not yet: how far inside
+
+A rule tests whether the source box's **centre** falls inside the region box.
+There is no "how deep" threshold, so depth is decided when you label: draw the
+region around the mouth of something and touching it counts, draw it around the
+space behind and only fully entering does.
+
+That is enough for most things and wrong for some. A box is axis-aligned and a
+net is a volume seen in perspective, so the fraction of a ball inside the
+*box* is not the fraction inside the *net*, and no threshold on box overlap
+would fix it.
+
+Doing it properly needs contours rather than boxes:
+
+- a segmentation model for the region class, so the cache carries a mask or a
+  polygon instead of four numbers;
+- a depth measure over that contour — how far past the front edge the source's
+  centre sits, or what fraction of its area the mask contains;
+- a rule option for it, defaulting to today's centre test so no existing rule
+  changes meaning.
+
+The first of those is the real cost: it is a different export and a wider cache
+format, and every rule that does not ask for depth would still pay to store
+them. Worth doing when something actually needs to distinguish "on the line"
+from "over it".
+
 ---
 
 ## Primitives, not categories
