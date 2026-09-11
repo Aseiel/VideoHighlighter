@@ -161,10 +161,28 @@ signals include the per-second audio and vocal measurements (`audio_level`,
 detectors produced. A match becomes an event under a name you choose, and that
 name then appears in the report like any other signal.
 
-Rules live in `composition_rules.yaml` beside the executable, or in the project
-root when running from source. There is no built-in set and the file is not
-tracked by git: the vocabulary is yours, and the engine is skipped entirely when
-the file is absent.
+**This is how you get an event the models have no word for.** Action
+recognition answers from a fixed list of 400 classes: ask it about anything
+outside that list and it returns the nearest thing inside it, with the
+confidence you would expect from a wrong answer. A rule is not limited that
+way. It describes a relation between detections — one class inside another,
+counted, holding steady over a window — so the event is whatever that relation
+means in your footage, under the name you gave it.
+
+The confidence follows from that. A composed event is only as sure as the
+weakest detection it matched, so it carries *detector* confidence rather than a
+classifier's guess at a class it was never taught: in practice 80–100%, for
+moments an action label would score far lower and often name wrongly.
+
+Composed events get their own rows on the timeline, directly under the
+waveform, one row per rule that actually fired, filterable separately from
+objects and actions.
+
+Rules live in `composition_rules.yaml` in your user data folder — beside the
+executable on Windows, `~/Library/Application Support/VideoHighlighter` on
+macOS, the project root when running from source. There is no built-in set and
+the file is not tracked by git: the vocabulary is yours, and the engine is
+skipped entirely when the file is absent.
 
 They run on **every** pass, over whatever detections are already to hand — a
 rule is a reading of boxes that already exist, not a second detection. So
