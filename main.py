@@ -2318,7 +2318,7 @@ class VideoHighlighterGUI(QWidget):
         comp_outer.addLayout(comp_btn_row)
 
         comp_box.setLayout(comp_outer)
-        advanced_layout.addWidget(comp_box, 3, 0, 1, 2)
+        advanced_layout.addWidget(comp_box, 4, 0, 1, 2)
 
         # ---- load existing rules into table ----
         def _comp_load_rules():
@@ -2666,6 +2666,24 @@ class VideoHighlighterGUI(QWidget):
         self.bbox_actions_chk.setToolTip("Display detected action names on frames")
         bbox_layout.addWidget(self.bbox_actions_chk)
 
+        bbox_box.setLayout(bbox_layout)
+        advanced_layout.addWidget(bbox_box, 1, 1)
+
+        # ── Group 6: Highlight Report ──
+        # Its own group, and not a corner of the bounding-box one. The report is
+        # the answer to "why these moments", which is the thing this app is for;
+        # filed under a debugging switch that writes an _annotated.mp4, it read
+        # as a developer option nobody was meant to turn on.
+        report_box = QGroupBox("Highlight Report")
+        report_layout = QVBoxLayout()
+
+        report_info = QLabel(
+            "ℹ️ Why each moment was kept: an HTML page beside the highlight, "
+            "with thumbnails, scores and the moments that nearly made it")
+        report_info.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
+        report_info.setWordWrap(True)
+        report_layout.addWidget(report_info)
+
         # On by default: it costs one frame grab per kept segment and answers the
         # question every user asks first — why these moments and not others.
         self.why_report_chk = QCheckBox("Write a highlight report")
@@ -2677,7 +2695,7 @@ class VideoHighlighterGUI(QWidget):
             "moments that scored well but were left out.\n\n"
             "One self-contained file with thumbnails embedded — openable in any\n"
             "browser and sendable to a client. A matching .json holds the same data.")
-        bbox_layout.addWidget(self.why_report_chk)
+        report_layout.addWidget(self.why_report_chk)
 
         # The narration passes, which used to be reachable only from the
         # AI-summary menu after the run had already finished. On by default: a
@@ -2692,7 +2710,7 @@ class VideoHighlighterGUI(QWidget):
             "One model call per clip, so it adds a minute or two — and it needs a\n"
             "model with a vision half. The clip cards are written from the\n"
             "pictures; without this they carry only what was measured.")
-        bbox_layout.addWidget(self.narrate_clips_chk)
+        report_layout.addWidget(self.narrate_clips_chk)
 
         # The label carries the warning the default cannot: this is the slowest
         # thing the report does, so the user needs to know what it costs at the
@@ -2706,7 +2724,7 @@ class VideoHighlighterGUI(QWidget):
             "One model call per chapter — minutes, not seconds, and the slowest\n"
             "pass here. A chapter can be told from its transcript, so this adds\n"
             "least on footage that already has speech in it.")
-        bbox_layout.addWidget(self.narrate_chapters_chk)
+        report_layout.addWidget(self.narrate_chapters_chk)
 
         for _chk in (self.narrate_clips_chk, self.narrate_chapters_chk):
             # Both narrate the report, so neither means anything without one.
@@ -2730,8 +2748,8 @@ class VideoHighlighterGUI(QWidget):
             "the range requests seeking needs.")
         self.why_report_chk.toggled.connect(self.serve_base_input.setEnabled)
         self.serve_base_input.setEnabled(self.why_report_chk.isChecked())
-        bbox_layout.addWidget(QLabel("Served at (optional):"))
-        bbox_layout.addWidget(self.serve_base_input)
+        report_layout.addWidget(QLabel("Served at (optional):"))
+        report_layout.addWidget(self.serve_base_input)
 
         # The other half, and the one that survives with nothing running: where
         # the *footage* lives on a share. A browser cannot play `smb://` — no
@@ -2751,11 +2769,14 @@ class VideoHighlighterGUI(QWidget):
             "field above instead when you want playback to land on the moment.")
         self.why_report_chk.toggled.connect(self.media_base_input.setEnabled)
         self.media_base_input.setEnabled(self.why_report_chk.isChecked())
-        bbox_layout.addWidget(QLabel("Video reachable at (optional):"))
-        bbox_layout.addWidget(self.media_base_input)
+        report_layout.addWidget(QLabel("Video reachable at (optional):"))
+        report_layout.addWidget(self.media_base_input)
 
-        bbox_box.setLayout(bbox_layout)
-        advanced_layout.addWidget(bbox_box, 1, 1)
+        report_box.setLayout(report_layout)
+        # Full width, below the four detector groups: it is about the run as a
+        # whole rather than about one detector, and the two URL fields need the
+        # room to show an address without eliding it.
+        advanced_layout.addWidget(report_box, 3, 0, 1, 2)
 
         # ── Group: Video Output ──
         # How the final highlight is re-encoded. CPU (libx265) is VR-safe but slow;
@@ -2784,7 +2805,7 @@ class VideoHighlighterGUI(QWidget):
         # Equal column widths; let the row below the composition table absorb slack
         advanced_layout.setColumnStretch(0, 1)
         advanced_layout.setColumnStretch(1, 1)
-        advanced_layout.setRowStretch(4, 1)
+        advanced_layout.setRowStretch(5, 1)
 
         advanced_scroll = QScrollArea()
         advanced_scroll.setWidgetResizable(True)
