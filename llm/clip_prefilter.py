@@ -119,6 +119,13 @@ def cuda_device() -> Optional[str]:
     except Exception:
         return None
     try:
+        # A card newer than this torch build is "available" and still cannot
+        # run a kernel; see modules/cuda_check.py.
+        from modules.cuda_check import cuda_usable
+        return "cuda:0" if cuda_usable(torch) else None
+    except ImportError:
+        pass
+    try:
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
             return "cuda:0"
     except Exception as e:  # noqa: BLE001 — a probe must never break the caller
@@ -129,10 +136,11 @@ def cuda_device() -> Optional[str]:
 def directml_device() -> Optional[str]:
     """The torch device string for a usable DirectML GPU, else None.
 
-    The one place this module reaches into `modules/` — deliberately, and it
-    does not break the self-containment the block above describes:
-    `modules.directml_device` imports nothing but `os` and `typing` at module
-    scope, so it costs the same as the local probe it would otherwise be. The
+    One of two places this module reaches into `modules/` (the other is
+    `cuda_device`, on the same terms) — deliberately, and it does not break the
+    self-containment the block above describes: `modules.directml_device`
+    imports nothing but `os` and `typing` at module scope, so it costs the same
+    as the local probe it would otherwise be. The
     reason not to inline it is that DirectML has genuine footguns (the backend
     name changed between releases; the import is what registers the backend at
     all) and a copy of that reasoning per module is a copy that goes stale.

@@ -497,7 +497,8 @@ def _resolve_r3d_device(device_str):
             return torch.device('cpu')
         return torch.device(resolved)
 
-    if str(device_str).startswith('cuda') and not torch.cuda.is_available():
+    from modules.cuda_check import cuda_usable
+    if str(device_str).startswith('cuda') and not cuda_usable(torch):
         return torch.device('cpu')
     try:
         return torch.device(device_str)

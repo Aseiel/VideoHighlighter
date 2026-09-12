@@ -463,8 +463,9 @@ def detect_scenes_motion_optimized(video_path,
             print(f"Motion detection cancelled - partial results: Scenes: {len(scenes)}, Motion events: {len(motion_events)}, Peaks: {len(motion_peaks)}")
 
     except Exception as e:
-        if debug:
-            print(f"Motion detection error: {e}")
+        # Always said: whatever was collected before the failure is returned,
+        # and the run carries on as though the rest of the video had no motion.
+        print(f"⚠️ Motion detection error: {e}")
     finally:
         # Cleanup
         try:

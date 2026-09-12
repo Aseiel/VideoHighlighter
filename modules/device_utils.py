@@ -12,6 +12,8 @@ One source of truth for all device strings passed to:
 
 import os
 
+from modules import cuda_check
+
 try:
     import torch
     _TORCH_AVAILABLE = True
@@ -60,6 +62,10 @@ def _cuda_info(log_fn=print):
         return None
     try:
         if not torch.cuda.is_available():
+            return None
+        reason = cuda_check.cuda_unusable_reason(torch)
+        if reason:
+            log_fn(f"⚠️ Not using the NVIDIA GPU: {reason}")
             return None
         count = torch.cuda.device_count()
         log_fn(f"✅ CUDA available: {count} device(s)")
@@ -413,9 +419,11 @@ def resolve_yolo_device(requested: str) -> str:
         return "cpu"
 
     if requested.startswith("cuda") or requested.isdigit():
-        if _TORCH_AVAILABLE and torch.cuda.is_available():
+        reason = (cuda_check.cuda_unusable_reason(torch) if _TORCH_AVAILABLE
+                  else "PyTorch is not installed")
+        if reason is None:
             return requested
-        _warn(f"CUDA requested ('{requested}') but torch.cuda.is_available() is False. "
+        _warn(f"CUDA requested ('{requested}') but it cannot run here: {reason}. "
               f"Falling back to CPU.")
         return "cpu"
 

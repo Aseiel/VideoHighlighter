@@ -16,6 +16,8 @@ import json
 import hashlib
 import cv2
 
+from modules.cuda_check import cuda_usable
+
 
 def build_tracking_model(model_size="n", log_fn=print):
     """YOLO tracking model on the best device.
@@ -35,7 +37,7 @@ def build_tracking_model(model_size="n", log_fn=print):
         log_fn("✅ Tracking model: OpenVINO (Intel GPU / Arc)")
         return YOLO(ov_folder, task="detect")
 
-    if torch.cuda.is_available():
+    if cuda_usable(torch):
         log_fn(f"✅ Tracking model: CUDA yolo11{model_size}.pt")
         return YOLO(f"yolo11{model_size}.pt")
 
@@ -48,7 +50,7 @@ def track_device():
     import torch
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return "intel:gpu"     # OpenVINO GPU plugin → the Arc
-    if torch.cuda.is_available():
+    if cuda_usable(torch):
         return 0
     return "cpu"
 

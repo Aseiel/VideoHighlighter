@@ -53,6 +53,15 @@ def log_file_path() -> str:
     return os.path.join(user_data_dir(), "debug.log")
 
 
+# tqdm redraws its bar in place: "\r" and the whole bar again, several times a
+# second. A terminal overwrites the line; the log file and window append, and a
+# five-hour video left over a megabyte of bars in debug.log. Their copies keep a
+# redraw at most this often, plus the latest one whenever other output arrives,
+# so the bar's final state is never lost. The terminal still gets every one.
+_REDRAW_INTERVAL = 10.0
+_clock = time.monotonic
+
+
 class _Tee(io.TextIOBase):
     """Fan out writes to the log file, the live log window (if open), the ring
     backlog, and the original stream (visible when running from a terminal).
@@ -61,6 +70,21 @@ class _Tee(io.TextIOBase):
     def __init__(self, original):
         self._original = original
         self._at_line_start = True
+        self._last_redraw = float("-inf")
+        self._held_redraw = ""
+
+    def _for_copies(self, s: str) -> str:
+        """The part of ``s`` the log file and window get (see _REDRAW_INTERVAL)."""
+        if s.startswith("\r") and "\n" not in s:
+            now = _clock()
+            if now - self._last_redraw < _REDRAW_INTERVAL:
+                self._held_redraw = s
+                return ""
+            self._last_redraw = now
+            self._held_redraw = ""
+            return s
+        held, self._held_redraw = self._held_redraw, ""
+        return held + s
 
     def _stamped(self, s: str) -> str:
         out = []
@@ -75,19 +99,21 @@ class _Tee(io.TextIOBase):
         if not s:
             return 0
         with _lock:
-            stamped = self._stamped(s)
-            _backlog.append(stamped)
-            if _log_fh is not None:
-                try:
-                    _log_fh.write(stamped)
-                    _log_fh.flush()
-                except Exception:
-                    pass
-            if _gui_sink is not None:
-                try:
-                    _gui_sink(stamped)  # thread-safe: queued Qt signal emit
-                except Exception:
-                    pass
+            logged = self._for_copies(s)
+            if logged:
+                stamped = self._stamped(logged)
+                _backlog.append(stamped)
+                if _log_fh is not None:
+                    try:
+                        _log_fh.write(stamped)
+                        _log_fh.flush()
+                    except Exception:
+                        pass
+                if _gui_sink is not None:
+                    try:
+                        _gui_sink(stamped)  # thread-safe: queued Qt signal emit
+                    except Exception:
+                        pass
             if self._original is not None:
                 try:
                     self._original.write(s)

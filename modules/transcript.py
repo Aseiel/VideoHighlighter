@@ -7,6 +7,8 @@ import contextlib
 import subprocess
 import time
 
+from modules.cuda_check import cuda_usable
+
 
 class TranscriptionCancelled(RuntimeError):
     """Raised when a run is cancelled part-way through transcription.
@@ -200,7 +202,7 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
     - should_cancel: optional predicate, polled throughout. Raises
       TranscriptionCancelled promptly rather than at the end of the run.
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if cuda_usable(torch) else "cpu"
     log_fn(f"Using device for Whisper: {device}")
 
     log_fn(f"🔤 Language parameter received: {language}")
