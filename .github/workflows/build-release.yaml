@@ -144,6 +144,14 @@ jobs:
           --copy-metadata safetensors
           --copy-metadata regex
           main.py
+      - name: Check numpy.libs came through whole
+        # The bundle once kept numpy's vendored MSVC runtime in pandas.libs only,
+        # and ml_dtypes (via onnx) failed to load, so the DirectML detector's
+        # ONNX export never happened. packaging/pyinstaller-hooks/hook-ml_dtypes.py
+        # puts every numpy.libs file back; this fails the build if a PyInstaller
+        # or numpy bump undoes that, instead of an AMD user's run.
+        run: |
+          python -c "import os, importlib.util as u; src = os.path.join(os.path.dirname(os.path.dirname(u.find_spec('numpy').origin)), 'numpy.libs'); dst = os.path.join('dist', 'VideoHighlighter', '_internal', 'numpy.libs'); want = sorted(os.listdir(src)); have = set(os.listdir(dst)) if os.path.isdir(dst) else set(); missing = [f for f in want if f not in have]; print('numpy.libs:', ', '.join(want)); assert not missing, 'bundled numpy.libs lacks ' + ', '.join(missing)"
       - name: Report build size
         run: |
           $size = (Get-ChildItem -Recurse ./dist/VideoHighlighter | Measure-Object -Property Length -Sum).Sum / 1GB
