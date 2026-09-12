@@ -38,7 +38,7 @@ pip install torch-directml
 
 **Do that in its own virtualenv.** `torch-directml` pins an exact `torch`
 version, and pip satisfies that by *replacing* whatever torch is installed. On
-a machine carrying a `+xpu` build (Arc) or a `+cu124` build (CUDA), that
+a machine carrying a `+xpu` build (Arc) or a `+cu128` build (CUDA), that
 silently removes Arc or CUDA support and the app then looks broken for a reason
 that has nothing to do with AMD. `CLAUDE.local.md` describes the same class of
 accident from the other direction.

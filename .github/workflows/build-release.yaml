@@ -74,7 +74,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install numpy==2.2.6 mkl mkl-include
-          pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
           pip install openvino==2026.2.1
           pip install -r requirements.txt
           pip install pyinstaller
@@ -83,6 +83,15 @@ jobs:
           python -c "import torch; print('Torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
           python -c "import openvino; import os; lib_dir = os.path.join(os.path.dirname(openvino.__file__), 'libs'); files = os.listdir(lib_dir); print('OpenVINO libs:', len(files), 'files,', round(sum(os.path.getsize(os.path.join(lib_dir,f)) for f in files)/1e6), 'MB')"
           python -c "import numpy; numpy.show_config()"
+      - name: Check the CUDA build covers every supported GPU generation
+        # The build the exe ships decides which NVIDIA cards get a GPU at all.
+        # torch 2.6.0+cu124 stopped at sm_90, and an RTX 50-series (sm_120) failed
+        # with "no kernel image is available"; a later CUDA line may drop an old
+        # generation instead. get_arch_list() is empty on a runner without a GPU,
+        # so read the compiled list directly: GTX 10, RTX 20, RTX 30 (RTX 40 is
+        # served by the sm_8x kernels) and RTX 50.
+        run: |
+          python -c "import torch; flags = torch._C._cuda_getArchFlags().split(); print('CUDA archs:', ' '.join(flags)); missing = [a for a in ('sm_61', 'sm_75', 'sm_86', 'sm_120') if a not in flags]; assert not missing, 'torch build lacks ' + ', '.join(missing)"
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
       - name: Build EXE
@@ -192,11 +201,15 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install numpy==2.2.6 mkl mkl-include
-          pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
           pip install openvino==2026.2.1
           pip install -r requirements.txt
           pip install -r sidecar/requirements.txt
           pip install pyinstaller
+      - name: Check the CUDA build covers every supported GPU generation
+        # Same guard as the Qt build: the sidecar bundles the same CUDA torch.
+        run: |
+          python -c "import torch; flags = torch._C._cuda_getArchFlags().split(); print('CUDA archs:', ' '.join(flags)); missing = [a for a in ('sm_61', 'sm_75', 'sm_86', 'sm_120') if a not in flags]; assert not missing, 'torch build lacks ' + ', '.join(missing)"
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
       - name: Build the sidecar

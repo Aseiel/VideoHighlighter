@@ -30,7 +30,7 @@ The install is destructive, which is why this is opt-in
 -------------------------------------------------------
 ``torch-directml`` pins an exact ``torch`` version and pip will happily satisfy
 that by *replacing* whatever torch is installed. On a machine with a ``+xpu``
-or ``+cu124`` build that silently removes Arc or CUDA support, and the app then
+or ``+cu128`` build that silently removes Arc or CUDA support, and the app then
 looks broken for an unrelated reason. So DirectML must never be a hard
 requirement, must never be installed as a side effect of anything, and belongs
 in its own virtualenv on a machine that also has another accelerator.

@@ -126,7 +126,7 @@ def _xpu_info(log_fn=print):
 def _openvino_info(log_fn=print):
     """DeviceInfo for an Intel GPU driven by OpenVINO, or None.
 
-    The frozen exe ships a CUDA torch (the release build installs the cu124
+    The frozen exe ships a CUDA torch (the release build installs the cu128
     wheel). torch.xpu still *exists* on it — the attribute is there in any
     build — but reports is_available() False, so :func:`_xpu_info` never fires
     in the packaged app, even on an Arc machine. OpenVINO can still drive the

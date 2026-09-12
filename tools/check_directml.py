@@ -84,7 +84,7 @@ def report_env() -> bool:
         print("  Note there is no torch-directml>=1.13 - releases are dated dev")
         print("  builds (0.2.5.dev240914), so a normal-looking version floor")
         print("  matches nothing. Install it in its own virtualenv: it pins an")
-        print("  exact torch and pip will replace a +xpu or +cu124 build with a")
+        print("  exact torch and pip will replace a +xpu or +cu128 build with a")
         print("  stock wheel to satisfy that, silently removing Arc/CUDA support.")
         return False
 
