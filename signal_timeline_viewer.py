@@ -1441,13 +1441,10 @@ class SignalTimelineWindow(QMainWindow):
         """Initialize waveform visualization in background with better debugging"""
         # First check if video even has audio
         try:
-            result = subprocess.run([
-                "ffprobe", "-v", "error", "-select_streams", "a:0",
-                "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1",
-                self.video_path
-            ], capture_output=True, text=True, timeout=8)
+            from modules.ffmpeg_tools import probe
+            streams = probe(self.video_path, timeout=8).get("streams") or []
 
-            if result.returncode != 0 or not result.stdout.strip():
+            if not any(s.get("codec_type") == "audio" for s in streams):
                 print("⚠️ Video has NO AUDIO STREAM → no waveform possible")
                 self.statusBar().showMessage("Video has no audio track", 5000)
                 return

@@ -53,15 +53,13 @@ def _ffprobe_exe() -> str:
 
 
 def _has_audio_stream(path: str) -> bool:
-    """True when ffprobe sees at least one audio stream. Optimistic on probe
+    """True when the file has at least one audio stream. Optimistic on probe
     failure: a wrong True makes the mix/duck ffmpeg call fail loudly instead
     of silently dropping the original audio."""
     try:
-        out = subprocess.run(
-            [_ffprobe_exe(), "-v", "error", "-select_streams", "a",
-             "-show_entries", "stream=index", "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=30)
-        return bool((out.stdout or "").strip())
+        from modules.ffmpeg_tools import probe
+        return any(s.get("codec_type") == "audio"
+                   for s in probe(path).get("streams") or [])
     except Exception:
         return True
 

@@ -51,6 +51,9 @@ async def lifespan(_app: "FastAPI"):
     # Capture the serving event loop so worker threads can dispatch events even
     # before any WebSocket has connected.
     manager.loop = asyncio.get_running_loop()
+    # Jobs run ffmpeg by name; the one pip installed has to answer to it.
+    from modules.ffmpeg_tools import ensure_ffmpeg_on_path
+    ensure_ffmpeg_on_path()
     yield
 
 

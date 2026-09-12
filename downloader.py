@@ -55,33 +55,23 @@ def extract_domain(u: str) -> str:
 # -----------------------------
 def get_duration_from_ffprobe(filepath: str, log_fn: Callable = print) -> Optional[float]:
     """
-    Get real duration in seconds by probing the downloaded file.
-    Requires ffprobe (part of ffmpeg) installed and available on PATH.
+    Get real duration in seconds by probing the downloaded file — with ffprobe
+    when it is installed, PyAV otherwise (modules.ffmpeg_tools.probe).
     Returns:
         duration seconds, or None if unavailable/fails.
     """
     try:
         if not filepath or not os.path.exists(filepath):
             return None
-        cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            filepath
-        ]
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
-        out = (p.stdout or "").strip()
-        if not out:
-            # Sometimes ffprobe writes useful hints to stderr
-            return None
-        d = float(out)
+        from modules.ffmpeg_tools import probe
+        d = float((probe(filepath, timeout=15).get("format") or {}).get("duration") or 0)
         if d > 0:
             return d
-    except FileNotFoundError:
-        log_fn("⚠️ ffprobe not found. Install ffmpeg (ffprobe) and ensure it's on PATH.")
+    except subprocess.CalledProcessError:
+        # Not (yet) a readable media file, e.g. a partial download.
+        return None
     except Exception as e:
-        log_fn(f"⚠️ ffprobe failed: {str(e)[:120]}...")
+        log_fn(f"⚠️ Duration probe failed: {str(e)[:120]}...")
     return None
 
 def parse_iso8601_duration_enhanced(duration_str: str) -> Optional[float]:

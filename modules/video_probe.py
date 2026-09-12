@@ -30,11 +30,10 @@ maintain; stale rotate tags are the leftover.
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
 
 from modules.app_paths import ffmpeg_exe
+from modules.ffmpeg_tools import probe
 
 
 def ffprobe_exe() -> str:
@@ -102,7 +101,8 @@ def _rotation_from_stream(stream: dict) -> int:
 
 
 def probe_video(path: str) -> dict:
-    """All display-relevant metadata for ``path`` from a single ffprobe call.
+    """All display-relevant metadata for ``path`` from a single probe (ffprobe,
+    or PyAV where there is none).
 
     Returns ``{"duration": float, "width": int, "height": int, "fps": float,
     "rotation": int}``. Duration prefers the container (format) value —
@@ -111,16 +111,10 @@ def probe_video(path: str) -> dict:
     rotation is 90/270 the displayed aspect is their swap, and that stays the
     caller's job so the raw numbers remain trustworthy.
 
-    ffprobe failures propagate (CalledProcessError / FileNotFoundError):
-    a file we cannot probe is the caller's decision, not a silent zero.
+    Probe failures propagate (see `ffmpeg_tools.probe`): a file we cannot
+    probe is the caller's decision, not a silent zero.
     """
-    out = subprocess.run(
-        [ffprobe_exe(), "-v", "error", "-print_format", "json",
-         "-show_streams", "-show_format", str(path)],
-        capture_output=True, encoding="utf-8", errors="replace",
-        check=True, timeout=30,
-    ).stdout
-    data = json.loads(out or "{}")
+    data = probe(path)
     stream = next((s for s in data.get("streams") or []
                    if s.get("codec_type") == "video"), {})
     fmt = data.get("format") or {}

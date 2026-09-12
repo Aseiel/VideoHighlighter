@@ -68,8 +68,8 @@ VideoHighlighter（免费版）
 从[Releases](https://github.com/Aseiel/VideoHighlighter/releases)下载最新的`.exe`文件——无需安装Python或任何依赖项。
 
 ### Linux / 从源码构建
-1. **Python & FFmpeg**
-   系统中必须已安装 FFmpeg，且其路径需在系统 PATH 中。
+1. **Python**
+   运行 `pip install -r requirements.txt`。FFmpeg 会随之安装（通过 `imageio-ffmpeg`），无需单独安装；如果 PATH 中已有 FFmpeg，则优先使用它。
 
 ## 使用方法
 Linux：python main.py

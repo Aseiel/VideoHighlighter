@@ -340,22 +340,11 @@ def _source_file(path: str) -> str:
 
 
 def _tags(path: str) -> dict:
-    """The container tags, via one ffprobe call. Empty on any failure."""
-    import json
-    import subprocess
-
-    from modules.video_probe import ffprobe_exe
+    """The container tags, via one probe. Empty on any failure."""
+    from modules.ffmpeg_tools import probe
 
     try:
-        result = subprocess.run(
-            [ffprobe_exe(), "-v", "error", "-show_entries", "format_tags",
-             "-of", "json", path],
-            capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=30)
-        if result.returncode != 0:
-            return {}
-        data = json.loads(result.stdout or "{}")
-        return (data.get("format") or {}).get("tags") or {}
+        return (probe(path).get("format") or {}).get("tags") or {}
     except Exception:
         return {}
 

@@ -274,8 +274,10 @@ Mac builds get far less testing than Windows — please [open an
 issue](https://github.com/Aseiel/VideoHighlighter/issues) when something breaks.
 
 ### Linux / building from source
-1. **Python & FFmpeg**
-   FFmpeg must be installed and available in your system PATH.
+1. **Python**
+   `pip install -r requirements.txt` — FFmpeg comes with it (via
+   `imageio-ffmpeg`), nothing to install separately. An FFmpeg already on your
+   PATH is used instead when there is one.
 
 ## Usage
 - **Windows:** run `VideoHighlighter.exe` from the extracted build.

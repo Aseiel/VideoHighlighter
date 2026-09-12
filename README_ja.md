@@ -68,8 +68,8 @@ OpenAI Whisperを利用して字幕付きのテキストを生成します。
 [Releases](https://github.com/Aseiel/VideoHighlighter/releases) から最新の `.exe` ファイルをダウンロードしてください。Pythonやその他の依存関係は不要です。
 
 ### Linux / ソースからのビルド
-1. **Python & FFmpeg**
-   FFmpegはインストールされており、システムのPATHに含まれている必要があります。
+1. **Python**
+   `pip install -r requirements.txt` を実行してください。FFmpegは（`imageio-ffmpeg`経由で）一緒にインストールされるため、別途インストールする必要はありません。PATH上に既にFFmpegがある場合はそちらが使われます。
 
 ## 使用方法
 Linux: python main.py  

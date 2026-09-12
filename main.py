@@ -6564,6 +6564,10 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     reset_duration_method_cache()
+    # Nobody should have to install ffmpeg: pip already brought one
+    # (imageio-ffmpeg). Give it its plain name on PATH before anything runs it.
+    from modules.ffmpeg_tools import ensure_ffmpeg_on_path
+    ensure_ffmpeg_on_path()
     # Disable D3D11VA hardware acceleration in Qt multimedia's FFmpeg backend.
     # On some Windows systems D3D11VA initialisation fails for H.264, causing
     # noisy warnings even though playback still works via software decoding.

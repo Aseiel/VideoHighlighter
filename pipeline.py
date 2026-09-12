@@ -23,6 +23,7 @@ from modules.auto_segments import build_auto_segments
 from modules.highlight_select import peak_confidence_by_sec, select_fixed_window_segments
 from modules.device_utils import resolve_yolo_device
 from modules.app_paths import ffmpeg_exe
+from modules import ffmpeg_tools
 
 
 # Emitted when detection is skipped because cached results were reused. The
@@ -63,19 +64,15 @@ def seconds_to_mmss(sec):
     return f"{minutes:02d}:{seconds:02d}"
 
 def get_video_duration(video_path, log_fn=print):
-    """Robust duration via ffprobe. cv2's frame_count/fps is unreliable on VFR
-    or mis-tagged files and can read 2× on a re-open. Falls back to cv2."""
+    """Robust duration from the container (ffprobe, or PyAV without one). cv2's
+    frame_count/fps is unreliable on VFR or mis-tagged files and can read 2× on
+    a re-open. Falls back to cv2."""
     try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        d = float(out)
+        d = float((ffmpeg_tools.probe(video_path).get("format") or {}).get("duration") or 0)
         if d > 0:
             return d
     except Exception as e:
-        log_fn(f"⚠️ ffprobe duration failed ({e}); using cv2 fallback")
+        log_fn(f"⚠️ Duration probe failed ({e}); using cv2 fallback")
     cap = cv2.VideoCapture(video_path)
     fps_ = cap.get(cv2.CAP_PROP_FPS) or 25.0
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
@@ -370,6 +367,9 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         str (single output path) or list of tuples [(input_path, output_path), ...]
     """
     
+    # Before anything runs a bare "ffmpeg" — Whisper's audio loader included.
+    ffmpeg_tools.ensure_ffmpeg_on_path(log_fn)
+
     # ========== MULTI-FILE BATCH PROCESSING ==========
     if isinstance(video_path, (list, tuple)):
         results = []
@@ -650,10 +650,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             except (FileNotFoundError, OSError) as e:
                 # ffmpeg missing/unresolvable — would otherwise crash the pipeline
                 # thread uncaught (silent failure in the windowed exe -> empty timeline)
-                log(f"❌ ffmpeg not found for trimming ({e}). Install ffmpeg or ensure "
-                    f"imageio-ffmpeg is bundled. Cannot process time range.")
+                log(f"❌ ffmpeg not found for trimming ({e}). It comes with the app's "
+                    f"requirements (imageio-ffmpeg) — reinstall them. Cannot process time range.")
                 return None
-            except RuntimeError:
+            except RuntimeError as e:
+                # A cancel has already said so (check_cancellation); anything
+                # else would end the run with no reason given.
+                if not (cancel_flag and cancel_flag.is_set()):
+                    log(f"❌ Failed to trim video: {e}")
                 return None
         else:
             log("ℹ️ Processing full video")
@@ -834,8 +838,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     with open(transcript_file, "w", encoding="utf-8") as f:
                         f.write(transcript_text)
                     log(f"✅ Transcript saved: {transcript_file}")
-                except RuntimeError:
-                    return None
+                except RuntimeError as e:
+                    # Cancellation arrives as a RuntimeError and stops the run.
+                    # So did every Whisper and torch failure, unlogged — a video
+                    # then ended as "Failed" with no reason anywhere.
+                    if cancel_flag and cancel_flag.is_set():
+                        return None
+                    log(f"⚠ Transcript processing failed: {e}")
+                    transcript_segments = []
                 except Exception as e:
                     log(f"⚠ Transcript processing failed: {e}")
                     transcript_segments = []

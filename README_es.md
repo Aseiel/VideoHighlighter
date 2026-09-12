@@ -69,8 +69,8 @@ Esta versión sigue siendo gratuita y está licenciada bajo AGPL-3.0.
 Descargue la última versión en formato `.exe` desde [Releases](https://github.com/Aseiel/VideoHighlighter/releases); no se requiere Python ni otras dependencias.
 
 ### Linux / Compilación desde el código fuente
-1. **Python & FFmpeg**
-   Es necesario tener instalado FFmpeg y que esté disponible en el PATH de su sistema.
+1. **Python**
+   `pip install -r requirements.txt`: FFmpeg viene incluido (mediante `imageio-ffmpeg`), no hace falta instalarlo aparte. Si ya hay un FFmpeg en el PATH, se usa ese.
 
 ## Uso
 Linux: python main.py 
