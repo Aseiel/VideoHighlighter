@@ -48,16 +48,55 @@ def amd_box(monkeypatch):
     # The wrapper imports the package itself, for the backend registration.
     monkeypatch.setitem(sys.modules, "torch_directml", types.ModuleType("torch_directml"))
     dml.probe(refresh=True)
+    # torch wins on this box whatever ONNX Runtime says, and pinning it keeps
+    # that a statement about the code rather than about the test machine.
+    _set_ort_dml(monkeypatch, True)
     return fake
 
 
-@pytest.fixture
-def no_directml(monkeypatch):
+def _no_torch_directml(monkeypatch):
     def boom():
         raise ImportError("No module named 'torch_directml'")
     monkeypatch.setattr(dml, "_import_torch_directml", boom)
     monkeypatch.delitem(sys.modules, "torch_directml", raising=False)
     dml.probe(refresh=True)
+
+
+def _set_ort_dml(monkeypatch, available):
+    """Pin what ONNX Runtime answers, rather than asking this machine.
+
+    Without this the two "auto" tests below would depend on whether the
+    developer's box happens to have `onnxruntime-directml` — passing on CI,
+    where it is absent, and failing on the Windows machine the feature is for.
+    """
+    from modules import ort_directml
+    # `dml.enabled()` is in the stub because it is in the real thing:
+    # ort_directml.probe() consults it, so that VH_DIRECTML=off turns off
+    # DirectML whichever runtime would have supplied it. A stub that ignored the
+    # switch would hide a regression in exactly the setting users reach for when
+    # the backend misbehaves.
+    monkeypatch.setattr(ort_directml, "available",
+                        lambda: available and dml.enabled())
+    monkeypatch.setattr(
+        ort_directml, "probe",
+        lambda refresh=False: types.SimpleNamespace(
+            available=available and dml.enabled(), version="1.24.4",
+            reason=None if available else "no onnxruntime", providers=()))
+
+
+@pytest.fixture
+def no_directml(monkeypatch):
+    """Neither runtime: the machine has no DirectML of any kind."""
+    _no_torch_directml(monkeypatch)
+    _set_ort_dml(monkeypatch, False)
+
+
+@pytest.fixture
+def onnx_dml_box(monkeypatch):
+    """The packaged build on a DX12 card: ONNX Runtime has DirectML, torch does
+    not, and never can — `torch-directml` pins an exact torch."""
+    _no_torch_directml(monkeypatch)
+    _set_ort_dml(monkeypatch, True)
 
 
 @pytest.fixture
@@ -216,8 +255,10 @@ def test_on_demand_runs_send_r3d_to_directml(monkeypatch, amd_box):
     from modules import device_utils as du
     monkeypatch.setattr(du, "_TORCH_AVAILABLE", False)
 
-    enable, half, device = ao._r3d_flags("auto", log=lambda *a, **k: None)
-    assert (enable, half, device) == (True, False, "privateuseone:0")
+    flags = ao._r3d_flags("auto", log=lambda *a, **k: None)
+    # No ONNX permission: torch holds the card, and a second session on the same
+    # adapter would be contention rather than acceleration.
+    assert flags == (True, False, "privateuseone:0", False)
 
 
 def test_on_demand_auto_without_directml_is_unchanged(monkeypatch, no_directml):
@@ -225,16 +266,118 @@ def test_on_demand_auto_without_directml_is_unchanged(monkeypatch, no_directml):
     from modules import device_utils as du
     monkeypatch.setattr(du, "_TORCH_AVAILABLE", False)
 
-    assert ao._r3d_flags("auto", log=lambda *a, **k: None) == (False, False, None)
+    assert ao._r3d_flags("auto", log=lambda *a, **k: None) == (
+        False, False, None, False)
 
 
 @pytest.mark.parametrize("backend,expected", [
-    ("openvino", (False, False, None)),
-    ("r3d_cuda", (True, True, "cuda")),
-    ("r3d_cpu", (True, False, "cpu")),
+    ("openvino", (False, False, None, False)),
+    ("r3d_cuda", (True, True, "cuda", False)),
+    ("r3d_cpu", (True, False, "cpu", False)),
 ])
 def test_explicit_backend_choices_name_their_device(backend, expected, amd_box):
     """Each choice pins its own device, so "R3D + CPU" cannot silently become
     DirectML on an AMD machine just because one is present."""
     from modules import analysis_ondemand as ao
     assert ao._r3d_flags(backend, log=lambda *a, **k: None) == expected
+
+# ---------------------------------------------------------------------------
+# The packaged build's DirectML, which arrives through ONNX Runtime
+# ---------------------------------------------------------------------------
+
+def test_auto_reaches_for_onnx_runtime_when_torch_cannot(monkeypatch, onnx_dml_box):
+    """The gap this closes. `auto` used to enable R3D only where torch could
+    address a GPU, so in the exe on an AMD box the branch fell through to
+    OpenVINO — which there *is* the processor, because OpenVINO's GPU plugin is
+    Intel-only. R3D was skipped on exactly the machines with a card going
+    unused."""
+    from modules import analysis_ondemand as ao
+    from modules import device_utils as du
+    monkeypatch.setattr(du, "_TORCH_AVAILABLE", False)
+
+    enable, half, device, onnx_dml = ao._r3d_flags("auto", log=lambda *a, **k: None)
+
+    assert (enable, onnx_dml) == (True, True)
+    assert device == "cpu"   # torch's device; the model is what leaves it
+    assert half is False     # fp16 is uneven across DirectML's operators
+
+
+def test_choosing_the_cpu_still_means_the_cpu_on_a_dx12_box(onnx_dml_box):
+    """"R3D + CPU (PyTorch, slow)" is a choice a user can make on a machine that
+    has DirectML, and it has to keep meaning what the label says. This is why
+    the permission is passed rather than inferred from the device: the wrapper
+    sees "cpu" in both cases and cannot tell them apart on its own."""
+    from modules import analysis_ondemand as ao
+
+    assert ao._r3d_flags("r3d_cpu", log=lambda *a, **k: None) == (
+        True, False, "cpu", False)
+
+
+class _OnnxCandidate:
+    """The attributes `_try_onnx` reads, without building a real R3D."""
+
+    def __init__(self, ar_module, device="cpu", allow=True):
+        self.model = object()
+        self.model_name = "r3d_18"
+        self.num_classes = 400
+        self.device = ar_module.torch.device(device)
+        self.allow_onnx_dml = allow
+
+
+def _try_onnx(ar_module, candidate):
+    return ar_module.R3DModelWrapper._try_onnx(candidate, None)
+
+
+def test_without_permission_onnx_runtime_is_never_asked(ar, monkeypatch):
+    """The refusal has to happen before the import, not after the session: an
+    export costs real seconds and a user who asked for the CPU should not pay
+    them."""
+    from modules import r3d_onnx
+    calls = []
+    monkeypatch.setattr(r3d_onnx, "load", lambda *a, **k: calls.append(1))
+
+    assert _try_onnx(ar, _OnnxCandidate(ar, allow=False)) is None
+    assert calls == []
+
+
+def test_a_working_torch_gpu_is_never_displaced(ar, monkeypatch):
+    """Permission is not the only gate. A DirectML or CUDA model that survived
+    its warm-up keeps the card it has, because moving it to a second runtime on
+    the same adapter would be contention rather than acceleration."""
+    from modules import r3d_onnx
+    calls = []
+    monkeypatch.setattr(r3d_onnx, "load", lambda *a, **k: calls.append(1))
+
+    candidate = _OnnxCandidate(ar, device="privateuseone:0", allow=True)
+    assert _try_onnx(ar, candidate) is None
+    assert calls == []
+
+
+def test_a_demoted_model_is_offered_to_onnx_runtime(ar, monkeypatch):
+    """The warm-up runs first and may move the model to the CPU. That is the
+    moment this matters most: DirectML could not run it through torch, and ONNX
+    Runtime's operator coverage is not the same set."""
+    from modules import r3d_onnx
+    sentinel = object()
+    seen = {}
+
+    def fake_load(model, name, classes, custom_weights=None, **kw):
+        seen.update(name=name, classes=classes, weights=custom_weights)
+        return sentinel
+
+    monkeypatch.setattr(r3d_onnx, "load", fake_load)
+
+    assert _try_onnx(ar, _OnnxCandidate(ar)) is sentinel
+    assert seen == {"name": "r3d_18", "classes": 400, "weights": None}
+
+
+def test_the_load_line_names_the_runtime_not_the_torch_device(ar):
+    """`self.device` says "cpu" on a machine where ONNX Runtime just took the
+    model to the GPU — the one case this path exists for — so the summary reads
+    the label instead."""
+    candidate = _OnnxCandidate(ar)
+    candidate.onnx = object()
+
+    label = ar.R3DModelWrapper.backend_label.fget(candidate)
+    assert label == "DirectML (ONNX Runtime)"
+    assert ar._r3d_device_name(candidate) == "DirectML (ONNX Runtime)"

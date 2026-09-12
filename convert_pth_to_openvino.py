@@ -171,11 +171,18 @@ def convert_current_model():
     print(f"\n🔄 Converting to ONNX...")
     print(f"  - Input shape: [batch_size, {sequence_length}, {feature_dim}]")
     
+    # The ONNX is kept, not deleted. It used to be a scratch file on the way to
+    # OpenVINO IR, which is Intel-only; ONNX Runtime's DirectML provider runs
+    # the same graph on any DX12 card and is the one accelerated runtime a
+    # packaged build can carry (see modules/ort_directml.py). Writing both
+    # costs a few MB and gives the AMD path a model to load.
+    onnx_path = "action_classifier_3d.onnx"
+
     # Convert to ONNX
     torch.onnx.export(
         model,
         dummy_input,
-        "temp_model_3d.onnx",
+        onnx_path,
         input_names=['input'],
         output_names=['output'],
         dynamic_axes={
@@ -188,15 +195,11 @@ def convert_current_model():
     
     # Convert ONNX to OpenVINO
     print("🔄 Converting to OpenVINO format...")
-    ov_model = ov.convert_model("temp_model_3d.onnx")
+    ov_model = ov.convert_model(onnx_path)
     
     # Save the model
     output_path = "action_classifier_3d.xml"
     ov.save_model(ov_model, output_path)
-    
-    # Clean up
-    if os.path.exists("temp_model_3d.onnx"):
-        os.remove("temp_model_3d.onnx")
     
     print("\n✅ Conversion successful!")
     print(f"✓ Architecture: 2-layer BiLSTM with Attention")
@@ -204,6 +207,7 @@ def convert_current_model():
     print(f"✓ Hidden dimension: {hidden_dim}")
     print(f"✓ Number of classes: {num_classes}")
     print(f"✓ Model saved as: {output_path}")
+    print(f"✓ ONNX kept for DirectML/ONNX Runtime: {onnx_path}")
     
     # Update mapping file with correct dimensions
     mapping_data['model_feature_dim'] = feature_dim

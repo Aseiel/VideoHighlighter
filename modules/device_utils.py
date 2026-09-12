@@ -158,10 +158,20 @@ def _any_directml_info(log_fn=print):
         info = _directml_info(log_fn)
         if info is not None:
             return info
+
+    info = _onnx_dml_info(log_fn)
+    if info is not None:
+        return info
+
+    # Only now is the torch runtime's absence worth a line. Said any earlier it
+    # read as a fault on a machine that was about to get its GPU anyway, from
+    # the runtime below — two messages about one card, the first of them
+    # describing what the second was already there to announce.
+    if _dml is not None:
         reason = _dml.unavailable_reason()
         if reason and _dml.enabled():
-            log_fn(f"ℹ️ DirectML not used for torch models: {reason}")
-    return _onnx_dml_info(log_fn)
+            log_fn(f"ℹ️ DirectML unavailable: {reason}")
+    return None
 
 
 def _cpu_info(log_fn=print, note="ℹ️ No GPU found — using CPU"):
@@ -256,22 +266,12 @@ def detect_best_device(log_fn=print, prefer=None):
     # ---- DirectML (AMD, and anything else with a DX12 driver) ---------------
     # Reached only when neither CUDA nor an Intel path was found, so this can
     # never take work away from a faster backend — it only rescues machines
-    # that would otherwise run everything on the processor.
-    if _dml is not None:
-        info = _directml_info(log_fn)
-        if info is not None:
-            return info
-        reason = _dml.unavailable_reason()
-        if reason and _dml.enabled():
-            log_fn(f"ℹ️ DirectML not used for torch models: {reason}")
-
-    # ---- DirectML for detection only, through ONNX Runtime ------------------
-    # Reached when torch has no DirectML but ONNX Runtime does, which is every
-    # packaged build: `torch-directml` pins an exact torch and so can never be
-    # bundled beside the CUDA one, while `onnxruntime-directml` depends on no
-    # torch at all. Detection is the heaviest per-frame stage, so this is the
-    # larger half of the win even though it moves fewer models.
-    info = _onnx_dml_info(log_fn)
+    # that would otherwise run everything on the processor. Whichever of the two
+    # DirectML runtimes this machine has, `_any_directml_info` picks it and says
+    # so once; the packaged build always has the ONNX Runtime one and never the
+    # torch one, because `torch-directml` pins an exact torch and so can never
+    # be bundled beside the CUDA one.
+    info = _any_directml_info(log_fn)
     if info is not None:
         return info
 
@@ -326,6 +326,10 @@ def _directml_info(log_fn=print):
         # them, detection goes to the GPU too rather than staying on the CPU
         # because Ultralytics has no DirectML backend.
         onnx_dml_yolo=(_ort_dml is not None and _ort_dml.available()),
+        # torch already holds the card here, so R3D must not be handed to the
+        # other runtime as well: two sessions on one adapter is contention, not
+        # acceleration.
+        onnx_dml_torch=False,
         backend_name="DirectML (AMD/DX12)",
     )
 
@@ -333,10 +337,22 @@ def _directml_info(log_fn=print):
 def _onnx_dml_info(log_fn=print):
     """DeviceInfo for a machine whose GPU only ONNX Runtime can reach, or None.
 
-    Everything torch touches stays on the processor — that is the honest answer
-    when there is no torch build for this card. What changes is `onnx_dml_yolo`:
-    the object detector may load an ONNX export and run it on the GPU, which is
-    where most of a run's per-frame time goes.
+    This is every packaged build on a DX12 card, and for a long time it meant
+    "detection on the GPU, everything else on the processor". It no longer does.
+    Two flags say what moves:
+
+    * `onnx_dml_yolo` — the object detector loads an ONNX export instead of the
+      Ultralytics model, which has no DirectML backend. Detection is the
+      heaviest per-frame stage, so this is the larger half of the win.
+    * `onnx_dml_torch` — R3D action recognition exports itself once and runs
+      through the same runtime (`modules/r3d_onnx.py`). torch stays on the
+      processor either way; what changes is that the *model* does not.
+
+    `pytorch_device` is still "cpu", and deliberately: it is torch's device, and
+    torch genuinely has no GPU here. Everything else torch drives — the CLIP
+    prefilter, OWLv2, motion — has no ONNX export in front of it yet and so is
+    still on the processor, which is why the flag is specific rather than a
+    blanket "torch is accelerated".
 
     `gpu_available` is True for the same reason it is on the Intel/OpenVINO
     branch above: a GPU *is* doing work, just not through torch, and
@@ -347,8 +363,8 @@ def _onnx_dml_info(log_fn=print):
         return None
     probe = _ort_dml.probe()
     log_fn(f"✅ DirectML via ONNX Runtime {probe.version or ''}".rstrip())
-    log_fn("   object detection only — torch models stay on the CPU "
-           "(see docs/AMD-GPU.md)")
+    log_fn("   object detection and action recognition on the GPU; other "
+           "torch models stay on the CPU (see docs/AMD-GPU.md)")
     return DeviceInfo(
         yolo_pt_device="cpu",
         yolo_ov_device="cpu",
@@ -360,6 +376,7 @@ def _onnx_dml_info(log_fn=print):
         use_openvino_yolo=True,
         gpu_available=True,
         onnx_dml_yolo=True,
+        onnx_dml_torch=True,
         backend_name="DirectML (ONNX Runtime)",
     )
 
@@ -419,13 +436,14 @@ class DeviceInfo:
         "yolo_pt_device", "yolo_ov_device", "openvino_device",
         "pytorch_device", "motion_device", "dml_device",
         "use_openvino_yolo", "gpu_available", "backend_name",
-        "onnx_dml_yolo",
+        "onnx_dml_yolo", "onnx_dml_torch",
     )
 
     # Every slot gets a default. __slots__ leaves an unset attribute *missing*
     # rather than None, so a field added later (dml_device was) would raise
     # AttributeError on every DeviceInfo built by the branches that predate it.
-    _DEFAULTS = {"dml_device": None, "onnx_dml_yolo": False}
+    _DEFAULTS = {"dml_device": None, "onnx_dml_yolo": False,
+                 "onnx_dml_torch": False}
 
     def __init__(self, **kwargs):
         for k, v in self._DEFAULTS.items():

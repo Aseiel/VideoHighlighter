@@ -2825,8 +2825,9 @@ class VideoHighlighterGUI(QWidget):
             "measure it against that choice \u2014 DirectML on an Intel card, say.\n\n"
             "A backend this machine does not have falls back to automatic and\n"
             "says so in the log, and every run reports the one it got.\n\n"
-            "DirectML drives object detection in every build; the rest of it\n"
-            "needs a source install \u2014 see docs/AMD-GPU.md."
+            "DirectML drives object detection and action recognition in\n"
+            "every build; the rest of it needs a source install \u2014\n"
+            "see docs/AMD-GPU.md."
         )
         _saved_backend = (compute_backend.from_config(self.config_data)
                           or compute_backend.configured()

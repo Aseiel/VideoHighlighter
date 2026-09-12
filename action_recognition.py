@@ -436,6 +436,10 @@ def _r3d_device_name(wrapper) -> str:
     summary sourced from the module-level flag would report the device that was
     *asked for*.
     """
+    if getattr(wrapper, "onnx", None) is not None:
+        # Checked before `device`, which says "cpu" here: torch is on the
+        # processor precisely because ONNX Runtime took the model to the GPU.
+        return "DirectML (ONNX Runtime)"
     device = getattr(wrapper, "device", None)
     if device is None:
         return "CPU"
@@ -517,7 +521,8 @@ class R3DModelWrapper:
     """
 
     def __init__(self, model_name='r3d_18', device_str='cuda', half_precision=True,
-                 custom_weights=None, custom_num_classes=None):
+                 custom_weights=None, custom_num_classes=None,
+                 allow_onnx_dml=False):
         """
         Args:
             model_name: One of 'r3d_18', 'mc3_18', 'r2plus1d_18'
@@ -525,8 +530,15 @@ class R3DModelWrapper:
             half_precision: Use FP16 on CUDA for faster inference
             custom_weights: Path to .pth file with fine-tuned weights (optional)
             custom_num_classes: Number of classes in custom model (required if custom_weights)
+            allow_onnx_dml: May this model move to ONNX Runtime's DirectML
+                provider when torch ends up on the processor? Off by default,
+                and asked rather than inferred: "R3D + CPU (PyTorch, slow)" is a
+                choice a user can make on an AMD box, and it has to keep meaning
+                the CPU there. The caller that knows the difference between that
+                choice and an automatic fallback is the one that decides.
         """
         self.model_name = model_name
+        self.allow_onnx_dml = bool(allow_onnx_dml)
         self.device = _resolve_r3d_device(device_str)
         # FP16 stays CUDA-only. On DirectML half precision is implemented
         # unevenly per operator, so a 3D CNN that falls back for one layer pays
@@ -568,7 +580,48 @@ class R3DModelWrapper:
         # Warm-up inference to trigger CUDA kernel compilation — and, on
         # DirectML, to find out whether this model can run there at all.
         self._warmup()
-        print(f"✓ {model_name} loaded and warmed up on {self.device}")
+
+        # Last resort before the processor. Asked *after* the warm-up, so a
+        # torch backend that survived it keeps the card it already has.
+        self.onnx = self._try_onnx(custom_weights)
+        print(f"✓ {model_name} loaded and warmed up on {self.backend_label}")
+
+    def _try_onnx(self, custom_weights=None):
+        """An ONNX Runtime session on a DX12 GPU, or None to stay on torch.
+
+        Only ever reached when torch itself ended up on the processor: either
+        this machine has no accelerator torch can address, or the DirectML
+        warm-up above demoted the model. The packaged exe is always in the first
+        case on an AMD box, because `torch-directml` pins an exact torch and so
+        can never be bundled beside the CUDA one — which is the entire reason
+        action recognition was stuck on the processor there.
+
+        Never displaces a working GPU, and never raises: the model this would
+        replace is already loaded and working.
+        """
+        if not self.allow_onnx_dml or self.device.type != 'cpu':
+            return None
+        try:
+            from modules import r3d_onnx
+        except Exception:  # noqa: BLE001 — an absent module means "no ONNX path"
+            return None
+        runner = r3d_onnx.load(self.model, self.model_name, self.num_classes,
+                               custom_weights=custom_weights)
+        if runner is not None:
+            print(f"✅ {self.model_name} on ONNX Runtime via DirectML")
+        return runner
+
+    @property
+    def backend_label(self) -> str:
+        """What is actually about to run the model, for the load line.
+
+        `self.device` alone would say "cpu" on a machine where ONNX Runtime just
+        took the model to the GPU, which is the one case this whole path exists
+        for.
+        """
+        if getattr(self, "onnx", None) is not None:
+            return "DirectML (ONNX Runtime)"
+        return str(self.device)
 
     def _place_on_device(self):
         """Move the model and the normalisation constants to self.device.
@@ -690,6 +743,11 @@ class R3DModelWrapper:
         Returns:
             numpy array of raw logits (400,)
         """
+        if getattr(self, "onnx", None) is not None:
+            # Already on the processor — self.onnx is only ever set when
+            # self.device is the CPU — so this hands over the buffer rather
+            # than copying a tensor off a card.
+            return self.onnx.predict(clip_tensor.cpu().numpy())
         output = self.model(clip_tensor)
         return output.cpu().float().numpy().flatten()
 
@@ -710,6 +768,9 @@ class R3DModelWrapper:
 
     def cleanup(self):
         """Free GPU memory."""
+        if getattr(self, "onnx", None) is not None:
+            self.onnx.close()
+            self.onnx = None
         del self.model
         del self.mean
         del self.std
@@ -904,7 +965,7 @@ def compile_with_fallback(ie, model, preferred_device, model_name="model"):
 
 def load_models(device="AUTO", openvino_threads=None,
                 enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True,
-                action_models='mixed', r3d_device=None):
+                action_models='mixed', r3d_device=None, r3d_onnx_dml=False):
     """
     Load models based on action_models selection.
 
@@ -1019,15 +1080,19 @@ def load_models(device="AUTO", openvino_threads=None,
             r3d_wrapper = R3DModelWrapper(
                 model_name=r3d_model_name,
                 device_str=r3d_device,
+                allow_onnx_dml=r3d_onnx_dml,
                 half_precision=r3d_half and CUDA_AVAILABLE,
             )
             models_info['cuda'] = {
                 'wrapper': r3d_wrapper,
                 'labels':  KINETICS_400_LABELS,
                 'type':    'pytorch',
-                'device':  r3d_device,
+                # The wrapper's label, not the requested device: it is the only
+                # one that reflects where the model ended up after the warm-up
+                # and the ONNX Runtime attempt.
+                'device':  r3d_wrapper.backend_label,
             }
-            print(f"✅ R3D pretrained loaded on {r3d_device}")
+            print(f"✅ R3D pretrained loaded on {r3d_wrapper.backend_label}")
         except Exception as e:
             print(f"⚠️ Failed to load R3D pretrained model: {e}")
             r3d_wrapper = None
@@ -1046,6 +1111,7 @@ def load_models(device="AUTO", openvino_threads=None,
                 r3d_custom_wrapper = R3DModelWrapper(
                     model_name=custom_variant,
                     device_str=r3d_custom_device,
+                    allow_onnx_dml=r3d_onnx_dml,
                     half_precision=r3d_half and CUDA_AVAILABLE,
                     custom_weights=str(R3D_CUSTOM_WEIGHTS_PATH),
                     custom_num_classes=num_classes,
@@ -1054,9 +1120,10 @@ def load_models(device="AUTO", openvino_threads=None,
                     'wrapper': r3d_custom_wrapper,
                     'labels':  R3D_CUSTOM_LABELS,
                     'type':    'pytorch',
-                    'device':  r3d_custom_device,
+                    'device':  r3d_custom_wrapper.backend_label,
                 }
-                print(f"✅ R3D custom model loaded on {r3d_custom_device}")
+                print(f"✅ R3D custom model loaded on "
+                      f"{r3d_custom_wrapper.backend_label}")
             except Exception as e:
                 print(f"⚠️ Failed to load R3D custom model: {e}")
         elif R3D_CUSTOM_LABELS and not R3D_CUSTOM_WEIGHTS_PATH.exists():
@@ -1268,7 +1335,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                          openvino_threads=None, preprocess_workers=2,
                          enable_r3d=True, r3d_model_name='r3d_18', r3d_half=True,
                          action_models='mixed', preview_fn=None,
-                         r3d_device=None):
+                         r3d_device=None, r3d_onnx_dml=False):
     """
     Run action recognition — OPTIMIZED version with R3D/CUDA support.
 
@@ -1341,7 +1408,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
         load_models(device, openvino_threads=openvino_threads,
                     enable_r3d=enable_r3d, r3d_model_name=r3d_model_name,
                     r3d_half=r3d_half, action_models=action_models,
-                    r3d_device=r3d_device)  # ← passed through
+                    r3d_device=r3d_device,  # ← passed through
+                    r3d_onnx_dml=r3d_onnx_dml)
 
     encoder_engine = AsyncBatchedInferenceEngine(
         compiled_encoder, encoder_input, encoder_output, num_requests=num_requests)

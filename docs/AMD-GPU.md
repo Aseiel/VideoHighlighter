@@ -1,5 +1,8 @@
 # AMD GPUs, via DirectML (experimental)
 
+> On an **Intel** GPU none of this applies: OpenVINO drives it, it is not
+> experimental, and DirectML loses badly there. See [INTEL-GPU.md](INTEL-GPU.md).
+
 An AMD card runs everything in this app on the processor. There is now an
 opt-in path that changes that on Windows, and it is genuinely experimental:
 the mechanism is in the repo and covered by tests, but **none of it has been
@@ -222,16 +225,47 @@ So there are two DirectML paths, with different reach:
 | | torch-directml | ONNX Runtime DirectML |
 |---|---|---|
 | In the packaged build | no, and cannot be | yes |
-| Drives | R3D action recognition, visual search | object detection |
+| Drives | R3D action recognition, visual search | object detection, R3D action recognition |
 | Switch | `VH_DIRECTML` | the same `VH_DIRECTML` |
 
 `modules/device_utils.py` reflects that: when torch has a DirectML device it is
-used as before, and when it does not — every exe on an AMD box — the probe
-falls through to a detection-only branch that reports
-`DirectML (ONNX Runtime)` and leaves every torch model on the processor.
+used as before, and when it does not — every exe on a DX12 box — the probe
+falls through to a branch that reports `DirectML (ONNX Runtime)` and sets two
+flags, `onnx_dml_yolo` and `onnx_dml_torch`, for the two model groups that have
+an ONNX export in front of them.
 
-The export itself is made once, next to the weights, the first time a machine
-needs it. It costs tens of seconds and no other machine ever makes one.
+`pytorch_device` stays `"cpu"` on that branch and is not a mistake: it is
+*torch's* device, and torch genuinely cannot address the card. What moves is the
+model, not the framework. Everything else torch drives — the CLIP prefilter,
+OWLv2, motion — has no export yet and is still on the processor, which is why
+the flags name specific models rather than saying "torch is accelerated".
+
+Both exports are made once on the machine that needs them and then reused: the
+detector's next to its weights (`modules/yolo_onnx.py`), R3D's in an
+`onnx-cache` folder under the user-data directory (`modules/r3d_onnx.py`, which
+keys the filename on the class count and re-exports when imported custom weights
+are newer than the cached graph). Each costs tens of seconds, once.
+
+### R3D's second gate
+
+Two things have to be true before the action model moves, not one. ONNX Runtime
+has to have DirectML, and the caller has to have granted permission —
+`r3d_onnx_dml`, threaded from `_r3d_flags` and the pipeline's backend choice
+down to `R3DModelWrapper(allow_onnx_dml=...)`.
+
+The permission exists because the wrapper cannot tell the two "cpu" cases apart
+on its own. *"R3D + CPU (PyTorch, slow)"* is a choice a user can make on a DX12
+machine and it has to keep meaning the processor there; an automatic fallback
+that landed on the CPU because nothing else was available is the opposite case
+and wants the GPU. Only the code that knows which of those happened can say.
+
+The session is then tested rather than trusted, twice over. `load()` runs one
+real forward pass at the true clip shape, so an operator DirectML cannot place
+fails at load instead of an hour into a job — the same reasoning as the torch
+warm-up above. And a session that came back on `CPUExecutionProvider`, which is
+what ONNX Runtime quietly does when it cannot initialise the provider it was
+asked for, is declined outright: it is no faster than the torch model it would
+displace, and torch is the better-tested of the two CPU paths.
 
 ### The win that needs no model
 
@@ -248,33 +282,40 @@ lose nvenc for an unrelated reason.
 
 ## Measured, once, on the wrong card
 
-**2026-09-11, and the only numbers anyone here has.** A Ryzen 5 5600 with an
-Intel Arc A750 on Windows 11, in the app's interpreter (miniconda 3.13.11,
-`onnxruntime-directml` 1.24.4, `openvino` 2026.2.1), running a `yolo11n` ONNX
-export at 640 — thirty inferences after three warm-ups, timing `session.run`
-alone:
+**2026-09-11, and the only numbers anyone here has.** They were taken on an
+Intel Arc A750, which is not the hardware this path exists for, so the full
+four-way table and what it means for Intel users live in
+[INTEL-GPU.md](INTEL-GPU.md). Two rows from it matter here:
 
 | backend | per frame |
 |---|---|
-| OpenVINO, Arc GPU | 3.8 ms |
-| OpenVINO, processor | 14.9 ms |
 | ONNX Runtime, processor | 26.9 ms |
 | ONNX Runtime, DirectML | 73.1 ms |
 
-End to end through `OnnxDetector` — letterbox and decode included — DirectML
-took 84.7 ms against 36.1 ms for the same runtime on the processor. The
-detections were identical either way, to the pixel: the provider computes the
-right answer, slowly.
+The same runtime, the same `yolo11n` export at 640, the same machine. End to end
+through `OnnxDetector` — letterbox and decode included — DirectML took 84.7 ms
+against 36.1 ms on the processor. The detections were identical either way, to
+the pixel: the provider computes the right answer, slowly.
 
-Two caveats about *this* measurement. It is an Intel card, which is not the
-hardware the path exists for, and on it the routing never chooses DirectML
-anyway — OpenVINO wins by a factor of nineteen and is probed first. And the
-adapter is not certain: device ids 0 and 1 both bound and performed the same,
-Windows lists only a virtual display device and the Arc, and ONNX Runtime
-offers no way to ask a session which adapter it took. Ids above 1 do not exist,
-and ORT falls back to the processor without saying so in any readable way (the
-error it prints is mojibake), which is why `session_backend()` reads the
+**Why that is weak evidence about AMD.** DirectML does not implement convolution
+itself — it asks the graphics driver for a *metacommand*, a vendor-tuned
+implementation, and falls back to its own generic compute shaders when the driver
+offers none. AMD and NVIDIA maintain mature metacommand sets because DirectML is
+the Windows compute path their customers use. Intel's answer for compute is
+OpenVINO, so the Arc number is closer to a measurement of the generic fallback
+than of DirectML on hardware that supports it properly. It could still lose on
+AMD. It would lose for different reasons and by a different margin.
+
+**The adapter is also not certain.** Device ids 0 and 1 both bound and performed
+the same, Windows lists only a virtual display device and the Arc, and ONNX
+Runtime offers no way to ask a session which adapter it took. Ids above 1 do not
+exist, and ORT falls back to the processor without saying so in any readable way
+(the error it prints is mojibake), which is why `session_backend()` reads the
 provider back off the live session rather than trusting the request.
+`modules/ort_directml.py` binds adapter 0 and does *not* filter software
+adapters, unlike `modules/directml_device.py` — so on a machine whose adapter 0
+is Microsoft's software renderer, that row is measuring a CPU implementation of
+D3D12 rather than a graphics card.
 
 ### The open question
 
@@ -345,6 +386,8 @@ is read off the device object the installed package hands back. Use
   machinery.
 - `modules/ort_directml.py` — the same questions asked of ONNX Runtime: is the
   provider here, which adapter, what session. Shares the `VH_DIRECTML` switch.
+- `modules/r3d_onnx.py` — the R3D export and its ONNX Runtime runner: where the
+  cached graph lives, when it is stale, and the two refusals above.
 - `modules/onnx_detector.py` — the detector that runs an ONNX export, with its
   own letterbox and NMS and no Ultralytics import, so the Pro edition can use
   it with a different export in front.

@@ -38,19 +38,59 @@ def clean_module_state(monkeypatch):
 
 @pytest.fixture
 def amd_box(monkeypatch):
-    """A machine whose only accelerator is a DirectML-capable AMD card."""
+    """A machine whose only accelerator is a DirectML-capable AMD card, with
+    torch able to address it — a source install, never the exe."""
     fake = FakeTorchDirectML(names=("AMD Radeon RX 570",))
     monkeypatch.setattr(dml, "_import_torch_directml", lambda: fake)
     dml.probe(refresh=True)
+    _set_ort_dml(monkeypatch, True)
     return fake
+
+
+def _set_ort_dml(monkeypatch, available):
+    """Pin what ONNX Runtime answers instead of asking this machine.
+
+    Two runtimes can each provide DirectML and the ordering between them is the
+    thing under test, so leaving one of them to be decided by whether the
+    developer happens to have `onnxruntime-directml` installed would make these
+    assertions about the box rather than about the code.
+    """
+    from modules import ort_directml
+    # `dml.enabled()` is in the stub because it is in the real thing:
+    # ort_directml.probe() consults it, so that VH_DIRECTML=off turns off
+    # DirectML whichever runtime would have supplied it. A stub that ignored the
+    # switch would hide a regression in exactly the setting users reach for when
+    # the backend misbehaves.
+    monkeypatch.setattr(ort_directml, "available",
+                        lambda: available and dml.enabled())
+    monkeypatch.setattr(
+        ort_directml, "probe",
+        lambda refresh=False: types.SimpleNamespace(
+            available=available and dml.enabled(), version="1.24.4",
+            reason=None if available else "onnxruntime is not installed",
+            providers=()))
 
 
 @pytest.fixture
 def no_directml(monkeypatch):
+    """Neither runtime has it: the machine genuinely has no DirectML."""
     def boom():
         raise ImportError("No module named 'torch_directml'")
     monkeypatch.setattr(dml, "_import_torch_directml", boom)
     dml.probe(refresh=True)
+    _set_ort_dml(monkeypatch, False)
+
+
+@pytest.fixture
+def onnx_dml_box(monkeypatch):
+    """The packaged build on a DX12 card: ONNX Runtime has DirectML and torch
+    does not, because `torch-directml` pins an exact torch and so cannot be
+    bundled beside the CUDA one this build ships."""
+    def boom():
+        raise ImportError("No module named 'torch_directml'")
+    monkeypatch.setattr(dml, "_import_torch_directml", boom)
+    dml.probe(refresh=True)
+    _set_ort_dml(monkeypatch, True)
 
 
 @pytest.fixture
@@ -275,3 +315,66 @@ def test_existing_vendors_are_unchanged(vendor_for):
     assert vendor_for("CUDA") == "nvidia"
     assert vendor_for("Intel GPU (OpenVINO)") == "intel"
     assert vendor_for("CPU") is None
+
+# ---------------------------------------------------------------------------
+# What the log says about a DX12 card, which is all most users ever see of this
+# ---------------------------------------------------------------------------
+
+def _lines(monkeypatch, torch_available=False):
+    from modules import device_utils as du
+    monkeypatch.setattr(du, "_TORCH_AVAILABLE", torch_available)
+    out = []
+    du.detect_best_device(log_fn=lambda *a, **k: out.append(" ".join(str(x) for x in a)))
+    return out
+
+
+def test_one_card_gets_one_explanation(monkeypatch, onnx_dml_box):
+    """The packaged build used to print two things about the same GPU: a note
+    that torch-directml is absent, and then the ONNX Runtime line announcing the
+    card. The first read as a failure on a machine that was about to be told it
+    had a working GPU, and it went on to describe what the second line was there
+    to say. Only the announcement survives."""
+    lines = _lines(monkeypatch)
+
+    assert any("DirectML via ONNX Runtime" in line for line in lines)
+    assert not any("torch-directml" in line for line in lines)
+
+
+def test_the_onnx_line_names_what_runs_on_the_gpu(monkeypatch, onnx_dml_box):
+    """It used to say "object detection only". Action recognition goes through
+    the same runtime now (`modules/r3d_onnx.py`), and a user reading the old
+    line would have no reason to expect it."""
+    lines = _lines(monkeypatch)
+    detail = " ".join(lines)
+
+    assert "object detection and action recognition" in detail
+
+
+def test_a_machine_with_no_directml_at_all_is_still_told_why(monkeypatch, no_directml):
+    """Suppressing the reason must not mean never showing it. With neither
+    runtime present there is no announcement coming, and the reason is the only
+    thing that distinguishes "no DX12 card" from "wrong build installed"."""
+    lines = _lines(monkeypatch)
+
+    assert any("DirectML unavailable" in line for line in lines)
+
+
+def test_the_onnx_box_grants_torch_models_the_gpu(monkeypatch, onnx_dml_box):
+    """`onnx_dml_torch` is what lets R3D export itself and move. Without it the
+    action model stays on the processor, which is where it was stuck."""
+    info = _detect(monkeypatch)
+
+    assert info.onnx_dml_torch is True
+    assert info.onnx_dml_yolo is True
+    assert info.pytorch_device == "cpu"   # torch itself really has no GPU here
+    assert info.backend_name == "DirectML (ONNX Runtime)"
+
+
+def test_torch_directml_keeps_the_card_to_itself(monkeypatch, amd_box):
+    """Where torch can drive the adapter it already has R3D. Handing the same
+    model to ONNX Runtime as well would put two sessions on one card, which is
+    contention rather than acceleration."""
+    info = _detect(monkeypatch)
+
+    assert info.dml_device == "privateuseone:0"
+    assert info.onnx_dml_torch is False

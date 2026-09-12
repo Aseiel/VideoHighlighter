@@ -145,14 +145,27 @@ def test_a_missing_package_is_a_reason_not_an_exception(no_directml):
 
 def test_a_packaged_build_is_told_what_it_actually_has(no_directml, monkeypatch):
     """Inside an exe there is no pip, so "not installed" reads as an instruction
-    the reader cannot follow — and it is not the whole truth either, because
-    detection still reaches the card through ONNX Runtime."""
+    the reader cannot follow. It says what is true of *this* build and where the
+    other one is, and nothing else."""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     reason = dml.probe(refresh=True).reason
 
     assert "not installed" not in reason
-    assert "ONNX Runtime" in reason
+    assert "packaged build" in reason
     assert "docs/AMD-GPU.md" in reason
+
+
+def test_the_reason_claims_nothing_about_the_other_runtime(no_directml, monkeypatch):
+    """This module can see torch's DirectML and nothing else, so a sentence here
+    about ONNX Runtime is a guess printed as a fact — and it was wrong as soon as
+    the ONNX path grew past object detection. The caller decides whether this
+    line is even worth showing (`device_utils._any_directml_info`), so it has no
+    business describing what that caller is about to do."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    reason = dml.probe(refresh=True).reason
+
+    assert "ONNX" not in reason
+    assert "object detection" not in reason
 
 
 def test_an_installed_package_with_no_device_says_so_differently(amd_box):

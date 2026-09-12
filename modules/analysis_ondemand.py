@@ -305,15 +305,23 @@ def _actions_to_cache(dets) -> list:
 
 
 def _r3d_flags(action_backend: str, log=print) -> tuple:
-    """`(enable_r3d, r3d_half, r3d_device)` for a backend choice — the same
-    mapping the pipeline applies, so an on-demand run picks the decoders a full
-    run would. `r3d_device` is None for "use whatever this machine reports"."""
+    """`(enable_r3d, r3d_half, r3d_device, r3d_onnx_dml)` for a backend choice —
+    the same mapping the pipeline applies, so an on-demand run picks the decoders
+    a full run would. `r3d_device` is None for "use whatever this machine
+    reports".
+
+    `r3d_onnx_dml` is permission, not a device: it says the model may move to
+    ONNX Runtime's DirectML provider if torch ends up on the processor. Only the
+    automatic branch grants it. "R3D + CPU (PyTorch, slow)" is a choice a user
+    can make on a DX12 box and it has to keep meaning the CPU there, which it
+    would not if the wrapper inferred the permission from the device alone.
+    """
     if action_backend == "openvino":
-        return False, False, None
+        return False, False, None, False
     if action_backend == "r3d_cuda":
-        return True, True, "cuda"       # FP16 on CUDA
+        return True, True, "cuda", False    # FP16 on CUDA
     if action_backend == "r3d_cpu":
-        return True, False, "cpu"       # FP32 on the CPU, on every machine
+        return True, False, "cpu", False    # FP32 on the CPU, on every machine
     # "auto": R3D needs a GPU to be worth it. On Intel it stays off, because
     # OpenVINO on the Intel GPU beats R3D on the CPU. On AMD there is no such
     # GPU path to protect — OpenVINO's plugin is Intel-only — so DirectML is
@@ -323,12 +331,17 @@ def _r3d_flags(action_backend: str, log=print) -> tuple:
         from modules.device_utils import detect_best_device
         dev = detect_best_device(log_fn=log)
         if dev.pytorch_device == "cuda":
-            return True, True, "cuda"
+            return True, True, "cuda", False
         if dev.dml_device:
-            return True, False, dev.dml_device
+            return True, False, dev.dml_device, False
+        # Same card, the other runtime — the packaged build's only DirectML.
+        # torch stays on the processor and the model does not: see
+        # modules/r3d_onnx.py.
+        if getattr(dev, "onnx_dml_torch", False):
+            return True, False, "cpu", True
     except Exception:
         pass
-    return False, False, None
+    return False, False, None, False
 
 
 def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
@@ -351,7 +364,8 @@ def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
     d = analysis_defaults()
     sample_rate = sample_rate or d["sample_rate"]
     keep = [a.strip() for a in (interesting_actions or []) if a and a.strip()] or None
-    enable_r3d, r3d_half, r3d_device = _r3d_flags(d["action_backend"], log=log)
+    enable_r3d, r3d_half, r3d_device, r3d_onnx_dml = _r3d_flags(
+        d["action_backend"], log=log)
 
     detections, _bboxes = run_action_detection(
         video_path=video_path,
@@ -370,6 +384,7 @@ def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
         r3d_model_name=d["r3d_model"],
         r3d_half=r3d_half,
         r3d_device=r3d_device,
+        r3d_onnx_dml=r3d_onnx_dml,
         action_models=d["action_models"],
         preview_fn=preview_fn,
     )

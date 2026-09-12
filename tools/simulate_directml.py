@@ -57,7 +57,14 @@ class Scenario:
 
     def __init__(self, key, summary, adapters=("AMD Radeon RX 570",),
                  backend="privateuseone", installed=True, available=True,
-                 vram_mb=8192, op_gap=False, mode=None, real_device="cpu"):
+                 vram_mb=8192, op_gap=False, mode=None, real_device="cpu",
+                 ort=None):
+        # `ort` pins what ONNX Runtime answers: None leaves this machine's real
+        # one alone, True/False simulate a build that has or lacks the DirectML
+        # provider. Two runtimes can each supply DirectML and the ordering
+        # between them is a decision worth simulating, not a property of the
+        # developer's box.
+        self.ort = ort
         self.key = key
         self.summary = summary
         self.adapters = list(adapters)
@@ -88,7 +95,12 @@ SCENARIOS = [
     Scenario("legacy-backend",
              "torch-directml 0.1.x, where the backend is called 'dml'",
              backend="dml"),
-    Scenario("missing", "torch-directml is not installed", installed=False),
+    Scenario("missing", "torch-directml is not installed", installed=False,
+             ort=False),
+    Scenario("packaged-exe",
+             "the shipped build on a DX12 card: ONNX Runtime has DirectML, "
+             "torch never can",
+             installed=False, ort=True),
     Scenario("no-device",
              "the package imports but reports no DX12 device (old driver)",
              available=False),
@@ -357,6 +369,22 @@ def simulate(scenario: Scenario, hide_real=True, real_tensors=True):
         stack.callback(lambda: (os.environ.pop(dml.MODE_ENV, None) if old_mode is None
                                 else os.environ.__setitem__(dml.MODE_ENV, old_mode)))
 
+        if scenario.ort is not None:
+            from modules import ort_directml as _ort
+            has_ort = bool(scenario.ort)
+            # `dml.enabled()` is in both stubs because it is in the real probe:
+            # VH_DIRECTML=off turns off DirectML whichever runtime supplies it.
+            stack.enter_context(_patched(
+                _ort, "available", lambda: has_ort and dml.enabled()))
+            stack.enter_context(_patched(
+                _ort, "probe",
+                lambda refresh=False: types.SimpleNamespace(
+                    available=has_ort and dml.enabled(), version="1.24.4",
+                    reason=None if has_ort else "onnxruntime is not installed",
+                    providers=())))
+            _ort.reset_probe_cache()
+            stack.callback(_ort.reset_probe_cache)
+
         if hide_real:
             _hide_real_accelerators(stack)
 
@@ -416,14 +444,17 @@ def report_routing(scenario: Scenario) -> None:
     _line("CLIP resolve_device('AUTO')", cp.resolve_device("AUTO"))
     _line("CLIP resolve_device('dml')", cp.resolve_device("dml"))
     _line("encoder vendor", es.preferred_gpu_vendor())
+    _line("onnx_dml_yolo (detector)", getattr(info, "onnx_dml_yolo", False))
+    _line("onnx_dml_torch (R3D)", getattr(info, "onnx_dml_torch", False))
 
     # Action recognition. The viewer and the pipeline share this mapping, so
     # one line covers both — and a disagreement between them would mean a cache
     # built by one is a cache the other would not have produced.
     from modules import analysis_ondemand as ao
     quiet = lambda *a, **k: None  # noqa: E731
-    enable, half, device = ao._r3d_flags("auto", log=quiet)
-    _line("R3D on 'auto'", f"enabled={enable} fp16={half} device={device}")
+    enable, half, device, onnx_dml = ao._r3d_flags("auto", log=quiet)
+    _line("R3D on 'auto'",
+          f"enabled={enable} fp16={half} device={device} onnx_dml={onnx_dml}")
     _line("R3D on 'r3d_cpu'", ao._r3d_flags("r3d_cpu", log=quiet))
 
 

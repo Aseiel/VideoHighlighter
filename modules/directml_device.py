@@ -158,15 +158,19 @@ def _missing_package_reason(exc) -> str:
 
     A packaged build never has it and never can (see the module docstring), so
     telling that user it "is not installed" reads as an instruction they have no
-    way to follow: there is no pip inside an exe. They are not stuck, either —
-    object detection still reaches a DX12 card through ONNX Runtime — so the
-    message says which half they have rather than implying they have none.
+    way to follow: there is no pip inside an exe.
+
+    It deliberately says nothing about what ONNX Runtime is doing. This module
+    cannot see that, and the caller that can
+    (`device_utils._any_directml_info`) now withholds this line entirely
+    whenever the other runtime is about to announce itself — so by the time a
+    user reads this, DirectML really is absent and a claim about a second
+    runtime would only be wrong.
     """
     if getattr(sys, "frozen", False):
-        return ("packaged builds cannot ship torch-directml (it pins an exact "
-                "torch), so action recognition stays on the CPU here — object "
-                "detection still uses the GPU via ONNX Runtime. A source "
-                "install lifts the rest: see docs/AMD-GPU.md")
+        return ("a packaged build cannot carry torch-directml — it pins an "
+                "exact torch and this build ships the CUDA one. Running from "
+                "source adds it: see docs/AMD-GPU.md")
     return f"torch-directml is not installed ({type(exc).__name__}: {exc})"
 
 

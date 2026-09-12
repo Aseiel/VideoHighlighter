@@ -1500,6 +1500,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # device came from whatever the machine reported, and "R3D + CPU
                 # (PyTorch, slow)" would quietly become DirectML on an AMD box.
                 r3d_device = None
+                r3d_onnx_dml = False
                 if action_backend == "openvino":
                     enable_r3d = False
                     r3d_half = False
@@ -1539,6 +1540,22 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         log(f"🎯 Auto backend → DirectML detected, using R3D on "
                             f"{_dev.dml_device} ({_dev.backend_name}); it falls "
                             f"back to the CPU if the backend cannot run it")
+                    elif getattr(_dev, "onnx_dml_torch", False):
+                        # Same card, the other runtime. This is the packaged
+                        # build on a DX12 box: torch cannot address the GPU
+                        # because torch-directml cannot be bundled, but ONNX
+                        # Runtime can, so R3D exports itself once and runs
+                        # there. Before this the branch fell through to
+                        # OpenVINO — which on AMD is the processor, since the
+                        # GPU plugin is Intel-only — so R3D was skipped on
+                        # exactly the machines that had a card going unused.
+                        enable_r3d = True
+                        r3d_half = False      # fp16 is uneven on DirectML
+                        r3d_device = "cpu"    # torch's device; the model leaves it
+                        r3d_onnx_dml = True
+                        log(f"🎯 Auto backend → DirectML via ONNX Runtime, using "
+                            f"R3D ({_dev.backend_name}); it stays on the CPU if "
+                            f"the export or the provider will not run")
                     else:
                         enable_r3d = False
                         r3d_half = False
@@ -1561,6 +1578,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     r3d_model_name=r3d_model,
                     r3d_half=r3d_half,
                     r3d_device=r3d_device,
+                    r3d_onnx_dml=r3d_onnx_dml,
                     action_models=action_models_selection,
                     preview_fn=preview_fn,
                 )
