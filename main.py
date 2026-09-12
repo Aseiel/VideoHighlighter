@@ -34,6 +34,7 @@ ui_scale.apply()
 # This module deliberately pulls in no Qt, so it cannot disturb the import
 # order below, which matters on Windows.
 from modules import startup_splash
+from modules import compute_backend
 startup_splash.stage("Loading the video engine…")
 
 import cv2
@@ -1028,6 +1029,11 @@ class VideoHighlighterGUI(QWidget):
         self.worker = None
 
         self.config_data = self.load_config()
+
+        # Publish the saved DirectML choice into the environment before anything
+        # probes a device, so worker processes — which inherit the environment
+        # and nothing else — make the same choice the GUI shows.
+        compute_backend.apply(self.config_data)
 
         layout = QVBoxLayout()
         # A little breathing room, but tight enough that the ~8 stacked sections
@@ -2800,7 +2806,43 @@ class VideoHighlighterGUI(QWidget):
             self.render_mode_combo.setCurrentIndex(_rm_idx)
         output_layout.addRow("Cut / encode:", self.render_mode_combo)
         output_box.setLayout(output_layout)
-        advanced_layout.addWidget(output_box, 0, 0, 1, 2)
+        advanced_layout.addWidget(output_box, 0, 0)
+
+        # ── Group: Compute ──
+        # DirectML had a switch (VH_DIRECTML) and no way to reach it: the
+        # packaged app is started from a shortcut, and an environment variable
+        # exported in a console is not inherited by one. Anybody without a
+        # terminal therefore could not try the backend that exists for them.
+        compute_box = QGroupBox("Compute")
+        compute_layout = QFormLayout()
+        self.backend_combo = QComboBox()
+        for _backend, _label in compute_backend.CHOICES:
+            self.backend_combo.addItem(_label, _backend)
+        self.backend_combo.setToolTip(
+            "Which accelerator the run should use.\n\n"
+            "Automatic takes the fastest this machine has: CUDA, then Intel,\n"
+            "then DirectML, then the processor. Naming one instead is how you\n"
+            "measure it against that choice \u2014 DirectML on an Intel card, say.\n\n"
+            "A backend this machine does not have falls back to automatic and\n"
+            "says so in the log, and every run reports the one it got.\n\n"
+            "DirectML drives object detection in every build; the rest of it\n"
+            "needs a source install \u2014 see docs/AMD-GPU.md."
+        )
+        _saved_backend = (compute_backend.from_config(self.config_data)
+                          or compute_backend.configured()
+                          or compute_backend.AUTO)
+        _backend_idx = self.backend_combo.findData(_saved_backend)
+        if _backend_idx >= 0:
+            self.backend_combo.setCurrentIndex(_backend_idx)
+        # Applied immediately as well as saved: the next run reads the
+        # environment, and waiting for a restart to try a backend is the kind of
+        # friction that stops anybody trying it.
+        self.backend_combo.currentIndexChanged.connect(
+            lambda: compute_backend.set_now(self.backend_combo.currentData(),
+                                            log=self.append_log))
+        compute_layout.addRow("Prefer:", self.backend_combo)
+        compute_box.setLayout(compute_layout)
+        advanced_layout.addWidget(compute_box, 0, 1)
 
         # Equal column widths; let the row below the composition table absorb slack
         advanced_layout.setColumnStretch(0, 1)
@@ -4302,6 +4344,9 @@ class VideoHighlighterGUI(QWidget):
                 "action_backend": self.action_backend_combo.currentData(),
                 "r3d_model": self.r3d_model_combo.currentData(),
                 "action_models": self.action_models_combo.currentData(),
+            },
+            "compute": {
+                "backend": self.backend_combo.currentData(),
             },
             "visualization": {
                 "draw_object_boxes": self.bbox_objects_chk.isChecked(),

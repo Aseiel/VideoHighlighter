@@ -27,6 +27,27 @@ def _quiet(monkeypatch):
     monkeypatch.setattr(device_utils, "_ort_dml", None)
 
 
+class _FakeTorchDml:
+    """Stands in for modules.directml_device with no torch-directml present."""
+
+    MODE_ENV = "VH_DIRECTML"
+
+    def __init__(self, available=False):
+        self._available = available
+
+    def forced(self):
+        return False
+
+    def enabled(self):
+        return True
+
+    def probe(self):
+        return type("P", (), {"available": self._available})()
+
+    def unavailable_reason(self):
+        return None if self._available else "torch-directml is not installed"
+
+
 class _FakeOrtDml:
     def __init__(self, ok=True, version="1.24.4"):
         self._ok = ok
@@ -141,6 +162,80 @@ class TestItNeverOutranksSomethingFaster:
 
         assert info.backend_name == "Intel GPU (OpenVINO)"
         assert info.onnx_dml_yolo is False
+
+
+class TestChoosingIt:
+    """The settings screen lets a user name the backend so they can measure it
+    against what the machine would otherwise pick. Naming DirectML has to reach
+    the ONNX runtime: it is the only DirectML a packaged build has, so a choice
+    that could only reach torch's would do nothing for the people most likely
+    to make it."""
+
+    def test_choosing_it_takes_detection_even_when_cuda_is_present(self, monkeypatch):
+        class _Cuda:
+            @staticmethod
+            def is_available():
+                return True
+
+            @staticmethod
+            def device_count():
+                return 1
+
+            @staticmethod
+            def get_device_name(i):
+                return "RTX 4080"
+
+            @staticmethod
+            def get_device_properties(i):
+                return type("P", (), {"total_mem": 16 * 1024 ** 3})()
+
+        monkeypatch.setattr(device_utils, "_TORCH_AVAILABLE", True)
+        monkeypatch.setattr(device_utils, "torch",
+                            type("T", (), {"cuda": _Cuda}), raising=False)
+        monkeypatch.setattr(device_utils, "_ort_dml", _FakeOrtDml())
+        monkeypatch.setattr(device_utils, "_dml", _FakeTorchDml())
+
+        info = device_utils.detect_best_device(log_fn=lambda *_: None,
+                                               prefer="directml")
+
+        assert info.backend_name == "DirectML (ONNX Runtime)"
+        assert info.onnx_dml_yolo is True
+
+    def test_a_backend_this_machine_lacks_falls_back_and_says_so(self, monkeypatch):
+        """A config carried from another machine, or a card that was swapped
+        out, costs a line in the log rather than a run."""
+        said = []
+        monkeypatch.setattr(device_utils, "_ort_dml", _FakeOrtDml(ok=False))
+        monkeypatch.setattr(device_utils, "_dml", _FakeTorchDml())
+        _no_openvino(monkeypatch)
+
+        info = device_utils.detect_best_device(log_fn=said.append,
+                                               prefer="directml")
+
+        assert info.backend_name == "CPU"
+        assert any("not available here" in line for line in said)
+
+    def test_the_processor_can_be_asked_for_outright(self, monkeypatch):
+        """Somebody diagnosing a backend wants the baseline, and on a machine
+        with a GPU there was no way to get one."""
+        monkeypatch.setattr(device_utils, "_ort_dml", _FakeOrtDml())
+
+        info = device_utils.detect_best_device(log_fn=lambda *_: None,
+                                               prefer="cpu")
+
+        assert info.backend_name == "CPU"
+        assert info.gpu_available is False
+
+    def test_an_unknown_name_falls_back_to_automatic(self, monkeypatch):
+        said = []
+        monkeypatch.setattr(device_utils, "_ort_dml", _FakeOrtDml())
+        _no_openvino(monkeypatch)
+
+        info = device_utils.detect_best_device(log_fn=said.append,
+                                               prefer="rocm")
+
+        assert info.backend_name == "DirectML (ONNX Runtime)"
+        assert any("Unknown compute backend" in line for line in said)
 
 
 class TestDefaultsForOlderCallers:

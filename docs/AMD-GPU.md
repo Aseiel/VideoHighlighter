@@ -59,12 +59,34 @@ Nothing to configure. With `torch-directml` importable, the app picks DirectML
 up automatically **only where the alternative was the processor** — it can
 never displace CUDA or an Intel path.
 
-Two environment variables exist for the cases where that is not what you want:
+**Advanced → Compute → Prefer** is where to change that. It lists the backends
+by the hardware they drive — automatic, NVIDIA (CUDA), Intel (OpenVINO), AMD or
+any DX12 card (DirectML), processor only — and naming one puts it ahead of the
+automatic order. That is how you measure DirectML against whatever this machine
+would otherwise have picked, and the run reports which backend it actually got.
+
+A backend this machine does not have falls back to automatic and says so, so a
+config copied between machines costs a line in the log rather than a run.
+
+The setting is saved in `config.yaml` under `compute.backend`, and published
+into the environment when the app starts. That last part matters: object
+detection runs in worker *processes*, which inherit the environment and no
+Python state, so a setting that lived only in the GUI would apply to the window
+and quietly not to the work.
+
+The environment variables still exist and still win, which is what a developer
+testing a build expects:
 
 | Variable | Values | Effect |
 | --- | --- | --- |
-| `VH_DIRECTML` | `off` / `auto` (default) / `force` | `off` disables DirectML entirely, including the import. `force` puts it ahead of CUDA and Intel — for testing it on a machine that has something better. |
+| `VH_BACKEND` | `auto` / `cuda` / `intel` / `directml` / `cpu` | The same choice as the setting. Set by hand, it outranks the config file. |
+| `VH_DIRECTML` | `off` / `auto` (default) / `force` | DirectML's own older switch, still read. Choosing a backend keeps it in step, so the two cannot disagree. |
 | `VH_DIRECTML_FP16` | `1` to enable | Run DirectML models in fp16. Off by default; see *Precision* below. |
+
+Forcing it reaches **both** runtimes, torch's first and ONNX Runtime's as the
+fallback. That is deliberate: ONNX Runtime is the only DirectML a packaged
+build has, so a force that could not reach it would do nothing at all for the
+people most likely to try it.
 
 ## Check it before trusting it
 

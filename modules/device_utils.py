@@ -36,11 +36,162 @@ except Exception:  # noqa: BLE001
     _ort_dml = None
 
 
+def preferred_backend():
+    """The backend the user asked for, or None for the automatic order.
+
+    Read on every probe rather than cached: a worker process inherits the
+    environment and decides for itself, and the settings combo changes it
+    without a restart.
+    """
+    try:
+        from modules import compute_backend
+        return compute_backend.configured()
+    except Exception:  # noqa: BLE001 - a missing module means "automatic"
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Primary entry point — call this once at the top of pipeline.py
 # ---------------------------------------------------------------------------
 
-def detect_best_device(log_fn=print):
+def _cuda_info(log_fn=print):
+    """DeviceInfo for an NVIDIA card, or None."""
+    if not _TORCH_AVAILABLE:
+        return None
+    try:
+        if not torch.cuda.is_available():
+            return None
+        count = torch.cuda.device_count()
+        log_fn(f"✅ CUDA available: {count} device(s)")
+        for i in range(count):
+            try:
+                name = torch.cuda.get_device_name(i)
+                vram = torch.cuda.get_device_properties(i).total_mem / (1024 ** 3)
+                log_fn(f"   Device {i}: {name} ({vram:.1f} GB VRAM)")
+            except Exception:
+                pass
+        return DeviceInfo(
+            yolo_pt_device="cuda:0",
+            yolo_ov_device="cpu",
+            openvino_device="AUTO",
+            pytorch_device="cuda",
+            motion_device="cuda:0",
+            use_openvino_yolo=False,
+            gpu_available=True,
+            backend_name="CUDA",
+        )
+    except Exception as e:
+        log_fn(f"⚠️ CUDA check failed: {e}")
+        return None
+
+
+def _xpu_info(log_fn=print):
+    """DeviceInfo for an Intel GPU through torch's own XPU build, or None.
+
+    torch 2.5+ '+xpu' builds expose torch.xpu natively — no ipex import needed.
+    """
+    if not (_TORCH_AVAILABLE and hasattr(torch, "xpu")):
+        return None
+    try:
+        if not torch.xpu.is_available():
+            return None
+        count = torch.xpu.device_count()
+        log_fn(f"✅ Intel XPU available: {count} device(s)")
+        for i in range(count):
+            try:
+                log_fn(f"   Device {i}: {torch.xpu.get_device_name(i)}")
+            except Exception:
+                pass
+        return DeviceInfo(
+            yolo_pt_device="cpu",
+            yolo_ov_device="cpu",
+            openvino_device="GPU",
+            pytorch_device="cpu",
+            motion_device="cpu",
+            use_openvino_yolo=True,
+            gpu_available=True,
+            backend_name="Intel XPU (OpenVINO)",
+        )
+    except Exception as e:
+        log_fn(f"⚠️ XPU check failed: {e}")
+        return None
+
+
+def _openvino_info(log_fn=print):
+    """DeviceInfo for an Intel GPU driven by OpenVINO, or None.
+
+    The frozen exe ships a CUDA torch (the release build installs the cu124
+    wheel). torch.xpu still *exists* on it — the attribute is there in any
+    build — but reports is_available() False, so :func:`_xpu_info` never fires
+    in the packaged app, even on an Arc machine. OpenVINO can still drive the
+    GPU, so probe it directly and use it for OpenVINO consumers (YOLO OV model
+    + action recognition).
+    """
+    try:
+        from openvino import Core
+        devices = Core().available_devices
+        if not any(d == "GPU" or d.startswith("GPU.") for d in devices):
+            return None
+        log_fn(f"✅ Intel GPU available via OpenVINO: {devices}")
+        return DeviceInfo(
+            yolo_pt_device="cpu",
+            yolo_ov_device="cpu",
+            openvino_device="GPU",
+            pytorch_device="cpu",
+            motion_device="cpu",
+            use_openvino_yolo=True,
+            gpu_available=True,
+            backend_name="Intel GPU (OpenVINO)",
+        )
+    except Exception as e:
+        log_fn(f"⚠️ OpenVINO GPU probe failed: {e}")
+        return None
+
+
+def _any_directml_info(log_fn=print):
+    """DeviceInfo for whichever DirectML runtime this machine has, or None.
+
+    torch's first because it drives more models; ONNX Runtime's second because
+    it is the only one a packaged build can carry.
+    """
+    if _dml is not None:
+        info = _directml_info(log_fn)
+        if info is not None:
+            return info
+        reason = _dml.unavailable_reason()
+        if reason and _dml.enabled():
+            log_fn(f"ℹ️ DirectML not used for torch models: {reason}")
+    return _onnx_dml_info(log_fn)
+
+
+def _cpu_info(log_fn=print, note="ℹ️ No GPU found — using CPU"):
+    if note:
+        log_fn(note)
+    return DeviceInfo(
+        yolo_pt_device="cpu",
+        yolo_ov_device="cpu",
+        openvino_device="CPU",
+        pytorch_device="cpu",
+        motion_device="cpu",
+        use_openvino_yolo=True,
+        gpu_available=False,
+        backend_name="CPU",
+    )
+
+
+# What a user can ask for by name, and the probe behind each. `intel` covers
+# both Intel paths: which of the two answers depends on how torch was built,
+# which is not a distinction anybody choosing a graphics card has in mind.
+_BACKEND_PROBES = {
+    "cuda": (lambda log_fn: _cuda_info(log_fn), "NVIDIA CUDA"),
+    "intel": (lambda log_fn: _xpu_info(log_fn) or _openvino_info(log_fn),
+              "Intel GPU"),
+    "directml": (lambda log_fn: _any_directml_info(log_fn), "DirectML"),
+    "cpu": (lambda log_fn: _cpu_info(log_fn, "ℹ️ Processor, by choice"), "CPU"),
+}
+
+
+def detect_best_device(log_fn=print, prefer=None):
     """
     Detect the best available hardware and return a DeviceInfo with
     pre-resolved device strings for every consumer in the pipeline.
@@ -50,8 +201,13 @@ def detect_best_device(log_fn=print):
     DirectML sits last on purpose. It is the slowest of the accelerated paths
     and has the narrowest operator coverage, so it is worth having only where
     the alternative is the CPU — which on an AMD box is exactly the situation.
-    `VH_DIRECTML=force` moves it to the front, for testing it on a machine that
-    has something better.
+
+    ``prefer`` — "cuda", "intel", "directml", "cpu", or None for the order
+    above — is the user's choice from the settings screen, read from the
+    environment when not passed. A backend that is not available here logs why
+    and falls back to the automatic order rather than failing the run: a
+    setting carried over from another machine should cost a line in the log,
+    not a run.
 
     Fields on the returned DeviceInfo:
         .yolo_pt_device    str   device for YOLO .pt models        "cuda:0" | "cpu"
@@ -64,89 +220,38 @@ def detect_best_device(log_fn=print):
         .gpu_available     bool  True if any GPU was found
         .backend_name      str   human-readable label for logging
     """
-    # ---- DirectML, when explicitly forced ahead of everything else ----------
+    # ---- What the user asked for, if they asked --------------------------
+    chosen = (prefer or preferred_backend() or "").strip().lower()
+    if chosen and chosen != "auto":
+        probe = _BACKEND_PROBES.get(chosen)
+        if probe is None:
+            log_fn(f"⚠️ Unknown compute backend {chosen!r} — using automatic")
+        else:
+            run, label = probe
+            info = run(log_fn)
+            if info is not None:
+                return info
+            log_fn(f"⚠️ {label} was chosen but is not available here — "
+                   f"falling back to automatic")
+
+    # `VH_DIRECTML=force` predates the backend setting and still means the same
+    # thing, so it keeps working for anyone with it in a script.
     if _dml is not None and _dml.forced():
-        forced = _directml_info(log_fn)
+        forced = _any_directml_info(log_fn)
         if forced is not None:
             return forced
         log_fn(f"⚠️ {_dml.MODE_ENV}=force but DirectML is unusable: "
                f"{_dml.unavailable_reason()}")
 
     # ---- NVIDIA CUDA -------------------------------------------------------
-    if _TORCH_AVAILABLE:
-        try:
-            if torch.cuda.is_available():
-                count = torch.cuda.device_count()
-                log_fn(f"✅ CUDA available: {count} device(s)")
-                for i in range(count):
-                    try:
-                        name = torch.cuda.get_device_name(i)
-                        vram = torch.cuda.get_device_properties(i).total_mem / (1024 ** 3)
-                        log_fn(f"   Device {i}: {name} ({vram:.1f} GB VRAM)")
-                    except Exception:
-                        pass
-                return DeviceInfo(
-                    yolo_pt_device="cuda:0",
-                    yolo_ov_device="cpu",
-                    openvino_device="AUTO",
-                    pytorch_device="cuda",
-                    motion_device="cuda:0",
-                    use_openvino_yolo=False,
-                    gpu_available=True,
-                    backend_name="CUDA",
-                )
-        except Exception as e:
-            log_fn(f"⚠️ CUDA check failed: {e}")
+    info = _cuda_info(log_fn)
+    if info is not None:
+        return info
 
-    # ---- Intel XPU (Arc dGPU / Xe iGPU) --------------------------------------
-    # torch 2.5+ '+xpu' builds expose torch.xpu natively — no ipex import needed.
-    if _TORCH_AVAILABLE and hasattr(torch, "xpu"):
-        try:
-            if torch.xpu.is_available():
-                count = torch.xpu.device_count()
-                log_fn(f"✅ Intel XPU available: {count} device(s)")
-                for i in range(count):
-                    try:
-                        log_fn(f"   Device {i}: {torch.xpu.get_device_name(i)}")
-                    except Exception:
-                        pass
-                return DeviceInfo(
-                    yolo_pt_device="cpu",
-                    yolo_ov_device="cpu",
-                    openvino_device="GPU",
-                    pytorch_device="cpu",
-                    motion_device="cpu",
-                    use_openvino_yolo=True,
-                    gpu_available=True,
-                    backend_name="Intel XPU (OpenVINO)",
-                )
-        except Exception as e:
-            log_fn(f"⚠️ XPU check failed: {e}")
-
-    # ---- Intel GPU via OpenVINO (no torch xpu build needed) -----------------
-    # The frozen exe ships a CUDA torch (the release build installs the cu124
-    # wheel). torch.xpu still *exists* on it — the attribute is there in any
-    # build — but reports is_available() False, so the XPU branch above never
-    # fires in the packaged app, even on an Arc machine. OpenVINO can still
-    # drive the GPU, so probe it directly and use it for OpenVINO consumers
-    # (YOLO OV model + action recognition).
-    try:
-        from openvino import Core
-        _ov_devices = Core().available_devices
-        if any(d == "GPU" or d.startswith("GPU.") for d in _ov_devices):
-            log_fn(f"✅ Intel GPU available via OpenVINO: {_ov_devices}")
-            return DeviceInfo(
-                yolo_pt_device="cpu",
-                yolo_ov_device="cpu",
-                openvino_device="GPU",
-                pytorch_device="cpu",
-                motion_device="cpu",
-                use_openvino_yolo=True,
-                gpu_available=True,
-                backend_name="Intel GPU (OpenVINO)",
-            )
-    except Exception as e:
-        log_fn(f"⚠️ OpenVINO GPU probe failed: {e}")
+    # ---- Intel, through torch's XPU build or through OpenVINO ---------------
+    info = _xpu_info(log_fn) or _openvino_info(log_fn)
+    if info is not None:
+        return info
 
     # ---- DirectML (AMD, and anything else with a DX12 driver) ---------------
     # Reached only when neither CUDA nor an Intel path was found, so this can
@@ -171,17 +276,7 @@ def detect_best_device(log_fn=print):
         return info
 
     # ---- CPU fallback -------------------------------------------------------
-    log_fn("ℹ️ No GPU found — using CPU")
-    return DeviceInfo(
-        yolo_pt_device="cpu",
-        yolo_ov_device="cpu",
-        openvino_device="CPU",
-        pytorch_device="cpu",
-        motion_device="cpu",
-        use_openvino_yolo=True,
-        gpu_available=False,
-        backend_name="CPU",
-    )
+    return _cpu_info(log_fn)
 
 
 def _directml_info(log_fn=print):

@@ -93,3 +93,42 @@ def real_opencv():
     finally:
         if shim is not None:
             sys.modules["cv2"] = shim
+
+
+# ---------------------------------------------------------------------------
+# Device selection must not leak between tests
+# ---------------------------------------------------------------------------
+
+import os                                        # noqa: E402
+
+import pytest                                    # noqa: E402
+
+# Both are read on *every* device probe, and both are plain environment
+# variables that a test can set without monkeypatch noticing — `os.environ[...]`
+# inside the code under test, most of all. One test leaving `VH_BACKEND=cpu`
+# behind silently steers every probe that runs after it, and the failure lands
+# in an unrelated file: exactly what happened when the backend setting was
+# added (three routing tests failed in the full run and passed alone).
+_DEVICE_VARS = ("VH_BACKEND", "VH_DIRECTML", "VH_DIRECTML_FP16",
+                "VH_DIRECTML_DEVICE")
+
+
+@pytest.fixture(autouse=True)
+def _no_device_choice_leaks():
+    """Every test starts and ends with the automatic backend."""
+    before = {name: os.environ.get(name) for name in _DEVICE_VARS}
+    for name in _DEVICE_VARS:
+        os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        for name, value in before.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        try:
+            from modules import directml_device
+            directml_device.set_mode(None)
+        except Exception:
+            pass
