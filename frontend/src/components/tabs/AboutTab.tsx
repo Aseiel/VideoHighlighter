@@ -43,9 +43,11 @@ export function AboutTab() {
         </CardHeader>
         <CardContent className="space-y-2 text-sm">
           <p>
-            You&apos;re running the free, open-source edition.{" "}
-            <strong>Pro</strong> adds face identity search, teaching by example
-            frames, commercial licensing, and continued development.
+            You&apos;re running the free, open-source edition — face identity,
+            expressions, the report and the assistant are all here.{" "}
+            <strong>Pro</strong> teaches the app a vocabulary of its own:
+            categories from your own example frames, search by example,
+            open-vocabulary detection, a live overlay, and a commercial licence.
           </p>
           <p>
             {info ? (

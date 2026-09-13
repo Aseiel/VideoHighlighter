@@ -110,8 +110,10 @@ def test_simple_page_calls_the_length_a_highlight():
     assert "Find and explain the moments that matter" in text
     assert "separate clips" in text
     assert "Footage stays on your disk" in text
-    assert "Get Pro" in text
-    assert "face identity search" in text
+    # No upsell on the empty first screen: an ad shown before the app has
+    # produced anything is an ad. Pro belongs where there is a result to
+    # extend, and in About.
+    assert "Get Pro" not in text
 
 
 def test_drop_zone_shows_the_filename_once_loaded():

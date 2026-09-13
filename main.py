@@ -3477,9 +3477,11 @@ class VideoHighlighterGUI(QWidget):
         pro_group = QGroupBox("VideoHighlighter Pro")
         pro_layout = QVBoxLayout(pro_group)
         pro_line = QLabel(
-            "You're running the free, open-source edition. "
-            "<b>Pro</b> adds face identity search, teaching by example frames, "
-            "commercial licensing, and continued development.<br>"
+            "You're running the free, open-source edition — face identity, "
+            "expressions, the report and the assistant are all here. "
+            "<b>Pro</b> teaches the app a vocabulary of its own: categories "
+            "from your own example frames, search by example, open-vocabulary "
+            "detection, a live overlay, and a commercial licence.<br>"
             f'👉 <a href="{WEBSITE_URL}">Learn more / Get Pro</a>'
         )
         pro_line.setOpenExternalLinks(True)

@@ -32,7 +32,6 @@ SETTINGS_APP = "ui-sections"
 SETTINGS_KEY = "ui/simple_start"
 
 LOGO_ASSET = os.path.join("assets", "icon.png")
-PRO_URL = "https://aseiel.github.io/VideoHighlighter-site/"
 
 
 def build_brand_header(parent: QWidget | None = None) -> QWidget:
@@ -208,15 +207,6 @@ class SimpleStartPage(QWidget):
         blurb.setWordWrap(True)
         blurb.setStyleSheet(f"color: {p.text_dim}; font-size: 11pt;")
         root.addWidget(blurb)
-
-        pro = QLabel(
-            "Need face identity search, teaching by example, or a commercial "
-            f'license? <a href="{PRO_URL}">Get Pro</a>')
-        pro.setOpenExternalLinks(True)
-        pro.setTextInteractionFlags(Qt.TextBrowserInteraction)
-        pro.setWordWrap(True)
-        pro.setStyleSheet(f"color: {p.text_mute}; font-size: 10pt;")
-        root.addWidget(pro)
 
         self.drop = DropZone(self._add_paths, self._browse, self)
         root.addWidget(self.drop, 1)
