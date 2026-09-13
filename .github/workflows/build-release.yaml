@@ -406,6 +406,14 @@ jobs:
             --copy-metadata safetensors \
             --copy-metadata regex \
             main.py
+      # TODO(mac): ad-hoc is not shippable. `--sign -` produces no Developer ID,
+      # so Gatekeeper quarantines the download and the first launch fails with
+      # "VideoHighlighter is damaged and can't be opened" — the README currently
+      # talks the user through clearing the quarantine flag, which is fine for a
+      # free build and not fine for a paid one. Supporting macOS means an Apple
+      # Developer Program identity in secrets, `--options runtime --timestamp`
+      # signing against it, then `xcrun notarytool submit --wait` and
+      # `xcrun stapler staple` on the DMG.
       - name: Ad-hoc sign the app
         run: |
           codesign --force --deep --sign - "dist/VideoHighlighter.app"
@@ -424,10 +432,7 @@ jobs:
         with:
           name: mac-build
           path: VideoHighlighter-${{ needs.version.outputs.slug }}.dmg
-          # The largest artifact by an order of magnitude, for the one platform
-          # the site marks unsupported. Shortest retention of the set until that
-          # changes or the job goes.
-          retention-days: 3
+          retention-days: 7
 
   bootstrap:
     needs: version
