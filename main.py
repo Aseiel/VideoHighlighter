@@ -49,7 +49,7 @@ from PySide6.QtWidgets import (
     QApplication, QCompleter, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QLineEdit, QSpinBox, QDoubleSpinBox,
     QGroupBox, QTextEdit, QFormLayout, QProgressBar, QCheckBox,
-    QComboBox, QTabWidget, QListWidget, QSplitter,
+    QComboBox, QTabWidget, QListWidget, QSplitter, QStackedWidget,
     QDialog, QDialogButtonBox, QAbstractItemView,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
     QGridLayout, QSlider, QSizePolicy, QToolButton, QMenu,
@@ -61,6 +61,10 @@ from llm.llm_chat_widget import LLMChatWidget
 from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 from modules import analysis_stats
 from modules.ui import icons as _ui_icons, theme as _ui_theme
+from modules.simple_run import apply_simple_run
+from modules.ui.simple_start import (
+    SimpleStartPage, persist_simple_start, simple_start_enabled,
+)
 # The five classes the expression scan can report. Imported for the Basic
 # tab's picker; the module itself loads no model until something asks it to scan.
 from modules.face_emotions import EMOTION_LABELS
@@ -1035,19 +1039,30 @@ class VideoHighlighterGUI(QWidget):
         # and nothing else — make the same choice the GUI shows.
         compute_backend.apply(self.config_data)
 
-        layout = QVBoxLayout()
-        # A little breathing room, but tight enough that the ~8 stacked sections
-        # don't add up to a screenful of gaps (that empty space pushed the tabs
-        # and Run row down). Trimmed from the original 20/16/14.
-        layout.setContentsMargins(16, 8, 16, 8)
-        layout.setSpacing(6)
+        # Window root: update banner + a stack of (Simple start | full UI).
+        # Simple start is the first-run alternative for issue #20; every
+        # existing widget still lives on full_page — nothing is removed.
+        root = QVBoxLayout()
+        root.setContentsMargins(16, 8, 16, 8)
+        root.setSpacing(6)
 
         # --- Update notice (hidden unless there is actually a newer build) ---
         # Costs no vertical space while hidden, which is the whole reason it is
         # a banner and not a startup dialog: nothing interrupts a launch, and
         # nothing is permanently occupying a row on a small screen.
         self.update_banner = self._build_update_banner()
-        layout.addWidget(self.update_banner)
+        root.addWidget(self.update_banner)
+
+        self.view_stack = QStackedWidget()
+        root.addWidget(self.view_stack, 1)
+
+        self.full_page = QWidget()
+        layout = QVBoxLayout(self.full_page)
+        # A little breathing room, but tight enough that the ~8 stacked sections
+        # don't add up to a screenful of gaps (that empty space pushed the tabs
+        # and Run row down). Trimmed from the original 20/16/14.
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
         # Store video duration
         self.current_video_duration = 0
@@ -2874,10 +2889,12 @@ class VideoHighlighterGUI(QWidget):
 
         # --- Tab 4: LLM Chat ---
         llm_tab = QWidget()
-        llm_layout = QVBoxLayout()
+        self.llm_tab_layout = QVBoxLayout()
         self.llm_chat = LLMChatWidget(parent=self)
-        llm_layout.addWidget(self.llm_chat)
-        llm_tab.setLayout(llm_layout)
+        self.llm_tab_layout.addWidget(self.llm_chat)
+        # Kept so the tab can reclaim the panel after the Simple view has
+        # borrowed it (see set_simple_start).
+        llm_tab.setLayout(self.llm_tab_layout)
         tabs.addTab(self._scrollable(llm_tab), "LLM Chat")
 
         # --- Tab 5: Avoid ---
@@ -3007,6 +3024,12 @@ class VideoHighlighterGUI(QWidget):
                                             "discuss in chat, choose the model")
         self.ai_summary_opts_btn.clicked.connect(self.show_ai_summary_menu)
 
+        self.simple_start_btn = QPushButton("Simple view")
+        self.simple_start_btn.setToolTip(
+            "One-button workspace: drop a video, press Analyze, stay there.\n"
+            "Detailed settings remain here for people who want the knobs.")
+        self.simple_start_btn.clicked.connect(lambda: self.set_simple_start(True))
+
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setStyleSheet("QPushButton:enabled { background-color: #ff4444; color: white; font-weight: bold; }")
@@ -3025,6 +3048,7 @@ class VideoHighlighterGUI(QWidget):
         self.run_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
         self.run_btn.clicked.connect(self.toggle_run)
 
+        ctrl_layout.addWidget(self.simple_start_btn)
         ctrl_layout.addWidget(self.cancel_btn)
         ctrl_layout.addWidget(self.keep_temp_chk)
         ctrl_layout.addWidget(self.export_clips_chk)
@@ -3076,7 +3100,16 @@ class VideoHighlighterGUI(QWidget):
         # squeezed the tabs while the log kept its 80px minimum.
         QTimer.singleShot(0, self._balance_content_splitter)
 
-        self.setLayout(layout)
+        # The Simple page grows when its chat section is unfolded, so it scrolls
+        # rather than forcing a window taller than the screen. The stack holds
+        # the scroll area; set_simple_start switches to that, not to the page.
+        self.simple_page = SimpleStartPage(self)
+        self.simple_host = self._scrollable(self.simple_page)
+        self.view_stack.addWidget(self.simple_host)
+        self.view_stack.addWidget(self.full_page)
+        self.set_simple_start(simple_start_enabled(default=True), persist=False)
+
+        self.setLayout(root)
 
         self.setup_label_completers()
         self.status_timer = QTimer()
@@ -3153,6 +3186,36 @@ class VideoHighlighterGUI(QWidget):
         area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         area.setWidget(page)
         return area
+
+    def set_simple_start(self, on: bool, persist: bool = True):
+        """Simple view vs Detailed settings. Neither one is a wizard step;
+        the last chosen workspace is remembered. The detailed page is never
+        destroyed."""
+        page = getattr(self, "simple_page", None)
+        if page is None or not hasattr(self, "view_stack"):
+            return
+        self.view_stack.setCurrentWidget(self.simple_host if on else self.full_page)
+        if persist:
+            persist_simple_start(bool(on))
+        # One chat panel, moved to whichever view is on screen. Building a second
+        # one would mean two model connections and two analysis caches claiming
+        # to be the answer for the same video.
+        chat = getattr(self, "llm_chat", None)
+        if chat is not None:
+            if on:
+                page.attach_chat(chat)
+            elif hasattr(self, "llm_tab_layout"):
+                page.release_chat(chat)
+                if self.llm_tab_layout.indexOf(chat) < 0:
+                    self.llm_tab_layout.addWidget(chat)
+        if on:
+            page.refresh_files()
+            page.sync_run_chrome()
+
+    def _sync_simple_start(self):
+        page = getattr(self, "simple_page", None)
+        if page is not None:
+            page.sync_run_chrome()
 
     def _balance_content_splitter(self):
         """Give the log a fixed slice and the tabs everything else.
@@ -3415,8 +3478,8 @@ class VideoHighlighterGUI(QWidget):
         pro_layout = QVBoxLayout(pro_group)
         pro_line = QLabel(
             "You're running the free, open-source edition. "
-            "<b>Pro</b> adds faster detection backends and extra features, "
-            "and supports continued development.<br>"
+            "<b>Pro</b> adds face identity search, teaching by example frames, "
+            "commercial licensing, and continued development.<br>"
             f'👉 <a href="{WEBSITE_URL}">Learn more / Get Pro</a>'
         )
         pro_line.setOpenExternalLinks(True)
@@ -4185,12 +4248,14 @@ class VideoHighlighterGUI(QWidget):
         # Update video duration for time range slider (use first video)
         if file_paths:
             self.update_video_duration(file_paths[0])
+        self._sync_simple_start()
 
     def remove_selected_file(self):
         """Remove selected file from the list"""
         current_row = self.file_list.currentRow()
         if current_row >= 0:
             self.file_list.takeItem(current_row)
+            self._sync_simple_start()
 
     def clear_files(self):
         """Clear all files from the list and reset output name"""
@@ -4201,6 +4266,7 @@ class VideoHighlighterGUI(QWidget):
         self.video_duration_label.setText("Select a video to enable time range controls")
         self.video_duration_label.setStyleSheet("color: #666; font-style: italic;")
         self.update_selection_info()
+        self._sync_simple_start()
 
     def get_file_list(self):
         """Get list of all files in the list widget"""
@@ -4674,6 +4740,10 @@ class VideoHighlighterGUI(QWidget):
         if at_bottom:
             scrollbar.setValue(scrollbar.maximum())
 
+        page = getattr(self, "simple_page", None)
+        if page is not None:
+            page.append_log(text)
+
     def _show_progress(self, visible=True):
         # Show/hide the whole progress box. Hidden when idle so it doesn't sit
         # there empty; the tabs+log splitter above absorbs the size change.
@@ -4684,6 +4754,7 @@ class VideoHighlighterGUI(QWidget):
             self.process_progress_bar.setVisible(False)
             self.hide_batch_progress()
             self.task_label.setText("Ready")
+        self._sync_simple_start()
 
     @Slot(int, int, str, str)
     def update_pipeline_progress(self, current: int, total: int, task_name: str, details: str = ""):
@@ -4712,6 +4783,7 @@ class VideoHighlighterGUI(QWidget):
         self.process_progress_bar.setVisible(True)
         self.process_progress_bar.setRange(0, 0)  # indeterminate
         self.task_label.setText(text)
+        self._sync_simple_start()
 
     @Slot(int, int, str, str)
     def update_download_progress(self, current: int, total: int, task_name: str, details: str = ""):
@@ -4726,6 +4798,7 @@ class VideoHighlighterGUI(QWidget):
             self.download_progress_bar.setRange(0, 0)
             self.task_label.setText(f"⬇️ {task_name} - {details}")
 
+        self._sync_simple_start()
         QApplication.processEvents()
 
     @Slot(int, int, str, str)
@@ -4741,6 +4814,7 @@ class VideoHighlighterGUI(QWidget):
             self.process_progress_bar.setRange(0, 0)
             self.task_label.setText(f"🔧 {task_name} - {details}")
 
+        self._sync_simple_start()
         # Keep UI responsive
         QApplication.processEvents()
 
@@ -4995,7 +5069,7 @@ class VideoHighlighterGUI(QWidget):
         except Exception as e:
             print(f"⚠️ preview draw error: {e}")
 
-    def run_pipeline(self, report_only: bool = False):
+    def run_pipeline(self, report_only: bool = False, simple: bool = False):
         from pipeline import run_highlighter
         """Start the pipeline processing (UPDATED for multi-file).
 
@@ -5003,8 +5077,12 @@ class VideoHighlighterGUI(QWidget):
         weights is cheap — detection is cached — but re-rendering a highlight
         to find out what the new weights did is not, and that cost is what
         makes trying a setting feel expensive.
+
+        ``simple`` is the one-button workspace: built-in defaults for that run
+        only. It does not rewrite the Detailed settings knobs.
         """
         self._report_only = bool(report_only)
+        self._simple_run = bool(simple)
         video_paths = self.get_file_list()
         
         if not video_paths:
@@ -5058,7 +5136,7 @@ class VideoHighlighterGUI(QWidget):
                        beginning_points + ending_points + object_points + action_points
                        + face_points)
         
-        if total_points == 0:
+        if total_points == 0 and not self._simple_run:
             self.append_log("❌ ERROR: All scoring points are set to 0!")
             self.append_log("")
             self.append_log("Please configure at least one scoring point:")
@@ -5174,6 +5252,13 @@ class VideoHighlighterGUI(QWidget):
             "force_reprocess": self.force_reprocess_checkbox.isChecked(),
         }
 
+        if self._simple_run:
+            length = "medium"
+            page = getattr(self, "simple_page", None)
+            if page is not None:
+                length = page.length_key()
+            apply_simple_run(config, length)
+
         # Remove None values
         config = {k: v for k,v in config.items() if v is not None}
 
@@ -5181,6 +5266,10 @@ class VideoHighlighterGUI(QWidget):
         self.log_output.clear()
         self._show_progress(True)
         self.append_log("=== Starting Video Highlighter Pipeline ===")
+        if self._simple_run:
+            self.append_log("Simple view: default scoring (motion peaks + loudness), "
+                            "reel + separate clips, highlight length from this page. "
+                            "Detailed knobs unchanged.")
         self.append_log(f"📁 Input: {video_paths}")
         self.append_log(f"📁 Output: {config.get('output_file', 'highlight.mp4')}")
         if config.get('draw_object_boxes') or config.get('draw_action_labels'):
@@ -5216,6 +5305,7 @@ class VideoHighlighterGUI(QWidget):
         self.browse_btn.setEnabled(False)
         self.remove_btn.setEnabled(False)
         self.clear_btn.setEnabled(False)
+        self._sync_simple_start()
 
         # Create and start worker
         self.worker = Worker(video_paths, config)
@@ -5457,11 +5547,15 @@ class VideoHighlighterGUI(QWidget):
             except Exception as e:
                 self.append_log(f"⚠️ Could not refresh timeline viewer: {e}")
 
-    def toggle_run(self):
-        """Run / Pause / Resume - single button"""
+    def toggle_run(self, *args, simple=False):
+        """Run / Pause / Resume - single button.
+
+        ``simple=True`` is the one-button workspace (built-in defaults).
+        Extra *args absorb QPushButton.clicked(bool).
+        """
         # Not running → start pipeline
         if not self.worker or not self.worker._is_running:
-            self.run_pipeline(report_only=False)
+            self.run_pipeline(report_only=False, simple=simple)
             return
 
         # Running and not paused → pause
@@ -5472,6 +5566,7 @@ class VideoHighlighterGUI(QWidget):
             self.task_label.setText("⏸ Paused")
             self.task_label.setStyleSheet("color: #ff8c00; font-weight: bold;")
             self.append_log("⏸ Pipeline paused")
+            self._sync_simple_start()
             return
 
         # Paused → resume
@@ -5479,7 +5574,7 @@ class VideoHighlighterGUI(QWidget):
         self.run_btn.setText("⏸ Pause")
         self.run_btn.setStyleSheet("QPushButton { background-color: #ff8c00; color: white; font-weight: bold; padding: 8px; }")
         self.run_btn.setEnabled(True)  # keep enabled for pause
-
+        self._sync_simple_start()
     def force_download_cleanup(self, worker=None):
         """Safety net (fires ~10s after a cancel request) in case the worker
         never emitted its finished/cancelled signal — e.g. it's stuck in a
@@ -5687,6 +5782,7 @@ class VideoHighlighterGUI(QWidget):
         self.remove_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
         self.output_input.setEnabled(True)
+        self._sync_simple_start()
 
         # Reset task label style
         QTimer.singleShot(5000, lambda: self.task_label.setStyleSheet("color: #666; font-weight: bold;"))
