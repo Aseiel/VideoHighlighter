@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import datetime as _dt
+import hashlib
 import html
 import json
 import os
@@ -425,6 +426,54 @@ def _second_detail(sec: int,
     }
 
 
+def source_fingerprint(video_path: str,
+                       *, chunk: int = 1 << 20) -> dict:
+    """Identify the exact file this report was made from.
+
+    A report that explains a cut but cannot say *which* file it read is an
+    opinion. Anyone acting on one professionally — an investigator handing it
+    to a client, an insurer attaching it to a claim — has to be able to show
+    the footage they still hold is the footage that was measured, and a name
+    and a duration do not survive a re-encode or a renamed copy.
+
+    The digest covers the whole file. A prefix hash would be cheaper and would
+    also match a truncated or padded file, which is the one thing this exists
+    to rule out. The cost is not the objection it sounds like: SHA-256 runs at
+    gigabytes a second, while the analysis this accompanies decodes the same
+    bytes and spends minutes on them.
+
+    Failure is reported, not raised. A missing or unreadable file must not cost
+    a run its report — the reader simply sees that the source could not be
+    fingerprinted, which is itself the honest answer.
+    """
+    record: dict = {}
+    try:
+        stat = os.stat(video_path)
+        digest = hashlib.sha256()
+        with open(video_path, "rb") as handle:
+            for block in iter(lambda: handle.read(chunk), b""):
+                digest.update(block)
+        record["sha256"] = digest.hexdigest()
+        record["size"] = int(stat.st_size)
+        record["modified"] = _dt.datetime.fromtimestamp(
+            stat.st_mtime, _dt.timezone.utc).isoformat(timespec="seconds")
+    except OSError as exc:
+        record["error"] = str(exc)
+    return record
+
+
+def tool_identity() -> dict:
+    """Which build produced this, so a finding can be reproduced or disputed."""
+    record = {"name": "VideoHighlighter"}
+    try:
+        from version import __edition__, __version__
+        record["version"] = str(__version__)
+        record["edition"] = str(__edition__)
+    except Exception:                              # pragma: no cover - defensive
+        pass
+    return record
+
+
 def format_timestamp(seconds: float) -> str:
     """Seconds -> ``M:SS`` or ``H:MM:SS`` once past an hour."""
     total = int(seconds)
@@ -456,6 +505,7 @@ def build_report(*,
                  loudness_levels: Optional[Sequence[float]] = None,
                  motion_peaks: Optional[Sequence[float]] = None,
                  scene_cuts: Optional[Sequence[float]] = None,
+                 source: Optional[Mapping] = None,
                  ) -> dict:
     """Attribute every kept segment to the evidence that selected it.
 
@@ -854,13 +904,24 @@ def build_report(*,
         print(f"⚠️ Pending checks skipped: {exc}")
 
     kept_duration = sum(e - s for s, e in segments)
+    # A caller that already hashed the file (a batch walking a folder) passes it
+    # in rather than paying twice; everyone else gets it computed here, so no
+    # report can be written without one by forgetting to ask.
+    fingerprint = dict(source) if source is not None else source_fingerprint(video_path)
     return {
-        "schema": 3,
+        "schema": 4,
         "generated_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        # Local time answers "when did I run this"; it does not survive being
+        # read in another country, which is exactly what a report that travels
+        # has to do. Both are kept: the local one is friendlier on screen.
+        "generated_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(
+            timespec="seconds"),
+        "tool": tool_identity(),
         "video": {
             "path": str(video_path),
             "name": str(video_path).replace("\\", "/").rsplit("/", 1)[-1],
             "duration": _f(video_duration),
+            **fingerprint,
         },
         "totals": {
             "segments": len(segments),
@@ -998,6 +1059,12 @@ def render_text(report: Mapping) -> str:
     t = report["totals"]
     out.append(f"{t['segments']} segment(s), {t['duration']:.1f}s "
                f"({t['coverage_pct']:.1f}% of the source)")
+
+    video = report.get("video") or {}
+    if video.get("sha256"):
+        out.append(f"Source SHA-256: {video['sha256']}")
+    if report.get("generated_at_utc"):
+        out.append(f"Analysed: {report['generated_at_utc']}")
 
     # The whole run in a few lines, before any of the detail. First because it
     # is the only part a reader is guaranteed to reach.
@@ -1187,6 +1254,15 @@ body{margin:0;padding:32px 20px;background:var(--bg);color:var(--text);
 h1{font-size:22px;margin:0 0 4px}
 .sub{color:var(--dim);font-size:13.5px;margin-bottom:8px}
 .sub2{color:var(--text);font-size:15px;margin-bottom:24px}
+.prov{margin:0 0 12px}
+.prov summary{cursor:pointer;color:var(--dim);font-size:12px;list-style:none;
+     display:inline-block;border-bottom:1px dotted var(--line)}
+.prov summary::-webkit-details-marker{display:none}
+.prov summary:hover{color:var(--accent);border-color:var(--accent)}
+.prov-rows{margin-top:8px;display:grid;gap:4px}
+.prov-rows .l{color:var(--dim);font-size:12px;display:inline-block;min-width:140px}
+.prov-rows .v{font-family:ui-monospace,Consolas,monospace;font-size:12px;
+     word-break:break-all}
 .totals{display:flex;gap:28px;flex-wrap:wrap;padding:16px 0 24px;
         border-bottom:1px solid var(--line);margin-bottom:28px}
 .totals div span{display:block}
@@ -2757,6 +2833,48 @@ def _serve_link(serve_url):
             f'the network</a> to play the clips.</div>')
 
 
+def _provenance(report: Mapping) -> str:
+    """What was read, by which build, when — in UTC.
+
+    Placed at the top rather than in a footer: a reader deciding whether to
+    trust the page needs it before the findings, and a reader who has to quote
+    it should not have to hunt.
+    """
+    video = report.get("video") or {}
+    tool = report.get("tool") or {}
+    rows = []
+
+    digest = str(video.get("sha256") or "")
+    if digest:
+        rows.append(("Source SHA-256", digest))
+    elif video.get("error"):
+        rows.append(("Source SHA-256",
+                     f"not computed — {video['error']}"))
+
+    size = video.get("size")
+    if isinstance(size, (int, float)) and size > 0:
+        rows.append(("Source size", f"{int(size):,} bytes"))
+    if video.get("modified"):
+        rows.append(("Source modified", str(video["modified"])))
+    if report.get("generated_at_utc"):
+        rows.append(("Analysed", str(report["generated_at_utc"])))
+    if tool.get("version"):
+        edition = f" {tool['version']}"
+        if tool.get("edition"):
+            edition += f" {tool['edition']}"
+        rows.append(("Tool", f"{tool.get('name', 'VideoHighlighter')}{edition}"))
+
+    if not rows:
+        return ""
+    cells = "".join(
+        f'<div><span class="l">{html.escape(label)}</span>'
+        f'<span class="v">{html.escape(str(value))}</span></div>'
+        for label, value in rows
+    )
+    return (f'<details class="prov"><summary>Provenance</summary>'
+            f'<div class="prov-rows">{cells}</div></details>')
+
+
 def render_html(report: Mapping, title: Optional[str] = None,
                 media_src: Optional[str] = None,
                 serve_url: Optional[str] = None,
@@ -2862,6 +2980,7 @@ def render_html(report: Mapping, title: Optional[str] = None,
 <body>{_section_nav()}<div class="wrap">
 <h1>{html.escape(heading)}</h1>
 <div class="sub">Generated {html.escape(report["generated_at"])}</div>
+{_provenance(report)}
 {_serve_link(serve_url)}
 <div class="sub2">{html.escape(_run_sentence(report))}</div>
 <div class="totals">

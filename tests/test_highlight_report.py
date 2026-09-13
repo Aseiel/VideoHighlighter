@@ -366,7 +366,68 @@ class TestRenderers:
         write_report(rep, str(html_path), str(json_path))
 
         assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")
-        assert json.loads(json_path.read_text(encoding="utf-8"))["schema"] == 3
+        assert json.loads(json_path.read_text(encoding="utf-8"))["schema"] == 4
+
+
+class TestProvenance:
+    """Which file was read, by which build, when.
+
+    A report acted on professionally has to survive the question "prove the
+    footage you still hold is the footage this measured", and a filename does
+    not answer it.
+    """
+
+    def _report(self, path, **kw):
+        sig = _signals(object={17: 10.0})
+        return build_report(video_path=path, video_duration=60,
+                            score=_score(sig), signals=sig,
+                            segments=[(10, 20)], **kw)
+
+    def test_digest_identifies_the_source_file(self, tmp_path):
+        import hashlib
+
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"not really a video, but it hashes the same way")
+        rep = self._report(str(video))
+        expected = hashlib.sha256(video.read_bytes()).hexdigest()
+        assert rep["video"]["sha256"] == expected
+        assert rep["video"]["size"] == video.stat().st_size
+
+    def test_a_changed_byte_changes_the_digest(self, tmp_path):
+        first = tmp_path / "a.mp4"
+        first.write_bytes(b"aaaa")
+        second = tmp_path / "b.mp4"
+        second.write_bytes(b"aaab")
+        assert (self._report(str(first))["video"]["sha256"]
+                != self._report(str(second))["video"]["sha256"])
+
+    def test_an_unreadable_source_is_reported_not_raised(self):
+        """A missing file must not cost the run its report."""
+        rep = self._report("no-such-file.mp4")
+        assert "sha256" not in rep["video"]
+        assert rep["video"]["error"]
+
+    def test_a_caller_that_already_hashed_is_not_charged_twice(self, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"x" * 32)
+        rep = self._report(str(video), source={"sha256": "deadbeef", "size": 3})
+        assert rep["video"]["sha256"] == "deadbeef"
+
+    def test_the_run_is_stamped_in_utc_and_names_the_build(self):
+        rep = self._report("a.mp4")
+        assert rep["generated_at_utc"].endswith("+00:00")
+        assert rep["tool"]["name"] == "VideoHighlighter"
+
+    def test_both_renderers_carry_the_digest(self, tmp_path):
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"evidence")
+        rep = self._report(str(video))
+        digest = rep["video"]["sha256"]
+        assert digest in render_text(rep)
+        assert digest in render_html(rep)
+
+    def test_the_page_says_why_there_is_no_digest(self):
+        assert "not computed" in render_html(self._report("gone.mp4"))
 
 
 class TestTagGrouping:
