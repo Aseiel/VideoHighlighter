@@ -45,6 +45,11 @@ frontend/src-tauri/binaries/
 dist-sidecar/
 build-sidecar/
 
+# The Windows installer: CI fetches 7zr.exe from 7-zip.org next to the .iss and
+# compiles the Setup.exe. Both are build inputs/outputs, not source.
+packaging/installer/7zr.exe
+build-installer/
+
 # --- Pipeline runtime artifacts ---
 # Written next to the project when a run executes: the analysis cache, the
 # per-run object log, and YOLO weights ultralytics auto-downloads on first use.

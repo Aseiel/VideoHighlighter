@@ -190,6 +190,44 @@ jobs:
           name: windows-build
           path: "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z*"
           retention-days: 7
+      # Built here rather than in its own job because only this one knows how
+      # many volumes 7-Zip just produced and how big the unpacked tree is — the
+      # installer needs both compiled in (one URL per volume, and a free-space
+      # check it can make before starting a multi-gigabyte download).
+      - name: Build the Windows installer
+        shell: pwsh
+        run: |
+          $tag = "${{ needs.version.outputs.slug }}"
+          $vols = @(Get-ChildItem "VideoHighlighter-Windows-$tag.7z.*" | Sort-Object Name)
+          if ($vols.Count -eq 0) { throw "No .7z volumes to install from." }
+          $archiveMB = [int][math]::Ceiling((($vols | Measure-Object Length -Sum).Sum) / 1MB)
+          $installedMB = [int][math]::Ceiling(((Get-ChildItem dist/VideoHighlighter -Recurse -File |
+            Measure-Object Length -Sum).Sum) / 1MB)
+          Write-Host "volumes=$($vols.Count) download=${archiveMB}MB installed=${installedMB}MB"
+          # Official standalone LZMA extractor; the installer carries it because
+          # a machine with no 7-Zip is exactly the machine this is here for.
+          Invoke-WebRequest -Uri https://www.7-zip.org/a/7zr.exe `
+            -OutFile packaging/installer/7zr.exe -UseBasicParsing
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=$tag" `
+            "/DTag=$tag" `
+            "/DVolumes=$($vols.Count)" `
+            "/DArchiveMB=$archiveMB" `
+            "/DInstalledMB=$installedMB" `
+            "/O$(Get-Location)" `
+            packaging/installer/videohighlighter.iss
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          if-no-files-found: error
+          # Fixed filename, no version in it, so that
+          # /releases/latest/download/00-VideoHighlighter-Windows-Setup.exe is a
+          # permanent link the site and every old post can keep pointing at. The
+          # tag it downloads from is compiled into the exe, not in its name.
+          path: 00-VideoHighlighter-Windows-Setup.exe
+          retention-days: 7
 
   # The web UI: a Tauri shell around the React frontend, with the Python engine
   # bundled as a PyInstaller sidecar. Independent of the Qt build above — both
@@ -476,25 +514,34 @@ jobs:
           name: VideoHighlighter ${{ needs.version.outputs.slug }}
           draft: true
           body: |
-            ## Windows — recommended
+            ## Download
 
-            Download **`00-VideoHighlighter-Windows-Setup.zip`** (top of Assets —
-            the `00-` keeps it first in GitHub's alphabetical list),
-            extract it anywhere, and double-click **`Install-VideoHighlighter.bat`**.
-            The script fetches both archive parts and unpacks them automatically.
+            ### [Install VideoHighlighter for Windows](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/00-VideoHighlighter-Windows-Setup.exe)
 
-            **Manual:** grab both `VideoHighlighter-Windows-*.7z.001` and `.002`,
-            same folder, extract the `.001` with 7-Zip.
+            One file. Run it, click through, done — it fetches and unpacks
+            everything else itself. Installs per user, no admin rights needed.
 
-            ## Windows — web UI (portable)
+            |  | Installer | Portable |
+            |---|---|---|
+            | Windows (desktop app) | [Setup .exe](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/00-VideoHighlighter-Windows-Setup.exe) | [.7z part 1](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z.001) + [part 2](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z.002) |
+            | Windows (web UI) | — | [.7z part 1](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z.001) + [part 2](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z.002) |
+            | macOS | — | [.dmg](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-${{ needs.version.outputs.slug }}.dmg) |
 
-            `VideoHighlighter-Web-Windows-*.7z.001` and `.002` are the Tauri shell
-            around the React frontend, with the Python engine bundled. Same folder,
-            extract the `.001` with 7-Zip, then run the app — no installer, because
-            no installer can hold a 1.7 GB sidecar.
+            The installer is not signed yet, so Windows SmartScreen shows
+            "Windows protected your PC" on first run — **More info → Run anyway**.
 
-            **macOS:** `.dmg` only.
-          artifacts: "windows-build/*,web-windows-build/*,mac-build/*,bootstrap-zip/*"
+            The portable downloads are **split archives**: every `.7z.0NN` part
+            listed under Assets must sit in the same folder, then extract the
+            `.001` with 7-Zip. Downloading one part alone fails. The installer
+            above exists so you never have to do that.
+
+            The web UI is the Tauri shell around the React frontend with the
+            Python engine bundled; it has no installer because no installer can
+            hold a 1.7 GB sidecar.
+
+            `00-VideoHighlighter-Windows-Setup.zip` is the older script-based
+            installer, kept as a fallback.
+          artifacts: "windows-installer/*,windows-build/*,web-windows-build/*,mac-build/*,bootstrap-zip/*"
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Say what still has to happen
         # A green run reads as "shipped", and it is not: the release is a draft,
