@@ -71,9 +71,11 @@ python tools/build_bootstrap_zip.py --edition free --write-config
 
 When happy:
 
-1. CI builds `VideoHighlighter-Windows-Setup.zip` automatically (`tools/build_bootstrap_zip.py`).
-2. Attach that zip as the **first** asset on the Free release page (filename must stay
-   constant so `/releases/latest/download/VideoHighlighter-Windows-Setup.zip` works).
+1. CI builds `00-VideoHighlighter-Windows-Setup.zip` automatically (`tools/build_bootstrap_zip.py`).
+2. Attach that zip on the Free release page. The `00-` prefix is what keeps it at the
+   **top** of GitHub's alphabetical Assets list (without it, Setup sank below the
+   multi-GB archives). Filename must stay constant so
+   `/releases/latest/download/00-VideoHighlighter-Windows-Setup.zip` works.
 3. Keep the `.7z.001` / `.7z.002` assets as today — bootstrap just downloads them.
 
 Pro customers use Lemon Squeezy (single `.7z`); see `docs/LS-PRODUCT-SETUP.md` in the Pro repo.

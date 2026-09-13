@@ -447,12 +447,15 @@ jobs:
           python tools/build_bootstrap_zip.py \
             --edition free \
             --tag "${{ needs.version.outputs.slug }}" \
-            --out packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
+            --out packaging/bootstrap/00-VideoHighlighter-Windows-Setup.zip
       - name: Upload bootstrap artifact
         uses: actions/upload-artifact@v4
         with:
           name: bootstrap-zip
-          path: packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
+          # Leading 00- so GitHub's alphabetical Assets list puts the installer
+          # first. Without it, Setup.zip sank below the multi-GB .7z parts and
+          # the .dmg, and people clicked the wrong file.
+          path: packaging/bootstrap/00-VideoHighlighter-Windows-Setup.zip
           retention-days: 7
 
   release:
@@ -475,7 +478,8 @@ jobs:
           body: |
             ## Windows — recommended
 
-            Download **`VideoHighlighter-Windows-Setup.zip`** (first asset below),
+            Download **`00-VideoHighlighter-Windows-Setup.zip`** (top of Assets —
+            the `00-` keeps it first in GitHub's alphabetical list),
             extract it anywhere, and double-click **`Install-VideoHighlighter.bat`**.
             The script fetches both archive parts and unpacks them automatically.
 

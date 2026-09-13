@@ -1,4 +1,8 @@
-"""Build VideoHighlighter-Windows-Setup.zip for GitHub Release attachment.
+"""Build 00-VideoHighlighter-Windows-Setup.zip for GitHub Release attachment.
+
+The ``00-`` prefix is deliberate: GitHub sorts release Assets alphabetically,
+so without it the tiny installer sank below the multi-GB ``.7z`` parts and the
+``.dmg``, and people downloaded the wrong file.
 
 The zip is tiny (~10 KB): double-click Install-VideoHighlighter.bat on Windows,
 and the script downloads both split 7z volumes plus extracts them.
@@ -175,8 +179,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--out",
         type=Path,
-        default=ROOT / "packaging" / "bootstrap" / "VideoHighlighter-Windows-Setup.zip",
-        help="Output zip path.",
+        default=ROOT / "packaging" / "bootstrap" / "00-VideoHighlighter-Windows-Setup.zip",
+        help="Output zip path (00- prefix keeps it first on the release Assets list).",
     )
     args = parser.parse_args(argv)
     tag = args.tag or default_tag(args.edition)

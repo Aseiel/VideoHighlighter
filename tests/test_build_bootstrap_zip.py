@@ -39,7 +39,7 @@ def app_version():
 
 
 def test_build_free_bootstrap_zip(mod, tmp_path: Path) -> None:
-    out = tmp_path / "VideoHighlighter-Windows-Setup.zip"
+    out = tmp_path / "00-VideoHighlighter-Windows-Setup.zip"
     mod.build_zip(edition="free", tag="0.9.0", out=out)
 
     assert out.is_file()
