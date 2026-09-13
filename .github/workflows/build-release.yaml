@@ -175,6 +175,13 @@ jobs:
         with:
           name: windows-manifest
           path: dist/VideoHighlighter/manifest.json
+          # Artifacts here are a handoff to the `release` job minutes later, not
+          # an archive — the durable copies are the Release assets. At the 90-day
+          # default a single mac DMG is 1.2 GB, and a handful of runs exhausted
+          # the account's storage and blocked every subsequent build with
+          # "Artifact storage quota has been hit" for 6-12 hours at a time.
+          # Anything still wanted after a week is wanted from the Release.
+          retention-days: 7
       - name: Create archive
         run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z" ./dist/VideoHighlighter
       - name: Upload artifact
@@ -182,6 +189,7 @@ jobs:
         with:
           name: windows-build
           path: "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z*"
+          retention-days: 7
 
   # The web UI: a Tauri shell around the React frontend, with the Python engine
   # bundled as a PyInstaller sidecar. Independent of the Qt build above — both
@@ -269,6 +277,7 @@ jobs:
           # Fail loudly rather than uploading nothing if the path drifts again.
           if-no-files-found: error
           path: "VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z*"
+          retention-days: 7
 
   build-mac:
     needs: version
@@ -415,6 +424,10 @@ jobs:
         with:
           name: mac-build
           path: VideoHighlighter-${{ needs.version.outputs.slug }}.dmg
+          # The largest artifact by an order of magnitude, for the one platform
+          # the site marks unsupported. Shortest retention of the set until that
+          # changes or the job goes.
+          retention-days: 3
 
   bootstrap:
     needs: version
@@ -435,6 +448,7 @@ jobs:
         with:
           name: bootstrap-zip
           path: packaging/bootstrap/VideoHighlighter-Windows-Setup.zip
+          retention-days: 7
 
   release:
     # `version` must be listed even though no build step needs its output
