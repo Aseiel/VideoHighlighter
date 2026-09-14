@@ -247,6 +247,15 @@ identical in both editions.
 
 ## Installation
 
+### GPU support
+VideoHighlighter runs on **Intel, AMD and NVIDIA** GPUs. Tested on:
+
+| GPU | Backend |
+| --- | ------- |
+| Intel Arc A750 | OpenVINO |
+| NVIDIA GeForce GTX 1060 | CUDA |
+| AMD Radeon RX 570 | DirectML |
+
 ### Windows (recommended)
 1. **Installer:** download [`00-VideoHighlighter-Windows-Setup.exe`](https://github.com/Aseiel/VideoHighlighter/releases/latest/download/00-VideoHighlighter-Windows-Setup.exe) from [Releases](https://github.com/Aseiel/VideoHighlighter/releases) and run it. It fetches both archive parts and unpacks them (~3 GB download, per-user install, no admin). The build is **not code-signed** yet — if Windows or Chrome blocks it, use *Keep* / *More info → Run anyway*.
 2. **Portable:** download **both** `VideoHighlighter-Windows-*.7z.001` and `.7z.002` into the same folder, then extract the `.001` file with [7-Zip](https://www.7-zip.org/), and run `VideoHighlighter.exe`.
