@@ -45,6 +45,8 @@ pytorchvideo
 iopath
 protobuf
 onnx
+onnxscript  # torch.onnx.export needs it; without it the DirectML R3D export fails
+            # and action recognition quietly stays on the CPU (modules/r3d_onnx.py)
 ffmpeg-python
 selenium
 trio
