@@ -985,8 +985,18 @@ def load_models(device="AUTO", openvino_threads=None,
     print(f"Available OpenVINO devices: {available_devices}")
 
     if device == "AUTO":
-        device_priority = ["GPU.1", "GPU.0", "GPU", "CPU"]
-        selected_device = next((d for d in device_priority if d in available_devices), "CPU")
+        # OpenVINO's GPU plugin is written for Intel graphics, yet it lists any
+        # OpenCL GPU — an NVIDIA card too. There the action encoder runs three
+        # times slower than on the processor (118 ms vs 40 ms, GTX 1060 against
+        # a Ryzen 5 1400), so AUTO only takes a GPU that is Intel's.
+        def _is_intel_gpu(name):
+            try:
+                return "intel" in str(ie.get_property(name, "FULL_DEVICE_NAME")).lower()
+            except Exception:  # noqa: BLE001 — a device that cannot say is not taken
+                return False
+        device_priority = ["GPU.1", "GPU.0", "GPU"]
+        selected_device = next((d for d in device_priority
+                                if d in available_devices and _is_intel_gpu(d)), "CPU")
     else:
         selected_device = device if device in available_devices else "CPU"
 
