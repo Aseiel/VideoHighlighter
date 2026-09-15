@@ -144,14 +144,16 @@ jobs:
           --copy-metadata safetensors
           --copy-metadata regex
           main.py
-      - name: Check numpy.libs came through whole
-        # The bundle once kept numpy's vendored MSVC runtime in pandas.libs only,
-        # and ml_dtypes (via onnx) failed to load, so the DirectML detector's
-        # ONNX export never happened. packaging/pyinstaller-hooks/hook-ml_dtypes.py
-        # puts every numpy.libs file back; this fails the build if a PyInstaller
-        # or numpy bump undoes that, instead of an AMD user's run.
+      - name: Check ml_dtypes can find the DLLs it links against
+        # ml_dtypes (via onnx) links against a delvewheel-renamed MSVC runtime it
+        # expects in numpy.libs. With numpy pinned older than the one ml_dtypes was
+        # built beside, that name is not numpy's own: 0.11.1 and 0.11.2 shipped it
+        # in pandas.libs only, and every DirectML ONNX export failed with "DLL load
+        # failed while importing _ml_dtypes_ext". This reads the names out of the
+        # BUNDLED extension, so it checks what the exe will ask for rather than
+        # what the runner's numpy happens to vendor, which is how it passed before.
         run: |
-          python -c "import os, importlib.util as u; src = os.path.join(os.path.dirname(os.path.dirname(u.find_spec('numpy').origin)), 'numpy.libs'); dst = os.path.join('dist', 'VideoHighlighter', '_internal', 'numpy.libs'); want = sorted(os.listdir(src)); have = set(os.listdir(dst)) if os.path.isdir(dst) else set(); missing = [f for f in want if f not in have]; print('numpy.libs:', ', '.join(want)); assert not missing, 'bundled numpy.libs lacks ' + ', '.join(missing)"
+          python -c "import glob, os, re; root = os.path.join('dist', 'VideoHighlighter', '_internal'); exts = glob.glob(os.path.join(root, 'ml_dtypes', '**', '*.pyd'), recursive=True); assert exts, 'no ml_dtypes extension in the bundle, so onnx cannot import'; want = sorted({m.decode() for p in exts for m in re.findall(rb'[\w.+-]+-[0-9a-f]{32}\.dll', open(p, 'rb').read(), re.I)}); libs = os.path.join(root, 'numpy.libs'); have = set(os.listdir(libs)) if os.path.isdir(libs) else set(); missing = [n for n in want if n not in have]; print('ml_dtypes links against:', ', '.join(want) or 'nothing vendored'); assert not missing, 'bundled numpy.libs lacks ' + ', '.join(missing)"
       - name: Report build size
         run: |
           $size = (Get-ChildItem -Recurse ./dist/VideoHighlighter | Measure-Object -Property Length -Sum).Sum / 1GB
