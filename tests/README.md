@@ -39,7 +39,7 @@ Expected: all green in <5 seconds.
 ## How it stays light
 
 `tests/conftest.py` installs `MagicMock` shims for `cv2`, `torch`, `whisper`,
-`googletrans`, `openvino`, and friends **before** any test
+`openvino`, and friends **before** any test
 imports the modules under test. So `pip install -r requirements.txt`
 (~1.9 GB) is not required to run the suite — only pytest + numpy.
 
@@ -71,6 +71,5 @@ Three rules for tests added under this directory:
 
 Next additions (Phase 1+):
 
-- `modules.translate` — adapter contract: signature stable across NLLB / MarianMT / googletrans backends.
 - `modules.logging_utils` — JSON-schema validation of emitted log records.
 - Scoring math (the per-second weighted sum + multi-signal boost) — currently buried in `pipeline.run_pipeline`; needs extraction during Phase 2 refactor first.

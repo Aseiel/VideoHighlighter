@@ -85,7 +85,7 @@ VideoHighlighter 有时会对你的视频内容发表“意见”。当它这么
 
 OpenAI Whisper采用MIT许可证，可自由使用。
 
-Google Translate API 是可选的。如果使用非官方库（googletrans），则无需 API 密钥，但若 Google 更改接口地址，功能可能会出现异常。
+字幕翻译通过 [ollama](https://ollama.com) 在本地 LLM 上运行：不涉及任何翻译服务、API 密钥或账户，文本绝不会离开本机。若未安装 ollama，字幕将以原始语言写出。
 
 该项目不包含任何付费 API 密钥。若要使用官方服务，用户需自行提供相关密钥。
 

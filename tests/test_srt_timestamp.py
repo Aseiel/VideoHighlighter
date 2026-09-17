@@ -6,9 +6,9 @@ not a dot — VLC, ffmpeg subtitle muxer, and most players are strict here).
 This module-level function is called by every subtitle write path, so it is
 the right place to pin behaviour before any translation-stack refactor.
 
-`transcript_srt.py` does a top-level `import whisper`, `import cv2`, and
-`from googletrans import Translator`. None of those are installed in the test
-environment — the shims in `conftest.py` handle them.
+`transcript_srt.py` does a top-level `import whisper` and `import cv2`.
+Neither is installed in the test environment — the shims in `conftest.py`
+handle them.
 """
 
 from __future__ import annotations

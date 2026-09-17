@@ -18,7 +18,10 @@ pyyaml
 opencv-python>=4.7  # FaceDetectorYN (YuNet) + FaceRecognizerSF (SFace) need >=4.5.4
 tqdm
 openai-whisper
-googletrans==4.0.0rc1
+# Translation is LLM-based (ollama) — no machine-translation library is
+# required. The httpx floor keeps pip off ancient releases whose `import cgi`
+# breaks on Python 3.13 and conflicts with the ML stack.
+httpx>=0.24
 openvino==2026.2.1
 # Object detection is YOLOX (Apache-2.0): the runtime is OpenVINO above, and the
 # stock models download on first use. Training a detector in the app also needs

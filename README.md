@@ -316,7 +316,7 @@ startup, so restart the app after changing it.
 
 OpenAI Whisper is MIT licensed — freely usable.
 
-Google Translate API is optional. If using unofficial libraries (googletrans), no API key is needed, but results may break if Google changes endpoints.
+Subtitle translation runs on a local LLM through [ollama](https://ollama.com): no translation service, API key or account is involved, and the text never leaves the machine. Without ollama, subtitles are written in the language that was spoken.
 
 This project does not include any paid API keys. Users must provide their own if using official services.
 

@@ -1,11 +1,8 @@
 import os
 import re
-import time
-import random
 import whisper
 import cv2
 from typing import List, Dict, Optional
-from googletrans import Translator
 
 # --------------------------
 # VIDEO & TIMESTAMP UTILITIES
@@ -446,29 +443,12 @@ def translate_batch_with_llm(texts, source_lang="en", target_lang="pl",
         progress_fn(total, total, "Translation", f"{total} segments")
     return results
 
-def safe_translate(translator, text, src, dest, retries=3, delay=1.0):
-    """
-    Try translating with googletrans with retries and exponential backoff.
-    Falls back to original text if all retries fail.
-    """
-    for attempt in range(retries):
-        try:
-            result = translator.translate(text, src=src, dest=dest)
-            return result.text
-        except Exception as e:
-            print(f"⚠️ Translation failed (attempt {attempt+1}/{retries}): {e}")
-            if attempt < retries - 1:
-                sleep_time = delay * (2 ** attempt) + random.uniform(0, 0.5)
-                time.sleep(sleep_time)
-            else:
-                return text  # fallback
-
 def translate_segments(segments, source_lang="en", target_lang="pl",
                        progress_fn=None):
     """
     Translate subtitle segments.
     Strategy: try local LLM (llama via ollama) first for better quality,
-    fall back to googletrans if LLM is unavailable.
+    Uses the local LLM (llama via ollama) — there is no second backend.
 
     progress_fn: optional (current, total, task, details) callback. Translation
     is a second long pass after transcription — an hour of speech is hundreds of
@@ -517,36 +497,14 @@ def translate_segments(segments, source_lang="en", target_lang="pl",
             print(f"✅ Translated {len(translated_segments)} segments via LLM")
             return translated_segments
         else:
-            print(f"⚠️ LLM returned {len(translated_texts)} translations for {len(segments)} segments, falling back")
+            print(f"⚠️ LLM returned {len(translated_texts)} translations for {len(segments)} segments — keeping the originals")
 
-    # --- Fallback: googletrans ---
-    try:
-        translator = Translator()
-        print("🌐 Using googletrans for translation (LLM not available)")
-    except Exception as e:
-        print(f"❌ No translation backend available: {e}")
-        print("   Install ollama + llama3 for better translations, or pip install googletrans==4.0.0-rc1")
-        return segments
-
-    translated_segments = []
-    for i, seg in enumerate(segments):
-        translated_text = safe_translate(translator, seg["text"], src=source_lang, dest=target_lang)
-        new_seg = {
-            'start': seg['start'],
-            'end': seg['end'],
-            'text': translated_text
-        }
-        for key in ('speaker', 'speaker_label', 'gender', 'gender_confidence'):
-            if key in seg:
-                new_seg[key] = seg[key]
-        translated_segments.append(new_seg)
-        print(f"  Translated {i+1}/{len(segments)}", end='\r')
-        if progress_fn:
-            progress_fn(i + 1, len(segments), "Translation",
-                        f"{i+1}/{len(segments)} segments")
-
-    print(f"\n✅ Translated {len(translated_segments)} segments via googletrans")
-    return translated_segments
+    # No LLM backend. Leave the subtitles in the source language rather than
+    # routing them through a scraped web endpoint, and say so loudly: an
+    # untranslated SRT is otherwise indistinguishable from a working run.
+    print("❌ No translation backend available — subtitles left untranslated.")
+    print("   Install ollama and pull a model to enable translation.")
+    return segments
 
 # --------------------------
 # FILE GENERATION

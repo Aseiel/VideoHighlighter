@@ -86,7 +86,7 @@ De vez en cuando, VideoHighlighter “siente” algo al respecto de tus grabacio
 
 OpenAI Whisper está bajo licencia MIT, por lo que se puede utilizar libremente.
 
-La API de Google Translate es opcional. Si se utilizan bibliotecas no oficiales (como googletrans), no se necesita clave de API, pero los resultados podrían dejar de funcionar si Google modifica sus puntos de conexión.
+La traducción de subtítulos se ejecuta en un LLM local a través de [ollama](https://ollama.com): no interviene ningún servicio de traducción, clave de API ni cuenta, y el texto nunca sale de la máquina. Sin ollama, los subtítulos se escriben en el idioma hablado.
 
 Este proyecto no incluye claves API de pago. Los usuarios deben proporcionar las suyas propias si utilizan servicios oficiales.
 
