@@ -21,7 +21,7 @@ import pytest
 
 
 def _shim_heavy_for_pipeline_import() -> None:
-    """Pipeline.py imports torch / ultralytics / cv2 / openvino at the top.
+    """Pipeline.py imports torch / cv2 / openvino at the top.
     The conftest already shims most of these, but pipeline also imports
     `action_recognition` and `object_recognition` (siblings, not under
     `modules.`). Shim them too.
@@ -29,7 +29,7 @@ def _shim_heavy_for_pipeline_import() -> None:
     # NB: do NOT shim `object_recognition` — we want the real module so we
     # can verify it correctly imports `seconds_to_mmss` from
     # `modules.pipeline_helpers` after the duplicate removal. The real module
-    # is itself shim-friendly (cv2 / ultralytics are already shimmed by
+    # is itself shim-friendly (cv2 is already shimmed by
     # conftest.py, and the rest is stdlib + numpy).
     for name in (
         "action_recognition",  # heavy openvino + torch; keep shimmed

@@ -10,8 +10,21 @@ from pathlib import Path
 from collections import defaultdict
 import torch
 
-# YOLO imports for pose estimation
-from ultralytics import YOLO
+# Optional pose-assist backend.
+#
+# ultralytics is AGPL, and a model trained or pre-filled with it inherits that.
+# Models made in this app are meant to be shared and used by anyone, in any
+# build, so the app itself never depends on it. This file is dev-only tooling
+# under tools/ — not imported by the app, never pulled into the exe from
+# main.py — and pose pre-fill only speeds up placing keypoints by hand.
+#
+# The import is optional so nothing in this repo hard-depends on an AGPL
+# package: without ultralytics the labeller still runs, it just loses the pose
+# pre-fill and every keypoint is placed by hand.
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
 def _disp(internal: str) -> str:
     """Strip the dedup suffix (~2, ~3 …) to get the display/class name."""
@@ -340,7 +353,19 @@ class VideoLabelerGUI:
     # ============ YOLO MODEL LOADING ============
     
     def load_yolo_model(self):
-        """Load YOLO model with progress feedback"""
+        """Load the optional pose-assist model, with progress feedback.
+
+        A missing ultralytics is a normal state rather than an error — keypoints
+        can always be placed by hand, and every caller already guards on
+        `self.yolo_model is None`. So say so quietly instead of raising a dialog
+        the user cannot act on if they deliberately keep AGPL out of the env.
+        """
+        if YOLO is None:
+            self.status_var.set(
+                "ℹ️ Pose assist off (ultralytics not installed) — place keypoints manually"
+            )
+            self.yolo_model = None
+            return
         try:
             self.status_var.set("🔄 Loading YOLO model...")
             self.root.update()
@@ -2318,13 +2343,14 @@ if __name__ == "__main__":
         print("❌ PIL/Pillow not installed. Run: pip install pillow")
         exit(1)
     
-    # Check for ultralytics
+    # Optional pose assist (see the import note at the top of this file).
     try:
         import ultralytics
-        print(f"✅ Ultralytics YOLO version: {ultralytics.__version__}")
+        print(f"✅ Pose assist available (ultralytics {ultralytics.__version__})")
     except ImportError:
-        print("❌ Ultralytics not installed. Run: pip install ultralytics")
-        # Continue anyway - app will show error when trying to use YOLO
+        print("ℹ️ Pose assist off — ultralytics not installed. Labelling works, "
+              "keypoints are placed by hand. (Optional: pip install ultralytics; "
+              "AGPL, dev-only, never ship it.)")
     
     root = tk.Tk()
     app = VideoLabelerGUI(root)

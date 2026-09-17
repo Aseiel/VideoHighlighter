@@ -145,29 +145,9 @@ def data_file(name: str) -> str:
 
 
 def latest_custom_pose_model():
-    """Return the most recent trained custom keypoint model (best.pt), or None.
-
-    Looks in the usual ultralytics output locations under the project, plus a
-    drop-in copy next to the executable / project root named
-    'custom_keypoints.pt'. Lets the GUI/pipeline pick up a freshly trained model
-    without hardcoding a path.
-    """
-    import glob
-    roots = {_project_root(), user_data_dir()}
-    candidates = []
-    for root in roots:
-        # explicit drop-in
-        for name in ("custom_keypoints.pt",):
-            p = os.path.join(root, name)
-            if os.path.exists(p):
-                candidates.append(p)
-        # ultralytics training outputs
-        candidates += glob.glob(os.path.join(root, "**", "weights", "best.pt"), recursive=True)
-        candidates += glob.glob(os.path.join(root, "training", "**", "weights", "best.pt"), recursive=True)
-    candidates = [c for c in candidates if os.path.exists(c)]
-    if not candidates:
-        return None
-    return max(candidates, key=os.path.getmtime)
+    """Custom keypoint models are not supported: the only trainer for them was
+    AGPL, and nothing trained with it may ship. Kept so callers need no guard."""
+    return None
 
 
 def _read_keypoint_names(path):
@@ -211,61 +191,87 @@ def object_models_dir() -> str:
     return os.path.join(user_data_dir(), "models", "custom")
 
 
-_OBJECT_MODEL_NAMES_CACHE: dict = {}
-
-
 def object_model_names(path: str) -> list:
-    """Class names a detector reports for itself, or [] if it is not an object
-    detector or cannot be read.
-
-    Cached per (path, mtime): this loads the model, which is slow enough that
-    re-reading it every time the combo rebuilds is noticeable.
-    """
+    """Class names a detector reports: its embedded metadata, else the
+    labels.json beside it. [] when neither is readable."""
+    from modules.detection_backend import names_from_model, load_class_names
     try:
-        key = (path, os.path.getmtime(path))
-    except OSError:
-        return []
-    if key in _OBJECT_MODEL_NAMES_CACHE:
-        return _OBJECT_MODEL_NAMES_CACHE[key]
-    names = []
-    try:
-        from ultralytics import YOLO
-        model = YOLO(str(path))
-        if getattr(model, "task", "") == "detect":
-            names = [str(n) for n in model.names.values()]
+        return names_from_model(path) or load_class_names(
+            os.path.join(os.path.dirname(path), "labels.json"))
     except Exception as e:
         print(f"⚠️ could not read classes from {os.path.basename(path)}: {e}")
-    _OBJECT_MODEL_NAMES_CACHE[key] = names
-    return names
+        return []
+
+
+def import_object_model(src: str) -> str:
+    """Install a detector into models/custom/<name>/ and return the model path.
+
+    Each model gets its own folder because a YOLOX export names its classes in
+    a ``labels.json`` beside it, and two models sharing one folder would share
+    one labels file. An .xml brings its .bin; a labels.json next to the source
+    comes along.
+    """
+    name = os.path.splitext(os.path.basename(src))[0]
+    dst_dir = os.path.join(object_models_dir(), name)
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, os.path.basename(src))
+    shutil.copy2(src, dst)
+    src_dir = os.path.dirname(src)
+    if src.lower().endswith(".xml"):
+        bin_src = os.path.splitext(src)[0] + ".bin"
+        if os.path.exists(bin_src):
+            shutil.copy2(bin_src, os.path.join(dst_dir, os.path.basename(bin_src)))
+    labels_src = os.path.join(src_dir, "labels.json")
+    if os.path.exists(labels_src):
+        shutil.copy2(labels_src, os.path.join(dst_dir, "labels.json"))
+    return dst
 
 
 def discover_object_models() -> list:
     """List custom object detectors under models/custom/, newest first, each with
-    the class names read from the model itself.
+    the class names it reports.
 
     Returns [{"path": str, "name": str, "classes": list[str]}]. Empty when the
-    folder is absent or holds no detectors — callers then offer only the standard
-    option. Keypoint/pose models are skipped: they run a different code path and
-    get their names from custom_keypoint_names().
+    folder is absent or holds no models — callers then offer only the standard
+    option. Only .onnx and OpenVINO .xml are listed: those are what the YOLOX
+    runtime loads.
     """
     import glob
     d = object_models_dir()
     if not os.path.isdir(d):
         return []
     paths = []
-    for ext in ("*.pt", "*.onnx"):
+    for ext in ("*.onnx", "*.xml"):
         paths.extend(glob.glob(os.path.join(d, ext)))
+        paths.extend(glob.glob(os.path.join(d, "*", ext)))
+    # An installed model sits as .onnx + .xml side by side; list it once, as IR.
+    paths = [p for p in paths if not (
+        p.lower().endswith(".onnx") and os.path.exists(os.path.splitext(p)[0] + ".xml"))]
     paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
+    # lazy: avoid import cycle
+    from modules.detection_backend import names_from_model, load_class_names
     out = []
     for p in paths:
-        classes = object_model_names(p)
-        if not classes:
+        # Same resolution order build_object_detector uses — embedded metadata
+        # first, then a labels.json sidecar. A YOLOX export carries no
+        # class-name metadata, so without the sidecar it would list zero classes.
+        names = names_from_model(p) or load_class_names(
+            os.path.join(os.path.dirname(p), "labels.json"))
+        if not names:
             continue
         out.append({
             "path": p,
             "name": os.path.splitext(os.path.basename(p))[0],
-            "classes": classes,
+            "classes": names,
         })
+    # Community models installed from the hub (model_hub), listed after the
+    # user's own. Each is checksum-verified here; a changed file drops out.
+    try:
+        from model_hub.hub import installed_detectors
+        out.extend(installed_detectors())
+    except Exception as e:  # noqa: BLE001 - a broken install must not hide the rest
+        print(f"⚠️ community model discovery failed: {e}")
     return out
 
 

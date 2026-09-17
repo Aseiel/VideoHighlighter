@@ -165,7 +165,7 @@ not a finding.
 | Video encoding (AMF) | yes, indirectly | See *The win that needs no model*. |
 | Action recognition (R3D) | yes, verified at load | 3D convolution is DirectML's least certain area, so this is proven, not assumed — see below. |
 | Action recognition (Intel encoder/decoder) | no | Deliberate: it is small enough that moving it buys nothing, and it exists only as OpenVINO IR. |
-| **Object detection** | **no** | Ultralytics has no DirectML backend. See below. |
+| Object detection (stock YOLOX) | yes, through ONNX Runtime | Same export as the OpenVINO model. See below. |
 | Face, motion | no | Unchanged: OpenVINO on the CPU. |
 
 **R3D action recognition proves itself at load.** `pytorch_device` in
@@ -190,12 +190,13 @@ is small enough that moving it would buy nothing, and it ships as OpenVINO IR
 only — Open Model Zoo publishes no ONNX for it, so there is no artifact
 DirectML could run even if it were worth doing.
 
-**Object detection uses DirectML through ONNX Runtime, not torch.** YOLO
-runs through Ultralytics, which has no DirectML backend, so
-`resolve_yolo_device()` still answers a DirectML request with `cpu` — handing
-Ultralytics `privateuseone:0` would trade a slow run for a failed one. Instead
-the detector is exported to ONNX and run under ONNX Runtime's DirectML
-execution provider, which is a different runtime with no opinion about torch.
+**Object detection uses DirectML through ONNX Runtime, not torch.** The
+detector is YOLOX, normally run by OpenVINO — whose GPU plugin is Intel-only,
+so `resolve_yolo_device()` still answers a DirectML request with `cpu`. Where
+ONNX Runtime's DirectML provider is present (`onnx_dml_yolo`), the same YOLOX
+ONNX export runs under it instead (`YoloxOnnxRuntimeDetector` in
+`modules/detection_backend.py`, chosen by `object_recognition.directml_detector`).
+Custom and mixed models stay on OpenVINO.
 
 Detection is the heaviest per-frame stage, so this is the larger half of the
 win. It is also the half that reaches people who did not install anything: see
@@ -240,11 +241,11 @@ model, not the framework. Everything else torch drives — the CLIP prefilter,
 OWLv2, motion — has no export yet and is still on the processor, which is why
 the flags name specific models rather than saying "torch is accelerated".
 
-Both exports are made once on the machine that needs them and then reused: the
-detector's next to its weights (`modules/yolo_onnx.py`), R3D's in an
+The detector needs no export here — YOLOX publishes ONNX, downloaded once into
+`models/yolox/onnx/` (`modules/yolox_models.py`). R3D's is made once and reused, in an
 `onnx-cache` folder under the user-data directory (`modules/r3d_onnx.py`, which
 keys the filename on the class count and re-exports when imported custom weights
-are newer than the cached graph). Each costs tens of seconds, once.
+are newer than the cached graph). That costs tens of seconds, once.
 
 ### R3D's second gate
 
@@ -391,8 +392,8 @@ is read off the device object the installed package hands back. Use
 - `modules/onnx_detector.py` — the detector that runs an ONNX export, with its
   own letterbox and NMS and no Ultralytics import, so the Pro edition can use
   it with a different export in front.
-- `modules/yolo_onnx.py` — the free edition's export half (Ultralytics does the
-  converting), kept apart from the runner for that reason.
+- `modules/detection_backend.py` — `YoloxOnnxRuntimeDetector`, the stock YOLOX
+  export on ONNX Runtime; `modules/yolox_models.py` downloads that export.
 - `modules/device_utils.py` — the pipeline-wide decision. DirectML sits after
   the Intel probes and before the CPU fallback.
 - `llm/clip_prefilter.py` — visual search, with its own `resolve_device` (it

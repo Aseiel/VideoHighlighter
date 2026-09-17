@@ -76,7 +76,7 @@ CONFIG = {
     "smoothing_window_size": 5,
     "motion_threshold": 2.0,
     "use_pose_guided_crop": True,
-    "pose_model": "yolo11n-pose.pt",
+    "pose_model": None,  # no permissive pose model yet; ROI uses person boxes
     "pose_conf_threshold": 0.3,
     "max_action_people": 2,
     "allow_dynamic_group": True,

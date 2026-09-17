@@ -9,13 +9,13 @@ into the cache.
 Design:
 - Thin wrappers over the same entry points the pipeline uses
   (`get_transcript_segments`, `run_action_detection`, `run_object_detection_single`
-  fed an ultralytics YOLO model), so behaviour and model choice never drift
+  fed the YOLOX detector), so behaviour and model choice never drift
   from a full run.
 - The *advanced* knobs stay in the first GUI. Here we read that GUI's saved
   `config.yaml` for defaults (Whisper model, object list, confidence, sample
   rate, YOLO model size), so a viewer button runs "what the main GUI is
   currently set to".
-- Every heavy import (torch, whisper, ultralytics) lives inside the function
+- Every heavy import (torch, whisper, openvino) lives inside the function
   that needs it, so importing this module stays cheap and the viewer never
   hard-depends on a model runtime at construction time.
 - Each runner takes a uniform `progress(current, total, task, details)`
@@ -64,6 +64,7 @@ def analysis_defaults() -> dict:
         "object_frame_skip": int(advanced_cfg.get("object_frame_skip", 10) or 10),
         "yolo_model_size": str(advanced_cfg.get("yolo_model_size", "n") or "n"),
         "yolo_type": advanced_cfg.get("yolo_type", "standard") or "standard",
+        "yolo_custom_model_path": advanced_cfg.get("yolo_custom_model_path") or "",
         # Which action decoders the main window is set to. Read here so an
         # on-demand run uses the models the user picked, rather than whatever
         # `run_action_detection`'s own defaults happen to be.
@@ -397,31 +398,33 @@ def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
 # Objects
 # --------------------------------------------------------------------------- #
 def _load_yolo(d: dict, log=print, devices=None):
-    """Load an ultralytics YOLO detector the way the pipeline does: prefer a
-    pre-exported OpenVINO folder for the chosen size, else the .pt (ultralytics
-    fetches the weights if they aren't present).
+    """Load the object detector the way the pipeline does: the Advanced tab's
+    standard / custom / mixed choice, resolved by
+    ``modules.detection_backend.build_object_detector``. The stock YOLOX models
+    are fetched on first use from a source checkout.
 
-    `devices` is the already-probed DeviceInfo when the caller has one, so the
-    probe (and its log lines) happen once per run rather than once per stage.
+    `devices` is the already-probed DeviceInfo when the caller has one: where it
+    says ONNX Runtime reaches the GPU, the stock detector runs there instead.
     """
-    from ultralytics import YOLO
-    size = d["yolo_model_size"]
-    ov_folder = f"yolo11{size}_openvino_model/"
-    pt_path = f"yolo11{size}.pt"
-
-    # A GPU only ONNX Runtime can reach: run the export rather than Ultralytics,
-    # which has no DirectML backend and would sit on the processor instead.
-    if devices is not None and getattr(devices, "onnx_dml_yolo", False):
-        from modules import yolo_onnx
-        detector = yolo_onnx.load_detector(pt_path, log=log)
+    from modules.detection_backend import build_object_detector
+    yolo_type = str(d.get("yolo_type") or "standard")
+    mode = ("custom" if yolo_type == "custom"
+            else "mixed" if "custom" in yolo_type else "coco")
+    size = str(d.get("yolo_model_size") or "n").lower()
+    prefer = "small" if size in ("n", "nano", "tiny") else "large"
+    if mode == "coco" and devices is not None and getattr(devices, "onnx_dml_yolo", False):
+        from object_recognition import directml_detector
+        detector = directml_detector(prefer, log=log)
         if detector is not None:
             return detector
-
-    if os.path.isdir(ov_folder):
-        log(f"✅ Object detector: YOLO OpenVINO ({ov_folder})")
-        return YOLO(ov_folder, task="detect")
-    log(f"✅ Object detector: YOLO {pt_path}")
-    return YOLO(pt_path)
+    detector, names = build_object_detector(
+        mode=mode, custom_model_xml=d.get("yolo_custom_model_path") or "",
+        device="AUTO", default_prefer=prefer,
+        log=log, auto_install=True,
+    )
+    if detector is not None:
+        log(f"✅ Object detector: {type(detector).__name__}, {len(names)} classes")
+    return detector
 
 
 def run_objects(video_path: str, objects: list, *, progress: ProgressFn = None,
@@ -444,7 +447,9 @@ def run_objects(video_path: str, objects: list, *, progress: ProgressFn = None,
 
     model = _load_yolo(d, log, devices=detect_best_device(log_fn=log))
     if model is None:
-        raise RuntimeError("Object detector unavailable — could not load a YOLO model.")
+        raise RuntimeError(
+            "Object detector unavailable — no usable model "
+            "(run tools/get_yolox_model.py, or import a custom model).")
 
     det_by_sec, _bboxes = run_object_detection_single(
         video_path, model, objects,

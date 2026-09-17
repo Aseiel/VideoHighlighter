@@ -4,7 +4,7 @@ Shared pytest fixtures + heavy-dependency import shims.
 Why shims?
 ==========
 The production code imports heavy ML libraries (torch, opencv, whisper,
-ultralytics, openvino, googletrans) at module-load time. We deliberately want
+openvino, googletrans) at module-load time. We deliberately want
 the test suite to run **without** those installed so a CI job can validate
 pure logic (forbidden-range math, clustering, SRT formatting) in seconds rather
 than minutes, and so a contributor can run `pytest` after `pip install -r
@@ -50,7 +50,6 @@ _HEAVY_DEPS = [
     "torch.nn.functional",
     "whisper",
     "googletrans",
-    "ultralytics",
     "openvino",
     "openvino.runtime",
     "pytorchvideo",

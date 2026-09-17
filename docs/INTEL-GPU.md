@@ -73,17 +73,15 @@ the table above shows.
 | Action recognition (R3D) | **no** | See below. |
 | Face, motion | no | OpenVINO on the processor. |
 
-**Detection reaches the GPU through Ultralytics, not through the app's own
-device choice.** A full run exports `yolo11<size>.pt` to an OpenVINO folder the
-first time it needs one, then loads that folder. Ultralytics compiles it with
-OpenVINO's `AUTO` device, which picks the Arc on its own, which is why the log
-says the model is loaded and OpenVINO manages the device. The app's
+**Detection reaches the GPU through OpenVINO's `AUTO` device, not through the
+app's own device choice.** The detector is YOLOX IR under `models/yolox/`,
+downloaded on first use, compiled with `AUTO`, which picks the Arc on its own.
+(The measurements below were taken with the earlier `yolo11n` detector.) The app's
 `openvino_device` field is `"GPU"` and drives the *action* encoder and decoder;
 it is not what puts the detector on the card.
 
-One consequence: the on-demand analysis in the viewer uses the OpenVINO folder
-only if it is already there. It does not export one. So the first full run is
-what creates it.
+The on-demand analysis in the viewer uses the same models, and fetches them on
+first use as a full run does.
 
 **R3D stays off on Intel, on purpose.** With the action backend on `auto`, R3D
 is enabled only where torch or ONNX Runtime can reach a GPU. Neither can here:

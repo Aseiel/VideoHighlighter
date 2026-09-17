@@ -4,12 +4,15 @@ import cv2
 import json
 import random
 import numpy as np
-from ultralytics import YOLO
+from modules.detection_backend import YoloxPeopleDetector
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from openvino.runtime import Core
+try:                                  # OpenVINO >= 2024 removed openvino.runtime
+    from openvino import Core
+except ImportError:                     # older installs still need the old path
+    from openvino.runtime import Core
 from tqdm import tqdm
 from collections import deque
 
@@ -83,8 +86,10 @@ class AdaptiveActionDetector:
     
     def _get_matched_poses(self, frame, person_boxes, pose_extractor, max_poses):
         """Get poses only for the detected action people - WITH LOWER THRESHOLDS"""
+        if pose_extractor is None or getattr(pose_extractor, "model", None) is None:
+            return []
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose_extractor.model.predict(frame_rgb, conf=0.15, verbose=False)  # Lower confidence!
+        results = pose_extractor.model.predict(frame_rgb, conf=0.15, verbose=False)
         
         if len(results) == 0 or results[0].keypoints is None:
             return []
@@ -1034,10 +1039,11 @@ class SmoothedROIDetector:
 # Pose Estimation for Spatial Guidance
 # =============================
 class PoseExtractor:
-    """Extract YOLOv11 pose keypoints to guide spatial cropping"""
-    def __init__(self, model_name="yolo11n-pose.pt", conf_threshold=0.3):
-        print(f"🦴 Loading pose estimation model: {model_name}")
-        self.model = YOLO(model_name)
+    """Pose-guided cropping unavailable (YOLOX is detection-only)."""
+
+    def __init__(self, model_name=None, conf_threshold=0.3):
+        print("⚠️ Pose model disabled — ROI will use YOLOX person boxes only.")
+        self.model = None
         self.conf_threshold = conf_threshold
         self.num_keypoints = 17
         self.keypoint_names = [
@@ -1046,20 +1052,21 @@ class PoseExtractor:
             'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
             'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
         ]
-        
+
     def get_all_keypoints_for_visualization(self, frame):
-        results = self.model.predict(frame, conf=self.conf_threshold, verbose=False)
-        
-        if len(results) == 0 or results[0].keypoints is None:
-            return []
-        
-        all_keypoints = results[0].keypoints.data.cpu().numpy()
-        return [kpts for kpts in all_keypoints if np.sum(kpts[:, 2] > 0.3) >= 5]
+        return []
 
 # =============================
 # Person Detection with Tracking
 # =============================
-yolo_people = YOLO("yolo11n.pt")
+_yolox_people = None
+
+
+def get_yolox_people():
+    global _yolox_people
+    if _yolox_people is None:
+        _yolox_people = YoloxPeopleDetector(device="GPU")
+    return _yolox_people
 
 class PersonTracker:
     """Simple IoU-based person tracker"""
@@ -1272,7 +1279,7 @@ def visualize_training_sample(video_path, label, pose_extractor, adaptive_detect
                 
                 # Use SMART ACTION DETECTION to find ACTION PEOPLE ONLY
                 last_tracked_people = action_detector.detect_with_tracking(
-                    frame_rgb, yolo_people, person_tracker, max_people=2
+                    frame_rgb, get_yolox_people(), person_tracker, max_people=2
                 )
                 
                 # Extract boxes from ACTION people only
@@ -1294,7 +1301,7 @@ def visualize_training_sample(video_path, label, pose_extractor, adaptive_detect
                     adaptive_detector.debug_motion_analysis(frame_rgb, boxes_only, pose_extractor)
                     
                     # Get poses for visualization
-                    if CONFIG.get('visualize_skeletons', False):
+                    if CONFIG.get('visualize_skeletons', False) and pose_extractor.model is not None:
                         last_poses = []
                         results = pose_extractor.model.predict(frame_rgb, conf=pose_extractor.conf_threshold, verbose=False)
                         
@@ -1498,7 +1505,7 @@ CONFIG = {
     "use_adaptive_cropping": True,  # Enable adaptive action region detection
     "motion_threshold": 2.0,        # Lower threshold for better detection of body part involved
     "use_pose_guided_crop": True,
-    "pose_model": "yolo11n-pose.pt",
+    "pose_model": None,
     "pose_conf_threshold": 0.3,
     "visualize_skeletons": False,
     "max_action_people": 2,
@@ -1583,7 +1590,7 @@ def load_video_normalized(path, pose_extractor=None, is_training=True, verbose=F
         
         # Detect action people
         tracked = action_detector.detect_with_tracking(
-            frame, yolo_people, person_tracker, 
+            frame, get_yolox_people(), person_tracker, 
             max_people=CONFIG.get('max_action_people', 2)
         )
         
@@ -2701,7 +2708,7 @@ if __name__ == "__main__":
     if CONFIG.get('create_visualizations', False):
         print("\n🦴 Initializing pose extractor for visualizations...")
         pose_extractor = PoseExtractor(
-            model_name=CONFIG.get('pose_model', 'yolo11n-pose.pt'),
+            model_name=CONFIG.get('pose_model'),
             conf_threshold=CONFIG.get('pose_conf_threshold', 0.3)
         )
 

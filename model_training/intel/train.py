@@ -36,7 +36,7 @@ Options:
     --decoder                Decoder type: mlp (default) or lstm
     --no-viz                 Skip sample visualizations before training
     --viz                    Create sample visualizations before training
-    --no-cache               Disable ROI cache (slow — runs YOLO every epoch)
+    --no-cache               Disable ROI cache (slow — runs the person detector every epoch)
     --rebuild-cache          Force rebuild ROI cache even if one exists
     --no-feature-cache       Disable feature caching (encode every epoch)
     --rebuild-feature-cache  Force rebuild feature cache
@@ -531,7 +531,7 @@ def main():
     parser.add_argument("--viz", action="store_true",
                         help="Create sample visualizations before training")
     parser.add_argument("--no-cache", action="store_true",
-                        help="Disable ROI cache (slow — runs YOLO every epoch)")
+                        help="Disable ROI cache (slow — runs the person detector every epoch)")
     parser.add_argument("--rebuild-cache", action="store_true",
                         help="Force rebuild ROI cache even if one exists")
     parser.add_argument("--no-feature-cache", action="store_true",
@@ -624,7 +624,7 @@ def main():
     pose_ext = None
 
     if CONFIG.get("use_adaptive_cropping") and CONFIG.get("use_pose_guided_crop"):
-        pose_ext = PoseExtractor(CONFIG.get("pose_model", "yolo11n-pose.pt"),
+        pose_ext = PoseExtractor(CONFIG.get("pose_model"),
                                   CONFIG.get("pose_conf_threshold", 0.3))
 
     if not args.no_cache:
@@ -651,7 +651,7 @@ def main():
         train_ds.roi_cache = roi_cache
         val_ds.roi_cache = roi_cache
     else:
-        print("\n⚠️  ROI cache DISABLED — training will be slow (YOLO runs every epoch)")
+        print("\n⚠️  ROI cache DISABLED — training will be slow (the person detector runs every epoch)")
 
     # ==============================
     # Sample Visualizations

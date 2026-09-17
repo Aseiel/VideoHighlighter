@@ -5,53 +5,45 @@ pipeline needs, with a per-video cache so the expensive tagging pass runs ONCE.
     forbidden_ranges          : [(start_sec, end_sec), ...]        -> skip method
     forbidden_boxes_by_frame  : {frame_idx: [(x1,y1,x2,y2), ...]}  -> crop method (pixels)
 
-Device: Intel Arc is driven through OpenVINO (Ultralytics device='intel:gpu') —
-Ultralytics does not accept torch's 'xpu' string. NVIDIA uses the .pt model on CUDA;
-plain CPU uses the .pt model. InsightFace stays on CPU. Result cached per video.
+Identity avoid uses YOLOX (Apache-2.0) person tracking + the YuNet/SFace face
+bank. Result cached per video.
 """
 
 from __future__ import annotations
 import os
+import sys
 import json
 import hashlib
 import cv2
 
-from modules.cuda_check import cuda_usable
 
+def build_tracking_model(model_size="n", log_fn=print, device="GPU"):
+    """Build a permissive YOLOX person tracker for identity / avoid passes."""
+    from modules.tracking_backend import YoloxPersonTracker, resolve_yolox_ir
 
-def build_tracking_model(model_size="n", log_fn=print):
-    """YOLO tracking model on the best device.
-      Intel Arc  -> OpenVINO model (Ultralytics device='intel:gpu')
-      NVIDIA     -> .pt on CUDA
-      CPU        -> .pt on CPU
-    The inference device itself is applied at track() time (see track_device)."""
-    from ultralytics import YOLO
-    import torch
-
-    # Intel GPU (Arc): Ultralytics runs Intel GPUs via OpenVINO, not torch xpu.
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        ov_folder = f"yolo11{model_size}_openvino_model/"
-        if not os.path.exists(ov_folder):
-            log_fn(f"⚙️ Exporting yolo11{model_size} → OpenVINO for Intel GPU (one-time)…")
-            YOLO(f"yolo11{model_size}.pt").export(format="openvino")
-        log_fn("✅ Tracking model: OpenVINO (Intel GPU / Arc)")
-        return YOLO(ov_folder, task="detect")
-
-    if cuda_usable(torch):
-        log_fn(f"✅ Tracking model: CUDA yolo11{model_size}.pt")
-        return YOLO(f"yolo11{model_size}.pt")
-
-    log_fn(f"✅ Tracking model: CPU yolo11{model_size}.pt")
-    return YOLO(f"yolo11{model_size}.pt")
+    model_xml = resolve_yolox_ir(model_size)
+    if not model_xml and not getattr(sys, "frozen", False):
+        try:
+            from modules import yolox_models
+            log_fn("⬇️ First run: fetching the YOLOX person detector (Apache-2.0)…")
+            yolox_models.install(log=log_fn)
+            model_xml = resolve_yolox_ir(model_size)
+        except Exception as exc:
+            log_fn(f"⚠️ Could not fetch the YOLOX detector: {exc}")
+    if not model_xml:
+        log_fn("⚠️ No YOLOX IR for tracking — run tools/get_yolox_model.py")
+        return None
+    try:
+        tracker = YoloxPersonTracker(model_xml=model_xml, model_size=model_size, device=device)
+        log_fn(f"✅ Person tracker ready (YOLOX): {model_xml}")
+        return tracker
+    except Exception as exc:
+        log_fn(f"⚠️ Person tracker failed to load: {exc}")
+        return None
 
 
 def track_device():
-    """Ultralytics device for the track() call: 'intel:gpu' | 0 (cuda) | 'cpu'."""
-    import torch
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
-        return "intel:gpu"     # OpenVINO GPU plugin → the Arc
-    if cuda_usable(torch):
-        return 0
+    """Tracking device placeholder retained for API compatibility."""
     return "cpu"
 
 
@@ -172,6 +164,10 @@ def tag_entries(video_path, bank, yolo_model=None, model_size="n",
 
     if yolo_model is None:
         yolo_model = build_tracking_model(model_size, log_fn=log_fn)
+    if yolo_model is None:
+        if save_bank:
+            bank.save()
+        return []
 
     def _progress(i, msg):
         if cancel_flag is not None and getattr(cancel_flag, "is_set", lambda: False)():

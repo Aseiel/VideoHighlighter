@@ -20,7 +20,15 @@ tqdm
 openai-whisper
 googletrans==4.0.0rc1
 openvino==2026.2.1
-ultralytics
+# Object detection is YOLOX (Apache-2.0): the runtime is OpenVINO above, and the
+# stock models download on first use. Training a detector in the app also needs
+# the yolox package itself, installed separately and WITHOUT its deps, because
+# its declared requirements would let pip replace the torch build:
+#     pip install yolox==0.3.0 --no-deps
+# Nothing here may depend on an AGPL detector: a model trained on one inherits
+# the licence, and models made in this app are meant to be shared.
+pycocotools  # yolox's COCO dataset reader
+loguru       # imported by yolox at module level
 PySide6
 beautifulsoup4
 yt-dlp
@@ -45,6 +53,9 @@ pytorchvideo
 iopath
 protobuf
 onnx
+# Community models (model_hub): browse, install and share on Hugging Face.
+huggingface_hub  # Apache-2.0
+keyring          # MIT; keeps the Hugging Face token in the OS credential store
 onnxscript  # torch.onnx.export needs it; without it the DirectML R3D export fails
             # and action recognition quietly stays on the CPU (modules/r3d_onnx.py)
 ffmpeg-python

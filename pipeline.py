@@ -10,8 +10,6 @@ import yaml
 import csv
 import cv2
 from tqdm import tqdm
-from ultralytics import YOLO
-
 from action_recognition import run_action_detection, load_models
 from object_recognition import run_object_detection_single
 # modules
@@ -79,83 +77,6 @@ def get_video_duration(video_path, log_fn=print):
     cap.release()
     return n / fps_ if fps_ else 0.0
 
-
-def run_keypoint_detection(video_path, model_path, keypoint_names, frame_skip=5,
-                           confidence_threshold=0.25, log=print, cancel_flag=None,
-                           progress_fn=None):
-    """Run a custom YOLO-pose model over a video and turn each detected keypoint
-    into (a) a per-second object detection and (b) an overlay bbox entry — so the
-    custom model's points feed the same scoring + overlay paths as object
-    detection.
-
-    Returns (object_detections {sec: [names]}, object_bboxes [{timestamp, objects,
-    bboxes (normalised x,y,w,h), confidences}]).
-    """
-    from ultralytics import YOLO
-    model = YOLO(str(model_path))
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        log(f"❌ Could not open video for keypoint detection: {video_path}")
-        return {}, []
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    total_seconds = max(1, int(total_frames / fps)) if fps else 1
-    box = 0.05  # overlay marker size as a fraction of the frame
-    detections, bboxes = {}, []
-    fi = 0
-    step = max(1, int(frame_skip))
-    last_reported = -1
-    if progress_fn:
-        progress_fn(0, total_seconds, "Object Detection", "Custom keypoints: starting…")
-    while True:
-        if cancel_flag is not None and cancel_flag.is_set():
-            break
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if fi % step == 0:
-            sec_now = int(fi / fps) if fps else 0
-            if progress_fn and sec_now != last_reported:
-                last_reported = sec_now
-                progress_fn(sec_now, total_seconds, "Object Detection",
-                            f"Custom keypoints: {sec_now}/{total_seconds}s")
-            try:
-                r = model(frame, conf=confidence_threshold, verbose=False)[0]
-            except Exception as e:
-                log(f"⚠️ keypoint inference failed at frame {fi}: {e}")
-                fi += 1
-                continue
-            if r.keypoints is not None and r.keypoints.xy is not None:
-                kxy = r.keypoints.xy.cpu().numpy()                      # (inst, kp, 2)
-                kconf = (r.keypoints.conf.cpu().numpy()
-                         if r.keypoints.conf is not None else None)     # (inst, kp)
-                ts = fi / fps
-                sec = int(ts)
-                for inst in range(kxy.shape[0]):
-                    for ki, name in enumerate(keypoint_names):
-                        if ki >= kxy.shape[1]:
-                            break
-                        x, y = float(kxy[inst, ki, 0]), float(kxy[inst, ki, 1])
-                        if x <= 0 and y <= 0:
-                            continue   # keypoint not present this instance
-                        c = float(kconf[inst, ki]) if kconf is not None else 1.0
-                        if c < confidence_threshold:
-                            continue
-                        detections.setdefault(sec, set()).add(name)
-                        bboxes.append({
-                            'timestamp': float(ts),
-                            'objects': [name],
-                            'bboxes': [[max(0.0, x / W - box / 2),
-                                        max(0.0, y / H - box / 2), box, box]],
-                            'confidences': [c],
-                        })
-        fi += 1
-    cap.release()
-    if progress_fn:
-        progress_fn(total_seconds, total_seconds, "Object Detection", "Custom keypoints: done")
-    return {s: sorted(v) for s, v in detections.items()}, bboxes
 
 def _collapse_runs(items, fmt="{val} ×{n}", sep=", "):
     """['a','a','a','b','b'] -> 'a ×3, b ×2' (collapses CONSECUTIVE repeats)."""
@@ -1172,21 +1093,24 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # Get list of objects to highlight from GUI or config
         highlight_objects = gui_config.get("highlight_objects", config.get("highlight_objects", []))
 
+        # Advanced tab: standard -> the stock detector, custom -> the user's own
+        # model alone, custom_mixed -> both. Key names predate the YOLOX switch
+        # and are kept so saved configs and the web UI keep working.
+        yolo_type = str(gui_config.get("yolo_type", "standard"))
         yolo_model_size = str(gui_config.get("yolo_model_size") or "n").lower()
-        openvino_model_folder = gui_config.get(
-            "openvino_model_folder",
-            f"yolo11{yolo_model_size}_openvino_model/"
-        )
-        yolo_pt_path = gui_config.get("yolo_pt_path", f"yolo11{yolo_model_size}.pt")
-
-
-        # Also update the default PT path based on model size
-        default_pt_path = f"yolo11{yolo_model_size}.pt"
-        log(f"🎯 YOLO model size: {yolo_model_size} (using {default_pt_path})")
+        custom_model_path = gui_config.get("yolo_custom_model_path") or ""
+        object_mode = ("custom" if yolo_type == "custom"
+                       else "mixed" if "custom" in yolo_type else "coco")
+        log(f"🎯 Object detector: {object_mode}, size {yolo_model_size}"
+            + (f" (+ {os.path.basename(custom_model_path)})"
+               if custom_model_path and object_mode != "coco" else ""))
 
         # Check OpenVINO devices (best-effort)
         try:
-            from openvino.runtime import Core
+            try:                          # OpenVINO >= 2024 dropped openvino.runtime
+                from openvino import Core
+            except ImportError:
+                from openvino.runtime import Core
             ie = Core()
             log(f"🔹 OpenVINO available devices: {ie.available_devices}")
         except ImportError:
@@ -1194,82 +1118,46 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         except Exception as e:
             log(f"⚠️ OpenVINO device check failed: {e}")
 
-        # Export model to OpenVINO if missing
-        if not os.path.exists(openvino_model_folder):
-            try:
-                check_cancellation(cancel_flag, log, "YOLO model export")
-                log(f"⚠️ OpenVINO folder not found. Exporting YOLO model (requires {default_pt_path})...")
-                
-                # Use the PT path from config, or fall back to default based on model size
-                yolo_pt_path = gui_config.get("yolo_pt_path", default_pt_path)
-                yolo_model_export = YOLO(yolo_pt_path)
-                export_result = yolo_model_export.export(format="openvino")
-                log(f"✅ Model exported to: {export_result}")
-            except RuntimeError:
-                return None
-            except Exception as e:
-                log(f"❌ YOLO export to OpenVINO failed: {e}")
-
-        # Load YOLO model — YOLO-World or Standard YOLO
+        yolo_model = None  # legacy variable name; holds a Detector backend
+        object_class_names = []
         try:
-            check_cancellation(cancel_flag, log, "YOLO model loading")
-            
-            yolo_type = gui_config.get("yolo_type", "standard")
-            
+            check_cancellation(cancel_flag, log, "object detector loading")
+            from modules.detection_backend import build_object_detector
+
             if "yolo_world" in yolo_type:
-                # YOLO-World: open-vocabulary detection (no OpenVINO support)
-                from ultralytics import YOLOWorld
-                world_pt = f"yolov8{yolo_model_size}-worldv2.pt"
-                log(f"🌍 Loading YOLO-World model: {world_pt}")
-                yolo_model = YOLOWorld(world_pt)
-                
-                # Set classes from user's object list
-                if highlight_objects:
-                    yolo_model.set_classes(highlight_objects)
-                    log(f"🌍 YOLO-World classes set to: {highlight_objects}")
-                else:
-                    log("⚠️ YOLO-World loaded but no objects specified — nothing will be detected")
-                
-                # Move to GPU if available
+                log("⚠️ Open-vocabulary detection is no longer part of this "
+                    "detector — using the standard one")
+            if object_mode != "coco" and custom_model_path.lower().endswith(".pt"):
+                log(f"⚠️ {os.path.basename(custom_model_path)} is a .pt model, "
+                    "which this detector cannot load. Export it to ONNX, or "
+                    "train a model of your own in the app.")
+            prefer = "small" if yolo_model_size in ("n", "nano", "tiny") else "large"
+            if object_mode == "coco":
+                # AMD / NVIDIA: OpenVINO would run this on the processor, while
+                # ONNX Runtime's DirectML provider reaches the card.
                 from modules.device_utils import detect_best_device
-                devices = detect_best_device(log_fn=log)
-                if "cuda" in yolo_device:
-                    yolo_model.to(yolo_device)
-                    yolo_device_for_inference = yolo_device
-                    log(f"✅ YOLO-World loaded on {yolo_device}")
-                else:
-                    yolo_device_for_inference = "cpu"
-                    log(f"✅ YOLO-World loaded on CPU")
+                if getattr(detect_best_device(log_fn=log), "onnx_dml_yolo", False):
+                    from object_recognition import directml_detector
+                    yolo_model = directml_detector(prefer, log=log)
+                    if yolo_model is not None:
+                        from modules.detection_backend import load_class_names
+                        object_class_names = load_class_names("yolo_objects_labels.json")
+            if yolo_model is None:
+                yolo_model, object_class_names = build_object_detector(
+                    mode=object_mode, custom_model_xml=custom_model_path,
+                    device="AUTO", default_prefer=prefer,
+                    log=log, auto_install=True,
+                )
+            if yolo_model is None:
+                log("⚠️ Object detection unavailable — no usable model "
+                    "(run tools/get_yolox_model.py, or import a custom model)")
             else:
-                # Standard YOLO11 (supports OpenVINO)
-                from modules.device_utils import detect_best_device, resolve_yolo_device
-                devices = detect_best_device(log_fn=log)
-                # A DX12 card that torch cannot address still runs an ONNX
-                # export under ONNX Runtime. Detection is the heaviest
-                # per-frame stage, so this is where the GPU is worth having.
-                if getattr(devices, "onnx_dml_yolo", False):
-                    from modules import yolo_onnx
-                    dml_detector = yolo_onnx.load_detector(yolo_pt_path, log=log)
-                else:
-                    dml_detector = None
-
-                if dml_detector is not None:
-                    yolo_model = dml_detector
-                    yolo_device_for_inference = "cpu"
-                elif devices.use_openvino_yolo:
-                    yolo_model = YOLO(openvino_model_folder, task="detect")
-                    yolo_device_for_inference = "cpu"
-                    log(f"✅ YOLO OpenVINO model loaded (OpenVINO manages device)")
-                else:
-                    yolo_model = YOLO(yolo_pt_path)
-                    yolo_model.to(devices.yolo_pt_device)
-                    yolo_device_for_inference = devices.yolo_pt_device
-                    log(f"✅ YOLO .pt model loaded on {yolo_device_for_inference}")
-
+                log(f"✅ Object detector: {type(yolo_model).__name__}, "
+                    f"{len(object_class_names)} classes")
         except RuntimeError:
             return None
         except Exception as e:
-            log(f"❌ Failed to load YOLO model: {e}")
+            log(f"❌ Failed to load object detector: {e}")
             yolo_model = None
 
         # --- Object detection ---
@@ -1298,51 +1186,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             else:
                 frame_skip_for_obj = gui_config.get("object_frame_skip", CLIP_TIME if CLIP_TIME > 0 else 5)
                 object_detections, object_bboxes_cache = {}, []
-                custom_only = (yolo_type == "custom")
-                use_custom = "custom" in yolo_type
-
-                # --- Custom model (object detector OR keypoint model) ---
-                if use_custom:
-                    cm = gui_config.get("yolo_custom_model_path")
-                    if cm and os.path.exists(cm):
-                        from ultralytics import YOLO as _YOLO
-                        custom_model = _YOLO(str(cm))
-                        c_conf = float(gui_config.get("object_confidence", 0.3))
-                        if getattr(custom_model, "task", "") == "detect":
-                            # Custom object detector -> standard object detection path
-                            want = highlight_objects or list(custom_model.names.values())
-                            log(f"🧩 Custom object detector: {os.path.basename(cm)} {want}")
-                            c_det, c_bb = run_object_detection_single(
-                                processed_video_path, custom_model, want,
-                                log_fn=log_fn, progress_fn=progress_fn,
-                                frame_skip=frame_skip_for_obj, cancel_flag=cancel_flag,
-                                device=yolo_device, confidence_threshold=c_conf,
-                                preview_fn=preview_fn,
-                            )
-                        else:
-                            # Custom keypoint/pose model -> keypoint path
-                            try:
-                                from modules.app_paths import custom_keypoint_names
-                                kp_names = custom_keypoint_names() or highlight_objects
-                            except Exception:
-                                kp_names = highlight_objects
-                            log(f"🧩 Custom keypoint model: {os.path.basename(cm)} {kp_names}")
-                            c_det, c_bb = run_keypoint_detection(
-                                processed_video_path, cm, kp_names,
-                                frame_skip=frame_skip_for_obj, confidence_threshold=c_conf,
-                                log=log, cancel_flag=cancel_flag, progress_fn=progress_fn,
-                            )
-                        for sec, names in c_det.items():
-                            object_detections.setdefault(sec, [])
-                            object_detections[sec] = sorted(set(object_detections[sec]) | set(names))
-                        object_bboxes_cache += c_bb
-                        log(f"✅ Custom model: {sum(len(v) for v in c_det.values())} hits "
-                            f"over {len(c_det)} seconds")
-                    else:
-                        log(f"⚠️ Custom model path not found: {cm}")
-
-                # --- Standard / YOLO-World object detection (skipped for custom-only) ---
-                if not custom_only:
+                # Custom and mixed models are already folded into yolo_model
+                if yolo_model is not None:
                     draw_object_boxes = gui_config.get("draw_object_boxes", False)
                     object_annotated_path = None
                     if draw_object_boxes:

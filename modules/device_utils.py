@@ -11,6 +11,7 @@ One source of truth for all device strings passed to:
 """
 
 import os
+import re
 
 from modules import cuda_check
 
@@ -36,6 +37,11 @@ try:
     from modules import ort_directml as _ort_dml
 except Exception:  # noqa: BLE001
     _ort_dml = None
+
+
+# Trailing "(dGPU)" / "(iGPU)" style suffixes, stripped when matching names
+# across runtimes in describe_devices().
+_RE_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")
 
 
 def preferred_backend():
@@ -471,6 +477,89 @@ class DeviceInfo:
 # ---------------------------------------------------------------------------
 # Internal
 # ---------------------------------------------------------------------------
+
+def describe_devices() -> list:
+    """Every compute device present, named, with what can drive it.
+
+    Separate from :func:`detect_best_device`, which answers "what should the
+    pipeline use". This answers "what is in this machine" -- the question
+    somebody asks when they want to confirm a training run is about to use the
+    card they think it is. A box with an integrated Xe *and* a discrete Arc has
+    two Intel GPUs, and only the full name tells them apart.
+
+    Returns a list of strings. Never raises.
+    """
+    # {normalised name: [display name, [drivers]]}. Normalised because each
+    # runtime names the same card differently -- OpenVINO appends "(dGPU)" and
+    # torch does not -- and listing one physical GPU twice defeats the purpose.
+    found: dict = {}
+
+    def note(name: str, driver: str) -> None:
+        name = " ".join(str(name).split())      # OpenVINO pads its names
+        if not name:
+            return
+        key = _RE_SUFFIX.sub("", name).strip().casefold()
+        entry = found.setdefault(key, [name, []])
+        if len(name) > len(entry[0]):
+            entry[0] = name                     # keep the most descriptive form
+        if driver not in entry[1]:
+            entry[1].append(driver)
+
+    # torch FIRST. Creating an OpenVINO Core initialises its GPU plugin, after
+    # which torch.xpu.device_count() reports 0 in the same process even though
+    # the card is perfectly fine -- so asking OpenVINO first loses the PyTorch
+    # XPU annotation entirely. Measured on an Arc A750.
+    if _TORCH_AVAILABLE:
+        try:
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    note(torch.cuda.get_device_name(i), "PyTorch CUDA")
+        except Exception:
+            pass
+        try:
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                # device_count() has been seen returning 0 while is_available()
+                # is True, so trust the latter and look at the first device.
+                for i in range(max(1, torch.xpu.device_count())):
+                    note(torch.xpu.get_device_name(i), "PyTorch XPU")
+        except Exception:
+            pass
+
+    # OpenVINO second. It reports FULL_DEVICE_NAME, which distinguishes dGPU
+    # from iGPU, and it sees cards torch cannot: the released build ships a
+    # CUDA torch wheel on which torch.xpu.is_available() is False even on an
+    # Arc, and OpenVINO is then the only runtime that can name the hardware.
+    try:
+        from openvino import Core
+        core = Core()
+        for device in core.available_devices:
+            if device == "CPU" or device.startswith("CPU."):
+                continue
+            try:
+                note(core.get_property(device, "FULL_DEVICE_NAME"), f"OpenVINO {device}")
+            except Exception:
+                note(device, "OpenVINO")
+    except Exception as e:
+        _warn(f"OpenVINO device listing failed: {e}")
+
+    # DirectML last. It is the one runtime here that can name an AMD card, so
+    # without it an AMD box answers this question with an empty list and the
+    # training panel says "no GPU found" next to a working graphics card. Last
+    # rather than first for the same reason OpenVINO is not first: importing an
+    # accelerator runtime can disturb the ones probed after it, and this one is
+    # the least load-bearing, so it pays that cost instead of imposing it.
+    #
+    # Names arrive already deduplicated against the other runtimes by note(),
+    # so a card both torch and DirectML can see is listed once with both.
+    if _dml is not None and _dml.enabled():
+        try:
+            for i, name in enumerate(_dml.adapter_names()):
+                note(name, f"DirectML {i}" if i else "DirectML")
+        except Exception as e:  # noqa: BLE001
+            _warn(f"DirectML device listing failed: {e}")
+
+    return [f"{name} - {', '.join(drivers)}" for name, drivers in found.values()]
+
 
 def _warn(msg: str):
     print(f"⚠️ [device_utils] {msg}")

@@ -14,7 +14,7 @@ slightly different from before", which is much harder to notice.
 
 It does **not** exercise:
 
-- the ML models (YOLO, OpenVINO action recognition, Whisper, Resemblyzer)
+- the ML models (YOLOX, OpenVINO action recognition, Whisper, Resemblyzer)
 - GPU / hardware-dependent paths
 - the GUI (`main.py`)
 - FFmpeg cutting / concat
@@ -39,7 +39,7 @@ Expected: all green in <5 seconds.
 ## How it stays light
 
 `tests/conftest.py` installs `MagicMock` shims for `cv2`, `torch`, `whisper`,
-`googletrans`, `ultralytics`, `openvino`, and friends **before** any test
+`googletrans`, `openvino`, and friends **before** any test
 imports the modules under test. So `pip install -r requirements.txt`
 (~1.9 GB) is not required to run the suite — only pytest + numpy.
 

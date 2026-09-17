@@ -1,7 +1,6 @@
 import cv2
 import os
 import csv
-from ultralytics import YOLO
 from tqdm import tqdm
 from multiprocessing import Process, Manager
 import time
@@ -12,7 +11,7 @@ from modules.device_utils import resolve_device
 # ---------------- CONFIG ----------------
 NUM_WORKERS = 4
 FRAME_SKIP = 5
-openvino_model_folder = "yolo11n_openvino_model/"  # Default, will be overridden
+openvino_model_folder = None  # legacy setting, unused: the detector is YOLOX IR
 highlight_objects = []  # Add your objects of interest here, e.g., ["person", "car"]
 
 # Bounding box visualization settings
@@ -61,7 +60,7 @@ def detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes=False,
     
     Args:
         frame: Input frame
-        model: YOLO model
+        model: a Detector (modules.detection_backend) — anything with .detect(frame)
         objects_of_interest: List of object classes to detect
         draw_boxes: If True, draw bounding boxes on the frame
         confidence_threshold: Minimum confidence to accept a detection
@@ -75,61 +74,106 @@ def detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes=False,
     annotated_frame = frame.copy() if draw_boxes else None
     
     try:
-        results = model(frame, verbose=False, imgsz=640)
-        for result in results:
-            if result.boxes is not None:
-                for box in result.boxes:
-                    cls_id = int(box.cls[0])
-                    cls_name = model.names[cls_id]
-                    conf = float(box.conf[0])
-                    
-                    if conf > confidence_threshold and cls_name in objects_of_interest:
-                        objs.append(cls_name)
-                        # Store raw pixel coords for cache
-                        x1p, y1p, x2p, y2p = box.xyxy[0].cpu().numpy().astype(int)
-                        bbox_data.append((int(x1p), int(y1p), int(x2p), int(y2p), float(conf)))
-                        
-                        if draw_boxes:
-                            # Get bounding box coordinates
-                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                            
-                            # Choose color for this object class
-                            color = BBOX_COLORS.get(cls_name, BBOX_COLORS['default'])
-                            
-                            # Draw rectangle
-                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, BBOX_THICKNESS)
-                            
-                            # Prepare label text
-                            label = f"{cls_name} {conf:.2f}"
-                            
-                            # Get text size for background
-                            (text_width, text_height), baseline = cv2.getTextSize(
-                                label, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, FONT_THICKNESS
-                            )
-                            
-                            # Draw background rectangle for text
-                            cv2.rectangle(
-                                annotated_frame,
-                                (x1, y1 - text_height - baseline - 5),
-                                (x1 + text_width, y1),
-                                color,
-                                -1  # Filled
-                            )
-                            
-                            # Draw text
-                            cv2.putText(
-                                annotated_frame,
-                                label,
-                                (x1, y1 - baseline - 2),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                FONT_SCALE,
-                                (255, 255, 255),  # White text
-                                FONT_THICKNESS
-                            )
+        for detection in model.detect(frame):
+            cls_name = str(detection.class_name)
+            conf = float(detection.confidence)
+            if conf <= confidence_threshold or cls_name not in objects_of_interest:
+                continue
+            objs.append(cls_name)
+            x1, y1 = int(detection.x1), int(detection.y1)
+            x2, y2 = int(detection.x2), int(detection.y2)
+            # Store raw pixel coords for cache
+            bbox_data.append((x1, y1, x2, y2, conf))
+
+            if draw_boxes:
+                color = BBOX_COLORS.get(cls_name, BBOX_COLORS['default'])
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, BBOX_THICKNESS)
+                label = f"{cls_name} {conf:.2f}"
+                (text_width, text_height), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, FONT_SCALE, FONT_THICKNESS
+                )
+                # Filled background behind the label text
+                cv2.rectangle(
+                    annotated_frame,
+                    (x1, y1 - text_height - baseline - 5),
+                    (x1 + text_width, y1),
+                    color,
+                    -1
+                )
+                cv2.putText(
+                    annotated_frame,
+                    label,
+                    (x1, y1 - baseline - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    FONT_SCALE,
+                    (255, 255, 255),  # White text
+                    FONT_THICKNESS
+                )
     except Exception as e:
         print(f"⚠️ Error in detection: {e}")
     
     return objs, annotated_frame, bbox_data
+
+def directml_detector(prefer="large", log=print):
+    """The stock YOLOX detector on ONNX Runtime's DirectML provider, or None.
+
+    OpenVINO only accelerates Intel GPUs; on an AMD or NVIDIA card it runs the
+    detector on the processor. Where ``device_utils`` reports that ONNX Runtime
+    can reach the GPU (``onnx_dml_yolo``), the same YOLOX export runs there
+    instead. Any failure returns None and the caller uses OpenVINO.
+    """
+    try:
+        import sys
+        from modules import ort_directml, yolox_models
+        from modules.detection_backend import YoloxOnnxRuntimeDetector, load_class_names
+        onnx_path = yolox_models.find_onnx(prefer)
+        if not onnx_path and not getattr(sys, "frozen", False):
+            yolox_models.install(log=log)
+            onnx_path = yolox_models.find_onnx(prefer)
+        names = load_class_names("yolo_objects_labels.json")
+        if not onnx_path or not names:
+            return None
+        session = ort_directml.session(onnx_path)
+        detector = YoloxOnnxRuntimeDetector(session, names)
+        log(f"✅ Object detector: YOLOX on {ort_directml.session_backend(session)} "
+            f"({os.path.basename(onnx_path)})")
+        return detector
+    except Exception as e:
+        log(f"⚠️ DirectML detector unavailable, using OpenVINO: {e}")
+        return None
+
+
+def _wants_directml(log=print):
+    try:
+        from modules.device_utils import detect_best_device
+        return bool(getattr(detect_best_device(log_fn=lambda *_a: None), "onnx_dml_yolo", False))
+    except Exception:
+        return False
+
+
+def load_detector(model_path=None, model_size="n", device="AUTO", log=print):
+    """The YOLOX object detector for a size, or a user's own model when
+    ``model_path`` points at an .onnx/.xml. Returns None when nothing is usable.
+
+    Fetches the stock models on first use from a source checkout, the way the
+    previous detector downloaded its weights on demand.
+    """
+    from modules.detection_backend import build_object_detector
+    custom = bool(model_path) and os.path.exists(str(model_path)) and         str(model_path).lower().endswith((".onnx", ".xml"))
+    prefer = "small" if str(model_size).lower() in ("n", "nano", "tiny") else "large"
+    if not custom and _wants_directml():
+        detector = directml_detector(prefer, log=log)
+        if detector is not None:
+            return detector
+    detector, _names = build_object_detector(
+        mode="custom" if custom else "coco",
+        custom_model_xml=str(model_path) if custom else "",
+        device=device,
+        default_prefer=prefer,
+        log=log, auto_install=True,
+    )
+    return detector
+
 
 def get_video_segments(video_path, num_segments):
     cap = cv2.VideoCapture(video_path)
@@ -151,22 +195,12 @@ def worker_process(video_path, start_frame, end_frame, objects_of_interest, retu
     """
     Worker process for object detection
     """
-    device = resolve_device(device)
-    # Load model based on device
-    if "cuda" in device:
-        model = YOLO(model_path)
-        model.to(device)
-        print(f"Worker {worker_id}: Loaded YOLO .pt model on {device}")
-    elif openvino_folder and os.path.exists(openvino_folder):
-        try:
-            model = YOLO(openvino_folder, task="detect")
-            print(f"Worker {worker_id}: Loaded OpenVINO model from {openvino_folder}")
-        except Exception as e:
-            print(f"Worker {worker_id}: Failed to load OpenVINO model, falling back to PT: {e}")
-            model = YOLO(model_path)
-    else:
-        model = YOLO(model_path)
-    
+    model = load_detector(model_path, device="AUTO")
+    if model is None:
+        print(f"Worker {worker_id}: no object detector available")
+        return
+    print(f"Worker {worker_id}: loaded {type(model).__name__}")
+
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     
@@ -246,7 +280,7 @@ def run_object_detection_single(video_path, model, highlight_objects, log_fn=pri
 
     Args:
         video_path: Path to input video
-        model: Pre-loaded YOLO model instance
+        model: Pre-loaded Detector instance
         highlight_objects: List of object classes to detect
         log_fn: Logging function
         progress_fn: Progress callback (current, total, task, details)
@@ -262,7 +296,7 @@ def run_object_detection_single(video_path, model, highlight_objects, log_fn=pri
         tuple: (sec_objects dict, object_bboxes_cache list)
     """
     if model is None:
-        log_fn("⚠️ No YOLO model available, skipping object detection")
+        log_fn("⚠️ No object detector available, skipping object detection")
         return {}, []
 
     cap = cv2.VideoCapture(video_path)
@@ -448,9 +482,9 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
         progress_fn: Progress callback function
         draw_boxes: If True, create annotated video with bounding boxes
         annotated_output: Path for annotated video output (only used if draw_boxes=True)
-        yolo_model_size: YOLO model size ('n', 's', 'm', 'l', 'x')
-        yolo_pt_path: Custom path to YOLO .pt file (optional, overrides default)
-        openvino_model_folder: Custom path to OpenVINO model folder (optional)
+        yolo_model_size: detector size ('n' picks the small model, others the large)
+        yolo_pt_path: path to a custom .onnx/.xml detector (optional, overrides default)
+        openvino_model_folder: unused, kept for callers
         device: Device for inference
         cancel_flag: threading.Event for cancellation support
         log_fn: Logging function
@@ -478,21 +512,17 @@ def run_object_detection(video_path, highlight_objects, frame_skip=5, csv_file="
     global FRAME_SKIP
     FRAME_SKIP = frame_skip
 
-    # Determine model paths based on parameters
-    if yolo_pt_path and os.path.exists(yolo_pt_path):
-        model_path = yolo_pt_path
-        log_fn(f"🎯 Using custom YOLO model: {model_path}")
+    # A custom .onnx/.xml detector when one is given, else the stock YOLOX
+    model_path = yolo_pt_path if yolo_pt_path and os.path.exists(yolo_pt_path) else None
+    if model_path:
+        log_fn(f"🎯 Using custom model: {model_path}")
     else:
-        model_path = f"yolo11{yolo_model_size}.pt"
-        log_fn(f"🎯 Using YOLO model: {model_path} (size: {yolo_model_size})")
-    
-    # Determine OpenVINO folder
-    if openvino_model_folder and os.path.exists(openvino_model_folder):
-        openvino_folder = openvino_model_folder
-        log_fn(f"🎯 Using OpenVINO model folder: {openvino_folder}")
-    else:
-        openvino_folder = f"yolo11{yolo_model_size}_openvino_model/"
-        log_fn(f"🎯 Using default OpenVINO folder: {openvino_folder}")
+        log_fn(f"🎯 Using YOLOX detector (size: {yolo_model_size})")
+    openvino_folder = None
+    # Fetch the stock models once here, not in four workers at the same time
+    if load_detector(model_path, yolo_model_size, log=log_fn) is None:
+        log_fn("⚠️ No object detector available, skipping object detection")
+        return {}, []
 
     log_fn(f"🔍 Confidence threshold: {confidence_threshold}")
 

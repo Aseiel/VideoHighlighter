@@ -77,6 +77,9 @@ jobs:
           pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
           pip install openvino==2026.2.1
           pip install -r requirements.txt
+          # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
+          # its declared requirements would let pip replace the torch above.
+          pip install yolox==0.3.0 --no-deps
           pip install pyinstaller
       - name: Verify key packages
         run: |
@@ -92,6 +95,11 @@ jobs:
         # served by the sm_8x kernels) and RTX 50.
         run: |
           python -c "import torch; flags = torch._C._cuda_getArchFlags().split(); print('CUDA archs:', ' '.join(flags)); missing = [a for a in ('sm_61', 'sm_75', 'sm_86', 'sm_120') if a not in flags]; assert not missing, 'torch build lacks ' + ', '.join(missing)"
+      - name: Fetch YOLOX detector models (Apache-2.0)
+        # models/yolox/ is gitignored (downloaded, not committed). Without this
+        # the packaged app has no object detector, and a frozen build never
+        # downloads one itself. Bundled via --add-data "models;models".
+        run: python tools/get_yolox_model.py
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
       - name: Build EXE
@@ -126,11 +134,14 @@ jobs:
           --hidden-import PySide6.QtQuickWidgets
           --hidden-import PySide6.QtMultimedia
           --collect-submodules whisper
-          --collect-submodules ultralytics
+          --collect-submodules yolox
+          --collect-submodules model_hub
+          --collect-submodules huggingface_hub
+          --collect-submodules keyring
+          --copy-metadata keyring
           --collect-all openvino
           --collect-all onnxruntime
           --collect-data whisper
-          --collect-data ultralytics
           --collect-binaries imageio_ffmpeg
           --hidden-import llm.clip_prefilter
           --additional-hooks-dir packaging/pyinstaller-hooks
@@ -261,11 +272,19 @@ jobs:
           pip install openvino==2026.2.1
           pip install -r requirements.txt
           pip install -r sidecar/requirements.txt
+          # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
+          # its declared requirements would let pip replace the torch above.
+          pip install yolox==0.3.0 --no-deps
           pip install pyinstaller
       - name: Check the CUDA build covers every supported GPU generation
         # Same guard as the Qt build: the sidecar bundles the same CUDA torch.
         run: |
           python -c "import torch; flags = torch._C._cuda_getArchFlags().split(); print('CUDA archs:', ' '.join(flags)); missing = [a for a in ('sm_61', 'sm_75', 'sm_86', 'sm_120') if a not in flags]; assert not missing, 'torch build lacks ' + ', '.join(missing)"
+      - name: Fetch YOLOX detector models (Apache-2.0)
+        # models/yolox/ is gitignored (downloaded, not committed). Without this
+        # the packaged app has no object detector, and a frozen build never
+        # downloads one itself. Bundled via --add-data "models;models".
+        run: python tools/get_yolox_model.py
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
       - name: Build the sidecar
@@ -332,7 +351,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
+          # its declared requirements would let pip replace the torch above.
+          pip install yolox==0.3.0 --no-deps
           pip install pyinstaller
+      - name: Fetch YOLOX detector models (Apache-2.0)
+        # models/yolox/ is gitignored (downloaded, not committed). Without this
+        # the packaged app has no object detector, and a frozen build never
+        # downloads one itself. Bundled via --add-data "models;models".
+        run: python tools/get_yolox_model.py
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
       - name: Give OpenVINO a libtbb that codesign accepts
@@ -429,10 +456,13 @@ jobs:
             --hidden-import PySide6.QtQuickWidgets \
             --hidden-import PySide6.QtMultimedia \
             --collect-submodules whisper \
-            --collect-submodules ultralytics \
+            --collect-submodules yolox \
+            --collect-submodules model_hub \
+            --collect-submodules huggingface_hub \
+            --collect-submodules keyring \
+            --copy-metadata keyring \
             --collect-all openvino \
             --collect-data whisper \
-            --collect-data ultralytics \
             --collect-binaries imageio_ffmpeg \
             --hidden-import llm.clip_prefilter \
             --additional-hooks-dir packaging/pyinstaller-hooks \

@@ -25,15 +25,17 @@ fast and reliable about.
 
 ---
 
-## 1. Object recognition (YOLO)
+## 1. Object recognition (YOLOX)
 
 **Answers:** where is this thing, right now, in this frame.
 
 **Speed:** real time.
 
 **Vocabulary:** the 80 COCO classes out of the box, plus any model you train
-and import. Runs a `.pt` model directly or an OpenVINO export (`yolo11n_
-openvino_model/` by default), whichever you point it at.
+in the app (the Train tab) or import as `.onnx` / OpenVINO `.xml`. The stock
+models download on first use into `models/yolox/`. Runs on OpenVINO; on an AMD
+or NVIDIA card the stock detector runs through ONNX Runtime's DirectML
+provider instead.
 
 **Strengths.** Precise boxes, stable confidence, cheap enough to run over a
 whole video. Because it emits boxes it can *count*, and counting is exact:
@@ -218,10 +220,12 @@ When no engine above can see your subject, you train a detector. Briefly:
 - **If two architectures score the same, you are data-limited, not
   model-limited.** Stop swapping backbones; fix the data.
 
-**On licensing:** this edition is AGPL-3.0 and uses ultralytics YOLO, which is
-also AGPL-3.0, so you can train and ship models with the ultralytics tooling
-freely — as long as whatever you distribute is AGPL too. That is the normal
-case here and needs no special handling.
+**On licensing:** detection and training here are YOLOX (Apache-2.0), and the
+app deliberately depends on no AGPL detector. That is what lets a model you
+train be shared and used by anyone, in any build: a model trained with an AGPL
+toolkit inherits that licence, and the app's model packages refuse a detector
+whose output layout is not YOLOX's. When you share a model, share the model —
+never the frames, clips or audio it was trained on.
 
 ---
 

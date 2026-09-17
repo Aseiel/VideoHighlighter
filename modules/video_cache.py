@@ -36,10 +36,10 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
     range_end = gui_config.get("range_end", None)
     range_end = int(range_end) if range_end is not None else None
 
-    # YOLO settings
+    # Detector settings (key names predate the YOLOX switch)
     yolo_model_size = str(gui_config.get("yolo_model_size") or "n").lower()
-    openvino_model_folder = gui_config.get("openvino_model_folder", f"yolo11{yolo_model_size}_openvino_model/")
-    yolo_pt_path = gui_config.get("yolo_pt_path", f"yolo11{yolo_model_size}.pt")
+    yolo_type = str(gui_config.get("yolo_type") or "standard")
+    custom_model_path = gui_config.get("yolo_custom_model_path") or ""
 
     params = {
         # bump this when you change the meaning/format of cached analysis
@@ -61,10 +61,12 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
         "action_use_person_detection": True,
         "action_max_people": int(gui_config.get("action_max_people", 2) or 2),
 
-        # yolo identity
+        # detector identity — "object_detector" changed from the earlier
+        # detector, so detections cached by it are recomputed, not reused
+        "object_detector": "yolox",
         "yolo_model_size": yolo_model_size,
-        "yolo_pt_path": str(yolo_pt_path),
-        "openvino_model_folder": str(openvino_model_folder),
+        "yolo_type": yolo_type,
+        "yolo_custom_model_path": str(custom_model_path) if "custom" in yolo_type else "",
 
         # time-range
         "use_time_range": use_time_range,

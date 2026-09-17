@@ -9,9 +9,9 @@ import queue
 import time
 import argparse
 from collections import Counter, deque
-from ultralytics import YOLO
 import concurrent.futures
 import os
+import sys
 import gc
 import re
 
@@ -821,13 +821,44 @@ class AsyncBatchedInferenceEngine:
 
 
 # =============================
-# PARALLEL YOLO DETECTOR - OPTIMIZED
+# PARALLEL PERSON DETECTOR - YOLOX (Apache-2.0) BACKED
 # =============================
 class ParallelYOLODetector:
-    """Parallel YOLO detection with frame skipping"""
+    """Parallel person detection with frame skipping, backed by the
+    permissive YOLOX/OpenVINO detector (modules.detection_backend).
 
-    def __init__(self, model_name="yolo11n.pt", num_workers=2, skip_frames=4):
-        self.model = YOLO(model_name)
+    detect_async() feeds frames (every `skip_frames`-th is actually inferred,
+    in a worker thread) and get_latest_detections() returns the last known
+    person boxes, so the AR loop and the live preview never block on detection.
+    """
+
+    PERSON_CONF = 0.40
+
+    def __init__(self, model_name=None, num_workers=2, skip_frames=4,
+                 device="AUTO"):
+        from modules.detection_backend import (
+            YoloxOpenVINODetector, find_default_yolox_ir,
+        )
+        model_xml = model_name or find_default_yolox_ir(prefer="small")
+        if not model_xml and not getattr(sys, "frozen", False):
+            try:
+                from modules import yolox_models
+                print("⬇️ First run: fetching the YOLOX person detector (Apache-2.0)…")
+                yolox_models.install()
+                model_xml = find_default_yolox_ir(prefer="small")
+            except Exception as e:
+                print(f"⚠️ Could not fetch the YOLOX detector: {e}")
+        if not model_xml or not os.path.exists(model_xml):
+            raise FileNotFoundError(
+                f"YOLOX IR not found ({model_xml!r}). "
+                "Run tools/get_yolox_model.py to install one."
+            )
+        # Person-only detector: class 0 in COCO ordering.
+        self.model = YoloxOpenVINODetector(
+            model_xml, class_names=["person"], device=device,
+            score_thr=self.PERSON_CONF,
+        )
+        self.model_xml = model_xml
         self.skip_frames = skip_frames
         self.frame_counter = 0
         self.last_detections = None
@@ -859,18 +890,22 @@ class ParallelYOLODetector:
 
     def _detect_sync(self, frame):
         try:
-            results = self.model.predict(frame, conf=0.40, classes=[0],
-                                         verbose=False, imgsz=640)
+            h, w = frame.shape[:2]
             boxes = []
-            for r in results:
-                for b in r.boxes:
-                    x1, y1, x2, y2 = map(int, b.xyxy[0])
+            for det in self.model.detect(frame):
+                if det.class_id != 0:  # COCO person
+                    continue
+                x1 = max(0, min(int(det.x1), w - 1))
+                y1 = max(0, min(int(det.y1), h - 1))
+                x2 = max(0, min(int(det.x2), w - 1))
+                y2 = max(0, min(int(det.y2), h - 1))
+                if x2 > x1 and y2 > y1:
                     boxes.append((x1, y1, x2, y2))
             with self.detection_lock:
                 self.last_detections = boxes
             return boxes
         except Exception as e:
-            print(f"YOLO detection error: {e}")
+            print(f"Person detection error: {e}")
             return []
 
     def get_latest_detections(self):
@@ -1469,15 +1504,20 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     action_detector = None
 
     if use_person_detection:
-        print(f"🔍 Initializing parallel YOLO with {yolo_workers} workers "
-              f"(skip: {yolo_skip_frames})...")
-        yolo_detector = ParallelYOLODetector(
-            model_name="yolo11n.pt",
-            num_workers=yolo_workers,
-            skip_frames=yolo_skip_frames
-        )
-        person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=10)
-        action_detector = SmartActionDetector(sticky_frames=15)
+        try:
+            yolo_detector = ParallelYOLODetector(
+                num_workers=yolo_workers,
+                skip_frames=yolo_skip_frames,
+            )
+            person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=10)
+            action_detector = SmartActionDetector(sticky_frames=15)
+            print(f"🔍 Person detector: YOLOX/OpenVINO "
+                  f"({os.path.basename(yolo_detector.model_xml)}, "
+                  f"{yolo_workers} workers, skip: {yolo_skip_frames})")
+        except FileNotFoundError as e:
+            print(f"⚠️ {e}")
+            print("⚠️ Falling back to full-frame action classification (no person ROIs)")
+            use_person_detection = False
 
     # ---- Open video ----
     cap = cv2.VideoCapture(video_path)

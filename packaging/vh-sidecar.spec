@@ -1,7 +1,7 @@
 # PyInstaller spec for the FastAPI sidecar bundled into the Tauri app.
 #
 # The sidecar imports the same engine as main.py (pipeline -> torch/cv2/whisper/
-# ultralytics/openvino), so the collection flags mirror .github/workflows/
+# yolox/openvino), so the collection flags mirror .github/workflows/
 # build-release.yaml. Differences from the Qt build:
 #   * console app, not --windowed: it's a child process, never user-facing, and
 #     its stdout is piped to the Tauri log.
@@ -64,12 +64,11 @@ hiddenimports = [
 ]
 
 hiddenimports += collect_submodules("whisper")
-hiddenimports += collect_submodules("ultralytics")
+hiddenimports += collect_submodules("yolox")
 hiddenimports += collect_submodules("optimum")
 hiddenimports += collect_submodules("transformers")
 
 datas += collect_data_files("whisper")
-datas += collect_data_files("ultralytics")
 datas += collect_data_files("transformers")
 
 # transformers/optimum read their own versions via importlib.metadata at import.

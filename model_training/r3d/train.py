@@ -22,7 +22,7 @@ Options:
     --freeze-backbone   Only train the FC head, freeze 3D-CNN layers
     --no-amp            Disable mixed precision (use FP32)
     --no-onnx           Skip ONNX export after training
-    --no-cache          Disable ROI cache (slow — runs YOLO every epoch)
+    --no-cache          Disable ROI cache (slow — runs the person detector every epoch)
     --rebuild-cache     Force rebuild ROI cache even if one exists
     --num-workers       DataLoader workers (default: 4, 0 = single-process)
     --no-viz            Skip sample visualizations before training
@@ -323,7 +323,7 @@ def main():
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--no-onnx", action="store_true")
     parser.add_argument("--no-cache", action="store_true",
-                        help="Disable ROI cache (slow — runs YOLO every epoch)")
+                        help="Disable ROI cache (slow — runs the person detector every epoch)")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="DataLoader workers (default: 4)")
     parser.add_argument("--rebuild-cache", action="store_true",
@@ -392,7 +392,7 @@ def main():
 
     if CONFIG.get("use_adaptive_cropping") and CONFIG.get("use_pose_guided_crop"):
         pose_ext = PoseExtractor(
-            CONFIG.get("pose_model", "yolo11n-pose.pt"),
+            CONFIG.get("pose_model"),
             CONFIG.get("pose_conf_threshold", 0.3),
         )
 
@@ -423,7 +423,7 @@ def main():
         train_ds.roi_cache = roi_cache
         val_ds.roi_cache = roi_cache
     else:
-        print("\n⚠️  ROI cache DISABLED — training will be slow (YOLO runs every epoch)")
+        print("\n⚠️  ROI cache DISABLED — training will be slow (the person detector runs every epoch)")
 
     # ==============================
     # DataLoaders

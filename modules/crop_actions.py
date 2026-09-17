@@ -1,5 +1,4 @@
 import cv2
-from ultralytics import YOLO
 from collections import deque
 from pathlib import Path
 import numpy as np
@@ -3188,13 +3187,9 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
     # Load pose model if ROI detection with pose is enabled
     pose_model = None
     if USE_ROI_DETECTION and USE_POSE_FOR_ROI:
-        try:
-            print("🧍 Loading pose estimation model for ROI detection...")
-            pose_model = YOLO("yolo11s-pose.pt")
-            print("✅ Pose model loaded for ROI detection")
-        except Exception as e:
-            print(f"⚠️ Could not load pose model: {e}")
-            print("   Continuing without pose-based ROI detection")
+        # No permissively-licensed pose model is wired in yet; ROI detection
+        # runs on person boxes alone, which every pose check already tolerates.
+        print("ℹ️ Pose-based ROI detection unavailable — using person boxes")
 
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     
@@ -3513,20 +3508,15 @@ def main():
         print("   MAGENTA (255, 0, 255) - Final crop regions (fallback mode)")
         print("-" * 60)
 
-    print("📦 Loading YOLO model...")
-    yolo = YOLO("yolo11s.pt")
-    print("✅ YOLO model loaded")
+    print("📦 Loading person detector (YOLOX)...")
+    from modules.detection_backend import YoloxPeopleDetector
+    yolo = YoloxPeopleDetector()
+    print("✅ Person detector loaded")
 
     # Load pose model for activity analysis
     pose_model = None
     if USE_POSE_ESTIMATION or USE_ROI_DETECTION:
-        try:
-            print("🧍 Loading pose estimation model...")
-            pose_model = YOLO("yolo11s-pose.pt")
-            print("✅ Pose model loaded")
-        except Exception as e:
-            print(f"⚠️ Could not load pose model: {e}")
-            print("   Continuing without pose estimation")
+        print("ℹ️ Pose estimation unavailable — continuing with person boxes")
 
     video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.flv', '*.wmv']
     video_files = []

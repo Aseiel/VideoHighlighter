@@ -1940,28 +1940,33 @@ class VideoHighlighterGUI(QWidget):
         self.obj_frame_skip_spin.setToolTip("Analyze every Nth frame for object detection (higher = faster, less precise)")
 
         self.yolo_type_combo = QComboBox()
-        self.yolo_type_combo.addItem("Standard YOLO (80 objects)", "standard")
+        self.yolo_type_combo.addItem("Standard YOLOX (80 objects)", "standard")
 
-        # Pro v1 keeps pose/keypoints disabled until a permissive backend lands.
+        # Custom keypoint models are unsupported: their only trainer was AGPL.
         self._custom_pose_model = None
 
         self.yolo_model_combo = QComboBox()
 
         # Object model selector: standard COCO / Custom / Mixed, auto-discovered
-        # from models/custom/. Loaded natively by ultralytics; class names come
-        # from each model's own metadata.
+        # from models/custom/. Run by the YOLOX runtime; class names come from
+        # each model's metadata or the labels.json beside it.
         self.object_model_combo = QComboBox()
         self.object_model_combo.setToolTip(
             "Standard — the 80 COCO objects\n"
             "Custom — a model you trained (auto-detected from models/custom/)\n"
-            "Mixed — standard YOLO + your custom model together")
+            "Mixed — the standard detector + your custom model together")
 
         import_obj_btn = QPushButton("Import model…")
-        import_obj_btn.setToolTip("Copy a trained model (.pt / .onnx) into models/custom/")
+        import_obj_btn.setToolTip("Copy a trained model (.onnx / OpenVINO .xml) into models/custom/")
         obj_model_row = QHBoxLayout()
         obj_model_row.setContentsMargins(0, 0, 0, 0)
         obj_model_row.addWidget(self.object_model_combo, 1)
         obj_model_row.addWidget(import_obj_btn)
+        community_btn = QPushButton("Community models…")
+        community_btn.setToolTip(
+            "Browse and install small detectors other people trained and shared "
+            "(hosted on Hugging Face, checked before use)")
+        obj_model_row.addWidget(community_btn)
         self.object_model_widget = QWidget()
         self.object_model_widget.setLayout(obj_model_row)
 
@@ -1971,7 +1976,7 @@ class VideoHighlighterGUI(QWidget):
             from modules.app_paths import discover_object_models
             self.object_model_combo.blockSignals(True)
             self.object_model_combo.clear()
-            self.object_model_combo.addItem("Standard YOLO (80 objects)", ("standard", ""))
+            self.object_model_combo.addItem("Standard (80 objects)", ("standard", ""))
             models = []
             try:
                 models = discover_object_models()
@@ -1979,8 +1984,9 @@ class VideoHighlighterGUI(QWidget):
                 print(f"⚠️ object model discovery failed: {e}")
             for m in models:
                 n = len(m["classes"])
+                kind = "Community" if m.get("community") else "Custom"
                 self.object_model_combo.addItem(
-                    f"Custom — {m['name']} ({n} classes)", ("custom", m["path"]))
+                    f"{kind} — {m['name']} ({n} classes)", ("custom", m["path"]))
             for m in models:
                 n = len(m["classes"])
                 self.object_model_combo.addItem(
@@ -1994,24 +2000,37 @@ class VideoHighlighterGUI(QWidget):
             self.object_model_combo.blockSignals(False)
 
         def _import_object_model():
-            from modules.app_paths import object_models_dir
+            from modules.app_paths import import_object_model
             src, _ = QFileDialog.getOpenFileName(
                 self, "Import object detector model", "",
-                "YOLO models (*.pt *.onnx);;All files (*)")
+                "Detector models (*.onnx *.xml);;All files (*)")
             if not src:
                 return
-            dst_dir = object_models_dir()
             try:
-                os.makedirs(dst_dir, exist_ok=True)
-                import shutil
-                dst = os.path.join(dst_dir, os.path.basename(src))
-                shutil.copy2(src, dst)
+                dst = import_object_model(src)
                 _populate_object_models(select_type="custom", select_path=dst)
                 self.append_log(f"✅ Imported object model: {os.path.basename(dst)}")
             except Exception as e:
                 self.append_log(f"⚠️ Object model import failed: {e}")
 
         import_obj_btn.clicked.connect(_import_object_model)
+
+        def _browse_community_models():
+            try:
+                from model_hub.gui import ModelBrowserDialog
+            except Exception as e:
+                self.append_log(f"⚠️ Community models unavailable: {e}")
+                return
+            dialog = ModelBrowserDialog(self)
+
+            def _on_installed(model):
+                _populate_object_models(select_type="custom", select_path=str(model.model_path))
+                self.append_log(f"✅ Installed community model: {model.manifest.display_name}")
+
+            dialog.installed.connect(_on_installed)
+            dialog.exec()
+
+        community_btn.clicked.connect(_browse_community_models)
 
         def on_object_model_changed(index=0):
             yolo_type = self.object_detector_choice()[0]
@@ -2896,6 +2915,22 @@ class VideoHighlighterGUI(QWidget):
         # borrowed it (see set_simple_start).
         llm_tab.setLayout(self.llm_tab_layout)
         tabs.addTab(self._scrollable(llm_tab), "LLM Chat")
+
+        # --- Tab: Train ---
+        # Assembling a dataset, fine-tuning a detector and exporting it for the
+        # app were three scripts and a Python prompt. The panel drives the same
+        # functions the tests do; nothing about the sequencing lives in it.
+        try:
+            from modules.ui.training_panel import TrainingPanel
+            train_tab = QWidget()
+            train_layout = QVBoxLayout()
+            self.training_panel = TrainingPanel(parent=self)
+            self.training_panel.model_installed.connect(self._on_model_installed)
+            train_layout.addWidget(self.training_panel)
+            train_tab.setLayout(train_layout)
+            tabs.addTab(self._scrollable(train_tab), "Train")
+        except Exception as e:
+            self.append_log(f"⚠️ Training panel unavailable: {e}")
 
         # --- Tab 5: Avoid ---
         avoid_tab = QWidget()
@@ -5548,6 +5583,22 @@ class VideoHighlighterGUI(QWidget):
                 self.timeline_window = None   # underlying window was destroyed
             except Exception as e:
                 self.append_log(f"⚠️ Could not refresh timeline viewer: {e}")
+
+    def _on_model_installed(self, exported):
+        """Say, in the user-facing log, that a model of their own is now installed.
+
+        The panel already reports the result in its own status line, but that
+        line is on a tab they are about to leave. The detector will use this
+        model on the next scan, which is a change to how the app behaves and
+        therefore belongs where the user reads about what the app did.
+        """
+        try:
+            names = ", ".join(getattr(exported, "class_names", []) or [])
+            self.append_log(
+                f"✅ Your own detector is installed ({names}). "
+                f"Pick it under Advanced → object model.")
+        except Exception as e:                     # pragma: no cover - defensive
+            print(f"⚠️ Could not report the installed model: {e}")
 
     def toggle_run(self, *args, simple=False):
         """Run / Pause / Resume - single button.

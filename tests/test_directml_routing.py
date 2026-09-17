@@ -214,10 +214,10 @@ def test_off_leaves_an_amd_box_exactly_as_it_was(monkeypatch, amd_box):
 
 def test_the_detector_never_receives_a_directml_device(monkeypatch, amd_box):
     """`resolve_yolo_device` is the *detector's* device, and detection has no
-    DirectML path — YOLO runs through Ultralytics.
+    DirectML path — YOLOX runs through OpenVINO.
 
-    Ultralytics rejects "privateuseone:0" outright, so passing one on would
-    trade a slow run for a failed one. The function exists to guarantee the
+    A torch-style "privateuseone:0" means nothing to that runtime, so passing
+    one on would trade a slow run for a failed one. The function exists to guarantee the
     value it returns is safe to use.
     """
     from modules import device_utils as du

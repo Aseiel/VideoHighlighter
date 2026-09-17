@@ -22,6 +22,27 @@ preset lists, commit messages, UI strings:
 If a feature seems to require naming that content in the repo, the design is
 wrong: make it user-supplied.
 
+## Models people make and share
+
+The app's direction is a community of small models: people teach it what to
+find in their own footage, train a model, and share it. Two rules make that
+possible, and both are load-bearing.
+
+**No AGPL detector, anywhere the app runs.** A model trained on top of one
+inherits its licence, and a shared model has to be usable by anyone, in any
+build. Object detection is YOLOX (Apache-2.0) through OpenVINO;
+`tests/test_no_agpl_detector.py` fails if `ultralytics` or its model files come
+back into app code. Dev-only `tools/` may use it behind a guarded import.
+
+**A shared model carries the model, never the material.** Training on footage
+and handing that footage to others are different acts, and the second is where
+the copyright risk is. `model_hub/` enforces it: a package is exactly
+`model.onnx` + `videohighlighter.json` + a generated `README.md` (+ `LICENSE`),
+detectors must be YOLOX-layout, licences are permissive only, and the publishing
+checklist must be confirmed before `hub.release_the_kraken` clears an upload.
+Don't add a field or file that could carry frames, crops, clips, audio or paths.
+`model_hub/` is kept identical to the Pro edition's copy.
+
 ## Never rewrite this repo's history
 
 This repo takes pull requests from outside the project, and a contributor's
@@ -52,7 +73,8 @@ forced repair is a GitHub Support ticket.
   tees all output to `debug.log` and the optional "Debug log" window. Diagnostic
   output belongs in `print()` (→ debug log); `append_log()` is the user-facing
   log pane and is only for things the user acts on.
-- Dependencies should be permissive (MIT/BSD/Apache) where practical — prefer
-  what is already in the stack over adding something new.
+- Dependencies should be permissive (MIT/BSD/Apache) — prefer what is already
+  in the stack over adding something new. Check the licence of a model's
+  *runtime and training toolkit*, not just its weights.
 - Commit messages in this repo carry no `Co-Authored-By` trailer.
 - Don't commit or push unless asked.
