@@ -35,6 +35,9 @@ models/actions/
 # every launch — slow, but never something to commit.
 models/clip-vit-base-patch32-ov/
 
+# RTMPose keypoint IRs + ONNX/zip cache (installed via tools/get_rtmpose_model.py)
+models/rtmpose/
+
 __pycache__/
 
 # --- Web frontend (Vite + React + Tauri) ---

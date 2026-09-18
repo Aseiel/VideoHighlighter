@@ -1,21 +1,23 @@
 """
-crop_core.py — shared cropping primitives.
+core.py — shared cropping primitives.
 
-Pure geometry + render helpers used by BOTH the focus cropper (crop_actions.py)
-and the avoid cropper (crop_avoid.py, coming next). Nothing in here knows about
+Pure geometry + render helpers used by BOTH the focus cropper (actions.py)
+and the avoid cropper (avoid.py). Nothing in here knows about
 zones, people-counting, identities, or "focus vs avoid" — it only turns a chosen
 crop rectangle into pixels on disk, and provides the box math both policies need.
 
-Extracted verbatim from crop_actions.py (no behaviour change) so the smoothing /
+Extracted verbatim from the original crop_actions.py (no behaviour change) so the smoothing /
 expansion / overlap logic exists in exactly one place. Fix a jump-resistance or
 padding bug here and both croppers get it.
 
 What deliberately did NOT move here:
-  - get_multi_calibration(): uses MultiActionTracker (focus-specific), stays in
-    crop_actions.py.
+  - get_multi_calibration(): uses MultiActionTracker (focus-specific), lives in
+    track.py.
   - the zone brain (determine_smart_crop_strategy_v2, analyze_region_activity,
     count_people_in_video, MultiActionDetector / MultiActionTracker, ROIDetector):
-    that's "where is the action" = the focus objective. Stays in crop_actions.py.
+    that's "where is the action" = the focus objective, split across zones.py,
+    people.py and track.py. The reason it is not here is unchanged — core is
+    shared by both objectives, and none of that is.
 """
 
 import cv2
@@ -25,7 +27,7 @@ from collections import deque
 
 # ── geometry constants the helpers below depend on ───────────────────────────
 # (moved here with the functions that use them; crop_actions.py imports these
-#  back from crop_core so its own references keep working.)
+#  back from core so their own references keep working.)
 OVERLAP_MARGIN = 5
 FALLBACK_BOX_EXPANSION = 0.50   # expansion for fallback boxes (poor/lost track)
 MIN_BOX_WIDTH_RATIO = 0.35

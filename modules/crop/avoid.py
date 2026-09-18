@@ -1,7 +1,7 @@
 """
-crop_avoid.py — exclusion cropper ("avoid this person").
+avoid.py — exclusion cropper ("avoid this person").
 
-The inverse of crop_actions.py. Focus cropping asks "where is the action?" and
+The inverse of actions.py. Focus cropping asks "where is the action?" and
 frames toward it. Avoid cropping asks "where is the person I must NOT show?" and
 frames away from them, keeping as much of everyone else as a single rectangle can.
 
@@ -36,11 +36,11 @@ THE EXCLUSION GUARANTEE:
     overlaps the forbidden slab. That single clamp is the source of truth for "they
     are not in frame," regardless of what smoothing did.
 
-WHY NOT reuse expand_box / safe_crop from crop_core here:
+WHY NOT reuse expand_box / safe_crop from core here:
     Both of those grow a box horizontally (margin expansion, min-width enforcement,
     aspect fixes). For focus that's harmless. For avoid it's dangerous — horizontal
     growth can re-cross the forbidden slab and put the avoided person back in shot.
-    So avoid computes its final window explicitly and clamps it; the only crop_core
+    So avoid computes its final window explicitly and clamps it; the only core
     pieces it reuses are the genuinely policy-neutral ones: pad_to_size (letterbox),
     calculate_iou (to tell the avoided YOLO box apart from keepers), and
     MultiSmoother (temporal stability, with the clamp as a safety net).
@@ -50,7 +50,7 @@ import os
 import cv2
 import numpy as np
 
-from crop_core import pad_to_size, calculate_iou, MultiSmoother
+from modules.crop.core import pad_to_size, calculate_iou, MultiSmoother
 
 
 # ── config ──────────────────────────────────────────────────────────────────
