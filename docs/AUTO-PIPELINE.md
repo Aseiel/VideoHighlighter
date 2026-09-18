@@ -230,6 +230,31 @@ When the nearest whole number of bars would run past the end of the source, the
 a 3.64 s bar becomes one bar, not 6.03 s. Clamping instead is what the first
 real render did, and it put every following cut off the grid.
 
+## Building the reel
+
+The `combine` stage merges the kept clips into one reel and, optionally, writes
+each clip out as a separate file beside it.
+
+**Rotation is baked, not copied.** Phone and GoPro footage carries its
+orientation as metadata, and the concat step throws that metadata away — so
+the frames are rotated for real before concatenation, and the canvas is sized
+to the *displayed* dimensions of the largest input. Portrait clips therefore
+survive a mixed-orientation reel instead of arriving on their side.
+
+**Blur gate.** Clips can be penalised for softness, so a sharp moment wins over
+a blurry one that scored the same on everything else.
+
+`music_mix` then lays the track down in one of three modes:
+
+| Mode | What it does |
+| --- | --- |
+| `replace` | The original audio is dropped; only the music is heard |
+| `mix` | Music is mixed under the original audio |
+| `duck` | Like `mix`, but the music is side-chain compressed against the original, so it drops back whenever there is speech |
+
+A video with no audio stream cannot mix or duck; both degrade to `replace`
+rather than failing.
+
 ## The runner
 
 Every stage records what it produced, and a re-run skips whatever is still on

@@ -133,6 +133,46 @@ events:
 means "none of these inside that". Source boxes are consumed across rules, so
 two rules each needing one source genuinely require two distinct objects.
 
+### An event the models have no word for
+
+This is what the engine is really for. Action recognition answers from a fixed
+list of 400 classes: ask it about anything outside that list and it returns the
+nearest thing inside it, with the confidence you would expect from a wrong
+answer. A rule is not limited that way. It describes a *relation* between
+detections — one class inside another, counted, holding steady over a window —
+so the event is whatever that relation means in your footage, under the name
+you gave it.
+
+A goal, for instance, is a ball whose centre is inside the net:
+
+```yaml
+events:
+  - name: ball_in_net
+    label: Ball in net
+    window_secs: 0.3        # it is only in there briefly — smooth less
+    persist_secs: 0.2
+    rules:
+      - {source: sports ball, region: net, min_count: 1}
+```
+
+The same rules in the app, where they are edited and run:
+
+![Composition rules editor: a spatial rule firing when a sports ball is inside a net, a second for a ball at a player, and a signal rule on vocal density](../assets/Composition_Engine.png)
+
+`sports ball` is one of the 80 classes the stock detector already knows. The net
+is not, so that single class is what you label and train — one primitive,
+reusable, rather than a "goal" class the network would have to infer from pixels
+that do not contain the distinction. The rule supplies the meaning. See
+[Primitives, not categories](#primitives-not-categories) below.
+
+### Confidence follows the weakest detection
+
+A composed event is only as sure as the weakest detection it matched, so it
+carries *detector* confidence rather than a classifier's guess at a class it was
+never taught. In the rule above, a ball found at 0.91 inside a net found at 0.87
+scores 0.87 — and 80–100% is the ordinary case, for moments an action label
+would score far lower and often name wrongly.
+
 ### Two settings worth understanding
 
 **`persist_secs`** keeps a class alive after its last detection. Raise it when
@@ -171,6 +211,29 @@ The first of those is the real cost: it is a different export and a wider cache
 format, and every rule that does not ask for depth would still pay to store
 them. Worth doing when something actually needs to distinguish "on the line"
 from "over it".
+
+### Where rules live, and what they cost
+
+Rules live in `composition_rules.yaml` in your user data folder — beside the
+executable on Windows, `~/Library/Application Support/VideoHighlighter` on
+macOS, the project root when running from source. Nothing ships with a rule set,
+and the file is gitignored, so the events you define stay on your machine. With
+no file present the engine is skipped entirely.
+
+Composed events get their own rows on the timeline, directly under the waveform,
+one row per rule that actually fired, filterable separately from objects and
+actions.
+
+They run on **every** pass, over whatever detections are already to hand — a
+rule is a reading of boxes that already exist, not a second detection. So
+editing one and re-running costs milliseconds and never invalidates the cache.
+The loop is: change a threshold, re-run, read the report, change it again.
+
+![Workflow stages: process video and AI, cache the results, review them in the timeline UI, edit, then adjust and reprocess against the same cache](../assets/workflow_stages.png)
+
+That cache is what makes the loop cheap — the detection pass is the expensive
+part, and adjusting scoring, rules or thresholds re-reads it rather than
+redoing it.
 
 ---
 
