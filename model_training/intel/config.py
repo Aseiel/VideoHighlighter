@@ -13,11 +13,19 @@ decoder_type options:
 import os
 import torch
 
+# Resolved against the repository, not the working directory: a bare relative
+# name dropped the trained model wherever the run happened to start, which for
+# the GUI's trainer subprocess is the install root. Everything a run produces
+# now lands in models/actions/, beside models/custom/ where the object
+# detectors go, and that is the first place the app looks for it.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 CONFIG = {
     # --- paths ---
     "data_path": "dataset",
-    "model_save_path": "intel_finetuned_classifier_3d.pth",
-    "checkpoint_dir": "checkpoints_intel",
+    "model_save_path": os.path.join(
+        _REPO_ROOT, "models", "actions", "intel_finetuned_classifier_3d.pth"),
+    "checkpoint_dir": os.path.join(_REPO_ROOT, "checkpoints_intel"),
     "checkpoint_path": None,           # set to resume, e.g. "checkpoints_intel/checkpoint_latest.pth"
 
     # --- encoder ---

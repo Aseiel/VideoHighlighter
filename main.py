@@ -76,6 +76,7 @@ except Exception:
     pass
 
 from modules.app_paths import resource_path as _resource_path, data_file as _data_file, config_path
+from modules.app_paths import action_model_file as _action_model_file
 from version import __version__, __edition__
 
 # --- Contact / support details shown in the About tab ---
@@ -90,8 +91,10 @@ CONFIG_FILE = config_path("config.yaml")
 
 YOLO_OBJECTS_LABELS_FILE = _resource_path("yolo_objects_labels.json")
 KINETICS_400_LABELS_FILE = _resource_path("kinetics_400_labels.json")
-INTEL_CUSTOM_LABELS_FILE = _data_file("intel_finetuned_classifier_3d_mapping.json")
-R3D_CUSTOM_LABELS_FILE = _data_file("r3d_finetuned_mapping.json")
+# Trained action models live in models/actions/ (the flat root locations stay
+# as a fallback) — see app_paths.action_model_file().
+INTEL_CUSTOM_LABELS_FILE = _action_model_file("intel_finetuned_classifier_3d_mapping.json")
+R3D_CUSTOM_LABELS_FILE = _action_model_file("r3d_finetuned_mapping.json")
 
 class LabelSelectorDialog(QDialog):
     """Dialog with search/filter and multi-select for labels."""

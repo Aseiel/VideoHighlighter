@@ -144,6 +144,33 @@ def data_file(name: str) -> str:
     return resource_path(name)
 
 
+def action_models_dir() -> str:
+    """Managed folder for trained action-recognition models.
+
+    Sits beside ``models/custom/`` (object detectors) so everything a training
+    run produces lands under ``models/`` rather than in the install root.
+    """
+    return os.path.join(user_data_dir(), "models", "actions")
+
+
+def action_model_file(name: str) -> str:
+    """Resolve one of the fixed action-model slots for *reading*.
+
+    ``models/actions/<name>`` is where training writes and where the app looks
+    first. The flat locations ``data_file()`` checks stay as a fallback: models
+    trained before this folder existed live in the root, and a packaged exe
+    still honours a file dropped next to it. When neither exists the managed
+    path is returned, so a caller reporting "not found" names the new place.
+    """
+    managed = os.path.join(action_models_dir(), name)
+    if os.path.exists(managed):
+        return managed
+    legacy = data_file(name)
+    if os.path.exists(legacy):
+        return legacy
+    return managed
+
+
 def latest_custom_pose_model():
     """Custom keypoint models are not supported: the only trainer for them was
     AGPL, and nothing trained with it may ship. Kept so callers need no guard."""
@@ -276,14 +303,16 @@ def discover_object_models() -> list:
 
 
 def custom_action_decoder_paths() -> tuple[str, str, str]:
-    """Fixed install locations for the user's custom fine-tuned OpenVINO action
-    decoder: (xml, bin, labels_json). Same resolve-with-override rule as
-    data_file() — a copy here (written by the Advanced tab's "Import model…"
-    button) overrides the bundled default."""
+    """Where to read the user's custom fine-tuned OpenVINO action decoder from:
+    (xml, bin, labels_json).
+
+    ``models/actions/`` first — that is where the Intel trainer writes and where
+    the Advanced tab's "Import model…" button installs — then the legacy flat
+    locations ``data_file()`` resolves, so an older install keeps working."""
     return (
-        data_file("action_classifier_3d.xml"),
-        data_file("action_classifier_3d.bin"),
-        data_file("intel_finetuned_classifier_3d_mapping.json"),
+        action_model_file("action_classifier_3d.xml"),
+        action_model_file("action_classifier_3d.bin"),
+        action_model_file("intel_finetuned_classifier_3d_mapping.json"),
     )
 
 
@@ -300,8 +329,14 @@ def import_custom_action_model(decoder_xml_src: str, labels_json_src: str = "") 
     Returns the number of classes found in the installed labels file (0 if
     none), so the caller can report/validate the import.
     """
-    dst_xml, dst_bin, dst_labels = custom_action_decoder_paths()
-    os.makedirs(os.path.dirname(dst_xml), exist_ok=True)
+    # Always install into the managed folder, never over a legacy root copy the
+    # reader may still be resolving: models/actions/ wins the lookup, so the
+    # freshly imported model is the one that loads.
+    dest = action_models_dir()
+    os.makedirs(dest, exist_ok=True)
+    dst_xml = os.path.join(dest, "action_classifier_3d.xml")
+    dst_bin = os.path.join(dest, "action_classifier_3d.bin")
+    dst_labels = os.path.join(dest, "intel_finetuned_classifier_3d_mapping.json")
     shutil.copy2(decoder_xml_src, dst_xml)
 
     src_bin = os.path.splitext(decoder_xml_src)[0] + ".bin"
@@ -326,12 +361,12 @@ def import_custom_action_model(decoder_xml_src: str, labels_json_src: str = "") 
 
 
 def r3d_custom_action_paths() -> tuple[str, str]:
-    """Fixed install locations for the user's custom fine-tuned R3D (PyTorch)
-    action model: (weights_pth, mapping_json). Same resolve-with-override rule
-    as data_file()."""
+    """Where to read the user's custom fine-tuned R3D (PyTorch) action model
+    from: (weights_pth, mapping_json). ``models/actions/`` first, then the
+    legacy flat locations — same rule as custom_action_decoder_paths()."""
     return (
-        data_file("r3d_finetuned.pth"),
-        data_file("r3d_finetuned_mapping.json"),
+        action_model_file("r3d_finetuned.pth"),
+        action_model_file("r3d_finetuned_mapping.json"),
     )
 
 
@@ -350,8 +385,10 @@ def import_r3d_action_model(weights_pth_src: str, mapping_json_src: str = "") ->
     the mapping omits it, in which case the loader falls back to the UI's
     "R3D model variant" dropdown selection.
     """
-    dst_pth, dst_mapping = r3d_custom_action_paths()
-    os.makedirs(os.path.dirname(dst_pth), exist_ok=True)
+    dest = action_models_dir()
+    os.makedirs(dest, exist_ok=True)
+    dst_pth = os.path.join(dest, "r3d_finetuned.pth")
+    dst_mapping = os.path.join(dest, "r3d_finetuned_mapping.json")
     shutil.copy2(weights_pth_src, dst_pth)
 
     if not mapping_json_src:

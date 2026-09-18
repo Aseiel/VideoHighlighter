@@ -6,6 +6,27 @@ import numpy as np
 import os
 import json
 
+# Trained action models live in models/actions/ alongside everything else a
+# training run produces. A bare name here used to read and write in whatever
+# directory the script was started from; the fallback keeps a checkpoint left
+# in the repo root by an older run convertible.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+_ACTIONS_DIR = os.path.join(_REPO_ROOT, "models", "actions")
+
+
+def _action_model(name, for_write=False):
+    managed = os.path.join(_ACTIONS_DIR, name)
+    if for_write or os.path.exists(managed):
+        return managed
+    legacy = os.path.join(_REPO_ROOT, name)
+    return legacy if os.path.exists(legacy) else managed
+
+
+CHECKPOINT_PATH = _action_model("intel_finetuned_classifier_3d.pth")
+MAPPING_PATH = _action_model("intel_finetuned_classifier_3d_mapping.json")
+DECODER_XML_PATH = _action_model("action_classifier_3d.xml", for_write=True)
+DECODER_ONNX_PATH = _action_model("action_classifier_3d.onnx", for_write=True)
+
 class EncoderLSTM(nn.Module):
     """Enhanced classifier matching your checkpoint structure"""
     def __init__(self, feature_dim=512, hidden_dim=256, num_classes=31, 
@@ -81,7 +102,7 @@ class EncoderLSTM(nn.Module):
 def inspect_checkpoint():
     """Inspect the checkpoint to understand its structure"""
     print("🔍 Inspecting checkpoint...")
-    checkpoint = torch.load("intel_finetuned_classifier_3d.pth", map_location='cpu', weights_only=False)
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location='cpu', weights_only=False)
     
     print("\nCheckpoint keys:")
     for key in checkpoint.keys():
@@ -94,7 +115,7 @@ def convert_current_model():
     checkpoint = inspect_checkpoint()
     
     # Load the mapping file to get model parameters
-    mapping_path = "intel_finetuned_classifier_3d_mapping.json"
+    mapping_path = MAPPING_PATH
     
     if not os.path.exists(mapping_path):
         print(f"\n❌ Error: Mapping file {mapping_path} not found!")
@@ -176,7 +197,8 @@ def convert_current_model():
     # the same graph on any DX12 card and is the one accelerated runtime a
     # packaged build can carry (see modules/ort_directml.py). Writing both
     # costs a few MB and gives the AMD path a model to load.
-    onnx_path = "action_classifier_3d.onnx"
+    onnx_path = DECODER_ONNX_PATH
+    os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
 
     # Convert to ONNX
     torch.onnx.export(
@@ -198,7 +220,8 @@ def convert_current_model():
     ov_model = ov.convert_model(onnx_path)
     
     # Save the model
-    output_path = "action_classifier_3d.xml"
+    output_path = DECODER_XML_PATH
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     ov.save_model(ov_model, output_path)
     
     print("\n✅ Conversion successful!")
@@ -233,13 +256,13 @@ def test_converted_model(feature_dim, sequence_length, num_classes):
     print("\n🧪 Testing converted model...")
     
     # Load the mapping file
-    mapping_path = "intel_finetuned_classifier_3d_mapping.json"
+    mapping_path = MAPPING_PATH
     with open(mapping_path, 'r') as f:
         mapping_data = json.load(f)
     
     # Load OpenVINO model
     core = ov.Core()
-    compiled_model = core.compile_model("action_classifier_3d.xml", "CPU")
+    compiled_model = core.compile_model(DECODER_XML_PATH, "CPU")
     
     # Create test input
     test_input = np.random.randn(1, sequence_length, feature_dim).astype(np.float32)

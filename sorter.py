@@ -22,9 +22,19 @@ BASE_DIR = Path(__file__).parent.resolve()
 
 ENCODER_XML = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.xml"
 ENCODER_BIN = BASE_DIR / "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin"
-CUSTOM_DECODER_XML = BASE_DIR / "action_classifier_3d.xml"
-CUSTOM_DECODER_BIN = BASE_DIR / "action_classifier_3d.bin"
-CUSTOM_MAPPING_PATH = BASE_DIR / "intel_finetuned_classifier_3d_mapping.json"
+# The trained decoder lives in models/actions/; BASE_DIR stays as the fallback
+# for a model trained before that folder existed.
+_ACTIONS_DIR = BASE_DIR / "models" / "actions"
+
+
+def _action_model(name):
+    managed = _ACTIONS_DIR / name
+    return managed if managed.exists() else BASE_DIR / name
+
+
+CUSTOM_DECODER_XML = _action_model("action_classifier_3d.xml")
+CUSTOM_DECODER_BIN = _action_model("action_classifier_3d.bin")
+CUSTOM_MAPPING_PATH = _action_model("intel_finetuned_classifier_3d_mapping.json")
 
 SEQUENCE_LENGTH = 16
 

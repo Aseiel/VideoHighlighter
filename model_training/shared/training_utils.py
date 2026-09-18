@@ -77,6 +77,7 @@ def save_checkpoint(model, optimizer, epoch, best_val_acc, label_to_idx,
     if extra:
         ckpt.update(extra)
 
+    os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
     torch.save(ckpt, checkpoint_path)
     print(f"💾 Checkpoint saved: {checkpoint_path} (epoch {epoch + 1})")
 
@@ -178,6 +179,10 @@ class ActionRecognitionModel:
         self.extra_meta = extra_meta or {}
 
     def save(self, path):
+        # The trained model now lands in models/actions/, which need not exist
+        # yet on a first run; every save site goes through here or
+        # save_checkpoint(), so creating it here covers them all.
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         torch.save(self.model.state_dict(), path)
         mapping_path = path.replace(".pth", "_mapping.json")
         data = {
@@ -214,6 +219,7 @@ class ActionRecognitionModel:
             set(self.idx_to_label.keys()) - keep_set)]
 
         mapping_path = path.replace(".pth", f"{suffix}_mapping.json")
+        os.makedirs(os.path.dirname(os.path.abspath(mapping_path)), exist_ok=True)
         data = {
             "label_to_idx": filtered_l2i,
             "idx_to_label": filtered_i2l,

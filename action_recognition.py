@@ -38,20 +38,26 @@ except ImportError:
 # =============================
 BASE_DIR = Path(__file__).parent.resolve()
 
-# Custom model + mapping files are resolved via data_file() so a packaged exe
-# picks up a copy dropped next to the executable (swap in a retrained model
-# without rebuilding); falls back to the bundled/source copy. From source this
-# is just the project root, so behaviour is unchanged.
+# Bundled data files are resolved via data_file(), so a packaged exe picks up a
+# copy dropped next to the executable; falls back to the bundled/source copy.
+# Trained action models go through action_model_file() instead: they live in
+# models/actions/, where the trainer writes them, with the flat root locations
+# kept as a fallback for models trained before that folder existed.
 try:
     from modules.app_paths import data_file as _data_file
+    from modules.app_paths import action_model_file as _action_model_file
 except Exception:
     def _data_file(name):
         return str(BASE_DIR / name)
 
-CUSTOM_MAPPING_PATH = Path(_data_file("intel_finetuned_classifier_3d_mapping.json"))
+    def _action_model_file(name):
+        managed = BASE_DIR / "models" / "actions" / name
+        return str(managed if managed.exists() else BASE_DIR / name)
+
+CUSTOM_MAPPING_PATH = Path(_action_model_file("intel_finetuned_classifier_3d_mapping.json"))
 KINETICS_LABELS_PATH = Path(_data_file("kinetics_400_labels.json"))
-R3D_CUSTOM_MAPPING_PATH = Path(_data_file("r3d_finetuned_mapping.json"))
-R3D_CUSTOM_WEIGHTS_PATH = Path(_data_file("r3d_finetuned.pth"))
+R3D_CUSTOM_MAPPING_PATH = Path(_action_model_file("r3d_finetuned_mapping.json"))
+R3D_CUSTOM_WEIGHTS_PATH = Path(_action_model_file("r3d_finetuned.pth"))
 
 
 CUSTOM_LABELS = None
@@ -1055,8 +1061,8 @@ def load_models(device="AUTO", openvino_threads=None,
         print(f"📌 Note: Encoder running on {encoder_device} (different from requested {selected_device})")
 
     # Custom decoder is user-swappable: resolve next-to-exe first, else bundled.
-    custom_decoder_xml = Path(_data_file("action_classifier_3d.xml"))
-    custom_decoder_bin = Path(_data_file("action_classifier_3d.bin"))
+    custom_decoder_xml = Path(_action_model_file("action_classifier_3d.xml"))
+    custom_decoder_bin = Path(_action_model_file("action_classifier_3d.bin"))
     intel_decoder_xml  = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.xml"
     intel_decoder_bin  = BASE_DIR / "models/intel_action/decoder/FP32/action-recognition-0001-decoder.bin"
 

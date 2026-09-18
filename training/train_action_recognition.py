@@ -1489,7 +1489,11 @@ CONFIG = {
     "augmentation_prob": 0.3,
     "sequence_length": 16,
     "crop_size": (224, 224),
-    "model_save_path": "intel_finetuned_classifier_3d.pth",
+    # models/actions/, same as model_training/: the trained model belongs with
+    # every other one the app produces, not in whatever directory the run started in.
+    "model_save_path": os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "models", "actions", "intel_finetuned_classifier_3d.pth"),
     "checkpoint_path": r"D:\movie_highlighter\checkpoints\checkpoint_latest.pth",
     "save_checkpoint_every": 5,
     "checkpoint_dir": "checkpoints",
