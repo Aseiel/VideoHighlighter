@@ -1,5 +1,5 @@
 """
-Tests for modules.shot_look — do two clips look like the same view.
+Tests for modules.segments.shot_look — do two clips look like the same view.
 
 The module makes one narrow claim: that the *smaller* of a layout agreement
 and a colour agreement is high only when both are, and that either on its own
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.shot_look import (
+from modules.segments.shot_look import (
     GRID,
     SAME_VIEW,
     Look,

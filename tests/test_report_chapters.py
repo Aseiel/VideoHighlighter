@@ -11,7 +11,7 @@ import json
 
 import numpy as np
 
-from modules.highlight_report import build_report, render_html, render_text
+from modules.report.highlight_report import build_report, render_html, render_text
 
 
 def _signals(n=600, **overrides):
@@ -122,14 +122,14 @@ class TestRenderers:
 
 class TestDescriptions:
     def test_a_concentrated_chapter_says_so(self):
-        from modules.highlight_prose import describe_chapter
+        from modules.report.highlight_prose import describe_chapter
 
         rep = _report(chapters=_chapters())
         lines = describe_chapter(rep["chapters"][0])
         assert any("of the cut" in line for line in lines)
 
     def test_an_undistinguished_chapter_says_that_instead(self):
-        from modules.highlight_prose import describe_chapter
+        from modules.report.highlight_prose import describe_chapter
 
         # Parity on every axis: same length, same shot rate, one clip each.
         chapters = [
@@ -150,7 +150,7 @@ class TestDescriptions:
         assert lines == ["Nothing here separates it from the rest of the video."]
 
     def test_the_headline_reports_concentration(self):
-        from modules.highlight_prose import summarise_chapter_run
+        from modules.report.highlight_prose import summarise_chapter_run
 
         rep = _report(chapters=_chapters())
         sentence = summarise_chapter_run(rep["chapters"])
@@ -158,7 +158,7 @@ class TestDescriptions:
         assert "real cut" not in sentence      # that claim belongs to the note
 
     def test_a_single_chapter_video_is_described_as_undivided(self):
-        from modules.highlight_prose import summarise_chapter_run
+        from modules.report.highlight_prose import summarise_chapter_run
 
         sentence = summarise_chapter_run([
             {"number": 1, "start": 0.0, "end": 120.0, "title": "Chapter 1",

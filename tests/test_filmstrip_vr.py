@@ -227,7 +227,7 @@ class TestTheExpensivePathLeavesATrace:
         return cache
 
     def test_a_vr_extraction_is_bracketed(self, app, tmp_path):
-        from modules import repaint_trace
+        from modules.system import repaint_trace
 
         repaint_trace.reset_for_tests()
         path = tmp_path / "trace.log"
@@ -247,7 +247,7 @@ class TestTheExpensivePathLeavesATrace:
         # Normal video decodes thousands of thumbnails through the cheap path
         # and is not where this crash lives; logging them would bury the lines
         # that matter.
-        from modules import repaint_trace
+        from modules.system import repaint_trace
 
         repaint_trace.reset_for_tests()
         path = tmp_path / "trace.log"

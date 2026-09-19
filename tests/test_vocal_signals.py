@@ -1,5 +1,5 @@
 """
-Tests for `modules.vocal_signals` — per-second vocal brightness and onset.
+Tests for `modules.audio.vocal_signals` — per-second vocal brightness and onset.
 
 Driven by synthetic audio rather than a fixture video, so the suite keeps its
 "no heavy deps, seconds not minutes" property and so each property is tested
@@ -18,7 +18,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from modules import vocal_signals as vs
+from modules.audio import vocal_signals as vs
 
 
 SR = vs.SAMPLE_RATE

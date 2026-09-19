@@ -1,6 +1,6 @@
 """Tests for chapterization — the partition layer over the shot list.
 
-No CLIP and no video here. Every operator in `modules/chapters.py` is numpy over
+No CLIP and no video here. Every operator in `modules/segments/chapters.py` is numpy over
 a shot-signature array, so a synthetic film — a known number of locations, a
 known number of shots each, dialogue alternation inside them — pins down exactly
 what the partition does. The embeddings only decide how far apart two locations
@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from modules.chapters import (
+from modules.segments.chapters import (
     DEFAULT_SHOT_WINDOW,
     boundary_novelty,
     chapterize,
@@ -314,14 +314,14 @@ class TestCachedSignatures:
     """`cached_index_arrays` must never build an index — only reuse one."""
 
     def test_a_missing_cache_falls_back_rather_than_encoding(self, tmp_path):
-        from modules.chapters import cached_index_arrays
+        from modules.segments.chapters import cached_index_arrays
 
         ts, emb = cached_index_arrays(str(tmp_path / "nope.mp4"),
                                       cache_dir=str(tmp_path))
         assert ts is None and emb is None
 
     def test_chapters_for_video_still_partitions_without_a_cache(self, tmp_path):
-        from modules.chapters import chapters_for_video
+        from modules.segments.chapters import chapters_for_video
 
         scenes, _, duration = _film(locations=4, shots_per_location=20)
         chapters = chapters_for_video(str(tmp_path / "nope.mp4"), scenes,

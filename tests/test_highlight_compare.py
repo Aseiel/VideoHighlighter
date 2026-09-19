@@ -1,4 +1,4 @@
-"""Tests for `modules.highlight_compare` — subjects ranked against their video.
+"""Tests for `modules.segments.highlight_compare` — subjects ranked against their video.
 
 The property worth protecting is that a size claim survives the camera moving.
 Frame share cannot tell a larger subject from a nearer one, so the module's
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from modules.highlight_compare import (
+from modules.segments.highlight_compare import (
     MIN_STRETCHES,
     build_distributions,
     compare_segment,

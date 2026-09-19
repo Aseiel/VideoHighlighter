@@ -19,7 +19,7 @@ import math
 import numpy as np
 import pytest
 
-from modules.chapter_compare import (
+from modules.segments.chapter_compare import (
     CUT_SHARE_LIFT,
     MIN_SECONDS_FOR_LIFT,
     NOTABLE_LIFT,
@@ -341,7 +341,7 @@ def _detections(spans):
 
 
 def test_a_class_taking_over_is_reported_against_the_previous_chapter():
-    from modules.chapter_compare import summarise_chapters
+    from modules.segments.chapter_compare import summarise_chapters
     chapters = [_seq_chapter(1, 0, 100), _seq_chapter(2, 100, 200)]
     dist = _detections({"class_a": [(0, 100), (100, 200)],
                         "class_b": [(0, 10), (100, 190)]})
@@ -354,7 +354,7 @@ def test_a_class_taking_over_is_reported_against_the_previous_chapter():
 
 
 def test_the_first_chapter_has_nothing_to_change_from():
-    from modules.chapter_compare import summarise_chapters
+    from modules.segments.chapter_compare import summarise_chapters
     chapters = [_seq_chapter(1, 0, 100), _seq_chapter(2, 100, 200)]
     dist = _detections({"class_a": [(0, 200)]})
     rows = summarise_chapters(chapters, distributions=dist, video_duration=200)
@@ -363,7 +363,7 @@ def test_the_first_chapter_has_nothing_to_change_from():
 
 def test_a_small_wobble_is_not_a_change():
     """Second-to-second detector scatter must not read as a narrative beat."""
-    from modules.chapter_compare import summarise_chapters
+    from modules.segments.chapter_compare import summarise_chapters
     chapters = [_seq_chapter(1, 0, 100), _seq_chapter(2, 100, 200)]
     dist = _detections({"class_a": [(0, 100), (100, 200)],
                         "class_b": [(0, 50), (100, 145)]})
@@ -372,7 +372,7 @@ def test_a_small_wobble_is_not_a_change():
 
 
 def test_at_most_two_movers_are_reported():
-    from modules.chapter_compare import summarise_chapters
+    from modules.segments.chapter_compare import summarise_chapters
     chapters = [_seq_chapter(1, 0, 100), _seq_chapter(2, 100, 200)]
     dist = _detections({
         "class_a": [(0, 100), (100, 200)],
@@ -384,7 +384,7 @@ def test_at_most_two_movers_are_reported():
 
 
 def test_a_chapter_carried_by_one_class_says_so():
-    from modules.chapter_compare import summarise_chapters
+    from modules.segments.chapter_compare import summarise_chapters
     chapters = [_seq_chapter(1, 0, 100)]
     dist = _detections({"class_a": [(0, 100)], "class_b": [(0, 10)]})
     rows = summarise_chapters(chapters, distributions=dist, video_duration=100)
@@ -394,7 +394,7 @@ def test_a_chapter_carried_by_one_class_says_so():
 
 def test_the_comparative_reads_as_english_in_both_directions():
     """'1.4x less as across the video' shipped for a while; it must not return."""
-    from modules.highlight_prose import describe_chapter
+    from modules.report.highlight_prose import describe_chapter
     more = describe_chapter({"clips": 1, "subjects": [
         {"name": "class_a", "kind": "subject", "lift": 2.0, "seconds": 30,
          "chapter_share_pct": 60.0, "video_share_pct": 30.0,

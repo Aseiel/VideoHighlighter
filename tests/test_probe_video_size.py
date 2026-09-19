@@ -22,7 +22,7 @@ import subprocess
 
 import pytest
 
-from modules import encoder_select
+from modules.system import encoder_select
 
 
 @pytest.fixture(autouse=True)

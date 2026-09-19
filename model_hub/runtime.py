@@ -7,7 +7,7 @@
 Each hit is a Hit(label, score, box) with box=None for classification. Frames
 are numpy uint8 arrays in OpenCV's BGR order, as the rest of the app uses.
 
-Detectors run through ``modules.detection_backend.YoloxOnnxRuntimeDetector`` —
+Detectors run through ``modules.vision.detection_backend.YoloxOnnxRuntimeDetector`` —
 the same letterbox, decode and NMS as a model the user trained themselves, so a
 community model and an own model can never disagree about the same frame
 because of glue code.
@@ -60,7 +60,7 @@ class CommunityModelRunner:
         self.dtype = {"tensor(float16)": np.float16, "tensor(uint8)": np.uint8}.get(inp.type, np.float32)
         self._detector = None
         if self.m.task == "object_detection":
-            from modules.detection_backend import YoloxOnnxRuntimeDetector
+            from modules.vision.detection_backend import YoloxOnnxRuntimeDetector
             self._detector = YoloxOnnxRuntimeDetector(
                 self.session, self.m.labels, score_thr=self.m.confidence_threshold)
 

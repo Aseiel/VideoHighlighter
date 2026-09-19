@@ -10,7 +10,7 @@ build pins numpy 2.2.6, whose numpy.libs holds msvcp140-2631…; ml_dtypes 0.5.4
 wants msvcp140-a4c2…, which numpy 2.4 vendors and which on the build machine
 exists only in pandas.libs. The frozen build put it there too, and nowhere on
 the search path when ml_dtypes loads. onnx imports ml_dtypes, the DirectML
-ONNX exports (modules/yolo_onnx.py, modules/r3d_onnx.py) import onnx, and the
+ONNX exports (modules/yolo_onnx.py, modules/vision/r3d_onnx.py) import onnx, and the
 exe died with "DLL load failed while importing _ml_dtypes_ext": the export
 failed and everything stayed on the CPU. Copying that DLL into numpy.libs by
 hand was enough for the export to succeed and run on DmlExecutionProvider.

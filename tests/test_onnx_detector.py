@@ -24,7 +24,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from conftest import real_opencv          # noqa: E402
 
-from modules import onnx_detector         # noqa: E402
+from modules.vision import onnx_detector         # noqa: E402
 
 _real_cv2 = real_opencv()
 

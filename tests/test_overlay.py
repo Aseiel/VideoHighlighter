@@ -1,5 +1,5 @@
 """
-Tests for modules.overlay — the graphics drawn over a finished reel.
+Tests for modules.media.overlay — the graphics drawn over a finished reel.
 
 Pillow is a real dependency of this suite rather than one of the mocked ones,
 so these draw actual frames and look at the pixels. That matters more than
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.overlay import (
+from modules.media.overlay import (
     ELEMENTS,
     MAX_POINTS,
     Box,
@@ -110,7 +110,7 @@ def test_marks_account_for_the_overlap_between_shots():
     """A cut starts earlier than the sum of the ones before it, because every
     transition overlaps two shots. If this disagrees with Edl.duration the
     graphics drift further out of step with the picture on every cut."""
-    from modules.edl import Cut, Edl
+    from modules.media.edl import Cut, Edl
 
     edl = Edl(width=360, height=640, cuts=[
         Cut(source="a.mp4", start=0, end=3.0, transition="crossfade",
@@ -127,7 +127,7 @@ def test_marks_account_for_the_overlap_between_shots():
 
 
 def test_a_scene_without_a_track_still_has_a_mark_per_cut():
-    from modules.edl import Cut, Edl
+    from modules.media.edl import Cut, Edl
 
     edl = Edl(cuts=[Cut(source=f"{i}.mp4", start=0, end=2.0, transition="cut")
                     for i in range(4)])

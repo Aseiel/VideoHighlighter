@@ -20,7 +20,7 @@ import json
 
 import pytest
 
-from modules.video_cache import (
+from modules.media.video_cache import (
     VideoAnalysisCache,
     atomic_write_json,
     holds_analysis,

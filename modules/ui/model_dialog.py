@@ -18,7 +18,7 @@ server, so the report asked the user to remember a tag that the machine it was
 about to talk to could simply be asked for. A mistyped tag is indistinguishable
 from one that has not been pulled, and the failure surfaces at the end of a
 generation somebody waited a minute for. Both fields now offer what is already
-there — see :mod:`modules.llm_discovery` — and both stay typable, because a
+there — see :mod:`modules.narration.llm_discovery` — and both stay typable, because a
 model being pulled right now is not a reason to refuse the name.
 
 Where the choices come from is injected rather than imported, so the dialog
@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from modules.llm_models import BACKENDS, label_for
+from modules.narration.llm_models import BACKENDS, label_for
 
 GGUF_FILTER = "GGUF models (*.gguf);;All files (*)"
 
@@ -51,7 +51,7 @@ class ModelDialog(QDialog):
     The three callables are everything that reaches outside this window: what
     the Ollama server holds, which GGUF files have been used before, and putting
     one at the top of that shortlist. They default to
-    :mod:`modules.llm_discovery`; a test passes its own and touches neither the
+    :mod:`modules.narration.llm_discovery`; a test passes its own and touches neither the
     network nor the settings.
     """
 
@@ -167,7 +167,7 @@ class ModelDialog(QDialog):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _default_models(refresh: bool = False) -> list:
-        from modules.llm_discovery import ollama_models
+        from modules.narration.llm_discovery import ollama_models
         return ollama_models(refresh=refresh)
 
     @staticmethod
@@ -189,12 +189,12 @@ class ModelDialog(QDialog):
 
     @staticmethod
     def _default_recent() -> list:
-        from modules.llm_discovery import recent_gguf
+        from modules.narration.llm_discovery import recent_gguf
         return recent_gguf()
 
     @staticmethod
     def _default_remember(path: str) -> None:
-        from modules.llm_discovery import remember_gguf
+        from modules.narration.llm_discovery import remember_gguf
         remember_gguf(path)
 
     def _fill_tags(self, refresh: bool = False):

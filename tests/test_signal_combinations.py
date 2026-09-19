@@ -1,4 +1,4 @@
-"""Tests for `modules.signal_combinations` — is this combination actually unusual?
+"""Tests for `modules.segments.signal_combinations` — is this combination actually unusual?
 
 The property worth protecting is that the module is willing to deflate a
 finding. Four signals agreeing inside one clip looks like a discovery, and on
@@ -10,8 +10,8 @@ everywhere and the module has to say so.
 
 from __future__ import annotations
 
-from modules.highlight_prose import describe_combination
-from modules.signal_combinations import (
+from modules.report.highlight_prose import describe_combination
+from modules.segments.signal_combinations import (
     MIN_WINDOWS,
     marks_of,
     rate,

@@ -126,7 +126,7 @@ def _no_device_choice_leaks():
             else:
                 os.environ[name] = value
         try:
-            from modules import directml_device
+            from modules.system import directml_device
             directml_device.set_mode(None)
         except Exception:
             pass

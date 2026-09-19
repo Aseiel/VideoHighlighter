@@ -6,12 +6,12 @@ the assembled version.
 
 | Piece | Module | What it owns |
 |---|---|---|
-| Ingest | `modules/gopro_ingest.py` | Finding a card, copying it off safely |
-| Script | `modules/script_plan.py` | What the film should contain |
-| Music | `modules/music_analysis.py` | Where the beats are |
-| Cut list | `modules/edl.py` | Which piece of which file, when |
-| Transitions | `modules/transitions.py` | How one clip becomes the next |
-| Runner | `modules/auto_pipeline.py` | Running the stages, and resuming them |
+| Ingest | `modules/media/gopro_ingest.py` | Finding a card, copying it off safely |
+| Script | `modules/segments/script_plan.py` | What the film should contain |
+| Music | `modules/audio/music_analysis.py` | Where the beats are |
+| Cut list | `modules/media/edl.py` | Which piece of which file, when |
+| Transitions | `modules/media/transitions.py` | How one clip becomes the next |
+| Runner | `modules/segments/auto_pipeline.py` | Running the stages, and resuming them |
 
 ---
 
@@ -51,7 +51,7 @@ truncated transfer.
 Nothing is ever deleted from the card.
 
 ```python
-from modules.gopro_ingest import find_gopro_cards, ingest, write_manifest
+from modules.media.gopro_ingest import find_gopro_cards, ingest, write_manifest
 
 card = find_gopro_cards()[0]
 result = ingest(card, r"D:\movies\GoPro")
@@ -104,7 +104,7 @@ hour: the run completes, the output ignores half of what you wrote, and nothing
 says why.
 
 ```python
-from modules.script_plan import load_script, compile_directives
+from modules.segments.script_plan import load_script, compile_directives
 
 script = load_script("script.yaml")
 script.clip_count            # 5  (Action counts three times)
@@ -151,7 +151,7 @@ empty grid is the identity. A music file that cannot be analysed must not cost
 you the film.
 
 ```python
-from modules.music_analysis import analyze_music, snap_segments
+from modules.audio.music_analysis import analyze_music, snap_segments
 
 a = analyze_music("track.mp3")
 a.bpm, len(a.beats), len(a.downbeats)
@@ -280,7 +280,7 @@ is still returned as the output. The expensive work is detection; losing it to
 an audio filter would be absurd.
 
 ```python
-from modules.auto_pipeline import run_auto_pipeline
+from modules.segments.auto_pipeline import run_auto_pipeline
 
 result = run_auto_pipeline(
     dest_root=r"D:\movies\GoPro",

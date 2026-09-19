@@ -84,7 +84,7 @@ datas += ov_datas
 binaries += ov_binaries
 hiddenimports += ov_hidden
 
-# ONNX Runtime, for the DirectML detection path (modules/onnx_detector.py). It
+# ONNX Runtime, for the DirectML detection path (modules/vision/onnx_detector.py). It
 # is imported inside a function rather than at module scope, and its providers
 # are native libraries, so collect it explicitly rather than trusting the graph.
 # Absent on any platform without the wheel — a sidecar built there simply has

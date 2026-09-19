@@ -1,6 +1,6 @@
 """Run the DirectML code paths on a machine that has no AMD GPU.
 
-`modules/directml_device.py` was written around one seam so the hardware could
+`modules/system/directml_device.py` was written around one seam so the hardware could
 be faked. This is that fake, driven far enough to be worth something: it
 installs a stand-in `torch_directml`, *hides this machine's real accelerators*
 so the AMD branch is the one actually taken, and redirects the simulated device
@@ -38,7 +38,7 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules import directml_device as dml  # noqa: E402
+from modules.system import directml_device as dml  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +120,7 @@ BY_KEY = {s.key: s for s in SCENARIOS}
 def _fake_torch_directml(scenario: Scenario):
     """A module object shaped like `torch_directml`.
 
-    Only the four things `modules/directml_device.py` is allowed to depend on:
+    Only the four things `modules/system/directml_device.py` is allowed to depend on:
     `is_available`, `device_count`, `device_name`, `device`. Keeping it this
     thin is the point — if this stub ever needs to grow, the module under test
     has started depending on something the real package might not provide.
@@ -370,7 +370,7 @@ def simulate(scenario: Scenario, hide_real=True, real_tensors=True):
                                 else os.environ.__setitem__(dml.MODE_ENV, old_mode)))
 
         if scenario.ort is not None:
-            from modules import ort_directml as _ort
+            from modules.system import ort_directml as _ort
             has_ort = bool(scenario.ort)
             # `dml.enabled()` is in both stubs because it is in the real probe:
             # VH_DIRECTML=off turns off DirectML whichever runtime supplies it.
@@ -400,7 +400,7 @@ def simulate(scenario: Scenario, hide_real=True, real_tensors=True):
 
         # Caches that would otherwise carry an answer across scenarios.
         try:
-            from modules import encoder_select as es
+            from modules.system import encoder_select as es
             old_vendor = es._vendor_cache
             es._vendor_cache = es._UNSET
             stack.callback(setattr, es, "_vendor_cache", old_vendor)
@@ -420,8 +420,8 @@ def _line(label, value):
 
 def report_routing(scenario: Scenario) -> None:
     """Every decision the app makes about this machine, in one place."""
-    from modules import device_utils as du
-    from modules import encoder_select as es
+    from modules.system import device_utils as du
+    from modules.system import encoder_select as es
     import llm.clip_prefilter as cp
 
     probe = dml.probe()
@@ -450,7 +450,7 @@ def report_routing(scenario: Scenario) -> None:
     # Action recognition. The viewer and the pipeline share this mapping, so
     # one line covers both — and a disagreement between them would mean a cache
     # built by one is a cache the other would not have produced.
-    from modules import analysis_ondemand as ao
+    from modules.report import analysis_ondemand as ao
     quiet = lambda *a, **k: None  # noqa: E731
     enable, half, device, onnx_dml = ao._r3d_flags("auto", log=quiet)
     _line("R3D on 'auto'",

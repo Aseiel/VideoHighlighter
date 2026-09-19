@@ -17,7 +17,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from modules import update_install, update_manifest as um
+from modules.update import update_install, update_manifest as um
 
 BASE = "https://updates.example/bucket"
 MANIFEST_URL = BASE + "/manifest.json"

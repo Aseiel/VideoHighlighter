@@ -1,5 +1,5 @@
 // Card-to-film in one tab: pick a source, say what the film should contain,
-// give it music, press go. Everything here maps onto modules/auto_pipeline.py's
+// give it music, press go. Everything here maps onto modules/segments/auto_pipeline.py's
 // stages, and the stage strip is the primary feedback — a single percentage bar
 // tells you nothing useful about a run that spends forty minutes in one stage.
 

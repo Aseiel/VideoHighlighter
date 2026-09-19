@@ -52,7 +52,7 @@ def test_batch_failures_are_not_counted():
 
 def test_increment_is_additive(tmp_path, monkeypatch):
     """The lifetime total accumulates across runs rather than being overwritten."""
-    from modules import analysis_stats
+    from modules.report import analysis_stats
 
     stats_file = tmp_path / "analysis_stats.json"
     monkeypatch.setattr(analysis_stats, "stats_path", lambda: str(stats_file))
@@ -65,7 +65,7 @@ def test_increment_is_additive(tmp_path, monkeypatch):
 
 def test_unwritable_stats_never_raises(monkeypatch):
     """A read-only install must not fail a run that already succeeded."""
-    from modules import analysis_stats
+    from modules.report import analysis_stats
 
     monkeypatch.setattr(analysis_stats, "stats_path",
                         lambda: "Z:/definitely/not/writable/stats.json")

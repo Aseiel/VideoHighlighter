@@ -37,7 +37,7 @@ DEFAULT_BASE_URL = "http://localhost:11434"
 DEFAULT_PORT = 11434
 
 # The chat panel's store, matched exactly — same pair of strings
-# `modules.llm_discovery` matches, and for the same reason: a second private
+# `modules.narration.llm_discovery` matches, and for the same reason: a second private
 # list of the same setting is how two parts of the app end up pointed at two
 # different servers.
 SETTINGS_ORG = "VideoHighlighter/LLMChat"

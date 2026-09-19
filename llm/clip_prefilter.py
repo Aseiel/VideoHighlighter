@@ -65,7 +65,7 @@ BUNDLED_OV_DIRNAME = "clip-vit-base-patch32-ov"
 def _ov_dir_candidates() -> list[str]:
     """Every place the pre-converted IR might live, most-specific first.
 
-    Self-contained (no dependency on modules.app_paths, which may not import
+    Self-contained (no dependency on modules.system.app_paths, which may not import
     cleanly from a lazily-imported module inside a frozen exe). Covers:
       - user-dropped override next to the exe / in the project root
       - the PyInstaller bundle dir (sys._MEIPASS)
@@ -96,7 +96,7 @@ def _bundled_ov_dir() -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Backend selection
 #
-# Deliberately a local probe rather than modules.device_utils: this module is
+# Deliberately a local probe rather than modules.system.device_utils: this module is
 # lazily imported (sometimes inside a frozen exe) and stays self-contained for
 # the same reason _ov_dir_candidates does. detect_best_device() would also drag
 # in an OpenVINO Core probe and its logging just to answer one bool.
@@ -120,8 +120,8 @@ def cuda_device() -> Optional[str]:
         return None
     try:
         # A card newer than this torch build is "available" and still cannot
-        # run a kernel; see modules/cuda_check.py.
-        from modules.cuda_check import cuda_usable
+        # run a kernel; see modules/system/cuda_check.py.
+        from modules.system.cuda_check import cuda_usable
         return "cuda:0" if cuda_usable(torch) else None
     except ImportError:
         pass
@@ -138,7 +138,7 @@ def directml_device() -> Optional[str]:
 
     One of two places this module reaches into `modules/` (the other is
     `cuda_device`, on the same terms) — deliberately, and it does not break the
-    self-containment the block above describes: `modules.directml_device`
+    self-containment the block above describes: `modules.system.directml_device`
     imports nothing but `os` and `typing` at module scope, so it costs the same
     as the local probe it would otherwise be. The
     reason not to inline it is that DirectML has genuine footguns (the backend
@@ -146,7 +146,7 @@ def directml_device() -> Optional[str]:
     all) and a copy of that reasoning per module is a copy that goes stale.
     """
     try:
-        from modules import directml_device as dml
+        from modules.system import directml_device as dml
     except Exception:  # noqa: BLE001 — absent module means "no DirectML"
         return None
     try:
@@ -158,7 +158,7 @@ def directml_device() -> Optional[str]:
 
 def _is_directml(device: str) -> bool:
     try:
-        from modules import directml_device as dml
+        from modules.system import directml_device as dml
         return dml.is_directml(device)
     except Exception:  # noqa: BLE001
         return False
@@ -172,7 +172,7 @@ def _device_name(device: str) -> str:
         # name matters more here than on CUDA: DirectML enumerates the
         # integrated GPU and the software renderer alongside the real card.
         try:
-            from modules import directml_device as dml
+            from modules.system import directml_device as dml
             return dml.probe().name() or device
         except Exception:  # noqa: BLE001
             return device
@@ -200,7 +200,7 @@ def resolve_device(requested: str) -> tuple[str, str]:
     plugin is Intel-only: on an AMD box "openvino", "GPU" silently means the
     CPU, so DirectML is competing with the processor there, not with a GPU. On
     an Intel box the order never matters, since CUDA is absent and DirectML is
-    only reached if `modules.directml_device` says yes — and on stock installs
+    only reached if `modules.system.directml_device` says yes — and on stock installs
     torch-directml is not there to say anything.
     """
     req = (requested or "AUTO").strip()
@@ -348,7 +348,7 @@ class ClipFramePrefilter:
             dtype = torch.float16
 
             if _is_directml(device):
-                from modules import directml_device as dml
+                from modules.system import directml_device as dml
 
                 # Registering the backend. `import torch_directml` is what
                 # teaches torch what "privateuseone" means; without it the

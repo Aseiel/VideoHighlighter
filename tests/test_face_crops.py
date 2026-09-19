@@ -1,4 +1,4 @@
-"""Tests for `modules.face_crops` — finding faces and cutting them out.
+"""Tests for `modules.vision.face_crops` — finding faces and cutting them out.
 
 Detection and embedding are injected, which is the reason those are callables:
 no cv2, no model, no video. Frames are plain arrays.
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from modules.face_crops import (
+from modules.vision.face_crops import (
     MIN_CROP_PIXELS,
     FaceCrop,
     crop_face,

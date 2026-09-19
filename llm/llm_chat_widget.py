@@ -1116,7 +1116,7 @@ class LLMChatWidget(QWidget):
                 return success
 
         try:
-            from modules.video_cache import VideoAnalysisCache
+            from modules.media.video_cache import VideoAnalysisCache
             cache = VideoAnalysisCache(cache_dir=self._cache_dir)
             vhash = cache._get_video_hash(video_path)
             matching = sorted(
@@ -1826,7 +1826,7 @@ class LLMChatWidget(QWidget):
         url = remember_ollama_host(self.ollama_host_input.text())
         self.ollama_host_input.setText(url or resolve_ollama_host())
         try:
-            from modules.llm_discovery import forget_ollama_models
+            from modules.narration.llm_discovery import forget_ollama_models
             forget_ollama_models()
         except Exception:                       # pragma: no cover - defensive
             pass
@@ -2448,8 +2448,8 @@ class LLMChatWidget(QWidget):
         """
         import json as _json
 
-        from modules.advisor import build_prompt, format_findings
-        from modules.highlight_advice import diagnose
+        from modules.report.advisor import build_prompt, format_findings
+        from modules.report.highlight_advice import diagnose
 
         with open(json_path, encoding="utf-8") as fh:
             report = _json.load(fh)

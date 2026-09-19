@@ -10,7 +10,7 @@ orderings:
   * too timid, and the AMD box it exists for still runs everything on the CPU.
 
 The probes are separate on purpose (each module documents why it does not
-import `modules.device_utils`), which is exactly the arrangement where one of
+import `modules.system.device_utils`), which is exactly the arrangement where one of
 them silently drifts. So each is pinned here.
 
 `describe_devices()` is not covered: it exists only in the Pro edition, for a
@@ -24,7 +24,7 @@ import types
 
 import pytest
 
-from modules import directml_device as dml
+from modules.system import directml_device as dml
 from tests.test_directml_device import FakeTorchDirectML
 
 
@@ -55,7 +55,7 @@ def _set_ort_dml(monkeypatch, available):
     developer happens to have `onnxruntime-directml` installed would make these
     assertions about the box rather than about the code.
     """
-    from modules import ort_directml
+    from modules.system import ort_directml
     # `dml.enabled()` is in the stub because it is in the real thing:
     # ort_directml.probe() consults it, so that VH_DIRECTML=off turns off
     # DirectML whichever runtime would have supplied it. A stub that ignored the
@@ -115,11 +115,11 @@ def fake_torch(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# modules/device_utils.py — the pipeline-wide answer
+# modules/system/device_utils.py — the pipeline-wide answer
 # ---------------------------------------------------------------------------
 
 def _detect(monkeypatch, torch_available=False):
-    from modules import device_utils as du
+    from modules.system import device_utils as du
     monkeypatch.setattr(du, "_TORCH_AVAILABLE", torch_available)
     return du.detect_best_device(log_fn=lambda *a, **k: None)
 
@@ -183,7 +183,7 @@ def test_cuda_still_wins_by_default(monkeypatch, amd_box):
     """The regression that would make this feature a net loss: DirectML runs on
     any DX12 card, NVIDIA included, so an over-eager probe would demote a
     working CUDA install to a slower backend."""
-    from modules import device_utils as du
+    from modules.system import device_utils as du
     stub = types.SimpleNamespace(
         cuda=types.SimpleNamespace(
             is_available=lambda: True, device_count=lambda: 1,
@@ -220,14 +220,14 @@ def test_the_detector_never_receives_a_directml_device(monkeypatch, amd_box):
     one on would trade a slow run for a failed one. The function exists to guarantee the
     value it returns is safe to use.
     """
-    from modules import device_utils as du
+    from modules.system import device_utils as du
     assert du.resolve_yolo_device("dml") == "cpu"
     assert du.resolve_yolo_device("privateuseone:0") == "cpu"
 
 
 def test_a_directml_string_on_a_machine_without_one_degrades_to_cpu(
         monkeypatch, no_directml):
-    from modules import device_utils as du
+    from modules.system import device_utils as du
     assert du.resolve_yolo_device("dml") == "cpu"
 
 
@@ -277,14 +277,14 @@ def test_clip_explicit_openvino_devices_are_untouched(monkeypatch, amd_box):
 
 
 # ---------------------------------------------------------------------------
-# modules/encoder_select.py — the win that lands without any model
+# modules/system/encoder_select.py — the win that lands without any model
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
 def vendor_for(monkeypatch):
     """preferred_gpu_vendor() against a chosen DeviceInfo."""
-    from modules import device_utils as du
-    from modules import encoder_select as es
+    from modules.system import device_utils as du
+    from modules.system import encoder_select as es
 
     def ask(backend_name, dml_device=None):
         monkeypatch.setattr(es, "_vendor_cache", es._UNSET)
@@ -321,7 +321,7 @@ def test_existing_vendors_are_unchanged(vendor_for):
 # ---------------------------------------------------------------------------
 
 def _lines(monkeypatch, torch_available=False):
-    from modules import device_utils as du
+    from modules.system import device_utils as du
     monkeypatch.setattr(du, "_TORCH_AVAILABLE", torch_available)
     out = []
     du.detect_best_device(log_fn=lambda *a, **k: out.append(" ".join(str(x) for x in a)))
@@ -342,7 +342,7 @@ def test_one_card_gets_one_explanation(monkeypatch, onnx_dml_box):
 
 def test_the_onnx_line_names_what_runs_on_the_gpu(monkeypatch, onnx_dml_box):
     """It used to say "object detection only". Action recognition goes through
-    the same runtime now (`modules/r3d_onnx.py`), and a user reading the old
+    the same runtime now (`modules/vision/r3d_onnx.py`), and a user reading the old
     line would have no reason to expect it."""
     lines = _lines(monkeypatch)
     detail = " ".join(lines)

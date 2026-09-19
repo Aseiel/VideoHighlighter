@@ -1,4 +1,4 @@
-"""Tests for `modules.highlight_swap` — "give me a different clip".
+"""Tests for `modules.segments.highlight_swap` — "give me a different clip".
 
 No Qt and no video: a session is built from a report record, which is the only
 thing the real UI has to hand after a run.
@@ -11,8 +11,8 @@ import json
 import numpy as np
 import pytest
 
-from modules.highlight_report import build_report, write_report
-from modules.highlight_swap import REPORT_SUFFIX, SwapSession, report_path_for
+from modules.report.highlight_report import build_report, write_report
+from modules.segments.highlight_swap import REPORT_SUFFIX, SwapSession, report_path_for
 
 
 def _report(n=400, clip_time=10, **kw):

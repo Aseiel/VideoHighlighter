@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules import llm_discovery
+from modules.narration import llm_discovery
 
 
 class FakeSettings:

@@ -46,7 +46,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.update_manifest import (  # noqa: E402
+from modules.update.update_manifest import (  # noqa: E402
     MANIFEST_FILENAME,
     MANIFEST_FORMAT,
     SIGNATURE_FILENAME,

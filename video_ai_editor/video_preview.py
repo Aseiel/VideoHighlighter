@@ -19,7 +19,7 @@ from PySide6.QtCore import Qt, QUrl, Signal, Slot, QTimer, QRect, QEvent
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QVideoFrame
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPixmap, QImage
-from modules.audio_device import follow_system_default
+from modules.media.audio_device import follow_system_default
 
 class AnalysisOverlayWidget(QWidget):
     """Floating transparent overlay that draws labels on top of video.

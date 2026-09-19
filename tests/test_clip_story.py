@@ -25,8 +25,8 @@ import json
 import numpy as np
 import pytest
 
-from modules import clip_story
-from modules.highlight_report import build_report, render_html
+from modules.narration import clip_story
+from modules.report.highlight_report import build_report, render_html
 
 
 FRAMES = ["Zg==", "cg==", "YQ==", "bQ=="]
@@ -393,7 +393,7 @@ class TestRender:
 
 class TestReportFile:
     def _write(self, tmp_path):
-        from modules.highlight_report import write_report
+        from modules.report.highlight_report import write_report
 
         html_path, json_path = tmp_path / "r.html", tmp_path / "r.json"
         write_report(_report(), str(html_path), str(json_path))
@@ -491,7 +491,7 @@ class TestReportFile:
     def test_the_players_survive_a_re_render(self, tmp_path):
         # Re-rendering without a media source would silently strip the per-clip
         # players a full write put on the page.
-        from modules.highlight_report import write_report
+        from modules.report.highlight_report import write_report
 
         video = tmp_path / "a.mp4"
         video.write_bytes(b"")

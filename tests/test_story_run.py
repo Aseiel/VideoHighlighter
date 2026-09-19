@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import pytest
 
-from modules import chapter_story, clip_story, story_run
-from modules.llm_models import is_captioner
+from modules.narration import chapter_story, clip_story, story_run
+from modules.narration.llm_models import is_captioner
 
 
 class _Recorder:
@@ -105,7 +105,7 @@ class TestWhatTheRunAsksFor:
         def _boom(*_a, **_kw):                      # pragma: no cover - guard
             raise AssertionError("loaded a model for a run that wanted none")
 
-        monkeypatch.setattr("modules.advisor.load_llm", _boom)
+        monkeypatch.setattr("modules.report.advisor.load_llm", _boom)
         assert story_run.narrate_report_file(
             "nowhere.json",
             config={"narrate_clips": False, "narrate_chapters": False},
@@ -114,7 +114,7 @@ class TestWhatTheRunAsksFor:
 
 class TestNarrationNeverCostsTheRun:
     def test_an_unreachable_model_is_a_log_line_and_a_zero(self, monkeypatch):
-        monkeypatch.setattr("modules.advisor.load_llm",
+        monkeypatch.setattr("modules.report.advisor.load_llm",
                             lambda *_a, **_kw: None)
         said = []
         assert story_run.narrate_report_file(
@@ -126,7 +126,7 @@ class TestNarrationNeverCostsTheRun:
         def _boom(*_a, **_kw):
             raise RuntimeError("no CUDA device")
 
-        monkeypatch.setattr("modules.advisor.load_llm", _boom)
+        monkeypatch.setattr("modules.report.advisor.load_llm", _boom)
         said = []
         assert story_run.narrate_report_file(
             "nowhere.json", config={}, log_fn=said.append)["clips"] == 0
@@ -137,9 +137,9 @@ class TestNarrationNeverCostsTheRun:
         def _boom(*_a, **_kw):
             raise ValueError("the report moved")
 
-        monkeypatch.setattr("modules.advisor.load_llm",
+        monkeypatch.setattr("modules.report.advisor.load_llm",
                             lambda *_a, **_kw: _Recorder())
-        monkeypatch.setattr("modules.clip_story.tell_report_file", _boom)
+        monkeypatch.setattr("modules.narration.clip_story.tell_report_file", _boom)
         said = []
         assert story_run.narrate_report_file(
             "nowhere.json", config={"narrate_chapters": False},
@@ -154,10 +154,10 @@ class TestNarrationNeverCostsTheRun:
             def accepts_images(self):
                 return False
 
-        monkeypatch.setattr("modules.advisor.load_llm",
+        monkeypatch.setattr("modules.report.advisor.load_llm",
                             lambda *_a, **_kw: _Blind())
         monkeypatch.setattr(
-            "modules.clip_story.tell_report_file",
+            "modules.narration.clip_story.tell_report_file",
             lambda *_a, **_kw: pytest.fail("read clips it could not see"))
         said = []
         assert story_run.narrate_report_file(
@@ -167,7 +167,7 @@ class TestNarrationNeverCostsTheRun:
 
     def test_a_cancelled_run_narrates_nothing(self, monkeypatch):
         monkeypatch.setattr(
-            "modules.advisor.load_llm",
+            "modules.report.advisor.load_llm",
             lambda *_a, **_kw: pytest.fail("built a model after cancel"))
         assert story_run.narrate_report_file(
             "nowhere.json", config={}, log_fn=lambda _m: None,

@@ -6,8 +6,8 @@ Usage:
     python tools/get_rtmpose_model.py s m l
 
 Output goes to models/rtmpose/rtmpose_<size>.xml/.bin — the location
-modules.pose_backend.find_default_rtmpose_ir() searches. The work itself lives
-in modules/rtmpose_models.py, which the app also calls on first run.
+modules.vision.pose_backend.find_default_rtmpose_ir() searches. The work itself lives
+in modules/vision/rtmpose_models.py, which the app also calls on first run.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from modules import rtmpose_models  # noqa: E402
+from modules.vision import rtmpose_models  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
@@ -28,7 +28,7 @@ def main(argv: list[str]) -> int:
         return 1
     print(f"\nDone. IR files in: {rtmpose_models.MODEL_DIR}")
     print("The app discovers these automatically "
-          "(modules.pose_backend.find_default_rtmpose_ir).")
+          "(modules.vision.pose_backend.find_default_rtmpose_ir).")
     return 0
 
 

@@ -17,7 +17,7 @@ import sys
 
 import pytest
 
-from modules import startup_splash
+from modules.system import startup_splash
 
 
 @pytest.fixture(autouse=True)

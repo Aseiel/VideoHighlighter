@@ -22,7 +22,7 @@
 ; installer carries it instead and installs offline.
 ;
 ; PER-USER, NO ADMIN: the app keeps its cache, debug.log and config.yaml beside
-; its own executable whenever that folder is writable (modules/app_paths.py,
+; its own executable whenever that folder is writable (modules/system/app_paths.py,
 ; user_data_dir) and only falls back to %LOCALAPPDATA% when it is not. Under
 ; Program Files it would always take the fallback, so the install a user can
 ; copy, inspect and delete stops being self-contained. %LOCALAPPDATA%\Programs

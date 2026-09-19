@@ -1,4 +1,4 @@
-"""Tests for `modules.highlight_select` — score curve to cut segments.
+"""Tests for `modules.segments.highlight_select` — score curve to cut segments.
 
 Pure numpy, no video: that is the point of the module existing separately. The
 behaviour locked in here is the greedy selection as it ran inline in
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from modules.highlight_select import (
+from modules.segments.highlight_select import (
     bucket_ceiling,
     peak_confidence_by_sec,
     rank_seconds,

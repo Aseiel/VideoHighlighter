@@ -68,7 +68,7 @@ def test_a_two_dimensional_output_is_rejected():
 def test_the_sidecar_is_the_bare_list_the_app_already_reads(tmp_path):
     """Not a richer format: the reader predates this writer.
 
-    ``modules.detection_backend`` reads a plain list. Anything cleverer here
+    ``modules.vision.detection_backend`` reads a plain list. Anything cleverer here
     would be a format the app does not understand, and the symptom would be a
     model that loads with no class names at all.
     """

@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import pytest
 
-from modules import analysis_ondemand as aod
-import modules.transcript_srt as srt
+from modules.report import analysis_ondemand as aod
+import modules.audio.transcript_srt as srt
 
 
 def _texts(n):
@@ -169,7 +169,7 @@ class TestSubtitleRunSharesTheBar:
                 progress_fn(56, 56, "Translation", "56 segments")
 
         monkeypatch.setattr(aod, "run_transcript", fake_run_transcript)
-        import modules.transcript_srt as srt_mod
+        import modules.audio.transcript_srt as srt_mod
         monkeypatch.setattr(srt_mod, "create_srt_file", fake_create_srt)
 
         def go(**kwargs):

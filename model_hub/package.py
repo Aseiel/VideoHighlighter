@@ -106,7 +106,7 @@ def detector_layout(shape) -> str:
     YOLOX emits ``[1, anchors, 5 + labels]``; the transposed
     ``[1, 4 + labels, anchors]`` layout is the AGPL toolkit's. The anchor axis
     always dwarfs the channel axis, which is what tells them apart — the same
-    rule ``modules.detection_backend.create_detector`` uses to pick a decoder.
+    rule ``modules.vision.detection_backend.create_detector`` uses to pick a decoder.
     """
     if len(shape) != 3:
         return "unknown"

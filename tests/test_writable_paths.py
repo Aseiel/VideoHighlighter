@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from modules import app_paths
+from modules.system import app_paths
 
 
 @pytest.fixture

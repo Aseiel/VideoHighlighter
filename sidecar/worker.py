@@ -304,7 +304,7 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
                 # video. A stats file that can't be written must not fail a run
                 # that already succeeded.
                 try:
-                    from modules import analysis_stats
+                    from modules.report import analysis_stats
 
                     # Batch mode returns [(input_path, output_or_None), ...], so
                     # count the ones that actually produced a highlight -- len()
@@ -360,7 +360,7 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
 
         elif kind == "scan_faces":
             from video_ai_editor.face_identity import FaceIdentityBank
-            from modules.compute_forbidden import build_tracking_model, tag_entries
+            from modules.segments.compute_forbidden import build_tracking_model, tag_entries
 
             bank = FaceIdentityBank(db_path=job["face_db_path"])
             yolo_model = build_tracking_model("n")
@@ -373,7 +373,7 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
             emit({"type": "finished", "output": f"{n} identities"})
 
         elif kind == "combine":
-            from modules import combine_videos
+            from modules.media import combine_videos
 
             music = None
             if job.get("music_path"):
@@ -394,7 +394,7 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
                 emit({"type": "cancelled"})
 
         elif kind == "auto":
-            from modules import auto_pipeline
+            from modules.segments import auto_pipeline
 
             def stage_fn(name: str, status: str, detail: str = "") -> None:
                 # A dedicated event rather than a log line: the UI draws the
@@ -416,7 +416,7 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
 
             card = None
             if job.get("card_root"):
-                from modules.gopro_ingest import find_gopro_cards
+                from modules.media.gopro_ingest import find_gopro_cards
 
                 root = job["card_root"]
                 cards = find_gopro_cards(extra_roots=[root], scan_mounts=False)
@@ -459,8 +459,8 @@ def run_job(conn, job: dict, cancel_evt, pause_evt, preview_flag) -> None:
                 emit({"type": "cancelled"})
 
         elif kind == "edl":
-            from modules.edl import Cut, Edl, render_edl
-            from modules.transitions import ReelCancelled
+            from modules.media.edl import Cut, Edl, render_edl
+            from modules.media.transitions import ReelCancelled
 
             spec = job["edl"]
             cut_list = Edl(

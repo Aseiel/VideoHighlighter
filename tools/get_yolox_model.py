@@ -6,8 +6,8 @@ Usage:
     python tools/get_yolox_model.py nano tiny s m l x
 
 Output goes to models/yolox/yolox_<size>.xml/.bin — the location
-modules.detection_backend.find_default_yolox_ir() searches. The work itself
-lives in modules/yolox_models.py, which the app also calls on first run.
+modules.vision.detection_backend.find_default_yolox_ir() searches. The work itself
+lives in modules/vision/yolox_models.py, which the app also calls on first run.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from modules import yolox_models  # noqa: E402
+from modules.vision import yolox_models  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
@@ -28,7 +28,7 @@ def main(argv: list[str]) -> int:
         return 1
     print(f"\nDone. IR files in: {yolox_models.MODEL_DIR}")
     print("The app discovers these automatically "
-          "(modules.detection_backend.find_default_yolox_ir).")
+          "(modules.vision.detection_backend.find_default_yolox_ir).")
     return 0
 
 

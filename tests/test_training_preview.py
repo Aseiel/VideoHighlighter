@@ -12,7 +12,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from conftest import real_opencv          # noqa: E402
 
-from modules import training_preview as tp  # noqa: E402
+from modules.vision import training_preview as tp  # noqa: E402
 
 
 @dataclass

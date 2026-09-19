@@ -47,10 +47,10 @@ from modules.ui.theme import DARK as THEME
 from modules.ui import icons as ui_icons
 # Building this window blocks the GUI thread for several seconds, so it reports
 # what it is on. The calls are no-ops unless someone opened a splash first
-# (modules/startup_splash.py), which keeps the window's own code free of any
+# (modules/system/startup_splash.py), which keeps the window's own code free of any
 # knowledge of who, if anyone, is watching.
-from modules import startup_splash
-from modules.audio_device import follow_system_default
+from modules.system import startup_splash
+from modules.media.audio_device import follow_system_default
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
 from video_ai_editor.timeline_export import TimelineExporter
@@ -1154,7 +1154,7 @@ class SignalTimelineWindow(QMainWindow):
         if checkbox is None or checkbox.isChecked():
             return
         try:
-            from modules.vr_detect import probe
+            from modules.media.vr_detect import probe
             layout = probe(self.video_path)
         except Exception as e:
             print(f"⚠️ Could not check the frame layout: {e}")
@@ -1441,7 +1441,7 @@ class SignalTimelineWindow(QMainWindow):
         """Initialize waveform visualization in background with better debugging"""
         # First check if video even has audio
         try:
-            from modules.ffmpeg_tools import probe
+            from modules.media.ffmpeg_tools import probe
             streams = probe(self.video_path, timeout=8).get("streams") or []
 
             if not any(s.get("codec_type") == "audio" for s in streams):
@@ -1963,7 +1963,7 @@ class SignalTimelineWindow(QMainWindow):
             return video_hash
         try:
             if self.video_path and os.path.exists(self.video_path):
-                from modules.video_cache import VideoAnalysisCache
+                from modules.media.video_cache import VideoAnalysisCache
                 cache = self.cache or VideoAnalysisCache()
                 video_hash = cache._get_video_hash(self.video_path)
                 if self.cache_data is None:
@@ -1980,7 +1980,7 @@ class SignalTimelineWindow(QMainWindow):
             from pathlib import Path
             import json
 
-            from modules.video_cache import atomic_write_json
+            from modules.media.video_cache import atomic_write_json
 
             if not self.cache_data:
                 self.cache_data = {}
@@ -2018,7 +2018,7 @@ class SignalTimelineWindow(QMainWindow):
                 # stages it believes are cached. load_cache_data() below reads
                 # this file directly and ignores the flag, so the findings
                 # survive a restart regardless.
-                from modules.video_cache import holds_analysis
+                from modules.media.video_cache import holds_analysis
                 disk_data['cache_complete'] = holds_analysis(disk_data)
 
             disk_data['visual_findings'] = findings
@@ -2051,7 +2051,7 @@ class SignalTimelineWindow(QMainWindow):
             from pathlib import Path
             import json
 
-            from modules.video_cache import atomic_write_json
+            from modules.media.video_cache import atomic_write_json
 
             cache_dir = Path("./cache")
             if not cache_dir.exists():
@@ -2092,7 +2092,7 @@ class SignalTimelineWindow(QMainWindow):
         """Get cache instance for highlight loading"""
         print(f"\n🔍 [TIMELINE] get_cache_instance")
         try:
-            from modules.video_cache import VideoAnalysisCache
+            from modules.media.video_cache import VideoAnalysisCache
             cache = VideoAnalysisCache()
             
             # List all cache files
@@ -2127,7 +2127,7 @@ class SignalTimelineWindow(QMainWindow):
         print(f"  - video_path: {self.video_path}")
         
         try:
-            from modules.video_cache import VideoAnalysisCache
+            from modules.media.video_cache import VideoAnalysisCache
             cache = VideoAnalysisCache()
             print(f"  ✓ Created VideoAnalysisCache instance")
             
@@ -2342,9 +2342,9 @@ class SignalTimelineWindow(QMainWindow):
         startup_splash.stage("Drawing the signal timeline…")
         self.signal_scene = SignalTimelineScene(self.cache_data, self.video_duration, waveform=self.waveform,
                                                 video_path=self.video_path)
-        # Restore ranges marked in an earlier session (see modules.manual_avoid).
+        # Restore ranges marked in an earlier session (see modules.segments.manual_avoid).
         try:
-            from modules.manual_avoid import load_ranges
+            from modules.segments.manual_avoid import load_ranges
             saved = load_ranges(self.video_path)
             if saved:
                 self.signal_scene.avoid_ranges = [tuple(r) for r in saved]
@@ -2689,7 +2689,7 @@ class SignalTimelineWindow(QMainWindow):
 
         Replaces the old info bar: its duration already duplicated the status
         bar, its hints are now the timeline's tooltip, and its "Debug log" box
-        was a synced duplicate of the main GUI's (modules.debug_console keeps
+        was a synced duplicate of the main GUI's (modules.system.debug_console keeps
         them in step, so the one in the main window still drives it).
         """
         self.time_label = QLabel("No time selected")
@@ -2800,7 +2800,7 @@ class SignalTimelineWindow(QMainWindow):
         # Prefill the class/keep lists from the main GUI's saved settings so a
         # run is usually one click.
         try:
-            from modules.analysis_ondemand import analysis_defaults
+            from modules.report.analysis_ondemand import analysis_defaults
             _d = analysis_defaults()
             obj_default = ", ".join(_d.get("object_list", []))
             act_default = ", ".join(_d.get("action_list", []))
@@ -2935,7 +2935,7 @@ class SignalTimelineWindow(QMainWindow):
 
     def _start_analysis(self, kind):
         import threading
-        from modules.analysis_ondemand import (
+        from modules.report.analysis_ondemand import (
             run_actions, run_objects, run_transcript, run_motion, run_audio)
 
         cancel = threading.Event()
@@ -3009,7 +3009,7 @@ class SignalTimelineWindow(QMainWindow):
 
     @Slot(str, object)
     def _on_analysis_finished(self, kind, result):
-        from modules.analysis_ondemand import _Cancelled
+        from modules.report.analysis_ondemand import _Cancelled
         self._set_analyze_busy(kind, False)
         self._analysis_running = None
         self._analysis_cancel = None
@@ -3140,7 +3140,7 @@ class SignalTimelineWindow(QMainWindow):
         could be one the viewer never reads on reopen) and seeds a fresh
         `<hash>.cache.json` from the current in-memory cache_data when there's
         none yet."""
-        from modules.analysis_ondemand import merge_into_cache
+        from modules.report.analysis_ondemand import merge_into_cache
         merge_into_cache(self.video_path, patch, seed=self.cache_data, log=print)
 
     @staticmethod
@@ -3799,7 +3799,7 @@ class SignalTimelineWindow(QMainWindow):
         if session is not None:
             return session
 
-        from modules.highlight_swap import SwapSession, report_path_for
+        from modules.segments.highlight_swap import SwapSession, report_path_for
 
         path = report_path_for(self.video_path)
         if not path:
@@ -3970,7 +3970,7 @@ class SignalTimelineWindow(QMainWindow):
         lo, hi = min(t0, t1), max(t0, t1)
         ranges = list(getattr(scene, "avoid_ranges", [])) + [(lo, hi)]
         try:
-            from modules.manual_avoid import merge_overlapping
+            from modules.segments.manual_avoid import merge_overlapping
             ranges = merge_overlapping(ranges)
         except Exception:
             pass
@@ -3994,7 +3994,7 @@ class SignalTimelineWindow(QMainWindow):
         window still reads the live scene directly, so in-process behaviour is
         unchanged. Never let a storage problem interrupt editing."""
         try:
-            from modules.manual_avoid import save_ranges
+            from modules.segments.manual_avoid import save_ranges
             save_ranges(self.video_path,
                         getattr(self.signal_scene, "avoid_ranges", []))
         except Exception as e:
@@ -4971,7 +4971,7 @@ class SignalTimelineWindow(QMainWindow):
         import threading
 
         def render():
-            from modules.app_paths import ffmpeg_exe
+            from modules.system.app_paths import ffmpeg_exe
             import tempfile
 
             def _parse_ffmpeg_time(ts):
@@ -5058,7 +5058,7 @@ class SignalTimelineWindow(QMainWindow):
         GUI's Advanced-tab setting. Falls back to 'cpu' (VR-safe)."""
         try:
             import yaml
-            from modules.app_paths import config_path
+            from modules.system.app_paths import config_path
             with open(config_path("config.yaml"), "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             mode = (cfg.get("highlights", {}) or {}).get("render_mode", "cpu")
@@ -5073,7 +5073,7 @@ class SignalTimelineWindow(QMainWindow):
             return
         try:
             import yaml
-            from modules.app_paths import config_path
+            from modules.system.app_paths import config_path
             p = config_path("config.yaml")
             try:
                 with open(p, "r", encoding="utf-8") as f:
@@ -5088,7 +5088,7 @@ class SignalTimelineWindow(QMainWindow):
 
     def _encoder_chain(self):
         """Video-encoder fallback chain for the render, delegated to the shared
-        modules.encoder_select helper (also used by the pipeline) so the codec
+        modules.system.encoder_select helper (also used by the pipeline) so the codec
         decision — GPU vendor via device_utils, HEVC-for-VR by resolution,
         libx264 fallback — lives in one place. Cached per (window, mode).
 
@@ -5098,7 +5098,7 @@ class SignalTimelineWindow(QMainWindow):
             self.render_mode_combo.currentData() if hasattr(self, "render_mode_combo") else "cpu")
         if getattr(self, "_enc_chain_mode", None) == mode and hasattr(self, "_enc_chain"):
             return self._enc_chain
-        from modules.encoder_select import encoder_chain
+        from modules.system.encoder_select import encoder_chain
         self._enc_chain = encoder_chain(self.video_path, mode=mode)
         self._enc_chain_mode = mode
         return self._enc_chain
@@ -5173,10 +5173,10 @@ class SignalTimelineWindow(QMainWindow):
 # Launched from /Applications (or a mounted .dmg) the CWD is `/`, and a relative
 # name here made the open() below raise `OSError: [Errno 30] Read-only file
 # system` at import time, taking the whole timeline viewer down with it. Same
-# reason modules/repaint_trace.py resolves its path this way.
+# reason modules/system/repaint_trace.py resolves its path this way.
 def _debug_file_path() -> str:
     try:
-        from modules.app_paths import user_data_dir
+        from modules.system.app_paths import user_data_dir
         return os.path.join(user_data_dir(), "timeline_debug.log")
     except Exception:
         return "timeline_debug.log"
@@ -5220,9 +5220,9 @@ debug_log(f"Script location: {__file__}")
 # for it: that reopens the file per call and there is nothing holding a
 # descriptor at the moment it matters. Arming here keeps one open and puts
 # faulthandler behind it, so a hard crash writes a C-level traceback instead of
-# vanishing. See modules/repaint_trace.py.
+# vanishing. See modules/system/repaint_trace.py.
 try:
-    from modules import repaint_trace as _repaint_trace
+    from modules.system import repaint_trace as _repaint_trace
     if _repaint_trace.arm():
         debug_log(f"🩺 Repaint trace → {_repaint_trace.default_path()}")
 except Exception as _e:

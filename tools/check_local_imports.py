@@ -335,7 +335,7 @@ def resolve_and_verify(
         for symbol in imp.symbols or ():
             submodule_candidate = f"{imp.package_path}/{symbol}"
             if not package_is_plain_module and resolved_file(submodule_candidate) is not None:
-                continue  # valid submodule import (e.g. `from modules import debug_console`)
+                continue  # valid submodule import (e.g. `from modules.system import debug_console`)
 
             if package_file is not None:
                 names = top_level_names(package_file)

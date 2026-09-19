@@ -42,7 +42,7 @@ fails to reach its GPU is still better off on OpenVINO than on the alternative.
 ## How the app finds an Intel GPU
 
 Two separate probes can answer for Intel, and which one fires depends on how
-torch was built. `detect_best_device()` in `modules/device_utils.py` tries them
+torch was built. `detect_best_device()` in `modules/system/device_utils.py` tries them
 in this order: CUDA, then Intel, then DirectML, then the processor.
 
 - **torch's own XPU build.** A `torch 2.5+` `+xpu` wheel exposes `torch.xpu`
@@ -69,7 +69,7 @@ the table above shows.
 | Object detection | yes, via OpenVINO IR | The heaviest per-frame stage, so the largest part of the win. Exported on first use — see below. |
 | Action recognition (Intel encoder/decoder) | yes | `action-recognition-0001`, which ships as OpenVINO IR. |
 | Visual search (CLIP prefilter) | yes | Pre-converted to IR at build time by `tools/export_clip_ov.py`. |
-| Video encoding (QSV) | yes, indirectly | `modules/encoder_select.py` reads the vendor and prefers `h264_qsv` / `hevc_qsv`. Nothing to do with machine learning. |
+| Video encoding (QSV) | yes, indirectly | `modules/system/encoder_select.py` reads the vendor and prefers `h264_qsv` / `hevc_qsv`. Nothing to do with machine learning. |
 | Action recognition (R3D) | **no** | See below. |
 | Face, motion | no | OpenVINO on the processor. |
 
@@ -117,9 +117,9 @@ good guide to what it does on Intel: do not use it.
 
 **The adapter is not certain.** Device ids 0 and 1 both bound and performed the
 same, Windows lists only a virtual display device and the Arc, and ONNX Runtime
-offers no way to ask a session which adapter it took. `modules/ort_directml.py`
+offers no way to ask a session which adapter it took. `modules/system/ort_directml.py`
 binds adapter 0 and does not filter software adapters, unlike
-`modules/directml_device.py`, which skips Microsoft's software renderer
+`modules/system/directml_device.py`, which skips Microsoft's software renderer
 deliberately. So the DirectML row may be measuring something other than the Arc.
 It does not change the conclusion for Intel users, since OpenVINO wins either
 way, but it does mean the row should not be quoted as *DirectML's* speed.
@@ -129,10 +129,10 @@ The ratios are large enough to act on and not precise enough to extrapolate.
 
 ## Where the code is
 
-- `modules/device_utils.py` — the probe order, the two Intel branches, and the
+- `modules/system/device_utils.py` — the probe order, the two Intel branches, and the
   `DeviceInfo` fields each one sets.
-- `modules/compute_backend.py` — the backend setting, including the `intel`
+- `modules/system/compute_backend.py` — the backend setting, including the `intel`
   choice that covers both probes.
-- `modules/encoder_select.py` — vendor detection for the QSV video encoders.
+- `modules/system/encoder_select.py` — vendor detection for the QSV video encoders.
 - `tools/export_clip_ov.py` — the build-time CLIP conversion to OpenVINO IR.
 - `docs/AMD-GPU.md` — the DirectML path, and why it is opt-in everywhere.

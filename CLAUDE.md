@@ -69,10 +69,11 @@ forced repair is a GitHub Support ticket.
 
 ## Conventions
 
-- The packaged exe is `--windowed`: `stdout` goes nowhere, so `modules/debug_console.py`
-  tees all output to `debug.log` and the optional "Debug log" window. Diagnostic
-  output belongs in `print()` (→ debug log); `append_log()` is the user-facing
-  log pane and is only for things the user acts on.
+- The packaged exe is `--windowed`: `stdout` goes nowhere, so
+  `modules/system/debug_console.py` tees all output to `debug.log` and the
+  optional "Debug log" window. Diagnostic output belongs in `print()`
+  (→ debug log); `append_log()` is the user-facing log pane and is only for
+  things the user acts on.
 - Dependencies should be permissive (MIT/BSD/Apache) — prefer what is already
   in the stack over adding something new. Check the licence of a model's
   *runtime and training toolkit*, not just its weights.

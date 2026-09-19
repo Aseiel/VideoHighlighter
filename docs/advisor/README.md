@@ -1,6 +1,6 @@
 # Advisor knowledge base
 
-These pages are what the advisor knows. `modules/highlight_advice.py` decides
+These pages are what the advisor knows. `modules/report/highlight_advice.py` decides
 *which* page applies by computing findings from the report; these files supply
 the explanation and the remedy in language a user can act on.
 

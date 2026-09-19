@@ -17,7 +17,7 @@ IR loads, and every box lands in the wrong place. Hence
 ``head.decode_in_inference = False`` before tracing, and the shape check after.
 
 **The names live beside the model, not in it.** A raw-grid export carries no
-class-name metadata at all, so ``modules.detection_backend.names_from_model``
+class-name metadata at all, so ``modules.vision.detection_backend.names_from_model``
 finds nothing. Without ``labels.json`` next to the IR the app logs "No class
 names for custom model" and quietly falls back to the 80-class detector — which
 reads as a bad model rather than a missing file.

@@ -1,5 +1,5 @@
 """
-Tests for modules.cuda_check — CUDA that is "available" but cannot run.
+Tests for modules.system.cuda_check — CUDA that is "available" but cannot run.
 
 Observed on a user's RTX 5060 under the release build's CUDA 12.4 torch:
 is_available() said yes, the build's kernels stop at sm_90, and the first real
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import types
 
-from modules import cuda_check
+from modules.system import cuda_check
 
 CU124_ARCHS = ["sm_50", "sm_60", "sm_61", "sm_70", "sm_75", "sm_80", "sm_86", "sm_90"]
 
@@ -83,7 +83,7 @@ def test_the_answer_is_cached_per_torch():
 
 
 def test_detect_best_device_passes_over_an_unusable_card(monkeypatch):
-    from modules import device_utils as du
+    from modules.system import device_utils as du
     torch = fake_torch(capability=(12, 0), name="NVIDIA GeForce RTX 5060")
     monkeypatch.setattr(du, "_TORCH_AVAILABLE", True)
     monkeypatch.setattr(du, "torch", torch)
@@ -98,7 +98,7 @@ def test_detect_best_device_passes_over_an_unusable_card(monkeypatch):
 
 
 def test_resolve_yolo_device_refuses_an_unusable_card(monkeypatch):
-    from modules import device_utils as du
+    from modules.system import device_utils as du
     monkeypatch.setattr(du, "_TORCH_AVAILABLE", True)
     monkeypatch.setattr(du, "torch", fake_torch(capability=(12, 0)))
 

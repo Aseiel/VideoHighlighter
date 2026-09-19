@@ -1,5 +1,5 @@
 """
-End-to-end rotation test for modules.video_cutter.cut_video.
+End-to-end rotation test for modules.media.video_cutter.cut_video.
 
 The trap this pins: a sideways-shot clip carries rotation metadata (a portrait
 phone recording stores 320x240 landscape frames plus a "rotate 90 CW" matrix).
@@ -25,9 +25,9 @@ import subprocess
 
 import pytest
 
-from modules import video_probe
-from modules.app_paths import ffmpeg_exe
-from modules.video_cutter import cut_video
+from modules.media import video_probe
+from modules.system.app_paths import ffmpeg_exe
+from modules.media.video_cutter import cut_video
 
 
 def _ffmpeg(*args):

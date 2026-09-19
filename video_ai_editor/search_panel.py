@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QSizePolicy, QSplitter, QComboBox, QMenu,
 )
 
-from modules.face_emotions import EMOTION_LABELS
+from modules.vision.face_emotions import EMOTION_LABELS
 
 THUMB_SIZE = 56    # face card thumbnail px
 MERGE_GAP  = 2.0  # seconds — gaps smaller than this are merged
@@ -67,7 +67,7 @@ def load_identity_entries(video_path: str) -> list[dict]:
     if not video_path:
         return []
     try:
-        from modules.compute_forbidden import _entries_key
+        from modules.segments.compute_forbidden import _entries_key
         key = _entries_key(video_path, "n", 15, 3)
         fname = key + ".entries.json"
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -254,7 +254,7 @@ class _ExpressionScanWorker(QThread):
 
     def run(self):
         try:
-            from modules.face_scan import scan_video
+            from modules.vision.face_scan import scan_video
             seconds = scan_video(
                 self._video_path,
                 cache_dir=self._cache_dir,
@@ -538,7 +538,7 @@ class SearchPanel(QWidget):
         if not self._video_path:
             return
         try:
-            from modules.face_scan import cache_path_for, load as load_scan
+            from modules.vision.face_scan import cache_path_for, load as load_scan
             seconds = load_scan(cache_path_for(self._video_path))
         except Exception:
             seconds = None
@@ -584,7 +584,7 @@ class SearchPanel(QWidget):
         self._apply_expression_scan(seconds)
 
     def _apply_expression_scan(self, seconds: dict, cached: bool = False):
-        from modules.face_scan import label_counts
+        from modules.vision.face_scan import label_counts
 
         self._expr_seconds = seconds
         self._expr_combo.setEnabled(True)
@@ -602,7 +602,7 @@ class SearchPanel(QWidget):
         label = self._expr_combo.currentData() or ""
         if not label or not self._expr_seconds:
             return
-        from modules.face_scan import segments_for
+        from modules.vision.face_scan import segments_for
 
         segments = segments_for(self._expr_seconds, label,
                                 duration=self._video_duration)

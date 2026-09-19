@@ -195,7 +195,7 @@ def convert_current_model():
     # The ONNX is kept, not deleted. It used to be a scratch file on the way to
     # OpenVINO IR, which is Intel-only; ONNX Runtime's DirectML provider runs
     # the same graph on any DX12 card and is the one accelerated runtime a
-    # packaged build can carry (see modules/ort_directml.py). Writing both
+    # packaged build can carry (see modules/system/ort_directml.py). Writing both
     # costs a few MB and gives the AMD path a model to load.
     onnx_path = DECODER_ONNX_PATH
     os.makedirs(os.path.dirname(onnx_path), exist_ok=True)

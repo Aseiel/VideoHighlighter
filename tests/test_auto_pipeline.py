@@ -1,5 +1,5 @@
 """
-Tests for modules.auto_pipeline — the card-to-film orchestrator.
+Tests for modules.segments.auto_pipeline — the card-to-film orchestrator.
 
 The engine is injected as a stub (``highlight_runner``) throughout, because
 nothing here is a test of detection quality: what is being tested is the
@@ -22,8 +22,8 @@ import subprocess
 
 import pytest
 
-from modules.app_paths import ffmpeg_exe
-from modules.auto_pipeline import (
+from modules.system.app_paths import ffmpeg_exe
+from modules.segments.auto_pipeline import (
     DONE,
     FAILED,
     SKIPPED,
@@ -53,7 +53,7 @@ def _ffmpeg_ok() -> bool:
         return False
 
 
-# The combine stage runs the real modules.combine_videos, which runs real
+# The combine stage runs the real modules.media.combine_videos, which runs real
 # ffmpeg. Feeding it fake bytes would only ever test that ffmpeg rejects
 # garbage, so the stub engine emits genuine (tiny) clips instead and these
 # tests skip outright where ffmpeg is unavailable.
@@ -263,11 +263,11 @@ def test_a_resumed_run_reloads_the_beat_grid(tmp_path, tiny_clip, monkeypatch):
         beats = [0.0, 0.5, 1.0, 1.5]
         downbeats = [0.0]
 
-    fake = types.ModuleType("modules.music_analysis")
+    fake = types.ModuleType("modules.audio.music_analysis")
     fake.analyze_music = lambda *a, **k: _Fake()
     fake.save_analysis = lambda _a, path: (open(path, "w").write("{}"), path)[1]
     fake.load_analysis = lambda path: (seen.append(path), _Fake())[1]
-    monkeypatch.setitem(sys.modules, "modules.music_analysis", fake)
+    monkeypatch.setitem(sys.modules, "modules.audio.music_analysis", fake)
 
     runner = _stub_engine(str(tmp_path / "hl"), tiny_clip)
     _run(tmp_path, tiny_clip, dest=dest, highlight_runner=runner,
@@ -384,14 +384,14 @@ def test_music_failure_still_returns_the_silent_reel(tmp_path, tiny_clip, monkey
     def boom(*_args, **_kwargs):
         raise RuntimeError("ffmpeg music mux failed")
 
-    bad_music = types.ModuleType("modules.music_track")
+    bad_music = types.ModuleType("modules.media.music_track")
     bad_music.apply_music = boom
-    monkeypatch.setitem(sys.modules, "modules.music_track", bad_music)
+    monkeypatch.setitem(sys.modules, "modules.media.music_track", bad_music)
 
-    bad_analysis = types.ModuleType("modules.music_analysis")
+    bad_analysis = types.ModuleType("modules.audio.music_analysis")
     bad_analysis.analyze_music = boom
     bad_analysis.save_analysis = boom
-    monkeypatch.setitem(sys.modules, "modules.music_analysis", bad_analysis)
+    monkeypatch.setitem(sys.modules, "modules.audio.music_analysis", bad_analysis)
 
     result = _run(tmp_path, tiny_clip, music_path=str(music))
 

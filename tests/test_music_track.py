@@ -1,5 +1,5 @@
 """
-Tests for `modules.music_track`.
+Tests for `modules.media.music_track`.
 
 Real end-to-end runs against ffmpeg: a synthetic 4 s video (testsrc2 + 440 Hz
 sine) gets a 2 s 220 Hz music bed applied in every mode. The pinned
@@ -17,17 +17,17 @@ import types
 
 import pytest
 
-from modules.app_paths import ffmpeg_exe
-from modules import music_track
-from modules.music_track import apply_music
+from modules.system.app_paths import ffmpeg_exe
+from modules.media import music_track
+from modules.media.music_track import apply_music
 
 try:
-    from modules import video_probe  # noqa: F401
+    from modules.media import video_probe  # noqa: F401
 except ImportError:
-    # Parallel-dev shim: modules/video_probe.py is a pinned sibling contract
+    # Parallel-dev shim: modules/media/video_probe.py is a pinned sibling contract
     # that may not have landed yet. Satisfy the one call music_track makes
     # (duration, for the replace-mode fade-out) with an ffprobe stand-in.
-    _stub = types.ModuleType("modules.video_probe")
+    _stub = types.ModuleType("modules.media.video_probe")
 
     def _probe_video(path):
         out = subprocess.run(
@@ -39,7 +39,7 @@ except ImportError:
                 "height": 0, "fps": 0.0, "rotation": 0}
 
     _stub.probe_video = _probe_video
-    sys.modules["modules.video_probe"] = _stub
+    sys.modules["modules.media.video_probe"] = _stub
 
 
 def _ffmpeg_ok() -> bool:

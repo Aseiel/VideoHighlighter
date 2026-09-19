@@ -15,7 +15,7 @@ import warnings
 import numpy as np
 import pytest
 
-from modules.audio_peaks import peaks_in_chunk
+from modules.audio.audio_peaks import peaks_in_chunk
 
 FULL_SCALE_NEGATIVE = -32768        # no positive twin exists in int16
 FULL_SCALE_POSITIVE = 32767

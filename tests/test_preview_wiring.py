@@ -94,7 +94,7 @@ def test_ondemand_runner_forwards_preview_fn(runner):
     """`run_actions`/`run_objects` take a preview hook and hand it to the
     detector — an on-demand run detects over the whole video exactly as the
     pipeline's stage does, so it has the same frames to show."""
-    tree = ast.parse((REPO / "modules" / "analysis_ondemand.py")
+    tree = ast.parse((REPO / "modules" / "report" / "analysis_ondemand.py")
                      .read_text(encoding="utf-8"))
     fn = next((n for n in ast.walk(tree)
                if isinstance(n, ast.FunctionDef) and n.name == runner), None)

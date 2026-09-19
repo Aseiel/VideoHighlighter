@@ -1,5 +1,5 @@
 """
-Tests for modules.transitions against real ffmpeg.
+Tests for modules.media.transitions against real ffmpeg.
 
 Two things can go wrong here and only one of them is visible in a duration
 check. The offsets can be wrong, which shows up as a reel of the wrong length;
@@ -19,8 +19,8 @@ import subprocess
 
 import pytest
 
-from modules.app_paths import ffmpeg_exe
-from modules.transitions import (
+from modules.system.app_paths import ffmpeg_exe
+from modules.media.transitions import (
     CURATED,
     EASINGS,
     FAMILIES,
@@ -69,7 +69,7 @@ def _clip(path, colour="red", duration=3.0, size="160x120", rate=30):
 
 
 def _duration(path) -> float:
-    from modules.video_probe import probe_video
+    from modules.media.video_probe import probe_video
     return probe_video(path)["duration"]
 
 
@@ -228,7 +228,7 @@ def test_a_transition_longer_than_its_clips_is_clamped(tmp_path):
 def test_the_canvas_can_be_overridden_for_delivery(two_clips, tmp_path):
     """Camera footage arrives at whatever it was shot at; the reel is allowed
     to be a sane size."""
-    from modules.video_probe import probe_video
+    from modules.media.video_probe import probe_video
 
     out = str(tmp_path / "reel.mp4")
     build_reel(two_clips, out, kind="crossfade", duration=0.5,
@@ -246,7 +246,7 @@ def test_an_all_cuts_reel_still_gets_its_delivery_size(two_clips, tmp_path):
     knows nothing about captions. The render succeeded, looked fine, and was
     5312x2988 landscape instead of the 1080x1920 that was asked for.
     """
-    from modules.video_probe import probe_video
+    from modules.media.video_probe import probe_video
 
     out = str(tmp_path / "reel.mp4")
     build_reel(two_clips, out, kind="cut", width=270, height=480,
@@ -259,7 +259,7 @@ def test_an_all_cuts_reel_still_gets_its_delivery_size(two_clips, tmp_path):
 def test_crop_fills_the_frame_rather_than_padding_it(tmp_path):
     """A wide shot padded into a vertical frame is a strip in a black screen,
     which is not what anyone means by a vertical reel."""
-    from modules.video_probe import probe_video
+    from modules.media.video_probe import probe_video
 
     clips = [_clip(tmp_path / "a.mp4", "red", duration=2.0, size="320x180"),
              _clip(tmp_path / "b.mp4", "blue", duration=2.0, size="320x180")]
@@ -283,7 +283,7 @@ def test_captions_survive_an_all_cuts_reel(two_clips, tmp_path):
 
     # The caption sits in a dark box in the lower third; a clean red frame has
     # nothing dark in it at all.
-    from modules.video_probe import probe_video
+    from modules.media.video_probe import probe_video
     assert probe_video(out)["duration"] > 0
     band = _rgb_at(out, 1.0, tmp_path)
     assert band is not None
@@ -369,7 +369,7 @@ def test_an_unknown_easing_is_refused():
 def test_eased_wipes_and_circles_render(two_clips, tmp_path, kind):
     """These are hand-written expressions rather than built-ins, so each one
     is a chance to get the geometry wrong."""
-    from modules.video_probe import probe_video
+    from modules.media.video_probe import probe_video
 
     out = str(tmp_path / f"w_{kind}.mp4")
     build_reel(two_clips, out,
@@ -391,7 +391,7 @@ def test_every_curated_transition_is_a_real_one():
 def test_odd_dimensions_are_made_even(two_clips, tmp_path):
     """yuv420p cannot represent an odd width, and ffmpeg's error for it is
     obscure."""
-    from modules.video_probe import probe_video
+    from modules.media.video_probe import probe_video
 
     out = str(tmp_path / "reel.mp4")
     build_reel(two_clips, out, kind="crossfade", duration=0.5,
@@ -694,7 +694,7 @@ def test_a_long_caption_is_wrapped_rather_than_run_off_the_frame():
     centres it, so a caption wider than the frame hangs off both sides. On a
     1080-wide reel at the default size that starts at about twelve
     characters, which is shorter than any real hook."""
-    from modules.transitions import TEXT_LINES, TEXT_WIDTH, fit_caption
+    from modules.media.transitions import TEXT_LINES, TEXT_WIDTH, fit_caption
 
     lines, size = fit_caption("21 clips. One morning.", 1080, 1920,
                               _font_or_skip())
@@ -705,7 +705,7 @@ def test_a_long_caption_is_wrapped_rather_than_run_off_the_frame():
 
 
 def test_a_short_caption_is_left_on_one_line():
-    from modules.transitions import fit_caption
+    from modules.media.transitions import fit_caption
 
     lines, _ = fit_caption("One morning.", 1080, 1920, _font_or_skip())
 
@@ -714,7 +714,7 @@ def test_a_short_caption_is_left_on_one_line():
 
 def test_a_word_too_wide_to_wrap_is_shrunk_instead():
     """Wrapping cannot help a single long word, so the size has to give."""
-    from modules.transitions import TEXT_WIDTH, fit_caption
+    from modules.media.transitions import TEXT_WIDTH, fit_caption
 
     word = "Supercalifragilisticexpialidocious"
     lines, size = fit_caption(word, 1080, 1920, _font_or_skip())
@@ -729,7 +729,7 @@ def test_fitting_survives_having_no_font_library():
     """The fallback estimate must wrap early rather than late — a caption a
     little narrower than it could be is invisible, and one that overflows is
     not."""
-    from modules.transitions import TEXT_WIDTH, fit_caption
+    from modules.media.transitions import TEXT_WIDTH, fit_caption
 
     lines, size = fit_caption("21 clips. One morning.", 1080, 1920, "")
 
@@ -738,7 +738,7 @@ def test_fitting_survives_having_no_font_library():
 
 
 def test_an_empty_caption_asks_for_nothing():
-    from modules.transitions import fit_caption
+    from modules.media.transitions import fit_caption
 
     assert fit_caption("", 1080, 1920, "") == ([], 0)
     assert fit_caption("   ", 1080, 1920, "") == ([], 0)
@@ -748,13 +748,13 @@ def test_line_breaks_survive_escaping():
     """The wrapping is expressed as newlines, and _escape_text used to
     collapse them to spaces — which put the caption straight back off the
     side of the frame."""
-    from modules.transitions import _escape_text
+    from modules.media.transitions import _escape_text
 
     assert "\n" in _escape_text("two\nlines")
 
 
 def _font_or_skip() -> str:
-    from modules.transitions import _font_path
+    from modules.media.transitions import _font_path
 
     path = _font_path()
     if not path:

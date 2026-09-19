@@ -1,4 +1,4 @@
-"""Tests for modules.script_plan — the script format and its bridge to the cutter.
+"""Tests for modules.segments.script_plan — the script format and its bridge to the cutter.
 
 The traps this file guards against, in order of how much time they cost:
 
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.script_plan import (
+from modules.segments.script_plan import (
     Beat,
     CutDirective,
     Script,

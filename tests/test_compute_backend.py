@@ -16,8 +16,8 @@ import os
 
 import pytest
 
-from modules import compute_backend as backend
-from modules import directml_device
+from modules.system import compute_backend as backend
+from modules.system import directml_device
 
 
 @pytest.fixture(autouse=True)

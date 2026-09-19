@@ -6,7 +6,7 @@ from multiprocessing import Process, Manager
 import time
 import numpy as np
 
-from modules.device_utils import resolve_device
+from modules.system.device_utils import resolve_device
 
 # ---------------- CONFIG ----------------
 NUM_WORKERS = 4
@@ -60,7 +60,7 @@ def detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes=False,
     
     Args:
         frame: Input frame
-        model: a Detector (modules.detection_backend) — anything with .detect(frame)
+        model: a Detector (modules.vision.detection_backend) — anything with .detect(frame)
         objects_of_interest: List of object classes to detect
         draw_boxes: If True, draw bounding boxes on the frame
         confidence_threshold: Minimum confidence to accept a detection
@@ -124,8 +124,9 @@ def directml_detector(prefer="large", log=print):
     """
     try:
         import sys
-        from modules import ort_directml, yolox_models
-        from modules.detection_backend import YoloxOnnxRuntimeDetector, load_class_names
+        from modules.system import ort_directml
+        from modules.vision import yolox_models
+        from modules.vision.detection_backend import YoloxOnnxRuntimeDetector, load_class_names
         onnx_path = yolox_models.find_onnx(prefer)
         if not onnx_path and not getattr(sys, "frozen", False):
             yolox_models.install(log=log)
@@ -145,7 +146,7 @@ def directml_detector(prefer="large", log=print):
 
 def _wants_directml(log=print):
     try:
-        from modules.device_utils import detect_best_device
+        from modules.system.device_utils import detect_best_device
         return bool(getattr(detect_best_device(log_fn=lambda *_a: None), "onnx_dml_yolo", False))
     except Exception:
         return False
@@ -158,7 +159,7 @@ def load_detector(model_path=None, model_size="n", device="AUTO", log=print):
     Fetches the stock models on first use from a source checkout, the way the
     previous detector downloaded its weights on demand.
     """
-    from modules.detection_backend import build_object_detector
+    from modules.vision.detection_backend import build_object_detector
     custom = bool(model_path) and os.path.exists(str(model_path)) and         str(model_path).lower().endswith((".onnx", ".xml"))
     prefer = "small" if str(model_size).lower() in ("n", "nano", "tiny") else "large"
     if not custom and _wants_directml():

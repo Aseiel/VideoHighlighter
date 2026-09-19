@@ -33,7 +33,7 @@ BLOCKLIST_URL = "https://aseiel.github.io/VideoHighlighter-site/models-blocklist
 
 # Written into an install folder by the app itself, never downloaded.
 INSTALL_RECORD = "install.json"
-LABELS_SIDECAR = "labels.json"   # what modules.detection_backend reads beside a model
+LABELS_SIDECAR = "labels.json"   # what modules.vision.detection_backend reads beside a model
 INSTALLED_EXTRA = frozenset({INSTALL_RECORD, LABELS_SIDECAR})
 
 # The kraken is what we call the moment a package is cleared to leave this
@@ -54,7 +54,7 @@ def default_models_dir() -> Path:
     if base:
         return Path(base) / "models" / "community"
     try:
-        from modules.app_paths import user_data_dir
+        from modules.system.app_paths import user_data_dir
         return Path(user_data_dir()) / "models" / "community"
     except Exception:  # noqa: BLE001 - used outside the app
         return Path.home() / ".videohighlighter" / "models" / "community"
@@ -383,7 +383,7 @@ def checksum_ok(model: InstalledModel) -> bool:
 
 def installed_detectors(models_dir: str | Path | None = None) -> list[dict]:
     """Community detectors ready for the object model picker, in the shape
-    ``modules.app_paths.discover_object_models`` returns:
+    ``modules.system.app_paths.discover_object_models`` returns:
     ``[{"path", "name", "classes", "community": repo_id}]``. A model whose file
     no longer matches its checksum is left out."""
     out = []

@@ -12,7 +12,7 @@ import datetime as dt
 
 import pytest
 
-from modules import update_check
+from modules.update import update_check
 
 
 def _manifest(version="0.9.1", **extra):

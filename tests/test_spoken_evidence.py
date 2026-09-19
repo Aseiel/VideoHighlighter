@@ -26,8 +26,8 @@ import json
 import numpy as np
 import pytest
 
-from modules import spoken_evidence
-from modules.highlight_report import build_report
+from modules.report import spoken_evidence
+from modules.report.highlight_report import build_report
 
 
 def _chapter(number, start, end, shares=None, words=()):
@@ -295,7 +295,7 @@ class TestFromRecord:
         # It has chapter shares, so it was labelled; it is missing from the
         # level summary, so it ran for less than that module's minimum. Said as
         # the bound it is rather than as a count nothing measured.
-        from modules.level_by_class import MIN_SECONDS
+        from modules.audio.level_by_class import MIN_SECONDS
 
         entry = self._row()["classes"][0]
         assert entry["under_seconds"] == MIN_SECONDS
@@ -365,7 +365,7 @@ class TestThroughTheReport:
         assert rows[0]["classes"][0]["seconds"] == 100
 
     def test_the_figures_are_printed_beside_the_paragraph_not_only_prompted(self):
-        from modules.highlight_prose import describe_chapter
+        from modules.report.highlight_prose import describe_chapter
 
         told = [line for ch in self._report()["chapters"]
                 for line in describe_chapter(ch)
@@ -374,7 +374,7 @@ class TestThroughTheReport:
         assert any("labelled in 100s of the video" in line for line in told)
 
     def test_the_narrator_is_asked_to_weigh_it(self):
-        from modules import chapter_story
+        from modules.narration import chapter_story
 
         report = self._report()
         prompts = [chapter_story.chapter_prompt(report, ch)
@@ -389,7 +389,7 @@ class TestThroughTheReport:
         # Sending it in the measured facts *and* in its own section put every
         # figure in the prompt twice and tipped a local model into repeating
         # one sentence until it hit the token cap.
-        from modules import chapter_story
+        from modules.narration import chapter_story
 
         report = self._report()
         prompt = [chapter_story.chapter_prompt(report, ch)
@@ -400,7 +400,7 @@ class TestThroughTheReport:
     def test_the_page_still_shows_it_in_the_chapter_block(self):
         # The suppression is for the prompt alone. The figures have to stay
         # printed beside the paragraph, or a reader cannot check it.
-        from modules.highlight_prose import describe_chapter
+        from modules.report.highlight_prose import describe_chapter
 
         chapter = [ch for ch in self._report()["chapters"]
                    if ch.get("spoken_evidence")][0]
@@ -413,7 +413,7 @@ class TestThroughTheReport:
         # The path the feature is actually used on: analysis ran hours ago,
         # only the narration is being re-run. Without the backfill the section
         # could never appear on the report it most wants to improve.
-        from modules import chapter_story
+        from modules.narration import chapter_story
 
         report = self._report()
         for ch in report["chapters"]:

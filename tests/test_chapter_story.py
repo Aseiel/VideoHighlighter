@@ -22,8 +22,8 @@ import json
 import numpy as np
 import pytest
 
-from modules import chapter_story
-from modules.highlight_report import build_report
+from modules.narration import chapter_story
+from modules.report.highlight_report import build_report
 
 
 class _FakeLLM:
@@ -268,7 +268,7 @@ class TestOnDisk:
         assert rep["chapter_story"]["model"] == "ollama/llama3"
 
     def test_the_page_says_a_model_wrote_them(self, tmp_path):
-        from modules.highlight_report import render_html
+        from modules.report.highlight_report import render_html
 
         _told, rep = self._written(tmp_path, model_name="ollama/llama3")
         page = render_html(rep)

@@ -1,5 +1,5 @@
 """
-Tests for modules.edl — the timestamped cut list.
+Tests for modules.media.edl — the timestamped cut list.
 
 The value of an EDL is that it round-trips: the machine writes one, a person
 edits it, and the render honours the edit. So the tests that matter most are
@@ -17,8 +17,8 @@ import subprocess
 
 import pytest
 
-from modules.app_paths import ffmpeg_exe
-from modules.edl import (
+from modules.system.app_paths import ffmpeg_exe
+from modules.media.edl import (
     Cut,
     Edl,
     EdlError,
@@ -335,7 +335,7 @@ def test_a_valid_cut_list_warns_about_nothing(tmp_path):
 def test_rendering_honours_the_timestamps(tmp_path):
     """Two 2-second pieces taken out of 6-second sources make a 4-second reel —
     which is the whole claim of the format."""
-    from modules.video_probe import probe_video
+    from modules.media.video_probe import probe_video
 
     a = _clip(tmp_path / "a.mp4", "red", duration=6.0)
     b = _clip(tmp_path / "b.mp4", "blue", duration=6.0)
@@ -349,7 +349,7 @@ def test_rendering_honours_the_timestamps(tmp_path):
 
 @pytest.mark.skipif(not _ffmpeg_ok(), reason="ffmpeg not available")
 def test_rendering_applies_the_transition(tmp_path):
-    from modules.video_probe import probe_video
+    from modules.media.video_probe import probe_video
 
     a = _clip(tmp_path / "a.mp4", "red", duration=6.0)
     b = _clip(tmp_path / "b.mp4", "blue", duration=6.0)
@@ -621,7 +621,7 @@ def test_duration_uses_the_transition_length_that_will_actually_be_used():
     dissolve between two 1s shots takes 2s out of the reel, when only a third
     of a second will ever be taken — which made a reel of long transitions
     read as seconds shorter than it renders."""
-    from modules.edl import Cut, Edl
+    from modules.media.edl import Cut, Edl
 
     edl = Edl(cuts=[
         Cut(source="a.mp4", start=0, end=1.0, transition="crossfade",
@@ -636,7 +636,7 @@ def test_duration_uses_the_transition_length_that_will_actually_be_used():
 def test_a_transition_too_short_to_render_takes_no_time():
     """Below a couple of frames it degrades to a hard cut, so it cannot also
     be subtracted from the running time."""
-    from modules.edl import Cut, Edl
+    from modules.media.edl import Cut, Edl
 
     edl = Edl(cuts=[
         Cut(source="a.mp4", start=0, end=2.0, transition="crossfade",

@@ -25,7 +25,7 @@ try:
     import torchvision.models.video as video_models
     import torchvision.transforms as transforms
     TORCH_AVAILABLE = True
-    from modules.device_utils import detect_best_device as _detect_device
+    from modules.system.device_utils import detect_best_device as _detect_device
     _devices = _detect_device()          # logs GPU info at import time
     CUDA_AVAILABLE = _devices.gpu_available and _devices.pytorch_device == 'cuda'
     _PYTORCH_DEVICE = _devices.pytorch_device  # 'cuda' | 'cpu'
@@ -44,8 +44,8 @@ BASE_DIR = Path(__file__).parent.resolve()
 # models/actions/, where the trainer writes them, with the flat root locations
 # kept as a fallback for models trained before that folder existed.
 try:
-    from modules.app_paths import data_file as _data_file
-    from modules.app_paths import action_model_file as _action_model_file
+    from modules.system.app_paths import data_file as _data_file
+    from modules.system.app_paths import action_model_file as _action_model_file
 except Exception:
     def _data_file(name):
         return str(BASE_DIR / name)
@@ -456,7 +456,7 @@ def _r3d_device_name(wrapper) -> str:
             return "CUDA"
     if _is_directml_device(device):
         try:
-            from modules import directml_device as dml
+            from modules.system import directml_device as dml
             return f"{dml.probe().name() or 'DirectML'} (DirectML)"
         except Exception:  # noqa: BLE001
             return "DirectML"
@@ -466,7 +466,7 @@ def _r3d_device_name(wrapper) -> str:
 def _is_directml_device(device) -> bool:
     """True if `device` (string or torch.device) names the DirectML backend."""
     try:
-        from modules import directml_device as dml
+        from modules.system import directml_device as dml
         return dml.is_directml(str(device))
     except Exception:  # noqa: BLE001 — absent module means "no DirectML"
         return False
@@ -485,7 +485,7 @@ def _resolve_r3d_device(device_str):
     than broken.
     """
     if _is_directml_device(device_str):
-        from modules import directml_device as dml
+        from modules.system import directml_device as dml
 
         resolved = dml.normalize(str(device_str))
         if not resolved:
@@ -503,7 +503,7 @@ def _resolve_r3d_device(device_str):
             return torch.device('cpu')
         return torch.device(resolved)
 
-    from modules.cuda_check import cuda_usable
+    from modules.system.cuda_check import cuda_usable
     if str(device_str).startswith('cuda') and not cuda_usable(torch):
         return torch.device('cpu')
     try:
@@ -550,7 +550,7 @@ class R3DModelWrapper:
         # FP16 stays CUDA-only. On DirectML half precision is implemented
         # unevenly per operator, so a 3D CNN that falls back for one layer pays
         # a conversion on every call instead of saving bandwidth — see
-        # modules/directml_device.py and docs/AMD-GPU.md.
+        # modules/system/directml_device.py and docs/AMD-GPU.md.
         self.half = half_precision and self.device.type == 'cuda'
         self.num_classes = custom_num_classes or 400  # default Kinetics-400
 
@@ -609,7 +609,7 @@ class R3DModelWrapper:
         if not self.allow_onnx_dml or self.device.type != 'cpu':
             return None
         try:
-            from modules import r3d_onnx
+            from modules.vision import r3d_onnx
         except Exception:  # noqa: BLE001 — an absent module means "no ONNX path"
             return None
         runner = r3d_onnx.load(self.model, self.model_name, self.num_classes,
@@ -831,7 +831,7 @@ class AsyncBatchedInferenceEngine:
 # =============================
 class ParallelYOLODetector:
     """Parallel person detection with frame skipping, backed by the
-    permissive YOLOX/OpenVINO detector (modules.detection_backend).
+    permissive YOLOX/OpenVINO detector (modules.vision.detection_backend).
 
     detect_async() feeds frames (every `skip_frames`-th is actually inferred,
     in a worker thread) and get_latest_detections() returns the last known
@@ -842,13 +842,13 @@ class ParallelYOLODetector:
 
     def __init__(self, model_name=None, num_workers=2, skip_frames=4,
                  device="AUTO"):
-        from modules.detection_backend import (
+        from modules.vision.detection_backend import (
             YoloxOpenVINODetector, find_default_yolox_ir,
         )
         model_xml = model_name or find_default_yolox_ir(prefer="small")
         if not model_xml and not getattr(sys, "frozen", False):
             try:
-                from modules import yolox_models
+                from modules.vision import yolox_models
                 print("⬇️ First run: fetching the YOLOX person detector (Apache-2.0)…")
                 yolox_models.install()
                 model_xml = find_default_yolox_ir(prefer="small")

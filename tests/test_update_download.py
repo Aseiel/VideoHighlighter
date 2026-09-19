@@ -13,8 +13,8 @@ import os
 
 import pytest
 
-from modules import update_apply, update_download
-from modules.update_manifest import UpdatePlan
+from modules.update import update_apply, update_download
+from modules.update.update_manifest import UpdatePlan
 
 
 def _sha(data: bytes) -> str:

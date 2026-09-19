@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules import detection_routes as routes
+from modules.report import detection_routes as routes
 
 
 def _report(classes=("bench_vice", "lathe"), events=(), *, faces=0, actions=0,
@@ -162,14 +162,14 @@ class TestWhatThisBuildHas:
 
     def test_a_route_whose_engine_is_absent_is_not_offered(self):
         picked = routes.pick(_report(faces=400),
-                             self._without("modules.face_examples"))
+                             self._without("modules.vision.face_examples"))
         assert "face_category" not in [r["id"] for r in picked["all"]]
 
     def test_the_leaner_edition_still_gets_two_routes(self):
         # Nothing here may degrade to "there is no way to measure this". The
         # claim is the same claim; what changes is which engines can answer it.
         picked = routes.pick(_report(faces=400), self._without(
-            "llm.clip_categories", "llm.owl_detect", "modules.face_examples"))
+            "llm.clip_categories", "llm.owl_detect", "modules.vision.face_examples"))
         assert picked["fastest"]["id"] == "clip_search"
         assert picked["strongest"]["id"] == "trained_class"
         assert picked["first"]["id"] == "compose"

@@ -1,4 +1,4 @@
-"""Tests for `modules.face_scan` — one sweep, reused by everything downstream.
+"""Tests for `modules.vision.face_scan` — one sweep, reused by everything downstream.
 
 Decoding, detection and classification are injected, so none of this needs cv2,
 a model or a video. The behaviour worth holding still is what an *absent* second
@@ -12,8 +12,8 @@ import json
 
 import numpy as np
 
-from modules.face_emotions import EMOTION_LABELS
-from modules.face_scan import (
+from modules.vision.face_emotions import EMOTION_LABELS
+from modules.vision.face_scan import (
     best_by_second,
     cache_path_for,
     label_counts,

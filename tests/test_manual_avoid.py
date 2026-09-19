@@ -1,5 +1,5 @@
 """
-Tests for `modules.manual_avoid`.
+Tests for `modules.segments.manual_avoid`.
 
 Pin the parser's permissive input contract and the overlap / combine logic
 that the future "right-click → Avoid this range" timeline action will
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.manual_avoid import (
+from modules.segments.manual_avoid import (
     combine,
     merge_overlapping,
     parse_ranges,

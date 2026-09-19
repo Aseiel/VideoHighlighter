@@ -16,8 +16,8 @@ import types
 
 import pytest
 
-from modules import directml_device
-from modules import ort_directml
+from modules.system import directml_device
+from modules.system import ort_directml
 
 
 class _FakeOrt(types.ModuleType):

@@ -17,7 +17,7 @@ import pytest
 # Import under shim cover (see conftest.py — cv2 is replaced by MagicMock so
 # the top-level `import cv2` in compute_forbidden.py does not need a real
 # OpenCV install).
-from modules.compute_forbidden import _merge_seconds
+from modules.segments.compute_forbidden import _merge_seconds
 
 
 class TestEmptyAndTrivial:

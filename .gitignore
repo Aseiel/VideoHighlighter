@@ -1,4 +1,4 @@
-# Runtime debug logs (modules/debug_console writes them next to the exe /
+# Runtime debug logs (modules/system/debug_console writes them next to the exe /
 # project root at every launch)
 debug.log
 debug.prev.log

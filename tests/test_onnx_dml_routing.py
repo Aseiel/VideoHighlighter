@@ -16,7 +16,7 @@ import types
 
 import pytest
 
-from modules import device_utils
+from modules.system import device_utils
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +28,7 @@ def _quiet(monkeypatch):
 
 
 class _FakeTorchDml:
-    """Stands in for modules.directml_device with no torch-directml present."""
+    """Stands in for modules.system.directml_device with no torch-directml present."""
 
     MODE_ENV = "VH_DIRECTML"
 

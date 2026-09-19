@@ -12,7 +12,7 @@ import os
 
 import pytest
 
-from modules import ui_scale
+from modules.system import ui_scale
 
 
 @pytest.fixture(autouse=True)
@@ -82,7 +82,7 @@ class TestRefusingBadValues:
         broken.write_text("ui_scale: [unclosed\n", encoding="utf-8")
         monkeypatch.setattr(ui_scale, "_from_config",
                             ui_scale._from_config)          # the real one
-        monkeypatch.setattr("modules.app_paths.data_file",
+        monkeypatch.setattr("modules.system.app_paths.data_file",
                             lambda name: str(broken))
 
         assert ui_scale.configured() is None

@@ -18,7 +18,7 @@ import sys
 
 import pytest
 
-from modules import directml_device as dml
+from modules.system import directml_device as dml
 
 
 class FakeTorchDirectML:

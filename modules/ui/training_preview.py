@@ -1,7 +1,7 @@
 """The "watch it learn" window: what the model finds, round by round.
 
 The counterpart of the live detection preview for a model that is still
-training. Each round arrives as a ``modules.training_preview.RoundSnapshot``;
+training. Each round arrives as a ``modules.vision.training_preview.RoundSnapshot``;
 the window keeps every one, so a person can drag back to round 3 and forward
 to round 20 and see the guesses tighten. It follows the newest round unless
 they have scrubbed away from it.

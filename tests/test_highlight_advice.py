@@ -1,4 +1,4 @@
-"""Tests for `modules.highlight_advice` — why a highlight disappointed.
+"""Tests for `modules.report.highlight_advice` — why a highlight disappointed.
 
 Findings are computed from the report record and nothing else, so these run
 without a video, a model, or the app. The point of each test is that a finding
@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from modules.highlight_advice import attach_advice, diagnose
-from modules.highlight_report import build_report
+from modules.report.highlight_advice import attach_advice, diagnose
+from modules.report.highlight_report import build_report
 
 
 def _report(n=600, segments=None, settings=None, objects=None, **kw):
@@ -230,14 +230,14 @@ class TestOlderReports:
         return rep
 
     def test_totals_are_recovered_from_the_clips(self):
-        from modules.highlight_advice import signal_totals
+        from modules.report.highlight_advice import signal_totals
         assert signal_totals(self._schema1())["object"] == 10.0
 
     def test_findings_still_come_out(self):
         assert "single_signal" in _ids(diagnose(self._schema1()))
 
     def test_recorded_totals_are_preferred_when_present(self):
-        from modules.highlight_advice import signal_totals
+        from modules.report.highlight_advice import signal_totals
         rep = _report(signals={"object": {100: 10.0}})
         rep["signal_totals"] = {"object": 999.0}
         assert signal_totals(rep)["object"] == 999.0
@@ -342,5 +342,5 @@ class TestConcerns:
         assert rep["advice_concern"] == "repetitive"
 
     def test_every_concern_has_a_readable_description(self):
-        from modules.highlight_advice import CONCERNS
+        from modules.report.highlight_advice import CONCERNS
         assert all(isinstance(v, str) and v for v in CONCERNS.values())

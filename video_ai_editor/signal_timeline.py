@@ -2,7 +2,7 @@ from .timeline_bars import TimelineBar, DraggableTimelineBar
 from collections import defaultdict
 import json
 
-from modules import repaint_trace
+from modules.system import repaint_trace
 from .filmstrip_lane import LANE_HEIGHT as FILMSTRIP_LANE_HEIGHT
 from .filmstrip_lane import FilmstripLane
 from .filmstrip_painter import DEFAULT_ASPECT as DEFAULT_FILMSTRIP_ASPECT
@@ -58,7 +58,7 @@ class SignalTimelineScene(QGraphicsScene):
         self._filmstrip_repaint_pending = False
         # Side-by-side footage shows the left eye only, like every other view of
         # a frame in the app. Set from the window's VR checkbox (which the
-        # detector in modules/vr_detect ticks for itself when it can tell).
+        # detector in modules/media/vr_detect ticks for itself when it can tell).
         self._vr_mode = False
         
         # Waveform visualization
@@ -2140,7 +2140,7 @@ class SignalTimelineScene(QGraphicsScene):
 
     def _filters_path(self):
         try:
-            from modules.app_paths import user_data_dir
+            from modules.system.app_paths import user_data_dir
             import os
             return os.path.join(user_data_dir(), "timeline_filters.json")
         except Exception:
@@ -2764,7 +2764,7 @@ class SignalTimelineView(QGraphicsView):
         lo, hi = min(t0, t1), max(t0, t1)
         ranges = list(getattr(scene, "avoid_ranges", [])) + [(lo, hi)]
         try:
-            from modules.manual_avoid import merge_overlapping
+            from modules.segments.manual_avoid import merge_overlapping
             ranges = merge_overlapping(ranges)
         except Exception:
             pass

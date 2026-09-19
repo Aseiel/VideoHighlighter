@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
-from modules.audio_device import follow_system_default
+from modules.media.audio_device import follow_system_default
 
 try:
     import psutil

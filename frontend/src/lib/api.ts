@@ -492,7 +492,7 @@ export async function openEditor(
 
 // ── Camera cards, script, music, and the auto pipeline ────────────────────
 
-/** Stage names must match modules/auto_pipeline.py's STAGE_* constants — they
+/** Stage names must match modules/segments/auto_pipeline.py's STAGE_* constants — they
  *  are the on-disk job format, not display strings. */
 export type AutoStageName =
   | "ingest"

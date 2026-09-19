@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.analysis_plan import (
+from modules.report.analysis_plan import (
     GATED_ARTIFACTS,
     SIGNATURE_GATED,
     describe,
@@ -124,7 +124,7 @@ class TestTheInvariant:
         GATED_ARTIFACTS so a cached run can backfill. A gating setting in
         neither place is the bug, and this is what catches it.
         """
-        from modules.video_cache import build_analysis_cache_params
+        from modules.media.video_cache import build_analysis_cache_params
 
         signature = set(build_analysis_cache_params(
             gui_config={}, config={}, sample_rate=1, video_duration=60.0))

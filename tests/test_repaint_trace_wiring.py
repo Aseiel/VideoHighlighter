@@ -23,7 +23,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication
 
-from modules import repaint_trace
+from modules.system import repaint_trace
 from video_ai_editor.signal_timeline import SignalTimelineScene
 
 

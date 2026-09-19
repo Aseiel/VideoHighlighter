@@ -1,5 +1,5 @@
 """
-Tests for modules.ffmpeg_tools — running on the ffmpeg pip installed.
+Tests for modules.media.ffmpeg_tools — running on the ffmpeg pip installed.
 
 Staging is tested against a fake bundled binary and a controlled PATH, so it
 needs nothing installed. The probe tests write a tiny clip with PyAV and skip
@@ -16,7 +16,7 @@ import types
 
 import pytest
 
-from modules import ffmpeg_tools
+from modules.media import ffmpeg_tools
 
 EXE = ".exe" if sys.platform == "win32" else ""
 

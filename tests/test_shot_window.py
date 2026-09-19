@@ -1,5 +1,5 @@
 """
-Tests for modules.shot_window — which seconds of a clip are worth using.
+Tests for modules.segments.shot_window — which seconds of a clip are worth using.
 
 The measurement itself needs OpenCV, which conftest replaces with a MagicMock,
 so what is pinned here is everything downstream of it: that a window is chosen
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.shot_window import (
+from modules.segments.shot_window import (
     BLOWN,
     DARK,
     SAMPLES_PER_SECOND,

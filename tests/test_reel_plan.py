@@ -1,5 +1,5 @@
 """
-Tests for modules.reel_plan — the short-form story arrangement.
+Tests for modules.segments.reel_plan — the short-form story arrangement.
 
 What is worth pinning here is not that the function returns cuts, but that the
 three claims it makes are true of the result: that the reel lands near the
@@ -18,8 +18,8 @@ import subprocess
 
 import pytest
 
-from modules.app_paths import ffmpeg_exe
-from modules.reel_plan import (
+from modules.system.app_paths import ffmpeg_exe
+from modules.segments.reel_plan import (
     LENGTHS,
     MIN_SHOT,
     PACES,
@@ -372,7 +372,7 @@ def test_each_pace_reports_the_band_it_claims():
 # only that it *uses* what it is given.
 
 def _windows(path, qualities, rate=8.0):
-    from modules.shot_window import ClipWindows, Sample
+    from modules.segments.shot_window import ClipWindows, Sample
 
     return ClipWindows(
         path=path, duration=len(qualities) / rate, measured=True,
@@ -472,7 +472,7 @@ def test_a_moved_in_point_is_reported(clips):
 
 def test_an_unmeasured_clip_falls_back_to_the_top(clips):
     """Measuring failing costs the improvement, never the reel."""
-    from modules.shot_window import ClipWindows
+    from modules.segments.shot_window import ClipWindows
 
     graded = {p: ClipWindows(path=p, duration=6.0) for p in clips}
 

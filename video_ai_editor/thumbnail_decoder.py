@@ -40,7 +40,7 @@ import multiprocessing
 import threading
 
 try:
-    from modules import repaint_trace
+    from modules.system import repaint_trace
 except Exception:  # pragma: no cover - the decoder works without the recorder
     repaint_trace = None
 

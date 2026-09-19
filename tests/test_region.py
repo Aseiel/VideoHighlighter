@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.auto_segments import Region
+from modules.segments.auto_segments import Region
 
 
 class TestConstruction:

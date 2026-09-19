@@ -33,13 +33,13 @@ def _shim_heavy_for_pipeline_import() -> None:
     # conftest.py, and the rest is stdlib + numpy).
     for name in (
         "action_recognition",  # heavy openvino + torch; keep shimmed
-        "modules.audio_peaks",
-        "modules.motion_scene_detect_optimized",
-        "modules.video_cache",
-        "modules.video_cutter",
-        "modules.video_cutter",
-        "modules.transcript",
-        "modules.transcript_srt",
+        "modules.audio.audio_peaks",
+        "modules.segments.motion_scene_detect_optimized",
+        "modules.media.video_cache",
+        "modules.media.video_cutter",
+        "modules.media.video_cutter",
+        "modules.audio.transcript",
+        "modules.audio.transcript_srt",
     ):
         sys.modules.setdefault(name, MagicMock())
 

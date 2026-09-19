@@ -1,5 +1,5 @@
 """
-Tests for `modules.analysis_ondemand.run_composition` — applying composition
+Tests for `modules.report.analysis_ondemand.run_composition` — applying composition
 rules to boxes already in the cache, without re-running detection.
 
 The bug this addresses: in `pipeline.py` the engine only runs *inside* a fresh
@@ -14,7 +14,7 @@ import json
 
 import pytest
 
-from modules import analysis_ondemand as ao
+from modules.report import analysis_ondemand as ao
 from video_ai_editor.composition_engine import CompositionEngine
 
 
@@ -48,7 +48,7 @@ def _frames(n=8, together=True):
 def rules_file(tmp_path, monkeypatch):
     path = tmp_path / "composition_rules.yaml"
     path.write_text(RULES, encoding="utf-8")
-    monkeypatch.setattr("modules.app_paths.composition_rules_path",
+    monkeypatch.setattr("modules.system.app_paths.composition_rules_path",
                         lambda: str(path))
     return path
 
@@ -136,7 +136,7 @@ class TestRunComposition:
 
 class TestFailureMessages:
     def test_no_rules_file(self, monkeypatch, cached):
-        monkeypatch.setattr("modules.app_paths.composition_rules_path", lambda: None)
+        monkeypatch.setattr("modules.system.app_paths.composition_rules_path", lambda: None)
         with pytest.raises(RuntimeError, match="composition_rules.yaml"):
             ao.run_composition("v.mp4", log=lambda *a: None)
 
@@ -153,7 +153,7 @@ class TestFailureMessages:
     def test_rules_file_with_no_events(self, tmp_path, monkeypatch, cached):
         p = tmp_path / "empty.yaml"
         p.write_text("events: []\n", encoding="utf-8")
-        monkeypatch.setattr("modules.app_paths.composition_rules_path", lambda: str(p))
+        monkeypatch.setattr("modules.system.app_paths.composition_rules_path", lambda: str(p))
         cached["cache"] = {"object_bboxes": _frames()}
         with pytest.raises(RuntimeError, match="No events defined"):
             ao.run_composition("v.mp4", log=lambda *a: None)
@@ -257,10 +257,10 @@ def test_signal_rules_run_without_any_analysis_cache(tmp_path, monkeypatch):
     """
     rules = tmp_path / "rules.yaml"
     rules.write_text(SIGNAL_RULES, encoding="utf-8")
-    monkeypatch.setattr("modules.app_paths.composition_rules_path",
+    monkeypatch.setattr("modules.system.app_paths.composition_rules_path",
                         lambda: str(rules))
     monkeypatch.setattr(ao, "read_cache", lambda _p: {})
-    monkeypatch.setattr("modules.composition_signals.gather",
+    monkeypatch.setattr("modules.rules.composition_signals.gather",
                         lambda *a, **k: {"level": [0.0, 9.0, 9.0, 0.0]})
 
     patch = ao.run_composition("v.mp4", log=lambda *a: None)
@@ -273,7 +273,7 @@ def test_spatial_rules_still_require_a_cache(tmp_path, monkeypatch):
     """The guard is only relaxed where it was unnecessary."""
     rules = tmp_path / "rules.yaml"
     rules.write_text(RULES, encoding="utf-8")
-    monkeypatch.setattr("modules.app_paths.composition_rules_path",
+    monkeypatch.setattr("modules.system.app_paths.composition_rules_path",
                         lambda: str(rules))
     monkeypatch.setattr(ao, "read_cache", lambda _p: {})
     with pytest.raises(RuntimeError, match="analysis"):
@@ -302,7 +302,7 @@ events:
 def mixed_rules(tmp_path, monkeypatch):
     path = tmp_path / "composition_rules.yaml"
     path.write_text(MIXED_RULES, encoding="utf-8")
-    monkeypatch.setattr("modules.app_paths.composition_rules_path",
+    monkeypatch.setattr("modules.system.app_paths.composition_rules_path",
                         lambda: str(path))
     return path
 
@@ -417,7 +417,7 @@ class TestDisabledRulesCostNothing:
     def test_an_unticked_rule_does_not_trigger_a_measurement(self, mixed_rules):
         """The vocal measurement decodes the whole file — paying for it because
         of a rule that is switched off is the wait this avoids."""
-        from modules import composition_signals
+        from modules.rules import composition_signals
 
         assert composition_signals.signal_names(str(mixed_rules)) == set()
 

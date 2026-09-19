@@ -1,4 +1,4 @@
-// Timestamps, matching modules/edl.py's parse_time / format_time.
+// Timestamps, matching modules/media/edl.py's parse_time / format_time.
 //
 // The two implementations have to agree, because the same string round-trips
 // between this editor and the YAML cut list on disk: a value the UI accepts and

@@ -1,5 +1,5 @@
 """
-Progress reporting out of `modules.transcript`.
+Progress reporting out of `modules.audio.transcript`.
 
 Transcription is the longest single step in a run, and in the packaged
 `--windowed` build Whisper's own tqdm bar writes to a stderr that goes
@@ -19,7 +19,7 @@ import types
 
 import pytest
 
-from modules import transcript as tr
+from modules.audio import transcript as tr
 
 
 # --------------------------------------------------------------------------- #

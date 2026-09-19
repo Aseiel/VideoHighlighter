@@ -1,5 +1,5 @@
 """
-Tests for modules.shot_place — which clips were shot from the same spot.
+Tests for modules.segments.shot_place — which clips were shot from the same spot.
 
 The grouping rules are pinned against the numbers that motivated them, taken
 from a real shoot: four pairs of clips filmed 11-127 m apart within two minutes
@@ -17,7 +17,7 @@ import datetime as dt
 
 import pytest
 
-from modules.shot_place import (
+from modules.segments.shot_place import (
     PLACE_METRES,
     Place,
     Track,
@@ -77,7 +77,7 @@ def test_clips_from_one_spot_are_one_place():
 
 def test_two_vantage_points_on_one_valley_stay_separate():
     """479 m apart. Position says different places and position is right —
-    what makes these look alike is the subject, which modules.shot_look
+    what makes these look alike is the subject, which modules.segments.shot_look
     handles and this module deliberately does not guess at."""
     a, b = _at(0, 53.5218, -1.9950, "a"), _at(2.7, 53.5202, -1.9883, "b")
 

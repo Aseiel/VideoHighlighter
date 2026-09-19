@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import yaml
 
-from modules.compose_events import apply_rules, rules_fingerprint, strip_events
+from modules.rules.compose_events import apply_rules, rules_fingerprint, strip_events
 
 RULES = {"events": [{
     "name": "clamped_board", "label": "Clamped Board",
@@ -182,7 +182,7 @@ class TestWriteBack:
                 "transcript": {"segments": [{"start": 0, "text": "keep me"}]}}
 
     def _write(self, tmp_path, video, **over):
-        from modules.compose_events import write_back
+        from modules.rules.compose_events import write_back
 
         kwargs = dict(cached_data=self._cached(),
                       detections={10: ["clamp", "clamped_board"]},
@@ -197,7 +197,7 @@ class TestWriteBack:
                           **kwargs)
 
     def _reload(self, tmp_path, video):
-        from modules.video_cache import VideoAnalysisCache
+        from modules.media.video_cache import VideoAnalysisCache
 
         return VideoAnalysisCache(cache_dir=str(tmp_path / "cache")).load(
             str(video), params={"schema": "v1"})
@@ -240,7 +240,7 @@ class TestWriteBack:
     def test_a_failure_is_reported_rather_than_raised(self, tmp_path):
         # Losing the run because a cache refresh failed would be a far worse
         # trade than a stale timeline.
-        from modules.compose_events import write_back
+        from modules.rules.compose_events import write_back
 
         assert write_back("/no/such/video.mp4", {"objects": []}, {}, [], [],
                           cache_dir=str(tmp_path / "c"),

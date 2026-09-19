@@ -2,7 +2,7 @@
 Tests for clip-quality sharpness scoring.
 
 These tests decode real video, so they need the real cv2 and a working ffmpeg
-(resolved the same way the engine resolves it, via modules.app_paths). Both
+(resolved the same way the engine resolves it, via modules.system.app_paths). Both
 fixtures are generated on the fly: testsrc2 has fine detail, and piping the
 same source through boxblur=10 destroys it — the Laplacian variance of the
 two must be far apart. The is_blurry threshold is placed between the two
@@ -41,8 +41,8 @@ cv2 = _real_cv2()
 if cv2 is None:
     pytest.skip("real cv2 required to decode video fixtures", allow_module_level=True)
 
-from modules import clip_quality
-from modules.app_paths import ffmpeg_exe
+from modules.segments import clip_quality
+from modules.system.app_paths import ffmpeg_exe
 
 
 def _make_video(tmp_path_factory, name: str, vf: str | None) -> str:

@@ -56,14 +56,14 @@ def extract_domain(u: str) -> str:
 def get_duration_from_ffprobe(filepath: str, log_fn: Callable = print) -> Optional[float]:
     """
     Get real duration in seconds by probing the downloaded file — with ffprobe
-    when it is installed, PyAV otherwise (modules.ffmpeg_tools.probe).
+    when it is installed, PyAV otherwise (modules.media.ffmpeg_tools.probe).
     Returns:
         duration seconds, or None if unavailable/fails.
     """
     try:
         if not filepath or not os.path.exists(filepath):
             return None
-        from modules.ffmpeg_tools import probe
+        from modules.media.ffmpeg_tools import probe
         d = float((probe(filepath, timeout=15).get("format") or {}).get("duration") or 0)
         if d > 0:
             return d

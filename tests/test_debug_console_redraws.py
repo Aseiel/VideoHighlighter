@@ -13,7 +13,7 @@ import io
 
 import pytest
 
-from modules import debug_console
+from modules.system import debug_console
 
 
 @pytest.fixture

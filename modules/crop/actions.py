@@ -121,7 +121,7 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
     # Load pose model if ROI detection with pose is enabled
     pose_model = None
     if USE_ROI_DETECTION and USE_POSE_FOR_ROI:
-        from modules.pose_backend import build_pose_estimator
+        from modules.vision.pose_backend import build_pose_estimator
         pose_model = build_pose_estimator()
         if pose_model is None:
             # Still a supported state: every pose check tolerates None and
@@ -456,7 +456,7 @@ def main():
         print("-" * 60)
 
     print("📦 Loading person detector (YOLOX)...")
-    from modules.detection_backend import YoloxPeopleDetector
+    from modules.vision.detection_backend import YoloxPeopleDetector
     # score_thr, NOT the per-call conf= argument, is what YOLOX filters on:
     # YoloxOpenVINODetector applies `cls_scores > self.score_thr` inside
     # inference, and the shim's conf= only filters what survived that. Its
@@ -472,7 +472,7 @@ def main():
     pose_model = None
     if USE_POSE_ESTIMATION or USE_ROI_DETECTION:
         print("📦 Loading pose estimator (RTMPose)...")
-        from modules.pose_backend import build_pose_estimator
+        from modules.vision.pose_backend import build_pose_estimator
         pose_model = build_pose_estimator(auto_install=True)
         if pose_model is None:
             print("ℹ️ Pose estimation unavailable — continuing with person boxes")

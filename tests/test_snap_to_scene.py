@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.auto_segments import snap_to_scene
+from modules.segments.auto_segments import snap_to_scene
 
 
 class TestInsideScene:

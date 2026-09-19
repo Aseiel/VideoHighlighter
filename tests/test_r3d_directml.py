@@ -26,7 +26,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from modules import directml_device as dml
+from modules.system import directml_device as dml
 from tests.test_directml_device import FakeTorchDirectML
 
 
@@ -69,7 +69,7 @@ def _set_ort_dml(monkeypatch, available):
     developer's box happens to have `onnxruntime-directml` — passing on CI,
     where it is absent, and failing on the Windows machine the feature is for.
     """
-    from modules import ort_directml
+    from modules.system import ort_directml
     # `dml.enabled()` is in the stub because it is in the real thing:
     # ort_directml.probe() consults it, so that VH_DIRECTML=off turns off
     # DirectML whichever runtime would have supplied it. A stub that ignored the
@@ -251,8 +251,8 @@ def test_a_cuda_failure_is_still_a_failure(ar, amd_box):
 def test_on_demand_runs_send_r3d_to_directml(monkeypatch, amd_box):
     """The viewer's runs and a full pipeline run must agree, or a cache built by
     one is a cache the other would not have produced."""
-    from modules import analysis_ondemand as ao
-    from modules import device_utils as du
+    from modules.report import analysis_ondemand as ao
+    from modules.system import device_utils as du
     monkeypatch.setattr(du, "_TORCH_AVAILABLE", False)
 
     flags = ao._r3d_flags("auto", log=lambda *a, **k: None)
@@ -262,8 +262,8 @@ def test_on_demand_runs_send_r3d_to_directml(monkeypatch, amd_box):
 
 
 def test_on_demand_auto_without_directml_is_unchanged(monkeypatch, no_directml):
-    from modules import analysis_ondemand as ao
-    from modules import device_utils as du
+    from modules.report import analysis_ondemand as ao
+    from modules.system import device_utils as du
     monkeypatch.setattr(du, "_TORCH_AVAILABLE", False)
 
     assert ao._r3d_flags("auto", log=lambda *a, **k: None) == (
@@ -278,7 +278,7 @@ def test_on_demand_auto_without_directml_is_unchanged(monkeypatch, no_directml):
 def test_explicit_backend_choices_name_their_device(backend, expected, amd_box):
     """Each choice pins its own device, so "R3D + CPU" cannot silently become
     DirectML on an AMD machine just because one is present."""
-    from modules import analysis_ondemand as ao
+    from modules.report import analysis_ondemand as ao
     assert ao._r3d_flags(backend, log=lambda *a, **k: None) == expected
 
 # ---------------------------------------------------------------------------
@@ -291,8 +291,8 @@ def test_auto_reaches_for_onnx_runtime_when_torch_cannot(monkeypatch, onnx_dml_b
     OpenVINO — which there *is* the processor, because OpenVINO's GPU plugin is
     Intel-only. R3D was skipped on exactly the machines with a card going
     unused."""
-    from modules import analysis_ondemand as ao
-    from modules import device_utils as du
+    from modules.report import analysis_ondemand as ao
+    from modules.system import device_utils as du
     monkeypatch.setattr(du, "_TORCH_AVAILABLE", False)
 
     enable, half, device, onnx_dml = ao._r3d_flags("auto", log=lambda *a, **k: None)
@@ -307,7 +307,7 @@ def test_choosing_the_cpu_still_means_the_cpu_on_a_dx12_box(onnx_dml_box):
     has DirectML, and it has to keep meaning what the label says. This is why
     the permission is passed rather than inferred from the device: the wrapper
     sees "cpu" in both cases and cannot tell them apart on its own."""
-    from modules import analysis_ondemand as ao
+    from modules.report import analysis_ondemand as ao
 
     assert ao._r3d_flags("r3d_cpu", log=lambda *a, **k: None) == (
         True, False, "cpu", False)
@@ -332,7 +332,7 @@ def test_without_permission_onnx_runtime_is_never_asked(ar, monkeypatch):
     """The refusal has to happen before the import, not after the session: an
     export costs real seconds and a user who asked for the CPU should not pay
     them."""
-    from modules import r3d_onnx
+    from modules.vision import r3d_onnx
     calls = []
     monkeypatch.setattr(r3d_onnx, "load", lambda *a, **k: calls.append(1))
 
@@ -344,7 +344,7 @@ def test_a_working_torch_gpu_is_never_displaced(ar, monkeypatch):
     """Permission is not the only gate. A DirectML or CUDA model that survived
     its warm-up keeps the card it has, because moving it to a second runtime on
     the same adapter would be contention rather than acceleration."""
-    from modules import r3d_onnx
+    from modules.vision import r3d_onnx
     calls = []
     monkeypatch.setattr(r3d_onnx, "load", lambda *a, **k: calls.append(1))
 
@@ -357,7 +357,7 @@ def test_a_demoted_model_is_offered_to_onnx_runtime(ar, monkeypatch):
     """The warm-up runs first and may move the model to the CPU. That is the
     moment this matters most: DirectML could not run it through torch, and ONNX
     Runtime's operator coverage is not the same set."""
-    from modules import r3d_onnx
+    from modules.vision import r3d_onnx
     sentinel = object()
     seen = {}
 

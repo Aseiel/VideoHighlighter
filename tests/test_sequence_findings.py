@@ -1,7 +1,7 @@
 """What the sequence findings claim, and — mostly — what they refuse to."""
 import pytest
 
-from modules.sequence_findings import findings, summarise
+from modules.report.sequence_findings import findings, summarise
 
 
 def _report(segments, *, duration=100.0, speech=None, activity=None):

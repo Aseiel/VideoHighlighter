@@ -3,7 +3,7 @@ pose.py — keypoint estimation and everything derived from it.
 
 DORMANT AS OF THIS SPLIT. Every function here needs a pose model, and the app
 has not had one since the AGPL YOLO package was dropped: YOLOX is a detector
-with no keypoint head, and the shim in modules/detection_backend.py
+with no keypoint head, and the shim in modules/vision/detection_backend.py
 says so explicitly (`_PredictResult.keypoints = None`). So `pose_model` arrives
 as None at every call site, `get_pose_keypoints_for_frame` returns [], and the
 guards downstream (`if pose_model:`, `if not poses: return True`) turn the whole

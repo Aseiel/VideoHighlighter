@@ -32,7 +32,7 @@ turns out to be slower than the CPU -- so it works as a smoke test on an AMD
 machine, not just as a printout.
 
 Needs torch and torch-directml. Nothing else in the app is imported beyond
-`modules.directml_device`, which is stdlib-only, so this runs in the isolated
+`modules.system.directml_device`, which is stdlib-only, so this runs in the isolated
 DirectML virtualenv that docs/AMD-GPU.md recommends.
 """
 from __future__ import annotations
@@ -45,7 +45,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules import directml_device as dml  # noqa: E402
+from modules.system import directml_device as dml  # noqa: E402
 
 # Cosine between the DirectML result and an fp32 CPU reference. DirectML is
 # free to reassociate and to use fp16 intermediates, so this is looser than the

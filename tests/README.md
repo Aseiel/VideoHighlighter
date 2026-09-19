@@ -63,11 +63,11 @@ Three rules for tests added under this directory:
 
 | File | Module covered | Why it matters |
 |------|---------------|----------------|
-| `test_merge_seconds.py` | `modules.compute_forbidden._merge_seconds` | Powers the AVOID(skip) flow |
-| `test_cluster_points.py` | `modules.auto_segments.cluster_points` | Auto-segmentation core when `CLIP_TIME=0` |
-| `test_snap_to_scene.py` | `modules.auto_segments.snap_to_scene` | Scene-boundary alignment |
-| `test_region.py` | `modules.auto_segments.Region` | Overlap/merge geometry for highlight regions |
-| `test_srt_timestamp.py` | `modules.transcript_srt.format_timestamp_srt` | SRT spec compliance for every subtitle written |
+| `test_merge_seconds.py` | `modules.segments.compute_forbidden._merge_seconds` | Powers the AVOID(skip) flow |
+| `test_cluster_points.py` | `modules.segments.auto_segments.cluster_points` | Auto-segmentation core when `CLIP_TIME=0` |
+| `test_snap_to_scene.py` | `modules.segments.auto_segments.snap_to_scene` | Scene-boundary alignment |
+| `test_region.py` | `modules.segments.auto_segments.Region` | Overlap/merge geometry for highlight regions |
+| `test_srt_timestamp.py` | `modules.audio.transcript_srt.format_timestamp_srt` | SRT spec compliance for every subtitle written |
 
 Next additions (Phase 1+):
 

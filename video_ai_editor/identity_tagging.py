@@ -81,7 +81,7 @@ def tag_video_with_identities(
     cap.release()
 
     if model is None:
-        from modules.compute_forbidden import build_tracking_model
+        from modules.segments.compute_forbidden import build_tracking_model
         model = build_tracking_model("n", device=device or "GPU")
     if model is None:
         print("⚠️ Identity tracking skipped — no person tracker available")

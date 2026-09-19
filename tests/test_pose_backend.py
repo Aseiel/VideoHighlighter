@@ -10,11 +10,11 @@ module scope would fail collection rather than skip.
 import numpy as np
 import pytest
 
-from modules.pose_backend import (
+from modules.vision.pose_backend import (
     KEYPOINT_NAMES, _affine, _box_to_center_scale, _decode_simcc,
     find_default_rtmpose_ir,
 )
-from modules.rtmpose_models import BBOX_PADDING, INPUT_SIZE, SIZES
+from modules.vision.rtmpose_models import BBOX_PADDING, INPUT_SIZE, SIZES
 
 
 def test_keypoint_layout_is_coco_17():
@@ -112,7 +112,7 @@ def test_estimate_returns_one_entry_per_box_in_order():
     if isinstance(sys.modules.get("openvino"), MagicMock):
         pytest.skip("openvino is shimmed in this run")
 
-    from modules.pose_backend import RTMPoseOpenVINOEstimator
+    from modules.vision.pose_backend import RTMPoseOpenVINOEstimator
 
     est = RTMPoseOpenVINOEstimator(ir, device="CPU")
     frame = np.zeros((480, 640, 3), dtype=np.uint8)

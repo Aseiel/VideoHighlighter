@@ -16,7 +16,7 @@ Constraints that shaped it, all from PyInstaller's Splash:
     `text_pos`; the `--splash` CLI flag hardcodes it to None. The build uses the
     CLI flag, so this image carries no space reserved for text and has to read
     as finished on its own — the app's own Qt splash takes over the moment Qt
-    is up (modules/startup_splash.py).
+    is up (modules/system/startup_splash.py).
 """
 
 from __future__ import annotations

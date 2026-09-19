@@ -14,7 +14,7 @@ import pytest
 
 
 def test_simple_preset_can_score_without_any_knobs():
-    from modules.simple_run import apply_simple_run, simple_scoring_total
+    from modules.segments.simple_run import apply_simple_run, simple_scoring_total
     assert simple_scoring_total() > 0
     cfg = apply_simple_run({}, "short")
     assert cfg["motion_peak_points"] > 0
@@ -36,7 +36,7 @@ def test_main_keeps_the_full_ui_and_adds_the_stack():
 
 
 def test_video_path_accepts_common_containers():
-    from modules.simple_run import is_video_path
+    from modules.segments.simple_run import is_video_path
     assert is_video_path(r"C:\clips\talk.mp4")
     assert is_video_path("/tmp/a.MKV")
     assert not is_video_path("/tmp/notes.txt")
@@ -94,7 +94,7 @@ def test_chat_panel_moves_between_the_two_views():
 
 
 def test_idle_status_names_the_loaded_file_count():
-    from modules.simple_run import idle_status_text
+    from modules.segments.simple_run import idle_status_text
     assert idle_status_text(0) == "Ready"
     assert idle_status_text(1) == "1 video ready — press Analyze"
     assert idle_status_text(3) == "3 videos ready — press Analyze"

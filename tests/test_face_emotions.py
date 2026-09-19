@@ -1,4 +1,4 @@
-"""Tests for `modules.face_emotions` — the built-in expression classes.
+"""Tests for `modules.vision.face_emotions` — the built-in expression classes.
 
 Inference is injected, so none of this needs OpenVINO or the model file. What
 is being protected is mostly the honesty of the reduction: a face the model
@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from modules.face_emotions import (
+from modules.vision.face_emotions import (
     DEFAULT_CONFIDENCE,
     EMOTION_LABELS,
     EmotionClassifier,
@@ -20,7 +20,7 @@ from modules.face_emotions import (
     top_emotion,
     to_signal,
 )
-from modules.face_crops import FaceCrop
+from modules.vision.face_crops import FaceCrop
 
 
 def _probs(**named):
@@ -135,7 +135,7 @@ class TestClassifyCrops:
         assert out.shape == (3, len(EMOTION_LABELS))
 
     def test_the_real_resize_is_the_default(self):
-        from modules.face_emotions import preprocess
+        from modules.vision.face_emotions import preprocess
         import inspect
         assert "preprocess_fn" in inspect.signature(classify_crops).parameters
 

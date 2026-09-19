@@ -388,12 +388,12 @@ shared files stay portable to the free edition:
 | `llm/category_scoring.py` | tile scoring, shared by live and offline | **done** — ported out of `live_category.py` |
 | `llm/example_mine.py` | scan a file → candidates | to do, no Qt, testable |
 | `modules/box_refine.py` | coarse region → fitted box | to do, isolated so refiners can be swapped and measured |
-| `modules/label_store.py` | labels, verdicts, boxes on disk + COCO assembly | **done** — source-agnostic, segment-aware split |
+| `modules/vision/label_store.py` | labels, verdicts, boxes on disk + COCO assembly | **done** — source-agnostic, segment-aware split |
 | `modules/train_rounds.py` | round history, held-out set, promote/reject a model | to do, pure, testable without a GPU |
 | `modules/review_queue.py` | what to ask the human next, ranked | to do, pure — the acquisition rules above |
 | `training/train_yolox_run.py` | training with progress + cancel | **done** — fine-tunes on XPU/CUDA/CPU |
 | `training/train_estimate.py` | how long a run will take, said before it starts | **done** — measured speeds per device, refined by every run on this computer |
-| `modules/training_preview.py` + `modules/ui/training_preview.py` | what the model finds each round on held-out frames; the "Watch it learn" window | **done** |
+| `modules/vision/training_preview.py` + `modules/ui/training_preview.py` | what the model finds each round on held-out frames; the "Watch it learn" window | **done** |
 | `training/export_yolox.py` | checkpoint → ONNX → IR → `models/custom/` | **done** — raw-grid, layout-checked |
 | `modules/ui/training_tab.py` | the Qt | to do |
 

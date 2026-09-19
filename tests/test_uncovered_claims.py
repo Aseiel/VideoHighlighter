@@ -8,7 +8,7 @@ could stop noticing that:
 
 * a claim said exactly *once* has to surface, because that is the shape of the
   sentence this exists for — a frequency threshold cannot reach it at any
-  setting, which is why :mod:`modules.vocabulary_gap` is not enough;
+  setting, which is why :mod:`modules.report.vocabulary_gap` is not enough;
 * a line some class already covers must *not* appear, or the section
   contradicts the measurements printed above it;
 * an interjection must not outrank an assertion, which is the one thing
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules import uncovered_claims
+from modules.report import uncovered_claims
 
 
 def _lines(*items):
@@ -176,7 +176,7 @@ class TestAgainstTheGap:
         gap able to reach a one-off claim, this file would be doing work
         somebody else already does; while it cannot, the two are both needed.
         """
-        from modules.vocabulary_gap import find_gaps
+        from modules.report.vocabulary_gap import find_gaps
 
         claim = _lines((60, "the dovetail is the thing I care about most in "
                             "this entire workshop, honestly"))
@@ -241,7 +241,7 @@ class TestTheFinding:
         return report
 
     def test_it_fires_and_names_both_routes(self):
-        from modules.highlight_advice import attach_advice
+        from modules.report.highlight_advice import attach_advice
 
         report = self._report()
         attach_advice(report)
@@ -255,8 +255,8 @@ class TestTheFinding:
     def test_it_points_at_a_page_the_advisor_actually_has(self):
         # A finding whose topic names no file gives the model no material and
         # fails silently -- the answer just gets vaguer.
-        from modules.advisor import knowledge_topics
-        from modules.highlight_advice import diagnose
+        from modules.report.advisor import knowledge_topics
+        from modules.report.highlight_advice import diagnose
 
         report = self._report()
         uncovered_claims.ensure(report)
@@ -265,7 +265,7 @@ class TestTheFinding:
             assert finding.topic in topics, finding.id
 
     def test_no_claims_means_no_finding(self):
-        from modules.highlight_advice import diagnose
+        from modules.report.highlight_advice import diagnose
 
         report = self._report()
         report["unmeasured"] = {}

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules import analysis_ondemand as aod
+from modules.report import analysis_ondemand as aod
 
 
 SEGMENTS = [
@@ -52,7 +52,7 @@ def subtitles(monkeypatch, tmp_path, cache):
     monkeypatch.setattr(aod, "_write_transcript_sidecar",
                         lambda *a, **k: None)
 
-    import modules.transcript_srt as srt_mod
+    import modules.audio.transcript_srt as srt_mod
     monkeypatch.setattr(
         srt_mod, "create_srt_file",
         lambda segments, path, **kw: calls["srt"].append((path, len(segments), kw)),
@@ -271,7 +271,7 @@ class TestCachedTranscriptHelper:
         called = []
         monkeypatch.setattr(aod, "_write_transcript_sidecar", lambda *a, **k: None)
 
-        import modules.transcript as tr_mod
+        import modules.audio.transcript as tr_mod
         monkeypatch.setattr(tr_mod, "get_transcript_segments",
                             lambda *a, **k: called.append(1) or SEGMENTS)
         aod.run_transcript("movie.mp4", language="en", log=lambda *a: None)

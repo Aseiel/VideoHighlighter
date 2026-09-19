@@ -96,7 +96,7 @@ def _old_user_data_dir():
 
 
 def check_where_it_writes(old: bool) -> bool:
-    from modules import app_paths
+    from modules.system import app_paths
 
     target = _old_user_data_dir() if old else app_paths.user_data_dir()
     inside_bundle = ".app" in target
@@ -108,7 +108,7 @@ def check_where_it_writes(old: bool) -> bool:
 
 
 def check_working_directory(old: bool) -> bool:
-    from modules import app_paths
+    from modules.system import app_paths
 
     if old:
         cwd = os.getcwd()                         # 0.11.0 left it alone
@@ -124,15 +124,15 @@ def check_working_directory(old: bool) -> bool:
 def check_the_cache_opens(old: bool) -> bool:
     """The actual failure: VideoAnalysisCache mkdir'ing a relative path.
 
-    This is the call in `modules/video_cache.py` that the timeline viewer and
+    This is the call in `modules/media/video_cache.py` that the timeline viewer and
     the subtitles-on-demand run both die in.
     """
     try:
-        from modules.video_cache import VideoAnalysisCache
+        from modules.media.video_cache import VideoAnalysisCache
     except Exception as e:
         print(f"{INFO} cache module unavailable here ({type(e).__name__}: {e})")
         return True
-    from modules import app_paths
+    from modules.system import app_paths
 
     try:
         cache = VideoAnalysisCache(cache_dir="./cache")
@@ -154,7 +154,7 @@ def check_the_cache_opens(old: bool) -> bool:
 
 
 def check_certificates(old: bool) -> bool:
-    from modules import https_certs
+    from modules.system import https_certs
 
     if old:
         print(f"{FAIL} HTTPS used urllib's default store "

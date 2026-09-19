@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules import llm_acceleration
+from modules.narration import llm_acceleration
 
 
 @pytest.fixture

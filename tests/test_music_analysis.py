@@ -1,4 +1,4 @@
-"""Tests for `modules.music_analysis`.
+"""Tests for `modules.audio.music_analysis`.
 
 Fixtures are synthesised with numpy and the stdlib `wave` module, so the
 default path of this file needs no ffmpeg, no network and no music: a click
@@ -26,9 +26,9 @@ import wave
 import numpy as np
 import pytest
 
-from modules.app_paths import ffmpeg_exe
-from modules import music_analysis as ma
-from modules.music_analysis import (
+from modules.system.app_paths import ffmpeg_exe
+from modules.audio import music_analysis as ma
+from modules.audio.music_analysis import (
     MusicAnalysis,
     Section,
     analyze_music,

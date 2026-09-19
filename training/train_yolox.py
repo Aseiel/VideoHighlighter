@@ -23,7 +23,7 @@ same as ``tools/get_yolox_model.py``. Use YOLOX's official export, then
 
 Class names: unlike an ultralytics export, YOLOX's own export tooling embeds
 no class-name metadata into the ONNX/IR file at all — a raw-grid export is
-just weights. ``modules.detection_backend.names_from_model`` can only recover
+just weights. ``modules.vision.detection_backend.names_from_model`` can only recover
 names from that embedded metadata, so without a ``labels.json`` sidecar next
 to the exported model, the app finds zero class names, logs "No class names
 for custom model", and silently falls back to the 80-class COCO detector. This
@@ -66,7 +66,7 @@ def class_names_from_coco(coco_path: Path) -> list[str]:
 def write_labels_json(names: list[str], out_path: Path) -> Path:
     """Write ``names`` as the plain-list shape ``load_class_names`` reads.
 
-    This is the file ``modules.detection_backend._custom()`` looks for beside
+    This is the file ``modules.vision.detection_backend._custom()`` looks for beside
     a custom model's ``.xml``/``.onnx`` — see the module docstring for why it
     has to exist at all for a YOLOX export.
     """

@@ -30,12 +30,12 @@ from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 
 try:
-    from modules.app_paths import ffmpeg_exe
+    from modules.system.app_paths import ffmpeg_exe
 except Exception:  # pragma: no cover - fall back to OpenCV-only extraction
     ffmpeg_exe = None
 
 try:
-    from modules import repaint_trace
+    from modules.system import repaint_trace
 except Exception:  # pragma: no cover - the cache works without the recorder
     repaint_trace = None
 

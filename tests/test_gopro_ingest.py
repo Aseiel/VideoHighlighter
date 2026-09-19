@@ -1,5 +1,5 @@
 """
-Tests for modules.gopro_ingest against a synthetic card on disk.
+Tests for modules.media.gopro_ingest against a synthetic card on disk.
 
 The card is built as real directories and files (a few KB each) rather than
 mocked, because every behaviour worth testing here is a filesystem behaviour:
@@ -20,7 +20,7 @@ import time
 
 import pytest
 
-from modules.gopro_ingest import (
+from modules.media.gopro_ingest import (
     CopyCancelled,
     GoProCard,
     find_gopro_cards,
@@ -296,7 +296,7 @@ def test_unreadable_file_is_recorded_but_others_still_copy(tmp_path, monkeypatch
     _make_card(src, ["GX013762.MP4", "GX013763.MP4"])
     dest = tmp_path / "out"
 
-    import modules.gopro_ingest as gi
+    import modules.media.gopro_ingest as gi
     real_copy = gi._copy_one
 
     def flaky(source, target, size, verify, **kwargs):
@@ -321,7 +321,7 @@ def test_progress_reaches_the_total_even_when_a_file_fails(tmp_path, monkeypatch
     _make_card(src, ["GX013762.MP4", "GX013763.MP4"])
     dest = tmp_path / "out"
 
-    import modules.gopro_ingest as gi
+    import modules.media.gopro_ingest as gi
     real_copy = gi._copy_one
 
     def flaky(source, target, size, verify, **kwargs):

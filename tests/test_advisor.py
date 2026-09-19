@@ -1,4 +1,4 @@
-"""Tests for `modules.advisor` — findings joined to the pages that explain them.
+"""Tests for `modules.report.advisor` — findings joined to the pages that explain them.
 
 The behaviour worth protecting is the boundary: everything works with no model,
 the model is only ever given material that was computed rather than recalled,
@@ -10,9 +10,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from modules import advisor
-from modules.highlight_advice import diagnose
-from modules.highlight_report import build_report
+from modules.report import advisor
+from modules.report.highlight_advice import diagnose
+from modules.report.highlight_report import build_report
 
 
 def _report(n=600):
@@ -50,7 +50,7 @@ class TestKnowledge:
 
     def test_every_topic_a_finding_can_reference_actually_exists(self):
         """A finding pointing at a missing page would explain nothing."""
-        from modules.highlight_advice import (
+        from modules.report.highlight_advice import (
             _rule_single_signal, _rule_concentrated, _rule_dominant_tag,
             _rule_flat_score, _rule_boost_never_fired, _rule_near_miss_gap,
             _rule_short_of_target, _rule_silent_detector,
@@ -229,7 +229,7 @@ class TestSummaryTask:
 
 class TestSummariseReportFile:
     def _written(self, tmp_path):
-        from modules.highlight_report import write_report
+        from modules.report.highlight_report import write_report
         json_path = tmp_path / "r.json"
         html_path = tmp_path / "r.html"
         write_report(_report(), str(html_path), str(json_path))
@@ -296,8 +296,8 @@ def _footage_report():
 
 def test_the_model_is_shown_what_the_run_found_in_the_footage():
     """Without it the model can discuss weights and never the moments."""
-    from modules.advisor import build_prompt
-    from modules.highlight_advice import diagnose
+    from modules.report.advisor import build_prompt
+    from modules.report.highlight_advice import diagnose
     report = _footage_report()
     prompt = build_prompt(report, diagnose(report))
     assert "## What the run found in the footage" in prompt
@@ -306,15 +306,15 @@ def test_the_model_is_shown_what_the_run_found_in_the_footage():
 
 
 def test_the_clip_lines_carry_the_rarity_that_argues_with_them():
-    from modules.advisor import build_prompt
-    from modules.highlight_advice import diagnose
+    from modules.report.advisor import build_prompt
+    from modules.report.highlight_advice import diagnose
     report = _footage_report()
     prompt = build_prompt(report, diagnose(report))
     assert "Hardly anywhere else in this video" in prompt
 
 
 def test_the_reading_prompt_permits_a_guess_and_requires_it_to_be_marked():
-    from modules.advisor import READING_SYSTEM_PROMPT as rules
+    from modules.report.advisor import READING_SYSTEM_PROMPT as rules
     assert "may suggest what a combination of signals could mean" in rules
     assert "Mark it as your reading" in rules
     # ...and still cannot introduce arithmetic of its own.
@@ -322,13 +322,13 @@ def test_the_reading_prompt_permits_a_guess_and_requires_it_to_be_marked():
 
 
 def test_the_reading_prompt_carries_the_limit_of_the_expression_channel():
-    from modules.advisor import READING_SYSTEM_PROMPT as rules
+    from modules.report.advisor import READING_SYSTEM_PROMPT as rules
     assert "cannot tell a performed expression from a felt one" in rules
 
 
 def test_advice_and_reading_are_kept_in_different_fields():
     """Two opposite questions; a reader must be able to tell which is which."""
-    from modules.advisor import READING_SYSTEM_PROMPT, SYSTEM_PROMPT
+    from modules.report.advisor import READING_SYSTEM_PROMPT, SYSTEM_PROMPT
     assert READING_SYSTEM_PROMPT != SYSTEM_PROMPT
     assert "never speculate" not in READING_SYSTEM_PROMPT.lower()
 
@@ -340,7 +340,7 @@ def test_a_gguf_path_reaches_the_backend_as_a_path():
     "GGUF model not found:" naming no file at all, so every local-model summary
     failed identically to a missing model.
     """
-    import modules.advisor as advisor
+    import modules.report.advisor as advisor
 
     seen = {}
 
@@ -376,7 +376,7 @@ def _blocks():
 
 
 def test_a_prompt_that_fits_keeps_everything():
-    from modules.advisor import _fit
+    from modules.report.advisor import _fit
     said = _fit("HEAD", _blocks(), "## Task\nask", max_chars=10000)
     for heading in ("## Footage", "## Documentation", "## Clips", "## Chapters"):
         assert heading in said
@@ -385,7 +385,7 @@ def test_a_prompt_that_fits_keeps_everything():
 
 def test_the_least_useful_section_goes_first():
     """llama.cpp refuses an over-long call outright, so this is a budget."""
-    from modules.advisor import _fit
+    from modules.report.advisor import _fit
     said = _fit("HEAD", _blocks(), "## Task\nask", max_chars=1500)
     assert "## Footage" in said          # priority 1 survives
     assert "## Chapters" not in said     # priority 4 goes first
@@ -394,14 +394,14 @@ def test_the_least_useful_section_goes_first():
 
 def test_the_question_is_never_dropped():
     """A model given context and no question answers one it invented."""
-    from modules.advisor import _fit
+    from modules.report.advisor import _fit
     said = _fit("HEAD", _blocks(), "## Task\nask", max_chars=1)
     assert said.endswith("## Task\nask")
 
 
 def test_what_was_cut_is_named_in_the_prompt():
     """A summary written without the chapters must not describe a video without them."""
-    from modules.advisor import _fit
+    from modules.report.advisor import _fit
     said = _fit("HEAD", _blocks(), "## Task\nask", max_chars=1500)
     assert "Left out of this prompt for length: Chapters" in said
     assert "do not describe them as missing from the run" in said
@@ -409,9 +409,9 @@ def test_what_was_cut_is_named_in_the_prompt():
 
 def test_a_real_report_fits_the_window_the_loader_asks_for():
     """The failure this replaces was 5391 tokens against a 4096-token window."""
-    from modules.advisor import (DEFAULT_N_CTX, MAX_PROMPT_CHARS, SUMMARY_TOKENS,
+    from modules.report.advisor import (DEFAULT_N_CTX, MAX_PROMPT_CHARS, SUMMARY_TOKENS,
                                  build_prompt)
-    from modules.highlight_advice import diagnose
+    from modules.report.highlight_advice import diagnose
     report = _footage_report()
     # Twelve clips, scoring differently — a run the size that overran the window.
     report["segments"] = [
@@ -427,21 +427,21 @@ def test_a_real_report_fits_the_window_the_loader_asks_for():
 def test_the_loader_asks_for_a_window_the_prompt_can_live_in():
     import inspect
 
-    import modules.advisor as advisor
+    import modules.report.advisor as advisor
     assert "n_ctx=n_ctx" in inspect.getsource(advisor.load_llm)
     assert advisor.DEFAULT_N_CTX > 4096
 
 
 def test_reading_is_given_room_that_advising_is_not():
     """At 0.3 and 200 tokens the same report produced the same paragraph."""
-    from modules.advisor import (READING_TEMPERATURE, READING_TOKENS,
+    from modules.report.advisor import (READING_TEMPERATURE, READING_TOKENS,
                                  SUMMARY_TOKENS)
     assert READING_TOKENS > SUMMARY_TOKENS
     assert READING_TEMPERATURE > 0.5
 
 
 def test_the_temperature_reaches_the_model():
-    from modules.advisor import _generate
+    from modules.report.advisor import _generate
 
     seen = {}
 
@@ -466,7 +466,7 @@ def test_a_projector_is_not_attached_to_a_text_only_summary():
     nothing — which surfaces as "the model returned nothing" and reads like a
     refusal.
     """
-    import modules.advisor as advisor
+    import modules.report.advisor as advisor
 
     seen = {}
 

@@ -2,7 +2,7 @@
 
 `torch-directml` cannot be bundled — it pins an exact torch, and the release
 build ships the CUDA one — so on a DX12 card the exe had action recognition on
-the processor with no way for the user to change it. `modules/r3d_onnx.py`
+the processor with no way for the user to change it. `modules/vision/r3d_onnx.py`
 routes the model through the runtime that *is* in the bundle.
 
 Nothing here needs an AMD card, ONNX Runtime, or a real R3D. What the module
@@ -20,7 +20,7 @@ import types
 import numpy as np
 import pytest
 
-from modules import r3d_onnx
+from modules.vision import r3d_onnx
 
 
 @pytest.fixture(autouse=True)

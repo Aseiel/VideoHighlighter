@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from modules import repaint_trace
+from modules.system import repaint_trace
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(repaint_trace.__file__)))
 
@@ -181,7 +181,7 @@ class TestATraceThatEndsWithoutAGoodbye:
         subprocess.run(
             [sys.executable, "-c",
              f"import sys; sys.path.insert(0, r'{_REPO_ROOT}');"
-             "from modules import repaint_trace;"
+             "from modules.system import repaint_trace;"
              f"repaint_trace.arm(r'{path}')"],
             check=True, timeout=60)
 
@@ -196,7 +196,7 @@ class TestATraceThatEndsWithoutAGoodbye:
         proc = subprocess.Popen(
             [sys.executable, "-c",
              f"import sys, time; sys.path.insert(0, r'{_REPO_ROOT}');"
-             "from modules import repaint_trace;"
+             "from modules.system import repaint_trace;"
              f"repaint_trace.arm(r'{path}');"
              "repaint_trace.note('working'); time.sleep(30)"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

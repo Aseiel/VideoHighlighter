@@ -13,15 +13,15 @@ from tqdm import tqdm
 from action_recognition import run_action_detection, load_models
 from object_recognition import run_object_detection_single
 # modules
-from modules.audio_peaks import extract_audio_peaks
-from modules.motion_scene_detect_optimized import detect_scenes_motion_optimized
-from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
-from modules.video_cutter import cut_video
-from modules.auto_segments import build_auto_segments
-from modules.highlight_select import peak_confidence_by_sec, select_fixed_window_segments
-from modules.device_utils import resolve_yolo_device
-from modules.app_paths import ffmpeg_exe
-from modules import ffmpeg_tools
+from modules.audio.audio_peaks import extract_audio_peaks
+from modules.segments.motion_scene_detect_optimized import detect_scenes_motion_optimized
+from modules.media.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+from modules.media.video_cutter import cut_video
+from modules.segments.auto_segments import build_auto_segments
+from modules.segments.highlight_select import peak_confidence_by_sec, select_fixed_window_segments
+from modules.system.device_utils import resolve_yolo_device
+from modules.system.app_paths import ffmpeg_exe
+from modules.media import ffmpeg_tools
 
 
 # Emitted when detection is skipped because cached results were reused. The
@@ -49,8 +49,8 @@ class ProgressTracker:
 
 # Transcript modules (optional)
 try:
-    from modules.transcript import get_transcript_segments, search_transcript_for_keywords
-    from modules.transcript_srt import create_highlight_subtitles, create_enhanced_transcript, create_srt_file, translate_segments
+    from modules.audio.transcript import get_transcript_segments, search_transcript_for_keywords
+    from modules.audio.transcript_srt import create_highlight_subtitles, create_enhanced_transcript, create_srt_file, translate_segments
     TRANSCRIPT_AVAILABLE = True
 except ImportError:
     TRANSCRIPT_AVAILABLE = False
@@ -122,7 +122,7 @@ def check_cancellation(cancel_flag, log_fn, step_name="operation"):
 def _face_label_counts(face_seconds):
     """How many readable seconds each expression accounted for."""
     try:
-        from modules.face_scan import label_counts
+        from modules.vision.face_scan import label_counts
         return {k: v for k, v in label_counts(face_seconds).items() if v}
     except Exception:
         return {}
@@ -130,7 +130,7 @@ def _face_label_counts(face_seconds):
 
 def check_gpu_availability(log_fn=print):
     """Legacy shim — the single source of truth is device_utils.detect_best_device()."""
-    from modules.device_utils import detect_best_device
+    from modules.system.device_utils import detect_best_device
     d = detect_best_device(log_fn=log_fn)
     return d.gpu_available, d.yolo_pt_device   # ("cuda:0" | "cpu")
 
@@ -367,7 +367,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
     try:
         # --- Load config defaults (from config.yaml) ---
         config = {}
-        from modules.app_paths import config_path
+        from modules.system.app_paths import config_path
         cfg_path = config_path("config.yaml")
         if os.path.exists(cfg_path):
             try:
@@ -832,11 +832,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # A cached run can still be missing motion data - the points that gate
         # the detector are scoring weights and deliberately outside the cache
         # signature, so a cache written while they were zero holds empty lists
-        # forever. `modules.analysis_plan` owns that reasoning and the registry
+        # forever. `modules.report.analysis_plan` owns that reasoning and the registry
         # of which settings do this; see its docstring for why it is a module
         # rather than a condition written out here for the third time.
-        from modules.analysis_plan import describe as _describe_backfill
-        from modules.analysis_plan import gate_is_open, needs_backfill
+        from modules.report.analysis_plan import describe as _describe_backfill
+        from modules.report.analysis_plan import gate_is_open, needs_backfill
         motion_wanted = gate_is_open(effective_points, "motion")
         motion_backfill = needs_backfill(
             "motion", effective_points, using_cache=using_cache,
@@ -955,7 +955,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             # If waveform wasn't cached in older runs, compute it now (cheap) so timeline works
             if waveform_data is None:
                 try:
-                    from modules.audio_peaks import extract_waveform_data
+                    from modules.audio.audio_peaks import extract_waveform_data
                     # Scale resolution with duration so bins stay ~0.25s (tight
                     # waveform/preview alignment) instead of a fixed 1000 points
                     # that become ~1.4s bins on long videos. Capped for draw perf.
@@ -971,7 +971,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
             # Always try to compute waveform for the timeline viewer
             try:
-                from modules.audio_peaks import extract_waveform_data
+                from modules.audio.audio_peaks import extract_waveform_data
                 # Scale resolution with duration so bins stay ~0.25s (tight
                 # waveform/preview alignment) instead of a fixed 1000 points that
                 # become ~1.4s bins on long videos. Capped for scene-draw perf.
@@ -1004,14 +1004,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # answer different questions: that one thresholds at a fixed -20 dBFS,
         # which is a property of the mastering rather than of the content, and on
         # two files mastered 17 dB apart it cannot describe both. A z-score
-        # against a rolling median can. See modules/loudness_bursts.py.
+        # against a rolling median can. See modules/audio/loudness_bursts.py.
         LOUDNESS_BURST_POINTS = gui_config.get(
             "loudness_burst_points",
             config.get("scoring", {}).get("loudness_burst_points", 0))
         loudness_bursts = []
         # Per-second dBFS, kept because the report compares the level measured
         # during each labelled class and that needs a value for every second,
-        # not only the ones that stood out. See modules/level_by_class.py.
+        # not only the ones that stood out. See modules/audio/level_by_class.py.
         loudness_levels = []
         if LOUDNESS_BURST_POINTS:
             _cached_blob = cached_data if "cached_data" in locals() else None
@@ -1031,7 +1031,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log("🔹 Step 3b: Finding loudness bursts...")
                 try:
                     check_cancellation(cancel_flag, log, "loudness burst detection")
-                    from modules import loudness_bursts as _lb
+                    from modules.audio import loudness_bursts as _lb
                     _lb_cfg = config.get("loudness_bursts", {}) or {}
                     _lb_result = _lb.detect(
                         processed_video_path,
@@ -1122,7 +1122,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         object_class_names = []
         try:
             check_cancellation(cancel_flag, log, "object detector loading")
-            from modules.detection_backend import build_object_detector
+            from modules.vision.detection_backend import build_object_detector
 
             if "yolo_world" in yolo_type:
                 log("⚠️ Open-vocabulary detection is no longer part of this "
@@ -1135,12 +1135,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             if object_mode == "coco":
                 # AMD / NVIDIA: OpenVINO would run this on the processor, while
                 # ONNX Runtime's DirectML provider reaches the card.
-                from modules.device_utils import detect_best_device
+                from modules.system.device_utils import detect_best_device
                 if getattr(detect_best_device(log_fn=log), "onnx_dml_yolo", False):
                     from object_recognition import directml_detector
                     yolo_model = directml_detector(prefer, log=log)
                     if yolo_model is not None:
-                        from modules.detection_backend import load_class_names
+                        from modules.vision.detection_backend import load_class_names
                         object_class_names = load_class_names("yolo_objects_labels.json")
             if yolo_model is None:
                 yolo_model, object_class_names = build_object_detector(
@@ -1225,11 +1225,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # already exist, so editing one and re-running must not require the
         # detections to be computed again — it used to, and the symptom was a
         # rule change that silently did nothing on a cached pass. See
-        # modules/compose_events.py; the call is idempotent.
+        # modules/rules/compose_events.py; the call is idempotent.
         try:
-            from modules.app_paths import composition_rules_path
-            from modules.compose_events import apply_rules, write_back
-            from modules.composition_signals import gather, signal_names
+            from modules.system.app_paths import composition_rules_path
+            from modules.rules.compose_events import apply_rules, write_back
+            from modules.rules.composition_signals import gather, signal_names
 
             _rules_path = composition_rules_path()
             _needed = signal_names(_rules_path)
@@ -1381,7 +1381,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # R3DModelWrapper runs a real forward pass at load and demotes
                     # itself to the CPU if the backend cannot execute it, leaving
                     # the machine exactly where it was before.
-                    from modules.device_utils import detect_best_device
+                    from modules.system.device_utils import detect_best_device
                     _dev = detect_best_device(log_fn=log)
                     if _dev.pytorch_device == "cuda":
                         enable_r3d = True
@@ -1610,7 +1610,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         if AVOID_ENABLED and AVOID_IDS:
             try:
                 from video_ai_editor.face_identity import FaceIdentityBank
-                from modules.compute_forbidden import compute_forbidden
+                from modules.segments.compute_forbidden import compute_forbidden
                 bank = FaceIdentityBank(db_path=gui_config.get("face_db_path", "./cache/face_db.json"))
                 forbidden_ranges, forbidden_boxes_by_frame = compute_forbidden(
                     processed_video_path, bank, AVOID_IDS, fps,
@@ -1626,7 +1626,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # "skip" regardless of the face-avoid toggle/method, then merged with any
         # face-identity ranges so downstream zeroing/subtraction sees one list.
         try:
-            from modules.manual_avoid import parse_ranges, combine
+            from modules.segments.manual_avoid import parse_ranges, combine
             manual_avoid = parse_ranges(gui_config.get("avoid_manual_ranges", []))
         except Exception as e:
             log(f"⚠️ Manual avoid parse failed — ignoring manual ranges: {e}")
@@ -1742,7 +1742,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # Every second an event spans, not just its peak: a loudness burst is a
         # moment with a duration, and scoring only the peak second would make the
         # clip-builder cut around a single instant of a two-second event.
-        from modules.loudness_bursts import event_seconds as _burst_seconds
+        from modules.audio.loudness_bursts import event_seconds as _burst_seconds
         loudness_burst_set = _burst_seconds(loudness_bursts)
         for sec in loudness_burst_set:
             if 0 <= sec < len(score):
@@ -1827,8 +1827,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         face_seconds = {}
         if FACE_POINTS and FACE_LABELS:
             try:
-                from modules.face_scan import best_by_second, scan_video
-                from modules.face_emotions import to_signal as face_to_signal
+                from modules.vision.face_scan import best_by_second, scan_video
+                from modules.vision.face_emotions import to_signal as face_to_signal
 
                 face_seconds = scan_video(
                     processed_video_path,
@@ -1853,8 +1853,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # after `face_score` is final, so the arithmetic is untouched either way.
         if not face_seconds:
             try:
-                from modules.face_scan import cache_path_for
-                from modules.face_scan import load as load_face_scan
+                from modules.vision.face_scan import cache_path_for
+                from modules.vision.face_scan import load as load_face_scan
                 _cached = load_face_scan(cache_path_for(
                     processed_video_path, gui_config.get("cache_dir", "./cache")))
                 if _cached:
@@ -2019,7 +2019,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # penalizes and never crashes the run.
         if QUALITY_GATE and segments:
             try:
-                from modules.clip_quality import sample_sharpness, is_blurry
+                from modules.segments.clip_quality import sample_sharpness, is_blurry
 
                 penalized = 0
                 for seg_start, seg_end in segments:
@@ -2057,7 +2057,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # describes the cut that is actually produced.
         if segments and gui_config.get("write_highlight_report", True):
             try:
-                from modules.highlight_report import build_report, write_report
+                from modules.report.highlight_report import build_report, write_report
 
                 def _thumb(sec, _path=processed_video_path):
                     """One JPEG per segment peak. Opened per call rather than
@@ -2089,7 +2089,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # cannot slow a run down.
                 chapters = []
                 try:
-                    from modules.chapters import chapters_for_video
+                    from modules.segments.chapters import chapters_for_video
                     chapters = chapters_for_video(video_path, scenes,
                                                   video_duration, log_fn=print)
                 except Exception as _ce:
@@ -2202,7 +2202,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # Order, interval, and the questions this run cannot answer.
                 # Before the advisor, which reads what this attaches.
                 try:
-                    from modules.sequence_findings import attach as _seq_attach
+                    from modules.report.sequence_findings import attach as _seq_attach
                     _seq_attach(report)
                 except Exception as _fe:
                     print(f"⚠️ Sequence findings skipped: {_fe}")
@@ -2210,7 +2210,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # Diagnose the run before writing it out, so the page and the
                 # JSON carry the same findings and neither can drift.
                 try:
-                    from modules.highlight_advice import attach_advice
+                    from modules.report.highlight_advice import attach_advice
                     attach_advice(report)
                     if report.get("advice"):
                         log(f"💡 {len(report['advice'])} suggestion(s) in the "
@@ -2227,7 +2227,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 log(f"📄 Why-these-moments report: {os.path.basename(html_path)}")
                 # The same breakdown into the debug log, from the same dict, so
                 # the two can never disagree about what happened.
-                from modules.highlight_report import render_text
+                from modules.report.highlight_report import render_text
                 print("\n" + render_text(report))
 
                 # Narrate what was just written, if the run asked for it. Here
@@ -2241,7 +2241,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # the record they update — the page and the JSON must not be
                 # able to disagree about what the model said.
                 try:
-                    from modules.story_run import narrate_report_file
+                    from modules.narration.story_run import narrate_report_file
 
                     narrate_report_file(
                         f"{base}_why.json", config=gui_config, log_fn=log,
@@ -2540,7 +2540,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                               "gpu": "GPU re-encode"}[RENDER_MODE]
         log(f"🔹 Step 7: Cutting video segments... [{_render_mode_label}]")
         try:
-            from modules.clip_export import (
+            from modules.media.clip_export import (
                 clips_directory, sanitize_base_name, segment_clip_path,
             )
             import re
@@ -2637,7 +2637,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # never killing a run that already produced a video.
                 if MUSIC_PATH and OUTPUT_FILE and os.path.exists(OUTPUT_FILE):
                     try:
-                        from modules.music_track import apply_music
+                        from modules.media.music_track import apply_music
 
                         music_root, music_ext = os.path.splitext(OUTPUT_FILE)
                         music_tmp = f"{music_root}_music{music_ext or '.mp4'}"

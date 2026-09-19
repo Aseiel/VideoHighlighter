@@ -512,7 +512,7 @@ class AnnotatedVideoManager(QObject):
         from pathlib import Path
         
         try:
-            from modules.video_cache import VideoAnalysisCache
+            from modules.media.video_cache import VideoAnalysisCache
             
             cache = VideoAnalysisCache()
             video_hash = cache._get_video_hash(self.video_path)

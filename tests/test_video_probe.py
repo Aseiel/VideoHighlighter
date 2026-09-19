@@ -1,5 +1,5 @@
 """
-Tests for modules.video_probe — the single-call ffprobe wrapper.
+Tests for modules.media.video_probe — the single-call ffprobe wrapper.
 
 The rotation sign convention is the part worth pinning hard: ffprobe reports
 the displaymatrix angle counter-clockwise (a sideways phone recording shows
@@ -19,8 +19,8 @@ import subprocess
 
 import pytest
 
-from modules import video_probe
-from modules.app_paths import ffmpeg_exe
+from modules.media import video_probe
+from modules.system.app_paths import ffmpeg_exe
 
 
 def _ffmpeg(*args):

@@ -1,4 +1,4 @@
-"""Tests for `modules.llm_models` — the list of models a report can be written with.
+"""Tests for `modules.narration.llm_models` — the list of models a report can be written with.
 
 The property worth protecting is that a stored list can never break the feature
 it configures. Settings survive upgrades, get hand-edited, and come back from
@@ -9,7 +9,7 @@ after the user has waited for a model to load.
 
 from __future__ import annotations
 
-from modules.llm_models import active, label_for, migrate, parse, serialise
+from modules.narration.llm_models import active, label_for, migrate, parse, serialise
 
 
 class TestParsing:

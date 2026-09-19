@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from modules import manual_avoid
+from modules.segments import manual_avoid
 
 
 @pytest.fixture(autouse=True)

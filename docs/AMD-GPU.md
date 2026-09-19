@@ -169,7 +169,7 @@ not a finding.
 | Face, motion | no | Unchanged: OpenVINO on the CPU. |
 
 **R3D action recognition proves itself at load.** `pytorch_device` in
-`modules/device_utils.py` carries the DirectML string on an AMD box, which is
+`modules/system/device_utils.py` carries the DirectML string on an AMD box, which is
 what routes R3D there, and `auto` enables it — on AMD there is no faster path
 being displaced, because OpenVINO's GPU plugin is Intel-only and that branch is
 the processor.
@@ -195,7 +195,7 @@ detector is YOLOX, normally run by OpenVINO — whose GPU plugin is Intel-only,
 so `resolve_yolo_device()` still answers a DirectML request with `cpu`. Where
 ONNX Runtime's DirectML provider is present (`onnx_dml_yolo`), the same YOLOX
 ONNX export runs under it instead (`YoloxOnnxRuntimeDetector` in
-`modules/detection_backend.py`, chosen by `object_recognition.directml_detector`).
+`modules/vision/detection_backend.py`, chosen by `object_recognition.directml_detector`).
 Custom and mixed models stay on OpenVINO.
 
 Detection is the heaviest per-frame stage, so this is the larger half of the
@@ -229,7 +229,7 @@ So there are two DirectML paths, with different reach:
 | Drives | R3D action recognition, visual search | object detection, R3D action recognition |
 | Switch | `VH_DIRECTML` | the same `VH_DIRECTML` |
 
-`modules/device_utils.py` reflects that: when torch has a DirectML device it is
+`modules/system/device_utils.py` reflects that: when torch has a DirectML device it is
 used as before, and when it does not — every exe on a DX12 box — the probe
 falls through to a branch that reports `DirectML (ONNX Runtime)` and sets two
 flags, `onnx_dml_yolo` and `onnx_dml_torch`, for the two model groups that have
@@ -242,8 +242,8 @@ OWLv2, motion — has no export yet and is still on the processor, which is why
 the flags name specific models rather than saying "torch is accelerated".
 
 The detector needs no export here — YOLOX publishes ONNX, downloaded once into
-`models/yolox/onnx/` (`modules/yolox_models.py`). R3D's is made once and reused, in an
-`onnx-cache` folder under the user-data directory (`modules/r3d_onnx.py`, which
+`models/yolox/onnx/` (`modules/vision/yolox_models.py`). R3D's is made once and reused, in an
+`onnx-cache` folder under the user-data directory (`modules/vision/r3d_onnx.py`, which
 keys the filename on the class count and re-exports when imported custom weights
 are newer than the cached graph). That costs tens of seconds, once.
 
@@ -270,7 +270,7 @@ displace, and torch is the better-tested of the two CPU paths.
 
 ### The win that needs no model
 
-Detecting the card at all means `modules/encoder_select.py` can finally answer
+Detecting the card at all means `modules/system/encoder_select.py` can finally answer
 "amd" and prefer `h264_amf` / `hevc_amf` when re-encoding clips. That is
 hardware video encoding, it has nothing to do with machine learning, and it
 works whether or not a single model ever runs on DirectML. It is likely the
@@ -313,8 +313,8 @@ Runtime offers no way to ask a session which adapter it took. Ids above 1 do not
 exist, and ORT falls back to the processor without saying so in any readable way
 (the error it prints is mojibake), which is why `session_backend()` reads the
 provider back off the live session rather than trusting the request.
-`modules/ort_directml.py` binds adapter 0 and does *not* filter software
-adapters, unlike `modules/directml_device.py` — so on a machine whose adapter 0
+`modules/system/ort_directml.py` binds adapter 0 and does *not* filter software
+adapters, unlike `modules/system/directml_device.py` — so on a machine whose adapter 0
 is Microsoft's software renderer, that row is measuring a CPU implementation of
 D3D12 rather than a graphics card.
 
@@ -370,36 +370,36 @@ resolved it. Worth trying before suspecting the app.
 **A device string that torch rejects.** `import torch_directml` is what
 registers the backend with torch — the string `privateuseone:0` means nothing
 until it has happened, in *that* process. Every call site here imports it
-before the first `.to()`, and `modules/directml_device.py:ensure_backend()` is
+before the first `.to()`, and `modules/system/directml_device.py:ensure_backend()` is
 the helper for any new one. A device string arriving from a worker process, a
 CLI flag or a stale config is the case that catches this out.
 
 **The backend is not called what you expect.** torch-directml 0.1.x called it
 `dml`; 0.2.x calls it `privateuseone`. Nothing here hardcodes either — the name
 is read off the device object the installed package hands back. Use
-`modules.directml_device.device_string()` rather than a literal.
+`modules.system.directml_device.device_string()` rather than a literal.
 
 ## Where the code is
 
-- `modules/directml_device.py` — everything torch-DirectML-specific: the
+- `modules/system/directml_device.py` — everything torch-DirectML-specific: the
   opt-in, the probe, device-string normalisation, backend registration. Imports
   nothing but `os` and `typing`, so any module can use it without dragging in
   machinery.
-- `modules/ort_directml.py` — the same questions asked of ONNX Runtime: is the
+- `modules/system/ort_directml.py` — the same questions asked of ONNX Runtime: is the
   provider here, which adapter, what session. Shares the `VH_DIRECTML` switch.
-- `modules/r3d_onnx.py` — the R3D export and its ONNX Runtime runner: where the
+- `modules/vision/r3d_onnx.py` — the R3D export and its ONNX Runtime runner: where the
   cached graph lives, when it is stale, and the two refusals above.
-- `modules/onnx_detector.py` — the detector that runs an ONNX export, with its
+- `modules/vision/onnx_detector.py` — the detector that runs an ONNX export, with its
   own letterbox and NMS and no Ultralytics import, so the Pro edition can use
   it with a different export in front.
-- `modules/detection_backend.py` — `YoloxOnnxRuntimeDetector`, the stock YOLOX
-  export on ONNX Runtime; `modules/yolox_models.py` downloads that export.
-- `modules/device_utils.py` — the pipeline-wide decision. DirectML sits after
+- `modules/vision/detection_backend.py` — `YoloxOnnxRuntimeDetector`, the stock YOLOX
+  export on ONNX Runtime; `modules/vision/yolox_models.py` downloads that export.
+- `modules/system/device_utils.py` — the pipeline-wide decision. DirectML sits after
   the Intel probes and before the CPU fallback.
 - `llm/clip_prefilter.py` — visual search, with its own `resolve_device` (it
   explains why it does not use `device_utils`).
 - `action_recognition.py` — `R3DModelWrapper`, whose warm-up is the guard.
-- `modules/encoder_select.py` — the AMF encoder preference.
+- `modules/system/encoder_select.py` — the AMF encoder preference.
 - `tools/check_directml.py` — the diagnostic, for a real AMD machine.
 - `tools/simulate_directml.py` — the fake AMD machine, for every other one.
 - `tests/test_directml_device.py`, `tests/test_directml_routing.py`,

@@ -2,11 +2,11 @@ import os
 import sys
 
 # Capture every print/warning/traceback from the very first import: the
-# packaged exe is --windowed (no stdout), so modules/debug_console tees all
+# packaged exe is --windowed (no stdout), so modules/system/debug_console tees all
 # output into debug.log next to the exe and can mirror it to a live console
 # window. Must run before the heavy imports below — some of them print
 # warnings worth keeping.
-from modules import debug_console
+from modules.system import debug_console
 debug_console.install()
 
 # Every relative path in the app — `./cache` above all — resolves against the
@@ -14,14 +14,14 @@ debug_console.install()
 # macOS starts an .app in `/`, which is read-only, so the first cache write
 # failed with "[Errno 30] Read-only file system: 'cache'". Do this before
 # anything opens a file.
-from modules.app_paths import use_writable_cwd
+from modules.system.app_paths import use_writable_cwd
 print(f"📂 Working directory: {use_writable_cwd()}")
 
 # Interface size, if the user set one. Qt reads QT_SCALE_FACTOR when the
 # QApplication is constructed and never again, so this has to happen before the
 # Qt imports below — on a 55" 4K panel the OS scale is right for a television
 # and far too large for an app at desk distance.
-from modules import ui_scale
+from modules.system import ui_scale
 ui_scale.apply()
 
 # Progress reporting for the launch itself. Imported here, before the heavy
@@ -30,11 +30,11 @@ ui_scale.apply()
 # any window can exist. The bootloader's splash covers that stretch with the
 # logo; these stage() calls are what make a slow launch readable afterwards in
 # debug.log, and they would drive the splash text too if the build ever moves
-# to a .spec (see modules/startup_splash.py on why the CLI flag cannot).
+# to a .spec (see modules/system/startup_splash.py on why the CLI flag cannot).
 # This module deliberately pulls in no Qt, so it cannot disturb the import
 # order below, which matters on Windows.
-from modules import startup_splash
-from modules import compute_backend
+from modules.system import startup_splash
+from modules.system import compute_backend
 startup_splash.stage("Loading the video engine…")
 
 import cv2
@@ -58,16 +58,16 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot
 from downloader import download_videos_with_immediate_processing, extract_video_links, DownloadError, reset_duration_method_cache
 startup_splash.stage("Loading the assistant…")
 from llm.llm_chat_widget import LLMChatWidget
-from modules.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
-from modules import analysis_stats
+from modules.media.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
+from modules.report import analysis_stats
 from modules.ui import icons as _ui_icons, theme as _ui_theme
-from modules.simple_run import apply_simple_run
+from modules.segments.simple_run import apply_simple_run
 from modules.ui.simple_start import (
     SimpleStartPage, persist_simple_start, simple_start_enabled,
 )
 # The five classes the expression scan can report. Imported for the Basic
 # tab's picker; the module itself loads no model until something asks it to scan.
-from modules.face_emotions import EMOTION_LABELS
+from modules.vision.face_emotions import EMOTION_LABELS
 
 startup_splash.stage("Loading the detection runtime…")
 try:
@@ -75,8 +75,8 @@ try:
 except Exception:
     pass
 
-from modules.app_paths import resource_path as _resource_path, data_file as _data_file, config_path
-from modules.app_paths import action_model_file as _action_model_file
+from modules.system.app_paths import resource_path as _resource_path, data_file as _data_file, config_path
+from modules.system.app_paths import action_model_file as _action_model_file
 from version import __version__, __edition__
 
 # --- Contact / support details shown in the About tab ---
@@ -641,7 +641,7 @@ class SignalRunWorker(QThread):
     result into that video's cache (leaving the other signals intact).
 
     This is the main-window twin of the timeline viewer's "Analyze" panel: same
-    engine (`modules.analysis_ondemand`), same fold-into-cache behaviour, just
+    engine (`modules.report.analysis_ondemand`), same fold-into-cache behaviour, just
     looped over the whole file list instead of one loaded video. It never cuts
     highlights — it only produces the standalone `.srt`/`.txt` (subtitles /
     transcript) and/or warms the cache for a later highlight run or the viewer.
@@ -662,7 +662,7 @@ class SignalRunWorker(QThread):
         self.preview_enabled = False
 
     def run(self):
-        from modules import analysis_ondemand as aod
+        from modules.report import analysis_ondemand as aod
         self._is_running = True
         n = len(self.video_paths)
         done = 0
@@ -770,7 +770,7 @@ class FaceScanWorker(QThread):
     def run(self):
             try:
                 from video_ai_editor.face_identity import FaceIdentityBank
-                from modules.compute_forbidden import build_tracking_model, tag_entries
+                from modules.segments.compute_forbidden import build_tracking_model, tag_entries
 
                 bank = FaceIdentityBank(db_path=self.db_path)
                 model = build_tracking_model("n", log_fn=self.log.emit)
@@ -800,7 +800,7 @@ class UpdateCheckWorker(QThread):
     travels back as a signal, and silence means "nothing to say".
     """
 
-    found = Signal(object)   # modules.update_check.UpdateInfo
+    found = Signal(object)   # modules.update.update_check.UpdateInfo
     nothing = Signal(str)    # only for an explicit "check now": why it found nothing
 
     def __init__(self, force=False, parent=None):
@@ -809,7 +809,7 @@ class UpdateCheckWorker(QThread):
 
     def run(self):
         try:
-            from modules import update_check
+            from modules.update import update_check
             info = update_check.check_for_update(force=self.force)
         except Exception as e:
             # An update check must never be the reason anything goes wrong.
@@ -828,7 +828,7 @@ class UpdateCheckWorker(QThread):
 class UpdateInstallWorker(QThread):
     """Download and install a release, off the GUI thread.
 
-    All the logic lives in modules/update_install; this only marshals progress
+    All the logic lives in modules/update/update_install; this only marshals progress
     and the result back to the window.
     """
 
@@ -845,7 +845,7 @@ class UpdateInstallWorker(QThread):
         self._cancel = True
 
     def run(self):
-        from modules import update_install
+        from modules.update import update_install
         try:
             result = update_install.install_update(
                 self.manifest_url, self.root,
@@ -1976,7 +1976,7 @@ class VideoHighlighterGUI(QWidget):
         def _populate_object_models(select_type=None, select_path=""):
             """Rebuild the combo from discovery. Each entry's data is
             (yolo_type, path), matching what the pipeline consumes."""
-            from modules.app_paths import discover_object_models
+            from modules.system.app_paths import discover_object_models
             self.object_model_combo.blockSignals(True)
             self.object_model_combo.clear()
             self.object_model_combo.addItem("Standard (80 objects)", ("standard", ""))
@@ -2003,7 +2003,7 @@ class VideoHighlighterGUI(QWidget):
             self.object_model_combo.blockSignals(False)
 
         def _import_object_model():
-            from modules.app_paths import import_object_model
+            from modules.system.app_paths import import_object_model
             src, _ = QFileDialog.getOpenFileName(
                 self, "Import object detector model", "",
                 "Detector models (*.onnx *.xml);;All files (*)")
@@ -2144,7 +2144,7 @@ class VideoHighlighterGUI(QWidget):
                 # the newly imported model's class count shows up immediately,
                 # without requiring an app restart.
                 if is_r3d:
-                    from modules.app_paths import (
+                    from modules.system.app_paths import (
                         import_r3d_action_model, r3d_custom_action_paths)
                     n_classes, variant = import_r3d_action_model(src, labels_src)
                     if n_classes == 0:
@@ -2158,7 +2158,7 @@ class VideoHighlighterGUI(QWidget):
                         len(self.load_labels_from_json(fresh)) if os.path.exists(fresh) else 0)
                     select_mode = "r3d_custom_only"
                 else:
-                    from modules.app_paths import (
+                    from modules.system.app_paths import (
                         import_custom_action_model, custom_action_decoder_paths)
                     n_classes = import_custom_action_model(src, labels_src)
                     if n_classes == 0:
@@ -2183,7 +2183,7 @@ class VideoHighlighterGUI(QWidget):
                     #     GPU / CPU at runtime).
                     if select_mode == "r3d_custom_only":
                         try:
-                            from modules.device_utils import detect_best_device
+                            from modules.system.device_utils import detect_best_device
                             has_cuda = detect_best_device(
                                 log_fn=lambda *a, **k: None).pytorch_device == "cuda"
                         except Exception:
@@ -2365,7 +2365,7 @@ class VideoHighlighterGUI(QWidget):
 
         # ---- load existing rules into table ----
         def _comp_load_rules():
-            from modules.app_paths import composition_rules_path, user_data_dir
+            from modules.system.app_paths import composition_rules_path, user_data_dir
             path = composition_rules_path()
             events = []
             if path:
@@ -2664,7 +2664,7 @@ class VideoHighlighterGUI(QWidget):
             failures — for the automatic saves (on Run, on close), where a log
             line per close is noise and a silent loss of a ticked box is not.
             """
-            from modules.app_paths import user_data_dir
+            from modules.system.app_paths import user_data_dir
             import os as _os
             out = {'events': _comp_collect_events()}
             if quiet and out == getattr(self, '_comp_saved_state', None):
@@ -3194,7 +3194,7 @@ class VideoHighlighterGUI(QWidget):
         Resizing to fill a large, heavily scaled display has been reported to
         kill the process, and a crash below the Python frame writes no
         traceback — so the last line in debug.log is the evidence. See
-        modules/display_info.py.
+        modules/system/display_info.py.
         """
         super().resizeEvent(event)
         timer = getattr(self, "_size_log_timer", None)
@@ -3202,7 +3202,7 @@ class VideoHighlighterGUI(QWidget):
             timer.start()
 
     def _log_size(self):
-        from modules import display_info
+        from modules.system import display_info
         display_info.log_window_size(self, "Main window")
 
     # --- About / Contact tab ---
@@ -3352,7 +3352,7 @@ class VideoHighlighterGUI(QWidget):
               f"{' [self-install]' if can_install else ''}")
 
     def _sweep_updated_files(self):
-        from modules import update_apply
+        from modules.update import update_apply
 
         try:
             freed = update_apply.sweep_old(update_apply.install_root())
@@ -3368,7 +3368,7 @@ class VideoHighlighterGUI(QWidget):
         info = getattr(self, "_pending_update", None)
         if not info or not info.manifest_url:
             return
-        from modules import update_apply
+        from modules.update import update_apply
 
         self.update_install_btn.setEnabled(False)
         self.update_skip_btn.setVisible(False)
@@ -3384,7 +3384,7 @@ class VideoHighlighterGUI(QWidget):
         self.update_installer.start()
 
     def _on_install_progress(self, phase, done, total, detail):
-        from modules import update_install
+        from modules.update import update_install
 
         if phase == update_install.DOWNLOADING and total:
             self.update_progress.setRange(0, total)
@@ -3430,7 +3430,7 @@ class VideoHighlighterGUI(QWidget):
         once nothing holds them open.
         """
         import subprocess
-        from modules import update_apply
+        from modules.update import update_apply
 
         try:
             subprocess.Popen(update_apply.relaunch_command(),
@@ -3456,7 +3456,7 @@ class VideoHighlighterGUI(QWidget):
     def _skip_update(self):
         info = getattr(self, "_pending_update", None)
         if info:
-            from modules import update_check
+            from modules.update import update_check
             update_check.skip_version(info.version)
         self.update_banner.setVisible(False)
 
@@ -3486,7 +3486,7 @@ class VideoHighlighterGUI(QWidget):
         layout.addWidget(subtitle)
 
         # --- Updates ---
-        from modules import update_check as _update_check
+        from modules.update import update_check as _update_check
 
         upd_group = QGroupBox("Updates")
         upd_layout = QVBoxLayout(upd_group)
@@ -4315,7 +4315,7 @@ class VideoHighlighterGUI(QWidget):
     def combine_highlights(self, highlight_files, output_path):
         """Combine multiple highlight videos into one.
 
-        Thin delegate to modules.combine_videos.combine_videos (the same engine
+        Thin delegate to modules.media.combine_videos.combine_videos (the same engine
         the sidecar drives), keeping this method's original contract for the Qt
         callers: None when there is nothing to combine, the lone file passed
         straight through when there is only one, otherwise the combined output
@@ -4336,7 +4336,7 @@ class VideoHighlighterGUI(QWidget):
             return valid_files[0]
 
         try:
-            from modules.combine_videos import combine_videos
+            from modules.media.combine_videos import combine_videos
 
             return combine_videos(
                 valid_files, output_path, log_fn=self.append_log,
@@ -4558,7 +4558,7 @@ class VideoHighlighterGUI(QWidget):
         path = self.object_detector_choice()[1]
         if not path or not os.path.exists(path):
             return []
-        from modules.app_paths import object_model_names
+        from modules.system.app_paths import object_model_names
         return object_model_names(path)
 
     def open_object_label_selector(self):
@@ -4574,7 +4574,7 @@ class VideoHighlighterGUI(QWidget):
             labels = self.custom_object_class_names()
             if not labels:
                 try:
-                    from modules.app_paths import custom_keypoint_names
+                    from modules.system.app_paths import custom_keypoint_names
                     labels = custom_keypoint_names()
                 except Exception:
                     labels = []
@@ -5763,7 +5763,7 @@ class VideoHighlighterGUI(QWidget):
         # Feed analysis data to LLM chat
         if hasattr(self, 'llm_chat'):
             try:
-                from modules.video_cache import VideoAnalysisCache
+                from modules.media.video_cache import VideoAnalysisCache
                 cache = VideoAnalysisCache()
                 video_path = self.get_file_list()[0] if self.get_file_list() else ""
                 
@@ -5862,7 +5862,7 @@ class VideoHighlighterGUI(QWidget):
             except Exception:
                 pass
         try:
-            from modules.manual_avoid import load_ranges
+            from modules.segments.manual_avoid import load_ranges
             paths = self.get_file_list()
             if paths:
                 return [list(r) for r in load_ranges(paths[0])]
@@ -6004,7 +6004,7 @@ class VideoHighlighterGUI(QWidget):
     def _llm_models(self):
         """Every configured model, oldest single-model setting folded in."""
         from PySide6.QtCore import QSettings
-        from modules.llm_models import migrate, parse
+        from modules.narration.llm_models import migrate, parse
 
         s = QSettings("VideoHighlighter", "Pro")
         models = parse(s.value("advisor/models"))
@@ -6015,7 +6015,7 @@ class VideoHighlighterGUI(QWidget):
 
     def _save_llm_models(self, models, chosen=None):
         from PySide6.QtCore import QSettings
-        from modules.llm_models import label_for, serialise
+        from modules.narration.llm_models import label_for, serialise
 
         s = QSettings("VideoHighlighter", "Pro")
         s.setValue("advisor/models", serialise(models))
@@ -6024,7 +6024,7 @@ class VideoHighlighterGUI(QWidget):
 
     def _active_llm_model(self):
         from PySide6.QtCore import QSettings
-        from modules.llm_models import active
+        from modules.narration.llm_models import active
 
         s = QSettings("VideoHighlighter", "Pro")
         return active(self._llm_models(), s.value("advisor/model_chosen"))
@@ -6045,7 +6045,7 @@ class VideoHighlighterGUI(QWidget):
         if not json_path:
             return
 
-        from modules import advisor
+        from modules.report import advisor
         entry = model or self._active_llm_model()
         backend = (entry or {}).get("backend", "ollama")
         model = (entry or {}).get("model", "llama3")
@@ -6065,7 +6065,7 @@ class VideoHighlighterGUI(QWidget):
                     f"⚠️ Could not reach {backend}/{model}. The report's findings "
                     "are there without it — only the summary needs a model.")
                 return
-            from modules.llm_models import label_for
+            from modules.narration.llm_models import label_for
             text = advisor.summarise_report_file(
                 json_path, llm=llm, question=question or None, reading=reading,
                 model_name=label_for(entry))
@@ -6104,8 +6104,10 @@ class VideoHighlighterGUI(QWidget):
 
         import json
 
-        from modules import advisor, chapter_story
-        from modules.llm_models import label_for
+        from modules.report import advisor
+
+        from modules.narration import chapter_story
+        from modules.narration.llm_models import label_for
 
         try:
             with open(json_path, encoding="utf-8") as fh:
@@ -6172,9 +6174,11 @@ class VideoHighlighterGUI(QWidget):
 
         from PySide6.QtWidgets import (QApplication, QInputDialog, QMessageBox)
 
-        from modules import advisor, rule_proposal
-        from modules.app_paths import composition_rules_path
-        from modules.llm_models import label_for
+        from modules.report import advisor
+
+        from modules.rules import rule_proposal
+        from modules.system.app_paths import composition_rules_path
+        from modules.narration.llm_models import label_for
 
         json_path = self._newest_why_report_json()
         if not json_path:
@@ -6295,7 +6299,7 @@ class VideoHighlighterGUI(QWidget):
     def show_ai_summary_menu(self):
         from PySide6.QtWidgets import QMenu
 
-        from modules.llm_models import label_for
+        from modules.narration.llm_models import label_for
 
         menu = QMenu(self)
         # First, because it is the one that answers "what is in this video"
@@ -6365,7 +6369,7 @@ class VideoHighlighterGUI(QWidget):
         import json
 
         from PySide6.QtWidgets import QInputDialog
-        from modules.highlight_advice import CONCERNS, attach_advice
+        from modules.report.highlight_advice import CONCERNS, attach_advice
 
         json_path = self._newest_why_report_json()
         if not json_path:
@@ -6387,7 +6391,7 @@ class VideoHighlighterGUI(QWidget):
             with open(json_path, "w", encoding="utf-8") as fh:
                 json.dump(report, fh, indent=1)
 
-            from modules.highlight_report import render_html
+            from modules.report.highlight_report import render_html
             html_path = os.path.splitext(json_path)[0] + ".html"
             with open(html_path, "w", encoding="utf-8") as fh:
                 fh.write(render_html(report))
@@ -6435,7 +6439,7 @@ class VideoHighlighterGUI(QWidget):
         """
         from PySide6.QtWidgets import QApplication
 
-        from modules.llm_models import label_for
+        from modules.narration.llm_models import label_for
         from modules.ui.model_dialog import ModelDialog
 
         models = self._llm_models()
@@ -6558,7 +6562,7 @@ class VideoHighlighterGUI(QWidget):
                     self.timeline_window = None
 
             # Check if cache exists - use the same parameters as in pipeline
-            from modules.video_cache import VideoAnalysisCache, build_analysis_cache_params
+            from modules.media.video_cache import VideoAnalysisCache, build_analysis_cache_params
             
             # Build the same parameters that were used when processing
             # We need to recreate the analysis_params that were used
@@ -6718,7 +6722,7 @@ if __name__ == "__main__":
     reset_duration_method_cache()
     # Nobody should have to install ffmpeg: pip already brought one
     # (imageio-ffmpeg). Give it its plain name on PATH before anything runs it.
-    from modules.ffmpeg_tools import ensure_ffmpeg_on_path
+    from modules.media.ffmpeg_tools import ensure_ffmpeg_on_path
     ensure_ffmpeg_on_path()
     # Disable D3D11VA hardware acceleration in Qt multimedia's FFmpeg backend.
     # On some Windows systems D3D11VA initialisation fails for H.264, causing
@@ -6743,7 +6747,7 @@ if __name__ == "__main__":
     # What we are drawing on, written down before anything draws. A window that
     # dies while being resized on a large scaled display leaves no traceback, so
     # the screen geometry and scale factors are the evidence.
-    from modules import display_info
+    from modules.system import display_info
     display_info.log(app)
 
     # Central theme: one graphite + accent stylesheet for all base widgets.

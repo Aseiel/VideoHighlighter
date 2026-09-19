@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.transcript_srt import format_timestamp_srt
+from modules.audio.transcript_srt import format_timestamp_srt
 
 
 class TestBasicFormatting:

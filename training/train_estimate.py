@@ -249,9 +249,9 @@ def estimate(train_frames: int, val_frames: int, epochs: int, size: str,
 
 
 def frames_in_store(store, val_fraction: Optional[float] = None) -> tuple:
-    """(train, val) frame counts a ``modules.label_store.LabelStore`` will
+    """(train, val) frame counts a ``modules.vision.label_store.LabelStore`` will
     produce, split the way ``build_dataset`` splits it."""
-    from modules.label_store import segments, split_segments, DEFAULT_VAL_FRACTION
+    from modules.vision.label_store import segments, split_segments, DEFAULT_VAL_FRACTION
     usable = store.accepted() + store.negatives()
     if not usable:
         return 0, 0
@@ -263,7 +263,7 @@ def frames_in_store(store, val_fraction: Optional[float] = None) -> tuple:
 
 def default_store_path() -> str:
     try:
-        from modules.app_paths import user_data_dir
+        from modules.system.app_paths import user_data_dir
         base = user_data_dir()
     except Exception:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -52,7 +52,7 @@ async def lifespan(_app: "FastAPI"):
     # before any WebSocket has connected.
     manager.loop = asyncio.get_running_loop()
     # Jobs run ffmpeg by name; the one pip installed has to answer to it.
-    from modules.ffmpeg_tools import ensure_ffmpeg_on_path
+    from modules.media.ffmpeg_tools import ensure_ffmpeg_on_path
     ensure_ffmpeg_on_path()
     yield
 
@@ -287,7 +287,7 @@ async def resume_run() -> dict:
 async def stats() -> dict:
     """Lifetime count of analyzed videos — the Qt GUI's counter, same file."""
     try:
-        from modules import analysis_stats
+        from modules.report import analysis_stats
 
         return {
             "ok": True,
@@ -330,7 +330,7 @@ async def cancel_run() -> dict:
 @app.get("/config")
 async def get_config() -> dict:
     import yaml
-    from modules.app_paths import config_path
+    from modules.system.app_paths import config_path
 
     try:
         path = config_path()
@@ -351,7 +351,7 @@ async def save_config(req: ConfigRequest) -> dict:
     """Merge-write config.yaml. Merging (rather than replacing) preserves keys
     the web UI doesn't own yet, e.g. ui.suppress_no_cache_warning."""
     import yaml
-    from modules.app_paths import config_path
+    from modules.system.app_paths import config_path
 
     try:
         path = config_path()
@@ -380,7 +380,7 @@ async def save_config(req: ConfigRequest) -> dict:
 @app.get("/composition-rules")
 async def get_composition_rules() -> dict:
     import yaml
-    from modules.app_paths import composition_rules_path
+    from modules.system.app_paths import composition_rules_path
 
     try:
         path = composition_rules_path()
@@ -412,7 +412,7 @@ class CompRulesRequest(BaseModel):
 @app.post("/composition-rules")
 async def save_composition_rules(req: CompRulesRequest) -> dict:
     import yaml
-    from modules.app_paths import user_data_dir
+    from modules.system.app_paths import user_data_dir
 
     try:
         events_ordered: list[dict] = []
@@ -455,14 +455,14 @@ async def save_composition_rules(req: CompRulesRequest) -> dict:
 @app.get("/video-info")
 async def video_info(path: str) -> dict:
     """Full display metadata for a video, so the UI can show a real time-range
-    slider AND orient a preview correctly. Backed by modules.video_probe (one
+    slider AND orient a preview correctly. Backed by modules.media.video_probe (one
     ffprobe JSON call); keeps the {ok, duration} back-compat shape and adds
     width/height/fps/rotation. probe_video raises on ffprobe failure, so the
     try/except yields the {ok:false,error} shape the other endpoints use."""
     try:
         if not os.path.exists(path):
             return {"ok": False, "error": "file not found"}
-        from modules.video_probe import probe_video
+        from modules.media.video_probe import probe_video
 
         info = await asyncio.to_thread(probe_video, path)
         return {
@@ -585,7 +585,7 @@ async def gopro_cards() -> dict:
     disconnected drive, so it runs off the event loop.
     """
     try:
-        from modules.gopro_ingest import find_gopro_cards, scan_card, suggest_folder_name
+        from modules.media.gopro_ingest import find_gopro_cards, scan_card, suggest_folder_name
 
         def probe() -> list[dict]:
             found = []
@@ -613,7 +613,7 @@ async def gopro_cards() -> dict:
 async def script_example() -> dict:
     """A commented starter script the UI can drop into an empty editor."""
     try:
-        from modules.script_plan import example_script
+        from modules.segments.script_plan import example_script
         return {"ok": True, "text": example_script()}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
@@ -631,7 +631,7 @@ async def script_validate(req: ScriptRequest) -> dict:
     a key was misspelled after twenty minutes of detection.
     """
     try:
-        from modules.script_plan import ScriptError, parse_script, validate_script
+        from modules.segments.script_plan import ScriptError, parse_script, validate_script
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
     try:
@@ -655,7 +655,7 @@ async def script_validate(req: ScriptRequest) -> dict:
 async def music_analysis(path: str) -> dict:
     """Beat grid for a music file, for the UI's waveform/beat display."""
     try:
-        from modules.music_analysis import analyze_music
+        from modules.audio.music_analysis import analyze_music
 
         if not path or not os.path.exists(path):
             return {"ok": False, "error": f"not found: {path!r}"}
@@ -682,7 +682,7 @@ async def list_transitions() -> dict:
     """The transition names the engine accepts, so the UI never offers one the
     renderer would refuse."""
     try:
-        from modules.transitions import (CURATED, DEFAULT_DURATION, EASINGS,
+        from modules.media.transitions import (CURATED, DEFAULT_DURATION, EASINGS,
                                           TRANSITIONS)
         return {"ok": True,
                 # Curated first, then the rest: a list of fifty-seven is a menu
@@ -701,7 +701,7 @@ async def list_transitions() -> dict:
 async def get_edl(path: str) -> dict:
     """Read a cut list for the timeline editor."""
     try:
-        from modules.edl import EdlError, load_edl, validate_edl
+        from modules.media.edl import EdlError, load_edl, validate_edl
 
         if not path or not os.path.exists(path):
             return {"ok": True, "exists": False}
@@ -743,7 +743,7 @@ class EdlSaveRequest(BaseModel):
 
 
 def _edl_from_request(req: "EdlSaveRequest"):
-    from modules.edl import Cut, Edl
+    from modules.media.edl import Cut, Edl
 
     return Edl(
         title=req.title or "Untitled",
@@ -773,7 +773,7 @@ async def save_edl_endpoint(req: EdlSaveRequest) -> dict:
     """Write the timeline back to disk. Validated first so a broken edit is
     reported instead of overwriting a good cut list with a bad one."""
     try:
-        from modules.edl import EdlError, parse_edl, save_edl, validate_edl
+        from modules.media.edl import EdlError, parse_edl, save_edl, validate_edl
 
         edl = _edl_from_request(req)
         # Round-trip through the parser: it owns the rules, and writing a file
@@ -837,7 +837,7 @@ async def render_edl_endpoint(req: EdlRenderRequest) -> dict:
 def _motion_options() -> list:
     """The moves that can be put on the ends of a clip, named for a menu."""
     try:
-        from modules.motion import MOTION_LABELS, MOTIONS
+        from modules.media.motion import MOTION_LABELS, MOTIONS
         return [{"key": k, "label": MOTION_LABELS.get(k, k)} for k in MOTIONS]
     except Exception:  # noqa: BLE001
         return []
@@ -851,7 +851,7 @@ def _overlay_options() -> list:
     bands and the transition names are served rather than copied.
     """
     try:
-        from modules.overlay import ELEMENTS
+        from modules.media.overlay import ELEMENTS
         return [{"key": key, "label": getattr(cls, "label", key),
                  "needs_track": key in ("elevation", "route", "readout")}
                 for key, cls in sorted(ELEMENTS.items())]
@@ -865,8 +865,8 @@ async def reel_options() -> dict:
     the UI shows the same names and numbers the renderer uses rather than a
     copy that can drift out of step with it."""
     try:
-        from modules.reel_plan import LENGTHS, PACES, STRUCTURE, minimum_duration
-        from modules.transitions import (
+        from modules.segments.reel_plan import LENGTHS, PACES, STRUCTURE, minimum_duration
+        from modules.media.transitions import (
             BLENDS, CURATED, DEFAULT_FEATHER, EASINGS, FAMILIES, MASKS,
             TRANSITIONS,
         )
@@ -919,18 +919,18 @@ class ReelRequest(BaseModel):
     transition_duration: float | None = 0.25
     easing: str | None = "linear"
     feather: float | None = 0.0
-    # A move on the ends of each clip. See modules.motion.
+    # A move on the ends of each clip. See modules.media.motion.
     motion: str | None = "none"
     # Whether shots may start later than frame zero when the camera is still
-    # being placed at the top of a clip. See modules.shot_window.
+    # being placed at the top of a clip. See modules.segments.shot_window.
     settle: bool | None = True
     # Whether the reel avoids showing the same spot, or the same picture,
-    # twice. See modules.shot_place and modules.shot_look.
+    # twice. See modules.segments.shot_place and modules.segments.shot_look.
     spread: bool | None = True
     # A GPX file, for placing clips whose own metadata carries no GPS — and
     # the series the graphics below are drawn from.
     track: str | None = ""
-    # Graphics drawn over the finished reel. See modules.overlay.
+    # Graphics drawn over the finished reel. See modules.media.overlay.
     overlays: list | None = None
     width: int | None = 1080
     height: int | None = 1920
@@ -955,7 +955,7 @@ def _reel_sources(req: "ReelRequest") -> list[str]:
 
 
 def _build_reel_edl(req: "ReelRequest"):
-    from modules.reel_plan import plan_reel
+    from modules.segments.reel_plan import plan_reel
 
     sources = _reel_sources(req)
     if not sources:
@@ -965,7 +965,7 @@ def _build_reel_edl(req: "ReelRequest"):
     analysis = None
     if req.music and os.path.exists(req.music):
         try:
-            from modules.music_analysis import analyze_music
+            from modules.audio.music_analysis import analyze_music
             analysis = analyze_music(req.music, log_fn=lambda *_: None)
         except Exception:
             analysis = None   # a reel without beat snapping is still a reel
@@ -993,7 +993,7 @@ async def reel_plan_endpoint(req: ReelRequest) -> dict:
     """Plan without rendering, so the UI can show the shot list and the real
     length before anyone waits on an encode."""
     try:
-        from modules.reel_plan import cuts_per_minute, describe_plan
+        from modules.segments.reel_plan import cuts_per_minute, describe_plan
 
         edl = await asyncio.to_thread(_build_reel_edl, req)
         return {
@@ -1041,7 +1041,7 @@ async def reel_render(req: ReelRequest) -> dict:
         req.dest_root or os.path.dirname(edl.cuts[0].source), "reel.mp4")
     edl_path = os.path.splitext(output)[0] + ".edl.yaml"
     try:
-        from modules.edl import save_edl
+        from modules.media.edl import save_edl
         save_edl(edl, edl_path)
     except Exception:
         edl_path = ""
@@ -1116,7 +1116,7 @@ async def start_auto(req: AutoRunRequest) -> dict:
     # the render is the last stage, and finding out about a typo then costs the
     # whole run.
     try:
-        from modules.transitions import normalise_kind
+        from modules.media.transitions import normalise_kind
         normalise_kind(req.transition or "cut")
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
@@ -1167,7 +1167,7 @@ async def auto_job(root: str) -> dict:
     would skip — before anything is started.
     """
     try:
-        from modules.auto_pipeline import job_path, load_job
+        from modules.segments.auto_pipeline import job_path, load_job
 
         path = job_path(root)
         if not os.path.exists(path):
@@ -1258,7 +1258,7 @@ async def about() -> dict:
 
 def _debug_log_path() -> str:
     try:
-        from modules import debug_console
+        from modules.system import debug_console
 
         return debug_console.log_file_path()
     except Exception:
@@ -1382,7 +1382,7 @@ def _load_label_json(path: str) -> list[str]:
 async def get_object_labels(yolo_type: str = "standard") -> dict:
     """Object vocabulary. Mirrors open_object_label_selector: the source depends
     on the detector type (standard COCO vs custom keypoints vs both)."""
-    from modules.app_paths import custom_keypoint_names, data_file
+    from modules.system.app_paths import custom_keypoint_names, data_file
 
     try:
         coco = _load_label_json(data_file("yolo_objects_labels.json"))
@@ -1401,7 +1401,7 @@ async def get_action_labels(backend: str = "auto", models: str = "intel_only") -
     """Action vocabulary. Mirrors open_action_label_selector, including the
     r3d_* backends forcing intel_only and the mixed mode's [custom]/[intel]
     disambiguation suffixes for labels present in both sets."""
-    from modules.app_paths import data_file
+    from modules.system.app_paths import data_file
 
     try:
         if backend in ("r3d_cuda", "r3d_cpu"):
@@ -1542,7 +1542,7 @@ async def clear_faces(req: ClearFacesRequest) -> dict:
 async def get_avoid_ranges(path: str) -> dict:
     """Manual avoid ranges marked for a video in the Timeline Viewer."""
     try:
-        from modules.manual_avoid import load_ranges
+        from modules.segments.manual_avoid import load_ranges
 
         return {"ok": True, "ranges": [[a, b] for a, b in load_ranges(path)]}
     except Exception as exc:  # noqa: BLE001
@@ -1557,7 +1557,7 @@ class AvoidRangesRequest(BaseModel):
 @app.post("/avoid-ranges")
 async def set_avoid_ranges(req: AvoidRangesRequest) -> dict:
     try:
-        from modules.manual_avoid import save_ranges
+        from modules.segments.manual_avoid import save_ranges
 
         save_ranges(req.video_path, [tuple(r) for r in req.ranges])
         return {"ok": True}
@@ -1702,7 +1702,7 @@ async def llm_chat(req: ChatRequest) -> dict:
         analysis = None
         if req.video_path and os.path.exists(req.video_path):
             try:
-                from modules.video_cache import VideoAnalysisCache
+                from modules.media.video_cache import VideoAnalysisCache
 
                 analysis = VideoAnalysisCache().load(req.video_path)
             except Exception:
@@ -1733,7 +1733,7 @@ async def open_editor(req: EditorRequest) -> dict:
 
     The viewer is a separate process, so it can't be driven in-process the way
     main.py does it; ranges marked there reach us through the shared store in
-    modules.manual_avoid.
+    modules.segments.manual_avoid.
     """
     import subprocess
     import sys as _sys

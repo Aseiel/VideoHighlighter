@@ -1,4 +1,4 @@
-"""Tests for `modules.level_by_class` — comparing level between labelled classes.
+"""Tests for `modules.audio.level_by_class` — comparing level between labelled classes.
 
 Synthetic levels and abstract class names throughout: the module is told what
 the labels are and holds no opinion about them, so the tests use ``class_a`` /
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from modules.level_by_class import (
+from modules.audio.level_by_class import (
     annotate,
     classes_at,
     peak_in_range,

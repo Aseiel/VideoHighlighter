@@ -1,4 +1,4 @@
-"""Tests for `modules.loudness_bursts` — turning measurements into events.
+"""Tests for `modules.audio.loudness_bursts` — turning measurements into events.
 
 Pure stdlib and numpy, no ffmpeg and no video file: `group` and `event_seconds`
 take the candidate dicts `reaction_bursts.find_candidates` produces, so the
@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from modules.loudness_bursts import (
+from modules.audio.loudness_bursts import (
     DEFAULT_EDGE_GUARD,
     DEFAULT_MERGE_GAP,
     event_seconds,
     group,
 )
-from modules.reaction_bursts import find_candidates
+from modules.audio.reaction_bursts import find_candidates
 
 
 def _candidate(start, end, z, modulation=0.05, mod_hz=1.0):

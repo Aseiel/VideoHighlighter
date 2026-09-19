@@ -1,0 +1,273 @@
+"""
+compute_forbidden.py — turn "avoid these identities" into the two feeds the
+pipeline needs, with a per-video cache so the expensive tagging pass runs ONCE.
+
+    forbidden_ranges          : [(start_sec, end_sec), ...]        -> skip method
+    forbidden_boxes_by_frame  : {frame_idx: [(x1,y1,x2,y2), ...]}  -> crop method (pixels)
+
+Identity avoid uses YOLOX (Apache-2.0) person tracking + the YuNet/SFace face
+bank. Result cached per video.
+"""
+
+from __future__ import annotations
+import os
+import sys
+import json
+import hashlib
+import cv2
+
+
+def build_tracking_model(model_size="n", log_fn=print, device="GPU"):
+    """Build a permissive YOLOX person tracker for identity / avoid passes."""
+    from modules.vision.tracking_backend import YoloxPersonTracker, resolve_yolox_ir
+
+    model_xml = resolve_yolox_ir(model_size)
+    if not model_xml and not getattr(sys, "frozen", False):
+        try:
+            from modules.vision import yolox_models
+            log_fn("⬇️ First run: fetching the YOLOX person detector (Apache-2.0)…")
+            yolox_models.install(log=log_fn)
+            model_xml = resolve_yolox_ir(model_size)
+        except Exception as exc:
+            log_fn(f"⚠️ Could not fetch the YOLOX detector: {exc}")
+    if not model_xml:
+        log_fn("⚠️ No YOLOX IR for tracking — run tools/get_yolox_model.py")
+        return None
+    try:
+        tracker = YoloxPersonTracker(model_xml=model_xml, model_size=model_size, device=device)
+        log_fn(f"✅ Person tracker ready (YOLOX): {model_xml}")
+        return tracker
+    except Exception as exc:
+        log_fn(f"⚠️ Person tracker failed to load: {exc}")
+        return None
+
+
+def track_device():
+    """Tracking device placeholder retained for API compatibility."""
+    return "cpu"
+
+
+def _merge_seconds(seconds, merge_gap=2.0):
+    """Set of int seconds -> merged (start, end) ranges, bridging gaps <= merge_gap."""
+    if not seconds:
+        return []
+    s = sorted(seconds)
+    ranges = []
+    start = prev = s[0]
+    for cur in s[1:]:
+        if cur - prev <= merge_gap:
+            prev = cur
+        else:
+            ranges.append((float(start), float(prev + 1)))
+            start = prev = cur
+    ranges.append((float(start), float(prev + 1)))
+    return ranges
+
+
+# ── cache ─────────────────────────────────────────────────────────────────────
+def _cache_key(video_path, avoid_ids, model_size, face_every, vid_stride):
+    try:
+        st = os.stat(video_path)
+        stat_sig = f"{st.st_size}|{int(st.st_mtime)}"
+    except OSError:
+        stat_sig = "nostat"
+    sig = "|".join([
+        os.path.abspath(video_path), stat_sig,
+        ",".join(sorted(avoid_ids)), str(model_size), str(face_every), str(vid_stride),
+    ])
+    return hashlib.md5(sig.encode("utf-8")).hexdigest()
+
+
+def _entries_key(video_path, model_size, face_every, vid_stride):
+    """Cache key for the raw per-frame tagging entries — independent of avoid_ids,
+    so the expensive tracking+recognition pass is shared between the dry-run scan
+    and the pipeline's avoid step."""
+    try:
+        st = os.stat(video_path)
+        stat_sig = f"{st.st_size}|{int(st.st_mtime)}"
+    except OSError:
+        stat_sig = "nostat"
+    sig = "|".join([
+        os.path.abspath(video_path), stat_sig,
+        str(model_size), str(face_every), str(vid_stride),
+    ])
+    return hashlib.md5(sig.encode("utf-8")).hexdigest()
+
+
+def _entries_path(cache_dir, video_path, model_size, face_every, vid_stride):
+    return os.path.join(cache_dir, "avoid",
+                        _entries_key(video_path, model_size, face_every, vid_stride) + ".entries.json")
+
+
+def _entries_load(path, log_fn):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+        log_fn(f"🚫 Avoid: reusing cached face-tagging entries ({len(entries)} frame(s)) — "
+               f"no re-scan needed")
+        return entries
+    except Exception:
+        return None
+
+
+def _entries_save(path, entries, log_fn):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(entries, f)
+    except Exception as e:
+        log_fn(f"⚠️ Avoid: could not write entries cache: {e}")
+
+
+def _cache_load(path, log_fn):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ranges = [tuple(r) for r in data.get("forbidden_ranges", [])]
+        boxes = {int(k): [tuple(b) for b in v]
+                 for k, v in data.get("forbidden_boxes_by_frame", {}).items()}
+        log_fn(f"🚫 Avoid: loaded cached tagging ({len(boxes)} frame(s), {len(ranges)} range(s))")
+        return ranges, boxes
+    except Exception:
+        return None
+
+
+def _cache_save(path, ranges, boxes, log_fn):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data = {
+            "forbidden_ranges": [list(r) for r in ranges],
+            "forbidden_boxes_by_frame": {str(k): [list(b) for b in v] for k, v in boxes.items()},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception as e:
+        log_fn(f"⚠️ Avoid: could not write cache: {e}")
+
+
+def tag_entries(video_path, bank, yolo_model=None, model_size="n",
+                face_every=15, vid_stride=3, use_cache=True, cache_dir="./cache",
+                save_bank=False, log_fn=print, cancel_flag=None):
+    """Run (or reuse a cached) full tracking + face-recognition pass over the video
+    and return the per-frame tagging entries. The result is cached per video+params
+    (NOT per avoid selection), so the dry-run scan and the pipeline's avoid step share
+    one pass. Call this from the scan to pre-populate the cache."""
+    entries_path = _entries_path(cache_dir, video_path, model_size, face_every, vid_stride)
+    if use_cache and os.path.exists(entries_path):
+        cached = _entries_load(entries_path, log_fn)
+        if cached is not None:
+            if save_bank:
+                bank.save()
+            return cached
+
+    from video_ai_editor.identity_tagging import tag_video_with_identities
+
+    if yolo_model is None:
+        yolo_model = build_tracking_model(model_size, log_fn=log_fn)
+    if yolo_model is None:
+        if save_bank:
+            bank.save()
+        return []
+
+    def _progress(i, msg):
+        if cancel_flag is not None and getattr(cancel_flag, "is_set", lambda: False)():
+            raise RuntimeError("cancelled during identity tagging")
+        if i % 150 == 0:
+            log_fn(f"🚫 Avoid: {msg}")
+
+    dev = track_device()
+    log_fn(f"🚫 Avoid: tracking on device={dev}")
+    entries = tag_video_with_identities(
+        video_path, bank,
+        model=yolo_model,
+        device=dev,
+        face_every=face_every,
+        vid_stride=vid_stride,
+        save_bank=save_bank,
+        progress_cb=_progress,
+    )
+
+    if use_cache:
+        _entries_save(entries_path, entries, log_fn)
+    return entries
+
+
+def compute_forbidden(video_path, bank, avoid_ids, fps,
+                      yolo_model=None, model_size="n",
+                      face_every=15, vid_stride=3, merge_gap=2.0,
+                      use_cache=True, cache_dir="./cache",
+                      log_fn=print, cancel_flag=None):
+    """Returns (forbidden_ranges, forbidden_boxes_by_frame). Cached per video."""
+    avoid = set(avoid_ids or [])
+    if not avoid:
+        return [], {}
+
+    cache_path = os.path.join(cache_dir, "avoid",
+                              _cache_key(video_path, avoid, model_size, face_every, vid_stride) + ".json")
+    if use_cache and os.path.exists(cache_path):
+        hit = _cache_load(cache_path, log_fn)
+        if hit is not None:
+            return hit
+
+    cap = cv2.VideoCapture(video_path)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    cap.release()
+    if W == 0 or H == 0:
+        log_fn("⚠️ compute_forbidden: could not read frame size — skipping exclusion")
+        return [], {}
+
+    # Shared, avoid-independent pass: reuses the dry-run scan's cached entries if present.
+    entries = tag_entries(
+        video_path, bank,
+        yolo_model=yolo_model, model_size=model_size,
+        face_every=face_every, vid_stride=vid_stride,
+        use_cache=use_cache, cache_dir=cache_dir,
+        save_bank=False, log_fn=log_fn, cancel_flag=cancel_flag,
+    )
+
+    forbidden_seconds = set()
+    forbidden_boxes_by_frame = {}
+
+    for e in entries:
+        ts = e["timestamp"]
+        frame_idx = int(round(ts * fps))
+        boxes_here = []
+        for bbox, iid in zip(e["bboxes"], e["identity_ids"]):
+            if iid in avoid:
+                x, y, bw, bh = bbox                       # normalised x,y,w,h
+                x1, y1 = int(x * W), int(y * H)
+                x2, y2 = int((x + bw) * W), int((y + bh) * H)
+                if x2 > x1 and y2 > y1:
+                    boxes_here.append((x1, y1, x2, y2))
+        if boxes_here:
+            forbidden_seconds.add(int(ts))
+            forbidden_boxes_by_frame.setdefault(frame_idx, []).extend(boxes_here)
+
+    forbidden_ranges = _merge_seconds(forbidden_seconds, merge_gap=merge_gap)
+    log_fn(f"🚫 Avoid: avoided identity present in {len(forbidden_boxes_by_frame)} frame(s), "
+           f"{len(forbidden_ranges)} merged range(s)")
+
+    if use_cache:
+        _cache_save(cache_path, forbidden_ranges, forbidden_boxes_by_frame, log_fn)
+
+    return forbidden_ranges, forbidden_boxes_by_frame
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 4:
+        print("Usage: python compute_forbidden.py <video> <face_db.json> <avoid_id> [avoid_id...]")
+        sys.exit(1)
+    from video_ai_editor.face_identity import FaceIdentityBank
+    video, db = sys.argv[1], sys.argv[2]
+    avoid_ids = sys.argv[3:]
+    bank = FaceIdentityBank(db_path=db)
+    cap = cv2.VideoCapture(video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+    ranges, boxes = compute_forbidden(video, bank, avoid_ids, fps)
+    print(f"\nforbidden_ranges ({len(ranges)}):")
+    for a, b in ranges[:20]:
+        print(f"  {a:.1f}s – {b:.1f}s")
+    print(f"forbidden_boxes_by_frame: {len(boxes)} frame(s)")

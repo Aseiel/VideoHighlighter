@@ -20,7 +20,7 @@ def get_yolox_people_model(model_xml: str | None = None, device: str = "GPU"):
     """Lazy-load YOLOX person detector for training pipelines (singleton)."""
     global _yolox_people_model
     if _yolox_people_model is None:
-        from modules.detection_backend import YoloxPeopleDetector
+        from modules.vision.detection_backend import YoloxPeopleDetector
         _yolox_people_model = YoloxPeopleDetector(model_xml=model_xml, device=device)
         print(f"🧍 YOLOX people model loaded: {_yolox_people_model.model_xml}")
     return _yolox_people_model

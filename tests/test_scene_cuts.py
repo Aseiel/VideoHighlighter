@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from modules.scene_cuts import (
+from modules.segments.scene_cuts import (
     DEFAULT_Z,
     MIN_PLAUSIBLE_CUTS_PER_MINUTE,
     MIN_SAMPLES,

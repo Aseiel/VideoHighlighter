@@ -21,8 +21,8 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from modules.app_paths import resource_path
-from modules.simple_run import SIMPLE_LENGTHS, idle_status_text, is_video_path
+from modules.system.app_paths import resource_path
+from modules.segments.simple_run import SIMPLE_LENGTHS, idle_status_text, is_video_path
 from modules.ui.collapsible import CollapsibleSection
 from modules.ui.theme import DARK
 from version import __build_date__, __edition__, __version__

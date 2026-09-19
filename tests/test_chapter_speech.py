@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pytest
 
-from modules.chapter_speech import (
+from modules.segments.chapter_speech import (
     MIN_KEYNESS,
     MIN_QUOTE_GAP,
     MIN_WORD_COUNT,
@@ -316,7 +316,7 @@ class TestInTheReport:
     def _report(self, transcript=None):
         import numpy as np
 
-        from modules.highlight_report import build_report
+        from modules.report.highlight_report import build_report
 
         score = np.zeros(600)
         score[100] = 10.0
@@ -357,7 +357,7 @@ class TestInTheReport:
         assert without == with_it
 
     def test_quotes_reach_the_html_and_the_text(self):
-        from modules.highlight_report import render_html, render_text
+        from modules.report.highlight_report import render_html, render_text
 
         rep = self._report(self._transcript())
         quote = rep["chapters"][0]["quotes"][0]["text"]
@@ -365,14 +365,14 @@ class TestInTheReport:
         assert quote in render_text(rep)
 
     def test_quotes_reach_the_advisor_prompt(self):
-        from modules.advisor import build_prompt
+        from modules.report.advisor import build_prompt
 
         rep = self._report(self._transcript())
         prompt = build_prompt(rep, [])
         assert rep["chapters"][0]["quotes"][0]["text"] in prompt
 
     def test_a_report_without_speech_says_so_on_the_page(self):
-        from modules.highlight_report import render_html
+        from modules.report.highlight_report import render_html
 
         page = render_html(self._report())
         assert "run the transcript" in page

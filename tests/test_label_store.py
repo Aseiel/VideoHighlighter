@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from modules.label_store import (
+from modules.vision.label_store import (
     ACCEPTED,
     NEGATIVE,
     PENDING,

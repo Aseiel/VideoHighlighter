@@ -182,7 +182,7 @@ class _LiveDetector:
     """
 
     def __init__(self, model, device, class_names, image_size, score_thr=0.3):
-        from modules.detection_backend import YoloxOpenVINODetector, NMS_THR
+        from modules.vision.detection_backend import YoloxOpenVINODetector, NMS_THR
         self._model = model
         self._device = device
         self._impl = YoloxOpenVINODetector.__new__(YoloxOpenVINODetector)
@@ -228,11 +228,11 @@ def eta_seconds(done: int, total: int, elapsed: float) -> float:
 
 def directml_device(requested=None):
     """The DirectML device string, or None. Same reasoning as the probes above:
-    ``modules.directml_device`` imports only ``os`` and ``typing``, so using it
+    ``modules.system.directml_device`` imports only ``os`` and ``typing``, so using it
     costs nothing this module was protecting, and the DirectML footguns are
     written down once instead of once per caller."""
     try:
-        from modules import directml_device as dml
+        from modules.system import directml_device as dml
     except Exception:  # noqa: BLE001 — absent module means "no DirectML"
         return None
     try:
@@ -244,7 +244,7 @@ def directml_device(requested=None):
 
 def is_directml(device) -> bool:
     try:
-        from modules import directml_device as dml
+        from modules.system import directml_device as dml
         return dml.is_directml(device)
     except Exception:  # noqa: BLE001
         return False
@@ -266,7 +266,7 @@ def resolve_device(requested: str = "AUTO") -> str:
     ``.to(device)`` and uses no autocast, which is exactly what DirectML needs
     too, so an AMD card gets training for free from work already done for Arc.
 
-    A local probe rather than ``modules.device_utils``, matching the reasoning
+    A local probe rather than ``modules.system.device_utils``, matching the reasoning
     in ``llm/owl_detect.py``: this module is imported lazily, sometimes inside
     a frozen exe, and stays self-contained so a device query cannot drag in
     unrelated machinery.

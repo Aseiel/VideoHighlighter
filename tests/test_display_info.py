@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import types
 
-from modules import display_info
+from modules.system import display_info
 
 
 def _screen(name, w, h, ratio=1.0, dpi=96.0):

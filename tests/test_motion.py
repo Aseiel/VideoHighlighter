@@ -1,5 +1,5 @@
 """
-Tests for modules.motion — making the cut move rather than dissolve.
+Tests for modules.media.motion — making the cut move rather than dissolve.
 
 The claims worth pinning are the ones a render would not reveal. A filter chain
 that is syntactically fine and moves nothing produces a reel indistinguishable
@@ -15,8 +15,8 @@ import subprocess
 
 import pytest
 
-from modules.app_paths import ffmpeg_exe
-from modules.motion import (
+from modules.system.app_paths import ffmpeg_exe
+from modules.media.motion import (
     MOTION_LABELS,
     MOTIONS,
     apply_motion,
@@ -156,7 +156,7 @@ def test_no_motion_changes_the_frame_rate(marked, tmp_path, name):
     silently resamples every clip it touches, which puts a reel cut to music
     progressively out of time with it."""
     out = _moved(marked, name, tmp_path)
-    from modules.video_probe import ffprobe_exe
+    from modules.media.video_probe import ffprobe_exe
 
     probe = subprocess.run(
         [ffprobe_exe(), "-v", "error",

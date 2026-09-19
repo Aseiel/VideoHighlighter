@@ -125,7 +125,7 @@ class _EventSpec:
 
     # Seconds to ignore at the start and at the end. Opening material is
     # titles, music beds and encoding artifacts, none of it content and all of
-    # it shaped like signal; `modules/loudness_bursts.py` guards 120s for that
+    # it shaped like signal; `modules/audio/loudness_bursts.py` guards 120s for that
     # reason and measured 18 of 48 raw candidates falling inside it.
     #
     # They are separate because the two ends are not alike, which cost a real

@@ -33,16 +33,16 @@ detector is where the ones who care go next.
 
 ## What is built
 
-- **Detection is YOLOX in both editions** (`modules/detection_backend.py`,
-  `modules/yolox_models.py`). No AGPL detector anywhere the app runs, so no
+- **Detection is YOLOX in both editions** (`modules/vision/detection_backend.py`,
+  `modules/vision/yolox_models.py`). No AGPL detector anywhere the app runs, so no
   model trained here inherits a licence that stops it being shared.
 - **Training in the app** — the Train tab (`modules/ui/training_panel.py`) over
-  `modules/label_store.py` → `training/train_yolox_run.py` →
+  `modules/vision/label_store.py` → `training/train_yolox_run.py` →
   `training/export_yolox.py`. Progress, cancel, any device.
 - **Time and progress** — an estimate before the run, measured on this
   computer after the first one (`training/train_estimate.py`); stages, time left,
   and after each round what the model finds on held-out frames, with a
-  "Watch it learn" window (`modules/training_preview.py`).
+  "Watch it learn" window (`modules/vision/training_preview.py`).
 - **The hub** — `model_hub/` (tests: `tests/test_model_hub.py`):
   - *Package*: a folder of `model.onnx`, `videohighlighter.json` (manifest with
     task, labels, input format, category, measured metrics, checklist, sha256),

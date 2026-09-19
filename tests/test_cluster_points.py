@@ -16,7 +16,7 @@ import math
 
 import pytest
 
-from modules.auto_segments import cluster_points
+from modules.segments.auto_segments import cluster_points
 
 
 class TestEmptyAndSingleton:

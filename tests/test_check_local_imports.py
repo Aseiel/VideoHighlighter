@@ -97,14 +97,14 @@ def test_try_except_guarded_import_extracted_identically_to_unguarded():
     # Mirrors action_recognition.py:28 -- a real, confirmed pattern.
     source = (
         "try:\n"
-        "    from modules.device_utils import detect_best_device\n"
+        "    from modules.system.device_utils import detect_best_device\n"
         "    TORCH_AVAILABLE = True\n"
         "except ImportError:\n"
         "    TORCH_AVAILABLE = False\n"
     )
     imports = _imports_from_source(source, importing_file="action_recognition.py")
     assert len(imports) == 1
-    assert imports[0].package_path == "modules/device_utils"
+    assert imports[0].package_path == "modules/system/device_utils"
     assert imports[0].symbols == ("detect_best_device",)
 
 
@@ -223,7 +223,7 @@ def test_resolve_and_verify_no_violation_for_plain_module_import(tmp_path):
 def test_untracked_or_missing_violation_when_file_absent_from_disk(tmp_path):
     repo = tmp_path
     tracked: set[str] = set()
-    imp = _local_import("modules/video_regions")
+    imp = _local_import("modules/media/video_regions")
     violations = resolve_and_verify([imp], tracked, repo)
     assert len(violations) == 1
     assert violations[0].kind == "untracked-or-missing-file"
@@ -232,9 +232,9 @@ def test_untracked_or_missing_violation_when_file_absent_from_disk(tmp_path):
 def test_untracked_or_missing_violation_when_present_on_disk_but_not_tracked(tmp_path):
     # The actual 0150a27 mechanism: file exists locally but was never
     # `git add`ed, so it's absent from the tracked-file set.
-    repo = _make_repo(tmp_path, {"modules/video_regions.py": "def f():\n    pass\n"})
+    repo = _make_repo(tmp_path, {"modules/media/video_regions.py": "def f():\n    pass\n"})
     tracked: set[str] = set()  # deliberately does NOT include the file present on disk
-    imp = _local_import("modules/video_regions")
+    imp = _local_import("modules/media/video_regions")
     violations = resolve_and_verify([imp], tracked, repo)
     assert len(violations) == 1
     assert violations[0].kind == "untracked-or-missing-file"

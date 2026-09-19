@@ -24,9 +24,9 @@ import json
 import pytest
 import yaml
 
-from modules import rule_proposal
-from modules.rule_proposal import Proposal, apply, parse, propose
-from modules.vocabulary_gap import (
+from modules.rules import rule_proposal
+from modules.rules.rule_proposal import Proposal, apply, parse, propose
+from modules.report.vocabulary_gap import (
     MIN_COUNT_FOR_GAP,
     MIN_KEYNESS_FOR_GAP,
     covered_words,
@@ -304,7 +304,7 @@ class TestFindings:
         return report
 
     def test_a_gap_produces_a_finding_that_names_the_words(self):
-        from modules.highlight_advice import diagnose
+        from modules.report.highlight_advice import diagnose
 
         gaps = [{"word": "lathe", "count": 5, "times": 12.0,
                  "chapters": [{"number": 2, "timestamp": "0:05:00",
@@ -315,7 +315,7 @@ class TestFindings:
         assert "lathe" in gap.detail and gap.topic == "composition"
 
     def test_each_check_state_produces_its_own_finding(self):
-        from modules.highlight_advice import diagnose
+        from modules.report.highlight_advice import diagnose
 
         for state, ident in (("fired", "check_fired:r"),
                              ("never_fired", "check_silent:r"),
@@ -326,7 +326,7 @@ class TestFindings:
             assert any(f.id == ident for f in found), state
 
     def test_an_unloaded_rule_is_the_most_serious_of_the_three(self):
-        from modules.highlight_advice import diagnose
+        from modules.report.highlight_advice import diagnose
 
         found = diagnose(self._report(checks=[
             {"rule": "r", "state": "not_in_rules", "claim": "c"}]))
@@ -334,6 +334,6 @@ class TestFindings:
             == "high"
 
     def test_the_topic_every_one_of_these_points_at_exists(self):
-        from modules.advisor import knowledge_topics
+        from modules.report.advisor import knowledge_topics
 
         assert "composition" in knowledge_topics()

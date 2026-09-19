@@ -1,5 +1,5 @@
 """
-End-to-end tests for modules.combine_videos against real ffmpeg.
+End-to-end tests for modules.media.combine_videos against real ffmpeg.
 
 Three tiny generated clips cover the traps the combiner exists to handle:
 a large landscape clip with audio, a sideways clip (rotation metadata, the
@@ -12,7 +12,7 @@ Rotation metadata cannot be written by every ffmpeg build; when neither
 -display_rotation nor the rotate tag sticks, the rotation-specific
 assertions skip instead of lying.
 
-probe checks go through modules.video_probe when present (the contract
+probe checks go through modules.media.video_probe when present (the contract
 probe), with a local ffprobe fallback so these tests do not depend on that
 module landing first.
 """
@@ -28,8 +28,8 @@ import types
 
 import pytest
 
-from modules.app_paths import ffmpeg_exe
-from modules.combine_videos import CombineCancelled, _ffprobe_exe, combine_videos
+from modules.system.app_paths import ffmpeg_exe
+from modules.media.combine_videos import CombineCancelled, _ffprobe_exe, combine_videos
 
 FFMPEG = ffmpeg_exe()
 FFPROBE = _ffprobe_exe()
@@ -90,7 +90,7 @@ def _local_probe(path: str) -> dict:
 
 def _probe(path: str) -> dict:
     try:
-        from modules.video_probe import probe_video
+        from modules.media.video_probe import probe_video
         return probe_video(path)
     except ImportError:
         return _local_probe(path)
@@ -100,7 +100,7 @@ def _expected_canvas() -> tuple[int, int]:
     """Canvas = dims of the largest input when video_probe can measure them,
     else the module's documented 1920x1080 fallback."""
     try:
-        import modules.video_probe  # noqa: F401
+        import modules.media.video_probe  # noqa: F401
         return 1280, 720
     except ImportError:
         return 1920, 1080
@@ -288,11 +288,11 @@ def test_music_failure_after_concat_leaves_no_output(fixtures, tmp_path, monkeyp
     def apply_music(*_a, **_k):
         raise RuntimeError("boom")
 
-    fake = types.ModuleType("modules.music_track")
+    fake = types.ModuleType("modules.media.music_track")
     fake.apply_music = apply_music
     fake._MODES = ("replace", "mix", "duck")
-    monkeypatch.setitem(sys.modules, "modules.music_track", fake)
-    monkeypatch.setattr(sys.modules["modules"], "music_track", fake, raising=False)
+    monkeypatch.setitem(sys.modules, "modules.media.music_track", fake)
+    monkeypatch.setattr(sys.modules["modules.media"], "music_track", fake, raising=False)
 
     out = str(tmp_path / "music_fail.mp4")
     c = fixtures["files"][2]
@@ -320,15 +320,14 @@ def test_music_is_applied_via_music_track(fixtures, tmp_path, monkeypatch):
         shutil.copyfile(video, out)
         return out
 
-    fake = types.ModuleType("modules.music_track")
+    fake = types.ModuleType("modules.media.music_track")
     fake.apply_music = apply_music
-    monkeypatch.setitem(sys.modules, "modules.music_track", fake)
-    # `from modules import music_track` prefers the package attribute over
-    # sys.modules once the real module has been imported elsewhere in the run.
-    # `modules` is a namespace package already loaded via the import above; grab
-    # it from sys.modules rather than a bare `import modules` (which the
-    # local-import completeness check flags, there being no modules/__init__.py).
-    modules_pkg = sys.modules["modules"]
+    monkeypatch.setitem(sys.modules, "modules.media.music_track", fake)
+    # `from modules.media import music_track` prefers the package attribute over
+    # sys.modules once the real module has been imported elsewhere in the run,
+    # so the attribute on the package has to be replaced too. Grab the package
+    # from sys.modules — it is already loaded via the import above.
+    modules_pkg = sys.modules["modules.media"]
     monkeypatch.setattr(modules_pkg, "music_track", fake, raising=False)
 
     out = str(tmp_path / "with_music.mp4")

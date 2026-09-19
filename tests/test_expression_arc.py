@@ -1,4 +1,4 @@
-"""Tests for `modules.expression_arc` — the shape of the expression reading.
+"""Tests for `modules.vision.expression_arc` — the shape of the expression reading.
 
 Two properties are worth protecting, and only one of them is about arithmetic.
 
@@ -15,7 +15,7 @@ ones where the module is handed convincing-looking rubbish and has to say so.
 
 from __future__ import annotations
 
-from modules.expression_arc import (
+from modules.vision.expression_arc import (
     DOMINANT_SHARE,
     GOOD_FIT,
     analyse,

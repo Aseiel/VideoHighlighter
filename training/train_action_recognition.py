@@ -4,7 +4,7 @@ import cv2
 import json
 import random
 import numpy as np
-from modules.detection_backend import YoloxPeopleDetector
+from modules.vision.detection_backend import YoloxPeopleDetector
 import torch
 import torch.nn as nn
 import torch.optim as optim

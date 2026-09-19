@@ -20,8 +20,8 @@ import types
 
 import pytest
 
-from modules import transcript as tr
-from modules import analysis_ondemand as aod
+from modules.audio import transcript as tr
+from modules.report import analysis_ondemand as aod
 
 
 SEGMENT = {"start": 0.0, "end": 2.0, "text": "a real sentence here"}

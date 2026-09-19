@@ -1,7 +1,7 @@
 """The panel that turns labelled examples into a model, without a command line.
 
 Everything this drives already exists and is tested without Qt:
-``modules.label_store`` assembles a COCO dataset, ``training.train_yolox_run``
+``modules.vision.label_store`` assembles a COCO dataset, ``training.train_yolox_run``
 fine-tunes on whatever device is present, and ``training.export_yolox`` converts
 the result into the IR the app's detector loads. Until now the only way to reach
 any of it was a Python prompt, which meant in practice it was run by whoever
@@ -15,7 +15,7 @@ from a callback the training loop already emitted.
 take, on which hardware, and whether that number was measured on this computer
 (``training.train_estimate``). During it: which stage it is in, time elapsed and
 left, and after every round a sentence about what the model now finds on frames
-it was not trained on (``modules.training_preview``) — with a "Watch it learn"
+it was not trained on (``modules.vision.training_preview``) — with a "Watch it learn"
 window for anyone who wants to see it. Loss values go to the debug log — they
 are the right diagnostic and the wrong progress indicator, because nobody
 outside this file can say whether 2.48 is good.
@@ -51,7 +51,7 @@ class ObjectTrainingWorker(QObject):
 
     progress = Signal(int, str)        # percent, human-readable status
     stage = Signal(int)                # index into STAGES
-    round_done = Signal(object)        # modules.training_preview.RoundSnapshot
+    round_done = Signal(object)        # modules.vision.training_preview.RoundSnapshot
     finished = Signal(object)          # ExportResult
     error = Signal(str)
 
@@ -82,7 +82,7 @@ class ObjectTrainingWorker(QObject):
     def run(self) -> None:
         stage = "starting"
         try:
-            from modules.label_store import LabelStore, build_dataset
+            from modules.vision.label_store import LabelStore, build_dataset
             from training.train_yolox_run import Cancelled, train
             from training.export_yolox import install
 
@@ -124,7 +124,7 @@ class ObjectTrainingWorker(QObject):
                 " The first run downloads its starting weights (20-70 MB)."
                 if first_time else ""))
 
-            from modules.training_preview import pick_frames, snapshot
+            from modules.vision.training_preview import pick_frames, snapshot
             preview_frames = pick_frames(dataset_dir)
             history: list = []
             learning_started = [False]
@@ -433,7 +433,7 @@ class ObjectTrainingSection(QWidget):
 
     def _load_store(self, path: str) -> None:
         try:
-            from modules.label_store import LabelStore
+            from modules.vision.label_store import LabelStore
             store = LabelStore(path).load()
         except Exception as exc:
             self._say(f"Could not read that file: {exc}", THEME.danger)
@@ -476,7 +476,7 @@ class ObjectTrainingSection(QWidget):
         if not path:
             return
         try:
-            from modules.label_store import LabelStore, from_labeler_export
+            from modules.vision.label_store import LabelStore, from_labeler_export
             imported = from_labeler_export(path)
         except Exception as exc:
             self._say(f"Could not import that export: {exc}", THEME.danger)
@@ -1003,7 +1003,7 @@ class ActionTrainingSection(QWidget):
     def _choose_pipeline(self) -> None:
         """Decide which trainer to use, and say so before anything is started.
 
-        **Hardware detection goes through `modules.device_utils`, not a torch
+        **Hardware detection goes through `modules.system.device_utils`, not a torch
         probe.** That module is the app's single source of truth and it knows
         something a torch probe cannot: the released build ships a *CUDA* torch
         wheel, on which `torch.xpu` exists but reports `is_available()` False —
@@ -1021,7 +1021,7 @@ class ActionTrainingSection(QWidget):
         """
         backend, gpu_present = "CPU", False
         try:
-            from modules.device_utils import detect_best_device
+            from modules.system.device_utils import detect_best_device
             info = detect_best_device(log_fn=lambda *a, **k: None)
             backend = str(getattr(info, "backend_name", "CPU"))
             gpu_present = bool(getattr(info, "gpu_available", False))
@@ -1260,7 +1260,7 @@ class TrainingPanel(QWidget):
         label = QLabel()
         label.setWordWrap(True)
         try:
-            from modules.device_utils import describe_devices
+            from modules.system.device_utils import describe_devices
             devices = describe_devices()
         except Exception as exc:                # pragma: no cover - defensive
             devices = []
