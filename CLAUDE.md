@@ -58,7 +58,7 @@ the graph — while people whose commits are long gone stay listed. The only
 forced repair is a GitHub Support ticket.
 
 - Never `filter-repo`, `rebase`, `commit --amend`, or `reset --hard` anything
-  already pushed to `main`.
+  already pushed to `main` — save for the one narrow exception below.
 - A contributor's authorship is theirs. Don't "fix" it by re-authoring their
   commits or by adding `Co-Authored-By` to a merge commit — the author field
   already credits them, and a trailer is strictly weaker.
@@ -66,6 +66,31 @@ forced repair is a GitHub Support ticket.
   stale cache rather than the repo. Check the commit's `author.login` via the
   API first. The answer is to wait for the recompute or to open a support
   ticket — never to push again harder.
+
+### The one exception: our own tip commit, minutes old
+
+A message is part of a commit's hash, so fixing a message means re-hashing. When
+the commit is the *tip* of `main` and every condition below holds, that re-hash
+touches nothing the section above is protecting: no commit is built on it, and
+no contributor's hash moves.
+
+- It is `origin/main`'s tip — no descendants, on no other branch. Check with
+  `git log --oneline <sha>..origin/main` (empty) and `git branch -a --contains
+  <sha>` (only `main`).
+- Every commit being rewritten is authored by a maintainer. One outside
+  contributor anywhere in the range and the exception is void, whatever a
+  trailer claims — read the `author` field, not the message.
+- It was pushed minutes ago and nobody has pulled or branched from it.
+- Only the message changes. `git diff <old> <new>` must come back empty.
+
+Then `git commit --amend` and `git push --force-with-lease origin main`. Never a
+bare `--force`: the lease is the part that proves nobody pushed in between.
+Re-check the conditions immediately before pushing rather than when you started,
+because `origin/main` moves under you.
+
+Miss one condition and the rule above stands: leave it. Even when it works this
+costs something small and permanent — a PR merged as the old hash keeps pointing
+at a commit that is no longer on `main`, and that never heals.
 
 ## Conventions
 
@@ -77,5 +102,9 @@ forced repair is a GitHub Support ticket.
 - Dependencies should be permissive (MIT/BSD/Apache) — prefer what is already
   in the stack over adding something new. Check the licence of a model's
   *runtime and training toolkit*, not just its weights.
-- Commit messages in this repo carry no `Co-Authored-By` trailer.
+- Commit messages in this repo carry no `Co-Authored-By` trailer. Amending it
+  off a pushed branch does not help: GitHub's squash-merge box prefills
+  co-authors from *every* commit a PR has ever had, force-pushed-away ones
+  included, so it reappears in the merge commit. Clear it in the merge box,
+  or keep it out of the first commit.
 - Don't commit or push unless asked.
