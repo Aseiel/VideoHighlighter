@@ -826,6 +826,71 @@ class AsyncBatchedInferenceEngine:
         self.requests.clear()
 
 
+
+class _FramePrefetcher:
+    """Decode frames on a background thread into a bounded queue so the main
+    loop never blocks on ``cap.read()``.
+
+    Decoding a file runs at several thousand fps on its own, but inline in the
+    loop that cost is serial with everything else. Off the critical path it
+    overlaps with the async encoder, which is waiting on the GPU anyway, so
+    processing rises toward the inference ceiling. Frame order is preserved;
+    ``read()`` returns ``None`` once the video is exhausted.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, cap, queue_size: int = 8):
+        self.cap = cap
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.is_set():
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            # Block when the consumer is behind, but wake periodically so a
+            # stop() while the queue is full can't wedge this thread.
+            while not self._stop.is_set():
+                try:
+                    self._queue.put(frame, timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
+        try:
+            self._queue.put(self._SENTINEL, timeout=0.5)
+        except queue.Full:
+            pass
+
+    def read(self):
+        """Next frame in order, or ``None`` at end of stream."""
+        while True:
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                if self._thread.is_alive():
+                    continue
+                return None
+            return None if item is self._SENTINEL else item
+
+    def stop(self):
+        self._stop.set()
+        # Drain so a producer blocked on put() can finish and exit.
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+
 # =============================
 # PARALLEL PERSON DETECTOR - YOLOX (Apache-2.0) BACKED
 # =============================
@@ -1547,6 +1612,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
     raw_frame_buffer = deque(maxlen=R3D_CLIP_LENGTH) if has_any_r3d else None
 
     try:
+        frame_reader = None  # background decode thread (started before main loop)
         if draw_bboxes and annotated_output:
             if frame_height > 1080 and downscale_factor < 1.0:
                 frame_width = int(frame_width * downscale_factor)
@@ -1682,6 +1748,11 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
         # =============================================
         pending_preprocess_future = None
 
+        # Decode ahead on a background thread so the loop never blocks on
+        # cap.read(). The warm-up above already finished its own reads, so
+        # the prefetcher owns the capture from here on.
+        frame_reader = _FramePrefetcher(cap).start()
+
         with open(log_file, mode="w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["timestamp_mmss", "frame_id", "action_id", "action_name",
@@ -1699,8 +1770,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     print("⚠️ Action detection canceled by user.")
                     break
 
-                ret, frame = cap.read()
-                if not ret:
+                frame = frame_reader.read()
+                if frame is None:
                     break
 
                 frame_id += 1
@@ -2140,6 +2211,8 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     finally:
         print("\n🧹 Cleaning up resources...")
+        if frame_reader is not None:
+            frame_reader.stop()
         cap.release()
         if video_writer:
             video_writer.release()
