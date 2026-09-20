@@ -809,7 +809,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         check_cancellation(cancel_flag, log, "transcript phase")
 
-        start_time = time.time()
+        # Not `start_time`: two loops below unpack action sequences into names
+        # of their own, and `start_time, end_time, ... = sequence` overwrote
+        # this one in the same function scope. The run then timed itself from
+        # the last selected sequence's offset (a few seconds into the video)
+        # instead of from now, and reported the whole Unix epoch as its
+        # duration -- "Processing time: 29831566m 49s".
+        run_started_at = time.time()
 
         # --- 1+2 Detect scenes + motion + peaks with live progress ---
         # The gate has to read exactly what the *scoring* will read, or the two
@@ -2727,8 +2733,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         progress.update_progress(100, 100, "Pipeline", "Complete!")
 
         # End timer
-        end_time = time.time()
-        elapsed = end_time - start_time
+        elapsed = time.time() - run_started_at
         minutes = int(elapsed // 60)
         seconds = int(elapsed % 60)
         log(f"⏱️ Processing time: {minutes}m {seconds}s")
