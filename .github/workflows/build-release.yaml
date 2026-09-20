@@ -353,7 +353,16 @@ jobs:
           pip install -r requirements.txt
           # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
           # its declared requirements would let pip replace the torch above.
-          pip install yolox==0.3.0 --no-deps
+          # --no-build-isolation: yolox ships an sdist only, and off Windows its
+          # setup.py asserts torch is importable, then pre-compiles
+          # FastCOCOEvalOp. An isolated build env never has torch no matter what
+          # is installed here, so this is the one job where the build has to see
+          # this environment. Windows skips that branch entirely
+          # (`if sys.platform != "win32"`), which is why only mac needs it.
+          # setuptools/wheel go in first because pip cannot provision build
+          # dependencies once isolation is off.
+          pip install setuptools wheel
+          pip install yolox==0.3.0 --no-deps --no-build-isolation
           pip install pyinstaller
       - name: Fetch YOLOX detector models (Apache-2.0)
         # models/yolox/ is gitignored (downloaded, not committed). Without this
