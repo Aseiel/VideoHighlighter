@@ -2098,9 +2098,14 @@ class VideoHighlighterGUI(QWidget):
         self.sample_rate_spin.setToolTip("Sample every Nth frame for action recognition clips")
 
         self.action_backend_combo = QComboBox()
-        self.action_backend_combo.addItem("Auto (CUDA / OpenVINO / CPU)", "auto")
+        # "Auto" has picked DirectML since R3D learned to run through ONNX
+        # Runtime; the old label predated that and named three of the four.
+        self.action_backend_combo.addItem(
+            "Auto (CUDA / DirectML / OpenVINO / CPU)", "auto")
         self.action_backend_combo.addItem("OpenVINO (Intel GPU / CPU)", "openvino")
         self.action_backend_combo.addItem("R3D + CUDA (NVIDIA GPU)", "r3d_cuda")
+        self.action_backend_combo.addItem(
+            "R3D + DirectML (AMD / any DX12 card)", "r3d_dml")
         self.action_backend_combo.addItem("R3D + CPU (PyTorch, slow)", "r3d_cpu")
         current_backend = advanced_cfg.get("action_backend", "auto")
         idx_ab = self.action_backend_combo.findData(current_backend)

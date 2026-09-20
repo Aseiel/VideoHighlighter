@@ -267,6 +267,27 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
 
     return analysis_data
 
+# action_backend -> (enable_r3d, r3d_half, r3d_device, r3d_onnx_dml) for the
+# choices that name a backend outright. "auto" is not here: it probes the
+# machine, so it lives at the call site with the detection it depends on.
+#
+# r3d_device is set explicitly so each label means what it says on every
+# machine. Without it the device came from whatever was detected, and
+# "R3D + CPU (PyTorch, slow)" would quietly become DirectML on an AMD box.
+#
+# r3d_dml asks for torch's "cpu" on purpose: the weights are exported once and
+# the forward pass leaves torch for an ONNX Runtime session on the DirectML
+# provider, which is the only way the packaged build reaches a DX12 card --
+# torch-directml cannot be bundled. Until now this was reachable only as a side
+# effect of the Compute setting, never as a request.
+ACTION_BACKEND_SETTINGS = {
+    "openvino": (False, False, None, False),
+    "r3d_cuda": (True, True, "cuda", False),    # FP16 on CUDA
+    "r3d_cpu": (True, False, "cpu", False),     # FP32 on CPU
+    "r3d_dml": (True, False, "cpu", True),      # fp16 is uneven on DirectML
+}
+
+
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log_fn=print, progress_fn=None, cancel_flag=None,
                     preview_fn=None, timeline_fn=None):
@@ -1362,17 +1383,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # (PyTorch, slow)" would quietly become DirectML on an AMD box.
                 r3d_device = None
                 r3d_onnx_dml = False
-                if action_backend == "openvino":
-                    enable_r3d = False
-                    r3d_half = False
-                elif action_backend == "r3d_cuda":
-                    enable_r3d = True
-                    r3d_half = True   # FP16 on CUDA
-                    r3d_device = "cuda"
-                elif action_backend == "r3d_cpu":
-                    enable_r3d = True
-                    r3d_half = False  # FP32 on CPU
-                    r3d_device = "cpu"
+                _explicit = ACTION_BACKEND_SETTINGS.get(action_backend)
+                if _explicit is not None:
+                    (enable_r3d, r3d_half, r3d_device,
+                     r3d_onnx_dml) = _explicit
+                    if r3d_onnx_dml:
+                        log("🎯 Action backend → R3D on DirectML through "
+                            "ONNX Runtime; it stays on the CPU if the export or "
+                            "the provider will not run")
                 else:  # "auto"
                     # R3D needs a GPU to be worth it. On Intel it stays off —
                     # R3D there could only run on the CPU, and OpenVINO on the
