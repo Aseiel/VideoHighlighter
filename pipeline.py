@@ -1430,9 +1430,23 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         enable_r3d = True
                         r3d_half = False  # FP16 is uneven on DirectML
                         r3d_device = _dev.dml_device
+                        # ONNX Runtime gets a turn before the processor does.
+                        # torch-directml refuses a 5D tensor outright --
+                        # nn.Conv3d raises "input must be 4-dimensional", which
+                        # is the whole of R3D -- so the warm-up demotes the
+                        # model. Without this the demotion goes straight to the
+                        # CPU and takes a working card with it, because ONNX
+                        # Runtime's DirectML provider implements the same
+                        # convolution for up to four spatial dimensions and runs
+                        # this model: 20 Conv nodes, all 3D, measured here at
+                        # 27.9 ms a window. Two stacks, one API, different
+                        # operator coverage. _try_onnx() already waits for
+                        # exactly this case and was never given permission.
+                        r3d_onnx_dml = True
                         log(f"🎯 Auto backend → DirectML detected, using R3D on "
-                            f"{_dev.dml_device} ({_dev.backend_name}); it falls "
-                            f"back to the CPU if the backend cannot run it")
+                            f"{_dev.dml_device} ({_dev.backend_name}); if that "
+                            f"backend cannot run it, ONNX Runtime is tried on "
+                            f"the same card before the CPU")
                     elif getattr(_dev, "onnx_dml_torch", False):
                         # Same card, the other runtime. This is the packaged
                         # build on a DX12 box: torch cannot address the GPU
