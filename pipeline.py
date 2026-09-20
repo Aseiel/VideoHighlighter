@@ -1383,6 +1383,22 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # (PyTorch, slow)" would quietly become DirectML on an AMD box.
                 r3d_device = None
                 r3d_onnx_dml = False
+
+                # Which OpenVINO device this run may use is decided by the
+                # compute preference, not by OpenVINO's own AUTO. The DirectML
+                # branches of detect_best_device already declare
+                # openvino_device="CPU" -- "there is no OpenVINO GPU here" --
+                # which on AMD is simply true, because the GPU plugin is
+                # Intel-only. load_models asked AUTO regardless and took the
+                # Intel GPU anyway, so on an Arc "Compute: DirectML" put
+                # OpenVINO on the very card ONNX Runtime was driving. Two
+                # threads into the GPU plugin while DirectML held the device
+                # wedged the run for good, in encoder wait, with no error and
+                # no traceback. Detected once here and used by every branch.
+                from modules.system.device_utils import detect_best_device
+                _dev = detect_best_device(log_fn=log)
+                openvino_device = getattr(_dev, "openvino_device", "AUTO") or "AUTO"
+
                 _explicit = ACTION_BACKEND_SETTINGS.get(action_backend)
                 if _explicit is not None:
                     (enable_r3d, r3d_half, r3d_device,
@@ -1405,8 +1421,6 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # R3DModelWrapper runs a real forward pass at load and demotes
                     # itself to the CPU if the backend cannot execute it, leaving
                     # the machine exactly where it was before.
-                    from modules.system.device_utils import detect_best_device
-                    _dev = detect_best_device(log_fn=log)
                     if _dev.pytorch_device == "cuda":
                         enable_r3d = True
                         r3d_half = True
@@ -1460,6 +1474,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     r3d_onnx_dml=r3d_onnx_dml,
                     action_models=action_models_selection,
                     preview_fn=preview_fn,
+                    device=openvino_device,
                 )
 
                 check_cancellation(cancel_flag, log, "action recognition processing")

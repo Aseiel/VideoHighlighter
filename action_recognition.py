@@ -1675,9 +1675,14 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     if use_person_detection:
         try:
+            # Same device the encoder and decoders were given. The detector
+            # is the one OpenVINO consumer that infers from a worker thread, so
+            # leaving it on AUTO put a second thread into the GPU plugin while
+            # the run had already decided OpenVINO was to stay off the card.
             yolo_detector = ParallelYOLODetector(
                 num_workers=yolo_workers,
                 skip_frames=yolo_skip_frames,
+                device=device,
             )
             person_tracker = PersonTracker(iou_threshold=0.3, max_lost_frames=10)
             action_detector = SmartActionDetector(sticky_frames=15)
