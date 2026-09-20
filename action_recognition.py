@@ -1200,6 +1200,27 @@ def load_models(device="AUTO", openvino_threads=None,
         ie, encoder_model, selected_device, model_name="encoder"
     )
     actual_device = encoder_device
+
+    # The decoders stay on the processor while another runtime holds the card.
+    # Two of them on one adapter is contention rather than acceleration -- the
+    # rule device_utils already applies in the other direction, where torch owns
+    # the GPU and R3D is kept off ONNX Runtime (`onnx_dml_torch=False`). Nothing
+    # applied it this way round, and a 0.12.0 run stalled for good inside the
+    # Intel decoder's infer() with R3D running on DirectML on the same Arc A750.
+    # No error, no traceback: an inference that never returns is not an exception.
+    #
+    # It costs nothing to move. Measured on that machine, per sampled window:
+    #
+    #     decoder   GPU 1.14 ms   CPU 0.67 ms   <- the processor is already faster
+    #     encoder   GPU 1.41 ms   CPU 11.41 ms  <- the GPU earns 8x, so it stays
+    #
+    # The decoder is an LSTM over sixteen feature vectors and the round trip costs
+    # more than the arithmetic; the encoder is the one doing work per frame.
+    decoder_device = actual_device
+    if r3d_onnx_dml and actual_device != "CPU":
+        decoder_device = "CPU"
+        print(f"📌 Decoders on CPU: {actual_device} is already running R3D "
+              f"through ONNX Runtime, and the CPU is the faster of the two here")
     if encoder_device != selected_device:
         print(f"📌 Note: Encoder running on {encoder_device} (different from requested {selected_device})")
 
@@ -1228,7 +1249,7 @@ def load_models(device="AUTO", openvino_threads=None,
         print("✓ Loading custom fine-tuned decoder model")
         custom_decoder_model = ie.read_model(model=custom_decoder_xml, weights=custom_decoder_bin)
         compiled_custom_decoder, custom_device = compile_with_fallback(
-            ie, custom_decoder_model, actual_device, model_name="custom decoder"
+            ie, custom_decoder_model, decoder_device, model_name="custom decoder"
         )
         models_info['custom'] = {
             'compiled': compiled_custom_decoder,
@@ -1247,7 +1268,7 @@ def load_models(device="AUTO", openvino_threads=None,
         print("✓ Loading Intel Kinetics-400 decoder model")
         intel_decoder_model = ie.read_model(model=intel_decoder_xml, weights=intel_decoder_bin)
         compiled_intel_decoder, intel_device = compile_with_fallback(
-            ie, intel_decoder_model, actual_device, model_name="Intel decoder"
+            ie, intel_decoder_model, decoder_device, model_name="Intel decoder"
         )
         models_info['intel'] = {
             'compiled': compiled_intel_decoder,
