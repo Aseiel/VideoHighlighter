@@ -827,6 +827,71 @@ class AsyncBatchedInferenceEngine:
 
 
 
+class _StallWatchdog:
+    """Says what the action loop was doing when it stopped doing it.
+
+    A run that wedges in here leaves nothing behind. The loop waits on other
+    threads and on two GPU runtimes -- the decode thread, OpenVINO's async
+    encoder, ONNX Runtime's DirectML provider -- and a wait that never ends is
+    not an exception: there is no traceback, no exit code, no last line. The
+    progress bar simply stops, and ``debug.log`` ends mid-run on whatever was
+    printed before the loop started.
+
+    So the loop stamps a phase name and a time as it goes, and this thread
+    watches that stamp. When one stops moving it writes the phase, how long it
+    has been stuck, and every thread's Python stack to the log -- which names
+    the blocking call: ``cap.read()`` in the prefetcher, ``session.run`` on
+    DirectML, ``request.wait()`` on OpenVINO. Costs one attribute write per
+    phase and one wakeup a second.
+
+    Python stacks rather than ``faulthandler.dump_traceback``: the frozen build
+    is --windowed, its stderr is a tee with no file descriptor behind it, and
+    faulthandler needs a real one. ``print`` reaches the log; a dump to a
+    descriptor that is not there reaches nobody.
+    """
+
+    def __init__(self, timeout: float = 20.0, repeat: float = 60.0):
+        self.timeout = timeout
+        self.repeat = repeat
+        # One tuple, replaced whole: the watcher reads a consistent pair
+        # without a lock, because the assignment is what CPython makes atomic,
+        # not the two writes it would otherwise take.
+        self._mark = ("starting up", time.monotonic())
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="action-stall-watchdog")
+        self._thread.start()
+
+    def beat(self, phase: str):
+        """Record what the loop is about to do."""
+        self._mark = (phase, time.monotonic())
+
+    def _run(self):
+        reported_at = 0.0
+        while not self._stop.wait(1.0):
+            phase, since = self._mark
+            stuck = time.monotonic() - since
+            if stuck < self.timeout:
+                reported_at = 0.0
+                continue
+            if reported_at and stuck - reported_at < self.repeat:
+                continue
+            reported_at = stuck
+            self._dump(phase, stuck)
+
+    def _dump(self, phase, stuck):
+        import traceback
+        names = {t.ident: t.name for t in threading.enumerate()}
+        print(f"⛔ Action loop stalled: {stuck:.0f}s in '{phase}'. "
+              f"Thread stacks follow (the run is still waiting):", flush=True)
+        for ident, frame in sys._current_frames().items():
+            print(f"--- {names.get(ident, 'thread')} ({ident}) ---")
+            print("".join(traceback.format_stack(frame)).rstrip(), flush=True)
+
+    def close(self):
+        self._stop.set()
+
+
 class _FramePrefetcher:
     """Decode frames on a background thread into a bounded queue so the main
     loop never blocks on ``cap.read()``.
@@ -879,16 +944,29 @@ class _FramePrefetcher:
                 return None
             return None if item is self._SENTINEL else item
 
-    def stop(self):
+    def stop(self, timeout: float = 10.0) -> bool:
+        """Stop decoding. True when the thread is really gone.
+
+        The join used to give up after a second, and the caller's very next
+        line is ``cap.release()`` -- releasing a capture the decode thread may
+        still be inside. That is a use-after-free in the FFmpeg backend, and it
+        wedges or crashes the process instead of raising. One in-flight
+        ``cap.read()`` is all this normally waits for.
+
+        Draining inside the loop rather than once: the producer can refill a
+        queue emptied a moment ago and go back to blocking on put(), and a
+        single drain before the join leaves it there.
+        """
         self._stop.set()
-        # Drain so a producer blocked on put() can finish and exit.
-        try:
-            while True:
-                self._queue.get_nowait()
-        except queue.Empty:
-            pass
-        if self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+        deadline = time.monotonic() + timeout
+        while self._thread.is_alive() and time.monotonic() < deadline:
+            try:
+                while True:
+                    self._queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._thread.join(timeout=0.25)
+        return not self._thread.is_alive()
 
 
 # =============================
@@ -1613,6 +1691,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     try:
         frame_reader = None  # background decode thread (started before main loop)
+        watchdog = None      # names the phase if the loop stops moving
         if draw_bboxes and annotated_output:
             if frame_height > 1080 and downscale_factor < 1.0:
                 frame_width = int(frame_width * downscale_factor)
@@ -1752,6 +1831,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
         # cap.read(). The warm-up above already finished its own reads, so
         # the prefetcher owns the capture from here on.
         frame_reader = _FramePrefetcher(cap).start()
+        watchdog = _StallWatchdog()
 
         with open(log_file, mode="w", newline="") as f:
             writer = csv.writer(f)
@@ -1770,6 +1850,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     print("⚠️ Action detection canceled by user.")
                     break
 
+                watchdog.beat('waiting for a decoded frame')
                 frame = frame_reader.read()
                 if frame is None:
                     break
@@ -1781,6 +1862,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                 # ---- Person detection ----
                 if use_person_detection and yolo_detector:
+                    watchdog.beat('person detection (YOLOX)')
                     yolo_start = time.time()
                     h, w = frame.shape[:2]
                     if h > 1080 or w > 1920:
@@ -1836,6 +1918,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                 # ── Live detection preview (boxes already burned into the frame) ──
                 if preview_fn is not None:
+                    watchdog.beat('live preview frame')
                     now = time.time()
                     if now - _last_preview_t >= 0.12:
                         _last_preview_t = now
@@ -1871,6 +1954,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     # --- PIPELINE: collect previous preprocess result ---
                     if pending_preprocess_future is not None:
                         preprocess_start = time.time()
+                        watchdog.beat('preprocess (worker thread)')
                         processed_frame = pending_preprocess_future.result()
                         preprocess_time += time.time() - preprocess_start
                     else:
@@ -1893,6 +1977,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                     # ---- Process PREVIOUS request's results ----
                     if prev_req is not None and len(sequence_buffer) >= SEQUENCE_LENGTH:
+                        watchdog.beat(f'encoder wait ({_backend_label})')
                         features = encoder_engine.wait_and_get(prev_req)[0]
                         features = np.reshape(features, (-1,))
                         sequence_buffer.append(features.copy())
@@ -1920,6 +2005,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                             if (raw_frame_buffer is not None
                                     and len(raw_frame_buffer) == R3D_CLIP_LENGTH):
                                 r3d_start = time.time()
+                                watchdog.beat('R3D inference')
                                 r3d_roi = current_action_roi if use_person_detection else None
                                 frames_list = list(raw_frame_buffer)
 
@@ -1946,6 +2032,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
                                 r3d_time += time.time() - r3d_start
 
+                            watchdog.beat('action decoders')
                             if interesting_actions_set:
                                 # === Targeted: only run decoders needed for mapped actions ===
                                 for key, (action_id, model_type) in action_to_model.items():
@@ -2049,6 +2136,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                                             'model_type':  det_model,
                                         })
 
+                    watchdog.beat('logging detections')
                     prev_req = req
                     prev_timestamp_secs = timestamp_secs
                     prev_frame_id = frame_id
@@ -2073,6 +2161,7 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                     last_perf_print = current_time
 
                 if progress_callback and (current_time - last_gui_update > 0.1):
+                    watchdog.beat('progress callback (GUI)')
                     elapsed = current_time - start_time
                     processing_fps = processed_frames / elapsed if elapsed > 0 else 0
                     engine_stats = encoder_engine.get_stats()
@@ -2211,9 +2300,18 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     finally:
         print("\n🧹 Cleaning up resources...")
-        if frame_reader is not None:
-            frame_reader.stop()
-        cap.release()
+        if watchdog is not None:
+            watchdog.close()
+        release_capture = True
+        if frame_reader is not None and not frame_reader.stop():
+            # Never release a capture another thread may still be reading:
+            # leaking one VideoCapture for the rest of the process costs a
+            # handle, while releasing it under a live read takes the run down.
+            print("⚠️ Decode thread would not stop — leaving the "
+                  "capture open rather than releasing it underneath the reader.")
+            release_capture = False
+        if release_capture:
+            cap.release()
         if video_writer:
             video_writer.release()
             print(f"✅ Annotated video saved: {annotated_output}")
