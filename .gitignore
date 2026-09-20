@@ -38,6 +38,10 @@ models/clip-vit-base-patch32-ov/
 # RTMPose keypoint IRs + ONNX/zip cache (installed via tools/get_rtmpose_model.py)
 models/rtmpose/
 
+# YOLOX detector IRs + ONNX cache (installed via tools/get_yolox_model.py,
+# and by the app on first run). Downloaded, never authored here.
+models/yolox/
+
 __pycache__/
 
 # --- Web frontend (Vite + React + Tauri) ---

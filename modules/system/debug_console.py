@@ -133,6 +133,29 @@ class _Tee(io.TextIOBase):
         return "utf-8"
 
 
+def force_utf8_stdio() -> None:
+    """Make stdout/stderr survive this repo's non-ASCII prints on a legacy console.
+
+    Most of the codebase prints emoji. Inside the app that is safe: install()
+    swaps stdout for a Tee that writes the log file as UTF-8 and swallows the
+    console write if it fails. Anything that runs *without* that Tee -- the
+    sidecar workers, the scripts in tools/ -- gets the raw stream, which on a
+    Windows console is the ANSI codepage (cp1250 on a Polish install, cp1252 on
+    a Western one). The first emoji then raises UnicodeEncodeError and takes the
+    whole process down before it has done any work: `tools/get_yolox_model.py`
+    died on the "downloading" line without fetching a byte.
+
+    errors="replace" rather than strict, because a mangled glyph in a progress
+    line is not worth losing the run over. Idempotent and never raises; a stream
+    that has been redirected to something without reconfigure() is left alone.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def install() -> None:
     """Redirect stdout/stderr through the tee and arm the crash handlers.
     Idempotent; safe in multiprocessing children (they append, never rotate,

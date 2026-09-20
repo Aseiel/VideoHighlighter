@@ -62,4 +62,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from modules.system.debug_console import force_utf8_stdio
+    force_utf8_stdio()
     raise SystemExit(main())
