@@ -473,6 +473,28 @@ def names_from_model(model_path: str | Path) -> list[str]:
     return []
 
 
+def _labels_path(source: str | Path) -> Path:
+    """Where a labels file named like ``yolo_objects_labels.json`` actually is.
+
+    A bare filename means *the app's own* labels file, not one in whatever
+    directory the process happens to be in. That distinction only shows up in
+    the packaged build: it works from the user-data dir (see
+    ``app_paths.use_writable_cwd``) while its data ships under ``_MEIPASS``, so
+    every relative lookup here resolved beside the exe, found nothing, and the
+    COCO detector was dropped for want of names — with the model itself found,
+    because ``DEFAULT_MODEL_DIR`` is absolute. From source both are the project
+    root, which is why it never showed there.
+
+    A path that exists as given wins, so an explicit file the user picked (or a
+    relative one in a source checkout) is still used exactly as before.
+    """
+    path = Path(source)
+    if path.exists() or path.parent != Path("."):
+        return path
+    from modules.system.app_paths import data_file  # lazy: keeps this import-cheap
+    return Path(data_file(path.name))
+
+
 def load_class_names(source: str | Path | Sequence[str] | None) -> list[str]:
     """Load class names from a list or a JSON labels file.
 
@@ -486,7 +508,7 @@ def load_class_names(source: str | Path | Sequence[str] | None) -> list[str]:
     if isinstance(source, Sequence) and not isinstance(source, (str, bytes, Path)):
         return [str(item) for item in source]
 
-    path = Path(source)
+    path = _labels_path(source)
     if not path.exists():
         return []
 
