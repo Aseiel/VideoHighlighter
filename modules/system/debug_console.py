@@ -156,6 +156,28 @@ def force_utf8_stdio() -> None:
             pass
 
 
+def is_multiprocessing_child(argv=None) -> bool:
+    """True in a process multiprocessing started, however early it is asked.
+
+    ``parent_process()`` is only set once ``spawn_main`` has run. A frozen
+    build starts every child -- a spawn worker, the Manager, the resource
+    tracker -- by re-running the exe, so the entry script's first lines run
+    before that and see ``None``. Such a child took itself for a fresh launch
+    and rotated the parent's live log away. The command line says what it is
+    from the start: ``--multiprocessing-fork`` for a spawn child, ``-c "from
+    multiprocessing.… import main"`` for the tracker and the forkserver.
+    """
+    try:
+        import multiprocessing
+        if multiprocessing.parent_process() is not None:
+            return True
+    except Exception:
+        pass
+    argv = sys.argv if argv is None else argv
+    return any(a == "--multiprocessing-fork"
+               or a.startswith("from multiprocessing.") for a in argv[1:])
+
+
 def install() -> None:
     """Redirect stdout/stderr through the tee and arm the crash handlers.
     Idempotent; safe in multiprocessing children (they append, never rotate,
@@ -166,11 +188,7 @@ def install() -> None:
     _installed = True
 
     path = log_file_path()
-    try:
-        import multiprocessing
-        is_child = multiprocessing.parent_process() is not None
-    except Exception:
-        is_child = False
+    is_child = is_multiprocessing_child()
     try:
         if not is_child:
             # keep exactly one previous run for comparison

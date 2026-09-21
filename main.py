@@ -9,6 +9,18 @@ import sys
 from modules.system import debug_console
 debug_console.install()
 
+# A frozen build starts every multiprocessing child — the object-detection
+# workers, their Manager, the thumbnail decoder — by re-running this exe, and
+# the child becomes a child only when it reaches freeze_support(). Left at the
+# bottom of the file, each one first loaded everything below: cv2, Qt,
+# OpenVINO, transformers, the assistant. Object detection starts six of them;
+# on a Mac that filled the memory until the machine had to be restarted.
+# Here a child costs the log tee and nothing else. In the parent (and in any
+# run from source) this is a no-op.
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
 # Every relative path in the app — `./cache` above all — resolves against the
 # working directory, and a packaged app does not get to choose what that is.
 # macOS starts an .app in `/`, which is read-only, so the first cache write
@@ -6719,7 +6731,7 @@ def _hard_exit(exit_code: int = 0):
 
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
+    # freeze_support() runs at the top of the file, before the heavy imports.
     try:
         multiprocessing.set_start_method("spawn")
     except RuntimeError:
