@@ -2,6 +2,10 @@
   <img src="assets/icon.png" alt="VideoHighlighter" width="160">
 </p>
 
+<p align="center">
+  <a href="https://discord.gg/cUPJqPAMmm"><img src="https://img.shields.io/discord/1471915944652832788?logo=discord&logoColor=white&label=Discord&color=brightgreen" alt="Discord"></a>
+</p>
+
 <!-- hy-mt2-i18n:start -->
 [English](./README.md) | [中文](./README_zh-CN.md) | **日本語** | [Español](./README_es.md)
 <!-- hy-mt2-i18n:end -->

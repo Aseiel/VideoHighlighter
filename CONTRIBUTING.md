@@ -8,7 +8,7 @@ Before you open a PR, please read this doc. It's short.
 
 1. **Bugs / small fixes** — open an issue or PR directly. No need to ask first.
 2. **New features / larger changes** — please open an issue first to discuss the approach before writing code. This avoids wasted work if the feature doesn't fit the project's direction.
-3. **Questions / discussion** — join the [Discord](your-invite-link) and ask in `#support` or `#dev`.
+3. **Questions / discussion** — join the [Discord](https://discord.gg/cUPJqPAMmm) and ask in `#support` or `#dev`.
 
 ### Development setup
 
@@ -44,4 +44,4 @@ Be respectful, be constructive, assume good faith. Standard open-source etiquett
 
 ---
 
-Questions? [Join the Discord](your-invite-link) — `#support` for help, `#dev` for contribution discussion.
+Questions? [Join the Discord](https://discord.gg/cUPJqPAMmm) — `#support` for help, `#dev` for contribution discussion.
