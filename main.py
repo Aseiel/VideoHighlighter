@@ -6741,6 +6741,19 @@ if __name__ == "__main__":
     # (imageio-ffmpeg). Give it its plain name on PATH before anything runs it.
     from modules.media.ffmpeg_tools import ensure_ffmpeg_on_path
     ensure_ffmpeg_on_path()
+
+    # `--smoke-test <video>` runs the packaged app's riskiest paths with no
+    # window and exits with the result; CI runs it on the built mac .app (see
+    # modules/system/smoke_test.py). Here, after every import above, so a crash
+    # on import still fails it — and before QApplication, which it does not need.
+    if "--smoke-test" in sys.argv:
+        from modules.system import smoke_test
+        _smoke_code = smoke_test.main(sys.argv)
+        sys.stdout.flush()
+        # Not _hard_exit: on Windows it kills the process with SIGTERM, and
+        # the exit code is the whole answer the workflow reads.
+        os._exit(_smoke_code)
+
     # Disable D3D11VA hardware acceleration in Qt multimedia's FFmpeg backend.
     # On some Windows systems D3D11VA initialisation fails for H.264, causing
     # noisy warnings even though playback still works via software decoding.

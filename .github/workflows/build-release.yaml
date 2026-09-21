@@ -474,6 +474,8 @@ jobs:
             --collect-data whisper \
             --collect-binaries imageio_ffmpeg \
             --hidden-import llm.clip_prefilter \
+            --hidden-import modules.system.smoke_test \
+            --hidden-import psutil \
             --additional-hooks-dir packaging/pyinstaller-hooks \
             --exclude-module nncf \
             --collect-submodules optimum \
@@ -497,6 +499,49 @@ jobs:
         run: |
           codesign --force --deep --sign - "dist/VideoHighlighter.app"
           codesign --verify --verbose "dist/VideoHighlighter.app"
+      - name: Smoke-test the app
+        # Nobody on the project has a Mac, and the first mac build a tester ran
+        # filled his memory until the machine had to be restarted: every
+        # multiprocessing child loaded the whole app. This runs the signed .app
+        # without a window — imports, a spawned child, object detection's
+        # workers, the thumbnail decoder — under a memory ceiling that kills the
+        # process tree rather than the runner. modules/system/smoke_test.py has
+        # the checks. A failure stops the release.
+        #
+        # The clips are generated, never real footage: what is measured is how
+        # many processes start and what each loads, and that does not depend on
+        # what is in the frame. Two codecs because they take different decode
+        # paths — H.264 through videotoolbox, and 1080p ProRes in a .mov, which
+        # is what the tester was editing when the memory ran out.
+        timeout-minutes: 30
+        run: |
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i testsrc2=size=1280x720:rate=30 \
+            -f lavfi -i sine=frequency=440:sample_rate=48000 \
+            -t 30 -c:v libx264 -pix_fmt yuv420p -c:a aac smoke-h264.mp4
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i testsrc2=size=1920x1080:rate=25 \
+            -f lavfi -i sine=frequency=440:sample_rate=48000 \
+            -t 30 -c:v prores_ks -profile:v 2 -c:a pcm_s16le smoke-prores.mov
+          status=0
+          for clip in smoke-h264.mp4 smoke-prores.mov; do
+            echo "::group::smoke test on $clip"
+            "dist/VideoHighlighter.app/Contents/MacOS/VideoHighlighter" \
+              --smoke-test "$PWD/$clip" \
+              --smoke-report "$PWD/smoke-report-${clip%.*}.json" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
+      - name: Upload smoke-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-smoke-test
+          path: |
+            smoke-report-*.json
+            ~/Library/Application Support/VideoHighlighter/*.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Create DMG
         run: |
           create-dmg \

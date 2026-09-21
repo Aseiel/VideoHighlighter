@@ -15,6 +15,7 @@ torch
 # and would overwrite it.
 onnxruntime-directml; sys_platform == "win32"
 pyyaml
+psutil  # memory readouts, and the --smoke-test process-tree watch (BSD-3)
 opencv-python>=4.7  # FaceDetectorYN (YuNet) + FaceRecognizerSF (SFace) need >=4.5.4
 tqdm
 openai-whisper
