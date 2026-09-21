@@ -91,7 +91,26 @@ def _serve(conn, video_path: str) -> None:
                 _write_thumbnail(container, stream, time_ms, height, vr, out_path)
                 conn.send(("ok", decoder))
             except Exception as e:
-                conn.send(("error", f"{type(e).__name__}: {e}"))
+                if decoder == "software":
+                    conn.send(("error", f"{type(e).__name__}: {e}"))
+                    continue
+                # Opening proves nothing about decoding: without software
+                # fallback a hardware decoder opens a codec it cannot decode
+                # and fails on the first frame instead — ProRes on a Mac whose
+                # VideoToolbox has no ProRes decoder. Drop to software for good
+                # rather than failing every thumbnail of this video.
+                print(f"⚠️ Thumbnail decoder: {decoder} could not decode "
+                      f"({type(e).__name__}: {e}) — switching to software")
+                try:
+                    container.close()
+                except Exception:
+                    pass
+                try:
+                    container, stream, decoder = _open(video_path, hardware=False)
+                    _write_thumbnail(container, stream, time_ms, height, vr, out_path)
+                    conn.send(("ok", decoder))
+                except Exception as e2:
+                    conn.send(("error", f"{type(e2).__name__}: {e2}"))
     except (EOFError, OSError):
         pass                      # parent went away; nothing to report to
     finally:
@@ -101,14 +120,16 @@ def _serve(conn, video_path: str) -> None:
             pass
 
 
-def _open(video_path: str):
-    """Open the file with the best decoder that actually works. → (container, stream, name)"""
+def _open(video_path: str, hardware: bool = True):
+    """Open the file with the best decoder that opens it. → (container, stream, name)"""
     import av
 
-    try:
-        from av.codec.hwaccel import HWAccel
-    except Exception:
-        HWAccel = None
+    HWAccel = None
+    if hardware:
+        try:
+            from av.codec.hwaccel import HWAccel
+        except Exception:
+            pass
 
     if HWAccel is not None:
         for device in HWACCEL_CANDIDATES:
@@ -242,6 +263,11 @@ class PersistentDecoder:
                 return True
             if status == "fatal":
                 self._fail(detail, permanent=True)
+            else:
+                # The child is fine, this frame was not. Said here because the
+                # caller only sees False, and a video whose every thumbnail
+                # fails this way otherwise leaves nothing in the log at all.
+                print(f"⚠️ Thumbnail decoder: frame at {int(time_ms)}ms failed — {detail}")
             return False
 
     def stop(self) -> None:

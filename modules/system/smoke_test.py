@@ -33,7 +33,11 @@ import time
 
 # Modules only the app's own window needs. A multiprocessing child that holds
 # any of them ran main.py's imports, which is the bug this exists to catch.
-APP_ONLY_MODULES = ("PySide6", "transformers", "llm.llm_chat_widget")
+# QtWidgets and not PySide6: PyInstaller's PySide6 runtime hook imports
+# PySide6.QtCore in every process of a frozen build, children included, before
+# main.py starts — so the package is always there and says nothing. main.py
+# imports QtWidgets at module level; the hook never does.
+APP_ONLY_MODULES = ("PySide6.QtWidgets", "transformers", "llm.llm_chat_widget")
 
 DEFAULT_MAX_TREE_MB = 5000       # macos-latest runners have 7 GB
 DEFAULT_MAX_CHILDREN = 12        # 4 workers + Manager + resource tracker ≈ 6
