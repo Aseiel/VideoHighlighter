@@ -67,9 +67,15 @@ jobs:
           os.makedirs("out", exist_ok=True)
           json.dump({"tag": f"packs-torch-{torch}", "packs": keep},
                     open("out/packs.json", "w", encoding="utf-8"), indent=2)
-          with open(os.environ["GITHUB_ENV"], "a") as env:
-              env.write(f"TAG=packs-torch-{torch}\n")
           EOF
+          # Read here, not through GITHUB_ENV: that only reaches later steps,
+          # and an empty tag makes `gh release view` answer about the latest
+          # release instead - the app release this must never touch.
+          TAG=$(python3 -c "import json; print(json.load(open('out/packs.json'))['tag'])")
+          case "$TAG" in
+            packs-torch-?*) ;;
+            *) echo "::error::unexpected tag '$TAG'"; exit 1 ;;
+          esac
           assets=$(python3 -c "import json; print(' '.join('in/' + p['asset'] for p in json.load(open('out/packs.json'))['packs']))")
           if gh release view "$TAG" >/dev/null 2>&1; then
             existing=$(gh release view "$TAG" --json assets --jq '.assets[].name')
