@@ -1,0 +1,42 @@
+name: Check installer scripts
+
+# Compiles the Inno Setup scripts against tiny stand-in folders, so a script
+# error costs two minutes here instead of surfacing at the end of a full
+# multi-hour build. Pascal errors (a Variant passed where a String is wanted,
+# an unknown function) are only caught by ISCC — nothing else parses [Code].
+
+on:
+  push:
+    paths:
+      - 'packaging/installer/**'
+      - '.github/workflows/check-installer.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Compile videohighlighter-packs.iss
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force stub/dist/_internal, stub/pack/site-packages | Out-Null
+          Set-Content stub/dist/VideoHighlighter.exe "stub"
+          Set-Content stub/pack/pack.json '{"dep":"torch","priority":0}'
+          Set-Content packaging/installer/7zr.exe "stub"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q `
+            "/DDistDir=$((Resolve-Path stub/dist).Path)" `
+            "/DCpuPackDir=$((Resolve-Path stub/pack).Path)" `
+            "/DPackBase=https://example.invalid/packs" `
+            "/DCudaPackSha256=0000000000000000000000000000000000000000000000000000000000000000" `
+            "/DCudaPackMB=1769" "/DCudaInstalledMB=4800" "/DInstalledMB=2100" `
+            "/O$((Resolve-Path stub).Path)" `
+            packaging/installer/videohighlighter-packs.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          Get-ChildItem stub -Filter *.exe | ForEach-Object { Write-Host "compiled: $($_.Name)" }

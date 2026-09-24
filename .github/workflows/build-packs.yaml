@@ -1,0 +1,305 @@
+name: Build packs (experimental)
+
+# The AnimeJaNai-style split, proven before the release pipeline adopts it:
+# a core app with no PyTorch inside, plus PyTorch as separate, versioned packs
+# (torch-cu128 for NVIDIA, torch-cpu for everyone else) that install once and
+# survive app updates. Nothing here touches build-release.yaml or ships to
+# anyone — it produces artifacts and a smoke-test verdict:
+#
+#   * how big the core and each pack are, compressed (every file must stay
+#     under GitHub's 2 GB release-asset cap);
+#   * whether the frozen app gets through main.py's imports and the pipeline
+#     with torch coming from a pack — once with the CPU pack, once with the
+#     CUDA one (the runner has no GPU, so that run proves the CUDA DLLs load in
+#     the frozen process, not that kernels run; that needs an NVIDIA machine).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packs-windows:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        # baseline = today's release build (torch inside), run through the same
+        # smoke test. It showed that the two Windows child checks the packs
+        # build fails, fail identically without packs, so it is off by
+        # default. Add it back to the list to compare again.
+        variant: [packs]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        # Same environment as the release build, so PyInstaller's analysis of
+        # everything that imports torch sees the same packages.
+        run: |
+          pip install numpy==2.2.6 mkl mkl-include
+          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+          pip install openvino==2026.2.1
+          pip install -r requirements.txt
+          pip install yolox==0.3.0 --no-deps
+          pip install pyinstaller psutil
+      - name: Build torch packs
+        if: matrix.variant == 'packs'
+        run: |
+          python tools/build_torch_pack.py --variant cu128 --out build-packs/torch-cu128
+          python tools/build_torch_pack.py --variant cpu --out build-packs/torch-cpu
+      - name: Pre-convert CLIP to OpenVINO IR
+        run: python -m tools.export_clip_ov
+      - name: Move CLIP into its own pack
+        # Model weights barely compress, so CLIP (288 MB even as FP16) would be
+        # most of an installer that is otherwise a few hundred MB. As a pack
+        # the installer downloads it (ticked by default) into {app}/models/,
+        # which llm/clip_prefilter.py searches before the bundle.
+        if: matrix.variant == 'packs'
+        shell: pwsh
+        run: |
+          $dest = "build-packs/models-clip/models"
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Move-Item models/clip-vit-base-patch32-ov $dest/
+          Remove-Item -Recurse -Force "$dest/clip-vit-base-patch32-ov/model_cache" -ErrorAction SilentlyContinue
+          $bytes = (Get-ChildItem $dest -Recurse -File | Measure-Object Length -Sum).Sum
+          [ordered]@{ name = "models-clip"; dep = "models-clip";
+                      version = "clip-vit-base-patch32-ov-fp16"; bytes_installed = $bytes } |
+            ConvertTo-Json | Set-Content build-packs/models-clip/pack.json -Encoding utf8
+      - name: Fetch YOLOX detector models (Apache-2.0)
+        run: python tools/get_yolox_model.py
+      - name: Build EXE (${{ matrix.variant }})
+        shell: pwsh
+        run: |
+          $extra = if ("${{ matrix.variant }}" -eq "packs") { python tools/pack_core_args.py } else { @() }
+          pyinstaller --name "VideoHighlighter" `
+            --icon "assets/icon.ico" `
+            --splash "assets/splash.png" `
+            --windowed `
+            --noconfirm `
+            --log-level WARN `
+            --add-data "config.yaml;." `
+            --add-data "yolo_objects_labels.json;." `
+            --add-data "kinetics_400_labels.json;." `
+            --add-data "assets;assets" `
+            --add-data "modules;modules" `
+            --add-data "models;models" `
+            --add-data "video_ai_editor/VRVideoOutput.qml;video_ai_editor" `
+            --add-data "video_ai_editor/models;video_ai_editor/models" `
+            --hidden-import action_recognition `
+            --hidden-import convert_pth_to_openvino `
+            --hidden-import crop_actions `
+            --hidden-import downloader `
+            --hidden-import object_recognition `
+            --hidden-import pipeline `
+            --hidden-import signal_timeline_viewer `
+            --hidden-import sorter `
+            --hidden-import video_picker_dialog `
+            --hidden-import PySide6.QtCore `
+            --hidden-import PySide6.QtGui `
+            --hidden-import PySide6.QtWidgets `
+            --hidden-import PySide6.QtQml `
+            --hidden-import PySide6.QtQuick `
+            --hidden-import PySide6.QtQuickWidgets `
+            --hidden-import PySide6.QtMultimedia `
+            --hidden-import modules.system.smoke_test `
+            --hidden-import psutil `
+            --collect-submodules whisper `
+            --collect-submodules yolox `
+            --collect-submodules model_hub `
+            --collect-submodules huggingface_hub `
+            --collect-submodules keyring `
+            --copy-metadata keyring `
+            --collect-all openvino `
+            --collect-all onnxruntime `
+            --collect-data whisper `
+            --collect-binaries imageio_ffmpeg `
+            --hidden-import llm.clip_prefilter `
+            --additional-hooks-dir packaging/pyinstaller-hooks `
+            --exclude-module nncf `
+            --collect-submodules optimum `
+            --collect-submodules transformers `
+            --collect-data transformers `
+            --copy-metadata transformers `
+            --copy-metadata tokenizers `
+            --copy-metadata huggingface-hub `
+            --copy-metadata safetensors `
+            --copy-metadata regex `
+            @extra `
+            main.py
+          if (("${{ matrix.variant }}" -eq "packs") -and (Test-Path dist/VideoHighlighter/_internal/torch)) {
+            throw "torch was bundled into the core; it must only arrive as a pack"
+          }
+      - name: Strip what the app never loads
+        if: matrix.variant == 'packs'
+        run: python tools/strip_bundle.py dist/VideoHighlighter
+      - name: Check ml_dtypes can find the DLLs it links against
+        # Same check as build-release.yaml: onnx's ml_dtypes links against a
+        # renamed MSVC runtime it expects in numpy.libs.
+        run: |
+          python -c "import glob, os, re; root = os.path.join('dist', 'VideoHighlighter', '_internal'); exts = glob.glob(os.path.join(root, 'ml_dtypes', '**', '*.pyd'), recursive=True); assert exts, 'no ml_dtypes extension in the bundle, so onnx cannot import'; want = sorted({m.decode() for p in exts for m in re.findall(rb'[\w.+-]+-[0-9a-f]{32}\.dll', open(p, 'rb').read(), re.I)}); libs = os.path.join(root, 'numpy.libs'); have = set(os.listdir(libs)) if os.path.isdir(libs) else set(); missing = [n for n in want if n not in have]; print('ml_dtypes links against:', ', '.join(want) or 'nothing vendored'); assert not missing, 'bundled numpy.libs lacks ' + ', '.join(missing)"
+      - name: Compress core and packs
+        if: matrix.variant == 'packs'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          7z a -t7z -mx=9 out/core.7z ./dist/VideoHighlighter | Out-Null
+          foreach ($p in Get-ChildItem build-packs -Directory) {
+            Push-Location $p.FullName
+            # A model pack unpacks into the install root (models/...); a
+            # Python pack into packs/<name>/ and carries pack.json for the loader.
+            # @(...) keeps it an array: an if-expression yielding one item is a
+            # string, and splatting a string passes it one character at a time.
+            $content = @(if ($p.Name -like "models-*") { "models" } else { "site-packages", "pack.json" })
+            7z a -t7z -mx=9 "$env:GITHUB_WORKSPACE/out/component-$($p.Name).7z" @content | Out-Null
+            Pop-Location
+            if ((Get-Item "out/component-$($p.Name).7z").Length -lt 1MB) {
+              throw "component-$($p.Name).7z is under 1 MB: the pack was archived empty"
+            }
+          }
+          $rows = foreach ($f in Get-ChildItem out -File) {
+            $mb = [math]::Round($f.Length / 1MB)
+            Write-Host ("{0,8} MB  {1}" -f $mb, $f.Name)
+            if ($f.Length -gt 2000000000) { Write-Host "::error::$($f.Name) is over GitHub's 2 GB release-asset cap" }
+            [ordered]@{ asset = $f.Name; bytes = $f.Length;
+                        sha256 = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower() }
+          }
+          $installed = [math]::Round(((Get-ChildItem dist/VideoHighlighter -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB)
+          Write-Host "core installed: $installed MB"
+          $packs = foreach ($p in Get-ChildItem build-packs -Directory) {
+            $info = Get-Content "$($p.FullName)/pack.json" | ConvertFrom-Json
+            $row = $rows | Where-Object { $_.asset -eq "component-$($p.Name).7z" }
+            [ordered]@{ name = $info.name; dep = $info.dep; version = $info.version;
+                        python = $info.python; asset = $row.asset; bytes = $row.bytes;
+                        sha256 = $row.sha256; bytes_installed = $info.bytes_installed }
+          }
+          @{ packs = @($packs) } | ConvertTo-Json -Depth 4 | Set-Content out/packs.json -Encoding utf8
+          Get-Content out/packs.json
+      - name: Smoke test, baseline build
+        if: matrix.variant == 'baseline'
+        shell: pwsh
+        timeout-minutes: 30
+        continue-on-error: true
+        run: |
+          $ffmpeg = python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+          & $ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=30 `
+            -f lavfi -i sine=frequency=440:sample_rate=48000 -t 30 -c:v libx264 -pix_fmt yuv420p -c:a aac smoke.mp4
+          $p = Start-Process -FilePath dist/VideoHighlighter/VideoHighlighter.exe -Wait -PassThru `
+                 -ArgumentList @("--smoke-test", "$PWD/smoke.mp4", "--smoke-report", "$PWD/smoke-report-baseline.json")
+          if (Test-Path smoke-report-baseline.json) { Get-Content smoke-report-baseline.json }
+          Get-ChildItem dist/VideoHighlighter -Filter *.log -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName "debug-baseline.log" }
+          Write-Host "baseline exit code: $($p.ExitCode)"
+          exit $p.ExitCode
+      - name: Smoke test with each pack
+        if: matrix.variant == 'packs'
+        # Reports without stopping the job, so the installer below is still
+        # built and tested while a smoke failure is being diagnosed.
+        continue-on-error: true
+        # The same headless checks the mac release runs (modules/system/smoke_test.py):
+        # main.py's imports, the pipeline import, object detection, a spawned
+        # child. main.py imports pipeline, and pipeline imports torch at the
+        # top, so passing means the whole app starts on torch from the pack.
+        shell: pwsh
+        timeout-minutes: 40
+        run: |
+          $ffmpeg = python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+          & $ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=30 `
+            -f lavfi -i sine=frequency=440:sample_rate=48000 -t 30 -c:v libx264 -pix_fmt yuv420p -c:a aac smoke.mp4
+          $status = 0
+          foreach ($pack in @("torch-cpu", "torch-cu128")) {
+            Remove-Item -Recurse -Force dist/VideoHighlighter/packs -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force dist/VideoHighlighter/packs | Out-Null
+            Copy-Item -Recurse "build-packs/$pack" "dist/VideoHighlighter/packs/$pack"
+            Write-Host "::group::smoke test with $pack"
+            $p = Start-Process -FilePath dist/VideoHighlighter/VideoHighlighter.exe `
+                   -ArgumentList @("--smoke-test", "$PWD/smoke.mp4", "--smoke-report", "$PWD/smoke-report-$pack.json") `
+                   -Wait -PassThru
+            if (Test-Path "smoke-report-$pack.json") { Get-Content "smoke-report-$pack.json" }
+            Get-ChildItem dist/VideoHighlighter -Filter *.log -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName "debug-$pack.log"; Get-Content $_.FullName -Tail 60 }
+            Write-Host "::endgroup::"
+            Write-Host "$pack exit code: $($p.ExitCode)"
+            if ($p.ExitCode -ne 0) { $status = 1 }
+          }
+          exit $status
+      - name: Build the installer (core + CPU pack, NVIDIA pack on demand)
+        if: matrix.variant == 'packs'
+        # packaging/installer/videohighlighter-packs.iss: Inno compresses the
+        # files itself — no .7z inside, nothing unpacked after the fact. The
+        # NVIDIA pack's URL comes from the PACKS_BASE_URL repo variable; while
+        # it is unset the checkbox installs nothing extra and the app runs on
+        # the CPU pack, which is what this run can test anyway.
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force dist/VideoHighlighter/packs -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri https://www.7-zip.org/a/7zr.exe -OutFile packaging/installer/7zr.exe -UseBasicParsing
+          choco install innosetup -y --no-progress | Out-Null
+          $packs = (Get-Content out/packs.json | ConvertFrom-Json).packs
+          $cuda = $packs | Where-Object { $_.name -eq "torch-cu128" }
+          $clip = $packs | Where-Object { $_.name -eq "models-clip" }
+          $installedMB = [int][math]::Ceiling(((Get-ChildItem dist/VideoHighlighter, build-packs/torch-cpu -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB)
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q `
+            "/DAppVersion=packs-experiment" `
+            "/DOutputName=VideoHighlighter-Setup-packs" `
+            "/DDistDir=$((Resolve-Path dist/VideoHighlighter).Path)" `
+            "/DCpuPackDir=$((Resolve-Path build-packs/torch-cpu).Path)" `
+            "/DPackBase=${{ vars.PACKS_BASE_URL }}" `
+            "/DCudaPackAsset=$($cuda.asset)" `
+            "/DCudaPackSha256=$($cuda.sha256)" `
+            "/DCudaPackMB=$([int][math]::Ceiling($cuda.bytes / 1MB))" `
+            "/DCudaInstalledMB=$([int][math]::Ceiling($cuda.bytes_installed / 1MB))" `
+            "/DClipPackAsset=$($clip.asset)" `
+            "/DClipPackSha256=$($clip.sha256)" `
+            "/DClipPackMB=$([int][math]::Ceiling($clip.bytes / 1MB))" `
+            "/DClipInstalledMB=$([int][math]::Ceiling($clip.bytes_installed / 1MB))" `
+            "/DInstalledMB=$installedMB" `
+            "/O$((Resolve-Path out).Path)" `
+            packaging/installer/videohighlighter-packs.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          $exe = Get-Item out/VideoHighlighter-Setup-packs.exe
+          Write-Host ("installer: {0} MB (installs {1} MB)" -f [math]::Round($exe.Length / 1MB), $installedMB)
+      - name: Install silently and smoke-test the installed app
+        if: matrix.variant == 'packs'
+        continue-on-error: true
+        # What a customer's machine gets, rather than the build folder: the
+        # installer's own file list, the CPU pack where Setup put it.
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $dir = "$env:RUNNER_TEMP\vh-installed"
+          $p = Start-Process out/VideoHighlighter-Setup-packs.exe -Wait -PassThru -ArgumentList @(
+                 "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$dir",
+                 "/MERGETASKS=!desktopicon,!clip", "/LOG=$PWD\setup.log")
+          Write-Host "setup exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Get-Content setup.log -Tail 60; exit 1 }
+          Get-ChildItem "$dir\packs" | ForEach-Object { Write-Host "installed pack: $($_.Name)" }
+          $s = Start-Process -FilePath "$dir\VideoHighlighter.exe" -Wait -PassThru `
+                 -ArgumentList @("--smoke-test", "$PWD/smoke.mp4", "--smoke-report", "$PWD/smoke-report-installed.json")
+          if (Test-Path smoke-report-installed.json) { Get-Content smoke-report-installed.json }
+          Get-ChildItem $dir -Filter *.log -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName "debug-installed.log" }
+          Write-Host "installed app smoke exit code: $($s.ExitCode)"
+          exit $s.ExitCode
+      - name: Upload smoke reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-${{ matrix.variant }}
+          path: |
+            smoke-report-*.json
+            debug-*.log
+            setup.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload core and packs
+        if: matrix.variant == 'packs'
+        uses: actions/upload-artifact@v4
+        with:
+          name: packs-and-core
+          path: out/
+          compression-level: 0
+          retention-days: 7
