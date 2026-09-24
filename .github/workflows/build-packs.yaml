@@ -312,18 +312,25 @@ jobs:
       - name: Install silently and smoke-test the installed app
         if: matrix.variant == 'packs'
         continue-on-error: true
-        # What a customer's machine gets, rather than the build folder: the
-        # installer's own file list, the CPU pack where Setup put it.
+        # What a customer's machine gets, rather than the build folder. Both
+        # downloads are ticked, so this exercises the whole path an NVIDIA
+        # user takes: fetch from PACKS_BASE, SHA-256 check, unpack, the NVIDIA
+        # pack replacing the CPU one, CLIP landing in models/. (The runner has
+        # no GPU; torch-cu128 then runs on the CPU, which the smoke test covers.)
         shell: pwsh
         timeout-minutes: 30
         run: |
           $dir = "$env:RUNNER_TEMP\vh-installed"
           $p = Start-Process out/VideoHighlighter-Setup-packs.exe -Wait -PassThru -ArgumentList @(
                  "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$dir",
-                 "/MERGETASKS=!desktopicon,!clip", "/LOG=$PWD\setup.log")
+                 "/MERGETASKS=!desktopicon,clip,nvidia", "/LOG=$PWD\setup.log")
           Write-Host "setup exit code: $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { Get-Content setup.log -Tail 60; exit 1 }
           Get-ChildItem "$dir\packs" | ForEach-Object { Write-Host "installed pack: $($_.Name)" }
+          $packs = @(Get-ChildItem "$dir\packs" -Directory | ForEach-Object Name)
+          if (($packs -join ",") -ne "torch-cu128") { Get-Content setup.log -Tail 60; throw "expected only torch-cu128 installed, found: $($packs -join ', ')" }
+          if (-not (Test-Path "$dir\models\clip-vit-base-patch32-ov\openvino_model.xml")) { Get-Content setup.log -Tail 60; throw "CLIP was not installed into models\" }
+          Write-Host "downloads OK: torch-cu128 replaced torch-cpu, CLIP in models\"
           $s = Start-Process -FilePath "$dir\VideoHighlighter.exe" -Wait -PassThru `
                  -ArgumentList @("--smoke-test", "$PWD/smoke.mp4", "--smoke-report", "$PWD/smoke-report-installed.json")
           if (Test-Path smoke-report-installed.json) { Get-Content smoke-report-installed.json }
@@ -341,6 +348,16 @@ jobs:
             debug-*.log
             setup.log
           if-no-files-found: ignore
+          retention-days: 7
+      - name: Upload the installer
+        # On its own, so trying it is one small download rather than the
+        # whole out/ folder.
+        if: matrix.variant == 'packs'
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: out/VideoHighlighter-Setup-packs.exe
+          compression-level: 0
           retention-days: 7
       - name: Upload core and packs
         if: matrix.variant == 'packs'
