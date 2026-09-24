@@ -15,6 +15,18 @@ name: Build packs (experimental)
 
 on:
   workflow_dispatch:
+    inputs:
+      rebuild_packs:
+        description: 'Build the packs from scratch (a new torch or CLIP) instead of using the published ones'
+        type: boolean
+        default: false
+
+env:
+  # The published packs (publish-packs.yaml in Aseiel/VideoHighlighter): what
+  # a build uses unless rebuild_packs is ticked, and where installers download
+  # the NVIDIA and CLIP packs from. A new pack is published under a new tag,
+  # and this line moves to it.
+  PACKS_BASE: https://github.com/Aseiel/VideoHighlighter/releases/download/packs-torch-2.7.1
 
 permissions:
   contents: read
@@ -47,18 +59,44 @@ jobs:
           pip install yolox==0.3.0 --no-deps
           pip install pyinstaller psutil
       - name: Build torch packs
-        if: matrix.variant == 'packs'
+        if: matrix.variant == 'packs' && inputs.rebuild_packs
         run: |
           python tools/build_torch_pack.py --variant cu128 --out build-packs/torch-cu128
           python tools/build_torch_pack.py --variant cpu --out build-packs/torch-cpu
+      - name: Fetch the published packs
+        # The packs are built once and published (publish-packs.yaml); an app
+        # build downloads them, checks each against the SHA-256 in their
+        # packs.json, and unpacks the two torch packs - for the smoke tests,
+        # and because the installer carries the CPU one.
+        if: matrix.variant == 'packs' && !inputs.rebuild_packs
+        shell: pwsh
+        run: |
+          $ProgressPreference = "SilentlyContinue"
+          New-Item -ItemType Directory -Force out, build-packs, packs-dl | Out-Null
+          Invoke-WebRequest "$env:PACKS_BASE/packs.json" -OutFile out/packs.json -UseBasicParsing
+          $packs = (Get-Content out/packs.json -Raw | ConvertFrom-Json).packs
+          foreach ($p in $packs) {
+            if ($p.name -notlike "torch-*") {
+              Write-Host ("{0,8} MB  {1}  (published, downloaded by Setup)" -f [math]::Round($p.bytes / 1MB), $p.asset)
+              continue
+            }
+            $file = "packs-dl/$($p.asset)"
+            Invoke-WebRequest "$env:PACKS_BASE/$($p.asset)" -OutFile $file -UseBasicParsing
+            $sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            if ($sha -ne $p.sha256) { throw "$($p.asset): sha256 $sha, packs.json says $($p.sha256)" }
+            7z x -y $file "-obuild-packs/$($p.name)" | Out-Null
+            Write-Host ("{0,8} MB  {1}  (published, verified)" -f [math]::Round($p.bytes / 1MB), $p.asset)
+          }
       - name: Pre-convert CLIP to OpenVINO IR
+        # A packs build without rebuild_packs takes CLIP from its pack.
+        if: matrix.variant != 'packs' || inputs.rebuild_packs
         run: python -m tools.export_clip_ov
       - name: Move CLIP into its own pack
         # Model weights barely compress, so CLIP (288 MB even as FP16) would be
         # most of an installer that is otherwise a few hundred MB. As a pack
         # the installer downloads it (ticked by default) into {app}/models/,
         # which llm/clip_prefilter.py searches before the bundle.
-        if: matrix.variant == 'packs'
+        if: matrix.variant == 'packs' && inputs.rebuild_packs
         shell: pwsh
         run: |
           $dest = "build-packs/models-clip/models"
@@ -141,12 +179,21 @@ jobs:
         # renamed MSVC runtime it expects in numpy.libs.
         run: |
           python -c "import glob, os, re; root = os.path.join('dist', 'VideoHighlighter', '_internal'); exts = glob.glob(os.path.join(root, 'ml_dtypes', '**', '*.pyd'), recursive=True); assert exts, 'no ml_dtypes extension in the bundle, so onnx cannot import'; want = sorted({m.decode() for p in exts for m in re.findall(rb'[\w.+-]+-[0-9a-f]{32}\.dll', open(p, 'rb').read(), re.I)}); libs = os.path.join(root, 'numpy.libs'); have = set(os.listdir(libs)) if os.path.isdir(libs) else set(); missing = [n for n in want if n not in have]; print('ml_dtypes links against:', ', '.join(want) or 'nothing vendored'); assert not missing, 'bundled numpy.libs lacks ' + ', '.join(missing)"
-      - name: Compress core and packs
+      - name: Compress core
+        # Only to measure it: what ships is the installer, which compresses
+        # the files itself.
         if: matrix.variant == 'packs'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
           7z a -t7z -mx=9 out/core.7z ./dist/VideoHighlighter | Out-Null
+          Write-Host ("{0,8} MB  core.7z" -f [math]::Round((Get-Item out/core.7z).Length / 1MB))
+      - name: Compress packs
+        # rebuild_packs only. The result is what publish-packs.yaml publishes,
+        # taking it from this run's artifact.
+        if: matrix.variant == 'packs' && inputs.rebuild_packs
+        shell: pwsh
+        run: |
           foreach ($p in Get-ChildItem build-packs -Directory) {
             Push-Location $p.FullName
             # A model pack unpacks into the install root (models/...); a
@@ -229,10 +276,10 @@ jobs:
       - name: Build the installer (core + CPU pack, NVIDIA pack on demand)
         if: matrix.variant == 'packs'
         # packaging/installer/videohighlighter-packs.iss: Inno compresses the
-        # files itself — no .7z inside, nothing unpacked after the fact. The
-        # NVIDIA pack's URL comes from the PACKS_BASE_URL repo variable; while
-        # it is unset the checkbox installs nothing extra and the app runs on
-        # the CPU pack, which is what this run can test anyway.
+        # files itself — no .7z inside, nothing unpacked after the fact. It
+        # downloads the NVIDIA and CLIP packs from PACKS_BASE and pins their
+        # SHA-256, so after a rebuild_packs run its downloads only match once
+        # those new packs are published and PACKS_BASE points at them.
         shell: pwsh
         run: |
           Remove-Item -Recurse -Force dist/VideoHighlighter/packs -ErrorAction SilentlyContinue
@@ -247,7 +294,7 @@ jobs:
             "/DOutputName=VideoHighlighter-Setup-packs" `
             "/DDistDir=$((Resolve-Path dist/VideoHighlighter).Path)" `
             "/DCpuPackDir=$((Resolve-Path build-packs/torch-cpu).Path)" `
-            "/DPackBase=${{ vars.PACKS_BASE_URL }}" `
+            "/DPackBase=$env:PACKS_BASE" `
             "/DCudaPackAsset=$($cuda.asset)" `
             "/DCudaPackSha256=$($cuda.sha256)" `
             "/DCudaPackMB=$([int][math]::Ceiling($cuda.bytes / 1MB))" `

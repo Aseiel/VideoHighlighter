@@ -1,0 +1,91 @@
+name: Publish packs
+
+# Puts the packs — PyTorch for NVIDIA (torch-cu128), PyTorch for everyone
+# else (torch-cpu) and the CLIP model (models-clip) — on a release of this
+# public repo, where both editions' installers download them from. They hold
+# nothing edition-specific, and each is under GitHub's 2 GB asset cap.
+#
+# Run only when a pack changes (a new torch, a re-exported model), a few times
+# a year. App releases do not rebuild or re-upload them: build-packs.yaml
+# fetches the published ones, and installers pin each by SHA-256.
+#
+# So a published pack is immutable. This refuses to replace an asset that
+# already exists — a new pack gets a new tag — because every installer built
+# against the old one checks for the old bytes.
+#
+# The packs come from a finished build-packs run (its packs-and-core
+# artifact), the run whose smoke test they already passed, rather than from a
+# rebuild whose bytes would differ.
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_run:
+        description: 'build-packs run id to take the packs from'
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the packs from the build run
+        uses: actions/download-artifact@v4
+        with:
+          name: packs-and-core
+          run-id: ${{ inputs.from_run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: in
+      - name: Verify, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, os, sys
+          packs = json.load(open("in/packs.json", encoding="utf-8-sig"))["packs"]
+          keep = [p for p in packs if p["name"] in ("torch-cu128", "torch-cpu", "models-clip")]
+          if len(keep) != 3:
+              sys.exit(f"expected three packs, found {[p['name'] for p in keep]}")
+          for p in keep:
+              path = os.path.join("in", p["asset"])
+              h = hashlib.sha256()
+              with open(path, "rb") as fh:
+                  for block in iter(lambda: fh.read(1 << 20), b""):
+                      h.update(block)
+              if h.hexdigest() != p["sha256"].lower():
+                  sys.exit(f"{p['asset']}: sha256 does not match packs.json")
+              if os.path.getsize(path) != p["bytes"] or p["bytes"] < 1 << 20:
+                  sys.exit(f"{p['asset']}: size is wrong or implausibly small")
+              if p["bytes"] > 2_000_000_000:
+                  sys.exit(f"{p['asset']}: over GitHub's 2 GB asset cap")
+              print(f"ok  {p['bytes'] / 2**20:8.0f} MB  {p['asset']}  {p['version']}")
+          torch = next(p for p in keep if p["name"] == "torch-cu128")["version"].split("+")[0]
+          os.makedirs("out", exist_ok=True)
+          json.dump({"tag": f"packs-torch-{torch}", "packs": keep},
+                    open("out/packs.json", "w", encoding="utf-8"), indent=2)
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"TAG=packs-torch-{torch}\n")
+          EOF
+          assets=$(python3 -c "import json; print(' '.join('in/' + p['asset'] for p in json.load(open('out/packs.json'))['packs']))")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            existing=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+            for a in $assets out/packs.json; do
+              if echo "$existing" | grep -qx "$(basename "$a")"; then
+                echo "::error::$TAG already has $(basename "$a"); published packs are never replaced - use a new tag"
+                exit 1
+              fi
+            done
+          else
+            # A prerelease, and never "latest": the downloader Setup of the
+            # regular release asks GitHub for the latest release, and a packs
+            # release must never be what it gets.
+            gh release create "$TAG" --prerelease --latest=false --target "$GITHUB_SHA" \
+              --title "Packs: PyTorch $TAG, CLIP" \
+              --notes "Components the VideoHighlighter installers download during setup: PyTorch for NVIDIA GPUs (torch-cu128), PyTorch for CPU (torch-cpu) and the CLIP visual search model (models-clip). Not an app release - install VideoHighlighter from the latest release. Checksums are in packs.json."
+          fi
+          gh release upload "$TAG" $assets out/packs.json
+          echo "published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
