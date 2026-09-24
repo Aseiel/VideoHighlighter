@@ -68,6 +68,23 @@ _DEFAULT_LANDING = {
 }
 
 
+def install_dir_writable() -> bool:
+    """Can the updater replace files where the app is installed?
+
+    Updating in place renames and writes inside the install folder. An install
+    for all users sits under Program Files, which a normal user cannot write
+    to, and the updater does not ask for elevation. Offering "Download and
+    install" there would fail halfway through, so such an install is offered
+    the download page instead. From source this is always True: main.py only
+    offers self-install to a frozen build anyway.
+    """
+    import sys
+    if not getattr(sys, "frozen", False):
+        return True
+    from modules.system.app_paths import _is_writable
+    return _is_writable(os.path.dirname(sys.executable))
+
+
 def _channel() -> str:
     """``"pro"`` or ``"free"`` — which manifest this build should read."""
     return "pro" if (__edition__ or "").strip().lower() == "pro" else "free"
@@ -230,7 +247,7 @@ class UpdateInfo:
 
     @property
     def can_self_install(self) -> bool:
-        return bool(self.manifest_url)
+        return bool(self.manifest_url) and install_dir_writable()
 
     @property
     def headline(self) -> str:

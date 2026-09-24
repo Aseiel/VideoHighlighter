@@ -183,3 +183,33 @@ def test_manifest_url_carries_no_identifiers():
     assert url.startswith("https://")
     assert "?" not in url, "a query string is where identifiers leak in"
     assert update_check._channel() in url
+
+
+# --- where an update can be installed in place ------------------------------
+
+def _info(**kw):
+    return update_check.UpdateInfo(version="9.9.9", manifest_url="https://x/m.json", **kw)
+
+
+def test_self_install_offered_where_the_install_can_be_written(monkeypatch, tmp_path):
+    import sys
+    from modules.system import app_paths
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "VideoHighlighter.exe"))
+    monkeypatch.setattr(app_paths, "_is_writable", lambda path: True)
+    assert _info().can_self_install
+
+
+def test_read_only_install_gets_the_download_page(monkeypatch, tmp_path):
+    # An install for all users under Program Files: the updater cannot rename
+    # files there without elevation, so it must not offer to try.
+    import sys
+    from modules.system import app_paths
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "VideoHighlighter.exe"))
+    monkeypatch.setattr(app_paths, "_is_writable", lambda path: False)
+    assert not _info().can_self_install
+
+
+def test_no_manifest_means_no_self_install_anywhere():
+    assert not update_check.UpdateInfo(version="9.9.9").can_self_install

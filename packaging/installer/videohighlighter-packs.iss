@@ -24,7 +24,13 @@
 ;            /DCudaPackAsset= /DCudaPackSha256= /DCudaPackMB= /DCudaInstalledMB= \
 ;            /DInstalledMB= packaging\installer\videohighlighter-packs.iss
 ;
-; PER-USER, NO ADMIN, for the reasons written up in videohighlighter.iss.
+; FOR ME ONLY, OR FOR ALL USERS. Setup asks. "For me only" installs under
+; %LOCALAPPDATA%\Programs with no admin prompt, and is the one the in-app
+; updater can update in place. "For all users" installs under Program Files
+; after one UAC prompt; the app runs the same (app_paths.user_data_dir moves
+; its data to the user's profile when its own folder is read-only), but a
+; normal user cannot write there, so updates for such an install come as a
+; download (update_check.install_dir_writable) rather than in place.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -88,7 +94,11 @@ AppVersion={#AppVersion}
 AppPublisher={#Publisher}
 WizardStyle=modern
 PrivilegesRequired=lowest
-DefaultDirName={localappdata}\Programs\{#AppName}
+PrivilegesRequiredOverridesAllowed=dialog
+; {autopf} follows the choice: Program Files for all users, the per-user
+; %LOCALAPPDATA%\Programs for me only.
+DefaultDirName={autopf}\{#AppName}
+UsedUserAreasWarning=no
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#AppExe}
@@ -139,6 +149,7 @@ Type: filesandordirs; Name: "{app}"
 var
   DownloadPage: TDownloadWizardPage;
   NvidiaFound: Boolean;
+  NvidiaName: String;
   NvidiaDefaultApplied: Boolean;
   CudaPackDownloaded: Boolean;
   ClipPackDownloaded: Boolean;
@@ -164,7 +175,10 @@ begin
       AdapterName := Item.Name;
       Log('Display adapter: ' + AdapterName);
       if Pos('NVIDIA', Uppercase(AdapterName)) > 0 then
+      begin
         Result := True;
+        NvidiaName := AdapterName;
+      end;
     end;
   except
     Log('GPU detection failed: ' + GetExceptionMessage);
@@ -193,13 +207,34 @@ begin
     @OnDownloadProgress);
 end;
 
+// Say what the detection found, so the checkbox explains itself (and a
+// tester can tell detection from a wrong default at a glance).
+procedure DescribeNvidiaTask;
+var
+  I: Integer;
+begin
+  for I := 0 to WizardForm.TasksList.Items.Count - 1 do
+    if Pos('NVIDIA GPU acceleration', WizardForm.TasksList.ItemCaption[I]) = 1 then
+    begin
+      if NvidiaFound then
+        WizardForm.TasksList.ItemCaption[I] := WizardForm.TasksList.ItemCaption[I]
+          + ' - recommended for your ' + NvidiaName
+      else
+        WizardForm.TasksList.ItemCaption[I] := WizardForm.TasksList.ItemCaption[I]
+          + ' - no NVIDIA card found';
+      Exit;
+    end;
+end;
+
 // Tick the NVIDIA box once, the first time the page is shown, when a card was
-// found — after that the user's own choice stands, including on Back/Next.
+// found - after that the user's own choice stands, including on Back/Next.
 procedure CurPageChanged(CurPageID: Integer);
 begin
-  if (CurPageID = wpSelectTasks) and NvidiaFound and not NvidiaDefaultApplied then
+  if (CurPageID = wpSelectTasks) and not NvidiaDefaultApplied then
   begin
-    WizardSelectTasks('nvidia');
+    DescribeNvidiaTask;
+    if NvidiaFound then
+      WizardSelectTasks('nvidia');
     NvidiaDefaultApplied := True;
   end;
 end;
