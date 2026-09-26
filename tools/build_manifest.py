@@ -117,6 +117,10 @@ def generate(args) -> int:
         "base_url": args.base_url or "",
         "files": files,
     }
+    if args.compression:
+        # How the blobs are stored on the host; the hashes stay those of the
+        # files themselves. Signed with the rest, so it cannot be switched.
+        manifest["compression"] = args.compression
     if args.min_version:
         # The oldest install this release can be laid over in place. Set it
         # when the install's layout changes; older installs are then offered
@@ -241,6 +245,8 @@ def main(argv=None) -> int:
     p_gen.add_argument("--edition", default="Pro")
     p_gen.add_argument("--platform", default="windows",
                        choices=("windows", "macos", "linux"))
+    p_gen.add_argument("--compression", choices=("gzip",),
+                       help="Store blobs gzip-compressed on the host (files/<sha>.gz).")
     p_gen.add_argument("--min-version", dest="min_version",
                        help="Oldest version that may update to this one in place.")
     p_gen.add_argument("--date", help="Release date (default: today).")

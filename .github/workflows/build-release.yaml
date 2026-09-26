@@ -261,7 +261,7 @@ jobs:
           if ($env:MIN_VERSION) { $floor = @("--min-version", $env:MIN_VERSION) }
           python tools/build_manifest.py generate --root dist/VideoHighlighter `
             --version "$v" --edition "$e" --platform windows `
-            --base-url "$env:UPDATE_BASE_URL" @floor
+            --base-url "$env:UPDATE_BASE_URL" --compression gzip @floor
           if ($LASTEXITCODE -ne 0) { throw "manifest generation failed" }
       - name: Smoke test with each pack
         # The headless checks the mac release runs too (modules/system/smoke_test.py):

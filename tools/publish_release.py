@@ -109,8 +109,9 @@ def prepare(args) -> int:
     os.makedirs(blobs, exist_ok=True)
 
     linked = copied = skipped = 0
-    new_bytes = 0
+    new_bytes = stored_bytes = 0
     seen = set()
+    gz = manifest.get("compression") == "gzip"
 
     for entry in manifest["files"]:
         digest = entry["sha256"]
@@ -118,20 +119,26 @@ def prepare(args) -> int:
             continue          # same content twice in the bundle: one blob
         seen.add(digest)
 
-        destination = os.path.join(blobs, digest)
+        destination = os.path.join(blobs, digest + (".gz" if gz else ""))
         if os.path.exists(destination):
             skipped += 1
+            stored_bytes += os.path.getsize(destination)
             continue
 
         source = local_path(root, entry["path"])
-        try:
-            os.link(source, destination)
-            linked += 1
-        except OSError:
-            # Different volume, or a filesystem without hardlinks.
-            shutil.copy2(source, destination)
+        if gz:
+            _gzip_file(source, destination)
             copied += 1
+        else:
+            try:
+                os.link(source, destination)
+                linked += 1
+            except OSError:
+                # Different volume, or a filesystem without hardlinks.
+                shutil.copy2(source, destination)
+                copied += 1
         new_bytes += int(entry.get("size", 0))
+        stored_bytes += os.path.getsize(destination)
 
     prefix = release_prefix(manifest)
     release_dir = os.path.join(out, *prefix.split("/"))
@@ -150,11 +157,28 @@ def prepare(args) -> int:
     print(f"  manifest     {prefix}/{MANIFEST_FILENAME}")
     print(f"  blobs        {len(seen)} distinct ({linked} linked, {copied} copied, "
           f"{skipped} already prepared)")
-    print(f"  bytes        {total / (1024 ** 2):.1f} MB in the release")
+    print(f"  bytes        {total / (1024 ** 2):.1f} MB in the release, "
+          f"{stored_bytes / (1024 ** 2):.1f} MB as stored"
+          + (" (gzip)" if gz else ""))
     if args.github_output:
         with open(args.github_output, "a", encoding="utf-8") as handle:
             handle.write(f"prefix={prefix}\n")
     return 0
+
+
+def _gzip_file(source: str, destination: str) -> None:
+    """gzip ``source`` to ``destination`` with no timestamp or name in the
+    header, so the same file always compresses to the same bytes: a re-staged
+    release then matches what is on the host, and ``sync --size-only`` is
+    right to skip it."""
+    import gzip
+
+    tmp = destination + ".tmp"
+    with open(source, "rb") as src, open(tmp, "wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=6,
+                           mtime=0) as out:
+            shutil.copyfileobj(src, out, 1024 * 1024)
+    os.replace(tmp, destination)
 
 
 # ---------------------------------------------------------------------------
@@ -342,12 +366,15 @@ def check(args) -> int:
         listing = json.load(handle) or []
     # `aws s3api list-objects-v2 --query 'Contents[].[Key,Size]'` output.
     on_host = {str(key).rsplit("/", 1)[-1]: int(size) for key, size in listing}
+    gz = manifest.get("compression") == "gzip"
     missing = wrong = 0
     for entry in manifest["files"]:
-        size = on_host.get(entry["sha256"])
+        size = on_host.get(entry["sha256"] + (".gz" if gz else ""))
         if size is None:
             missing += 1
-        elif size != int(entry.get("size", -1)):
+        elif not gz and size != int(entry.get("size", -1)):
+            # A compressed blob's size is not in the manifest; its content is
+            # still checked by every client, against the file's own hash.
             wrong += 1
     if missing or wrong:
         problems.append(f"{missing} blob(s) missing and {wrong} the wrong size "

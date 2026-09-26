@@ -143,7 +143,8 @@ def install_update(
 
     downloaded = update_download.download_plan(
         plan, base_url, staging,
-        progress=on_bytes, should_cancel=should_cancel, opener=opener)
+        progress=on_bytes, should_cancel=should_cancel, opener=opener,
+        compression=str(manifest.get("compression") or ""))
     result.downloaded_bytes = downloaded.bytes_done
 
     if downloaded.cancelled:

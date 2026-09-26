@@ -8,7 +8,7 @@ This page is for whoever cuts releases.
 
 ```
 build-release.yaml ──► R2 bucket vh-updates (public, HTTPS)
-  builds core + packs      files/<sha256>                              blobs, deduplicated forever
+  builds core + packs      files/<sha256>.gz                           blobs, gzip, deduplicated forever
   stages blobs and the     releases/<edition>/windows/<v>/manifest.json   unsigned until step 3
   UNSIGNED manifest        releases/<edition>/windows/<v>/manifest.json.sig
                            channels/<edition>.json                     "latest is <v>"  ◄── publish-update.yaml
@@ -33,6 +33,11 @@ build-release.yaml ──► R2 bucket vh-updates (public, HTTPS)
 
 The private key never goes to CI. It decides what runs on every user's machine,
 and an Actions secret can be read by anyone who can edit a workflow.
+
+Blobs are stored gzip-compressed (`compression: gzip` in the signed manifest).
+The hash that gets verified is always the hash of the decompressed file, so
+compression changes only what travels: roughly half the bytes for the DLLs
+and Python archives that make up most of an update.
 
 ## What the app refuses
 

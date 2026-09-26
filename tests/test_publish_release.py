@@ -275,3 +275,110 @@ def test_prefix_matches_what_prepare_writes(capsys):
     assert publish_release.main([
         "prefix", "--version", "1.2.0", "--edition", "Pro"]) == 0
     assert capsys.readouterr().out.strip() == "releases/pro/windows/1.2.0"
+
+
+# --- compressed blobs ------------------------------------------------------------
+
+def test_gzip_blobs_round_trip_and_are_reproducible(tmp_path, key, monkeypatch):
+    import gzip
+
+    installed = tmp_path / "install"
+    _bundle(installed, {"app.exe": b"v1" * 1000})
+    _generate(installed, version="1.1.0")
+
+    dist = tmp_path / "dist"
+    payload = b"new build " * 5000                    # compresses well
+    _bundle(dist, {"app.exe": payload})
+    manifest = _generate(dist, version="1.2.0", compression="gzip")
+    assert manifest["compression"] == "gzip"
+
+    host = tmp_path / "host"
+    assert publish_release.main(["prepare", "--root", str(dist), "--out", str(host),
+                                 "--allow-unsigned"]) == 0
+    blob = host / "files" / (manifest["files"][0]["sha256"] + ".gz")
+    assert blob.exists() and blob.stat().st_size < len(payload) // 10
+    assert gzip.decompress(blob.read_bytes()) == payload
+    # Staged again from scratch: the same bytes, so a size-only sync is right.
+    again = tmp_path / "host2"
+    publish_release.main(["prepare", "--root", str(dist), "--out", str(again),
+                          "--allow-unsigned"])
+    assert (again / "files" / blob.name).read_bytes() == blob.read_bytes()
+
+    manifest_path = host / "releases" / "free" / "windows" / "1.2.0" / "manifest.json"
+    sig = str(manifest_path) + ".sig"
+    assert publish_release.main(["sign", "--manifest", str(manifest_path), "--key", key,
+                                 "--out", sig]) == 0
+
+    class _R(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+    fetched = []
+
+    def opener(url, headers):
+        fetched.append(url)
+        return _R((host / url[len(BASE) + 1:]).read_bytes())
+
+    monkeypatch.setattr(update_install, "_running", lambda: ("1.1.0", "Free", "windows"))
+    monkeypatch.setattr(update_download, "RETRY_DELAYS", (0, 0))
+    result = update_install.install_update(
+        f"{BASE}/releases/free/windows/1.2.0/manifest.json", str(installed),
+        fetch=lambda url: (host / url[len(BASE) + 1:]).read_bytes(), opener=opener)
+    assert result.ok, result.message
+    assert (installed / "app.exe").read_bytes() == payload
+    assert fetched[0].endswith(".gz")
+
+    # check: the listing holds .gz names.
+    listing = tmp_path / "listing.json"
+    listing.write_text(json.dumps([[f"files/{blob.name}", blob.stat().st_size]]))
+    assert publish_release.main([
+        "check", "--manifest", str(manifest_path), "--sig", sig, "--version", "1.2.0",
+        "--edition", "Free", "--base-url", BASE, "--listing", str(listing)]) == 0
+
+
+def test_a_cut_off_compressed_blob_fails_and_is_retried(tmp_path, monkeypatch):
+    import gzip
+
+    from modules.update.update_manifest import UpdatePlan
+
+    data = b"payload " * 4000
+    whole = gzip.compress(data)
+    served = []
+
+    class _R(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+    def opener(url, headers):
+        served.append(url)
+        return _R(whole[: len(whole) // 2] if len(served) == 1 else whole)
+
+    import hashlib
+    plan = UpdatePlan(version="1")
+    plan.download = [{"path": "a.bin", "size": len(data),
+                      "sha256": hashlib.sha256(data).hexdigest()}]
+    monkeypatch.setattr(update_download, "RETRY_DELAYS", (0, 0))
+    result = update_download.download_plan(plan, BASE, str(tmp_path / "stage"),
+                                           opener=opener, compression="gzip")
+    assert result.ok and len(served) == 2
+    assert (tmp_path / "stage" / "a.bin").read_bytes() == data
+    assert result.bytes_done == len(data)
+
+
+def test_a_manifest_naming_an_unknown_compression_is_refused(key):
+    raw = json.dumps({"format": um.MANIFEST_FORMAT, "version": "1", "files": [],
+                      "compression": "zstd"}).encode()
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    import base64
+    with open(key, "rb") as fh:
+        private = load_pem_private_key(fh.read(), password=None)
+    sig = base64.urlsafe_b64encode(private.sign(raw)).decode().rstrip("=")
+    assert um.verify_manifest(raw, sig) is None

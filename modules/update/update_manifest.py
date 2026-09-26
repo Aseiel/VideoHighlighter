@@ -106,6 +106,11 @@ def verify_manifest(raw: bytes, signature: str) -> Optional[dict]:
     if not isinstance(manifest.get("files"), list):
         print("update_manifest: manifest has no file list; refusing.")
         return None
+    if str(manifest.get("compression") or "") not in ("", "gzip"):
+        # A blob encoding this build cannot read: every download would fail
+        # its hash, so say so here instead of after fetching gigabytes.
+        print("update_manifest: unsupported blob compression; refusing.")
+        return None
     for entry in manifest["files"]:
         if not isinstance(entry, dict) or not is_safe_relpath(entry.get("path")):
             print(f"update_manifest: unsafe path in manifest: {entry!r}")

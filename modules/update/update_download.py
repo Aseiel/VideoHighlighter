@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -61,7 +62,14 @@ def _default_opener(url: str, headers: dict):
                                   **https_certs.opener_kwargs())
 
 
-def file_url(base_url: str, entry: dict, layout: str = "content") -> str:
+# Blob encodings a signed manifest may declare. ``gzip`` blobs live at
+# ``files/<sha256>.gz``; the hash is always of the *decompressed* file, so
+# compression changes what travels and nothing about what is verified.
+COMPRESSIONS = ("", "gzip")
+
+
+def file_url(base_url: str, entry: dict, layout: str = "content",
+             compression: str = "") -> str:
     """Where to fetch one manifest entry from.
 
     ``content`` (the default) addresses files by their SHA-256 rather than by
@@ -82,9 +90,10 @@ def file_url(base_url: str, entry: dict, layout: str = "content") -> str:
     from urllib.parse import quote
 
     base = base_url.rstrip("/")
+    suffix = ".gz" if compression == "gzip" else ""
     if layout == "path":
-        return base + "/" + quote(entry["path"])
-    return base + "/files/" + quote(str(entry["sha256"]))
+        return base + "/" + quote(entry["path"]) + suffix
+    return base + "/files/" + quote(str(entry["sha256"])) + suffix
 
 
 def _is_permanent(exc: Exception) -> bool:
@@ -109,6 +118,7 @@ def download_plan(
     should_cancel: Optional[Callable[[], bool]] = None,
     opener: Optional[Callable] = None,
     workers: int = WORKERS,
+    compression: str = "",
 ) -> DownloadResult:
     """Download every file in ``plan`` into ``staging_dir``.
 
@@ -122,6 +132,8 @@ def download_plan(
     bytes, set the pace. Callbacks are still made one at a time, from whichever
     worker has news, so a caller never sees two at once.
     """
+    if compression not in COMPRESSIONS:
+        raise ValueError(f"unsupported blob compression {compression!r}")
     result = DownloadResult()
     total = plan.download_bytes
     fetch = opener or _default_opener
@@ -172,10 +184,14 @@ def download_plan(
 
         os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
         partial = target + ".part"
-        url = file_url(base_url, entry, layout)
+        url = file_url(base_url, entry, layout, compression)
 
         for attempt in range(len(RETRY_DELAYS) + 1):
             written = 0
+            # Progress counts bytes of the file as it will be on disk, so the
+            # bar's total (the manifest's sizes) means the same either way.
+            inflate = (zlib.decompressobj(16 + zlib.MAX_WBITS)
+                       if compression == "gzip" else None)
             try:
                 with fetch(url, headers or {}) as response:
                     with open(partial, "wb") as handle:
@@ -184,7 +200,18 @@ def download_plan(
                                 break
                             block = response.read(_CHUNK)
                             if not block:
+                                if inflate is not None:
+                                    block = inflate.flush()
+                                    if not inflate.eof:
+                                        raise EOFError("compressed blob ended early")
+                                    inflate = None
+                                    if block:
+                                        handle.write(block)
+                                        written += len(block)
+                                        advance(len(block), relative)
                                 break
+                            if inflate is not None:
+                                block = inflate.decompress(block)
                             handle.write(block)
                             written += len(block)
                             advance(len(block), relative)
