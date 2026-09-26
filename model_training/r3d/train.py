@@ -339,6 +339,9 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default=None)
     parser.add_argument("--metrics-out", type=str, default=None,
                         help="Write per-class validation accuracy here as JSON")
+    parser.add_argument("--keep-split", action="store_true",
+                        help="Use train/ and val/ exactly as given: never move clips "
+                             "between them (the caller chose the held-out set)")
     args = parser.parse_args()
 
     # Override config
@@ -349,6 +352,9 @@ def main():
         os.makedirs(os.path.dirname(CONFIG["model_save_path"]), exist_ok=True)
     if args.checkpoint_dir:
         CONFIG["checkpoint_dir"] = os.path.abspath(args.checkpoint_dir)
+    if args.keep_split:
+        CONFIG["min_val_ratio"] = 0.0
+        CONFIG["min_val_per_action"] = 1
     if args.model:
         CONFIG["model_variant"] = args.model
     if args.resume:

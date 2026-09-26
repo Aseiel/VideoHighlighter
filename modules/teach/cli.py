@@ -226,6 +226,10 @@ def cmd_folders(args, project):
 
 def cmd_review(args, project):
     from modules.teach import review
+    if args.window:
+        from modules.teach.review_window import open_window
+        open_window(project.root, size=args.size, class_name=args.cls or None)
+        return {"window": "closed", "counts": Project.load(project.root).counts()}
     record = review.next_sheet(project, size=args.size, class_name=args.cls or None)
     if not record:
         return {"sheet": None, "message": "nothing waiting for review"}
@@ -273,6 +277,104 @@ def cmd_build(args, project):
 def cmd_train(args, project):
     from modules.teach.train import train_round
     return train_round(project, epochs=args.epochs, install_policy=args.install)
+
+
+def run_auto(root: str, *, train: bool = False, max_steps: int = 20) -> dict:
+    """Run every unattended step in turn; stop where someone has to look.
+
+    Each step is exactly what ``status`` names, run through this same CLI, so
+    ``auto`` can never do anything a person could not do by hand. It stops at
+    a ``judge`` step, at training unless ``train`` is set, at a failure, or if
+    a step leaves ``status`` asking for it again.
+    """
+    from modules.teach.status import next_step
+
+    done = []
+    for _ in range(max_steps):
+        step = next_step(Project.load(root))
+        args = step.get("args") or []
+        if step["who"] != "auto" or not args:
+            return {"ran": done, "stopped_at": step}
+        if args[0] == "train" and not train:
+            return {"ran": done, "stopped_at": step,
+                    "message": "Ready to train. Run `train`, or `auto --train` to "
+                               "include it (GPU minutes to hours)."}
+        if done and done[-1]["args"] == args:
+            return {"ran": done, "stopped_at": step,
+                    "error": f"`{' '.join(args)}` ran but is still the next step"}
+        print(f"auto: {' '.join(args)}", file=sys.stderr)
+        code, result = run(["--project", root, *args])
+        result = dict(result or {})
+        result.pop("next", None)
+        done.append({"args": args, "exit": code,
+                     "result": {k: v for k, v in result.items()
+                                if k not in ("items", "prototypes")}})
+        if code != 0:
+            return {"ran": done, "stopped_at": step,
+                    "error": result.get("error") or result.get("errors")}
+    return {"ran": done, "stopped_at": next_step(Project.load(root)),
+            "message": f"stopped after {max_steps} steps"}
+
+
+def cmd_auto(args, project):
+    return run_auto(project.root, train=args.train)
+
+
+def cmd_quick(args, root):
+    """Project, classes, examples and footage in one go, then ``auto``.
+
+    ``--examples`` is a folder with one subfolder per class, named after what
+    it shows, holding a few clips of it: the folder names become the classes
+    and the clips their first examples. Everything already there is kept, so
+    running it again with more examples or videos just adds them.
+    """
+    from modules.teach.cut import VIDEO_EXTENSIONS
+    from modules.teach.naming import check_name, normalize_name
+
+    if os.path.exists(os.path.join(root, project_mod.PROJECT_FILE)):
+        project = Project.load(root)
+    else:
+        if not args.task:
+            raise ValueError("a new project needs --task actions or --task objects")
+        project = Project.create(root, args.task)
+    if args.focus:
+        project.settings.focus = True
+
+    classes, problems = {}, []
+    if args.examples:
+        for folder in sorted(os.listdir(args.examples)):
+            path = os.path.join(args.examples, folder)
+            if not os.path.isdir(path) or folder.startswith((".", "_")):
+                continue
+            clips = sorted(os.path.join(path, n) for n in os.listdir(path)
+                           if n.lower().endswith(VIDEO_EXTENSIONS))
+            name = normalize_name(folder)
+            if project.get_class(name) is None:
+                blocking = [p for p in check_name(name, project.class_names(), project.task)
+                            if p.blocking]
+                if blocking:
+                    problems.append(f"{folder!r}: " + "; ".join(p.message for p in blocking))
+                    continue
+                project.add_class(name)
+            classes[name] = clips
+    if problems:
+        raise ValueError("rename these example folders: " + " | ".join(problems))
+    if not project.classes:
+        raise ValueError("no classes: give --examples <folder with one subfolder per class>")
+    project.save()
+
+    from types import SimpleNamespace
+    added = {}
+    for name, clips in classes.items():
+        if clips:
+            cmd_add_example(SimpleNamespace(cls=name, clip=clips, sample=None), project)
+            added[name] = len(clips)
+    if args.videos:
+        cmd_add_video(SimpleNamespace(items=args.videos), project)
+    project.save()
+    return {"project": project.root, "classes": project.class_names(),
+            "examples_added": added, "sources": len(project.sources),
+            **run_auto(project.root, train=args.train)}
 
 
 def cmd_status(args, project):
@@ -356,6 +458,8 @@ def parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("review", help="draw the next contact sheet")
     s.add_argument("--size", type=int, default=24)
+    s.add_argument("--window", action="store_true",
+                   help="review by clicking, in a window, instead of a sheet image")
     s.add_argument("--class", dest="cls")
 
     s = sub.add_parser("verdict", help="record what a contact sheet shows")
@@ -386,6 +490,17 @@ def parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="where it stands, and the next command")
 
+    s = sub.add_parser("auto", help="run every unattended step until one needs a look")
+    s.add_argument("--train", action="store_true", help="include training")
+
+    s = sub.add_parser("quick", help="examples folder + videos -> as far as it can go alone")
+    s.add_argument("--task", choices=project_mod.TASKS,
+                   help="needed when the project does not exist yet")
+    s.add_argument("--examples", help="folder with one subfolder of clips per class")
+    s.add_argument("--videos", nargs="+", default=[], help="files, folders or URLs")
+    s.add_argument("--focus", action="store_true")
+    s.add_argument("--train", action="store_true")
+
     s = sub.add_parser("set", help="change settings: key=value ...")
     s.add_argument("pairs", nargs="+")
     return p
@@ -398,6 +513,7 @@ COMMANDS = {
     "focus": cmd_focus, "sort": cmd_sort, "folders": cmd_folders,
     "review": cmd_review, "verdict": cmd_verdict, "boxes": cmd_boxes,
     "build": cmd_build, "train": cmd_train, "status": cmd_status, "set": cmd_set,
+    "auto": cmd_auto,
 }
 
 
@@ -409,12 +525,15 @@ def run(argv=None) -> tuple:
         with contextlib.redirect_stdout(sys.stderr):
             if args.command == "init":
                 result = cmd_init(args, root)
+            elif args.command == "quick":
+                result = cmd_quick(args, root)
+                result.setdefault("next", result.get("stopped_at"))
             else:
                 if not os.path.exists(os.path.join(root, project_mod.PROJECT_FILE)):
                     raise FileNotFoundError(f"no project at {root}; run init first")
                 project = Project.load(root)
                 result = COMMANDS[args.command](args, project)
-                if args.command not in ("status",):
+                if args.command not in ("status", "auto"):
                     from modules.teach.status import next_step
                     result = dict(result or {})
                     result.setdefault("next", next_step(Project.load(root)))

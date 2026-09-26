@@ -26,7 +26,8 @@ def _cmd(project: Project, *args) -> str:
 
 
 def _step(project, who: str, why: str, *args) -> dict:
-    return {"who": who, "why": why, "command": _cmd(project, *args) if args else ""}
+    return {"who": who, "why": why, "command": _cmd(project, *args) if args else "",
+            "args": list(args)}
 
 
 def next_step(project: Project) -> dict:
@@ -94,6 +95,14 @@ def next_step(project: Project) -> dict:
         return _step(project, "judge", f"Need at least {MIN_TO_TRAIN} accepted samples of "
                      f"{', '.join(repr(n) for n in missing)}. Add footage where they "
                      "appear more, or review further.", "add-video", "<path or url>")
+
+    from modules.teach import autolabel
+    audits = {n: autolabel.audits_needed(project, n) for n in names + ["_none"]}
+    owed = {n: k for n, k in audits.items() if k}
+    if owed:
+        listed = ", ".join(f"{k} of {n!r}" for n, k in owed.items())
+        return _step(project, "judge", f"Spot-check what was auto-accepted before training "
+                     f"on it ({listed}); review sheets include them.", "review")
 
     from modules.teach.build import built_signature, dataset_signature
 

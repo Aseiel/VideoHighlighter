@@ -45,6 +45,7 @@ REVIEW_DIR = "review"
 DEFAULT_BATCH = 24
 CONFIDENT_SHARE = 0.1
 NEGATIVE_SHARE = 0.15
+AUDIT_SHARE = 0.15
 
 TILE_HEIGHT = 150
 CAPTION_HEIGHT = 22
@@ -65,11 +66,12 @@ def pick_batch(project: Project, size: int = DEFAULT_BATCH,
                class_name: Optional[str] = None, seed: int = 0) -> list:
     """The next samples worth a person's glance, most useful first."""
     pending = [s for s in project.samples if s.verdict == PENDING and s.scores]
+    has_auto = any(s.is_auto for s in project.samples)
     if class_name:
         pending = [s for s in pending
                    if s.proposed == class_name or _top(s)[0] == class_name
                    or s.model_proposed == class_name]
-    if not pending:
+    if not pending and not has_auto:
         return []
 
     counts = project.counts()
@@ -93,6 +95,15 @@ def pick_batch(project: Project, size: int = DEFAULT_BATCH,
     confident = sorted((s for s in rest if s.proposed in names),
                        key=lambda s: -s.margin)
 
+    # Spot checks of auto-accepted samples, most-needed class first.
+    from modules.teach import autolabel
+    audit_pool = sorted((s for s in project.samples if s.is_auto
+                         and (not class_name or s.label == class_name)),
+                        key=lambda s: (-autolabel.audits_needed(
+                            project, s.label if s.verdict == ACCEPTED else NONE),
+                            s.margin))
+    n_audit = min(len(audit_pool), max(1, int(size * AUDIT_SHARE))) if audit_pool else 0
+
     n_confident = max(1, int(size * CONFIDENT_SHARE)) if confident else 0
     n_negative = min(len(negatives), max(1, int(size * NEGATIVE_SHARE))) if negatives else 0
 
@@ -107,7 +118,7 @@ def pick_batch(project: Project, size: int = DEFAULT_BATCH,
                 seen.add(s.id)
 
     take(disagree, size)
-    main_limit = size - n_confident - n_negative
+    main_limit = size - n_confident - n_negative - n_audit
     # Interleave the two kinds of boundary case so neither starves the other.
     merged = [x for pair in zip(unsure, narrow) for x in pair]
     merged += unsure[len(narrow):] + narrow[len(unsure):]
@@ -117,9 +128,10 @@ def pick_batch(project: Project, size: int = DEFAULT_BATCH,
     pool = [s for s in confident[: max(n_confident * 5, 10)] if s.id not in seen]
     rng.shuffle(pool)
     take(pool, len(chosen) + n_confident)
+    take(audit_pool, len(chosen) + n_audit)
     # Anything left over fills the batch, so a small project is not stuck at
     # half a sheet while samples wait.
-    take(merged + negatives + confident, size)
+    take(merged + negatives + confident + audit_pool, size)
     return chosen[:size]
 
 
@@ -127,7 +139,17 @@ def pick_batch(project: Project, size: int = DEFAULT_BATCH,
 # The sheet
 # ---------------------------------------------------------------------------
 
+def guess_of(sample) -> str:
+    """What a tile asks to be confirmed: an auto-accepted sample's decision,
+    or an undecided one's proposal."""
+    if sample.is_auto:
+        return sample.label if sample.verdict == ACCEPTED else NONE
+    return sample.proposed
+
+
 def caption(sample) -> str:
+    if sample.is_auto:
+        return f"auto: {guess_of(sample)} (spot check)"
     if sample.proposed == UNSURE:
         name, score = _top(sample)
         text = f"{name}? ({score:.2f})" if name else "unsure"
@@ -213,7 +235,8 @@ def _next_sheet_number(review_dir: str) -> int:
 def next_sheet(project: Project, size: int = DEFAULT_BATCH,
                class_name: Optional[str] = None,
                frame_reader: Optional[Callable] = None,
-               renderer: Optional[Callable] = None) -> dict:
+               renderer: Optional[Callable] = None,
+               keep_tiles: bool = False) -> dict:
     """Pick a batch and draw it. Returns what the sheet holds, or ``{}``."""
     frame_reader = frame_reader or embed_mod.read_frames
     renderer = renderer or render_sheet
@@ -228,7 +251,7 @@ def next_sheet(project: Project, size: int = DEFAULT_BATCH,
     for n, sample in enumerate(batch, 1):
         tiles.append(_tile(frame_reader(sample.path, frames_per_tile), TILE_HEIGHT))
         captions.append(caption(sample))
-        items.append({"n": n, "sample": sample.id, "proposed": sample.proposed,
+        items.append({"n": n, "sample": sample.id, "proposed": guess_of(sample),
                       "caption": captions[-1]})
     image = os.path.join(review_dir, f"sheet-{number:04d}.jpg")
     columns = 2 if frames_per_tile > 1 else 4
@@ -240,6 +263,9 @@ def next_sheet(project: Project, size: int = DEFAULT_BATCH,
     with open(os.path.join(review_dir, f"sheet-{number:04d}.json"), "w",
               encoding="utf-8") as handle:
         json.dump(record, handle, indent=1)
+    if keep_tiles:
+        # The pictures themselves, for the review window; not saved.
+        record["tiles"] = tiles
     return record
 
 
@@ -325,7 +351,8 @@ def apply_verdicts(project: Project, number: int, *, accept: str = "",
         if sample is None:
             errors.append(f"tile {n}: sample {by_n[n]['sample']} is gone")
             continue
-        if verdict == ACCEPTED and not label and sample.proposed not in names:
+        label = label or (by_n[n]["proposed"] if verdict == ACCEPTED else "")
+        if verdict == ACCEPTED and label not in names:
             errors.append(f"tile {n} was a guess of {sample.proposed!r}; "
                           "say which class it is (relabel) instead of accepting")
             continue
@@ -336,6 +363,8 @@ def apply_verdicts(project: Project, number: int, *, accept: str = "",
     if errors:
         return {"applied": 0, "errors": errors}
 
+    from modules.teach import autolabel
+    auto = autolabel.apply(project)
     sheet["applied"] = True
     with open(project.path(REVIEW_DIR, f"sheet-{number:04d}.json"), "w",
               encoding="utf-8") as handle:
@@ -345,7 +374,8 @@ def apply_verdicts(project: Project, number: int, *, accept: str = "",
     for verdict, label in decided.values():
         key = label or verdict
         tally[key] = tally.get(key, 0) + 1
-    return {"applied": len(decided), "decisions": tally, "errors": []}
+    return {"applied": len(decided), "decisions": tally, "errors": [],
+            "auto": {"accepted": auto["accepted"], "reverted": auto["reverted"]}}
 
 
 def from_folders(project: Project, confirm: Sequence[str] = ()) -> dict:
@@ -398,4 +428,6 @@ def from_folders(project: Project, confirm: Sequence[str] = ()) -> dict:
             key = label or verdict
             tally[key] = tally.get(key, 0) + 1
     project.save()
+    from modules.teach import autolabel
+    autolabel.apply(project)
     return {"applied": sum(tally.values()), "decisions": tally, "errors": errors}

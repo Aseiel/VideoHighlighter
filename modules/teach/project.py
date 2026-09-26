@@ -47,6 +47,9 @@ REJECTED = "rejected"      # not usable (wrong, unclear, a bad cut) — never tr
 NEGATIVE = "negative"      # shows none of the classes — trained on as "not these"
 VERDICTS = (PENDING, ACCEPTED, REJECTED, NEGATIVE)
 
+# decided_by for auto-accepted samples.
+AUTO = "auto"
+
 # Proposal when no class stood out, and when every class scored low.
 UNSURE = "_unsure"
 NONE = "_none"
@@ -96,12 +99,24 @@ class Sample:
     model_confidence: float = 0.0
     verdict: str = PENDING
     label: str = ""
-    decided_by: str = ""                             # "example", "sheet", "folders", ...
+    decided_by: str = ""                             # "example", "sheet", "folders", "auto"
     split: str = ""
+    # What auto-accept said, kept after a person re-checks it: the record the
+    # spot checks are scored from (``autolabel``).
+    auto_label: str = ""
 
     @property
     def is_decided(self) -> bool:
         return self.verdict != PENDING
+
+    @property
+    def is_auto(self) -> bool:
+        """Decided by auto-accept and not looked at by anyone since."""
+        return self.decided_by == AUTO
+
+    @property
+    def is_human(self) -> bool:
+        return self.is_decided and not self.is_auto
 
     # label_store.segments() groups by these two names.
     @property
@@ -125,6 +140,14 @@ class Settings:
     val_fraction: float = 0.2
     boxes_per_sample: int = 3        # frames labelled per accepted object sample
     epochs: int = 30
+    # Auto-accept (``autolabel``): confident guesses decided without a review,
+    # once a class has enough checked samples to be judged by, and while spot
+    # checks keep agreeing with it.
+    auto_accept: bool = True
+    auto_gate: float = 0.9           # calibrated score: ~as close as the examples are
+    auto_margin: float = 0.3         # and clearly ahead of every other class
+    auto_min_checked: int = 5        # checked samples a class needs first
+    auto_max_error: float = 0.2      # spot checks overturning more: off for that class
 
 
 def slugify(text: str) -> str:
@@ -288,6 +311,8 @@ class Project:
             sample.label = ""
         sample.verdict = verdict
         sample.decided_by = by
+        if by == AUTO:
+            sample.auto_label = label if verdict == ACCEPTED else NONE
 
     def accepted(self, class_name: Optional[str] = None) -> list:
         return [s for s in self.samples if s.verdict == ACCEPTED

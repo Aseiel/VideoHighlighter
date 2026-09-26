@@ -17,6 +17,16 @@ command prints one JSON object; `status` names the next command.
    - `next.who` is `judge` and you cannot see images;
    - a command returns `error`, or training fails (read `runs/<n>/train.log`).
 
+## Fastest start
+
+If the user has example clips, ask them to put them in one subfolder per
+class, named after what it shows, then run
+`quick --task <actions|objects> --examples <folder> --videos <files/folders>`.
+It runs every unattended step. After a judge step, `auto` continues
+(`auto --train` includes training). A person reviews fastest with
+`review --window`. Tiles show their guesses; they click the wrong ones and
+press Enter.
+
 ## Starting a project
 
 - Ask what to find and for videos (files, folders or URLs) if not given.
@@ -40,7 +50,10 @@ command prints one JSON object; `status` names the next command.
   tile really matches its caption.
 - When unsure about a tile, reject it: a wrong label hurts more than a
   missing one.
-- Run `sort` again after every one or two sheets.
+- Run `sort` again after every one or two sheets (the window does it for you).
+- Tiles captioned "spot check" were auto-accepted. Judge them as strictly as
+  any other tile: they are how auto-accept is kept honest, and training waits
+  until each class has a few.
 
 ## Rules
 

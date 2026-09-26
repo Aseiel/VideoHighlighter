@@ -32,6 +32,8 @@ from typing import Optional
 from modules.teach.project import ACCEPTED, ACTIONS, NEGATIVE, TRAIN, VAL, Project
 
 DATASET_DIR = "dataset"
+# Neither train nor validation: see assign_splits.
+SKIP = "skip"
 BUILT_FILE = "built.json"
 MIN_VAL_PER_CLASS = 2
 
@@ -41,7 +43,15 @@ def _stable(key: str) -> int:
 
 
 def assign_splits(project: Project, val_fraction: Optional[float] = None) -> dict:
-    """Give every accepted (and negative) sample without a split one, for good."""
+    """Give every accepted (and negative) sample without a split one, for good.
+
+    Only samples a person decided are ever held out: the held-out set is what
+    says whether a model is any good, and a label nobody checked cannot say
+    that. Auto-accepted samples train. One that sits in the same stretch of
+    footage as a held-out sample is left out of both (``SKIP``): in training it
+    would be a near-copy of a question the model is later scored on. If a person
+    checks it later, it joins its stretch in validation.
+    """
     from modules.vision.label_store import segments
 
     fraction = project.settings.val_fraction if val_fraction is None else val_fraction
@@ -51,20 +61,25 @@ def assign_splits(project: Project, val_fraction: Optional[float] = None) -> dic
                    if name == NEGATIVE else project.accepted(name))
         if not members:
             continue
-        need = max(MIN_VAL_PER_CLASS, math.ceil(fraction * len(members)))
+        for sample in members:
+            if sample.split == SKIP and sample.is_human:
+                sample.split = VAL
+        human = [s for s in members if s.is_human]
+        need = max(MIN_VAL_PER_CLASS, math.ceil(fraction * len(human)))
         have = sum(1 for s in members if s.split == VAL)
         fresh = [s for s in members if not s.split]
         # Whole segments, in an order fixed by their content rather than by
         # when they were added, so a rebuild makes the same choice.
         groups = sorted(segments(fresh), key=lambda g: _stable(g[0].id))
         for group in groups:
-            side = VAL if have < need else TRAIN
+            checked = [s for s in group if s.is_human]
+            side = VAL if (checked and have < need) else TRAIN
             for sample in group:
-                sample.split = side
+                sample.split = side if (side == TRAIN or sample.is_human) else SKIP
             if side == VAL:
-                have += len(group)
-        groups_of[name] = {"train": sum(1 for s in members if s.split == TRAIN),
-                           "val": sum(1 for s in members if s.split == VAL)}
+                have += len(checked)
+        groups_of[name] = {k: sum(1 for s in members if s.split == v)
+                           for k, v in (("train", TRAIN), ("val", VAL), ("skipped", SKIP))}
     project.save()
     return groups_of
 
@@ -85,6 +100,8 @@ def build_actions(project: Project) -> dict:
     os.makedirs(root)
     written = 0
     for sample in project.accepted():
+        if sample.split not in (TRAIN, VAL):
+            continue
         # The person-focused crops when the cropper made them: those are what
         # the model will be shown, and each is its own training clip.
         files = sample.focus_paths or [sample.path]

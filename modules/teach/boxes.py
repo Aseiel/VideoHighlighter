@@ -42,6 +42,12 @@ BOX_REVIEW_PREFIX = "boxes"
 # A crop must beat the frame's other crops by this much to be the class's box.
 STANDOUT = 0.02
 MIN_AREA = 0.0015          # fraction of the frame; smaller is noise, not a thing
+TILE_STANDOUT = 0.03       # a region must beat the frame's typical one by this
+SHRINK_STEPS = 8
+SHRINK_TOLERANCE = 0.01    # likeness a shrink may cost before it stops
+AUTO_BOX_CONFIDENCE = 0.6  # a detector's own class at this confidence: no sheet
+MIN_CROP_EXAMPLES = 3      # accepted boxes before crops replace the class name
+MAX_CROP_EXAMPLES = 60
 
 
 def store(project: Project) -> LabelStore:
@@ -78,11 +84,9 @@ def propose(project: Project, detector, embedder, *,
     labels = store(project)
     done = _labelled_keys(labels)
     stock = set(load_vocabulary(OBJECTS))
-    text_vectors = {spec.name: embed_mod.unit(embedder.texts(
-        [PROMPTS[OBJECTS].format(spec.name)] + ([spec.description] if spec.description else []))
-        .mean(axis=0)) for spec in project.classes}
+    class_vectors = _class_vectors(project, labels, embedder, read_at)
 
-    added, empty = 0, 0
+    added, empty, auto_accepted = 0, 0, 0
     for sample in project.samples:
         if sample.verdict == SAMPLE_NEGATIVE:
             moment = frame_times(sample.duration, 1)[0]
@@ -104,23 +108,112 @@ def propose(project: Project, detector, embedder, *,
             if model_detector is not None:
                 box = _from_detector(model_detector, frame, sample.label, "model")
             if box is None and sample.label in stock:
-                box = _from_detector(detector, frame, sample.label, "prompt")
+                box = _from_detector(detector, frame, sample.label, "stock")
+            vector = class_vectors[sample.label]
             if box is None:
-                box = _by_clip(detector, embedder, frame, text_vectors[sample.label])
+                box = _by_clip(detector, embedder, frame, vector)
+            if box is None:
+                box = _by_tiles(embedder, frame, vector)
             if box is None:
                 empty += 1
                 continue
             coords, confidence, source = box
+            # A detector's own box for its own class, or last round's model,
+            # at a confidence detectors rarely reach by accident: accepted
+            # without a sheet. CLIP-picked regions always get a look.
+            sure = (project.settings.auto_accept and source in ("model", "stock")
+                    and confidence >= AUTO_BOX_CONFIDENCE)
             labels.add(LabelledBox(video=sample.path, time=moment,
                                    class_name=sample.label, box=coords,
-                                   source=source, confidence=confidence,
-                                   verdict=PENDING))
+                                   source="prompt" if source == "stock" else source,
+                                   confidence=confidence,
+                                   verdict=ACCEPTED if sure else PENDING))
+            auto_accepted += sure
             done.add((sample.path, moment))
             added += 1
     labels.save()
     project.save()
-    return {"proposed": added, "frames_without_a_proposal": empty,
+    return {"proposed": added, "auto_accepted": auto_accepted,
+            "frames_without_a_proposal": empty,
             "pending": len(labels.pending())}
+
+
+def _class_vectors(project: Project, labels: LabelStore, embedder, read_at) -> dict:
+    """What each class looks like, as one CLIP vector.
+
+    From the crops of its accepted boxes once there are a few — a picture of
+    the thing matches pictures far better than its name does — and from its
+    name and description until then. Crop vectors are cached, so each accepted
+    box is embedded once, ever.
+    """
+    cache = embed_mod.VectorCache(project.root, getattr(embedder, "model_id", ""))
+    out = {}
+    for spec in project.classes:
+        crops = []
+        for box in labels.accepted():
+            if box.class_name != spec.name or box.source == "hand" and not any(box.box):
+                continue
+            key = f"box:{box.video}@{box.time:.3f}:{','.join(f'{v:.4f}' for v in box.box)}"
+            vector = cache.get(key)
+            if vector is None:
+                frame = read_at(box.video, box.time)
+                if frame is None:
+                    continue
+                h, w = frame.shape[:2]
+                x, y, bw, bh = box.pixels(w, h)
+                crop = frame[int(y):int(y + bh), int(x):int(x + bw)]
+                if not crop.size:
+                    continue
+                vector = embed_mod.unit(embedder.images([crop]))[0]
+                cache.put(key, vector)
+            crops.append(vector)
+            if len(crops) >= MAX_CROP_EXAMPLES:
+                break
+        if len(crops) >= MIN_CROP_EXAMPLES:
+            out[spec.name] = embed_mod.unit(np.mean(crops, axis=0))
+        else:
+            prompts = [PROMPTS[OBJECTS].format(spec.name)] + (
+                [spec.description] if spec.description else [])
+            out[spec.name] = embed_mod.unit(embedder.texts(prompts).mean(axis=0))
+    cache.save()
+    return out
+
+
+def _by_tiles(embedder, frame, class_vector):
+    """For a thing no detector knows: the region of the frame that looks most
+    like the class, then shrunk while it still does.
+
+    Overlapping regions at two sizes (``llm.category_scoring.tile_rects``);
+    the winner must stand out from the frame's typical region. Then each
+    side is pulled in by a step as long as the crop's likeness does not drop
+    by more than ``SHRINK_TOLERANCE``, so the box ends up around the thing
+    rather than around a fixed fraction of the frame. Coarser than a
+    detector's box, which is why these always go to review.
+    """
+    from llm.category_scoring import crop_tiles, tile_rects
+
+    h, w = frame.shape[:2]
+    tiles = tile_rects(w, h, 3, 0.5) + tile_rects(w, h, 4, 0.35)
+    crops = [c for c in crop_tiles(frame, tiles)]
+    sims = embed_mod.unit(embedder.images(crops)) @ class_vector
+    best = int(np.argmax(sims))
+    if float(sims[best] - np.percentile(sims, 40)) < TILE_STANDOUT:
+        return None
+    x1, y1, x2, y2 = tiles[best]
+    score = float(sims[best])
+    for _ in range(SHRINK_STEPS):
+        dx, dy = max(1, int((x2 - x1) * 0.15)), max(1, int((y2 - y1) * 0.15))
+        options = [(x1 + dx, y1, x2, y2), (x1, y1 + dy, x2, y2),
+                   (x1, y1, x2 - dx, y2), (x1, y1, x2, y2 - dy)]
+        options = [o for o in options if o[2] - o[0] >= 16 and o[3] - o[1] >= 16]
+        if not options:
+            break
+        vs = embed_mod.unit(embedder.images(crop_tiles(frame, options))) @ class_vector
+        pick = int(np.argmax(vs))
+        if float(vs[pick]) < score - SHRINK_TOLERANCE:
+            break
+        (x1, y1, x2, y2), score = options[pick], max(score, float(vs[pick]))
+    return (x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h), score, "category"
 
 
 def _normalise(det, width: int, height: int) -> tuple:

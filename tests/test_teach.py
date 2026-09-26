@@ -533,11 +533,14 @@ def _frame(*_):
 def test_boxes_are_proposed_from_the_stock_detector_and_clip(tmp_path):
     p = _object_project(tmp_path)
     result = boxes.propose(p, FakeDetector(), CropEmbedder(), read_at=_frame)
-    assert result["proposed"] == 2
+    assert result["proposed"] == 2 and result["auto_accepted"] == 1
     labels = boxes.store(p)
-    by_class = {b.class_name: b for b in labels.pending()}
-    # A stock class takes the detector's own box...
+    by_class = {b.class_name: b for b in labels.boxes if b.class_name}
+    # A stock class takes the detector's own box, and at that confidence
+    # needs no review...
     assert by_class["person"].box == pytest.approx((0.1, 0.1, 0.3, 0.5))
+    assert by_class["person"].verdict == ACCEPTED
+    assert by_class["alpha widget"].verdict == PENDING
     # ...anything else, the detected region that looks like it.
     assert by_class["alpha widget"].box == pytest.approx((0.6, 0.2, 0.3, 0.3))
     assert len(labels.negatives()) == 1
@@ -551,11 +554,9 @@ def test_box_verdicts_and_the_labeller_worklist(tmp_path):
     boxes.propose(p, FakeDetector(), CropEmbedder(), read_at=_frame)
     record = boxes.next_sheet(p, read_at=lambda *a: None,
                               renderer=lambda *a, **k: None)
-    person = [i["n"] for i in record["items"] if i["class_name"] == "person"]
-    other = [i["n"] for i in record["items"] if i["class_name"] != "person"]
-    result = boxes.apply_verdicts(p, record["sheet"], accept=",".join(map(str, person)),
-                                  reject=",".join(map(str, other)))
-    assert result == {"applied": 2, "errors": []}
+    assert [i["class_name"] for i in record["items"]] == ["alpha widget"]
+    result = boxes.apply_verdicts(p, record["sheet"], reject="1")
+    assert result == {"applied": 1, "errors": []}
     todo = boxes.labeler_worklist(p)
     assert [t["class"] for t in todo] == ["alpha widget"]
 
@@ -639,3 +640,202 @@ def test_a_sample_the_cropper_or_the_proposer_found_nothing_in_is_not_asked_abou
 
     boxes.propose(o, Blind(), CropEmbedder(), read_at=_frame)
     assert "propose" not in status.next_step(Project.load(o.root))["command"]
+
+
+# --- auto-accept -------------------------------------------------------------------
+
+from modules.teach import autolabel  # noqa: E402
+from modules.teach.project import AUTO  # noqa: E402
+
+
+def _confident(project, n_alpha=20, checked=5):
+    """n_alpha pending samples confidently guessed alpha; ``checked`` of them
+    accepted by a person first."""
+    _add_samples(project, [0] * (n_alpha + checked))
+    for i, s in enumerate(project.samples):
+        s.scores = {"alpha move": 1.2, "beta move": 0.1}
+        s.proposed, s.margin = "alpha move", 1.1
+        if i < checked:
+            project.decide(s, ACCEPTED, "alpha move", by="sheet:1")
+    project.save()
+
+
+def test_nothing_is_auto_accepted_before_a_class_has_checked_samples(project):
+    _confident(project, checked=4)
+    result = autolabel.apply(project)
+    assert result["accepted"] == {}
+    assert "4 of 5" in result["classes"]["alpha move"]["why"]
+
+
+def test_confident_guesses_are_accepted_once_a_class_is_checked(project):
+    _confident(project, checked=5)
+    result = autolabel.apply(project)
+    assert result["accepted"] == {"alpha move": 20}
+    auto = [s for s in project.samples if s.is_auto]
+    assert len(auto) == 20 and all(s.auto_label == "alpha move" for s in auto)
+
+
+def test_a_narrow_or_disputed_guess_is_left_for_review(project):
+    _confident(project, checked=5)
+    project.samples[10].margin = 0.05
+    project.samples[11].model_proposed = "beta move"
+    autolabel.apply(project)
+    assert project.samples[10].verdict == PENDING
+    assert project.samples[11].verdict == PENDING
+
+
+def test_spot_checks_that_overturn_too_much_switch_it_off_and_take_it_back(project):
+    _confident(project, checked=5)
+    autolabel.apply(project)
+    auto = [s for s in project.samples if s.is_auto]
+    # A person checks five and overturns two: 40% > 20%.
+    for s in auto[:3]:
+        project.decide(s, ACCEPTED, "alpha move", by="sheet:2")
+    for s in auto[3:5]:
+        project.decide(s, ACCEPTED, "beta move", by="sheet:2")
+    result = autolabel.apply(project)
+    assert result["reverted"] == 15
+    assert not result["classes"]["alpha move"]["on"]
+    assert not any(s.is_auto for s in project.samples)
+    # ... and it stays off: the next sort decides nothing for that class.
+    assert autolabel.apply(project)["accepted"] == {}
+
+
+def test_review_sheets_carry_spot_checks_and_they_are_scored(project):
+    _confident(project, checked=5)
+    autolabel.apply(project)
+    assert autolabel.audits_needed(project, "alpha move") == 3
+    record = review.next_sheet(project, size=10, frame_reader=lambda *a, **k: [],
+                               renderer=lambda *a, **k: None)
+    audit = [i for i in record["items"] if "spot check" in i["caption"]]
+    assert audit and all(i["proposed"] == "alpha move" for i in audit)
+    review.apply_verdicts(project, record["sheet"], accept_rest=True)
+    checks, overturned = autolabel.spot_checks(project, "alpha move")
+    assert checks == len(audit) and overturned == 0
+
+
+def test_status_asks_for_spot_checks_before_training_on_auto_labels(project):
+    _confident(project, n_alpha=25, checked=25)
+    for s in project.samples[:25]:
+        s.verdict, s.decided_by = PENDING, ""
+    project.samples = project.samples[:25]
+    for s in project.samples[:5]:
+        project.decide(s, ACCEPTED, "alpha move", by="sheet:1")
+    project.classes = project.classes[:1]
+    project.classes[0].target = 20
+    autolabel.apply(project)
+    step = status.next_step(project)
+    assert step["who"] == "judge" and "Spot-check" in step["why"]
+
+
+def test_only_checked_samples_are_ever_held_out(project):
+    _confident(project, n_alpha=30, checked=10)
+    autolabel.apply(project)
+    build.assign_splits(project)
+    val = [s for s in project.samples if s.split == VAL]
+    assert val and all(s.is_human for s in val)
+    skipped = [s for s in project.samples if s.split == build.SKIP]
+    assert all(s.is_auto for s in skipped)
+    # A skipped neighbour a person later checks joins validation.
+    if skipped:
+        project.decide(skipped[0], ACCEPTED, "alpha move", by="sheet:3")
+        build.assign_splits(project)
+        assert skipped[0].split == VAL
+
+
+def test_auto_prototypes_ignore_auto_accepted_samples(project):
+    truth = _add_samples(project, [0, 0, 1, 1])
+    project.decide(project.samples[0], ACCEPTED, "alpha move", by="sheet:1")
+    project.decide(project.samples[1], ACCEPTED, "alpha move", by=AUTO)
+    vectors = {s.id: _direction(i) for i, s in enumerate(project.samples)}
+    protos = {p.name: p for p in sort.build_prototypes(project, vectors, FakeEmbedder())}
+    assert protos["alpha move"].n_examples == 1
+    assert truth  # (layout used)
+
+
+# --- auto / quick -------------------------------------------------------------------
+
+def test_auto_runs_unattended_steps_and_stops_where_someone_must_look(tmp_path, monkeypatch):
+    p = Project.create(str(tmp_path / "a"), ACTIONS)
+    p.add_class("alpha move")
+    p.save()
+    truth = _add_samples(p, [0] * 6 + [-1] * 4)
+    for s in p.sources:
+        s.cut = False
+    p.save()
+    ran = []
+
+    def fake_cut(proj, **kw):
+        for s in proj.sources:
+            s.cut = True
+        proj.save()
+        ran.append("cut")
+        return {"samples_made": 0}
+
+    monkeypatch.setattr(cut, "cut_project", fake_cut)
+    monkeypatch.setattr(cli, "make_embedder", FakeEmbedder)
+    import modules.teach.embed as embed_mod
+    monkeypatch.setattr(embed_mod, "read_frames", _reader(truth))
+
+    result = cli.run_auto(p.root)
+    assert [r["args"][0] for r in result["ran"]] == ["cut", "sort"]
+    assert result["stopped_at"]["who"] == "judge"
+
+
+def test_quick_builds_a_project_from_an_examples_folder(tmp_path, monkeypatch):
+    examples = tmp_path / "examples"
+    for folder in ("Alpha_Move", "beta move", "_ignored"):
+        (examples / folder).mkdir(parents=True)
+        (examples / folder / "one.mp4").write_bytes(b"x")
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "long.mp4").write_bytes(b"x")
+    monkeypatch.setattr(cut, "probe_duration", lambda path: 5.0)
+    monkeypatch.setattr(cli, "run_auto", lambda root, train=False: {"ran": [], "stopped_at": {}})
+
+    code, result = cli.run(["--project", str(tmp_path / "q"), "quick", "--task", "actions",
+                            "--examples", str(examples), "--videos", str(videos)])
+    assert code == 0, result
+    assert result["classes"] == ["alpha move", "beta move"]
+    assert result["examples_added"] == {"alpha move": 1, "beta move": 1}
+    project = Project.load(str(tmp_path / "q"))
+    assert [s.verdict for s in project.samples] == [ACCEPTED, ACCEPTED]
+    assert len(project.sources) == 3            # two example clips + one video
+
+    bad = tmp_path / "bad"
+    (bad / "123").mkdir(parents=True)
+    code, result = cli.run(["--project", str(tmp_path / "q2"), "quick", "--task", "actions",
+                            "--examples", str(bad)])
+    assert code == 2 and "rename" in result["error"]
+
+
+def test_a_thing_no_detector_knows_is_found_by_scanning_regions(tmp_path):
+    p = _object_project(tmp_path)
+
+    class Blind:
+        def detect(self, frame):
+            return []
+
+    def frame(*_):
+        f = np.zeros((90, 160, 3), np.uint8)
+        f[30:70, 100:150] = 200          # the thing: bright, right of centre
+        return f
+
+    class Brightness(FakeEmbedder):
+        """Likeness to the class = how much of the crop is the bright thing."""
+
+        def images(self, frames):
+            out = []
+            for f in frames:
+                share = float((f > 100).mean()) if isinstance(f, np.ndarray) else 0.0
+                out.append(share * _direction(0) + (1 - share) * _direction(DIM - 1))
+            v = np.array(out, np.float32)
+            return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+    result = boxes.propose(p, Blind(), Brightness(), read_at=frame)
+    found = [b for b in boxes.store(p).boxes if b.class_name == "alpha widget"]
+    assert result["proposed"] >= 1 and found
+    x, y, w, h = found[0].box
+    assert found[0].source == "category" and found[0].verdict == PENDING
+    # Around the thing (x 0.62-0.94, y 0.33-0.78), not a fixed half-frame.
+    assert x >= 0.45 and x + w <= 1.0 and w < 0.5

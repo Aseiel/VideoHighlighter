@@ -25,7 +25,53 @@ Everything lives in one project folder (by default `<user data>/teach/<name>`),
 never in the repository. Every step is safe to re-run, and `status` always says
 which one comes next.
 
-## A whole run
+## The quickest way
+
+Make a folder with one subfolder per thing to find, named after it, holding a
+few short clips that show it (3-5 is plenty). Then:
+
+```bash
+python -m modules.teach --project my-first quick --task actions \
+    --examples ~/examples/ --videos ~/Videos/footage/
+```
+
+```
+examples/
+  <first thing>/    a.mp4  b.mp4  c.mp4
+  <second thing>/   a.mp4  b.mp4
+```
+
+That creates the project, makes the folder names the classes and the clips
+their first examples, adds the footage, and runs everything that needs nobody:
+cut, crop (with `--focus`), sort, auto-accept, boxes, build. It stops at the
+first point where someone has to look, which is nearly always "check these
+guesses". Then:
+
+```bash
+python -m modules.teach --project my-first review --window
+```
+
+Each tile already shows its guess. Click the wrong ones, then press Enter. It
+re-sorts with what you just confirmed and shows the next batch. When `status`
+says it's ready: `auto --train`.
+
+### How little checking it takes
+
+After a class has **5 checked samples**, confident guesses for it are accepted
+automatically. They must look as much like the checked ones as those do like
+each other, and clearly unlike every other class. The same happens for "none
+of these" once five have been marked. What's left for you is the doubtful
+ones, plus a few **spot checks** of what was auto-accepted on every batch. If
+spot checks overturn more than 20% for a class, auto-accept switches off for
+it and hands everything it decided there back to you. Before training, each
+class needs a few spot checks (10% of its auto-accepted samples, at least 3).
+The held-out samples that score every round are always ones a person
+checked, so the score can't be flattered by the auto-labels.
+
+Settings: `set auto_accept=false` to check everything by hand;
+`auto_min_checked`, `auto_gate`, `auto_margin` and `auto_max_error` tune it.
+
+## A whole run, step by step
 
 ```bash
 T="python -m modules.teach --project my-first"
@@ -118,9 +164,14 @@ $T boxes worklist       # samples with no good box: label these in tools/labeler
 $T boxes import exports/*.json --accept-all
 ```
 
-For a class the stock detector already knows, its own box is used. Otherwise
-each detected region is compared with the class, and the one that stands out
-wins. What that cannot find goes to the labeller, as before.
+For a class the stock detector already knows, its own box is used, and at
+confidence 0.6 or more it is accepted without review. Otherwise each detected
+region is compared with the class, and the one that stands out wins. For
+something no detector knows, CLIP scans overlapping regions of the frame, then
+shrinks the best one while it still looks like the class. Those boxes are
+coarser and always go to review. Once a class has three accepted boxes, their
+crops replace its name as what "looks like it" means, which makes every later
+proposal better. What still can't be found goes to the labeller, as before.
 
 ## Honest numbers
 

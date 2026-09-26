@@ -43,15 +43,18 @@ def build_prototypes(project: Project, vectors: dict, embedder) -> list:
     """One prototype per class, plus ``NONE`` once negatives exist."""
     prototypes = []
     for spec in project.classes:
+        # Only what a person decided: an auto-accepted sample in the prototype
+        # would teach the sorter to agree with itself.
         ids = list(dict.fromkeys(list(spec.examples)
-                                 + [s.id for s in project.accepted(spec.name)]))
+                                 + [s.id for s in project.accepted(spec.name)
+                                    if s.is_human]))
         examples = [vectors[i] for i in ids if i in vectors]
         texts = embedder.texts(class_prompts(project, spec)) if not examples else []
         proto = scoring.build_prototype(spec.name, examples, texts)
         if proto is not None:
             prototypes.append(proto)
     negatives = [vectors[s.id] for s in project.samples
-                 if s.verdict == NEGATIVE and s.id in vectors]
+                 if s.verdict == NEGATIVE and s.is_human and s.id in vectors]
     if negatives:
         prototypes.append(scoring.build_prototype(NONE, negatives))
     return prototypes
@@ -98,7 +101,10 @@ def sort_project(project: Project, embedder, *,
             tally[sample.proposed] = tally.get(sample.proposed, 0) + 1
     project.save()
 
+    from modules.teach import autolabel
+    auto = autolabel.apply(project)
     return {
+        "auto": auto,
         "scored": len(results),
         "unreadable": len(project.samples) - len(results),
         "proposed": tally,

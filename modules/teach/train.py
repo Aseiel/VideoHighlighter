@@ -64,7 +64,10 @@ def actions_command(dataset: str, run_dir: str, epochs: int) -> list:
             "--model-save-path", os.path.join(run_dir, "r3d_finetuned.pth"),
             "--checkpoint-dir", os.path.join(run_dir, "checkpoints"),
             "--metrics-out", os.path.join(run_dir, "metrics.json"),
-            "--epochs", str(int(epochs)), "--no-viz"]
+            "--epochs", str(int(epochs)), "--no-viz",
+            # The held-out set was chosen from checked samples only; letting the
+            # trainer top it up from train/ would move unchecked ones into it.
+            "--keep-split"]
 
 
 def train_actions(project: Project, run_dir: str, *, epochs: int,
