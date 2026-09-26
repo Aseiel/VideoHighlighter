@@ -47,6 +47,7 @@ SHRINK_STEPS = 8
 SHRINK_TOLERANCE = 0.01    # likeness a shrink may cost before it stops
 AUTO_BOX_CONFIDENCE = 0.6  # a detector's own class at this confidence: no sheet
 MIN_CROP_EXAMPLES = 3      # accepted boxes before crops replace the class name
+MAX_REJECTED_PER_FRAME = 2 # proposals a frame may have rejected before the labeller
 MAX_CROP_EXAMPLES = 60
 
 
@@ -72,7 +73,31 @@ def _read_at(path: str, moment: float):
 
 
 def _labelled_keys(labels: LabelStore) -> set:
-    return {(b.video, round(b.time, 3)) for b in labels.boxes}
+    """Frames already answered: a box waiting, accepted, or marked empty.
+    A frame whose boxes were all rejected is not answered; see ``propose``."""
+    return {(b.video, round(b.time, 3)) for b in labels.boxes if b.verdict != REJECTED}
+
+
+def _rejected(labels: LabelStore) -> dict:
+    out: dict = {}
+    for b in labels.boxes:
+        if b.verdict == REJECTED:
+            out.setdefault((b.video, round(b.time, 3)), []).append(tuple(b.box))
+    return out
+
+
+def _iou(a, b) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    union = aw * ah + bw * bh - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _excluded(box, excluded) -> bool:
+    return any(_iou(box, other) > 0.5 for other in excluded)
 
 
 def propose(project: Project, detector, embedder, *,
@@ -83,8 +108,9 @@ def propose(project: Project, detector, embedder, *,
     read_at = read_at or _read_at
     labels = store(project)
     done = _labelled_keys(labels)
+    rejected = _rejected(labels)
     stock = set(load_vocabulary(OBJECTS))
-    class_vectors = _class_vectors(project, labels, embedder, read_at)
+    class_vectors, from_crops = _class_vectors(project, labels, embedder, read_at)
 
     added, empty, auto_accepted = 0, 0, 0
     for sample in project.samples:
@@ -99,21 +125,32 @@ def propose(project: Project, detector, embedder, *,
             continue
         sample.boxes_tried = True
         for moment in frame_times(sample.duration, project.settings.boxes_per_sample):
-            if (sample.path, moment) in done:
+            key = (sample.path, moment)
+            if key in done:
+                continue
+            # A frame whose proposals were all rejected gets another try, but
+            # only once the class is matched by its accepted crops (the same
+            # text-based guess would just come back), never at a rejected
+            # region, and at most twice before it is left to the labeller.
+            excluded = rejected.get(key, [])
+            if excluded and (sample.label not in from_crops
+                             or len(excluded) >= MAX_REJECTED_PER_FRAME):
                 continue
             frame = read_at(sample.path, moment)
             if frame is None:
                 continue
             box = None
             if model_detector is not None:
-                box = _from_detector(model_detector, frame, sample.label, "model")
+                box = _from_detector(model_detector, frame, sample.label, "model", excluded)
             if box is None and sample.label in stock:
-                box = _from_detector(detector, frame, sample.label, "stock")
+                box = _from_detector(detector, frame, sample.label, "stock", excluded)
             vector = class_vectors[sample.label]
             if box is None:
-                box = _by_clip(detector, embedder, frame, vector)
+                box = _by_clip(detector, embedder, frame, vector, excluded)
             if box is None:
                 box = _by_tiles(embedder, frame, vector)
+                if box is not None and _excluded(box[0], excluded):
+                    box = None
             if box is None:
                 empty += 1
                 continue
@@ -138,7 +175,7 @@ def propose(project: Project, detector, embedder, *,
             "pending": len(labels.pending())}
 
 
-def _class_vectors(project: Project, labels: LabelStore, embedder, read_at) -> dict:
+def _class_vectors(project: Project, labels: LabelStore, embedder, read_at) -> tuple:
     """What each class looks like, as one CLIP vector.
 
     From the crops of its accepted boxes once there are a few — a picture of
@@ -147,7 +184,7 @@ def _class_vectors(project: Project, labels: LabelStore, embedder, read_at) -> d
     box is embedded once, ever.
     """
     cache = embed_mod.VectorCache(project.root, getattr(embedder, "model_id", ""))
-    out = {}
+    out, from_crops = {}, set()
     for spec in project.classes:
         crops = []
         for box in labels.accepted():
@@ -171,12 +208,13 @@ def _class_vectors(project: Project, labels: LabelStore, embedder, read_at) -> d
                 break
         if len(crops) >= MIN_CROP_EXAMPLES:
             out[spec.name] = embed_mod.unit(np.mean(crops, axis=0))
+            from_crops.add(spec.name)
         else:
             prompts = [PROMPTS[OBJECTS].format(spec.name)] + (
                 [spec.description] if spec.description else [])
             out[spec.name] = embed_mod.unit(embedder.texts(prompts).mean(axis=0))
     cache.save()
-    return out
+    return out, from_crops
 
 
 def _by_tiles(embedder, frame, class_vector):
@@ -222,22 +260,23 @@ def _normalise(det, width: int, height: int) -> tuple:
     return (x1, y1, max(0.0, x2 - x1), max(0.0, y2 - y1))
 
 
-def _from_detector(detector, frame, class_name: str, source: str):
+def _from_detector(detector, frame, class_name: str, source: str, excluded=()):
     height, width = frame.shape[:2]
-    hits = [d for d in detector.detect(frame) if d.class_name == class_name]
+    hits = [d for d in detector.detect(frame) if d.class_name == class_name
+            and not _excluded(_normalise(d, width, height), excluded)]
     if not hits:
         return None
     best = max(hits, key=lambda d: d.confidence)
     return _normalise(best, width, height), float(best.confidence), source
 
 
-def _by_clip(detector, embedder, frame, class_vector):
+def _by_clip(detector, embedder, frame, class_vector, excluded=()):
     """The detected region that looks most like the class, if one stands out."""
     height, width = frame.shape[:2]
     candidates = []
     for det in detector.detect(frame):
         box = _normalise(det, width, height)
-        if box[2] * box[3] < MIN_AREA:
+        if box[2] * box[3] < MIN_AREA or _excluded(box, excluded):
             continue
         x1, y1 = int(det.x1), int(det.y1)
         crop = frame[max(0, y1):int(det.y2), max(0, x1):int(det.x2)]

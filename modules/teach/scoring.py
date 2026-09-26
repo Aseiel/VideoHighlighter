@@ -15,9 +15,12 @@ Raw cosines are not comparable between classes (text prototypes sit around
 
     calibrated = (cosine - background) / (anchor - background)
 
-``background`` is the median cosine of all samples to the prototype — what
-"not this" looks like in this footage, since most of any video is not any one
-thing. ``anchor`` is what "this" looks like: the examples' mean cosine to their
+``background`` is a low percentile (``BACKGROUND_PERCENTILE``) of all
+samples' cosines to the prototype: what "not this" looks like in this footage.
+Not the median: footage chosen *because* it shows the thing can show it in
+more than half its samples, and a median then sits among the real examples and
+calibrates them to zero, so nothing is ever proposed. The 20th percentile holds
+until the thing fills four fifths of the footage. ``anchor`` is what "this" looks like: the examples' mean cosine to their
 own prototype when there are examples, else the 97th percentile of the
 samples. So 0 is ordinary footage and 1 is "looks like the examples", on the
 same scale for every class.
@@ -43,6 +46,8 @@ from modules.teach.project import NONE, UNSURE
 
 # The upper end of "ordinary footage" for a text-only class, as a percentile.
 TEXT_ANCHOR_PERCENTILE = 97.0
+# Where "not this" is read from, as a percentile of the footage (see above).
+BACKGROUND_PERCENTILE = 20.0
 # Keeps a class whose samples all score alike from dividing by nothing.
 MIN_SPREAD = 0.02
 # Cap on how many accepted samples feed a prototype: past this, more of the
@@ -83,7 +88,7 @@ def calibrate(raw: np.ndarray, prototypes: Sequence[Prototype]) -> np.ndarray:
     out = np.zeros_like(raw, dtype=np.float32)
     for c, proto in enumerate(prototypes):
         column = raw[:, c]
-        background = float(np.median(column))
+        background = float(np.percentile(column, BACKGROUND_PERCENTILE))
         anchor = proto.anchor
         if anchor is None:
             anchor = float(np.percentile(column, TEXT_ANCHOR_PERCENTILE))

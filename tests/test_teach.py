@@ -981,3 +981,35 @@ def test_only_an_installed_round_proposes(project, tmp_path):
     project.rounds.append({"round": 1, "installed": False,
                            "metrics": {"weights": "x", "mapping": "y"}})
     assert sort.round_classifier(project) is None
+
+
+def test_a_frame_whose_box_was_rejected_is_proposed_again_elsewhere(tmp_path):
+    from modules.vision.label_store import LabelledBox, REJECTED as BOX_REJECTED
+
+    p = _object_project(tmp_path)
+    p.samples[1].verdict, p.samples[1].label = "rejected", ""     # only alpha matters
+    p.save()
+    sample = p.samples[0]
+    moment = boxes.frame_times(sample.duration, 1)[0]
+    labels = boxes.store(p)
+    # Three accepted boxes elsewhere teach what the class looks like...
+    for t in (10.0, 11.0, 12.0):
+        labels.add(LabelledBox(video=sample.path, time=t, class_name="alpha widget",
+                               box=(0.6, 0.2, 0.3, 0.3), verdict=ACCEPTED))
+    # ...and a person already said the obvious box on this frame is wrong.
+    labels.add(LabelledBox(video=sample.path, time=moment, class_name="alpha widget",
+                           box=(0.6, 0.2, 0.3, 0.3), verdict=BOX_REJECTED))
+    labels.save()
+
+    result = boxes.propose(p, FakeDetector(), CropEmbedder(), read_at=_frame)
+    assert result["proposed"] == 1
+    new = [b for b in boxes.store(p).pending() if b.time == moment]
+    assert new and boxes._iou(new[0].box, (0.6, 0.2, 0.3, 0.3)) <= 0.5
+
+    # Rejected twice: left to the labeller, not asked about again.
+    labels = boxes.store(p)
+    for b in labels.boxes:
+        if b.verdict == "pending":
+            b.verdict = BOX_REJECTED
+    labels.save()
+    assert boxes.propose(p, FakeDetector(), CropEmbedder(), read_at=_frame)["proposed"] == 0
