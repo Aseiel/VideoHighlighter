@@ -93,6 +93,7 @@ def propose(project: Project, detector, embedder, *,
             continue
         if sample.verdict != ACCEPTED:
             continue
+        sample.boxes_tried = True
         for moment in frame_times(sample.duration, project.settings.boxes_per_sample):
             if (sample.path, moment) in done:
                 continue
@@ -117,6 +118,7 @@ def propose(project: Project, detector, embedder, *,
             done.add((sample.path, moment))
             added += 1
     labels.save()
+    project.save()
     return {"proposed": added, "frames_without_a_proposal": empty,
             "pending": len(labels.pending())}
 

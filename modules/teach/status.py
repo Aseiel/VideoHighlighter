@@ -46,7 +46,7 @@ def next_step(project: Project) -> dict:
     if any(not s.cut for s in project.sources):
         return _step(project, "auto", "Cut the new footage into samples.", "cut")
     if (project.task == "actions" and project.settings.focus
-            and any(not s.focus_paths for s in project.samples)):
+            and any(not s.focus_tried for s in project.samples)):
         return _step(project, "auto", "Crop samples to the people in them.", "focus")
     unsorted = [s for s in project.samples if not s.scores]
     if not scored or unsorted:
@@ -81,9 +81,7 @@ def next_step(project: Project) -> dict:
             return _step(project, "judge", f"Check {len(labels.pending())} proposed boxes.",
                          "boxes", "review")
         todo = labeler_worklist(project)
-        framed = {b.video for b in labels.boxes}
-        unproposed = [t for t in todo if t["path"] not in framed]
-        if unproposed:
+        if any(not s.boxes_tried for s in project.accepted()):
             return _step(project, "auto", "Propose boxes on accepted samples.",
                          "boxes", "propose")
         if len(todo) > len(project.accepted()) // 2:

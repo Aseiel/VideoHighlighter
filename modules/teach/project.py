@@ -87,6 +87,8 @@ class Sample:
     start: float
     duration: float
     focus_paths: list = field(default_factory=list)
+    focus_tried: bool = False      # the cropper has seen it (it may have made nothing)
+    boxes_tried: bool = False      # boxes were proposed for it (maybe none found)
     scores: dict = field(default_factory=dict)       # class -> calibrated score
     proposed: str = ""                               # class, UNSURE or NONE
     margin: float = 0.0

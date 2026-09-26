@@ -601,3 +601,41 @@ def test_cli_settings_are_typed(tmp_path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["changed"] == {"gate": 0.4, "focus": True}
     assert cli.main(["--project", root, "set", "nonsense=1"]) == 2
+
+
+def test_a_sample_the_cropper_or_the_proposer_found_nothing_in_is_not_asked_about_forever(tmp_path):
+    from modules.teach import focus
+
+    p = Project.create(str(tmp_path / "f"), ACTIONS)
+    p.add_class("alpha move")
+    p.settings.focus = True
+    _add_samples(p, [0, 0])
+    example = tmp_path / "example.mp4"
+    example.write_bytes(b"clip")
+    p.add_source(str(example)).cut = True
+    p.samples.append(Sample(id="v002__example", source="v002", path=str(example),
+                            start=0.0, duration=5.0))
+    p.save()
+    seen = []
+
+    def cropper(inbox, out):
+        names = sorted(os.listdir(inbox))
+        seen.extend(names)
+        # Crops the first sample only; finds nobody in the rest.
+        open(os.path.join(out, names[0][:-4] + "_cropped_left.mp4"), "wb").close()
+
+    result = focus.focus_project(p, cropper=cropper)
+    assert result["cropped"] == 1 and result["nothing_found"] == 2
+    assert "v002__example.mp4" in seen                  # examples are cropped too
+    assert not status.next_step(p)["command"].endswith(" focus")
+    assert focus.focus_project(p, cropper=lambda *a: seen.append("again")) == {
+        "cropped": 0, "nothing_found": 0, "samples_total": 3}
+
+    o = _object_project(tmp_path)
+
+    class Blind:
+        def detect(self, frame):
+            return []
+
+    boxes.propose(o, Blind(), CropEmbedder(), read_at=_frame)
+    assert "propose" not in status.next_step(Project.load(o.root))["command"]

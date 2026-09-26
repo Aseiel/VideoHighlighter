@@ -14,38 +14,53 @@ from __future__ import annotations
 
 import glob
 import os
+import shutil
 from typing import Callable, Optional
 
 from modules.teach.project import ACTIONS, Project
 
 
 def focus_project(project: Project, *, cropper: Optional[Callable] = None) -> dict:
-    """Run the cropper over samples without a focused version yet.
+    """Run the cropper over every sample it has not seen yet.
 
-    ``cropper(input_folder, output_folder)`` defaults to the real one; the
-    cropper already skips inputs it has processed, so re-running is cheap.
+    The samples are linked into a scratch folder under their sample ids, so the
+    cropper sees example clips (which live wherever the user keeps them) as
+    well as cut samples, and nothing twice. ``cropper(input_folder,
+    output_folder)`` defaults to the real one.
     """
     if project.task != ACTIONS:
         return {"skipped": "focus is for action projects"}
-    samples_dir = project.path("samples")
     out_dir = project.path("focus")
-    os.makedirs(out_dir, exist_ok=True)
+    inbox = project.path("focus", ".inbox")
+    shutil.rmtree(inbox, ignore_errors=True)
+    os.makedirs(inbox, exist_ok=True)
 
-    if cropper is None:
-        from modules.crop.actions import main as run_cropper
+    todo = [s for s in project.samples if not s.focus_tried and os.path.exists(s.path)]
+    for sample in todo:
+        link = os.path.join(inbox, sample.id + os.path.splitext(sample.path)[1])
+        try:
+            os.link(sample.path, link)
+        except OSError:
+            shutil.copy2(sample.path, link)
 
-        def cropper(input_folder, output_folder):
-            run_cropper(input_folder=input_folder, output_folder=output_folder,
-                        debug=False)
+    if todo:
+        if cropper is None:
+            from modules.crop.actions import main as run_cropper
 
-    cropper(samples_dir, out_dir)
+            def cropper(input_folder, output_folder):
+                run_cropper(input_folder=input_folder, output_folder=output_folder,
+                            debug=False)
 
-    matched = 0
-    for sample in project.samples:
-        found = sorted(glob.glob(os.path.join(out_dir, sample.id + "*")))
-        found = [p for p in found if os.path.isfile(p)]
-        if found:
-            sample.focus_paths = found
-            matched += 1
+        cropper(inbox, out_dir)
+
+    made = 0
+    for sample in todo:
+        found = sorted(p for p in glob.glob(os.path.join(out_dir, sample.id + "*"))
+                       if os.path.isfile(p))
+        sample.focus_paths = found
+        sample.focus_tried = True
+        made += bool(found)
+    shutil.rmtree(inbox, ignore_errors=True)
     project.save()
-    return {"samples_with_focus": matched, "samples_total": len(project.samples)}
+    return {"cropped": made, "nothing_found": len(todo) - made,
+            "samples_total": len(project.samples)}
