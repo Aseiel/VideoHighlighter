@@ -328,8 +328,14 @@ def cmd_quick(args, root):
     and the clips their first examples. Everything already there is kept, so
     running it again with more examples or videos just adds them.
     """
+    from modules.teach import doctor
     from modules.teach.cut import VIDEO_EXTENSIONS
     from modules.teach.naming import check_name, normalize_name
+
+    # Before creating anything: a missing ffmpeg or CLIP found here costs
+    # seconds; found after the footage is added, it costs a confusing error.
+    if not args.skip_checks:
+        doctor.require(root)
 
     if os.path.exists(os.path.join(root, project_mod.PROJECT_FILE)):
         project = Project.load(root)
@@ -375,6 +381,11 @@ def cmd_quick(args, root):
     return {"project": project.root, "classes": project.class_names(),
             "examples_added": added, "sources": len(project.sources),
             **run_auto(project.root, train=args.train)}
+
+
+def cmd_doctor(args, root):
+    from modules.teach import doctor
+    return doctor.run(root)
 
 
 def cmd_status(args, project):
@@ -500,6 +511,10 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--videos", nargs="+", default=[], help="files, folders or URLs")
     s.add_argument("--focus", action="store_true")
     s.add_argument("--train", action="store_true")
+    s.add_argument("--skip-checks", action="store_true", dest="skip_checks",
+                   help="do not run `doctor` first")
+
+    sub.add_parser("doctor", help="is this machine ready? (seconds; nothing is loaded)")
 
     s = sub.add_parser("set", help="change settings: key=value ...")
     s.add_argument("pairs", nargs="+")
@@ -525,6 +540,8 @@ def run(argv=None) -> tuple:
         with contextlib.redirect_stdout(sys.stderr):
             if args.command == "init":
                 result = cmd_init(args, root)
+            elif args.command == "doctor":
+                result = cmd_doctor(args, root)
             elif args.command == "quick":
                 result = cmd_quick(args, root)
                 result.setdefault("next", result.get("stopped_at"))

@@ -27,6 +27,17 @@ which one comes next.
 
 ## The quickest way
 
+First, on a new machine:
+
+```bash
+python -m modules.teach --project my-first doctor
+```
+
+It checks in seconds that OpenCV, ffmpeg, CLIP, disk space and a training
+device are there, and says how to fix anything that's missing. `quick` runs
+the same checks and stops before creating anything if something required is
+missing.
+
 Make a folder with one subfolder per thing to find, named after it, holding a
 few short clips that show it (3-5 is plenty). Then:
 

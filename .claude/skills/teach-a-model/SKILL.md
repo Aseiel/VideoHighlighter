@@ -19,6 +19,9 @@ command prints one JSON object; `status` names the next command.
 
 ## Fastest start
 
+Run `doctor` first on a machine you haven't used. If `ready` is false, relay
+each blocking check's `fix` to the user rather than working around it.
+
 If the user has example clips, ask them to put them in one subfolder per
 class, named after what it shows, then run
 `quick --task <actions|objects> --examples <folder> --videos <files/folders>`.

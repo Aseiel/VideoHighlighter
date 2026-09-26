@@ -792,6 +792,8 @@ def test_quick_builds_a_project_from_an_examples_folder(tmp_path, monkeypatch):
     (videos / "long.mp4").write_bytes(b"x")
     monkeypatch.setattr(cut, "probe_duration", lambda path: 5.0)
     monkeypatch.setattr(cli, "run_auto", lambda root, train=False: {"ran": [], "stopped_at": {}})
+    from modules.teach import doctor
+    monkeypatch.setattr(doctor, "require", lambda root: None)
 
     code, result = cli.run(["--project", str(tmp_path / "q"), "quick", "--task", "actions",
                             "--examples", str(examples), "--videos", str(videos)])
@@ -839,3 +841,31 @@ def test_a_thing_no_detector_knows_is_found_by_scanning_regions(tmp_path):
     assert found[0].source == "category" and found[0].verdict == PENDING
     # Around the thing (x 0.62-0.94, y 0.33-0.78), not a fixed half-frame.
     assert x >= 0.45 and x + w <= 1.0 and w < 0.5
+
+
+
+# --- doctor ------------------------------------------------------------------------
+
+def test_doctor_separates_what_blocks_from_what_only_slows(tmp_path):
+    from modules.teach import doctor
+
+    checks = (lambda: doctor.Check("ffmpeg", True, doctor.REQUIRED, "found"),
+              lambda: doctor.Check("clip", False, doctor.REQUIRED, "missing", "install it"),
+              lambda: doctor.Check("pose model", False, doctor.OPTIONAL, "later"))
+    report = doctor.run(str(tmp_path / "p"), checks=checks)
+    assert not report["ready"] and report["blocking"] == ["clip"]
+    assert {c["name"] for c in report["checks"]} >= {"ffmpeg", "clip", "pose model",
+                                                     "disk space"}
+
+
+def test_quick_stops_before_creating_anything_when_not_ready(tmp_path, monkeypatch):
+    from modules.teach import doctor
+
+    monkeypatch.setattr(doctor, "run", lambda root: {
+        "ready": False, "blocking": ["clip"],
+        "checks": [{"name": "clip", "ok": False, "level": doctor.REQUIRED,
+                    "detail": "missing", "fix": "install the CLIP pack"}]})
+    root = tmp_path / "q"
+    code, result = cli.run(["--project", str(root), "quick", "--task", "actions"])
+    assert code == 2 and "install the CLIP pack" in result["error"]
+    assert not root.exists()
