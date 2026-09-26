@@ -382,3 +382,51 @@ def test_a_manifest_naming_an_unknown_compression_is_refused(key):
         private = load_pem_private_key(fh.read(), password=None)
     sig = base64.urlsafe_b64encode(private.sign(raw)).decode().rstrip("=")
     assert um.verify_manifest(raw, sig) is None
+
+
+# --- gc ---------------------------------------------------------------------------
+
+def _gc_setup():
+    def m(*shas, gz=True):
+        return {"compression": "gzip" if gz else "",
+                "files": [{"sha256": s, "path": s, "size": 1} for s in shas]}
+    manifests = {
+        "releases/free/windows/1.0.0": m("old", "shared"),
+        "releases/free/windows/1.1.0": m("mid", "shared"),
+        "releases/free/windows/1.10.0": m("new", "shared"),     # 1.10 > 1.9: by number
+        "releases/free/windows/1.9.0": m("nine", "shared"),
+        "releases/pro/windows/1.0.0": m("pro"),
+    }
+    channels = {"channels/free.json": {"manifests": {
+        "windows": "https://h/releases/free/windows/1.0.0/manifest.json"}}}
+    old = "2026-01-01T00:00:00Z"
+    listing = [[f"files/{s}.gz", 10, old] for s in
+               ("old", "mid", "new", "nine", "shared", "pro", "orphan")]
+    listing += [["files/fresh.gz", 10, "2026-09-26T10:00:00Z"],
+                ["releases/free/windows/1.1.0/manifest.json", 5, old]]
+    return listing, manifests, channels
+
+
+def test_gc_keeps_the_newest_releases_and_whatever_a_channel_names():
+    import datetime as dt
+    listing, manifests, channels = _gc_setup()
+    now = dt.datetime(2026, 9, 27, tzinfo=dt.timezone.utc)
+    result = publish_release.unreferenced(listing, manifests, channels, keep=2, now=now)
+    # Kept: 1.10 and 1.9 (newest two), 1.0.0 (the channel), pro 1.0.0.
+    # Gone: 1.1.0's own blob and the orphan. Never: the fresh blob, the manifest.
+    assert result["delete"] == ["files/mid.gz", "files/orphan.gz"]
+    assert result["too_new"] == 1
+    assert "releases/free/windows/1.0.0" in result["kept_releases"]
+
+
+def test_gc_writes_delete_requests_in_batches(tmp_path, monkeypatch):
+    listing = [[f"files/{i:05d}.gz", 1, "2026-01-01T00:00:00Z"] for i in range(2500)]
+    (tmp_path / "listing.json").write_text(json.dumps(listing))
+    (tmp_path / "meta").mkdir()
+    assert publish_release.main(["gc", "--listing", str(tmp_path / "listing.json"),
+                                 "--root", str(tmp_path / "meta"),
+                                 "--out", str(tmp_path / "out")]) == 0
+    batches = sorted(os.listdir(tmp_path / "out"))
+    assert batches == ["delete-000.json", "delete-001.json", "delete-002.json"]
+    sizes = [len(json.loads((tmp_path / "out" / b).read_text())["Objects"]) for b in batches]
+    assert sizes == [1000, 1000, 500]

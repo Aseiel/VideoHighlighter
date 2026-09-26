@@ -85,6 +85,16 @@ an installed copy finds its channel file, so a build made without it cannot
 find the update host. Builds without it still read the marketing site's
 channel file (`update_check._MANIFEST_BASE`), as every build did before.
 
+## Keeping the bucket small
+
+Each release uploads only the files that changed, and nothing is deleted
+automatically. Now and then, run **Prune update host** (`prune-updates.yaml`).
+It keeps every file of the newest `keep` releases (3 by default) of each
+edition and platform, plus the release each channel points at, and deletes
+the rest. Manifests are never deleted, and neither is anything uploaded in the
+last two days. It's a dry run unless you untick `dry_run`; the summary says
+what would go and how much space that frees.
+
 ## Build & Release options
 
 - **dry_run**: build and smoke-test everything, publish nothing (no draft

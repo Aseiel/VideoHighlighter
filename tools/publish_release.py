@@ -390,6 +390,113 @@ def check(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# gc (prune-updates.yaml)
+# ---------------------------------------------------------------------------
+
+# Blobs younger than this are never deleted: a build uploads its blobs minutes
+# before its manifest, and a listing taken in between would see them as
+# unreferenced.
+GC_GRACE_HOURS = 48
+
+
+def unreferenced(listing, manifests: dict, channels: dict, keep: int = 3,
+                 now=None, grace_hours: float = GC_GRACE_HOURS) -> dict:
+    """Which ``files/`` blobs no release worth keeping refers to.
+
+    ``listing``: ``[[key, size, last_modified_iso], ...]`` for the bucket.
+    ``manifests``: ``{"releases/<ed>/<plat>/<ver>": manifest dict}``.
+    ``channels``: ``{"channels/<ed>.json": channel dict}``.
+
+    Kept: every blob of the newest ``keep`` releases of each edition and
+    platform, and of every release a channel names. An install always updates
+    *to* one of those, so nothing older is ever downloaded again. Manifests and
+    signatures are never touched, only blobs, so an old release stays
+    described even when its files are gone.
+    """
+    import datetime as dt
+
+    from modules.update.update_check import parse_version
+
+    now = now or dt.datetime.now(dt.timezone.utc)
+    groups: dict = {}
+    for prefix in manifests:
+        parts = prefix.split("/")
+        if len(parts) == 4:
+            groups.setdefault(tuple(parts[1:3]), []).append(prefix)
+    kept_releases = set()
+    for prefixes in groups.values():
+        prefixes.sort(key=lambda p: parse_version(p.rsplit("/", 1)[-1]), reverse=True)
+        kept_releases.update(prefixes[:max(1, int(keep))])
+    for channel in channels.values():
+        for url in (channel.get("manifests") or {}).values():
+            marker = "/releases/"
+            if marker in str(url):
+                kept_releases.add("releases/" + str(url).split(marker, 1)[1]
+                                  .rsplit("/manifest.json", 1)[0])
+
+    wanted = set()
+    for prefix in kept_releases:
+        manifest = manifests.get(prefix)
+        if manifest is None:
+            continue
+        gz = ".gz" if manifest.get("compression") == "gzip" else ""
+        wanted.update(f"files/{e['sha256']}{gz}" for e in manifest.get("files", []))
+
+    delete, freed, young = [], 0, 0
+    for row in listing or []:
+        key, size = str(row[0]), int(row[1])
+        if not key.startswith("files/") or key in wanted:
+            continue
+        stamp = row[2] if len(row) > 2 else None
+        if stamp:
+            when = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            if (now - when).total_seconds() < grace_hours * 3600:
+                young += 1
+                continue
+        else:
+            young += 1           # no timestamp: never guess
+            continue
+        delete.append(key)
+        freed += size
+    return {"delete": sorted(delete), "bytes": freed, "kept_releases": sorted(kept_releases),
+            "kept_blobs": len(wanted), "too_new": young}
+
+
+def gc(args) -> int:
+    with open(args.listing, "r", encoding="utf-8") as handle:
+        listing = json.load(handle) or []
+    manifests, channels = {}, {}
+    for dirpath, _, names in os.walk(args.root):
+        for name in names:
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, args.root).replace(os.sep, "/")
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            if rel.endswith("/manifest.json") and rel.startswith("releases/"):
+                manifests[rel.rsplit("/manifest.json", 1)[0]] = data
+            elif rel.startswith("channels/"):
+                channels[rel] = data
+    result = unreferenced(listing, manifests, channels, keep=args.keep)
+    # One delete-objects request per thousand keys, which is S3's (and R2's) cap.
+    os.makedirs(args.out, exist_ok=True)
+    keys = result["delete"]
+    for n, start in enumerate(range(0, len(keys), 1000)):
+        with open(os.path.join(args.out, f"delete-{n:03d}.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"Objects": [{"Key": k} for k in keys[start:start + 1000]],
+                       "Quiet": True}, handle)
+    print(f"OK:{len(result['delete'])} blob(s), {result['bytes'] / 2**20:.1f} MB, "
+          f"not referenced by the {len(result['kept_releases'])} kept release(s); "
+          f"{result['too_new']} too new to judge")
+    for prefix in result["kept_releases"]:
+        print(f"  keeping {prefix}")
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -423,6 +530,17 @@ def main(argv=None) -> int:
     p.add_argument("--listing", required=True,
                    help="JSON [[key, size], ...] of the bucket's files/ prefix.")
     p.set_defaults(func=check)
+
+    p = sub.add_parser("gc", help="Blobs no kept release refers to (prune-updates.yaml).")
+    p.add_argument("--listing", required=True,
+                   help="JSON [[key, size, last_modified], ...] of files/")
+    p.add_argument("--root", required=True,
+                   help="Local copy of releases/**/manifest.json and channels/*.json")
+    p.add_argument("--keep", type=int, default=3,
+                   help="Newest releases kept per edition and platform")
+    p.add_argument("--out", required=True,
+                   help="Folder for the delete-objects requests (1000 keys each)")
+    p.set_defaults(func=gc)
 
     p = sub.add_parser("prefix", help="Print where a release's manifest lives.")
     p.add_argument("--version", required=True)
