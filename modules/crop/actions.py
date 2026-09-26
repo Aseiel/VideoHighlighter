@@ -428,7 +428,27 @@ def copy_video_to_output(input_path, output_folder):
         return None
 
 
-def main():
+def main(input_folder=None, output_folder=None, debug=None):
+    """Crop every video in ``input_folder`` into ``output_folder``.
+
+    Both default to config.py's folders, and ``debug`` to its DEBUG_MODE.
+    modules/teach runs this over a project's samples with debug off. The
+    helpers above read these as module globals, so they are swapped for the
+    run and put back after, rather than threaded through every call.
+    """
+    global INPUT_FOLDER, OUTPUT_FOLDER, DEBUG_MODE
+    saved = (INPUT_FOLDER, OUTPUT_FOLDER, DEBUG_MODE)
+    INPUT_FOLDER = input_folder or INPUT_FOLDER
+    OUTPUT_FOLDER = output_folder or OUTPUT_FOLDER
+    if debug is not None:
+        DEBUG_MODE = bool(debug)
+    try:
+        return _run_batch()
+    finally:
+        INPUT_FOLDER, OUTPUT_FOLDER, DEBUG_MODE = saved
+
+
+def _run_batch():
     # Created here rather than at import time. This module used to run
     # os.makedirs() at module level, so merely importing it — from a test, a
     # REPL, or another module — littered the current working directory with

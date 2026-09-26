@@ -332,11 +332,23 @@ def main():
                         help="Skip sample visualizations before training")
     parser.add_argument("--viz", action="store_true",
                         help="Create sample visualizations before training")
+    parser.add_argument("--model-save-path", type=str, default=None,
+                        help="Write the model here instead of models/actions/ "
+                             "(modules/teach trains each round into its own folder "
+                             "and installs it only if it beats the last)")
+    parser.add_argument("--checkpoint-dir", type=str, default=None)
+    parser.add_argument("--metrics-out", type=str, default=None,
+                        help="Write per-class validation accuracy here as JSON")
     args = parser.parse_args()
 
     # Override config
     if args.data_path:
         CONFIG["data_path"] = args.data_path
+    if args.model_save_path:
+        CONFIG["model_save_path"] = os.path.abspath(args.model_save_path)
+        os.makedirs(os.path.dirname(CONFIG["model_save_path"]), exist_ok=True)
+    if args.checkpoint_dir:
+        CONFIG["checkpoint_dir"] = os.path.abspath(args.checkpoint_dir)
     if args.model:
         CONFIG["model_variant"] = args.model
     if args.resume:
@@ -512,6 +524,24 @@ def main():
         )
 
     prod_path = CONFIG["model_save_path"].replace(".pth", "_production_mapping.json")
+
+    if args.metrics_out:
+        import json
+        per_class = {wrapped.idx_to_label[i]: float(per_class_acc.get(i, 0.0))
+                     for i in sorted(wrapped.idx_to_label)}
+        with open(args.metrics_out, "w", encoding="utf-8") as fh:
+            json.dump({
+                "per_class_accuracy": per_class,
+                # Mean over classes, not over clips: a rare class counts as
+                # much as a common one, so a model cannot look good by
+                # ignoring it.
+                "balanced_accuracy": (sum(per_class.values()) / len(per_class)
+                                      if per_class else 0.0),
+                "weights": CONFIG["model_save_path"],
+                "mapping": CONFIG["model_save_path"].replace(".pth", "_mapping.json"),
+                "val_clips": len(val_ds),
+                "train_clips": len(train_ds),
+            }, fh, indent=2)
 
     print(f"\n✅ Done!")
     print(f"  Weights:             {CONFIG['model_save_path']} ({len(wrapped.label_to_idx)} classes total)")

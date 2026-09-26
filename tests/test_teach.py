@@ -1,0 +1,603 @@
+"""Tests for modules/teach: the pipeline from "find this" to a trained model.
+
+No CLIP, no video decoding, no GPU. Samples are stand-ins whose "frames" say
+which class they truly show, and a fake embedder turns that into a vector near
+that class's direction, so sorting, reviewing, splitting and the status
+machine are exercised on known answers. ``test_teach_e2e.py`` runs the real
+decode and ffmpeg path wherever OpenCV and imageio-ffmpeg are installed.
+"""
+from __future__ import annotations
+
+import json
+import os
+
+import numpy as np
+import pytest
+
+from modules.teach import (
+    boxes, build, cli, cut, naming, review, scoring, sort, status, train,
+)
+from modules.teach.project import (
+    ACCEPTED, ACTIONS, NEGATIVE, NONE, OBJECTS, PENDING, REJECTED, UNSURE, VAL,
+    Project, Sample,
+)
+
+DIM = 16
+
+
+# --- fakes --------------------------------------------------------------------
+
+def _direction(k: int) -> np.ndarray:
+    v = np.zeros(DIM, np.float32)
+    v[k] = 1.0
+    return v
+
+
+class FakeEmbedder:
+    """Image "frames" are ``("truth", k)`` tuples -> a vector near axis ``k``.
+    ``k = -1`` is background: near a shared background axis."""
+
+    model_id = "fake"
+
+    def __init__(self, seed=0):
+        self.rng = np.random.default_rng(seed)
+
+    def images(self, frames):
+        out = []
+        for frame in frames:
+            k = frame[1] if isinstance(frame, tuple) else -1
+            base = _direction(DIM - 1) if k < 0 else _direction(k) + 0.3 * _direction(DIM - 1)
+            out.append(base + 0.05 * self.rng.normal(size=DIM))
+        v = np.array(out, np.float32)
+        return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+    def texts(self, texts):
+        # Words point loosely at the class they name (index = order of creation
+        # in these tests), which is roughly how weak CLIP text is.
+        out = []
+        for t in texts:
+            k = 0 if "alpha" in t else 1 if "beta" in t else 2
+            out.append(_direction(k) + 0.8 * _direction(DIM - 1)
+                       + 0.1 * self.rng.normal(size=DIM))
+        v = np.array(out, np.float32)
+        return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+
+def _reader(truth: dict):
+    """frame_reader: each sample path yields frames tagged with its truth."""
+    def read(path, count, **_):
+        return [("truth", truth.get(os.path.basename(path), -1))] * count
+    return read
+
+
+@pytest.fixture
+def project(tmp_path):
+    p = Project.create(str(tmp_path / "proj"), ACTIONS)
+    p.add_class("alpha move", "the first thing")
+    p.add_class("beta move", "the second thing")
+    p.save()
+    return p
+
+
+def _add_samples(p, layout):
+    """layout: list of truth indices per 5 s sample of one source."""
+    source = p.add_source(os.path.join(p.root, "v.mp4"))
+    source.cut = True
+    truth = {}
+    os.makedirs(p.path("samples"), exist_ok=True)
+    for i, k in enumerate(layout):
+        sid = cut.sample_id(source.id, i * 5.0)
+        path = p.path("samples", sid + ".mp4")
+        with open(path, "wb") as handle:
+            handle.write(b"clip")
+        p.samples.append(Sample(id=sid, source=source.id, path=path, start=i * 5.0,
+                                duration=5.0))
+        truth[sid + ".mp4"] = k
+    p.save()
+    return truth
+
+
+# --- naming -------------------------------------------------------------------
+
+def test_names_are_normalised_to_the_stock_style():
+    assert naming.normalize_name("  Kick_Flip-Fast ") == "kick flip fast"
+
+
+@pytest.mark.parametrize("name, code", [
+    ("", "empty"), ("Upper", "format"), ("_mine", "reserved"),
+    ("a/b", "path"), ("123", "numeric"), ("x" * 41, "long"),
+])
+def test_names_that_cannot_be_a_class_are_blocked(name, code):
+    problems = naming.check_name(name, [])
+    assert any(p.code == code and p.blocking for p in problems)
+
+
+def test_advice_does_not_block():
+    problems = naming.check_name("thing", [], vocabulary=[])
+    assert [p.code for p in problems] == ["vague"]
+    assert not any(p.blocking for p in problems)
+
+
+def test_duplicates_and_near_duplicates():
+    assert any(p.code == "duplicate" and p.blocking
+               for p in naming.check_name("flip", ["flip"], vocabulary=[]))
+    near = naming.check_name("flips", ["flip"], vocabulary=[])
+    assert [p.code for p in near] == ["near_duplicate"]
+
+
+def test_objects_are_singular_and_stock_names_are_recognised():
+    assert any(p.code == "plural" for p in naming.check_name("boxes", [], "objects",
+                                                             vocabulary=[]))
+    assert any(p.code == "stock" for p in naming.check_name("person", [], "objects"))
+
+
+def test_the_stock_vocabularies_load():
+    assert "person" in naming.load_vocabulary("objects")
+    assert len(naming.load_vocabulary("actions")) == 400
+
+
+def test_suggestions_rank_the_label_that_describes_the_examples():
+    rng = np.random.default_rng(1)
+    labels = [f"label {i}" for i in range(40)]
+    label_vectors = rng.normal(size=(40, DIM)).astype(np.float32)
+    examples = np.stack([label_vectors[7] + 0.1 * rng.normal(size=DIM) for _ in range(5)])
+    result = naming.suggest_names(examples, labels, label_vectors, top_k=3)
+    assert result["suggestions"][0]["name"] == "label 7"
+    assert result["suggestions"][0]["fit"] == "good"
+    assert result["consistency"] > 0.9
+    assert result["split"] is None
+
+
+def test_examples_of_two_things_are_flagged_for_splitting():
+    examples = np.stack([_direction(0)] * 3 + [_direction(1)] * 3) + 0.01
+    groups = naming.split_hint(examples)
+    assert sorted(map(sorted, groups)) == [[0, 1, 2], [3, 4, 5]]
+
+
+# --- scoring ------------------------------------------------------------------
+
+def test_example_prototypes_propose_and_negatives_compete():
+    emb = FakeEmbedder()
+    a = scoring.build_prototype("a", emb.images([("t", 0)] * 3))
+    b = scoring.build_prototype("b", emb.images([("t", 1)] * 3))
+    samples = emb.images([("t", 0), ("t", 1), ("t", -1), ("t", -1), ("t", -1), ("t", -1)])
+    out = scoring.score_samples(list("uvwxyz"), samples, [a, b], gate=0.5,
+                                margin=0.1, floor=0.2)
+    assert out["u"][1] == "a" and out["v"][1] == "b"
+    assert out["w"][1] == NONE
+
+    none = scoring.build_prototype(NONE, emb.images([("t", -1)] * 3))
+    out = scoring.score_samples(list("uvwxyz"), samples, [a, b, none], gate=0.5,
+                                margin=0.1, floor=0.2)
+    assert out["w"][1] == NONE
+    assert NONE not in out["u"][0]          # not reported as a class score
+
+
+def test_two_classes_that_both_fit_are_unsure():
+    row = np.array([0.9, 0.85], np.float32)
+    assert scoring.propose(row, ["a", "b"], gate=0.5, margin=0.1, floor=0.2)[0] == UNSURE
+
+
+# --- project ------------------------------------------------------------------
+
+def test_project_round_trips_and_renames_everywhere(project):
+    _add_samples(project, [0, 1])
+    s = project.samples[0]
+    project.decide(s, ACCEPTED, "alpha move")
+    s.scores = {"alpha move": 1.0}
+    project.rename_class("alpha move", "alpha step")
+    project.save()
+    again = Project.load(project.root)
+    assert again.class_names() == ["alpha step", "beta move"]
+    assert again.samples[0].label == "alpha step"
+    assert "alpha step" in again.samples[0].scores
+
+
+def test_accepting_needs_a_real_class(project):
+    _add_samples(project, [0])
+    with pytest.raises(ValueError):
+        project.decide(project.samples[0], ACCEPTED, "nope")
+
+
+# --- cut ----------------------------------------------------------------------
+
+def test_segments_cover_the_video_and_drop_a_short_tail():
+    assert cut.plan_segments(17.0, 5.0) == [(0.0, 5.0), (5.0, 5.0), (10.0, 5.0)]
+    assert cut.plan_segments(18.0, 5.0)[-1] == (15.0, 3.0)
+    assert len(cut.plan_segments(10.0, 5.0, stride=2.5)) == 3
+
+
+def test_cutting_is_resumable_and_records_failures(project, tmp_path):
+    src = tmp_path / "long.mp4"
+    src.write_bytes(b"x")
+    project.add_source(str(src))
+    calls = []
+
+    class R:
+        returncode = 0
+        stderr = ""
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if "00005000" in cmd[-1]:
+            r = R()
+            r.returncode, r.stderr = 1, "boom"
+            return r
+        open(cmd[-1], "wb").close()
+        return R()
+
+    result = cut.cut_project(project, run=run, duration_of=lambda p: 15.0)
+    assert result["samples_made"] == 2 and len(result["failed"]) == 1
+    assert not project.sources[0].cut            # retried next time
+
+    result = cut.cut_project(project, run=lambda cmd, **kw: (open(cmd[-1], "wb").close(), R())[1],
+                             duration_of=lambda p: 15.0)
+    assert result["samples_made"] == 1 and project.sources[0].cut
+    assert len(project.samples) == 3
+
+
+def test_cuts_are_frame_accurate_reencodes():
+    cmd = cut.cut_command("in.mp4", "out.mp4", 12.5, 5.0)
+    assert cmd[cmd.index("-ss") + 1] == "12.500" and "libx264" in cmd
+    assert cmd.index("-ss") < cmd.index("-i")
+
+
+# --- sort and folders -----------------------------------------------------------
+
+def test_sorting_proposes_from_words_then_sharpens_with_examples(project):
+    truth = _add_samples(project, [0, 1, -1, 0, -1, 1, -1, -1, 0, -1])
+    emb = FakeEmbedder()
+    result = sort.sort_project(project, emb, frame_reader=_reader(truth))
+    assert result["prototypes"]["alpha move"]["from"] == "text"
+
+    project.decide(project.samples[0], ACCEPTED, "alpha move")
+    project.decide(project.samples[1], ACCEPTED, "beta move")
+    project.decide(project.samples[2], NEGATIVE)
+    result = sort.sort_project(project, emb, frame_reader=_reader(truth))
+    assert result["prototypes"]["alpha move"]["from"] == "examples"
+    assert NONE in result["prototypes"]
+    by_id = {s.id: s for s in project.samples}
+    for sid_file, k in truth.items():
+        s = by_id[sid_file[:-4]]
+        if s.verdict == PENDING:
+            expected = {0: "alpha move", 1: "beta move", -1: NONE}[k]
+            assert s.proposed == expected, (s.id, s.scores)
+
+
+def test_folders_moved_by_hand_become_verdicts(project):
+    truth = _add_samples(project, [0, 1, -1, 0])
+    sort.sort_project(project, FakeEmbedder(), frame_reader=_reader(truth))
+    for s in project.samples:
+        s.proposed = "alpha move"          # everything guessed as alpha
+    sort.lay_out_folders(project)
+    root = project.path("sorted")
+    ids = [s.id for s in project.samples]
+    os.replace(os.path.join(root, "alpha move", ids[1] + ".mp4"),
+               os.path.join(root, "beta move", ids[1] + ".mp4"))
+    os.replace(os.path.join(root, "alpha move", ids[2] + ".mp4"),
+               os.path.join(root, NONE, ids[2] + ".mp4"))
+
+    result = review.from_folders(project)            # nothing confirmed yet
+    assert result["decisions"] == {"beta move": 1, NEGATIVE: 1}
+    assert project.get_sample(ids[0]).verdict == PENDING
+
+    result = review.from_folders(project, ["alpha move"])
+    assert project.get_sample(ids[0]).label == "alpha move"
+    assert project.get_sample(ids[3]).label == "alpha move"
+
+
+# --- review ---------------------------------------------------------------------
+
+def _scored(project, rows):
+    """rows: (proposed, margin, model_proposed)"""
+    _add_samples(project, [0] * len(rows))
+    for s, (proposed, margin, model) in zip(project.samples, rows):
+        s.proposed, s.margin, s.model_proposed = proposed, margin, model
+        s.scores = {"alpha move": 0.6, "beta move": 0.4}
+    project.save()
+
+
+def test_disagreements_come_first_and_confident_guesses_are_never_skipped(project):
+    rows = [("alpha move", 0.9, "")] * 20 + [("beta move", 0.2, "alpha move")] \
+        + [(UNSURE, 0.0, "")] * 10 + [(NONE, 0.5, "")] * 5
+    _scored(project, rows)
+    batch = review.pick_batch(project, size=10)
+    assert len(batch) == 10
+    assert batch[0].model_proposed == "alpha move"
+    assert any(s.proposed == NONE for s in batch)
+    assert any(s.proposed == "alpha move" and s.margin == 0.9 for s in batch)
+
+
+def test_a_sheet_and_its_verdicts(project):
+    _scored(project, [("alpha move", 0.5, "")] * 3 + [(UNSURE, 0.0, "")] * 2
+            + [(NONE, 0.3, "")])
+    drawn = {}
+    record = review.next_sheet(project, size=6, frame_reader=lambda *a, **k: [],
+                               renderer=lambda tiles, caps, cols, path, header="":
+                               drawn.setdefault("caps", caps))
+    assert record["sheet"] == 1 and len(drawn["caps"]) == 6
+    by_proposal = {}
+    for item in record["items"]:
+        by_proposal.setdefault(item["proposed"], []).append(item["n"])
+    unsure = by_proposal[UNSURE]
+
+    # Accepting an unsure guess is refused: it needs a class.
+    bad = review.apply_verdicts(project, 1, accept=str(unsure[0]))
+    assert bad["applied"] == 0 and bad["errors"]
+    bad = review.apply_verdicts(project, 1, accept="1", reject="1")
+    assert "two verdicts" in bad["errors"][0]
+
+    alpha = by_proposal["alpha move"]
+    result = review.apply_verdicts(project, 1, reject=str(alpha[0]),
+                                   relabel=[f"{unsure[0]}=beta move"], accept_rest=True)
+    assert result["errors"] == []
+    verdicts = {s.id: (s.verdict, s.label) for s in project.samples}
+    items = {i["n"]: i["sample"] for i in record["items"]}
+    assert verdicts[items[alpha[0]]] == (REJECTED, "")
+    assert verdicts[items[alpha[1]]] == (ACCEPTED, "alpha move")
+    assert verdicts[items[unsure[0]]] == (ACCEPTED, "beta move")
+    assert verdicts[items[unsure[1]]] == (PENDING, "")        # rest: unsure stays
+    assert verdicts[items[by_proposal[NONE][0]]] == (NEGATIVE, "")
+
+
+def test_ranges_parse():
+    assert review.parse_numbers("1-3, 7 9") == [1, 2, 3, 7, 9]
+
+
+# --- build ----------------------------------------------------------------------
+
+def test_the_held_out_set_is_frozen_and_every_class_gets_enough(project):
+    truth = _add_samples(project, [0] * 30 + [1] * 12)
+    for s in project.samples:
+        k = truth[s.id + ".mp4"]
+        project.decide(s, ACCEPTED, "alpha move" if k == 0 else "beta move")
+    build.assign_splits(project)
+    val = {s.id for s in project.samples if s.split == VAL}
+    for name in project.class_names():
+        members = project.accepted(name)
+        n_val = sum(1 for s in members if s.split == VAL)
+        assert n_val >= max(2, 0.2 * len(members))
+
+    # New footage later: the old split does not move.
+    _add_samples(project, [0] * 10)
+    for s in project.samples:
+        if not s.is_decided:
+            project.decide(s, ACCEPTED, "alpha move")
+    build.assign_splits(project)
+    assert val <= {s.id for s in project.samples if s.split == VAL}
+
+
+def test_neighbouring_samples_land_on_the_same_side(project):
+    _add_samples(project, [0] * 20)
+    for s in project.samples:
+        project.decide(s, ACCEPTED, "alpha move")
+    build.assign_splits(project)
+    splits = [s.split for s in sorted(project.samples, key=lambda s: s.start)]
+    changes = sum(1 for a, b in zip(splits, splits[1:]) if a != b)
+    assert changes <= 2          # contiguous runs, not a salt-and-pepper split
+
+
+def test_build_lays_out_what_the_trainers_read(project):
+    _add_samples(project, [0] * 6 + [1] * 6)
+    for s in project.samples:
+        project.decide(s, ACCEPTED, "alpha move" if s.start < 30 else "beta move")
+    result = build.build(project)
+    root = project.path("dataset")
+    for split in ("train", "val"):
+        for name in project.class_names():
+            assert os.listdir(os.path.join(root, split, name))
+    assert build.built_signature(project) == result["signature"]
+    project.decide(project.samples[0], REJECTED)
+    assert build.dataset_signature(project) != result["signature"]
+
+
+# --- train ----------------------------------------------------------------------
+
+def _ready(project):
+    _add_samples(project, [0] * 6 + [1] * 6)
+    for s in project.samples:
+        project.decide(s, ACCEPTED, "alpha move" if s.start < 30 else "beta move")
+    build.build(project)
+
+
+def _fake_trainer(score):
+    def run(cmd, **kw):
+        out = cmd[cmd.index("--metrics-out") + 1]
+        with open(out, "w") as fh:
+            json.dump({"balanced_accuracy": score, "weights": "w.pth",
+                       "mapping": "w_mapping.json",
+                       "per_class_accuracy": {"alpha move": score}}, fh)
+
+        class R:
+            returncode = 0
+        return R()
+    return run
+
+
+def test_a_round_is_installed_only_if_it_beats_the_last(project, monkeypatch):
+    _ready(project)
+    installs = []
+    monkeypatch.setattr(train, "install",
+                        lambda p, record: installs.append(record["round"]) or
+                        record.update(installed=True) or {"slot": "test"})
+
+    first = train.train_round(project, epochs=1, run=_fake_trainer(0.6))
+    assert first["installed"] and installs == [1]
+    worse = train.train_round(project, epochs=1, run=_fake_trainer(0.5))
+    assert not worse["installed"] and worse["kept_previous"] == 1
+    better = train.train_round(project, epochs=1, run=_fake_trainer(0.8))
+    assert better["installed"] and installs == [1, 3]
+    assert project.rounds[-1]["dataset"] == build.built_signature(project)
+
+
+def test_a_failed_training_run_says_where_the_log_is(project):
+    _ready(project)
+
+    class R:
+        returncode = 3
+
+    with pytest.raises(RuntimeError, match="train.log"):
+        train.train_round(project, epochs=1, run=lambda cmd, **kw: R())
+
+
+def test_actions_train_into_the_round_folder_not_over_the_installed_model():
+    cmd = train.actions_command("/p/dataset", "/p/runs/001", 5)
+    assert cmd[cmd.index("--model-save-path") + 1].startswith("/p/runs/001")
+    assert "--metrics-out" in cmd
+
+
+def test_better_means_higher_accuracy_or_lower_loss():
+    assert train.is_better({"balanced_accuracy": 0.7}, {"balanced_accuracy": 0.6})
+    assert not train.is_better({"best_val_loss": 2.0}, {"best_val_loss": 1.5})
+    assert train.is_better({"best_val_loss": 1.0}, None)
+
+
+# --- status: the path an agent follows ------------------------------------------------
+
+def test_status_walks_the_whole_way(tmp_path, monkeypatch):
+    p = Project.create(str(tmp_path / "p"), ACTIONS)
+    step = lambda: status.next_step(Project.load(p.root))   # noqa: E731
+    assert "add-class" in step()["command"]
+    p.add_class("alpha move")
+    p.add_class("beta move")
+    p.save()
+    assert "add-video" in step()["command"]
+    p.add_source(str(tmp_path / "v.mp4"))
+    p.save()
+    assert step()["command"].endswith(" cut")
+
+    p = Project.load(p.root)
+    p.sources = []
+    for spec in p.classes:
+        spec.target = 20
+    p.save()
+    truth = _add_samples(p, [0] * 30 + [1] * 30 + [-1] * 10)
+    assert step()["command"].endswith(" sort")
+    sort.sort_project(p, FakeEmbedder(), frame_reader=_reader(truth))
+    assert step()["who"] == "judge" and step()["command"].endswith(" review")
+
+    for s in p.samples:
+        if s.proposed in p.class_names():
+            p.decide(s, ACCEPTED, s.proposed)
+    p.save()
+    assert step()["command"].endswith(" build")
+    build.build(p)
+    assert step()["command"].endswith(" train")
+    monkeypatch.setattr(train, "install", lambda proj, record: {"slot": "test"})
+    train.train_round(p, epochs=1, run=_fake_trainer(0.7))
+    assert "add-video" in step()["command"]
+
+
+# --- boxes (object projects) --------------------------------------------------------------
+
+class _Det:
+    def __init__(self, name, box, conf=0.9):
+        self.class_name, self.confidence = name, conf
+        self.class_id = 0
+        self.x1, self.y1, self.x2, self.y2 = box
+
+
+class FakeDetector:
+    def detect(self, frame):
+        return [_Det("person", (10, 10, 40, 60)), _Det("cup", (60, 20, 90, 50), 0.4)]
+
+
+class CropEmbedder(FakeEmbedder):
+    """Crops from x >= 50 look like class 0 ("alpha"); the rest like background."""
+
+    def images(self, frames):
+        tagged = [("t", 0) if isinstance(f, np.ndarray) and f.mean() > 100 else ("t", -1)
+                  for f in frames]
+        return super().images(tagged)
+
+
+def _object_project(tmp_path):
+    p = Project.create(str(tmp_path / "obj"), OBJECTS)
+    p.add_class("alpha widget")
+    p.add_class("person")
+    _add_samples(p, [0, 0, -1])
+    p.decide(p.samples[0], ACCEPTED, "alpha widget")
+    p.decide(p.samples[1], ACCEPTED, "person")
+    p.decide(p.samples[2], NEGATIVE)
+    p.settings.boxes_per_sample = 1
+    p.save()
+    return p
+
+
+def _frame(*_):
+    frame = np.zeros((100, 100, 3), np.uint8)
+    frame[:, 50:] = 200          # the right half is the "alpha widget"
+    return frame
+
+
+def test_boxes_are_proposed_from_the_stock_detector_and_clip(tmp_path):
+    p = _object_project(tmp_path)
+    result = boxes.propose(p, FakeDetector(), CropEmbedder(), read_at=_frame)
+    assert result["proposed"] == 2
+    labels = boxes.store(p)
+    by_class = {b.class_name: b for b in labels.pending()}
+    # A stock class takes the detector's own box...
+    assert by_class["person"].box == pytest.approx((0.1, 0.1, 0.3, 0.5))
+    # ...anything else, the detected region that looks like it.
+    assert by_class["alpha widget"].box == pytest.approx((0.6, 0.2, 0.3, 0.3))
+    assert len(labels.negatives()) == 1
+
+    again = boxes.propose(p, FakeDetector(), CropEmbedder(), read_at=_frame)
+    assert again["proposed"] == 0                  # nothing proposed twice
+
+
+def test_box_verdicts_and_the_labeller_worklist(tmp_path):
+    p = _object_project(tmp_path)
+    boxes.propose(p, FakeDetector(), CropEmbedder(), read_at=_frame)
+    record = boxes.next_sheet(p, read_at=lambda *a: None,
+                              renderer=lambda *a, **k: None)
+    person = [i["n"] for i in record["items"] if i["class_name"] == "person"]
+    other = [i["n"] for i in record["items"] if i["class_name"] != "person"]
+    result = boxes.apply_verdicts(p, record["sheet"], accept=",".join(map(str, person)),
+                                  reject=",".join(map(str, other)))
+    assert result == {"applied": 2, "errors": []}
+    todo = boxes.labeler_worklist(p)
+    assert [t["class"] for t in todo] == ["alpha widget"]
+
+
+def test_labeller_exports_attach_to_the_project_samples(tmp_path):
+    p = _object_project(tmp_path)
+    sample = p.samples[0]
+    export = tmp_path / "export.json"
+    export.write_text(json.dumps({
+        "video": os.path.join("C:/elsewhere", os.path.basename(sample.path)),
+        "fps": 10, "frame_width": 100, "frame_height": 100,
+        "keyframes": [{"frame_number": 5, "points": {"alpha widget": [50, 50],
+                                                      "not a class": [1, 1]}}]}))
+    result = boxes.import_labeler(p, [str(export)], accept=True)
+    assert result == {"imported": 1, "skipped_unknown_classes": ["not a class"]}
+    box = boxes.store(p).accepted()[0]
+    assert box.video == sample.path and box.time == pytest.approx(0.5)
+
+
+# --- the CLI --------------------------------------------------------------------------------
+
+def test_cli_answers_in_json_and_names_the_next_step(tmp_path, capsys):
+    root = str(tmp_path / "cli")
+    assert cli.main(["--project", root, "init", "--task", "actions"]) == 0
+    capsys.readouterr()
+    assert cli.main(["--project", root, "add-class", "Alpha_Move"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["added"] == "alpha move"
+    assert "add-video" in out["next"]["command"]
+
+    assert cli.main(["--project", root, "add-class", "alpha move"]) == 2
+    assert "already" in json.loads(capsys.readouterr().out)["error"]
+
+    assert cli.main(["--project", str(tmp_path / "missing"), "status"]) == 2
+    assert "init" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_cli_settings_are_typed(tmp_path, capsys):
+    root = str(tmp_path / "cli")
+    cli.main(["--project", root, "init", "--task", "objects"])
+    capsys.readouterr()
+    assert cli.main(["--project", root, "set", "gate=0.4", "focus=yes"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["changed"] == {"gate": 0.4, "focus": True}
+    assert cli.main(["--project", root, "set", "nonsense=1"]) == 2
