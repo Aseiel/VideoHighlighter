@@ -284,6 +284,12 @@ jobs:
         run: |
           Remove-Item -Recurse -Force dist/VideoHighlighter/packs -ErrorAction SilentlyContinue
           Invoke-WebRequest -Uri https://www.7-zip.org/a/7zr.exe -OutFile packaging/installer/7zr.exe -UseBasicParsing
+          # What the app needs to fetch a pack itself later (modules/packs):
+          # the pinned list and 7-Zip. The portable .7z is this same folder
+          # plus packs/torch-cpu.
+          Copy-Item packaging/installer/7zr.exe dist/VideoHighlighter/7zr.exe
+          python tools/write_packs_lock.py --base "$env:PACKS_BASE" --packs-json out/packs.json `
+            --out dist/VideoHighlighter/packs.lock.json
           choco install innosetup -y --no-progress | Out-Null
           $packs = (Get-Content out/packs.json | ConvertFrom-Json).packs
           $cuda = $packs | Where-Object { $_.name -eq "torch-cu128" }
