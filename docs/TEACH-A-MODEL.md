@@ -79,6 +79,11 @@ class needs a few spot checks (10% of its auto-accepted samples, at least 3).
 The held-out samples that score every round are always ones a person
 checked, so the score can't be flattered by the auto-labels.
 
+For actions, "none of these" samples are only trained on if you name a class
+for them: `set background_class=background`. Without one, the model has no way
+to say "none", so it names one of your classes for everything it sees. With
+one, it can decline.
+
 Settings: `set auto_accept=false` to check everything by hand;
 `auto_min_checked`, `auto_gate`, `auto_margin` and `auto_max_error` tune it.
 

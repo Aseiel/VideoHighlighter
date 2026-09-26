@@ -59,7 +59,7 @@ def test_boxes_alone_answer_as_they_always_did(tmp_path):
 
 
 def test_an_outline_stops_the_empty_part_of_a_box_counting(tmp_path):
-    engine = _engine(tmp_path, "{source: thing, region: holder}")
+    engine = _engine(tmp_path, "{source: thing, region: holder, outline: true}")
     frames = _frames([("holder", REACH_BOX, REACH), ("thing", THING_BOX, None)])
     assert not _fires(engine, frames)      # the corner is outside the outline
 
@@ -68,10 +68,10 @@ def test_overlaps_measures_area_not_centres(tmp_path):
     # A thing two-thirds inside the arm's outline.
     thing = [0.3, 0.35, 0.15, 0.15]
     engine = _engine(tmp_path, "{source: thing, region: holder, relation: overlaps, "
-                               "min_overlap: 0.6}")
+                               "min_overlap: 0.6, outline: true}")
     assert _fires(engine, _frames([("holder", REACH_BOX, REACH), ("thing", thing, None)]))
     strict = _engine(tmp_path, "{source: thing, region: holder, relation: overlaps, "
-                               "min_overlap: 0.9}")
+                               "min_overlap: 0.9, outline: true}")
     assert not _fires(strict, _frames([("holder", REACH_BOX, REACH), ("thing", thing, None)]))
 
 
@@ -79,14 +79,15 @@ def test_diagonal_things_whose_boxes_overlap_do_not_touch(tmp_path):
     # Two thin diagonal bars, parallel, apart: their boxes overlap heavily.
     a = [[0.10, 0.50], [0.50, 0.10], [0.52, 0.12], [0.12, 0.52]]
     b = [[0.30, 0.70], [0.70, 0.30], [0.72, 0.32], [0.32, 0.72]]
-    engine = _engine(tmp_path, "{source: a, region: b, relation: touches}")
+    engine = _engine(tmp_path, "{source: a, region: b, relation: touches, outline: true}")
     boxes_only = _frames([("a", [0.1, 0.1, 0.42, 0.42], None),
                           ("b", [0.3, 0.3, 0.42, 0.42], None)])
     outlines = _frames([("a", [0.1, 0.1, 0.42, 0.42], a),
                         ("b", [0.3, 0.3, 0.42, 0.42], b)])
     assert _fires(engine, boxes_only)      # the boxes do meet...
     assert not _fires(engine, outlines)    # ...the things never do
-    near = _engine(tmp_path, "{source: a, region: b, relation: touches, max_gap: 0.3}")
+    near = _engine(tmp_path, "{source: a, region: b, relation: touches, max_gap: 0.3, "
+                             "outline: true}")
     assert _fires(near, outlines)
 
 
@@ -97,7 +98,7 @@ def test_a_misspelt_relation_fails_at_load(tmp_path):
 
 def test_matched_outlines_reach_the_overlay(tmp_path):
     engine = _engine(tmp_path, "{source: thing, region: holder, relation: overlaps, "
-                               "min_overlap: 0.1}")
+                               "min_overlap: 0.1, outline: true}")
     _, overlay = engine.run(_frames([("holder", REACH_BOX, REACH),
                                      ("thing", [0.3, 0.35, 0.15, 0.15], None)]))
     assert overlay and overlay[0]["event_contours"][0][0] == REACH
@@ -174,3 +175,11 @@ def test_a_column_set_back_to_its_default_stays_default():
                             owned=TABLE_RULE_KEYS | {"relation", "outline"})
     assert out == [{"source": "a", "region": "b", "min_count": 1, "max_count": 999,
                     "max_gap": 0.02}]
+
+
+def test_outlines_in_the_cache_only_change_rules_that_asked_for_them(tmp_path):
+    frames = _frames([("holder", REACH_BOX, REACH), ("thing", THING_BOX, None)])
+    boxes_rule = _engine(tmp_path, "{source: thing, region: holder}")
+    outline_rule = _engine(tmp_path, "{source: thing, region: holder, outline: true}")
+    assert _fires(boxes_rule, frames)          # the box answer, outlines or not
+    assert not _fires(outline_rule, frames)

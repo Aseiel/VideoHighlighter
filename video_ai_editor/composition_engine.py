@@ -682,6 +682,16 @@ class CompositionEngine:
             result[cls].append(det)
         return result
 
+    @staticmethod
+    def _as_used_by(det: dict, rule) -> dict:
+        """The detection as ``rule`` sees it: with its outline only if the rule
+        asked for outlines. Outlines traced for one rule sit in the cache for
+        every rule on those classes, and a rule that did not ask must keep
+        answering on boxes, exactly as it did before outlines existed."""
+        if rule.outline or 'contour' not in det:
+            return det
+        return {k: v for k, v in det.items() if k != 'contour'}
+
     @classmethod
     def _same_object(cls, ghost: dict, det: dict) -> bool:
         """Whether a detection continues a remembered one.
@@ -733,7 +743,8 @@ class CompositionEngine:
             # Claim source instances greedily; each source counts at most once
             claimed, claimed_idx = [], []
             for i, src in enumerate(sources):
-                if any(relates(src, rgn, rule.relation, rule.min_overlap, rule.max_gap)
+                if any(relates(self._as_used_by(src, rule), self._as_used_by(rgn, rule),
+                               rule.relation, rule.min_overlap, rule.max_gap)
                        for rgn in regions):
                     claimed.append(src)
                     claimed_idx.append(i)

@@ -115,7 +115,8 @@ jobs:
 
           # What the app will do: plain HTTPS to the public host. A bucket
           # without public access passes every check above and serves nobody.
-          sample=$(python -c "import json; print(json.load(open('manifest.json'))['files'][0]['sha256'])")
+          # A blob as clients will fetch it: files/<sha>.gz for a compressed release.
+          sample=$(python -c "import json; m = json.load(open('manifest.json')); print(m['files'][0]['sha256'] + ('.gz' if m.get('compression') == 'gzip' else ''))")
           for url in "$base/$prefix/manifest.json" "$base/$prefix/manifest.json.sig" "$base/files/$sample"; do
             curl -fsS -o /dev/null "$url" || {
               echo "::error::$url is not publicly reachable. Is public access on for the bucket, and is UPDATE_BASE_URL its public URL?"

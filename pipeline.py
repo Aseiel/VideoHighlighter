@@ -1280,6 +1280,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                          if _needed else None),
                 video_path=processed_video_path,
                 outline_stats=_outlined,
+                cancel=cancel_flag,
                 log_fn=log)
             # Only on a cached pass, and only when the rule set actually moved.
             # A fresh pass writes the whole cache further down; rewriting it

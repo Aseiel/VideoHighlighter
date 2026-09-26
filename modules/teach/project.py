@@ -44,7 +44,8 @@ TASKS = (ACTIONS, OBJECTS)
 PENDING = "pending"
 ACCEPTED = "accepted"      # shows ``label``
 REJECTED = "rejected"      # not usable (wrong, unclear, a bad cut) — never trained on
-NEGATIVE = "negative"      # shows none of the classes — trained on as "not these"
+NEGATIVE = "negative"      # shows none of the classes: object frames with no boxes,
+                           # and for actions the `background_class`, when one is set
 VERDICTS = (PENDING, ACCEPTED, REJECTED, NEGATIVE)
 
 # decided_by for auto-accepted samples.
@@ -92,6 +93,7 @@ class Sample:
     focus_paths: list = field(default_factory=list)
     focus_tried: bool = False      # the cropper has seen it (it may have made nothing)
     boxes_tried: bool = False      # boxes were proposed for it (maybe none found)
+    unreadable: bool = False       # no frames could be decoded: never sorted, never asked about
     scores: dict = field(default_factory=dict)       # class -> calibrated score
     proposed: str = ""                               # class, UNSURE or NONE
     margin: float = 0.0
@@ -148,6 +150,10 @@ class Settings:
     auto_margin: float = 0.3         # and clearly ahead of every other class
     auto_min_checked: int = 5        # checked samples a class needs first
     auto_max_error: float = 0.2      # spot checks overturning more: off for that class
+    # Actions only: the class "none of these" samples are trained as. An action
+    # classifier without one has no way to say "none", so it names one of the
+    # classes for everything; with one, it can decline. Empty = not trained on.
+    background_class: str = ""
 
 
 def slugify(text: str) -> str:
@@ -266,13 +272,24 @@ class Project:
         if problems:
             raise ValueError("; ".join(p.message for p in problems))
         spec.name = clean
+        # Everywhere the name is recorded, or it quietly splits in two: the
+        # spot-check record, the last model's guesses, and object boxes.
         for sample in self.samples:
-            if sample.label == old:
-                sample.label = clean
-            if sample.proposed == old:
-                sample.proposed = clean
+            for attr in ("label", "proposed", "auto_label", "model_proposed"):
+                if getattr(sample, attr) == old:
+                    setattr(sample, attr, clean)
             if old in sample.scores:
                 sample.scores[clean] = sample.scores.pop(old)
+        if os.path.exists(self.path(LABELS_FILE)):
+            from modules.vision.label_store import LabelStore
+            labels = LabelStore(self.path(LABELS_FILE)).load()
+            renamed = 0
+            for box in labels.boxes:
+                if box.class_name == old:
+                    box.class_name = clean
+                    renamed += 1
+            if renamed:
+                labels.save()
 
     # --- sources and samples -----------------------------------------------
 

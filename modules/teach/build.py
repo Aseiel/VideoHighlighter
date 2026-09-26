@@ -92,6 +92,20 @@ def _place(src: str, dst: str) -> None:
         shutil.copy2(src, dst)
 
 
+def background_folder(project: Project) -> str:
+    """The background class's name, checked like any class name; ``""`` if unset."""
+    from modules.teach.naming import check_name, normalize_name
+
+    name = normalize_name(project.settings.background_class)
+    if not name:
+        return ""
+    blocking = [p for p in check_name(name, project.class_names()) if p.blocking]
+    if blocking:
+        raise ValueError(f"background_class {name!r}: "
+                         + "; ".join(p.message for p in blocking))
+    return name
+
+
 def build_actions(project: Project) -> dict:
     splits = assign_splits(project)
     root = project.path(DATASET_DIR)
@@ -99,9 +113,12 @@ def build_actions(project: Project) -> dict:
         shutil.rmtree(root)
     os.makedirs(root)
     written = 0
-    for sample in project.accepted():
+    background = background_folder(project)
+    negatives = ([s for s in project.samples if s.verdict == NEGATIVE] if background else [])
+    for sample in project.accepted() + negatives:
         if sample.split not in (TRAIN, VAL):
             continue
+        label = sample.label or background
         # The person-focused crops when the cropper made them: those are what
         # the model will be shown, and each is its own training clip.
         files = sample.focus_paths or [sample.path]
@@ -109,7 +126,7 @@ def build_actions(project: Project) -> dict:
             if not os.path.exists(src):
                 continue
             suffix = f"_{i}" if len(files) > 1 else ""
-            dst = os.path.join(root, sample.split, sample.label,
+            dst = os.path.join(root, sample.split, label,
                                f"{sample.id}{suffix}{os.path.splitext(src)[1]}")
             _place(src, dst)
             written += 1
@@ -135,8 +152,15 @@ def dataset_signature(project: Project) -> str:
     ``build`` stores it and each training round records it, so "has this been
     built / trained on?" is a comparison rather than a guess from timestamps.
     """
+    # Negatives only count where they are trained on: object frames, or an
+    # action project with a background class. Otherwise marking one changes
+    # nothing a model sees and must not ask for a rebuild and a new round.
+    counted = (ACCEPTED, NEGATIVE) if (project.task != ACTIONS
+                                       or project.settings.background_class) else (ACCEPTED,)
     parts = sorted(f"{s.id}:{s.label}:{s.split}:{s.verdict}" for s in project.samples
-                   if s.verdict in (ACCEPTED, NEGATIVE))
+                   if s.verdict in counted)
+    if project.task == ACTIONS and project.settings.background_class:
+        parts.append(f"background={background_folder(project)}")
     if project.task != ACTIONS:
         from modules.teach.boxes import store
         parts += sorted(f"{b.video}@{b.time}:{b.class_name}:{b.verdict}:{b.box}"

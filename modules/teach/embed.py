@@ -32,9 +32,14 @@ class ClipBackend:
     """The app's CLIP, behind the ``Embedder`` interface. Loaded on first use."""
 
     def __init__(self, device: str = "AUTO"):
+        from llm.clip_prefilter import MODEL_ID
+
         self._device = device
         self._clip = None
-        self.model_id = ""
+        # Known before loading: the vector cache is opened before the first
+        # embedding, and a cache opened without a model name cannot tell that
+        # its vectors came from another model.
+        self.model_id = MODEL_ID
 
     def _load(self):
         if self._clip is None:
@@ -42,7 +47,7 @@ class ClipBackend:
             clip = ClipEmbedder(device=self._device)
             clip.load()
             self._clip = clip
-            self.model_id = getattr(clip, "model_id", "") or "clip"
+            self.model_id = getattr(clip, "model_id", "") or self.model_id
         return self._clip
 
     def images(self, frames_bgr: Sequence) -> np.ndarray:
@@ -104,8 +109,10 @@ class VectorCache:
         except (OSError, ValueError):
             return
         stored = str(data["model_id"]) if "model_id" in data.files else ""
-        if self.model_id and stored and stored != self.model_id:
-            return      # another model's space: every vector is meaningless here
+        if stored != self.model_id:
+            # Another model's space, or unrecorded: a vector is only comparable
+            # with vectors from the same model, so these are thrown away.
+            return
         for key, vector in zip(data["ids"], data["vectors"]):
             self._vectors[str(key)] = vector
 

@@ -85,6 +85,9 @@ def sort_project(project: Project, embedder, *,
 
     tally = {}
     for sample in project.samples:
+        # A clip nothing could be decoded from is set aside rather than left
+        # looking unsorted, which would keep `sort` the next step for ever.
+        sample.unreadable = sample.id not in vectors
         if sample.id not in results:
             continue
         sample.scores, sample.proposed, sample.margin = results[sample.id]

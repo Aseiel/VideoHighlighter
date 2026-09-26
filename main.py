@@ -2593,7 +2593,13 @@ class VideoHighlighterGUI(QWidget):
 
             rel_combo = QComboBox()
             rel_combo.addItems(["inside", "overlaps", "touches"])
-            rel_combo.setCurrentText(str(relation or 'inside'))
+            # Normalised the way the engine reads it, so `Touches` in the file
+            # shows as touches instead of falling back to inside and being
+            # dropped on the next save.
+            _rel = str(relation or 'inside').strip().lower()
+            if rel_combo.findText(_rel) < 0:
+                rel_combo.addItem(_rel)          # shown as-is; the engine says why it is wrong
+            rel_combo.setCurrentText(_rel)
             rel_combo.setToolTip("inside: its centre is in the region\n"
                                  "overlaps: most of its area is in the region\n"
                                  "touches: the two meet")

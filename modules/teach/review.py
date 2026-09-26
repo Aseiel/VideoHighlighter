@@ -320,7 +320,11 @@ def apply_verdicts(project: Project, number: int, *, accept: str = "",
         decided[n] = (verdict, label)
 
     for n in parse_numbers(accept):
-        mark(n, ACCEPTED)
+        # Accepting a "none of these" guess confirms it: that is a negative,
+        # and refusing the whole sheet over it punished the natural reading
+        # of "accept 1-24" = "every guess on this sheet is right".
+        guessed_none = n in by_n and by_n[n]["proposed"] == NONE
+        mark(n, NEGATIVE if guessed_none else ACCEPTED)
     for n in parse_numbers(reject):
         mark(n, REJECTED)
     for n in parse_numbers(negative):

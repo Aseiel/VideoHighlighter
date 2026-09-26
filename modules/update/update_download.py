@@ -104,7 +104,9 @@ def _is_permanent(exc: Exception) -> bool:
     a 5xx from a CDN edge — is the kind of thing a second attempt fixes.
     """
     code = getattr(exc, "code", None)
-    return isinstance(code, int) and 400 <= code < 500
+    # Except the 4xx that mean "not now": a timeout, and being rate-limited,
+    # which six parallel downloads make likely rather than rare.
+    return isinstance(code, int) and 400 <= code < 500 and code not in (408, 425, 429)
 
 
 def download_plan(

@@ -869,3 +869,77 @@ def test_quick_stops_before_creating_anything_when_not_ready(tmp_path, monkeypat
     code, result = cli.run(["--project", str(root), "quick", "--task", "actions"])
     assert code == 2 and "install the CLIP pack" in result["error"]
     assert not root.exists()
+
+
+def test_an_unreadable_clip_does_not_keep_sort_the_next_step_forever(project):
+    truth = _add_samples(project, [0, 1, 0, 1])
+    broken = project.samples[2].id + ".mp4"
+
+    def reader(path, count, **_):
+        return [] if os.path.basename(path) == broken else _reader(truth)(path, count)
+
+    result = sort.sort_project(project, FakeEmbedder(), frame_reader=reader)
+    assert result["unreadable"] == 1
+    assert project.samples[2].unreadable
+    assert not status.next_step(Project.load(project.root))["command"].endswith(" sort")
+
+
+def test_vectors_from_another_model_are_not_reused(tmp_path):
+    from modules.teach.embed import VectorCache
+
+    first = VectorCache(str(tmp_path), "model-a")
+    first.put("s1", np.ones(4, np.float32))
+    first.save()
+    assert VectorCache(str(tmp_path), "model-a").get("s1") is not None
+    assert VectorCache(str(tmp_path), "model-b").get("s1") is None
+    assert VectorCache(str(tmp_path), "").get("s1") is None
+
+
+def test_renaming_a_class_reaches_every_record_of_it(tmp_path):
+    from modules.vision.label_store import LabelledBox, LabelStore
+
+    p = _object_project(tmp_path)
+    s = p.samples[0]
+    s.auto_label, s.model_proposed = "alpha widget", "alpha widget"
+    labels = LabelStore(p.path("labels.json"))
+    labels.add(LabelledBox(video=s.path, time=0.5, class_name="alpha widget",
+                           box=(0.1, 0.1, 0.2, 0.2), verdict=ACCEPTED))
+    labels.save()
+    p.rename_class("alpha widget", "beta widget")
+    assert (s.label, s.auto_label, s.model_proposed) == ("beta widget",) * 3
+    assert [b.class_name for b in LabelStore(p.path("labels.json")).load().boxes] == [
+        "beta widget"]
+
+
+def test_negatives_train_as_a_background_class_only_when_one_is_named(project):
+    _add_samples(project, [0] * 6 + [-1] * 6)
+    for s in project.samples[:6]:
+        project.decide(s, ACCEPTED, "alpha move", by="sheet:1")
+    for s in project.samples[6:]:
+        project.decide(s, NEGATIVE, by="sheet:1")
+    before = build.build(project)["signature"]
+    assert not os.path.exists(project.path("dataset", "train", "background"))
+
+    # Marking yet another negative trains nothing new, so it needs no rebuild.
+    extra = _add_samples(project, [-1])
+    project.decide(project.samples[-1], NEGATIVE, by="sheet:2")
+    assert build.dataset_signature(project) == before and extra
+
+    project.settings.background_class = "background"
+    result = build.build(project)
+    assert result["signature"] != before
+    names = {split: os.listdir(project.path("dataset", split)) for split in ("train", "val")}
+    assert all("background" in n for n in names.values())
+
+    project.settings.background_class = "alpha move"      # a class already
+    with pytest.raises(ValueError, match="background_class"):
+        build.build(project)
+
+
+def test_accepting_a_none_of_these_guess_confirms_it(project):
+    _scored(project, [("alpha move", 0.5, "")] * 2 + [(NONE, 0.3, "")])
+    record = review.next_sheet(project, size=3, frame_reader=lambda *a, **k: [],
+                               renderer=lambda *a, **k: None)
+    result = review.apply_verdicts(project, record["sheet"], accept="1-3")
+    assert result["errors"] == []
+    assert sorted(s.verdict for s in project.samples) == [ACCEPTED, ACCEPTED, NEGATIVE]

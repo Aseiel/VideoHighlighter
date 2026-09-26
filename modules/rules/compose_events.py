@@ -97,6 +97,7 @@ def apply_rules(object_detections: Optional[Mapping],
                 signals: Optional[Mapping] = None,
                 video_path: Optional[str] = None,
                 outline_stats: Optional[dict] = None,
+                cancel=None,
                 log_fn=print) -> tuple:
     """Re-derive composed events. Returns ``(detections, boxes, names, hits)``.
 
@@ -150,7 +151,7 @@ def apply_rules(object_detections: Optional[Mapping],
     if video_path and boxes and (engine.outline_pairs or engine.keypoint_pairs):
         from modules.rules.rule_inputs import trace_for_rules
         boxes = [dict(frame) for frame in boxes]
-        report = trace_for_rules(video_path, boxes, engine, log=log_fn)
+        report = trace_for_rules(video_path, boxes, engine, cancel=cancel, log=log_fn)
         if outline_stats is not None:
             # `frames` > 0 tells the caller the cache gained something to save.
             traced = sum((s or {}).get("frames", 0) for s in report.values())

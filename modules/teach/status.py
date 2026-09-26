@@ -49,7 +49,7 @@ def next_step(project: Project) -> dict:
     if (project.task == "actions" and project.settings.focus
             and any(not s.focus_tried for s in project.samples)):
         return _step(project, "auto", "Crop samples to the people in them.", "focus")
-    unsorted = [s for s in project.samples if not s.scores]
+    unsorted = [s for s in project.samples if not s.scores and not s.unreadable]
     if not scored or unsorted:
         return _step(project, "auto", "Score every sample against every class.", "sort")
 
