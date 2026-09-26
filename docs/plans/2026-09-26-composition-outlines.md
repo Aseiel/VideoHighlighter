@@ -117,8 +117,8 @@ without a column was deleted on Save.
 | piece | effort | notes |
 |---|---|---|
 | SAM measured on real footage, licence confirmed, packaged | 1 day | steps above |
-| Draw outlines in the timeline overlay | 0.5-1 day | composed entries already carry `event_contours`; the overlay draws `bboxes` with `drawRect`, and needs a `drawPolygon` branch |
-| `Relation` and `Outline` columns in the Advanced tab | 0.5 day | YAML works today; the table now preserves the fields, it just doesn't show them |
+| ~~Draw outlines in the timeline overlay~~ | done | a traced shape is drawn solid, its box dashed behind it |
+| ~~`Relation` and `Outline` columns in the Advanced tab~~ | done | `min_overlap` / `max_gap` are still YAML-only (kept on save) |
 | Body-part sources from pose (`person.left_wrist inside cup`) | 1-2 days | RTMPose (Apache-2.0) already runs in the cropper; a keypoint is a precise point source for `inside` and `touches`. Probably the biggest precision gain for rules about people, at little cost |
 | Outlines in the *live* overlay (every frame, while playing) | hard; not recommended | needs real-time segmentation. Composition is an offline reading of cached detections, and that's where outlines pay |
 

@@ -2313,12 +2313,15 @@ class VideoHighlighterGUI(QWidget):
         # invisible here and could only be edited as YAML.
         self.COMP_MIN_UNSET = -9999.0
         self.COMP_MAX_UNSET = 9999.0
-        self.comp_table = QTableWidget(0, 13)
+        # Relation and Outline sit before the delete button; named so no
+        # lookup below depends on remembering where they went.
+        COMP_REL_COL, COMP_OUTLINE_COL, COMP_DEL_COL = 12, 13, 14
+        self.comp_table = QTableWidget(0, 15)
         self.comp_table.setHorizontalHeaderLabels([
             "On", "Kind", "Event Name", "Display Label",
             "Object / Signal", "Region / Equals",
             "Min", "Max", "Sustain (s)", "Within (s)",
-            "Window (s)", "Persist (s)", "",
+            "Window (s)", "Persist (s)", "Relation", "Outline", "",
         ])
         # chr(10) rather than an escape: this block is generated, and a
         # literal backslash-n did not survive the round trip intact.
@@ -2335,12 +2338,16 @@ class VideoHighlighterGUI(QWidget):
             "       signals not sampled at the same moments (Signal).",
             "Window: seconds of frames to smooth over (reduces flicker)",
             "Persist: seconds to keep a source alive after it disappears",
+            "Relation (Spatial): inside = its centre is in the region;",
+            "       overlaps = most of it is in the region; touches = they meet.",
+            "Outline (Spatial): trace the real shapes inside the boxes and",
+            "       decide on those. Slower the first time; kept after that.",
         ]))
         self.comp_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.comp_table.horizontalHeader().setStretchLastSection(False)
         for _c, _w in ((0, 34), (1, 78), (2, 140), (3, 140), (4, 150), (5, 120),
                        (6, 70), (7, 70), (8, 80), (9, 80), (10, 80), (11, 80),
-                       (12, 32)):
+                       (COMP_REL_COL, 92), (COMP_OUTLINE_COL, 60), (COMP_DEL_COL, 32)):
             self.comp_table.setColumnWidth(_c, _w)
         self.comp_table.setMinimumHeight(160)
         self.comp_table.setMaximumHeight(280)
@@ -2427,6 +2434,8 @@ class VideoHighlighterGUI(QWidget):
                         region=rule.get('region', ''),
                         min_c=rule.get('min_count', 1),
                         max_c=rule.get('max_count', 999),
+                        relation=rule.get('relation', 'inside'),
+                        outline=bool(rule.get('outline', False)),
                         **common)
                 for cond in ev.get('signals', []) or []:
                     equals = cond.get('equals')
@@ -2475,6 +2484,10 @@ class VideoHighlighterGUI(QWidget):
                 w = self.comp_table.cellWidget(row, col)
                 if w:
                     w.setEnabled(True)
+            for col in (COMP_REL_COL, COMP_OUTLINE_COL):   # shapes: spatial only
+                w = self.comp_table.cellWidget(row, col)
+                if w:
+                    w.setEnabled(not signal)
             head = self.comp_table.horizontalHeaderItem(4)
             if head:
                 head.setText("Object / Signal")
@@ -2482,7 +2495,8 @@ class VideoHighlighterGUI(QWidget):
         def _comp_add_table_row(ev_name='', ev_label='', source='', region='',
                                 min_c=None, max_c=None, window=0.75, persist=0.5,
                                 enabled=True, kind='Spatial',
-                                sustain=0, within=0):
+                                sustain=0, within=0, relation='inside',
+                                outline=False):
             r = self.comp_table.rowCount()
             self.comp_table.insertRow(r)
 
@@ -2577,6 +2591,20 @@ class VideoHighlighterGUI(QWidget):
             per_spin.setValue(float(persist))
             self.comp_table.setCellWidget(r, 11, per_spin)
 
+            rel_combo = QComboBox()
+            rel_combo.addItems(["inside", "overlaps", "touches"])
+            rel_combo.setCurrentText(str(relation or 'inside'))
+            rel_combo.setToolTip("inside: its centre is in the region\n"
+                                 "overlaps: most of its area is in the region\n"
+                                 "touches: the two meet")
+            self.comp_table.setCellWidget(r, COMP_REL_COL, rel_combo)
+
+            outline_chk = QCheckBox()
+            outline_chk.setChecked(bool(outline))
+            outline_chk.setToolTip("Decide on the real shapes, traced inside the "
+                                   "boxes, instead of the boxes")
+            self.comp_table.setCellWidget(r, COMP_OUTLINE_COL, outline_chk)
+
             del_btn = QPushButton()
             del_btn.setIcon(_ui_icons.cross())
             del_btn.setToolTip("Remove this condition")
@@ -2586,12 +2614,12 @@ class VideoHighlighterGUI(QWidget):
             def _make_del(btn):
                 def _del():
                     for i in range(self.comp_table.rowCount()):
-                        if self.comp_table.cellWidget(i, 12) is btn:
+                        if self.comp_table.cellWidget(i, COMP_DEL_COL) is btn:
                             self.comp_table.removeRow(i)
                             return
                 return _del
             del_btn.clicked.connect(_make_del(del_btn))
-            self.comp_table.setCellWidget(r, 12, del_btn)
+            self.comp_table.setCellWidget(r, COMP_DEL_COL, del_btn)
 
             _comp_apply_kind(r)
 
@@ -2664,24 +2692,32 @@ class VideoHighlighterGUI(QWidget):
                         cond['within_secs'] = int(within)
                     entry.setdefault('signals', []).append(cond)
                 else:
-                    entry.setdefault('rules', []).append({
+                    rule = {
                         'source': first,
                         'region': second,
                         # Counts are whole numbers; the shared spin box carries
                         # decimals for the signal case.
                         'min_count': int(round(min_v)) if min_v > self.COMP_MIN_UNSET else 0,
                         'max_count': int(round(max_v)) if max_v < self.COMP_MAX_UNSET else 999,
-                    })
+                    }
+                    rel_w = self.comp_table.cellWidget(r, COMP_REL_COL)
+                    if rel_w is not None and rel_w.currentText() != 'inside':
+                        rule['relation'] = rel_w.currentText()
+                    out_w = self.comp_table.cellWidget(r, COMP_OUTLINE_COL)
+                    if out_w is not None and out_w.isChecked():
+                        rule['outline'] = True
+                    entry.setdefault('rules', []).append(rule)
 
             # Rule fields without a column (relation, outline, ...) carried
             # over from each rule's original, matched by its source and region.
-            from modules.rules.rules_file import carry_rule_fields
+            from modules.rules.rules_file import TABLE_RULE_KEYS, carry_rule_fields
             originals = getattr(self, '_comp_original', {})
+            owned = TABLE_RULE_KEYS | {'relation', 'outline'}
             for entry in events_ordered:
                 if entry.get('rules'):
                     entry['rules'] = carry_rule_fields(
                         (originals.get(entry['name']) or {}).get('rules'),
-                        entry['rules'])
+                        entry['rules'], owned=owned)
 
             # Anything the table still cannot represent — an event with neither
             # kind of condition — is written back as it was read. The table

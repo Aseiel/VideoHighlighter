@@ -15,12 +15,16 @@ from __future__ import annotations
 TABLE_RULE_KEYS = frozenset({"source", "region", "min_count", "max_count"})
 
 
-def carry_rule_fields(original_rules, rebuilt_rules) -> list:
+def carry_rule_fields(original_rules, rebuilt_rules, owned=TABLE_RULE_KEYS) -> list:
     """``rebuilt_rules`` with each one's extra fields restored from its original.
 
     A rebuilt rule is matched to the first unused original rule with the same
     source and region, so two rules on the same pair keep their own settings
     in order, and a rule that was edited to a new pair starts clean.
+
+    ``owned`` are the fields the editor has columns for. They are never carried
+    over, even when the rebuilt rule leaves them out: an editor that writes
+    only non-default values must be able to set a field back to its default.
     """
     pool = [dict(r) for r in (original_rules or []) if isinstance(r, dict)]
     used = set()
@@ -33,7 +37,7 @@ def carry_rule_fields(original_rules, rebuilt_rules) -> list:
             if old.get("source") == rule.get("source") and old.get("region") == rule.get("region"):
                 used.add(i)
                 for key, value in old.items():
-                    if key not in TABLE_RULE_KEYS:
+                    if key not in owned:
                         merged.setdefault(key, value)
                 break
         out.append(merged)

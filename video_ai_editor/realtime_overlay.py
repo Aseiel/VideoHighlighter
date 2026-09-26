@@ -46,11 +46,11 @@ from video_ai_editor.live_face import LiveFaceController, LiveFaceOverlay
 
 from PySide6.QtCore import Qt, QRectF, QTimer, QUrl, QPointF, Signal, QSizeF
 from PySide6.QtGui import (
-    QColor, QPen, QBrush, QFont, QPainter, QImage, QTransform, QAction,
+    QColor, QPen, QBrush, QFont, QPainter, QImage, QTransform, QAction, QPolygonF,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
-    QGraphicsRectItem, QGraphicsTextItem, QGraphicsEllipseItem,
+    QGraphicsRectItem, QGraphicsTextItem, QGraphicsEllipseItem, QGraphicsPolygonItem,
     QCheckBox, QLabel, QGroupBox, QComboBox, QSlider, QGraphicsItem, QMenu, QInputDialog,
     QToolButton,
 )
@@ -313,7 +313,12 @@ class LazyBBoxLoader:
         if not bboxes and entry.get('bbox'):
             bboxes = [entry['bbox']] * max(1, len(names))
         confidences = entry.get('confidences', [])
-        
+        # Outlines, when a composition rule traced them (modules/vision/
+        # outlines.py): per detection in `contours`, and for a composed event
+        # the shapes it was about in `event_contours`.
+        contours = entry.get('contours') or []
+        event_contours = entry.get('event_contours') or []
+
         result = []
         for i, name in enumerate(names):
             if i >= len(bboxes):
@@ -322,12 +327,18 @@ class LazyBBoxLoader:
             if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
                 continue
             conf = confidences[i] if i < len(confidences) else 0.5
+            shapes = []
+            if i < len(event_contours) and event_contours[i]:
+                shapes = [s for s in event_contours[i] if s and len(s) >= 3]
+            elif i < len(contours) and contours[i] and len(contours[i]) >= 3:
+                shapes = [contours[i]]
             result.append({
                 'timestamp': ts,
                 'class_name': str(name),
                 'confidence': float(conf),
                 'bbox': tuple(bbox[:4]),
-                'type': 'object'
+                'type': 'object',
+                'contours': shapes,
             })
         return result
     
@@ -417,12 +428,17 @@ class BBoxOverlayItem(QGraphicsRectItem):
         timestamp: float,
         parent: QGraphicsItem | None = None,
         color: QColor | None = None,
+        contours: list | None = None,
     ):
         super().__init__(parent)
         self.class_name = class_name
         self.confidence = confidence
         self.timestamp = timestamp
         self.bbox_norm = bbox  # stored normalised, mapped to scene in update_geometry
+        # Normalised outlines inside the box, when traced. With one, the shape
+        # is what is drawn and the box stays only as a faint dashed frame: the
+        # rule was decided on the shape, so the shape is what to show.
+        self.contours_norm = [c for c in (contours or []) if c and len(c) >= 3]
 
         if color is None:
             color = color_for_class(class_name)
@@ -430,8 +446,21 @@ class BBoxOverlayItem(QGraphicsRectItem):
         # Box style
         pen = QPen(color, 2.5)
         pen.setCosmetic(True)  # constant thickness regardless of zoom
-        self.setPen(pen)
-        self.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 30)))
+        self._outline_items = []
+        if self.contours_norm:
+            faint = QPen(QColor(color.red(), color.green(), color.blue(), 110), 1.2,
+                         Qt.PenStyle.DashLine)
+            faint.setCosmetic(True)
+            self.setPen(faint)
+            self.setBrush(QBrush(Qt.NoBrush))
+            for _ in self.contours_norm:
+                shape = QGraphicsPolygonItem(self)
+                shape.setPen(pen)
+                shape.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 45)))
+                self._outline_items.append(shape)
+        else:
+            self.setPen(pen)
+            self.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 30)))
 
         # Label background + text
         self._label_bg = QGraphicsRectItem(self)
@@ -462,6 +491,9 @@ class BBoxOverlayItem(QGraphicsRectItem):
         pw = w * video_width
         ph = h * video_height
         self.setRect(px, py, pw, ph)
+        for item, outline in zip(self._outline_items, self.contours_norm):
+            item.setPolygon(QPolygonF([QPointF(float(x) * video_width, float(y) * video_height)
+                                       for x, y in outline]))
 
         # Scale the label font with the video resolution. The scene is video-sized
         # (e.g. 1920x1080) and gets downscaled to fit the small preview, so a fixed
@@ -685,6 +717,7 @@ class OverlayScene(QGraphicsScene):
                         confidence=bbox['confidence'],
                         timestamp=ts,
                         color=self._class_colors.get(bbox['class_name']),
+                        contours=bbox.get('contours'),
                     )
                     scene_r = self.sceneRect()
                     item.update_geometry(scene_r.width(), scene_r.height())

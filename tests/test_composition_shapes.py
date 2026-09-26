@@ -160,3 +160,17 @@ def test_a_table_save_keeps_rule_fields_it_has_no_column_for():
     assert out[1]["relation"] == "overlaps"
     assert "outline" not in out[2]                  # a different rule now
     assert top_level_fields({"outliner": "sam", "events": []}) == {"outliner": "sam"}
+
+
+def test_a_column_set_back_to_its_default_stays_default():
+    from modules.rules.rules_file import TABLE_RULE_KEYS, carry_rule_fields
+
+    original = [{"source": "a", "region": "b", "relation": "touches", "outline": True,
+                 "max_gap": 0.02}]
+    # The Advanced tab owns relation/outline and writes only non-defaults: a
+    # rule switched back to inside / no outline arrives without the keys.
+    rebuilt = [{"source": "a", "region": "b", "min_count": 1, "max_count": 999}]
+    out = carry_rule_fields(original, rebuilt,
+                            owned=TABLE_RULE_KEYS | {"relation", "outline"})
+    assert out == [{"source": "a", "region": "b", "min_count": 1, "max_count": 999,
+                    "max_gap": 0.02}]
