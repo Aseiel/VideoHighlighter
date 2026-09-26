@@ -1013,3 +1013,37 @@ def test_a_frame_whose_box_was_rejected_is_proposed_again_elsewhere(tmp_path):
             b.verdict = BOX_REJECTED
     labels.save()
     assert boxes.propose(p, FakeDetector(), CropEmbedder(), read_at=_frame)["proposed"] == 0
+
+
+# --- sharing a taught detector ---------------------------------------------------------
+
+def test_the_installed_detector_is_drafted_for_the_hub(tmp_path):
+    from modules.teach import share
+    from modules.vision.label_store import LabelledBox, LabelStore
+
+    p = _object_project(tmp_path)
+    with pytest.raises(share.NotShareable, match="train a round"):
+        share.share_draft(p)
+
+    model_dir = tmp_path / "models" / "teach_obj"
+    model_dir.mkdir(parents=True)
+    (model_dir / "m.onnx").write_bytes(b"onnx")
+    (model_dir / "labels.json").write_text(json.dumps(["alpha widget", "person"]))
+    p.rounds.append({"round": 1, "installed": True,
+                     "install": {"xml": str(model_dir / "m.xml")}})
+    labels = LabelStore(p.path("labels.json"))
+    for t in (1.0, 2.0):
+        labels.add(LabelledBox(video=p.samples[0].path, time=t, class_name="alpha widget",
+                               box=(0.1, 0.1, 0.2, 0.2), verdict=ACCEPTED))
+    labels.save()
+
+    onnx, draft = share.share_draft(p)
+    assert onnx == str(model_dir / "m.onnx")
+    assert draft.labels == ["alpha widget", "person"]
+    assert draft.metrics == {"rounds": 1, "train_frames": 2, "videos": 1}
+    assert draft.name == "" and draft.description == ""       # the person's to write
+    assert draft.problems(require_compliance=False)            # ...so not ready yet
+
+    p.task = ACTIONS
+    with pytest.raises(share.NotShareable, match="Only object"):
+        share.share_draft(p)

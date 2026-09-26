@@ -114,9 +114,13 @@ class TeachPanel(QWidget):
         self.train_btn = QPushButton("Train")
         self.train_btn.setToolTip("Continue, including training (can take a while)")
         self.train_btn.clicked.connect(lambda: self._run(["auto", "--train"]))
+        self.share_btn = QPushButton("Share…")
+        self.share_btn.setToolTip("Share the trained detector on the model hub "
+                                  "(the model only, never your footage)")
+        self.share_btn.clicked.connect(self.share)
         buttons = QHBoxLayout()
         for b in (self.doctor_btn, self.start_btn, self.review_btn, self.continue_btn,
-                  self.train_btn):
+                  self.train_btn, self.share_btn):
             buttons.addWidget(b)
         buttons.addStretch(1)
 
@@ -176,6 +180,23 @@ class TeachPanel(QWidget):
         self._review.destroyed.connect(lambda *_: self._run(["status"]))
         self._review.show()
 
+    def share(self):
+        from modules.teach.cli import resolve_root
+        from modules.teach.project import Project
+        from modules.teach.share import NotShareable, share_draft
+
+        root = resolve_root(self.project_arg())
+        try:
+            onnx, draft = share_draft(Project.load(root))
+        except FileNotFoundError:
+            self.output.setPlainText("Start a project first.")
+            return
+        except NotShareable as exc:
+            self.output.setPlainText(str(exc))
+            return
+        from model_hub.gui import PublishWizard
+        PublishWizard(self, model_path=onnx, draft=draft).exec()
+
     def _run(self, args: list):
         self._set_busy(True)
         self.output.setPlainText("Working… (" + " ".join(args) + ")")
@@ -197,5 +218,5 @@ class TeachPanel(QWidget):
 
     def _set_busy(self, busy: bool):
         for b in (self.doctor_btn, self.start_btn, self.review_btn, self.continue_btn,
-                  self.train_btn):
+                  self.train_btn, self.share_btn):
             b.setEnabled(not busy)

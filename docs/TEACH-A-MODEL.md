@@ -203,6 +203,15 @@ on every sample (`--no-model` to skip it). For objects, `boxes propose` uses
 its detector. Review then shows the samples where the model and CLIP
 disagree first: one of them is wrong, and those answers teach it the most.
 
+## Sharing a detector
+
+An object project's installed model can be shared on the model hub:
+**Share…** in the From videos tab opens the publish wizard with every
+technical field filled in (labels, input size, format), plus counts from the
+project: rounds, frames trained on, videos. You write the name, description
+and category, and tick the checklist. The package holds the model only, never
+your footage. Action models can't be shared on the hub yet.
+
 ## Honest numbers
 
 About 100 accepted samples per class gave good results by hand. The default

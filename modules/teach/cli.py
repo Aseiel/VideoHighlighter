@@ -403,6 +403,20 @@ def cmd_quick(args, root):
             **run_auto(project.root, train=args.train)}
 
 
+def cmd_share(args, project):
+    from dataclasses import asdict
+
+    from modules.teach.share import NotShareable, share_draft
+    try:
+        onnx, draft = share_draft(project)
+    except NotShareable as exc:
+        raise ValueError(str(exc)) from None
+    return {"model": onnx, "draft": asdict(draft),
+            "how": "Training -> From videos -> Share... opens the publish wizard with "
+                   "this filled in; name, description, category and the checklist "
+                   "are yours to complete."}
+
+
 def cmd_doctor(args, root):
     from modules.teach import doctor
     return doctor.run(root)
@@ -537,6 +551,7 @@ def parser() -> argparse.ArgumentParser:
                    help="do not run `doctor` first")
 
     sub.add_parser("doctor", help="is this machine ready? (seconds; nothing is loaded)")
+    sub.add_parser("share", help="the installed detector, drafted for the model hub")
 
     s = sub.add_parser("set", help="change settings: key=value ...")
     s.add_argument("pairs", nargs="+")
@@ -550,7 +565,7 @@ COMMANDS = {
     "focus": cmd_focus, "sort": cmd_sort, "folders": cmd_folders,
     "review": cmd_review, "verdict": cmd_verdict, "boxes": cmd_boxes,
     "build": cmd_build, "train": cmd_train, "status": cmd_status, "set": cmd_set,
-    "auto": cmd_auto,
+    "auto": cmd_auto, "share": cmd_share,
 }
 
 
