@@ -397,6 +397,8 @@ async def get_composition_rules() -> dict:
                         "region": rule.get("region", ""),
                         "min_count": rule.get("min_count", 1),
                         "max_count": rule.get("max_count", 999),
+                        "relation": str(rule.get("relation") or "inside").strip().lower(),
+                        "outline": bool(rule.get("outline", False)),
                         "window_secs": ev.get("window_secs", 0.75),
                         "persist_secs": ev.get("persist_secs", 0.5),
                     })
@@ -420,7 +422,9 @@ async def save_composition_rules(req: CompRulesRequest) -> dict:
     from what the file had, as main.py's table does.
     """
     import yaml
-    from modules.rules.rules_file import carry_rule_fields, top_level_fields
+    from modules.rules.rules_file import (
+        TABLE_RULE_KEYS, carry_rule_fields, top_level_fields,
+    )
     from modules.system.app_paths import composition_rules_path, user_data_dir
 
     try:
@@ -451,15 +455,28 @@ async def save_composition_rules(req: CompRulesRequest) -> dict:
                 })
                 events_map[name] = entry
                 events_ordered.append(entry)
-            events_map[name]["rules"].append({
+            rule = {
                 "source": source,
                 "region": region,
                 "min_count": int(row.get("min_count", 1)),
                 "max_count": int(row.get("max_count", 999)),
-            })
+            }
+            # Written only when not the default, as the Qt table does.
+            relation = str(row.get("relation") or "inside").strip().lower()
+            if relation != "inside":
+                rule["relation"] = relation
+            if row.get("outline"):
+                rule["outline"] = True
+            events_map[name]["rules"].append(rule)
+        # The fields this client edits: a client that sends them owns them (so
+        # setting one back to its default sticks); one that does not, such as
+        # an older frontend, leaves the file's values alone.
+        owned = TABLE_RULE_KEYS | {k for k in ("relation", "outline")
+                                   if any(k in row for row in req.rules)}
         for entry in events_ordered:
             entry["rules"] = carry_rule_fields(
-                (originals.get(entry["name"]) or {}).get("rules"), entry["rules"])
+                (originals.get(entry["name"]) or {}).get("rules"), entry["rules"],
+                owned=owned)
         # Events these rows cannot show at all (no spatial rule: signal-only)
         # are kept as they were; an event that had spatial rules and has no
         # rows now was deleted in the UI, and stays deleted.

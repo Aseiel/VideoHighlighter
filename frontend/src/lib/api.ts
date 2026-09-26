@@ -151,6 +151,11 @@ export interface CompRule {
   region: string
   min_count: number
   max_count: number
+  /** inside: the source's centre is in the region; overlaps: most of its
+   * area is; touches: they meet. See modules/rules/shapes.py. */
+  relation?: "inside" | "overlaps" | "touches"
+  /** Decide on outlines traced inside the boxes, not the boxes. */
+  outline?: boolean
   window_secs: number
   persist_secs: number
 }

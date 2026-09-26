@@ -52,3 +52,27 @@ def test_saving_rows_keeps_everything_else(tmp_path, monkeypatch):
     assert both["rules"] == [{"source": "a", "region": "b", "min_count": 2,
                               "max_count": 999, "relation": "touches", "outline": True}]
     assert server is not None
+
+
+def test_relation_and_outline_round_trip_through_the_web_ui(tmp_path, monkeypatch):
+    from sidecar.server import get_composition_rules
+
+    rules = tmp_path / "composition_rules.yaml"
+    rules.write_text(textwrap.dedent("""
+        events:
+          - name: e
+            rules:
+              - {source: a, region: b, relation: Touches, outline: true, max_gap: 0.02}
+        """), encoding="utf-8")
+    monkeypatch.setattr("modules.system.app_paths.composition_rules_path", lambda: str(rules))
+    monkeypatch.setattr("modules.system.app_paths.user_data_dir", lambda: str(tmp_path))
+
+    rows = asyncio.run(get_composition_rules())["rules"]
+    assert rows[0]["relation"] == "touches" and rows[0]["outline"] is True
+
+    # Switched back to the defaults in the UI: they must stick.
+    rows[0]["relation"], rows[0]["outline"] = "inside", False
+    assert asyncio.run(save_composition_rules(CompRulesRequest(rules=rows)))["ok"]
+    saved = yaml.safe_load(rules.read_text(encoding="utf-8"))["events"][0]["rules"][0]
+    assert "relation" not in saved and "outline" not in saved
+    assert saved["max_gap"] == 0.02               # no column for it: kept
