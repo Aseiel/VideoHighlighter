@@ -75,6 +75,15 @@ def _ov_dir_candidates() -> list[str]:
     bases: list[str] = []
     if getattr(sys, "frozen", False):
         bases.append(os.path.dirname(sys.executable))          # override next to exe
+        # Downloaded by the app into the per-user folder when the exe's folder
+        # is read-only (modules/packs/pack_manager.per_user_dir, same rule).
+        if sys.platform == "win32":
+            user_base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+        elif sys.platform == "darwin":
+            user_base = os.path.expanduser("~/Library/Application Support")
+        else:
+            user_base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        bases.append(os.path.join(user_base, "VideoHighlighter"))
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             bases.append(meipass)                              # bundled resources
