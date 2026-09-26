@@ -1239,6 +1239,16 @@ class TrainingPanel(QWidget):
         self.actions = ActionTrainingSection()
 
         tabs = QTabWidget()
+        # First: the automated loop (modules/teach), cutting, sorting and
+        # labelling by itself from example clips and videos. The two tabs after
+        # it train from data that is already labelled.
+        try:
+            from modules.teach.teach_panel import TeachPanel
+            self.teach = TeachPanel()
+            tabs.addTab(self.teach, "From videos")
+        except Exception as exc:                # pragma: no cover - never cost the rest
+            self.teach = None
+            print(f"[training] teach panel unavailable: {exc}")
         tabs.addTab(self.objects, "Objects")
         tabs.addTab(self.actions, "Actions")
 

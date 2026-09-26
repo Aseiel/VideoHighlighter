@@ -25,7 +25,14 @@ Everything lives in one project folder (by default `<user data>/teach/<name>`),
 never in the repository. Every step is safe to re-run, and `status` always says
 which one comes next.
 
-## The quickest way
+## In the app
+
+**Training → From videos** does all of this with buttons: choose what kind,
+an examples folder and the videos, press **Start**, then **Check guesses…**
+when it asks, and **Train** when it says it's ready. Every button runs the
+command of the same name below, so the two always agree.
+
+## The quickest way (command line)
 
 First, on a new machine:
 
