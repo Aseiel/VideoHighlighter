@@ -411,10 +411,26 @@ class CompRulesRequest(BaseModel):
 
 @app.post("/composition-rules")
 async def save_composition_rules(req: CompRulesRequest) -> dict:
+    """Save the rule rows, keeping everything the rows cannot express.
+
+    The rows are spatial rules only. The file also holds signal conditions,
+    events made only of them, event fields (durations, edge guards, enabled),
+    rule fields (relation, outline) and top-level settings (outliner). Writing
+    the rows alone deleted all of that on every save, so each event starts
+    from what the file had, as main.py's table does.
+    """
     import yaml
-    from modules.system.app_paths import user_data_dir
+    from modules.rules.rules_file import carry_rule_fields, top_level_fields
+    from modules.system.app_paths import composition_rules_path, user_data_dir
 
     try:
+        raw = {}
+        current = composition_rules_path()
+        if current and os.path.exists(current):
+            with open(current, encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh) or {}
+        originals = {str(ev.get("name", "")): ev for ev in raw.get("events", []) or []
+                     if isinstance(ev, dict) and ev.get("name")}
         events_ordered: list[dict] = []
         events_map: dict[str, dict] = {}
         for row in req.rules:
@@ -425,13 +441,14 @@ async def save_composition_rules(req: CompRulesRequest) -> dict:
             if not name or not source or not region:
                 continue
             if name not in events_map:
-                entry = {
+                entry = dict(originals.get(name, {}))
+                entry.update({
                     "name": name,
                     "label": str(row.get("label") or name).strip(),
                     "rules": [],
                     "window_secs": float(row.get("window_secs", 0.75)),
                     "persist_secs": float(row.get("persist_secs", 0.5)),
-                }
+                })
                 events_map[name] = entry
                 events_ordered.append(entry)
             events_map[name]["rules"].append({
@@ -440,10 +457,19 @@ async def save_composition_rules(req: CompRulesRequest) -> dict:
                 "min_count": int(row.get("min_count", 1)),
                 "max_count": int(row.get("max_count", 999)),
             })
+        for entry in events_ordered:
+            entry["rules"] = carry_rule_fields(
+                (originals.get(entry["name"]) or {}).get("rules"), entry["rules"])
+        # Events these rows cannot show at all (no spatial rule: signal-only)
+        # are kept as they were; an event that had spatial rules and has no
+        # rows now was deleted in the UI, and stays deleted.
+        for name, ev in originals.items():
+            if name not in events_map and not ev.get("rules"):
+                events_ordered.append(ev)
         path = os.path.join(user_data_dir(), "composition_rules.yaml")
         with open(path, "w", encoding="utf-8") as fh:
-            yaml.dump({"events": events_ordered}, fh, allow_unicode=True,
-                      sort_keys=False, default_flow_style=False)
+            yaml.dump({**top_level_fields(raw), "events": events_ordered}, fh,
+                      allow_unicode=True, sort_keys=False, default_flow_style=False)
         return {"ok": True, "path": path, "events": len(events_ordered)}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}

@@ -2385,10 +2385,16 @@ class VideoHighlighterGUI(QWidget):
             from modules.system.app_paths import composition_rules_path, user_data_dir
             path = composition_rules_path()
             events = []
+            self._comp_top = {}
             if path:
                 try:
                     with open(path, encoding='utf-8') as _f:
-                        events = (yaml.safe_load(_f) or {}).get('events', [])
+                        _raw = yaml.safe_load(_f) or {}
+                    events = _raw.get('events', [])
+                    # Top-level settings (the outliner) have no place in the
+                    # table either; kept and written back as they were.
+                    from modules.rules.rules_file import top_level_fields
+                    self._comp_top = top_level_fields(_raw)
                 except Exception:
                     pass
             self.comp_table.setRowCount(0)
@@ -2667,6 +2673,16 @@ class VideoHighlighterGUI(QWidget):
                         'max_count': int(round(max_v)) if max_v < self.COMP_MAX_UNSET else 999,
                     })
 
+            # Rule fields without a column (relation, outline, ...) carried
+            # over from each rule's original, matched by its source and region.
+            from modules.rules.rules_file import carry_rule_fields
+            originals = getattr(self, '_comp_original', {})
+            for entry in events_ordered:
+                if entry.get('rules'):
+                    entry['rules'] = carry_rule_fields(
+                        (originals.get(entry['name']) or {}).get('rules'),
+                        entry['rules'])
+
             # Anything the table still cannot represent — an event with neither
             # kind of condition — is written back as it was read. The table
             # rebuilds this file from its own rows, so without this such an
@@ -2683,7 +2699,8 @@ class VideoHighlighterGUI(QWidget):
             """
             from modules.system.app_paths import user_data_dir
             import os as _os
-            out = {'events': _comp_collect_events()}
+            out = {**(getattr(self, '_comp_top', None) or {}),
+                   'events': _comp_collect_events()}
             if quiet and out == getattr(self, '_comp_saved_state', None):
                 return False
             save_path = _os.path.join(user_data_dir(), 'composition_rules.yaml')

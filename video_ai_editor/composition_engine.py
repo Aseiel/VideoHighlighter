@@ -5,8 +5,13 @@ A "composed event" fires when a configurable set of conditions holds
 consistently over a short time window. Two kinds of condition exist:
 
 *spatial* (``rules:``)
-    Count how many boxes of a *source* class have their centre inside a box of
-    a *region* class, and require the count to fall in a range.
+    Count how many detections of a *source* class stand in a relation to one
+    of a *region* class, and require the count to fall in a range. The
+    relation is ``inside`` (the source's centre is in the region — the
+    original, and the default), ``overlaps`` (at least ``min_overlap`` of the
+    source's area is in the region) or ``touches`` (they meet, or come within
+    ``max_gap``). Detections are boxes, or outlines where the cache carries
+    ``contours``; see ``modules/rules/shapes.py``.
 
 *signal* (``signals:``)
     Compare a per-second measurement against a threshold, or a per-second label
@@ -35,15 +40,33 @@ from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from modules.rules.shapes import RELATIONS, relates
+
+
+def _relation(value) -> str:
+    """A rule's ``relation``, checked: a typo must fail loudly at load, not
+    silently fall back to ``inside`` and fire on the wrong thing."""
+    relation = str(value or "inside").strip().lower()
+    if relation not in RELATIONS:
+        raise ValueError(f"relation must be one of {RELATIONS}, not {value!r}")
+    return relation
+
 
 @dataclass
 class _Rule:
-    """One condition: count how many *source* boxes have their centre inside
-    a *region* box, and verify the count falls in [min_count, max_count]."""
+    """One condition: count how many *source* detections stand in ``relation``
+    to some *region* detection, and verify the count falls in
+    [min_count, max_count]."""
     source_class: str
     region_class: str
     min_count: int = 1
     max_count: int = 999   # 999 = no upper limit
+    relation: str = "inside"
+    min_overlap: float = 0.5   # overlaps: share of the source's area inside
+    max_gap: float = 0.0       # touches: fraction of the frame width
+    # Ask for outlines of both classes (``modules/vision/outlines.py``). Off,
+    # the rule is decided on boxes, as it always was.
+    outline: bool = False
 
 
 @dataclass
@@ -160,6 +183,7 @@ class CompositionEngine:
             'objects':     list[str],
             'bboxes':      list[[x1n, y1n, wn, hn]],  # normalised top-left + size
             'confidences': list[float],
+            'contours':    list[list[[xn, yn]] | None],   # optional outlines
         }
 
     Returns
@@ -179,6 +203,7 @@ class CompositionEngine:
 
     def __init__(self, rules_path: str | Path):
         self._specs = self._load(Path(rules_path))
+        self.outliner = self._read_outliner(Path(rules_path))
 
     # ------------------------------------------------------------------ public
 
@@ -191,6 +216,26 @@ class CompositionEngine:
         double-counting.
         """
         return [s.name for s in self._specs]
+
+    @staticmethod
+    def _read_outliner(path: Path) -> str:
+        """The rules file's ``outliner:`` (``grabcut`` unless it says ``sam``)."""
+        if not path.exists():
+            return "grabcut"
+        with open(path, encoding='utf-8') as f:
+            raw = yaml.safe_load(f) or {}
+        name = str(raw.get('outliner') or 'grabcut').strip().lower()
+        if name not in ('grabcut', 'sam'):
+            raise ValueError(f"outliner must be 'grabcut' or 'sam', not {name!r}")
+        return name
+
+    @property
+    def outline_pairs(self) -> list:
+        """``(source, region, max_gap)`` for every enabled rule that asked for
+        outlines: what an outline pass has to trace, and next to what."""
+        return sorted({(rule.source_class, rule.region_class, rule.max_gap)
+                       for spec in self._specs if spec.enabled
+                       for rule in spec.rules if rule.outline})
 
     @property
     def object_classes(self) -> list:
@@ -270,10 +315,12 @@ class CompositionEngine:
                                 g['ts'] = ts
                                 g['box'] = det['box']
                                 g['conf'] = det['conf']
+                                g['contour'] = det.get('contour')
                                 matched = True
                                 break
                         if not matched:
-                            existing.append({'ts': ts, 'box': det['box'], 'conf': det['conf']})
+                            existing.append({'ts': ts, 'box': det['box'], 'conf': det['conf'],
+                                             'contour': det.get('contour')})
 
                 # --- build effective detections = live ghosts ---
                 effective: dict = defaultdict(list)
@@ -405,12 +452,18 @@ class CompositionEngine:
                 # barely-there detections is not the same evidence as one firing
                 # on two solid ones, and now it does not claim to be.
                 confidence = min((m['conf'] for m in matched), default=0.0)
-                overlay_bboxes.append({
+                entry = {
                     'timestamp': ts,
                     'objects': [name],
                     'bboxes': [union] if union else [],
                     'confidences': [round(float(confidence), 3)] if union else [],
-                })
+                }
+                outlines = [m['contour'] for m in matched if m.get('contour')]
+                if outlines and union:
+                    # The shapes the event is about, for an overlay that can
+                    # draw them; one that cannot still has the box.
+                    entry['event_contours'] = [outlines]
+                overlay_bboxes.append(entry)
 
         return dict(sec_events), overlay_bboxes
 
@@ -533,6 +586,10 @@ class CompositionEngine:
                     region_class=r['region'],
                     min_count=int(r.get('min_count', 1)),
                     max_count=int(r.get('max_count', 999)),
+                    relation=_relation(r.get('relation')),
+                    min_overlap=float(r.get('min_overlap', 0.5)),
+                    max_gap=float(r.get('max_gap', 0.0)),
+                    outline=bool(r.get('outline', False)),
                 )
                 for r in ev.get('rules', [])
             ]
@@ -581,20 +638,16 @@ class CompositionEngine:
         objs = entry.get('objects', [])
         boxes = entry.get('bboxes', [])
         confs = entry.get('confidences', [])
+        contours = entry.get('contours') or []
         for i, cls in enumerate(objs):
             box = boxes[i] if i < len(boxes) else [0.0, 0.0, 0.0, 0.0]
             conf = confs[i] if i < len(confs) else 1.0
-            result[cls].append({'box': list(box), 'conf': float(conf)})
+            det = {'box': list(box), 'conf': float(conf)}
+            outline = contours[i] if i < len(contours) else None
+            if outline and len(outline) >= 3:
+                det['contour'] = [list(p) for p in outline]
+            result[cls].append(det)
         return result
-
-    @staticmethod
-    def _centre_inside(source_box: list, region_box: list) -> bool:
-        """True if the centre of *source_box* falls inside *region_box*.
-        Both are [x1n, y1n, wn, hn] normalised."""
-        sx1, sy1, sw, sh = source_box
-        cx, cy = sx1 + sw / 2, sy1 + sh / 2
-        rx1, ry1, rw, rh = region_box
-        return rx1 <= cx <= rx1 + rw and ry1 <= cy <= ry1 + rh
 
     @staticmethod
     def _iou(a: list, b: list) -> float:
@@ -634,7 +687,8 @@ class CompositionEngine:
             # Claim source instances greedily; each source counts at most once
             claimed, claimed_idx = [], []
             for i, src in enumerate(sources):
-                if any(self._centre_inside(src['box'], rgn['box']) for rgn in regions):
+                if any(relates(src, rgn, rule.relation, rule.min_overlap, rule.max_gap)
+                       for rgn in regions):
                     claimed.append(src)
                     claimed_idx.append(i)
             count = len(claimed)
