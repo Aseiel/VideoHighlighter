@@ -161,6 +161,60 @@ def lay_out_folders(project: Project) -> dict:
     return {"folder": root, "files": len(placed)}
 
 
+def r3d_classifier(weights: str, mapping: str, *, wrapper_factory=None,
+                   frame_reader: Optional[Callable] = None) -> Callable:
+    """A trained round's R3D model as a proposer: ``path -> (label, confidence)``.
+
+    The same ``R3DModelWrapper`` action recognition uses in the app, loaded
+    with the round's weights, so what it proposes here is what the model will
+    say in use. Sixteen frames spread over the clip, as it was trained on.
+    """
+    import json as _json
+
+    with open(mapping, "r", encoding="utf-8") as handle:
+        data = _json.load(handle)
+    idx_to_label = {int(k): v for k, v in (data.get("idx_to_label") or {}).items()}
+    variant = (data.get("metadata") or {}).get("model_variant") or "r3d_18"
+    if wrapper_factory is None:
+        from action_recognition import R3DModelWrapper as wrapper_factory
+    # "cuda" falls back to the processor by itself when no usable card is there.
+    model = wrapper_factory(model_name=variant, device_str="cuda", half_precision=False,
+                            custom_weights=weights, custom_num_classes=len(idx_to_label))
+    read = frame_reader or embed_mod.read_frames
+
+    def classify(path: str):
+        frames = read(path, 16)
+        if len(frames) != 16:
+            return "", 0.0
+        logits = np.asarray(model.predict_from_frames(frames), dtype=np.float64).ravel()
+        probs = np.exp(logits - logits.max())
+        probs /= probs.sum()
+        best = int(np.argmax(probs))
+        return idx_to_label.get(best, ""), float(probs[best])
+
+    return classify
+
+
+def round_classifier(project) -> Optional[Callable]:
+    """The installed round's model as a proposer, or None before there is one."""
+    import os as _os
+
+    from modules.teach.project import ACTIONS
+
+    if project.task != ACTIONS:
+        return None
+    for record in reversed(project.rounds):
+        metrics = record.get("metrics") or {}
+        if record.get("installed") and metrics.get("weights") and metrics.get("mapping"):
+            if _os.path.exists(metrics["weights"]) and _os.path.exists(metrics["mapping"]):
+                try:
+                    return r3d_classifier(metrics["weights"], metrics["mapping"])
+                except Exception as exc:        # a broken model must not stop the sort
+                    print(f"teach.sort: round {record.get('round')} model unusable: {exc}")
+                    return None
+    return None
+
+
 def sorter_classifier(xml: str, bin_path: str, mapping: str) -> Callable:
     """The last round's model, through sorter.py's own classify_clip.
 

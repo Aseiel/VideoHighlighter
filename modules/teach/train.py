@@ -120,6 +120,8 @@ def install(project: Project, record: dict) -> dict:
         other["installed"] = False
     record["installed"] = True
     record["installed_at"] = time.time()
+    # Where it went, so the next round's sort and box proposals can use it.
+    record["install"] = where
     project.save()
     return where
 

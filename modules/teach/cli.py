@@ -40,6 +40,21 @@ def make_detector():
     return detector
 
 
+def round_detector(project):
+    """The installed round's detector, to propose boxes from round 2 on."""
+    for record in reversed(project.rounds):
+        where = record.get("install") or {}
+        if record.get("installed") and where.get("xml") and os.path.exists(where["xml"]):
+            try:
+                from modules.vision.detection_backend import create_detector
+                return create_detector(where["xml"], where.get("classes") or [])
+            except Exception as exc:        # fall back to the stock detector alone
+                print(f"teach: round {record.get('round')} detector unusable: {exc}",
+                      file=sys.stderr)
+                return None
+    return None
+
+
 def resolve_root(value: str) -> str:
     if os.sep in value or (os.altsep and os.altsep in value) or value.startswith("."):
         return os.path.abspath(value)
@@ -208,6 +223,10 @@ def cmd_sort(args, project):
         base = os.path.splitext(args.model_xml)[0]
         classifier = sort.sorter_classifier(args.model_xml, base + ".bin",
                                             args.model_mapping or base + ".json")
+    elif not args.no_model:
+        # From round 2 the project's own model proposes too, and review asks
+        # first about where it and CLIP disagree.
+        classifier = sort.round_classifier(project)
     result = sort.sort_project(project, make_embedder(), model_classifier=classifier,
                                progress=lambda i, n: print(f"embedded {i}/{n}",
                                                            file=sys.stderr)
@@ -249,7 +268,8 @@ def cmd_verdict(args, project):
 def cmd_boxes(args, project):
     from modules.teach import boxes
     if args.action == "propose":
-        return boxes.propose(project, make_detector(), make_embedder())
+        return boxes.propose(project, make_detector(), make_embedder(),
+                             model_detector=round_detector(project))
     if args.action == "review":
         record = boxes.next_sheet(project, size=args.size)
         if record:
@@ -461,6 +481,8 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--model-xml", dest="model_xml",
                    help="an Intel-encoder decoder IR for sorter.py to propose with")
     s.add_argument("--model-mapping", dest="model_mapping")
+    s.add_argument("--no-model", action="store_true", dest="no_model",
+                   help="do not use the project's trained model as a second opinion")
 
     s = sub.add_parser("folders", help="lay out sorted/ folders, or --read them back")
     s.add_argument("--read", action="store_true")

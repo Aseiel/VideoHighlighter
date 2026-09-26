@@ -943,3 +943,41 @@ def test_accepting_a_none_of_these_guess_confirms_it(project):
     result = review.apply_verdicts(project, record["sheet"], accept="1-3")
     assert result["errors"] == []
     assert sorted(s.verdict for s in project.samples) == [ACCEPTED, ACCEPTED, NEGATIVE]
+
+
+# --- round 2: the project's own model proposes too ----------------------------------
+
+def test_a_trained_round_proposes_and_disagreements_are_reviewed_first(project, tmp_path):
+    weights = tmp_path / "r.pth"
+    weights.write_bytes(b"w")
+    mapping = tmp_path / "r_mapping.json"
+    mapping.write_text(json.dumps({"idx_to_label": {"0": "alpha move", "1": "beta move"},
+                                   "metadata": {"model_variant": "mc3_18"}}))
+    made = {}
+
+    class Wrapper:
+        def __init__(self, **kw):
+            made.update(kw)
+
+        def predict_from_frames(self, frames):
+            # Says "beta" for everything: disagrees with CLIP on alpha samples.
+            return np.array([0.0, 3.0])
+
+    classify = sort.r3d_classifier(str(weights), str(mapping), wrapper_factory=Wrapper,
+                                   frame_reader=lambda path, n: [np.zeros((4, 4, 3))] * n)
+    assert made["model_name"] == "mc3_18" and made["custom_num_classes"] == 2
+    label, confidence = classify("x.mp4")
+    assert label == "beta move" and confidence > 0.9
+
+    truth = _add_samples(project, [0, 0, 1, -1])
+    sort.sort_project(project, FakeEmbedder(), frame_reader=_reader(truth),
+                      model_classifier=classify)
+    batch = review.pick_batch(project, size=4)
+    assert batch[0].model_proposed == "beta move" and batch[0].proposed == "alpha move"
+
+
+def test_only_an_installed_round_proposes(project, tmp_path):
+    assert sort.round_classifier(project) is None
+    project.rounds.append({"round": 1, "installed": False,
+                           "metrics": {"weights": "x", "mapping": "y"}})
+    assert sort.round_classifier(project) is None

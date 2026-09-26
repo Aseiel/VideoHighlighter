@@ -189,6 +189,13 @@ coarser and always go to review. Once a class has three accepted boxes, their
 crops replace its name as what "looks like it" means, which makes every later
 proposal better. What still can't be found goes to the labeller, as before.
 
+## Round 2 and after
+
+Once a round has been installed, `sort` also asks that model for its guess
+on every sample (`--no-model` to skip it). For objects, `boxes propose` uses
+its detector. Review then shows the samples where the model and CLIP
+disagree first: one of them is wrong, and those answers teach it the most.
+
 ## Honest numbers
 
 About 100 accepted samples per class gave good results by hand. The default
