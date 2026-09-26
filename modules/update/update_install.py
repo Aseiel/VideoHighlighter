@@ -7,7 +7,8 @@ holds no update logic and this can be tested without Qt or a network.
 
 Order is deliberate and not rearrangeable:
 
-1. verify the signature — nothing else may happen first;
+1. verify the signature — nothing else may happen first — and that the
+   signed release is for this edition and platform, and newer than this build;
 2. diff against what is installed, so only changed files are fetched;
 3. download to staging, verifying every file's hash there;
 4. apply only once **every** file is present and correct.
@@ -60,6 +61,13 @@ def _fetch_bytes(url: str) -> bytes:
         return response.read()
 
 
+def _running() -> tuple:
+    """``(version, edition, platform_key)`` of this process, for the checks a
+    verified manifest must still pass. A function so tests can stand in."""
+    from version import __edition__, __version__
+    return __version__, __edition__, update_manifest.platform_key()
+
+
 def install_update(
     manifest_url: str,
     root: str,
@@ -98,6 +106,13 @@ def install_update(
         result.message = ("This update could not be verified as genuine and "
                           "was not installed. Download it from your account "
                           "page instead.")
+        return result
+
+    current, edition, platform = _running()
+    problem = update_manifest.release_problem(
+        manifest, current_version=current, edition=edition, platform=platform)
+    if problem:
+        result.message = problem
         return result
 
     result.version = str(manifest.get("version", ""))

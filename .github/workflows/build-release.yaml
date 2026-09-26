@@ -7,9 +7,33 @@ on:
         description: 'Override version (blank = use version.py, e.g. "0.9.0")'
         required: false
         default: ''
+      dry_run:
+        description: 'Build and test everything, publish nothing (no draft release, nothing staged on the update host)'
+        type: boolean
+        default: false
+      web_ui:
+        description: 'Also build the web UI (Tauri + sidecar). It bundles its own CUDA PyTorch, about 40 more Windows minutes'
+        type: boolean
+        default: false
+      update_min_version:
+        description: 'Oldest version that may update to this one in place (blank = any). Set it when the install layout changes'
+        required: false
+        default: ''
 
 permissions:
   contents: write
+
+env:
+  # The published packs (publish-packs.yaml): PyTorch for NVIDIA and for CPU,
+  # and CLIP. Built once per torch version, reused by every release. A new
+  # pack is published under a new tag, and this line moves to it.
+  PACKS_BASE: https://github.com/Aseiel/VideoHighlighter/releases/download/packs-torch-2.7.1
+  # The update host (Cloudflare R2). tools/publish_release.py has the layout.
+  R2_BUCKET: vh-updates
+  # R2 rejects the CRC64 checksums newer AWS CLIs send by default.
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
 
 jobs:
   # Single source of truth for the release version. Defaults to version.py so
@@ -45,6 +69,8 @@ jobs:
           echo "slug=${RAW// /-}" >> "$GITHUB_OUTPUT"
           echo "Release version: ${RAW// /-}"
       - name: Refuse to re-release an existing version
+        # A dry run publishes nothing, so it may rebuild a released version.
+        if: ${{ !inputs.dry_run }}
         # checkout is shallow and fetches no tags, so ask the remote directly
         # rather than looking for a local ref that is never there.
         env:
@@ -63,98 +89,140 @@ jobs:
           pip install -r requirements-dev.txt
           pytest tests/test_version_sync.py -q
 
+  # The desktop app as a core without PyTorch, plus PyTorch as packs.
+  #
+  # CUDA PyTorch was 4.4 GB of the 6.9 GB install, and every release installed
+  # it from pip, bundled it, and compressed it again — twice, counting the web
+  # UI — although it changes only when torch does. It is now built once per
+  # torch version (build-packs.yaml with rebuild_packs, published by
+  # publish-packs.yaml) and every release reuses the published packs, pinned by
+  # SHA-256. This job never installs or compresses CUDA; it downloads the
+  # NVIDIA pack only to smoke-test the app on it.
+  #
+  # Ships: the installer (core + CPU pack; NVIDIA and CLIP downloaded during
+  # setup), a portable .7z (core + CPU pack; the app fetches the others on first
+  # use, modules/packs), and the per-file update manifest, whose blobs go to
+  # the update host (tools/publish_release.py has the whole release flow).
   build-windows:
     needs: version
     runs-on: windows-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install dependencies
+        # torch is the CPU wheel on purpose. It is excluded from the bundle
+        # (tools/pack_core_args.py) and only has to be importable while
+        # PyInstaller analyses the modules that import it; the 2.5 GB CUDA
+        # wheel bought nothing here but a slower install.
         run: |
           pip install numpy==2.2.6 mkl mkl-include
-          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
           pip install openvino==2026.2.1
           pip install -r requirements.txt
           # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
           # its declared requirements would let pip replace the torch above.
           pip install yolox==0.3.0 --no-deps
-          pip install pyinstaller
-      - name: Verify key packages
+          pip install pyinstaller psutil
+      - name: Fetch the published packs
+        # Checked against the SHA-256 in their packs.json; the two torch packs
+        # are unpacked for the smoke tests, and the installer carries the CPU
+        # one. CLIP stays a download (Setup and the app fetch it).
+        shell: pwsh
         run: |
-          python -c "import torch; print('Torch:', torch.__version__, 'CUDA:', torch.cuda.is_available())"
-          python -c "import openvino; import os; lib_dir = os.path.join(os.path.dirname(openvino.__file__), 'libs'); files = os.listdir(lib_dir); print('OpenVINO libs:', len(files), 'files,', round(sum(os.path.getsize(os.path.join(lib_dir,f)) for f in files)/1e6), 'MB')"
-          python -c "import numpy; numpy.show_config()"
-      - name: Check the CUDA build covers every supported GPU generation
-        # The build the exe ships decides which NVIDIA cards get a GPU at all.
-        # torch 2.6.0+cu124 stopped at sm_90, and an RTX 50-series (sm_120) failed
-        # with "no kernel image is available"; a later CUDA line may drop an old
-        # generation instead. get_arch_list() is empty on a runner without a GPU,
-        # so read the compiled list directly: GTX 10, RTX 20, RTX 30 (RTX 40 is
+          $ProgressPreference = "SilentlyContinue"
+          New-Item -ItemType Directory -Force out, build-packs, packs-dl | Out-Null
+          Invoke-WebRequest "$env:PACKS_BASE/packs.json" -OutFile out/packs.json -UseBasicParsing
+          $packs = (Get-Content out/packs.json -Raw | ConvertFrom-Json).packs
+          foreach ($p in $packs) {
+            if ($p.name -notlike "torch-*") { continue }
+            $file = "packs-dl/$($p.asset)"
+            Invoke-WebRequest "$env:PACKS_BASE/$($p.asset)" -OutFile $file -UseBasicParsing
+            $sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            if ($sha -ne $p.sha256) { throw "$($p.asset): sha256 $sha, packs.json says $($p.sha256)" }
+            7z x -y $file "-obuild-packs/$($p.name)" | Out-Null
+            Remove-Item $file
+            Write-Host ("{0,8} MB  {1}  (verified)" -f [math]::Round($p.bytes / 1MB), $p.asset)
+          }
+      - name: Check the NVIDIA pack covers every supported GPU generation
+        # The pack decides which NVIDIA cards get a GPU at all. torch 2.6.0+cu124
+        # stopped at sm_90, and an RTX 50-series (sm_120) failed with "no kernel
+        # image is available". get_arch_list() is empty on a runner without a
+        # GPU, so read the compiled list: GTX 10, RTX 20, RTX 30 (RTX 40 is
         # served by the sm_8x kernels) and RTX 50.
         run: |
-          python -c "import torch; flags = torch._C._cuda_getArchFlags().split(); print('CUDA archs:', ' '.join(flags)); missing = [a for a in ('sm_61', 'sm_75', 'sm_86', 'sm_120') if a not in flags]; assert not missing, 'torch build lacks ' + ', '.join(missing)"
+          python -c "import sys; sys.path.insert(0, 'build-packs/torch-cu128/site-packages'); import torch; assert '+cu' in torch.__version__, torch.__version__; flags = torch._C._cuda_getArchFlags().split(); print('torch', torch.__version__, 'CUDA archs:', ' '.join(flags)); missing = [a for a in ('sm_61', 'sm_75', 'sm_86', 'sm_120') if a not in flags]; assert not missing, 'torch pack lacks ' + ', '.join(missing)"
       - name: Fetch YOLOX detector models (Apache-2.0)
         # models/yolox/ is gitignored (downloaded, not committed). Without this
         # the packaged app has no object detector, and a frozen build never
         # downloads one itself. Bundled via --add-data "models;models".
         run: python tools/get_yolox_model.py
-      - name: Pre-convert CLIP to OpenVINO IR
-        run: python -m tools.export_clip_ov
       - name: Build EXE
-        run: >
-          pyinstaller --name "VideoHighlighter"
-          --icon "assets/icon.ico"
-          --splash "assets/splash.png"
-          --windowed
-          --noconfirm
-          --add-data "config.yaml;."
-          --add-data "yolo_objects_labels.json;."
-          --add-data "kinetics_400_labels.json;."
-          --add-data "assets;assets"
-          --add-data "modules;modules"
-          --add-data "models;models"
-          --add-data "video_ai_editor/VRVideoOutput.qml;video_ai_editor"
-          --add-data "video_ai_editor/models;video_ai_editor/models"
-          --hidden-import action_recognition
-          --hidden-import convert_pth_to_openvino
-          --hidden-import crop_actions
-          --hidden-import downloader
-          --hidden-import object_recognition
-          --hidden-import pipeline
-          --hidden-import signal_timeline_viewer
-          --hidden-import sorter
-          --hidden-import video_picker_dialog
-          --hidden-import PySide6.QtCore
-          --hidden-import PySide6.QtGui
-          --hidden-import PySide6.QtWidgets
-          --hidden-import PySide6.QtQml
-          --hidden-import PySide6.QtQuick
-          --hidden-import PySide6.QtQuickWidgets
-          --hidden-import PySide6.QtMultimedia
-          --collect-submodules whisper
-          --collect-submodules yolox
-          --collect-submodules model_hub
-          --collect-submodules huggingface_hub
-          --collect-submodules keyring
-          --copy-metadata keyring
-          --collect-all openvino
-          --collect-all onnxruntime
-          --collect-data whisper
-          --collect-binaries imageio_ffmpeg
-          --hidden-import llm.clip_prefilter
-          --additional-hooks-dir packaging/pyinstaller-hooks
-          --exclude-module nncf
-          --collect-submodules optimum
-          --collect-submodules transformers
-          --collect-data transformers
-          --copy-metadata transformers
-          --copy-metadata tokenizers
-          --copy-metadata huggingface-hub
-          --copy-metadata safetensors
-          --copy-metadata regex
-          main.py
+        shell: pwsh
+        run: |
+          $extra = python tools/pack_core_args.py
+          pyinstaller --name "VideoHighlighter" `
+            --icon "assets/icon.ico" `
+            --splash "assets/splash.png" `
+            --windowed `
+            --noconfirm `
+            --log-level WARN `
+            --add-data "config.yaml;." `
+            --add-data "yolo_objects_labels.json;." `
+            --add-data "kinetics_400_labels.json;." `
+            --add-data "assets;assets" `
+            --add-data "modules;modules" `
+            --add-data "models;models" `
+            --add-data "video_ai_editor/VRVideoOutput.qml;video_ai_editor" `
+            --add-data "video_ai_editor/models;video_ai_editor/models" `
+            --hidden-import action_recognition `
+            --hidden-import convert_pth_to_openvino `
+            --hidden-import crop_actions `
+            --hidden-import downloader `
+            --hidden-import object_recognition `
+            --hidden-import pipeline `
+            --hidden-import signal_timeline_viewer `
+            --hidden-import sorter `
+            --hidden-import video_picker_dialog `
+            --hidden-import PySide6.QtCore `
+            --hidden-import PySide6.QtGui `
+            --hidden-import PySide6.QtWidgets `
+            --hidden-import PySide6.QtQml `
+            --hidden-import PySide6.QtQuick `
+            --hidden-import PySide6.QtQuickWidgets `
+            --hidden-import PySide6.QtMultimedia `
+            --hidden-import modules.system.smoke_test `
+            --hidden-import psutil `
+            --collect-submodules whisper `
+            --collect-submodules yolox `
+            --collect-submodules model_hub `
+            --collect-submodules huggingface_hub `
+            --collect-submodules keyring `
+            --copy-metadata keyring `
+            --collect-all openvino `
+            --collect-all onnxruntime `
+            --collect-data whisper `
+            --collect-binaries imageio_ffmpeg `
+            --hidden-import llm.clip_prefilter `
+            --additional-hooks-dir packaging/pyinstaller-hooks `
+            --exclude-module nncf `
+            --collect-submodules optimum `
+            --collect-submodules transformers `
+            --collect-data transformers `
+            --copy-metadata transformers `
+            --copy-metadata tokenizers `
+            --copy-metadata huggingface-hub `
+            --copy-metadata safetensors `
+            --copy-metadata regex `
+            @extra `
+            main.py
+          if (Test-Path dist/VideoHighlighter/_internal/torch) {
+            throw "torch was bundled into the core; it must only arrive as a pack"
+          }
+      - name: Strip what the app never loads
+        run: python tools/strip_bundle.py dist/VideoHighlighter
       - name: Check ml_dtypes can find the DLLs it links against
         # ml_dtypes (via onnx) links against a delvewheel-renamed MSVC runtime it
         # expects in numpy.libs. With numpy pinned older than the one ml_dtypes was
@@ -165,25 +233,174 @@ jobs:
         # what the runner's numpy happens to vendor, which is how it passed before.
         run: |
           python -c "import glob, os, re; root = os.path.join('dist', 'VideoHighlighter', '_internal'); exts = glob.glob(os.path.join(root, 'ml_dtypes', '**', '*.pyd'), recursive=True); assert exts, 'no ml_dtypes extension in the bundle, so onnx cannot import'; want = sorted({m.decode() for p in exts for m in re.findall(rb'[\w.+-]+-[0-9a-f]{32}\.dll', open(p, 'rb').read(), re.I)}); libs = os.path.join(root, 'numpy.libs'); have = set(os.listdir(libs)) if os.path.isdir(libs) else set(); missing = [n for n in want if n not in have]; print('ml_dtypes links against:', ', '.join(want) or 'nothing vendored'); assert not missing, 'bundled numpy.libs lacks ' + ', '.join(missing)"
-      - name: Report build size
+      - name: Add what the app needs to fetch packs itself
+        # The pinned pack list and 7-Zip (modules/packs). Before the manifest,
+        # so an update carries a new lock when the packs move.
+        shell: pwsh
         run: |
+          Invoke-WebRequest -Uri https://www.7-zip.org/a/7zr.exe -OutFile packaging/installer/7zr.exe -UseBasicParsing
+          Copy-Item packaging/installer/7zr.exe dist/VideoHighlighter/7zr.exe
+          python tools/write_packs_lock.py --base "$env:PACKS_BASE" --packs-json out/packs.json `
+            --out dist/VideoHighlighter/packs.lock.json
           $size = (Get-ChildItem -Recurse ./dist/VideoHighlighter | Measure-Object -Property Length -Sum).Sum / 1GB
-          Write-Host "Build size: $([math]::Round($size, 2)) GB"
-      - name: Generate release manifest
-        # Every shipped file with its SHA-256, written INTO the bundle before
-        # archiving so each install carries a record of what it was given. The
-        # updater diffs the next release against it and fetches only the files
-        # that differ.
-        #
-        # Deliberately NOT signed here: the release signing key decides what
-        # executes on users' machines, so it stays offline rather than living
-        # in Actions secrets, where anyone who can edit a workflow could
-        # exfiltrate it. Sign the manifest locally, then publish the .sig.
+          Write-Host "Core size: $([math]::Round($size, 2)) GB"
+      - name: Generate the update manifest
+        # Every shipped file with its SHA-256, written INTO the bundle so each
+        # install carries a record of what it was given. The updater diffs the
+        # next release against it and fetches only the files that differ.
+        # base_url is the update host; it is also how an installed copy finds
+        # its channel file (update_check.channel_urls). Signed later, offline.
+        shell: pwsh
+        env:
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+          MIN_VERSION: ${{ inputs.update_min_version }}
         run: |
           $v = python -c "import version; print(version.__version__)"
           $e = python -c "import version; print(version.__edition__)"
-          python tools/build_manifest.py generate --root dist/VideoHighlighter --version "$v" --edition "$e" --base-url "${{ vars.UPDATE_BASE_URL }}"
-      - name: Upload unsigned manifest (sign this locally)
+          $floor = @()
+          if ($env:MIN_VERSION) { $floor = @("--min-version", $env:MIN_VERSION) }
+          python tools/build_manifest.py generate --root dist/VideoHighlighter `
+            --version "$v" --edition "$e" --platform windows `
+            --base-url "$env:UPDATE_BASE_URL" @floor
+          if ($LASTEXITCODE -ne 0) { throw "manifest generation failed" }
+      - name: Smoke test with each pack
+        # The headless checks the mac release runs too (modules/system/smoke_test.py):
+        # main.py's imports, the pipeline import, object detection, a spawned
+        # child — with torch coming from the CPU pack, then the NVIDIA one (the
+        # runner has no GPU, so that proves the CUDA DLLs load in the frozen
+        # process). On a copy: the app writes its logs and caches beside the
+        # exe, and none of that may ship.
+        shell: pwsh
+        timeout-minutes: 40
+        run: |
+          $ffmpeg = python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+          & $ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=30 `
+            -f lavfi -i sine=frequency=440:sample_rate=48000 -t 30 -c:v libx264 -pix_fmt yuv420p -c:a aac smoke.mp4
+          $app = "$env:RUNNER_TEMP\smoke-app"
+          Copy-Item -Recurse dist/VideoHighlighter $app
+          $status = 0
+          foreach ($pack in @("torch-cpu", "torch-cu128")) {
+            Remove-Item -Recurse -Force "$app\packs" -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force "$app\packs" | Out-Null
+            Copy-Item -Recurse "build-packs/$pack" "$app\packs\$pack"
+            Write-Host "::group::smoke test with $pack"
+            $p = Start-Process -FilePath "$app\VideoHighlighter.exe" `
+                   -ArgumentList @("--smoke-test", "$PWD/smoke.mp4", "--smoke-report", "$PWD/smoke-report-$pack.json") `
+                   -Wait -PassThru
+            if (Test-Path "smoke-report-$pack.json") { Get-Content "smoke-report-$pack.json" }
+            Get-ChildItem $app -Filter *.log -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName "debug-$pack.log"; Get-Content $_.FullName -Tail 60 }
+            Write-Host "::endgroup::"
+            Write-Host "$pack exit code: $($p.ExitCode)"
+            if ($p.ExitCode -ne 0) { $status = 1 }
+          }
+          Remove-Item -Recurse -Force $app
+          exit $status
+      - name: Build the installer
+        # Core + CPU pack; NVIDIA (ticked when a card is found) and CLIP are
+        # downloaded during setup from PACKS_BASE and checked against the
+        # SHA-256 pinned here. Fixed filename, no version in it, so
+        # /releases/latest/download/00-VideoHighlighter-Windows-Setup.exe is a
+        # permanent link; the version is compiled into the exe.
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress | Out-Null
+          $packs = (Get-Content out/packs.json | ConvertFrom-Json).packs
+          $cuda = $packs | Where-Object { $_.name -eq "torch-cu128" }
+          $clip = $packs | Where-Object { $_.name -eq "models-clip" }
+          $installedMB = [int][math]::Ceiling(((Get-ChildItem dist/VideoHighlighter, build-packs/torch-cpu -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB)
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q `
+            "/DAppVersion=${{ needs.version.outputs.slug }}" `
+            "/DOutputName=00-VideoHighlighter-Windows-Setup" `
+            "/DDistDir=$((Resolve-Path dist/VideoHighlighter).Path)" `
+            "/DCpuPackDir=$((Resolve-Path build-packs/torch-cpu).Path)" `
+            "/DPackBase=$env:PACKS_BASE" `
+            "/DCudaPackAsset=$($cuda.asset)" `
+            "/DCudaPackSha256=$($cuda.sha256)" `
+            "/DCudaPackMB=$([int][math]::Ceiling($cuda.bytes / 1MB))" `
+            "/DCudaInstalledMB=$([int][math]::Ceiling($cuda.bytes_installed / 1MB))" `
+            "/DClipPackAsset=$($clip.asset)" `
+            "/DClipPackSha256=$($clip.sha256)" `
+            "/DClipPackMB=$([int][math]::Ceiling($clip.bytes / 1MB))" `
+            "/DClipInstalledMB=$([int][math]::Ceiling($clip.bytes_installed / 1MB))" `
+            "/DInstalledMB=$installedMB" `
+            "/O$((Resolve-Path out).Path)" `
+            packaging/installer/videohighlighter-packs.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          $exe = Get-Item out/00-VideoHighlighter-Windows-Setup.exe
+          Write-Host ("installer: {0} MB (installs {1} MB)" -f [math]::Round($exe.Length / 1MB), $installedMB)
+      - name: Install silently and smoke-test the installed app
+        # What a customer's machine gets, rather than the build folder. Both
+        # downloads ticked: fetch from PACKS_BASE, SHA-256 check, unpack, the
+        # NVIDIA pack replacing the CPU one, CLIP landing in models/. Then the
+        # install must carry the update manifest the updater diffs against.
+        shell: pwsh
+        timeout-minutes: 30
+        run: |
+          $dir = "$env:RUNNER_TEMP\vh-installed"
+          $p = Start-Process out/00-VideoHighlighter-Windows-Setup.exe -Wait -PassThru -ArgumentList @(
+                 "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$dir",
+                 "/MERGETASKS=!desktopicon,clip,nvidia", "/LOG=$PWD\setup.log")
+          Write-Host "setup exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Get-Content setup.log -Tail 60; exit 1 }
+          $packs = @(Get-ChildItem "$dir\packs" -Directory | ForEach-Object Name)
+          if (($packs -join ",") -ne "torch-cu128") { Get-Content setup.log -Tail 60; throw "expected only torch-cu128 installed, found: $($packs -join ', ')" }
+          if (-not (Test-Path "$dir\models\clip-vit-base-patch32-ov\openvino_model.xml")) { Get-Content setup.log -Tail 60; throw "CLIP was not installed into models\" }
+          if (-not (Test-Path "$dir\manifest.json")) { throw "the install has no manifest.json, so it could never update in place" }
+          Write-Host "downloads OK: torch-cu128 replaced torch-cpu, CLIP in models\, manifest.json present"
+          $s = Start-Process -FilePath "$dir\VideoHighlighter.exe" -Wait -PassThru `
+                 -ArgumentList @("--smoke-test", "$PWD/smoke.mp4", "--smoke-report", "$PWD/smoke-report-installed.json")
+          if (Test-Path smoke-report-installed.json) { Get-Content smoke-report-installed.json }
+          Get-ChildItem $dir -Filter *.log -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName "debug-installed.log" }
+          Write-Host "installed app smoke exit code: $($s.ExitCode)"
+          exit $s.ExitCode
+      - name: Upload smoke reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-test
+          path: |
+            smoke-report-*.json
+            debug-*.log
+            setup.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Stage the update on the update host
+        # Blobs by hash (only ones the host lacks are sent) and the UNSIGNED
+        # manifest. Nothing points at it until publish-update.yaml runs with a
+        # signature, and the app refuses a manifest without one, so staging is
+        # safe to do before the release is even reviewed.
+        if: ${{ !inputs.dry_run }}
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$R2_ACCOUNT_ID" ] || [ -z "$UPDATE_BASE_URL" ]; then
+            echo "::warning::R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY secrets or R2_ACCOUNT_ID / UPDATE_BASE_URL variables are not set; this release cannot be installed in place. docs/UPDATES.md has the setup."
+            exit 0
+          fi
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          python tools/publish_release.py prepare --root dist/VideoHighlighter \
+            --out publish --allow-unsigned --github-output prefix.txt
+          prefix=$(sed -n 's/^prefix=//p' prefix.txt)
+          if aws s3api head-object --endpoint-url "$endpoint" --bucket "$R2_BUCKET" \
+               --key "$prefix/manifest.json.sig" >/dev/null 2>&1; then
+            echo "::error::$prefix is already signed and published; a published release is never replaced. Bump the version."
+            exit 1
+          fi
+          # Hash-named, so a key that exists already holds these exact bytes.
+          aws s3 sync publish/files "s3://$R2_BUCKET/files" --endpoint-url "$endpoint" \
+            --size-only --only-show-errors \
+            --content-type application/octet-stream \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp "publish/$prefix/manifest.json" "s3://$R2_BUCKET/$prefix/manifest.json" \
+            --endpoint-url "$endpoint" --content-type application/json --cache-control "no-cache"
+          echo "staged: $UPDATE_BASE_URL/$prefix/manifest.json"
+      - name: Upload update manifest
         uses: actions/upload-artifact@v4
         with:
           name: windows-manifest
@@ -195,57 +412,41 @@ jobs:
           # "Artifact storage quota has been hit" for 6-12 hours at a time.
           # Anything still wanted after a week is wanted from the Release.
           retention-days: 7
-      - name: Create archive
-        run: 7z a -t7z -mx=9 -v1900m "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z" ./dist/VideoHighlighter
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-build
-          path: "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z*"
-          retention-days: 7
-      # Built here rather than in its own job because only this one knows how
-      # many volumes 7-Zip just produced and how big the unpacked tree is — the
-      # installer needs both compiled in (one URL per volume, and a free-space
-      # check it can make before starting a multi-gigabyte download).
-      - name: Build the Windows installer
-        shell: pwsh
-        run: |
-          $tag = "${{ needs.version.outputs.slug }}"
-          $vols = @(Get-ChildItem "VideoHighlighter-Windows-$tag.7z.*" | Sort-Object Name)
-          if ($vols.Count -eq 0) { throw "No .7z volumes to install from." }
-          $archiveMB = [int][math]::Ceiling((($vols | Measure-Object Length -Sum).Sum) / 1MB)
-          $installedMB = [int][math]::Ceiling(((Get-ChildItem dist/VideoHighlighter -Recurse -File |
-            Measure-Object Length -Sum).Sum) / 1MB)
-          Write-Host "volumes=$($vols.Count) download=${archiveMB}MB installed=${installedMB}MB"
-          # Official standalone LZMA extractor; the installer carries it because
-          # a machine with no 7-Zip is exactly the machine this is here for.
-          Invoke-WebRequest -Uri https://www.7-zip.org/a/7zr.exe `
-            -OutFile packaging/installer/7zr.exe -UseBasicParsing
-          choco install innosetup -y --no-progress
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
-            "/DAppVersion=$tag" `
-            "/DTag=$tag" `
-            "/DVolumes=$($vols.Count)" `
-            "/DArchiveMB=$archiveMB" `
-            "/DInstalledMB=$installedMB" `
-            "/O$(Get-Location)" `
-            packaging/installer/videohighlighter.iss
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           if-no-files-found: error
-          # Fixed filename, no version in it, so that
-          # /releases/latest/download/00-VideoHighlighter-Windows-Setup.exe is a
-          # permanent link the site and every old post can keep pointing at. The
-          # tag it downloads from is compiled into the exe, not in its name.
-          path: 00-VideoHighlighter-Windows-Setup.exe
+          path: out/00-VideoHighlighter-Windows-Setup.exe
+          compression-level: 0
+          retention-days: 7
+      - name: Create the portable archive
+        # Core + CPU pack: a working app offline; NVIDIA and CLIP are fetched
+        # by the app on first use. Volumes named .7z.001 even when there is only
+        # one, which is what the bootstrap zip's asset_pattern looks for.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/VideoHighlighter/packs | Out-Null
+          Copy-Item -Recurse build-packs/torch-cpu dist/VideoHighlighter/packs/torch-cpu
+          7z a -t7z -mx=9 -v1900m "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z" ./dist/VideoHighlighter | Out-Null
+          Get-ChildItem "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z.*" |
+            ForEach-Object { Write-Host ("{0,8} MB  {1}" -f [math]::Round($_.Length / 1MB), $_.Name) }
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          if-no-files-found: error
+          path: "VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z*"
+          compression-level: 0
           retention-days: 7
 
   # The web UI: a Tauri shell around the React frontend, with the Python engine
   # bundled as a PyInstaller sidecar. Independent of the Qt build above — both
   # ship from the same engine source.
   build-web-windows:
+    # Opt-in: the sidecar still bundles CUDA PyTorch itself, which is the
+    # expensive part this workflow no longer does for the desktop app.
+    if: ${{ inputs.web_ui }}
     needs: version
     runs-on: windows-latest
     steps:
@@ -586,47 +787,73 @@ jobs:
     # `version` must be listed even though no build step needs its output
     # directly: needs.version.outputs.slug resolves to an empty string in a job
     # that does not depend on it, which would publish an untagged release.
-    # build-web-windows ships the Tauri installers, so the release waits on it
-    # too rather than silently omitting half the product.
+    # build-web-windows is opt-in: a skipped web build must not skip the
+    # release, a failed one must stop it.
     needs: [version, build-windows, build-web-windows, build-mac, bootstrap]
+    if: ${{ !inputs.dry_run && !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
+      - name: Write the release notes
+        env:
+          SLUG: ${{ needs.version.outputs.slug }}
+          REPO: ${{ github.repository }}
+          WEB: ${{ inputs.web_ui }}
+        run: |
+          dl="https://github.com/$REPO/releases/download/$SLUG"
+          portable=""
+          for f in windows-build/*.7z.*; do
+            n=$(basename "$f"); portable="$portable [.7z.${n##*.7z.}]($dl/$n)"
+          done
+          {
+            echo "## Download"
+            echo ""
+            echo "### [Install VideoHighlighter for Windows]($dl/00-VideoHighlighter-Windows-Setup.exe)"
+            echo ""
+            echo "One file. Run it, click through, done. It installs the app with"
+            echo "PyTorch for the processor, and downloads NVIDIA GPU acceleration"
+            echo "(ticked when an NVIDIA card is found) and the visual search model"
+            echo "during setup. Installs per user, no admin rights needed, and a"
+            echo "per-user install updates itself in place from then on."
+            echo ""
+            echo "|  | Installer | Portable |"
+            echo "|---|---|---|"
+            echo "| Windows (desktop app) | [Setup .exe]($dl/00-VideoHighlighter-Windows-Setup.exe) |$portable |"
+            if [ "$WEB" = "true" ]; then
+              web=""
+              for f in web-windows-build/*.7z.*; do
+                n=$(basename "$f"); web="$web [.7z.${n##*.7z.}]($dl/$n)"
+              done
+              echo "| Windows (web UI) | — |$web |"
+            fi
+            echo "| macOS | — | [.dmg]($dl/VideoHighlighter-$SLUG.dmg) |"
+            echo ""
+            echo "The installer is not signed yet, so Windows SmartScreen shows"
+            echo "\"Windows protected your PC\" on first run — **More info → Run anyway**."
+            echo ""
+            echo "The portable download runs on the processor out of the box; the"
+            echo "app offers NVIDIA acceleration and visual search as downloads the"
+            echo "first time you pick them. If it comes in several \`.7z.0NN\` parts,"
+            echo "put them all in one folder and extract the \`.001\` with 7-Zip."
+            if [ "$WEB" = "true" ]; then
+              echo ""
+              echo "The web UI is the Tauri shell around the React frontend with the"
+              echo "Python engine bundled; it has no installer because no installer can"
+              echo "hold a 1.7 GB sidecar."
+            fi
+            echo ""
+            echo "\`00-VideoHighlighter-Windows-Setup.zip\` is the older script-based"
+            echo "installer, kept as a fallback."
+          } > release-notes.md
+          cat release-notes.md
       - name: Create GitHub Release
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ needs.version.outputs.slug }}
           name: VideoHighlighter ${{ needs.version.outputs.slug }}
           draft: true
-          body: |
-            ## Download
-
-            ### [Install VideoHighlighter for Windows](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/00-VideoHighlighter-Windows-Setup.exe)
-
-            One file. Run it, click through, done — it fetches and unpacks
-            everything else itself. Installs per user, no admin rights needed.
-
-            |  | Installer | Portable |
-            |---|---|---|
-            | Windows (desktop app) | [Setup .exe](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/00-VideoHighlighter-Windows-Setup.exe) | [.7z part 1](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z.001) + [part 2](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Windows-${{ needs.version.outputs.slug }}.7z.002) |
-            | Windows (web UI) | — | [.7z part 1](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z.001) + [part 2](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-Web-Windows-${{ needs.version.outputs.slug }}.7z.002) |
-            | macOS | — | [.dmg](https://github.com/Aseiel/VideoHighlighter/releases/download/${{ needs.version.outputs.slug }}/VideoHighlighter-${{ needs.version.outputs.slug }}.dmg) |
-
-            The installer is not signed yet, so Windows SmartScreen shows
-            "Windows protected your PC" on first run — **More info → Run anyway**.
-
-            The portable downloads are **split archives**: every `.7z.0NN` part
-            listed under Assets must sit in the same folder, then extract the
-            `.001` with 7-Zip. Downloading one part alone fails. The installer
-            above exists so you never have to do that.
-
-            The web UI is the Tauri shell around the React frontend with the
-            Python engine bundled; it has no installer because no installer can
-            hold a 1.7 GB sidecar.
-
-            `00-VideoHighlighter-Windows-Setup.zip` is the older script-based
-            installer, kept as a fallback.
+          bodyFile: release-notes.md
           artifacts: "windows-installer/*,windows-build/*,web-windows-build/*,mac-build/*,bootstrap-zip/*"
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Say what still has to happen
@@ -637,6 +864,7 @@ jobs:
         # nothing in the run said so. Now it does.
         env:
           SLUG: ${{ needs.version.outputs.slug }}
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
         run: |
           {
             echo "### $SLUG is a DRAFT — nobody can get it yet"
@@ -645,9 +873,23 @@ jobs:
             echo ""
             echo "* \`releases/latest\` keeps returning the previous version, so the"
             echo "  bootstrap installer downloads the old build;"
-            echo "* the in-app updater sees no new release;"
             echo "* no git tag \`$SLUG\` exists, so the re-release guard cannot"
             echo "  protect this version number yet."
             echo ""
-            echo "Sign \`manifest.json\` locally, attach the \`.sig\`, then publish."
+            echo "### Then, to offer it as an in-place update"
+            echo ""
+            if [ -z "$UPDATE_BASE_URL" ]; then
+              echo "The update host is not configured (\`UPDATE_BASE_URL\`), so this"
+              echo "release was not staged. See docs/UPDATES.md."
+            else
+              echo "The files are staged on the update host, unsigned. On the machine"
+              echo "with the release key:"
+              echo ""
+              echo "\`\`\`"
+              echo "python tools/publish_release.py sign --version $SLUG --base-url $UPDATE_BASE_URL"
+              echo "\`\`\`"
+              echo ""
+              echo "and run the command it prints (the **Publish update** workflow)."
+              echo "Installed copies see the release only after that."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

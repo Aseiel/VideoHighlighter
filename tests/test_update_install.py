@@ -17,7 +17,22 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from modules.update import update_install, update_manifest as um
+from modules.update import update_download, update_install, update_manifest as um
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_wait(monkeypatch):
+    # Retries still happen, just without the real back-off between them.
+    monkeypatch.setattr(update_download, "RETRY_DELAYS", (0, 0))
+
+
+@pytest.fixture(autouse=True)
+def _running(monkeypatch):
+    # The releases below are 0.9.1 Pro for Windows; stand in for a build they
+    # are meant for, whatever this machine and checkout are.
+    monkeypatch.setattr(update_install, "_running",
+                        lambda: ("0.9.0", "Pro", "windows"))
+
 
 BASE = "https://updates.example/bucket"
 MANIFEST_URL = BASE + "/manifest.json"
@@ -36,12 +51,13 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _release(files: dict, version="0.9.1"):
+def _release(files: dict, version="0.9.1", **fields):
     """``{relative_path: bytes}`` -> (manifest_bytes, blobs_by_digest)."""
     manifest = {
         "format": um.MANIFEST_FORMAT,
         "version": version,
         "edition": "Pro",
+        **fields,
         "base_url": BASE,
         "files": [{"path": p, "size": len(d), "sha256": _sha(d)}
                   for p, d in files.items()],
@@ -163,12 +179,59 @@ def test_unreachable_server_is_reported(tmp_path, key):
 
 def test_release_without_base_url_is_refused(tmp_path, key):
     manifest = {"format": um.MANIFEST_FORMAT, "version": "0.9.1",
-                "base_url": "", "files": []}
+                "edition": "Pro", "base_url": "", "files": []}
     raw = json.dumps(manifest).encode()
     result = update_install.install_update(
         MANIFEST_URL, str(tmp_path), fetch=_fetcher(raw, key))
     assert not result.ok
     assert "individual files" in result.message
+
+
+# --- a genuine release that is not for this install --------------------------
+# The channel file that names the release is unsigned. A valid signature only
+# says the vendor published this manifest once, so each of these must stop
+# before a byte is downloaded or the install is touched.
+
+@pytest.mark.parametrize("fields, version, says", [
+    ({"edition": "Free"}, "0.9.1", "Free edition"),
+    ({"edition": ""}, "0.9.1", "edition"),
+    ({"platform": "macos"}, "0.9.1", "for macos"),
+    ({}, "0.9.0", "not newer"),
+    ({}, "0.8.7", "not newer"),
+    ({"min_version": "0.9.0.1"}, "0.9.1", "Download it"),
+])
+def test_a_release_for_another_install_is_refused(tmp_path, key, fields, version, says):
+    _install(tmp_path, "app.exe", b"v1")
+    raw, blobs = _release({"app.exe": b"v2"}, version=version, **fields)
+
+    def opener(url, headers):
+        raise AssertionError("nothing may be downloaded for a refused release")
+
+    result = update_install.install_update(
+        MANIFEST_URL, str(tmp_path), fetch=_fetcher(raw, key), opener=opener)
+
+    assert not result.ok
+    assert says in result.message
+    assert (tmp_path / "app.exe").read_bytes() == b"v1"
+    assert not (tmp_path / update_install.STAGING_DIRNAME).exists()
+
+
+def test_platform_and_edition_are_matched_without_regard_to_case(tmp_path, key):
+    _install(tmp_path, "app.exe", b"v1")
+    raw, blobs = _release({"app.exe": b"v2"}, edition="PRO", platform="Windows")
+    result = update_install.install_update(
+        MANIFEST_URL, str(tmp_path), fetch=_fetcher(raw, key),
+        opener=_opener(blobs))
+    assert result.ok, result.message
+
+
+def test_a_floor_this_build_meets_does_not_block(tmp_path, key):
+    _install(tmp_path, "app.exe", b"v1")
+    raw, blobs = _release({"app.exe": b"v2"}, min_version="0.9.0")
+    result = update_install.install_update(
+        MANIFEST_URL, str(tmp_path), fetch=_fetcher(raw, key),
+        opener=_opener(blobs))
+    assert result.ok, result.message
 
 
 # --- interruptions ---------------------------------------------------------

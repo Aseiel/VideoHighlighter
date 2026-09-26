@@ -33,6 +33,25 @@ Edition
 -------
 The manifest URL is chosen from ``version.__edition__``, so this file is
 identical in the Pro and free repos and picks its own channel at runtime.
+
+Where the channel file lives
+----------------------------
+Two places, tried in order, first answer wins:
+
+1. ``<base_url>/channels/<edition>.json`` on the update host, where
+   ``base_url`` comes from the ``manifest.json`` this install shipped with.
+   CI stamps it at build time (the ``UPDATE_BASE_URL`` repository variable),
+   and ``.github/workflows/publish-update.yaml`` writes the channel file there
+   once a release is signed. Nothing about the host is compiled into the code,
+   so moving the bucket is a variable change, not a release.
+2. The marketing site, where the file is committed by hand. Every build from
+   before the update host existed reads only this one, and so does a run from
+   source, which has no ``manifest.json``.
+
+The channel file names one signed release manifest per platform
+(``"manifests": {"windows": ...}``). A platform with no entry gets the
+download page, which is how macOS stays notify-only: an in-place update would
+break the app bundle's signature.
 """
 from __future__ import annotations
 
@@ -91,7 +110,45 @@ def _channel() -> str:
 
 
 def manifest_url() -> str:
+    """The channel file on the marketing site (the fallback; see above)."""
     return f"{_MANIFEST_BASE}/{_channel()}.json"
+
+
+def update_host() -> str:
+    """The update host's base URL from this install's manifest, or ``""``."""
+    try:
+        from modules.update import update_apply, update_manifest
+        installed = update_manifest.load_installed_manifest(
+            update_apply.install_root()) or {}
+    except Exception:
+        return ""
+    base = str(installed.get("base_url") or "").strip().rstrip("/")
+    return base if base.startswith("https://") else ""
+
+
+def channel_urls() -> list:
+    """Where to look for the channel file, in order."""
+    urls = []
+    host = update_host()
+    if host:
+        urls.append(f"{host}/channels/{_channel()}.json")
+    urls.append(manifest_url())
+    return urls
+
+
+def _platform_manifest(channel: dict) -> str:
+    """The signed release manifest this platform should install, or ``""``."""
+    from modules.update.update_manifest import platform_key
+
+    platform = platform_key()
+    manifests = channel.get("manifests")
+    if isinstance(manifests, dict):
+        return str(manifests.get(platform) or "")
+    # The single-URL form predates per-platform entries, and every manifest it
+    # ever named was a Windows build.
+    if platform == "windows":
+        return str(channel.get("manifest_url") or "")
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +287,11 @@ def _get_json(url: str) -> dict:
 # The check
 # ---------------------------------------------------------------------------
 
+def _self_install_platform() -> bool:
+    import sys
+    return sys.platform == "win32"
+
+
 @dataclass
 class UpdateInfo:
     """A newer release the user has not already skipped."""
@@ -247,7 +309,18 @@ class UpdateInfo:
 
     @property
     def can_self_install(self) -> bool:
-        return bool(self.manifest_url) and install_dir_writable()
+        """Offer "Download and install" rather than the download page?
+
+        Only on Windows (a macOS app bundle is signed as a whole, and an
+        in-place update breaks the seal), only when this build can verify a
+        release at all, and only where the install folder can be written.
+        """
+        from modules.update import update_manifest
+
+        return (bool(self.manifest_url)
+                and _self_install_platform()
+                and bool(update_manifest.RELEASE_PUBLIC_KEY_HEX)
+                and install_dir_writable())
 
     @property
     def headline(self) -> str:
@@ -275,12 +348,18 @@ def check_for_update(
 
     current = current_version or __version__
     fetch = transport or _get_json
+    manifest = None
     try:
-        manifest = fetch(manifest_url())
-    except Exception as exc:
-        # Offline is the common case, not an error worth showing anyone.
-        print(f"update_check: no manifest ({type(exc).__name__}: {exc})")
-        return None
+        for url in channel_urls():
+            try:
+                manifest = fetch(url)
+                break
+            except Exception as exc:
+                # Offline is the common case, not an error worth showing anyone.
+                print(f"update_check: no manifest at {url} "
+                      f"({type(exc).__name__}: {exc})")
+        if manifest is None:
+            return None
     finally:
         if not force:
             mark_checked()
@@ -308,5 +387,5 @@ def check_for_update(
         download_url=str(
             manifest.get("download_url") or _DEFAULT_LANDING[_channel()]
         ),
-        manifest_url=str(manifest.get("manifest_url") or ""),
+        manifest_url=_platform_manifest(manifest),
     )

@@ -3422,6 +3422,9 @@ class VideoHighlighterGUI(QWidget):
 
         if not result.ok:
             self.update_skip_btn.setVisible(True)
+            # Whatever stopped it (a refused release, a dead connection), the
+            # download page still works, so it is always one click away.
+            self.update_get_btn.setVisible(True)
             self.update_label.setText(f"<b>{result.message}</b>")
             self.append_log(f"⚠️ Update: {result.message}")
             return

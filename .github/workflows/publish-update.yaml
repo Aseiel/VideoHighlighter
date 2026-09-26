@@ -1,0 +1,145 @@
+name: Publish update
+
+# The last step of a release, and the only one installed copies can see:
+# it points channels/<edition>.json on the update host at a signed release.
+#
+#   1. build-release.yaml built the release and staged it on the host,
+#      unsigned (blobs under files/, the manifest under releases/...);
+#   2. you pressed Publish on the GitHub release, and signed the manifest on
+#      the machine that holds the release key:
+#        python tools/publish_release.py sign --version <v> --base-url <host>
+#   3. this, with the signature that printed.
+#
+# Nothing is made visible until every check has passed: the release is
+# published on GitHub (so "Get it" works for everyone who cannot update in
+# place), the signature verifies against the public key the release was built
+# with, every blob is on the host, and the files are reachable over public
+# HTTPS the way the app will fetch them. The channel is written last.
+#
+# The private key never comes here. docs/UPDATES.md has the one-time setup.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release to publish, e.g. 0.13.0 (its GitHub release must be published)'
+        required: true
+      signature:
+        description: 'Signature printed by tools/publish_release.py sign'
+        required: true
+      notes:
+        description: 'One line for the update banner (blank = the release manifest''s)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  R2_BUCKET: vh-updates
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+concurrency:
+  # Two publishes racing on one channel file would each read the other's
+  # "previous" and one announcement would silently vanish.
+  group: publish-update
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the inputs and that the GitHub release is out
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          SIGNATURE: ${{ inputs.signature }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            echo "::error::'$VERSION' is not a version"; exit 1
+          fi
+          # Ed25519: 64 bytes, base64url without padding.
+          if ! [[ "$SIGNATURE" =~ ^[A-Za-z0-9_-]{86}$ ]]; then
+            echo "::error::that is not a signature from tools/publish_release.py sign"; exit 1
+          fi
+          draft=$(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft) || {
+            echo "::error::no GitHub release $VERSION"; exit 1; }
+          if [ "$draft" != "false" ]; then
+            echo "::error::release $VERSION is still a draft. Publish it first: people who cannot update in place are sent there."
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          # The tag, not main: the signature must verify against the public
+          # key this release was built with, whatever main carries today.
+          ref: ${{ inputs.version }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install cryptography certifi
+      - name: Verify, then publish
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+          VERSION: ${{ inputs.version }}
+          SIGNATURE: ${{ inputs.signature }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${R2_ACCOUNT_ID:-}" ] || [ -z "${UPDATE_BASE_URL:-}" ]; then
+            echo "::error::R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY secrets and R2_ACCOUNT_ID / UPDATE_BASE_URL variables are required. See docs/UPDATES.md."
+            exit 1
+          fi
+          base="${UPDATE_BASE_URL%/}"
+          ep="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          s3() { aws "$@" --endpoint-url "$ep"; }
+          edition=$(python -c "import version; print(version.__edition__)")
+          channel=$(python -c "from tools.publish_release import channel_name; print(channel_name('$edition'))")
+          prefix=$(python tools/publish_release.py prefix --version "$VERSION" --edition "$edition")
+
+          s3 s3 cp "s3://$R2_BUCKET/$prefix/manifest.json" manifest.json --only-show-errors || {
+            echo "::error::$prefix/manifest.json is not on the host. Was the release built with the update host configured?"
+            exit 1; }
+          printf '%s\n' "$SIGNATURE" > manifest.json.sig
+          s3 s3api list-objects-v2 --bucket "$R2_BUCKET" --prefix files/ \
+            --query 'Contents[].[Key,Size]' --output json > listing.json
+          python tools/publish_release.py check --manifest manifest.json --sig manifest.json.sig \
+            --version "$VERSION" --edition "$edition" --base-url "$base" --listing listing.json
+
+          s3 s3 cp manifest.json.sig "s3://$R2_BUCKET/$prefix/manifest.json.sig" \
+            --content-type text/plain --cache-control "public, max-age=31536000, immutable" --only-show-errors
+
+          # What the app will do: plain HTTPS to the public host. A bucket
+          # without public access passes every check above and serves nobody.
+          sample=$(python -c "import json; print(json.load(open('manifest.json'))['files'][0]['sha256'])")
+          for url in "$base/$prefix/manifest.json" "$base/$prefix/manifest.json.sig" "$base/files/$sample"; do
+            curl -fsS -o /dev/null "$url" || {
+              echo "::error::$url is not publicly reachable. Is public access on for the bucket, and is UPDATE_BASE_URL its public URL?"
+              exit 1; }
+          done
+
+          s3 s3 cp "s3://$R2_BUCKET/channels/$channel.json" previous.json --only-show-errors 2>/dev/null || echo '{}' > previous.json
+          python tools/publish_release.py channel --manifest manifest.json --previous previous.json \
+            --notes "$NOTES" --notes-url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$VERSION" \
+            --out channel.json
+          s3 s3 cp channel.json "s3://$R2_BUCKET/channels/$channel.json" \
+            --content-type application/json --cache-control "no-cache, max-age=0" --only-show-errors
+
+          {
+            echo "### $VERSION is live as an update"
+            echo ""
+            echo "Installed copies that update in place (per-user Windows installs"
+            echo "built with the release key) will see it at their next daily check,"
+            echo "or at once from **Check for updates**."
+            echo ""
+            echo "Builds from before the update host existed read the channel file on"
+            echo "the marketing site only; update that by hand if they should be told."
+            echo ""
+            echo '```json'
+            cat channel.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
