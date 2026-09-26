@@ -43,6 +43,11 @@ from pathlib import Path
 from modules.rules.shapes import RELATIONS, relates
 
 
+# Two points (body parts) closer than this, as a fraction of the frame, are the
+# same part seen again.
+POINT_MATCH = 0.05
+
+
 def _relation(value) -> str:
     """A rule's ``relation``, checked: a typo must fail loudly at load, not
     silently fall back to ``inside`` and fire on the wrong thing."""
@@ -204,6 +209,12 @@ class CompositionEngine:
     def __init__(self, rules_path: str | Path):
         self._specs = self._load(Path(rules_path))
         self.outliner = self._read_outliner(Path(rules_path))
+        # Rule classes that name a body part (``person.hand``): produced from
+        # the cache's keypoints, per frame, as point detections.
+        from modules.rules.body_parts import is_part
+        self._part_refs = {cls for spec in self._specs for rule in spec.rules
+                           for cls in (rule.source_class, rule.region_class)
+                           if is_part(cls)}
 
     # ------------------------------------------------------------------ public
 
@@ -233,9 +244,23 @@ class CompositionEngine:
     def outline_pairs(self) -> list:
         """``(source, region, max_gap)`` for every enabled rule that asked for
         outlines: what an outline pass has to trace, and next to what."""
-        return sorted({(rule.source_class, rule.region_class, rule.max_gap)
+        from modules.rules.body_parts import base_class
+        return sorted({(base_class(rule.source_class), base_class(rule.region_class),
+                        rule.max_gap)
                        for spec in self._specs if spec.enabled
                        for rule in spec.rules if rule.outline})
+
+    @property
+    def keypoint_pairs(self) -> list:
+        """``(person class, other class, max_gap)`` for enabled rules naming a
+        body part: where a pose pass has to run, and next to what."""
+        from modules.rules.body_parts import base_class, is_part
+        return sorted({(base_class(a), base_class(b), rule.max_gap)
+                       for spec in self._specs if spec.enabled
+                       for rule in spec.rules
+                       for a, b in ((rule.source_class, rule.region_class),
+                                    (rule.region_class, rule.source_class))
+                       if is_part(a)})
 
     @property
     def object_classes(self) -> list:
@@ -248,7 +273,10 @@ class CompositionEngine:
         will never look at. (``event_names`` includes them, deliberately, for
         the opposite reason: their previous output still has to be stripped.)
         """
-        return sorted({cls
+        from modules.rules.body_parts import base_class
+        # A body part is found on its class's detections: `person.hand` needs
+        # people detected, and asking a detector for "person.hand" finds nothing.
+        return sorted({base_class(cls)
                        for spec in self._specs if spec.enabled
                        for rule in spec.rules
                        for cls in (rule.source_class, rule.region_class)
@@ -296,6 +324,10 @@ class CompositionEngine:
         for entry in frames:
             ts = float(entry.get('timestamp', 0))
             dets = self._parse_frame(entry)
+            if self._part_refs:
+                from modules.rules.body_parts import part_detections
+                for ref, points in part_detections(entry, self._part_refs).items():
+                    dets[ref].extend(points)
 
             for spec in spatial_specs:
                 # --- expire old ghosts ---
@@ -311,7 +343,7 @@ class CompositionEngine:
                         existing = ghosts[spec.name][cls]
                         matched = False
                         for g in existing:
-                            if self._iou(g['box'], det['box']) > 0.3:
+                            if self._same_object(g, det):
                                 g['ts'] = ts
                                 g['box'] = det['box']
                                 g['conf'] = det['conf']
@@ -320,7 +352,8 @@ class CompositionEngine:
                                 break
                         if not matched:
                             existing.append({'ts': ts, 'box': det['box'], 'conf': det['conf'],
-                                             'contour': det.get('contour')})
+                                             'contour': det.get('contour'),
+                                             'point': det.get('point', False)})
 
                 # --- build effective detections = live ghosts ---
                 effective: dict = defaultdict(list)
@@ -648,6 +681,19 @@ class CompositionEngine:
                 det['contour'] = [list(p) for p in outline]
             result[cls].append(det)
         return result
+
+    @classmethod
+    def _same_object(cls, ghost: dict, det: dict) -> bool:
+        """Whether a detection continues a remembered one.
+
+        Boxes by overlap. Points (body parts) have no area, so their IoU is
+        always 0 and every frame would add a duplicate that lingers for
+        ``persist_secs``, inflating every count: they are matched by distance.
+        """
+        if det.get('point') or ghost.get('point'):
+            (gx, gy), (dx, dy) = ghost['box'][:2], det['box'][:2]
+            return (gx - dx) ** 2 + (gy - dy) ** 2 <= POINT_MATCH ** 2
+        return cls._iou(ghost['box'], det['box']) > 0.3
 
     @staticmethod
     def _iou(a: list, b: list) -> float:

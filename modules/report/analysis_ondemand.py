@@ -604,12 +604,13 @@ def _without_classes(bboxes: list, classes: set) -> list:
         trimmed["objects"] = [names[i] for i in keep]
         trimmed["bboxes"] = [boxes[i] for i in keep if i < len(boxes)]
         trimmed["confidences"] = [confs[i] for i in keep if i < len(confs)]
-        if entry.get("contours") is not None:
-            # Aligned with the boxes, so trimmed with them; left as it was,
-            # every outline after a removed class would sit on the wrong box.
-            contours = entry.get("contours") or []
-            trimmed["contours"] = [contours[i] if i < len(contours) else None
-                                   for i in keep]
+        for aligned in ("contours", "keypoints"):
+            if entry.get(aligned) is not None:
+                # Aligned with the boxes, so trimmed with them; left as it was,
+                # every outline or pose after a removed class would sit on the
+                # wrong box.
+                values = entry.get(aligned) or []
+                trimmed[aligned] = [values[i] if i < len(values) else None for i in keep]
         out.append(trimmed)
     return out
 
@@ -768,16 +769,12 @@ def run_composition(video_path: str, *, cache_dir: str = "./cache",
     # Outlines, for the rules that asked. Traced only where boxes cannot
     # already answer, and kept in the cache so the next run reuses them.
     outlined = False
-    if engine.outline_pairs and bboxes:
-        from modules.vision.outlines import add_outlines, make_outliner
-        stats = add_outlines(video_path, bboxes, engine.outline_pairs,
-                             outliner=make_outliner(engine.outliner), cancel=cancel)
+    if bboxes and (engine.outline_pairs or engine.keypoint_pairs):
+        from modules.rules.rule_inputs import trace_for_rules
+        report = trace_for_rules(video_path, bboxes, engine, cancel=cancel, log=log)
         if cancel is not None and cancel.is_set():
             raise _Cancelled()
-        outlined = stats["frames"] > 0
-        if outlined:
-            log(f"✏️ Outlines ({stats['outliner']}): {stats['traced']} traced on "
-                f"{stats['frames']} frame(s), {stats['no_outline']} left as boxes")
+        outlined = any((s or {}).get("frames") for s in report.values())
 
     duration = ((cache.get("video_metadata") or {}).get("duration")
                 or (cache.get("video_duration") or None))

@@ -147,16 +147,15 @@ def apply_rules(object_detections: Optional[Mapping],
     # video where boxes cannot already answer. On copies of the frames: the
     # caller's cache is not edited in place. Without a video path the rules are
     # decided on boxes, which is what they meant before outlines existed.
-    if video_path and engine.outline_pairs and boxes:
-        from modules.vision.outlines import add_outlines, make_outliner
+    if video_path and boxes and (engine.outline_pairs or engine.keypoint_pairs):
+        from modules.rules.rule_inputs import trace_for_rules
         boxes = [dict(frame) for frame in boxes]
-        stats = add_outlines(video_path, boxes, engine.outline_pairs,
-                             outliner=make_outliner(engine.outliner))
+        report = trace_for_rules(video_path, boxes, engine, log=log_fn)
         if outline_stats is not None:
-            outline_stats.update(stats)
-        if stats["frames"]:
-            log_fn(f"✏️ Outlines ({stats['outliner']}): {stats['traced']} traced on "
-                   f"{stats['frames']} frame(s), {stats['no_outline']} left as boxes")
+            # `frames` > 0 tells the caller the cache gained something to save.
+            traced = sum((s or {}).get("frames", 0) for s in report.values())
+            outline_stats.update(report.get("outlines") or {})
+            outline_stats["frames"] = traced
 
     composed, composed_boxes = engine.run(boxes, signals)
     hits = sum(len(v) for v in composed.values())

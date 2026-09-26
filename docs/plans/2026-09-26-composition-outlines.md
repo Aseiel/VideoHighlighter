@@ -101,7 +101,21 @@ loaded. Before shipping, one session is needed to:
 4. decide packaging: download on first use into the models folder, like the
    CLIP pack (`modules/packs`), rather than growing the installer.
 
-### 3. Saving from the UI no longer drops fields (done)
+### 3. Body parts (done): `modules/rules/body_parts.py`
+
+```yaml
+- {source: person.hand, region: <thing>, relation: touches, max_gap: 0.01}
+```
+
+A rule can name a part of a detection. The engine sees one point per visible
+keypoint (RTMPose, which the app already ships), so "a hand at the thing" is
+decided on the hand, not on a box that covers the whole person. Points are
+matched frame to frame by distance, since IoU is always 0 for a point and
+would have counted a remembered hand again on every frame. Pose runs only
+for people whose box meets the other class's box, once, and is cached with
+the boxes (`modules/vision/keypoints.py`).
+
+### 4. Saving from the UI no longer drops fields (done)
 
 Both rule editors rebuilt the file from their table rows, so anything
 without a column was deleted on Save.
@@ -119,7 +133,7 @@ without a column was deleted on Save.
 | SAM measured on real footage, licence confirmed, packaged | 1 day | steps above |
 | ~~Draw outlines in the timeline overlay~~ | done | a traced shape is drawn solid, its box dashed behind it |
 | ~~`Relation` and `Outline` columns in the Advanced tab~~ | done | `min_overlap` / `max_gap` are still YAML-only (kept on save) |
-| Body-part sources from pose (`person.left_wrist inside cup`) | 1-2 days | RTMPose (Apache-2.0) already runs in the cropper; a keypoint is a precise point source for `inside` and `touches`. Probably the biggest precision gain for rules about people, at little cost |
+| ~~Body-part sources from pose~~ | done | `source: person.hand` (or any COCO-17 keypoint, or the groups hand / foot / head / knee / elbow / shoulder / hip). Pose runs on demand only where the person's box meets the region's, and is cached as `keypoints` |
 | Outlines in the *live* overlay (every frame, while playing) | hard; not recommended | needs real-time segmentation. Composition is an offline reading of cached detections, and that's where outlines pay |
 
 Things that are *not* needed:
