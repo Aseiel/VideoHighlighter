@@ -247,3 +247,35 @@ def test_the_pipeline_path_traces_on_copies_and_reports_it(tmp_path, monkeypatch
     _, _, _, hits = compose_events.apply_rules({}, cache, rules_path=str(path),
                                                log_fn=lambda *a: None)
     assert hits == 3                          # no video: decided on boxes, as before
+
+
+@needs_cv2
+def test_the_comparison_tool_draws_both_outliners_and_measures_them(cv2, tmp_path):
+    from tools import compare_outliners
+
+    bboxes = [{"timestamp": float(t), "objects": ["thing", "other"],
+               "bboxes": [[0.25, 0.25, 0.5, 0.5], [0, 0, 0.1, 0.1]]} for t in range(40)]
+    picks = compare_outliners.pick(bboxes, "thing", 8)
+    assert len(picks) == 8 and picks[0][0] == 0.0 and picks[-1][0] == 35.0
+
+    square = [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7]]
+    shifted = [[0.4, 0.3], [0.8, 0.3], [0.8, 0.7], [0.4, 0.7]]
+
+    class Fixed:
+        def __init__(self, name, outline):
+            self.name, self._o = name, outline
+
+        def outline(self, frame, boxes):
+            return [self._o for _ in boxes]
+
+    def frames(video, stamps):
+        for ts in stamps:
+            yield ts, np.zeros((90, 160, 3), np.uint8)
+
+    drawn = {}
+    result = compare_outliners.compare(
+        "v.mp4", picks[:3], Fixed("one", square), Fixed("two", shifted),
+        str(tmp_path / "cmp.jpg"), frame_reader=frames,
+        renderer=lambda tiles, caps, cols, path, header="": drawn.update(caps=caps))
+    assert result["frames"] == 3 and len(drawn["caps"]) == 3
+    assert result["mean_agreement"] == pytest.approx(0.6, abs=0.05)   # 3/5 overlap
