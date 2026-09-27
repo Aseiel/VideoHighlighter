@@ -90,15 +90,53 @@ from model_training.intel.model import IntelFeatureExtractor, build_decoder
 # Intel GPU Detection
 # =============================
 HAS_IPEX = False
+
+def _utf8_stdout() -> None:
+    """Let this module print its emoji on a non-UTF-8 console.
+
+    Called at import time, not from main(): several of these prints happen
+    while the module is still loading (GPU detection, for one), so a guard
+    inside main() runs far too late. On a Windows console using a legacy
+    codepage the first emoji raises UnicodeEncodeError and kills the run
+    before any training starts. Replacing unencodable characters is the right
+    trade - a mangled glyph in a log beats a dead training run.
+    """
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_utf8_stdout()
+
 HAS_INTEL_GPU = False
+
+# Intel GPU detection must NOT be gated on intel_extension_for_pytorch.
+# torch 2.5+ '+xpu' builds expose torch.xpu natively and need no ipex at all
+# (modules/system/device_utils.py says the same). Gating on the import meant that on a
+# machine with a working Arc but no ipex installed, the whole block was skipped
+# by `except ImportError`, HAS_INTEL_GPU stayed False, and the run printed
+# "Training on CPU" while the GPU sat idle. ipex is still imported when present
+# — it can still contribute optimisations — but it is no longer the gate.
+if hasattr(torch, 'xpu'):
+    try:
+        if torch.xpu.is_available():
+            HAS_INTEL_GPU = True
+            # Announced only from the main process: Windows has no fork, so
+            # every DataLoader worker re-imports this module and would repeat
+            # the line once per worker, after the run has already finished.
+            import multiprocessing as _mp
+            if _mp.current_process().name == "MainProcess":
+                _gpu_name = (torch.xpu.get_device_name(0)
+                             if hasattr(torch.xpu, 'get_device_name') else 'Intel GPU')
+                print(f"✅ Intel GPU detected: {_gpu_name}")
+    except Exception as _e:
+        print(f"⚠️  Intel GPU check failed: {_e}")
 
 try:
     import intel_extension_for_pytorch as ipex
     HAS_IPEX = True
-    if hasattr(torch, 'xpu') and torch.xpu.is_available():
-        HAS_INTEL_GPU = True
-        _gpu_name = torch.xpu.get_device_name(0) if hasattr(torch.xpu, 'get_device_name') else 'Intel GPU'
-        print(f"✅ Intel GPU detected: {_gpu_name}")
 except (ImportError, OSError):
     pass
 
@@ -517,6 +555,7 @@ def train_classifier_live(encoder, train_loader, val_loader, num_classes,
 # =============================
 # Main
 # =============================
+
 def main():
     parser = argparse.ArgumentParser(description="Intel OpenVINO encoder → decoder training")
     parser.add_argument("--data-path", type=str, default=None)
@@ -590,7 +629,14 @@ def main():
 
     set_seed(42)
     print("=" * 60)
-    print(f"🧠 INTEL ENCODER (CPU) → {decoder_type.upper()} TRAINING ({CONFIG['device'].upper()})")
+    from model_training.intel.model import _encoder_device
+    from openvino import Core as _Core
+    try:
+        _enc_dev = _encoder_device(_Core())
+    except Exception:
+        _enc_dev = "CPU"
+    print(f"🧠 INTEL ENCODER ({_enc_dev}) → {decoder_type.upper()} "
+          f"TRAINING ({CONFIG['device'].upper()})")
     print("=" * 60)
 
     # Check encoder

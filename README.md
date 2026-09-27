@@ -109,12 +109,13 @@ Portable builds, GPU setup, where it writes, and fixing an oversized UI:
 
 **VideoHighlighter — this repository — is free software under AGPL-3.0, and
 stays that way.** It includes offline analysis, live face detection, VR
-side-by-side playback, CLIP search, the composition engine, model training and
-the model hub.
+side-by-side playback, CLIP search, the composition engine, model training —
+including teaching a model from one box drawn in the player, which then keeps
+improving while the app is idle — and the model hub.
 
 **[VideoHighlighter Pro](https://aseiel.github.io/VideoHighlighter-site/)** is a
 separate paid edition that adds real-time work on top: live object and action
-overlays during playback, teaching a category by drawing a box around it,
+overlays during playback, teaching a live category mid-playback,
 find-more-like-this search, open-vocabulary detection and counter/scoreboard
 detection.
 

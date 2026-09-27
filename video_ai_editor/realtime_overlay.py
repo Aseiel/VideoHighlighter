@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
     QGraphicsRectItem, QGraphicsTextItem, QGraphicsEllipseItem,
     QCheckBox, QLabel, QGroupBox, QComboBox, QSlider, QGraphicsItem, QMenu, QInputDialog,
-    QToolButton,
+    QToolButton, QMessageBox,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -796,6 +796,8 @@ class OverlayScene(QGraphicsScene):
 class OverlayView(QGraphicsView):
     """View that keeps video aspect ratio and supports smooth resize."""
     identity_context_requested = Signal(object, object)   # (identity_id, global_pos)
+    empty_context_requested = Signal(object, object)      # (scene_pos, global_pos) — right-click on nothing
+    teach_region_requested = Signal(object)               # (scene QRectF) — box drawn in teach mode
 
     def __init__(self, scene: OverlayScene, parent=None):
         super().__init__(scene, parent)
@@ -806,6 +808,61 @@ class OverlayView(QGraphicsView):
         self.setStyleSheet("QGraphicsView { background-color: black; border: none; }")
         self.setMinimumSize(320, 240)
         self._vr_mode = False
+        # One-shot "draw a box to teach a model" mode (see begin_teach_draw).
+        self._teach_mode = False
+        self._teach_origin = None          # QPointF in scene coords
+        self._teach_rubber = None          # QGraphicsRectItem shown while dragging
+
+    def begin_teach_draw(self):
+        """Arm teach mode: the next left-drag draws the box, then it disarms."""
+        self._teach_mode = True
+        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+
+    def _cancel_teach_draw(self):
+        self._teach_mode = False
+        self._teach_origin = None
+        self.viewport().unsetCursor()
+        if self._teach_rubber is not None:
+            self.scene().removeItem(self._teach_rubber)
+            self._teach_rubber = None
+
+    def mousePressEvent(self, event):
+        if self._teach_mode and event.button() == Qt.MouseButton.LeftButton:
+            self._teach_origin = self.mapToScene(event.pos())
+            self._teach_rubber = QGraphicsRectItem()
+            self._teach_rubber.setPen(QPen(QColor(120, 230, 140), 2, Qt.PenStyle.DashLine))
+            self._teach_rubber.setBrush(QBrush(QColor(120, 230, 140, 40)))
+            self._teach_rubber.setZValue(999)
+            self.scene().addItem(self._teach_rubber)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._teach_mode and self._teach_origin is not None:
+            self._teach_rubber.setRect(QRectF(self._teach_origin,
+                                              self.mapToScene(event.pos())).normalized())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._teach_mode and event.button() == Qt.MouseButton.LeftButton \
+                and self._teach_origin is not None:
+            rect = QRectF(self._teach_origin, self.mapToScene(event.pos())).normalized()
+            self._cancel_teach_draw()
+            if rect.width() >= 5 and rect.height() >= 5:
+                self.teach_region_requested.emit(rect)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if self._teach_mode and event.key() == Qt.Key.Key_Escape:
+            self._cancel_teach_draw()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def set_vr_mode(self, enabled: bool):
         """Show only the left half of the scene (SBS VR videos)."""
@@ -844,7 +901,9 @@ class OverlayView(QGraphicsView):
             self.identity_context_requested.emit(hit.data(0), event.globalPos())
             event.accept()
             return
-        super().contextMenuEvent(event)
+        # Nothing detected here: where "teach a model to find this" hooks in.
+        self.empty_context_requested.emit(scene_pos, event.globalPos())
+        event.accept()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -885,6 +944,9 @@ class RealtimeOverlayPreview(QWidget):
 
         self._init_ui()
         self._view.identity_context_requested.connect(self._on_identity_context)
+        self._view.empty_context_requested.connect(self._on_empty_context)
+        self._view.teach_region_requested.connect(self._on_teach_region)
+        self._pending_model_name = None     # set between "Teach a model…" and the box
         self._init_player()
         
         self._face_bank = None
@@ -1312,6 +1374,64 @@ class RealtimeOverlayPreview(QWidget):
                 self._face_bank.save()
         elif chosen == a_avoid:
             self.avoid_person_requested.emit(identity_id)
+
+    def _on_empty_context(self, scene_pos, global_pos):
+        """Right-click on nothing detected — offers to teach a model to find
+        what is there (modules/teach/from_player.py): one box, a name, and the
+        rest happens in the background while the app is idle."""
+        menu = QMenu(self)
+        a_model = menu.addAction("🧠  Teach a model to find this — draw a box…")
+        chosen = menu.exec(global_pos)
+        if chosen is not a_model:
+            return
+        name, ok = QInputDialog.getText(
+            self, "Teach a model",
+            "What is it? (a name; the same name again adds another view)")
+        if not (ok and name.strip()):
+            return
+        self._pending_model_name = name.strip()
+        self._view.begin_teach_draw()
+
+    def _normalized_region(self, scene_rect):
+        """``(roi, seconds)``: the drawn box as fractions of the whole frame,
+        kept inside it, and the playback time; None before a video is shown."""
+        s = self._scene.sceneRect()
+        if s.width() <= 0 or s.height() <= 0:
+            return None
+        x = max(0.0, min(1.0, scene_rect.x() / s.width()))
+        y = max(0.0, min(1.0, scene_rect.y() / s.height()))
+        roi = (x, y,
+               max(0.0, min(1.0 - x, scene_rect.width() / s.width())),
+               max(0.0, min(1.0 - y, scene_rect.height() / s.height())))
+        ts = 0.0
+        player = getattr(self, "_player", None)
+        if player is not None:
+            try:
+                ts = player.position() / 1000.0
+            except Exception:
+                ts = 0.0
+        return roi, float(ts)
+
+    def _teach_model(self, name: str, scene_rect):
+        """Seed a background-taught model from the drawn box (from_player)."""
+        region = self._normalized_region(scene_rect)
+        if region is None or not self.video_path:
+            return
+        from modules.teach.from_player import message, teach
+        try:
+            result = teach(self.video_path, region[1], region[0], name)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "Teach a model", str(exc))
+            return
+        print(f"teach: seeded {result['class']!r} in {result['root']} "
+              f"({result['seeds']} seeds)")
+        QMessageBox.information(self, "Teach a model", message(result))
+
+    def _on_teach_region(self, scene_rect):
+        """A box was drawn after "Teach a model…"."""
+        if self._pending_model_name:
+            name, self._pending_model_name = self._pending_model_name, None
+            self._teach_model(name, scene_rect)
 
     def shutdown_live_face(self):
         """Stop the worker thread cleanly. Call from the window's closeEvent."""

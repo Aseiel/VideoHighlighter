@@ -10,24 +10,57 @@ Intel Model Components
 import numpy as np
 import torch
 import torch.nn as nn
-from openvino.runtime import Core
+try:                                  # OpenVINO >= 2024 removed openvino.runtime
+    from openvino import Core
+except ImportError:                     # older installs still need the old path
+    from openvino.runtime import Core
 
 
 # =============================
 # OpenVINO Feature Extractor
+
+def _encoder_device(ie, requested=None) -> str:
+    """Which OpenVINO device should run the frozen encoder.
+
+    This used to be hard-coded to CPU, which on an Intel machine left the GPU
+    idle through the most expensive part of the run — encoding every clip once
+    takes minutes, and it is the step the feature cache exists to avoid
+    repeating. The encoder is exactly the kind of fixed-shape model OpenVINO
+    runs well on a GPU, so use one when it is there.
+    """
+    if requested:
+        return str(requested)
+    try:
+        devices = ie.available_devices
+        if any(d == "GPU" or d.startswith("GPU.") for d in devices):
+            return "GPU"
+    except Exception:
+        pass
+    return "CPU"
+
+
 # =============================
 class IntelFeatureExtractor:
     """Wraps the Intel action-recognition-0001 encoder (OpenVINO)."""
 
-    def __init__(self, encoder_xml, encoder_bin):
+    def __init__(self, encoder_xml, encoder_bin, device=None):
         ie = Core()
         model = ie.read_model(model=encoder_xml, weights=encoder_bin)
-        self.encoder = ie.compile_model(model, device_name="CPU")
+        self.device = _encoder_device(ie, device)
+        try:
+            self.encoder = ie.compile_model(model, device_name=self.device)
+        except Exception as e:
+            # A GPU that OpenVINO lists can still refuse a particular model.
+            # Falling back keeps the run alive rather than failing at the door.
+            print(f"⚠️ Encoder would not compile on {self.device} ({e}); using CPU")
+            self.device = "CPU"
+            self.encoder = ie.compile_model(model, device_name="CPU")
+        print(f"[encoder] running on: {self.device}")
 
         inp = self.encoder.inputs[0]
         self.input_name = inp.get_any_name()
         self.input_shape = list(inp.get_shape())
-        print(f"✓ Encoder input: {self.input_name}, shape: {self.input_shape}")
+        print(f"[encoder] input: {self.input_name}, shape: {self.input_shape}")
 
     def encode(self, frames_batch):
         """

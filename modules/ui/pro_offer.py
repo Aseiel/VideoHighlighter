@@ -12,7 +12,8 @@ Only right after the user has run into one of these:
 * ``rule_unbuildable`` -- they asked for a composition rule and none came back.
   A rule arranges classes the detector produced; it cannot add one. If what
   they asked about is not one of those classes, the fix is a detector that can
-  look for it, and those are Pro's.
+  look for it: teaching one is free (``modules/teach``), and the banner says so
+  first; looking by name with no training is Pro's.
 * ``report_unmeasured`` -- the report they just opened lists things that were
   said and never measured, and the routes that could measure them need an
   engine this build does not ship. Which routes those are is read from
@@ -194,9 +195,10 @@ def for_unbuildable_rule(now: Optional[_dt.datetime] = None) -> Optional[Offer]:
     return Offer("rule_unbuildable",
                  "If what you asked about isn't one of this video's classes, "
                  "no rule can add it — a rule only arranges what the detector "
-                 "found. <b>VideoHighlighter Pro</b> can look for it by name, "
-                 "or learn it from a box you draw around one example. "
-                 + _trial_line())
+                 "found. You can teach a model to find it: right-click it in "
+                 "the player, then <i>Teach a model</i>. <b>VideoHighlighter "
+                 "Pro</b> can also look for it by name straight away, with no "
+                 "training. " + _trial_line())
 
 
 def for_report(report: Mapping,
