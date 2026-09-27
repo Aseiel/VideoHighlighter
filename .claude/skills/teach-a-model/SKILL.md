@@ -27,8 +27,8 @@ class, named after what it shows, then run
 `quick --task <actions|objects> --examples <folder> --videos <files/folders>`.
 It runs every unattended step. After a judge step, `auto` continues
 (`auto --train` includes training). A person reviews fastest with
-`review --window`. Tiles show their guesses; they click the wrong ones and
-press Enter.
+`review --window` (and `boxes review --window` for boxes). Tiles show their
+guesses; they click the wrong ones and press Enter.
 
 ## Starting a project
 

@@ -182,6 +182,7 @@ After samples are accepted, boxes are needed:
 ```bash
 $T boxes propose        # stock detector + CLIP pick a box on each accepted sample
 $T boxes review         # boxes-0001.jpg: is the yellow box around it, and tight?
+                        # (or `boxes review --window`: click the wrong ones, Enter)
 $T boxes verdict --sheet 1 --accept 1-12 --reject 13
 $T boxes worklist       # samples with no good box: label these in tools/labeler.py
 $T boxes import exports/*.json --accept-all
@@ -194,7 +195,12 @@ something no detector knows, CLIP scans overlapping regions of the frame, then
 shrinks the best one while it still looks like the class. Those boxes are
 coarser and always go to review. Once a class has three accepted boxes, their
 crops replace its name as what "looks like it" means, which makes every later
-proposal better. What still can't be found goes to the labeller, as before.
+proposal better. That is also when a frame whose box was rejected gets one
+more try, at a different region; after two rejections it goes to the labeller.
+What still can't be found goes to the labeller, as before.
+
+In the app, **Check guesses…** opens the box window by itself when boxes are
+what the project is waiting on.
 
 ## Round 2 and after
 
