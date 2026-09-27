@@ -31,7 +31,9 @@ class _Job(QObject):
     def run(self):
         try:
             self.done.emit(self.fn())
-        except Exception as exc:              # shown, never raised into Qt
+        except BaseException as exc:          # shown, never raised into Qt, and
+            # never lost: a SystemExit here would end the thread with the
+            # buttons still disabled.
             self.done.emit((2, {"error": f"{type(exc).__name__}: {exc}"}))
 
 
@@ -92,7 +94,7 @@ class TeachPanel(QWidget):
         self.examples = QLineEdit()
         self.examples.setPlaceholderText("folder with one subfolder of clips per thing")
         self.videos = QLineEdit()
-        self.videos.setPlaceholderText("a video, or a folder of videos")
+        self.videos.setPlaceholderText("a folder of videos (or type the path of one video)")
         self.focus = QCheckBox("Crop samples to the people in them (actions)")
 
         form = QFormLayout()
@@ -175,10 +177,22 @@ class TeachPanel(QWidget):
         if self._open_review is not None:
             self._open_review(root)
             return
-        from modules.teach.review_window import ReviewWindow
-        self._review = ReviewWindow(root)
-        self._review.destroyed.connect(lambda *_: self._run(["status"]))
-        self._review.show()
+        from PySide6.QtCore import Qt
+
+        from modules.teach.review_window import BoxReviewWindow, ReviewWindow
+        window = BoxReviewWindow(root) if self.wants_box_review(root) else ReviewWindow(root)
+        # Deleted on close, so ``destroyed`` fires and the panel says what is next.
+        window.setAttribute(Qt.WA_DeleteOnClose)
+        window.destroyed.connect(lambda *_: self._run(["status"]))
+        self._review = window
+        window.show()
+
+    @staticmethod
+    def wants_box_review(root: str) -> bool:
+        """Boxes when that is what the project is waiting on; samples otherwise."""
+        from modules.teach.project import Project
+        from modules.teach.status import next_step
+        return next_step(Project.load(root)).get("args", [])[:2] == ["boxes", "review"]
 
     def share(self):
         from modules.teach.cli import resolve_root
@@ -206,11 +220,14 @@ class TeachPanel(QWidget):
         self._job.moveToThread(self._thread)
         self._thread.started.connect(self._job.run)
         self._job.done.connect(self._finished)
+        self._thread.finished.connect(self._job.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
     def _finished(self, outcome):
         self._thread.quit()
         self._thread.wait()
+        self._thread = self._job = None
         self._set_busy(False)
         code, result = outcome if isinstance(outcome, tuple) else (0, outcome)
         self.last_result = result

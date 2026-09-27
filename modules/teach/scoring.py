@@ -15,15 +15,16 @@ Raw cosines are not comparable between classes (text prototypes sit around
 
     calibrated = (cosine - background) / (anchor - background)
 
-``background`` is a low percentile (``BACKGROUND_PERCENTILE``) of all
-samples' cosines to the prototype: what "not this" looks like in this footage.
-Not the median: footage chosen *because* it shows the thing can show it in
-more than half its samples, and a median then sits among the real examples and
-calibrates them to zero, so nothing is ever proposed. The 20th percentile holds
-until the thing fills four fifths of the footage. ``anchor`` is what "this" looks like: the examples' mean cosine to their
-own prototype when there are examples, else the 97th percentile of the
-samples. So 0 is ordinary footage and 1 is "looks like the examples", on the
-same scale for every class.
+``background`` is what "not this" looks like in this footage (``background``
+below): the median of the samples that are *not* the thing. When the scores
+split cleanly into a low and a high group, that is the low group's median,
+whichever group is larger. Footage chosen *because* it shows the thing can show
+it in most samples, and a plain median then sits among the real examples and
+calibrates them to zero. When they do not split, the thing is rare or absent,
+and the plain median is ordinary footage. ``anchor`` is what "this" looks like:
+the examples' mean cosine to their own prototype when there are examples, else
+the 97th percentile of the samples. So 0 is ordinary footage and 1 is "looks
+like the examples", on the same scale for every class.
 
 A sample is **proposed** as the best class when its calibrated score clears
 ``gate`` *and* leads the runner-up by ``margin`` (two classes that both fit is
@@ -46,13 +47,39 @@ from modules.teach.project import NONE, UNSURE
 
 # The upper end of "ordinary footage" for a text-only class, as a percentile.
 TEXT_ANCHOR_PERCENTILE = 97.0
-# Where "not this" is read from, as a percentile of the footage (see above).
-BACKGROUND_PERCENTILE = 20.0
 # Keeps a class whose samples all score alike from dividing by nothing.
 MIN_SPREAD = 0.02
 # Cap on how many accepted samples feed a prototype: past this, more of the
 # same moves the mean by nothing and costs a stack of vectors.
 MAX_EXAMPLES = 200
+# How cleanly the scores must split in two (Otsu's between-group share of the
+# variance) before the low group alone is taken as ordinary footage. One bell
+# curve splits at 2/pi (0.64) and a flat spread at 0.75, so above both.
+BIMODAL_SPLIT = 0.8
+
+
+def background(column) -> float:
+    """What ordinary footage scores against one prototype (see above)."""
+    values = np.sort(np.asarray(column, dtype=np.float64))
+    n = len(values)
+    if n < 4:
+        return float(np.median(values))
+    total_var = float(values.var())
+    if total_var <= 1e-12:
+        return float(values[0])
+    # Otsu on one dimension: the split that maximises between-group variance.
+    prefix = np.cumsum(values)
+    mean = prefix[-1] / n
+    best_share, best_k = 0.0, 0
+    for k in range(1, n):
+        w0, w1 = k / n, (n - k) / n
+        m0, m1 = prefix[k - 1] / k, (prefix[-1] - prefix[k - 1]) / (n - k)
+        share = (w0 * (m0 - mean) ** 2 + w1 * (m1 - mean) ** 2) / total_var
+        if share > best_share:
+            best_share, best_k = share, k
+    if best_share >= BIMODAL_SPLIT:
+        return float(np.median(values[:best_k]))
+    return float(np.median(values))
 
 
 @dataclass
@@ -88,11 +115,11 @@ def calibrate(raw: np.ndarray, prototypes: Sequence[Prototype]) -> np.ndarray:
     out = np.zeros_like(raw, dtype=np.float32)
     for c, proto in enumerate(prototypes):
         column = raw[:, c]
-        background = float(np.percentile(column, BACKGROUND_PERCENTILE))
+        floor = background(column)
         anchor = proto.anchor
         if anchor is None:
             anchor = float(np.percentile(column, TEXT_ANCHOR_PERCENTILE))
-        out[:, c] = (column - background) / max(anchor - background, MIN_SPREAD)
+        out[:, c] = (column - floor) / max(anchor - floor, MIN_SPREAD)
     return out
 
 

@@ -15,6 +15,10 @@ loads the next batch, and by default re-sorts first, so what was just
 accepted sharpens the guesses on the next one.
 
     python -m modules.teach --project <name> review --window
+    python -m modules.teach --project <name> boxes review --window
+
+The box window is the same with one frame per tile and the proposed box drawn
+on it: accept, reject or leave undecided.
 
 Qt lives only here; everything it does goes through the modules the command
 line uses, so the two can never disagree about what a verdict means.
@@ -86,16 +90,20 @@ class Tile(QLabel):
     changed = Signal()
 
     def __init__(self, n: int, item: dict, image, sample_path: str, class_names,
-                 max_width: int = 560):
+                 max_width: int = 560, choices=CYCLE):
         super().__init__()
         self.n, self.item, self.path = n, item, sample_path
         self.class_names = list(class_names)
+        self.choices = tuple(choices)
         self.state, self.label = initial_state(item, self.class_names)
         self.picture = _pixmap(image, max_width)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAlignment(Qt.AlignCenter)
-        self.setToolTip("Click: accept / reject / none / undecided.  Right-click: "
-                        "it is another class.  Double-click: play.")
+        if NEGATIVE in self.choices:
+            self.setToolTip("Click: accept / reject / none / undecided.  Right-click: "
+                            "it is another class.  Double-click: play.")
+        else:
+            self.setToolTip("Click: accept / reject / undecided.  Double-click: play.")
         self.refresh()
 
     def refresh(self):
@@ -120,14 +128,15 @@ class Tile(QLabel):
         self.refresh()
 
     def cycle(self):
-        order = list(CYCLE)
-        self.set_state(order[(order.index(self.state) + 1) % len(order)])
+        order = list(self.choices)
+        at = order.index(self.state) if self.state in order else -1
+        self.set_state(order[(at + 1) % len(order)])
 
     def mousePressEvent(self, event):
         self.setFocus()
         if event.button() == Qt.LeftButton:
             self.cycle()
-        elif event.button() == Qt.RightButton:
+        elif event.button() == Qt.RightButton and NEGATIVE in self.choices:
             menu = QMenu(self)
             for name in self.class_names:
                 menu.addAction(f"it is: {name}", lambda n=name: self.set_state(ACCEPT, n))
@@ -142,7 +151,7 @@ class Tile(QLabel):
     def keyPressEvent(self, event):
         keys = {Qt.Key_A: ACCEPT, Qt.Key_R: REJECT, Qt.Key_N: NEGATIVE,
                 Qt.Key_U: UNDECIDED}
-        if event.key() in keys:
+        if event.key() in keys and keys[event.key()] in self.choices:
             self.set_state(keys[event.key()])
         elif event.key() == Qt.Key_Space:
             self.cycle()
@@ -226,27 +235,18 @@ class ReviewWindow(QWidget):
             holder.deleteLater()
         self.tiles, self.holders = [], []
         project = Project.load(self.root)
-        self.record = review.next_sheet(project, size=self.size,
-                                        class_name=self.class_name,
-                                        frame_reader=self.frame_reader,
-                                        keep_tiles=True)
+        self.record = self.fetch(project)
         if not self.record:
             self.header.setText("<b>Nothing left to check.</b> Close this window and run "
                                 "<code>status</code> for the next step.")
             self.save_next.setEnabled(False)
             self.update_progress(project)
             return
-        self.header.setText(
-            f"<b>Batch {self.record['sheet']}</b> — each tile already shows its guess. "
-            "Click the wrong ones: click cycles accept / reject / none of these / "
-            "undecided; right-click to say which class it really is; double-click to "
-            "play. Then press Enter.")
-        paths = {s.id: s.path for s in project.samples}
-        columns = 2 if project.task == "actions" else 4
-        names = project.class_names()
+        self.header.setText(self.intro())
+        columns = self.columns(project)
         for i, (item, image) in enumerate(zip(self.record["items"], self.record["tiles"])):
-            tile = Tile(item["n"], item, image, paths.get(item["sample"], ""), names,
-                        max_width=560 if columns == 2 else 280)
+            tile = self.make_tile(project, item, image,
+                                  max_width=560 if columns == 2 else 280)
             caption = QLabel()
             caption.setWordWrap(True)
             tile.caption_label = caption
@@ -263,6 +263,31 @@ class ReviewWindow(QWidget):
         if self.tiles:
             self.tiles[0].setFocus()
         self.update_progress(project)
+
+    # What a batch is, and how its tiles behave: the box window overrides these.
+
+    def fetch(self, project: Project) -> dict:
+        return review.next_sheet(project, size=self.size, class_name=self.class_name,
+                                 frame_reader=self.frame_reader, keep_tiles=True)
+
+    def intro(self) -> str:
+        return (f"<b>Batch {self.record['sheet']}</b> — each tile already shows its "
+                "guess. Click the wrong ones: click cycles accept / reject / none of "
+                "these / undecided; right-click to say which class it really is; "
+                "double-click to play. Then press Enter.")
+
+    def columns(self, project: Project) -> int:
+        return 2 if project.task == "actions" else 4
+
+    def make_tile(self, project: Project, item: dict, image, max_width: int) -> Tile:
+        paths = {s.id: s.path for s in project.samples}
+        return Tile(item["n"], item, image, paths.get(item["sample"], ""),
+                    project.class_names(), max_width=max_width)
+
+    def apply(self, project: Project) -> dict:
+        guesses = {t.n: t.item["proposed"] for t in self.tiles}
+        return review.apply_verdicts(project, self.record["sheet"],
+                                     **verdict_args(self.states(), guesses), by="window")
 
     def update_progress(self, project: Project):
         counts = project.counts()
@@ -283,11 +308,7 @@ class ReviewWindow(QWidget):
             if not and_next:
                 self.close()
             return {}
-        guesses = {t.n: t.item["proposed"] for t in self.tiles}
-        project = Project.load(self.root)
-        result = review.apply_verdicts(project, self.record["sheet"],
-                                       **verdict_args(self.states(), guesses),
-                                       by="window")
+        result = self.apply(Project.load(self.root))
         if result.get("errors"):
             QMessageBox.warning(self, "Not saved", "\n".join(result["errors"]))
             return result
@@ -320,8 +341,59 @@ class ReviewWindow(QWidget):
         self.load_batch()
 
 
-def open_window(root: str, size: int = 24, class_name: Optional[str] = None) -> int:
+class BoxReviewWindow(ReviewWindow):
+    """The proposed boxes, one frame per tile: is the box around the thing?
+
+    Same window, same keys; a tile is accepted, rejected or left undecided
+    (there is no "none of these" or relabel for a box). Verdicts go through
+    ``boxes.apply_verdicts``, as ``boxes verdict`` does.
+    """
+
+    def __init__(self, root: str, size: int = 24, read_at: Optional[Callable] = None):
+        self.read_at = read_at
+        super().__init__(root, size, make_embedder=None, frame_reader=read_at)
+        self.setWindowTitle("Check the boxes")
+        self.resort.setChecked(False)
+        self.resort.hide()
+
+    def fetch(self, project: Project) -> dict:
+        from modules.teach import boxes
+        record = boxes.next_sheet(project, size=self.size, read_at=self.read_at,
+                                  renderer=lambda *a, **k: None, keep_tiles=True)
+        for item in record.get("items") or []:
+            item["proposed"] = item["class_name"]
+        return record
+
+    def intro(self) -> str:
+        return (f"<b>Boxes {self.record['sheet']}</b> — is the yellow box around the "
+                "named thing, and tight? Click the wrong ones to reject them (click "
+                "cycles accept / reject / undecided). Then press Enter.")
+
+    def columns(self, project: Project) -> int:
+        return 4
+
+    def make_tile(self, project: Project, item: dict, image, max_width: int) -> Tile:
+        return Tile(item["n"], item, image, item["video"], [item["class_name"]],
+                    max_width=max_width, choices=(ACCEPT, REJECT, UNDECIDED))
+
+    def apply(self, project: Project) -> dict:
+        from modules.teach import boxes
+        states = self.states()
+        pick = lambda wanted: ",".join(str(n) for n, (state, _) in sorted(states.items())  # noqa: E731
+                                       if state == wanted)
+        return boxes.apply_verdicts(project, self.record["sheet"],
+                                    accept=pick(ACCEPT), reject=pick(REJECT))
+
+    def update_progress(self, project: Project):
+        from modules.teach import boxes
+        labels = boxes.store(project)
+        self.progress.setText(f"<b>{len(labels.accepted())}</b> boxes accepted, "
+                              f"<b>{len(labels.pending())}</b> waiting")
+
+
+def open_window(root: str, size: int = 24, class_name: Optional[str] = None,
+                boxes: bool = False) -> int:
     app = QApplication.instance() or QApplication([])
-    window = ReviewWindow(root, size, class_name)
+    window = BoxReviewWindow(root, size) if boxes else ReviewWindow(root, size, class_name)
     window.show()
     return app.exec()

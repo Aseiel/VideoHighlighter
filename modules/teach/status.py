@@ -76,7 +76,7 @@ def next_step(project: Project) -> dict:
                          "samples sharpen the next guesses.", "review")
 
     if project.task == OBJECTS:
-        from modules.teach.boxes import labeler_worklist, store
+        from modules.teach.boxes import labeler_worklist, retryable, store
         labels = store(project)
         if labels.pending():
             return _step(project, "judge", f"Check {len(labels.pending())} proposed boxes.",
@@ -84,6 +84,11 @@ def next_step(project: Project) -> dict:
         todo = labeler_worklist(project)
         if any(not s.boxes_tried for s in project.accepted()):
             return _step(project, "auto", "Propose boxes on accepted samples.",
+                         "boxes", "propose")
+        retry = retryable(project, labels)
+        if retry:
+            return _step(project, "auto", f"Try again on {len(retry)} frames whose boxes "
+                         "were rejected, now matching what accepted boxes look like.",
                          "boxes", "propose")
         if len(todo) > len(project.accepted()) // 2:
             return _step(project, "judge", f"{len(todo)} accepted samples have no good box. "

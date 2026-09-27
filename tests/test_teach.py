@@ -594,6 +594,11 @@ def test_cli_answers_in_json_and_names_the_next_step(tmp_path, capsys):
     assert "init" in json.loads(capsys.readouterr().out)["error"]
 
 
+def test_cli_bad_arguments_are_an_answer_not_an_exit(tmp_path):
+    code, result = cli.run(["--project", str(tmp_path / "p"), "sort", "--no-such-flag"])
+    assert code == 2 and "unrecognized arguments: --no-such-flag" in result["error"]
+
+
 def test_cli_settings_are_typed(tmp_path, capsys):
     root = str(tmp_path / "cli")
     cli.main(["--project", root, "init", "--task", "objects"])
@@ -976,6 +981,29 @@ def test_a_trained_round_proposes_and_disagreements_are_reviewed_first(project, 
     assert batch[0].model_proposed == "beta move" and batch[0].proposed == "alpha move"
 
 
+def test_round_model_reads_the_mapping_train_py_writes(tmp_path):
+    # Top-level variant, and a production mapping that dropped class 1: the
+    # head still has three outputs.
+    weights = tmp_path / "r.pth"
+    weights.write_bytes(b"w")
+    mapping = tmp_path / "r_mapping.json"
+    mapping.write_text(json.dumps({"idx_to_label": {"0": "alpha move", "2": "gamma move"},
+                                   "num_classes_total": 3, "model_variant": "r2plus1d_18"}))
+    made = {}
+
+    class Wrapper:
+        def __init__(self, **kw):
+            made.update(kw)
+
+        def predict_from_frames(self, frames):
+            return np.array([0.0, 0.0, 4.0])
+
+    classify = sort.r3d_classifier(str(weights), str(mapping), wrapper_factory=Wrapper,
+                                   frame_reader=lambda path, n: [np.zeros((4, 4, 3))] * n)
+    assert made["model_name"] == "r2plus1d_18" and made["custom_num_classes"] == 3
+    assert classify("x.mp4")[0] == "gamma move"
+
+
 def test_only_an_installed_round_proposes(project, tmp_path):
     assert sort.round_classifier(project) is None
     project.rounds.append({"round": 1, "installed": False,
@@ -1015,6 +1043,44 @@ def test_a_frame_whose_box_was_rejected_is_proposed_again_elsewhere(tmp_path):
     assert boxes.propose(p, FakeDetector(), CropEmbedder(), read_at=_frame)["proposed"] == 0
 
 
+def test_rejected_frames_are_retried_by_status_and_a_fruitless_retry_ends_it(tmp_path):
+    from modules.teach import status
+    from modules.vision.label_store import LabelledBox, REJECTED as BOX_REJECTED
+
+    p = _object_project(tmp_path)
+    p.samples[1].verdict, p.samples[1].label = "rejected", ""
+    for s in p.samples:
+        s.scores = {"alpha widget": 1.0}
+        s.boxes_tried = True
+    p.save()
+    sample = p.samples[0]
+    moment = boxes.frame_times(sample.duration, 1)[0]
+    labels = boxes.store(p)
+    labels.add(LabelledBox(video=sample.path, time=moment, class_name="alpha widget",
+                           box=(0.6, 0.2, 0.3, 0.3), verdict=BOX_REJECTED))
+    labels.save()
+    # Named only in words, a retry would guess the same box again: not offered.
+    assert boxes.retryable(p) == []
+
+    labels = boxes.store(p)
+    for t in (10.0, 11.0, 12.0):
+        labels.add(LabelledBox(video=sample.path, time=t, class_name="alpha widget",
+                               box=(0.6, 0.2, 0.3, 0.3), verdict=ACCEPTED))
+    labels.save()
+    assert boxes.retryable(p) == [(sample.path, moment)]
+    assert status.next_step(p)["args"] == ["boxes", "propose"]
+
+    class Nothing:
+        def detect(self, frame):
+            return []
+
+    blank = lambda *_: np.zeros((100, 100, 3), np.uint8)     # noqa: E731
+    result = boxes.propose(p, Nothing(), CropEmbedder(), read_at=blank)
+    assert result["proposed"] == 0
+    assert boxes.retryable(p) == []
+    assert status.next_step(p)["args"] != ["boxes", "propose"]
+
+
 # --- sharing a taught detector ---------------------------------------------------------
 
 def test_the_installed_detector_is_drafted_for_the_hub(tmp_path):
@@ -1047,3 +1113,41 @@ def test_the_installed_detector_is_drafted_for_the_hub(tmp_path):
     p.task = ACTIONS
     with pytest.raises(share.NotShareable, match="Only object"):
         share.share_draft(p)
+
+
+def test_sharing_describes_the_installed_round_not_the_latest(tmp_path, monkeypatch):
+    from modules.teach import share
+    from modules.teach.project import slugify
+
+    p = _object_project(tmp_path)
+    # Installed before rounds recorded where: found where install puts it.
+    monkeypatch.chdir(tmp_path)
+    name = f"teach_{slugify(p.name)}"
+    model_dir = tmp_path / "models" / "custom" / name
+    model_dir.mkdir(parents=True)
+    (model_dir / f"{name}.onnx").write_bytes(b"onnx")
+    (model_dir / "labels.json").write_text(json.dumps(["alpha widget"]))
+    p.rounds.append({"round": 1, "installed": True, "trained_frames": 5, "videos": 2})
+    # A later round that did not beat it, trained on more.
+    p.rounds.append({"round": 2, "installed": False, "trained_frames": 9, "videos": 3})
+
+    onnx, draft = share.share_draft(p)
+    assert onnx == str(model_dir / f"{name}.onnx")
+    assert draft.metrics == {"rounds": 1, "train_frames": 5, "videos": 2}
+
+
+@pytest.mark.parametrize("share", [0.1, 0.3, 0.6, 0.8])
+def test_ordinary_footage_calibrates_to_zero_however_common_the_thing_is(share):
+    rng = np.random.default_rng(0)
+    n = 200
+    k = int(n * share)
+    ordinary = rng.normal(0.5, 0.03, n - k)
+    thing = rng.normal(0.9, 0.03, k)
+    column = np.concatenate([ordinary, thing])
+    floor = scoring.background(column)
+    assert abs(floor - 0.5) < 0.02, (share, floor)
+
+
+def test_footage_without_the_thing_is_its_own_ordinary():
+    column = np.random.default_rng(1).normal(0.5, 0.03, 200)
+    assert abs(scoring.background(column) - np.median(column)) < 1e-9

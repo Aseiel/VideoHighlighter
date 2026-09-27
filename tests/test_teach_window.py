@@ -85,3 +85,49 @@ def test_undecided_tiles_stay_in_the_queue(app, tmp_path):
     window.save(and_next=False)
     left = [s.id for s in Project.load(p.root).samples if s.verdict == PENDING]
     assert left == ["v001__00000003"]
+
+
+def test_clicking_through_proposed_boxes(app, tmp_path, monkeypatch):
+    import sys
+
+    import numpy as np
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from conftest import real_opencv
+
+    cv2 = real_opencv()
+    if cv2 is None:
+        pytest.skip("drawing a box needs OpenCV")
+    monkeypatch.setitem(sys.modules, "cv2", cv2)
+
+    from modules.teach import boxes
+    from modules.teach.project import OBJECTS
+    from modules.vision.label_store import LabelledBox
+
+    p = Project.create(str(tmp_path / "b"), OBJECTS)
+    p.add_class("alpha widget")
+    p.save()
+    labels = boxes.store(p)
+    for t in (1.0, 2.0, 3.0):
+        labels.add(LabelledBox(video=str(tmp_path / "v.mp4"), time=t,
+                               class_name="alpha widget", box=(0.1, 0.1, 0.3, 0.3),
+                               confidence=t / 10, verdict=PENDING))
+    labels.save()
+
+    frame = lambda *_: np.zeros((60, 80, 3), np.uint8)       # noqa: E731
+    window = review_window.BoxReviewWindow(p.root, size=10, read_at=frame)
+    assert window.windowTitle() == "Check the boxes"
+    assert [t.state for t in window.tiles] == ["accept"] * 3
+    # A box has no "none of these": a click goes accept -> reject.
+    QTest.mouseClick(window.tiles[1], Qt.LeftButton)
+    assert window.tiles[1].state == "reject"
+    QTest.mouseClick(window.tiles[2], Qt.LeftButton)
+    QTest.mouseClick(window.tiles[2], Qt.LeftButton)
+    assert window.tiles[2].state == "undecided"
+    window.save(and_next=True)
+
+    verdicts = {b.time: b.verdict for b in boxes.store(Project.load(p.root)).boxes}
+    assert verdicts == {1.0: "accepted", 2.0: "rejected", 3.0: "pending"}
+    # The undecided box comes back in the next batch, alone.
+    assert [t.item["time"] for t in window.tiles] == [3.0]
+    window.close()

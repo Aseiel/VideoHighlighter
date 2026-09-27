@@ -76,3 +76,16 @@ def test_relation_and_outline_round_trip_through_the_web_ui(tmp_path, monkeypatc
     saved = yaml.safe_load(rules.read_text(encoding="utf-8"))["events"][0]["rules"][0]
     assert "relation" not in saved and "outline" not in saved
     assert saved["max_gap"] == 0.02               # no column for it: kept
+
+
+def test_an_unknown_relation_is_refused_and_nothing_written(tmp_path, monkeypatch):
+    rules = tmp_path / "composition_rules.yaml"
+    before = "events:\n  - name: e\n    rules:\n      - {source: a, region: b}\n"
+    rules.write_text(before, encoding="utf-8")
+    monkeypatch.setattr("modules.system.app_paths.composition_rules_path", lambda: str(rules))
+    monkeypatch.setattr("modules.system.app_paths.user_data_dir", lambda: str(tmp_path))
+
+    row = {"name": "e", "source": "a", "region": "b", "relation": "nearby"}
+    result = asyncio.run(save_composition_rules(CompRulesRequest(rules=[row])))
+    assert result["ok"] is False and "nearby" in result["error"]
+    assert rules.read_text(encoding="utf-8") == before

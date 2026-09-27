@@ -102,6 +102,8 @@ def compare(video: str, picks: list, outliner_a, outliner_b, out_path: str,
         raise SystemExit("no frames could be read for those detections")
     name_a = getattr(outliner_a, "name", "A")
     name_b = getattr(outliner_b, "name", "B")
+    if name_a == name_b:              # one outliner against itself: keep both timings
+        name_a, name_b = f"{name_a}_a", f"{name_b}_b"
     renderer(tiles, captions, 4, out_path,
              f"yellow = {name_a}   cyan = {name_b}   grey = detector box")
     n = len(tiles)

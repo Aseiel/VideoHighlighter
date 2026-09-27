@@ -86,6 +86,34 @@ def _rejected(labels: LabelStore) -> dict:
     return out
 
 
+def _crop_ready(labels: LabelStore) -> set:
+    """Classes with enough accepted boxes to be matched by their crops."""
+    counts: dict = {}
+    for b in labels.accepted():
+        if b.class_name and any(b.box):
+            counts[b.class_name] = counts.get(b.class_name, 0) + 1
+    return {name for name, n in counts.items() if n >= MIN_CROP_EXAMPLES}
+
+
+def retryable(project: Project, labels: Optional[LabelStore] = None) -> list:
+    """Frames of accepted samples whose proposals were all rejected and that
+    ``propose`` would try again now (see there): the class has crops to match,
+    and the frame has not used up its tries."""
+    labels = labels or store(project)
+    done = _labelled_keys(labels)
+    rejected = _rejected(labels)
+    ready = _crop_ready(labels)
+    out = []
+    for sample in project.accepted():
+        if sample.label not in ready:
+            continue
+        for moment in frame_times(sample.duration, project.settings.boxes_per_sample):
+            key = (sample.path, moment)
+            if key not in done and 0 < len(rejected.get(key, ())) < MAX_REJECTED_PER_FRAME:
+                out.append(key)
+    return out
+
+
 def _iou(a, b) -> float:
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
@@ -153,6 +181,13 @@ def propose(project: Project, detector, embedder, *,
                     box = None
             if box is None:
                 empty += 1
+                if excluded:
+                    # A retry that found nothing new counts as one more
+                    # rejection, so the frame runs out of tries and ``status``
+                    # stops offering it.
+                    labels.add(LabelledBox(video=sample.path, time=moment,
+                                           class_name=sample.label, box=(0.0, 0.0, 0.0, 0.0),
+                                           source="prompt", verdict=REJECTED))
                 continue
             coords, confidence, source = box
             # A detector's own box for its own class, or last round's model,
@@ -308,7 +343,7 @@ def _draw(frame, box, text: str):
 
 
 def next_sheet(project: Project, size: int = 20, *, read_at: Optional[Callable] = None,
-               renderer: Optional[Callable] = None) -> dict:
+               renderer: Optional[Callable] = None, keep_tiles: bool = False) -> dict:
     from modules.teach import review
 
     read_at = read_at or _read_at
@@ -329,7 +364,8 @@ def next_sheet(project: Project, size: int = 20, *, read_at: Optional[Callable] 
         tiles.append(review._tile(drawn, 220))
         captions.append(f"{box.class_name} ({box.source} {box.confidence:.2f})")
         items.append({"n": n, "video": box.video, "time": box.time,
-                      "class_name": box.class_name, "box": list(box.box)})
+                      "class_name": box.class_name, "box": list(box.box),
+                      "caption": captions[-1]})
     image = os.path.join(review_dir, f"{BOX_REVIEW_PREFIX}-{number:04d}.jpg")
     renderer(tiles, captions, 4, image,
              f"boxes {number}: is the yellow box around the named thing, and tight?")
@@ -337,6 +373,8 @@ def next_sheet(project: Project, size: int = 20, *, read_at: Optional[Callable] 
     with open(os.path.join(review_dir, f"{BOX_REVIEW_PREFIX}-{number:04d}.json"), "w",
               encoding="utf-8") as handle:
         json.dump(record, handle, indent=1)
+    if keep_tiles:
+        record["tiles"] = tiles          # for the review window; not saved
     return record
 
 

@@ -174,12 +174,18 @@ def r3d_classifier(weights: str, mapping: str, *, wrapper_factory=None,
     with open(mapping, "r", encoding="utf-8") as handle:
         data = _json.load(handle)
     idx_to_label = {int(k): v for k, v in (data.get("idx_to_label") or {}).items()}
-    variant = (data.get("metadata") or {}).get("model_variant") or "r3d_18"
+    # train.py writes the variant at the top level; older mappings nest it.
+    variant = (data.get("model_variant")
+               or (data.get("metadata") or {}).get("model_variant") or "r3d_18")
+    # A filtered (production) mapping lists fewer labels than the head has
+    # outputs; the weights need the head's own size.
+    num_classes = int(data.get("num_classes_total")
+                      or (max(idx_to_label) + 1 if idx_to_label else 0))
     if wrapper_factory is None:
         from action_recognition import R3DModelWrapper as wrapper_factory
     # "cuda" falls back to the processor by itself when no usable card is there.
     model = wrapper_factory(model_name=variant, device_str="cuda", half_precision=False,
-                            custom_weights=weights, custom_num_classes=len(idx_to_label))
+                            custom_weights=weights, custom_num_classes=num_classes)
     read = frame_reader or embed_mod.read_frames
 
     def classify(path: str):

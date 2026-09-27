@@ -58,6 +58,33 @@ def installed_round(project: Project) -> Optional[dict]:
     return None
 
 
+def installed_detector_files(project: Project) -> Optional[dict]:
+    """``{"round", "xml", "classes"}`` of the installed detector, or None.
+
+    Rounds record where they were installed. A round installed before that
+    was recorded is found where ``install`` puts every project's detector.
+    """
+    record = installed_round(project)
+    if record is None or project.task == ACTIONS:
+        return None
+    where = record.get("install") or {}
+    xml, classes = where.get("xml"), where.get("classes")
+    if not xml:
+        from modules.teach.project import slugify
+        from training.export_yolox import DEFAULT_DEST
+
+        name = f"teach_{slugify(project.name)}"
+        xml = os.path.join(os.path.abspath(DEFAULT_DEST), name, f"{name}.xml")
+    if not classes:
+        try:
+            with open(os.path.join(os.path.dirname(xml), "labels.json"),
+                      "r", encoding="utf-8") as handle:
+                classes = list(json.load(handle))
+        except (OSError, ValueError):
+            classes = []
+    return {"round": record.get("round"), "xml": xml, "classes": classes}
+
+
 def actions_command(dataset: str, run_dir: str, epochs: int) -> list:
     return [sys.executable, "-m", "model_training.r3d.train",
             "--data-path", dataset,
@@ -151,6 +178,11 @@ def train_round(project: Project, *, epochs: Optional[int] = None,
               "seconds": round(time.time() - started, 1), "epochs": epochs,
               "accepted": {c: len(project.accepted(c)) for c in project.class_names()},
               "metrics": metrics, "installed": False}
+    if project.task != ACTIONS:
+        # What this round learnt from, for sharing it later: counted now,
+        # because by then the project may have grown past it.
+        from modules.teach.share import measured
+        record.update(measured(project))
     incumbent = installed_round(project)
     better = is_better(metrics, incumbent["metrics"] if incumbent else None)
     record["better_than_installed"] = better

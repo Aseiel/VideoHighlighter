@@ -425,6 +425,7 @@ async def save_composition_rules(req: CompRulesRequest) -> dict:
     from modules.rules.rules_file import (
         TABLE_RULE_KEYS, carry_rule_fields, top_level_fields,
     )
+    from modules.rules.shapes import RELATIONS
     from modules.system.app_paths import composition_rules_path, user_data_dir
 
     try:
@@ -463,6 +464,11 @@ async def save_composition_rules(req: CompRulesRequest) -> dict:
             }
             # Written only when not the default, as the Qt table does.
             relation = str(row.get("relation") or "inside").strip().lower()
+            if relation not in RELATIONS:
+                # Refused before anything is written: the engine would
+                # reject the whole file on load.
+                return {"ok": False, "error": f"rule {name!r}: unknown relation "
+                        f"{relation!r} (one of {', '.join(RELATIONS)})"}
             if relation != "inside":
                 rule["relation"] = relation
             if row.get("outline"):

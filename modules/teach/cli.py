@@ -42,17 +42,17 @@ def make_detector():
 
 def round_detector(project):
     """The installed round's detector, to propose boxes from round 2 on."""
-    for record in reversed(project.rounds):
-        where = record.get("install") or {}
-        if record.get("installed") and where.get("xml") and os.path.exists(where["xml"]):
-            try:
-                from modules.vision.detection_backend import create_detector
-                return create_detector(where["xml"], where.get("classes") or [])
-            except Exception as exc:        # fall back to the stock detector alone
-                print(f"teach: round {record.get('round')} detector unusable: {exc}",
-                      file=sys.stderr)
-                return None
-    return None
+    from modules.teach.train import installed_detector_files
+
+    found = installed_detector_files(project)
+    if found is None or not os.path.exists(found["xml"]):
+        return None
+    try:
+        from modules.vision.detection_backend import create_detector
+        return create_detector(found["xml"], found["classes"])
+    except Exception as exc:        # fall back to the stock detector alone
+        print(f"teach: round {found['round']} detector unusable: {exc}", file=sys.stderr)
+        return None
 
 
 def resolve_root(value: str) -> str:
@@ -271,6 +271,12 @@ def cmd_boxes(args, project):
         return boxes.propose(project, make_detector(), make_embedder(),
                              model_detector=round_detector(project))
     if args.action == "review":
+        if args.window:
+            from modules.teach.review_window import open_window
+            open_window(project.root, size=args.size, boxes=True)
+            labels = boxes.store(Project.load(project.root))
+            return {"window": "closed", "accepted": len(labels.accepted()),
+                    "pending": len(labels.pending())}
         record = boxes.next_sheet(project, size=args.size)
         if record:
             record["how"] = (f"Look at {record['image']}. Then: boxes verdict --sheet "
@@ -527,6 +533,8 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--accept-rest", action="store_true", dest="accept_rest")
     s.add_argument("--accept-all", action="store_true", dest="accept_all",
                    help="import: the labeller's points are already checked")
+    s.add_argument("--window", action="store_true",
+                   help="review: by clicking, in a window, instead of a sheet image")
 
     sub.add_parser("build", help="write the dataset")
 
@@ -571,7 +579,22 @@ COMMANDS = {
 
 def run(argv=None) -> tuple:
     """``(exit code, result dict)``; what ``main`` prints."""
-    args = parser().parse_args(argv)
+    import io
+
+    complaint = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(complaint):
+            args = parser().parse_args(argv)
+    except SystemExit as exc:
+        if not exc.code:                    # --help: argparse printed it, as asked
+            sys.stderr.write(complaint.getvalue())
+            raise
+        # Bad arguments: an answer like any other, not an exit, so the panel
+        # and ``auto`` (which call this in-process) get told instead of dying.
+        lines = [ln for ln in complaint.getvalue().splitlines() if ln.strip()]
+        return 2, {"error": (lines[-1].split(" error: ", 1)[-1] if lines
+                            else "bad arguments"),
+                   "usage": "\n".join(lines[:-1])}
     root = resolve_root(args.project)
     try:
         with contextlib.redirect_stdout(sys.stderr):
