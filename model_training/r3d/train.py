@@ -78,6 +78,27 @@ from model_training.r3d.model import (
 )
 
 
+def _utf8_stdout() -> None:
+    """Let this module print its emoji on a non-UTF-8 console.
+
+    Called at import time rather than from main(): some of these prints happen
+    while the module is still loading, so a guard inside main() would run too
+    late. On a Windows console using a legacy codepage the first emoji raises
+    UnicodeEncodeError and kills the run before any training starts. Replacing
+    unencodable characters is the right trade - a mangled glyph in a log beats
+    a dead training run.
+    """
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_utf8_stdout()
+
+
+
 # =============================
 # R3D-specific dataset wrapper
 # =============================
@@ -310,6 +331,7 @@ def train_r3d(train_loader, val_loader, num_classes, label_to_idx, idx_to_label)
 # =============================
 # Main
 # =============================
+
 def main():
     parser = argparse.ArgumentParser(description="R3D 3D-CNN fine-tuning")
     parser.add_argument("--data-path", type=str, default=None)
@@ -324,6 +346,8 @@ def main():
     parser.add_argument("--no-onnx", action="store_true")
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable ROI cache (slow — runs the person detector every epoch)")
+    parser.add_argument("--device", type=str, default=None,
+                        help="cuda | xpu | cpu (default: best available)")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="DataLoader workers (default: 4)")
     parser.add_argument("--rebuild-cache", action="store_true",
@@ -332,15 +356,35 @@ def main():
                         help="Skip sample visualizations before training")
     parser.add_argument("--viz", action="store_true",
                         help="Create sample visualizations before training")
+    parser.add_argument("--model-save-path", type=str, default=None,
+                        help="Write the model here instead of models/actions/ "
+                             "(modules/teach trains each round into its own folder "
+                             "and installs it only if it beats the last)")
+    parser.add_argument("--checkpoint-dir", type=str, default=None)
+    parser.add_argument("--metrics-out", type=str, default=None,
+                        help="Write per-class validation accuracy here as JSON")
+    parser.add_argument("--keep-split", action="store_true",
+                        help="Use train/ and val/ exactly as given: never move clips "
+                             "between them (the caller chose the held-out set)")
     args = parser.parse_args()
 
     # Override config
     if args.data_path:
         CONFIG["data_path"] = args.data_path
+    if args.model_save_path:
+        CONFIG["model_save_path"] = os.path.abspath(args.model_save_path)
+        os.makedirs(os.path.dirname(CONFIG["model_save_path"]), exist_ok=True)
+    if args.checkpoint_dir:
+        CONFIG["checkpoint_dir"] = os.path.abspath(args.checkpoint_dir)
+    if args.keep_split:
+        CONFIG["min_val_ratio"] = 0.0
+        CONFIG["min_val_per_action"] = 1
     if args.model:
         CONFIG["model_variant"] = args.model
     if args.resume:
         CONFIG["checkpoint_path"] = args.resume
+    if args.device:
+        CONFIG["device"] = args.device
     if args.epochs:
         CONFIG["base_epochs"] = args.epochs
     if args.batch_size:
@@ -428,8 +472,8 @@ def main():
     # ==============================
     # DataLoaders
     # ==============================
-    # With cache: safe to use num_workers > 0 (no YOLO model in workers)
-    # Without cache: must use num_workers=0 (YOLO can't be pickled)
+    # With cache: safe to use num_workers > 0 (no YOLOX model in workers)
+    # Without cache: must use num_workers=0 (detector can't be pickled)
     nw = CONFIG.get("num_workers", 4) if roi_cache is not None else 0
     pin = CONFIG["device"] == "cuda"
     pf = CONFIG.get("prefetch_factor", 2) if nw > 0 else None
@@ -512,6 +556,24 @@ def main():
         )
 
     prod_path = CONFIG["model_save_path"].replace(".pth", "_production_mapping.json")
+
+    if args.metrics_out:
+        import json
+        per_class = {wrapped.idx_to_label[i]: float(per_class_acc.get(i, 0.0))
+                     for i in sorted(wrapped.idx_to_label)}
+        with open(args.metrics_out, "w", encoding="utf-8") as fh:
+            json.dump({
+                "per_class_accuracy": per_class,
+                # Mean over classes, not over clips: a rare class counts as
+                # much as a common one, so a model cannot look good by
+                # ignoring it.
+                "balanced_accuracy": (sum(per_class.values()) / len(per_class)
+                                      if per_class else 0.0),
+                "weights": CONFIG["model_save_path"],
+                "mapping": CONFIG["model_save_path"].replace(".pth", "_mapping.json"),
+                "val_clips": len(val_ds),
+                "train_clips": len(train_ds),
+            }, fh, indent=2)
 
     print(f"\n✅ Done!")
     print(f"  Weights:             {CONFIG['model_save_path']} ({len(wrapped.label_to_idx)} classes total)")

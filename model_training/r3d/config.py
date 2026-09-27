@@ -18,6 +18,22 @@ import torch
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _MODELS_DIR = os.path.join(_REPO_ROOT, "models", "actions")
 
+
+def _best_device() -> str:
+    """CUDA, else Intel XPU, else CPU — for training, not inference."""
+    try:
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
+    except Exception:
+        pass
+    return "cpu"
+
+
 CONFIG = {
     # --- paths ---
     "data_path": "dataset",
@@ -44,7 +60,14 @@ CONFIG = {
     "early_stopping_patience": 7,
     "min_delta": 0.001,
     "use_class_weights": True,
-    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    # CUDA first, then Intel XPU, then CPU. The XPU arm matters: on a machine
+    # with an Intel Arc and no NVIDIA card the old
+    # `cuda if available else cpu` silently chose CPU — and a 3D CNN over
+    # 16-frame clips on CPU is hours where the GPU takes minutes, with nothing
+    # in the output saying why. `modules.system.device_utils` is not used because its
+    # `pytorch_device` is deliberately "cpu" on Intel for the *inference*
+    # pipeline, which runs through OpenVINO; training is the other case.
+    "device": _best_device(),
 
     # --- backbone control ---
     "freeze_backbone": False,            # True = only train classifier head

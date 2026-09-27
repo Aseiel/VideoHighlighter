@@ -32,7 +32,7 @@ from .detection import (
     PoseExtractor,
     merge_boxes,
     crop_roi,
-    get_yolo_people_model,
+    get_yolox_people_model,
 )
 
 
@@ -103,10 +103,10 @@ def precompute_roi_cache(dataset, config, cache_path=None, pose_extractor=None):
             print(f"   ⚠️  Cache stale ({hits}/{len(sample_paths)} matched) — rebuilding")
 
     print(f"\n🔍 PRE-COMPUTING ROIs for {len(dataset.samples)} videos...")
-    print(f"   This runs YOLO + pose ONCE so training epochs are fast.")
+    print(f"   This runs YOLOX + optional pose ONCE so training epochs are fast.")
     print(f"   Cache: {cache_path}\n")
 
-    yolo_model = get_yolo_people_model()
+    yolox_model = get_yolox_people_model()
     cache = {}
 
     for video_path, _ in tqdm(dataset.samples, desc="Caching ROIs"):
@@ -151,7 +151,7 @@ def precompute_roi_cache(dataset, config, cache_path=None, pose_extractor=None):
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             tracked = action_det.detect_with_tracking(
-                frame_rgb, yolo_model, tracker,
+                frame_rgb, yolox_model, tracker,
                 max_people=config.get("max_action_people", 2),
             )
             people = (
@@ -271,7 +271,7 @@ def load_video_normalized(path, config, pose_extractor=None, is_training=True,
     crop_size = config["crop_size"]
     indices = compute_frame_indices(total_frames, config)
 
-    yolo_people = get_yolo_people_model()
+    yolox_people = get_yolox_people_model()
     action_detector = SmartActionDetector(debug=debug)
     adaptive_detector = AdaptiveActionDetector(
         motion_threshold=config.get("motion_threshold", 5.0), debug=debug
@@ -301,7 +301,7 @@ def load_video_normalized(path, config, pose_extractor=None, is_training=True,
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         tracked = action_detector.detect_with_tracking(
-            frame_rgb, yolo_people, person_tracker,
+            frame_rgb, yolox_people, person_tracker,
             max_people=config.get("max_action_people", 2),
         )
         people = (

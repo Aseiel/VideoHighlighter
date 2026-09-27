@@ -19,6 +19,7 @@ import torch
 # now lands in models/actions/, beside models/custom/ where the object
 # detectors go, and that is the first place the app looks for it.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ENCODER_DIR = os.path.join(_REPO_ROOT, "models", "intel_action", "encoder", "FP32")
 
 CONFIG = {
     # --- paths ---
@@ -29,8 +30,8 @@ CONFIG = {
     "checkpoint_path": None,           # set to resume, e.g. "checkpoints_intel/checkpoint_latest.pth"
 
     # --- encoder ---
-    "encoder_xml": os.path.join(os.getcwd(), "models/intel_action/encoder/FP32/action-recognition-0001-encoder.xml"),
-    "encoder_bin": os.path.join(os.getcwd(), "models/intel_action/encoder/FP32/action-recognition-0001-encoder.bin"),
+    "encoder_xml": os.path.join(_ENCODER_DIR, "action-recognition-0001-encoder.xml"),
+    "encoder_bin": os.path.join(_ENCODER_DIR, "action-recognition-0001-encoder.bin"),
 
     # --- input ---
     "sequence_length": 16,

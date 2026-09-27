@@ -18,7 +18,7 @@ from .detection import (
     SmoothedROIDetector,
     PoseExtractor,
     merge_boxes,
-    get_yolo_people_model,
+    get_yolox_people_model,
 )
 
 
@@ -39,7 +39,7 @@ def visualize_training_sample(video_path, label, pose_extractor,
     print(f"   Label: {label} | sample_rate: {sample_rate}")
 
     adaptive_detector.debug = debug
-    yolo_people = get_yolo_people_model()
+    yolox_people = get_yolox_people_model()
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -99,7 +99,7 @@ def visualize_training_sample(video_path, label, pose_extractor,
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                 last_tracked = action_det.detect_with_tracking(
-                    frame_rgb, yolo_people, tracker, max_people=2
+                    frame_rgb, yolox_people, tracker, max_people=2
                 )
                 boxes = (
                     [b for _, b in last_tracked]
@@ -210,6 +210,8 @@ def create_sample_visualizations(dataset, pose_extractor, num_samples=2,
 # ---- helper ----
 def _match_poses(frame_rgb, boxes, pose_extractor, max_poses=2):
     """Match detected poses to person boxes."""
+    if pose_extractor is None or getattr(pose_extractor, "model", None) is None:
+        return []
     results = pose_extractor.model.predict(frame_rgb, conf=0.3, verbose=False)
     if not results or results[0].keypoints is None:
         return []
