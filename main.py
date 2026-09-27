@@ -2880,13 +2880,14 @@ class VideoHighlighterGUI(QWidget):
         self.backend_combo.setToolTip(
             "Which accelerator the run should use.\n\n"
             "Automatic takes the fastest this machine has: CUDA, then Intel,\n"
-            "then DirectML, then the processor. Naming one instead is how you\n"
+            "then Apple or DirectML, then the processor. Naming one instead is how you\n"
             "measure it against that choice \u2014 DirectML on an Intel card, say.\n\n"
             "A backend this machine does not have falls back to automatic and\n"
             "says so in the log, and every run reports the one it got.\n\n"
             "DirectML drives object detection and action recognition in\n"
             "every build; the rest of it needs a source install \u2014\n"
-            "see docs/AMD-GPU.md."
+            "see docs/AMD-GPU.md. On a Mac, Apple GPU (Core ML) moves the\n"
+            "same two to the GPU / Neural Engine (experimental)."
         )
         _saved_backend = (compute_backend.from_config(self.config_data)
                           or compute_backend.configured()

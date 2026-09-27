@@ -35,6 +35,7 @@ class TestNamingABackend:
         ("intel", "intel"), ("OpenVINO", "intel"), ("xpu", "intel"),
         ("arc", "intel"),
         ("directml", "directml"), ("dml", "directml"), ("AMD", "directml"),
+        ("apple", "apple"), ("Metal", "apple"), ("coreml", "apple"), ("mps", "apple"),
         ("cpu", "cpu"), ("processor", "cpu"),
         ("auto", "auto"), ("", "auto"), ("  Automatic ", "auto"),
     ])
@@ -43,14 +44,14 @@ class TestNamingABackend:
         typing "nvidia" into a config file is not making a mistake."""
         assert backend.normalise(written) == expected
 
-    @pytest.mark.parametrize("written", [None, "metal", "rocm", "fastest"])
+    @pytest.mark.parametrize("written", [None, "rocm", "fastest"])
     def test_a_backend_this_app_does_not_have(self, written):
         assert backend.normalise(written) is None
 
     def test_every_choice_is_offered_once(self):
         offered = [name for name, _ in backend.CHOICES]
 
-        assert offered == ["auto", "cuda", "intel", "directml", "cpu"]
+        assert offered == ["auto", "cuda", "intel", "directml", "apple", "cpu"]
 
     def test_the_labels_name_hardware_first(self):
         """"OpenVINO" is an implementation detail of the Intel path; the person
@@ -60,6 +61,7 @@ class TestNamingABackend:
         assert "NVIDIA" in labels["cuda"]
         assert "Intel" in labels["intel"]
         assert "AMD" in labels["directml"]
+        assert "Apple" in labels["apple"]
 
 
 class TestReadingTheSetting:

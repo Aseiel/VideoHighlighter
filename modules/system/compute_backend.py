@@ -36,6 +36,7 @@ AUTO = "auto"
 CUDA = "cuda"
 INTEL = "intel"
 DIRECTML = "directml"
+APPLE = "apple"
 CPU = "cpu"
 
 # What the settings screen offers, in the order it offers them. Each label names
@@ -47,6 +48,7 @@ CHOICES = (
     (CUDA, "NVIDIA (CUDA)"),
     (INTEL, "Intel (OpenVINO)"),
     (DIRECTML, "AMD / any DX12 card (DirectML)"),
+    (APPLE, "Apple GPU (Core ML)"),
     (CPU, "Processor only"),
 )
 
@@ -58,6 +60,7 @@ _ALIASES = {
     "cuda": CUDA, "nvidia": CUDA, "gpu": CUDA,
     "intel": INTEL, "openvino": INTEL, "ov": INTEL, "xpu": INTEL, "arc": INTEL,
     "directml": DIRECTML, "dml": DIRECTML, "amd": DIRECTML, "dx12": DIRECTML,
+    "apple": APPLE, "mac": APPLE, "coreml": APPLE, "metal": APPLE, "mps": APPLE,
     "cpu": CPU, "processor": CPU, "none": CPU,
 }
 
@@ -130,7 +133,7 @@ def _publish(backend: str, log, note: str) -> str:
     if backend == DIRECTML:
         directml_device.set_mode(directml_device.MODE_FORCE)
         os.environ[directml_device.MODE_ENV] = directml_device.MODE_FORCE
-    elif backend in (CUDA, INTEL, CPU):
+    elif backend in (CUDA, INTEL, APPLE, CPU):
         directml_device.set_mode(directml_device.MODE_OFF)
         os.environ[directml_device.MODE_ENV] = directml_device.MODE_OFF
     else:

@@ -102,7 +102,7 @@ Portable builds, GPU setup, where it writes, and fixing an oversized UI:
 | [Installing](docs/INSTALL.md) | Every platform, GPU backends, settings |
 | [Training a model](docs/CUSTOM-MODEL-TRAINING.md) | Label your own class and train it |
 | [Community models](docs/COMMUNITY-MODELS.md) | Install models other people trained, publish your own |
-| [Intel GPU](docs/INTEL-GPU.md) · [AMD GPU](docs/AMD-GPU.md) | Vendor-specific acceleration |
+| [Intel GPU](docs/INTEL-GPU.md) · [AMD GPU](docs/AMD-GPU.md) · [Apple GPU](docs/MAC-GPU.md) | Vendor-specific acceleration |
 | [Remote ollama](docs/OLLAMA-REMOTE.md) | Run the local LLM on another box on your LAN |
 
 ## Pro edition
