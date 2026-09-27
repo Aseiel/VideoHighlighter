@@ -30,20 +30,35 @@ ORT build would buy nothing and break the one that matters.
 
 The user's switch is shared with the torch backend: ``VH_DIRECTML=off`` turns
 off DirectML, whichever runtime would have provided it.
+
+On macOS the same probe and factory hand out Apple's Core ML provider instead
+(:mod:`modules.system.ort_coreml`), which runs a model on the Apple GPU or
+Neural Engine. The plain ``onnxruntime`` wheel carries it there, the models and
+their pre- and post-processing are the same, and so is every caller: "can ONNX
+Runtime reach the GPU here" has one answer per platform, and this module gives
+it. ``VH_COREML=off`` is the Mac's switch.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional, Sequence
 
 from modules.system import directml_device as _dml
+from modules.system import ort_coreml as _coreml
 
 # ORT's name for the provider. A literal here is fine — unlike torch's backend
 # name, this string is part of ONNX Runtime's public API and is what
 # get_available_providers() returns.
 PROVIDER = "DmlExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
+COREML_PROVIDER = _coreml.PROVIDER
+
+# Every provider that means "the model is on a GPU", whichever platform put it
+# there. What a live session got is compared against this, never against one
+# name, so a Mac's Core ML session counts as the GPU it is.
+GPU_PROVIDERS = (PROVIDER, COREML_PROVIDER)
 
 # Adapter index, for a machine with more than one DX12 card. Shares the numbering
 # DirectML itself uses, so `tools/check_directml.py` output applies here too.
@@ -60,13 +75,16 @@ class ProviderProbe:
     without DirectML" are the same outcome and completely different problems.
     """
 
-    __slots__ = ("available", "reason", "version", "providers")
+    __slots__ = ("available", "reason", "version", "providers", "provider")
 
-    def __init__(self, available=False, reason=None, version=None, providers=()):
+    def __init__(self, available=False, reason=None, version=None, providers=(),
+                 provider=None):
         self.available = available
         self.reason = reason
         self.version = version
         self.providers = tuple(providers)
+        # The GPU provider this probe was about: DirectML, or Core ML on a Mac.
+        self.provider = provider
 
     def __repr__(self):  # pragma: no cover - diagnostics only
         state = "available" if self.available else f"unavailable ({self.reason})"
@@ -79,6 +97,20 @@ def _import_onnxruntime():
     touch it."""
     import onnxruntime  # noqa: PLC0415 - deliberate, see docstring
     return onnxruntime
+
+
+def gpu_provider() -> str:
+    """The GPU provider ONNX Runtime can offer on this platform.
+
+    One per platform, because each platform's wheel carries exactly one:
+    ``onnxruntime-directml`` on Windows, the plain wheel with Core ML on macOS.
+    """
+    return COREML_PROVIDER if sys.platform == "darwin" else PROVIDER
+
+
+def is_gpu_provider(name) -> bool:
+    """True when a session that got provider ``name`` runs on a GPU."""
+    return name in GPU_PROVIDERS
 
 
 def device_id() -> int:
@@ -100,17 +132,27 @@ def probe(refresh: bool = False) -> ProviderProbe:
     if _probe_cache is not None and not refresh:
         return _probe_cache
 
+    wanted = gpu_provider()
+
     # One switch for both DirectML runtimes: a user who turned DirectML off
-    # means off, not "off for torch and on for ONNX".
-    if not _dml.enabled():
-        _probe_cache = ProviderProbe(reason=f"disabled ({_dml.MODE_ENV}=off)")
+    # means off, not "off for torch and on for ONNX". The Mac has its own,
+    # because DirectML's switch saying "off" there would be about nothing.
+    if wanted == COREML_PROVIDER:
+        if not _coreml.enabled():
+            _probe_cache = ProviderProbe(
+                reason=f"disabled ({_coreml.MODE_ENV}=off)", provider=wanted)
+            return _probe_cache
+    elif not _dml.enabled():
+        _probe_cache = ProviderProbe(reason=f"disabled ({_dml.MODE_ENV}=off)",
+                                     provider=wanted)
         return _probe_cache
 
     try:
         ort = _import_onnxruntime()
     except Exception as e:  # noqa: BLE001 - a missing package is a normal answer
         _probe_cache = ProviderProbe(
-            reason=f"onnxruntime is not installed ({type(e).__name__}: {e})")
+            reason=f"onnxruntime is not installed ({type(e).__name__}: {e})",
+            provider=wanted)
         return _probe_cache
 
     version = getattr(ort, "__version__", None)
@@ -119,21 +161,25 @@ def probe(refresh: bool = False) -> ProviderProbe:
     except Exception as e:  # noqa: BLE001
         _probe_cache = ProviderProbe(
             reason=f"onnxruntime could not list its providers ({e})",
-            version=version)
+            version=version, provider=wanted)
         return _probe_cache
 
-    if PROVIDER not in providers:
+    if wanted not in providers:
         # The plain `onnxruntime` wheel reports CPU only. Saying which build is
         # installed is the difference between a fixable message and a shrug.
-        _probe_cache = ProviderProbe(
-            reason=("this onnxruntime build has no DirectML provider "
-                    f"(has: {', '.join(providers) or 'none'}) — "
-                    "onnxruntime-directml is the one that does"),
-            version=version, providers=providers)
+        if wanted == COREML_PROVIDER:
+            reason = ("this onnxruntime build has no Core ML provider "
+                      f"(has: {', '.join(providers) or 'none'})")
+        else:
+            reason = ("this onnxruntime build has no DirectML provider "
+                      f"(has: {', '.join(providers) or 'none'}) — "
+                      "onnxruntime-directml is the one that does")
+        _probe_cache = ProviderProbe(reason=reason, version=version,
+                                     providers=providers, provider=wanted)
         return _probe_cache
 
     _probe_cache = ProviderProbe(available=True, version=version,
-                                 providers=providers)
+                                 providers=providers, provider=wanted)
     return _probe_cache
 
 
@@ -151,12 +197,15 @@ def unavailable_reason() -> Optional[str]:
 def providers() -> Sequence:
     """The provider list to hand :func:`session`, best first.
 
-    Always ends in CPU. A DirectML session that cannot place one operator falls
-    back per-node rather than failing the run, which is the behaviour worth
-    having on a backend with partial operator coverage.
+    Always ends in CPU. A DirectML or Core ML session that cannot place one
+    operator falls back per-node rather than failing the run, which is the
+    behaviour worth having on a backend with partial operator coverage.
     """
-    if not available():
+    p = probe()
+    if not p.available:
         return [CPU_PROVIDER]
+    if p.provider == COREML_PROVIDER:
+        return [(COREML_PROVIDER, _coreml.provider_options()), CPU_PROVIDER]
     return [(PROVIDER, {"device_id": device_id()}), CPU_PROVIDER]
 
 

@@ -16,6 +16,8 @@ and it checks what hurt the tester, in the frozen binary itself:
 * object detection runs its workers, and the whole process tree stays under a
   memory ceiling — past it the tree is killed, so a runaway fails the job
   instead of the runner;
+* where ONNX Runtime has the GPU (Core ML on a Mac), the stock detector loads
+  there and answers a frame;
 * the thumbnail decoder child starts and answers;
 * a child does not rotate the parent's debug.log away.
 
@@ -214,6 +216,42 @@ def main(argv) -> int:
                                f"{len(objects)} seconds with objects")
     except BaseException as e:
         check("object detection ran its workers", False,
+              watch.tripped or f"{type(e).__name__}: {e}")
+
+    # The accelerator this machine got, in the report either way. Where it is
+    # ONNX Runtime's GPU provider — Core ML, on a Mac — nobody on the project
+    # has the hardware to try it, so the stock detector has to load there and
+    # answer a frame. The run itself would fall back to OpenVINO quietly, which
+    # is right for a user and useless for finding out whether it works.
+    try:
+        from modules.system.device_utils import detect_best_device
+        dev = detect_best_device(log_fn=print)
+        report["backend"] = dev.backend_name
+        if getattr(dev, "onnx_dml_yolo", False):
+            import cv2
+            import object_recognition
+            from modules.system import ort_directml
+            capture = cv2.VideoCapture(video)
+            try:
+                got, frame = capture.read()
+            finally:
+                capture.release()
+            detector = object_recognition.directml_detector("small", log=print)
+            if detector is None or not got:
+                check("GPU detector answers", False,
+                      "the ONNX Runtime detector did not load" if detector is None
+                      else "no frame to give it")
+            else:
+                started = time.perf_counter()
+                found = detector.detect(frame)
+                ms = (time.perf_counter() - started) * 1000
+                provider = ort_directml.session_backend(detector._session)
+                check("GPU detector answers",
+                      ort_directml.is_gpu_provider(provider) and not watch.tripped,
+                      watch.tripped or f"{dev.backend_name}: {provider}, "
+                                       f"{len(found)} boxes, first frame {ms:.0f} ms")
+    except BaseException as e:
+        check("GPU detector answers", False,
               watch.tripped or f"{type(e).__name__}: {e}")
 
     try:

@@ -12,6 +12,8 @@ One source of truth for all device strings passed to:
 
 import os
 import re
+import subprocess
+import sys
 
 from modules.system import cuda_check
 
@@ -166,6 +168,12 @@ def _any_directml_info(log_fn=print):
     torch's first because it drives more models; ONNX Runtime's second because
     it is the only one a packaged build can carry.
     """
+    # DirectML is Windows' (and WSL's). On a Mac its "unavailable" line would
+    # explain a CUDA torch the mac build does not ship, about an API the Mac
+    # does not have — noise in exactly the log a Mac tester sends back.
+    if sys.platform == "darwin":
+        return None
+
     if _dml is not None:
         info = _directml_info(log_fn)
         if info is not None:
@@ -184,6 +192,75 @@ def _any_directml_info(log_fn=print):
         if reason and _dml.enabled():
             log_fn(f"ℹ️ DirectML unavailable: {reason}")
     return None
+
+
+def _apple_chip_name():
+    """"Apple M2 Pro" and the like, or None. The chip is the GPU's name too:
+    on Apple silicon the GPU is part of it."""
+    try:
+        out = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                             capture_output=True, text=True, timeout=5)
+        name = " ".join((out.stdout or "").split())
+        return name or None
+    except Exception:  # noqa: BLE001 - a name is a nicety
+        return None
+
+
+def _mps_available() -> bool:
+    """True when torch can reach the Apple GPU through Metal (MPS)."""
+    if not _TORCH_AVAILABLE:
+        return False
+    try:
+        return bool(torch.backends.mps.is_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _apple_info(log_fn=print):
+    """DeviceInfo for a Mac whose GPU ONNX Runtime can reach through Core ML,
+    or None.
+
+    The same two models move as on the packaged DirectML build, through the
+    same flags and the same code: YOLOX detection (`onnx_dml_yolo`) and R3D
+    action recognition (`onnx_dml_torch`), both on ONNX Runtime, which on macOS
+    hands out Core ML instead of DirectML (`modules/system/ort_coreml.py`).
+    The flag names predate the Mac; read them as "ONNX Runtime has the GPU".
+
+    `pytorch_device` stays "cpu". torch on a Mac can reach the GPU too, through
+    Metal (MPS), and it is named in the log when it can — but no torch consumer
+    here is taught "mps" yet, and saying the device is there while every model
+    runs on the processor is exactly what this line would otherwise be.
+
+    OpenVINO stays on "CPU": macOS has no OpenVINO GPU plugin.
+    """
+    if sys.platform != "darwin" or _ort_dml is None:
+        return None
+    probe = _ort_dml.probe()
+    if probe.provider != _ort_dml.COREML_PROVIDER:
+        return None
+    if not probe.available:
+        log_fn(f"ℹ️ Apple GPU not used: {probe.reason}")
+        return None
+    from modules.system import ort_coreml
+    log_fn(f"✅ Apple GPU via Core ML (ONNX Runtime {probe.version or '?'}) — "
+           f"{_apple_chip_name() or 'Apple silicon'}")
+    log_fn(f"   object detection and action recognition on the "
+           f"{ort_coreml.describe_units()} (experimental; {ort_coreml.MODE_ENV}=off "
+           f"turns it off); other models stay on the CPU")
+    if _mps_available():
+        log_fn("   torch also sees the GPU through Metal (MPS); nothing uses it yet")
+    return DeviceInfo(
+        yolo_pt_device="cpu",
+        yolo_ov_device="cpu",
+        openvino_device="CPU",
+        pytorch_device="cpu",
+        motion_device="cpu",
+        use_openvino_yolo=True,
+        gpu_available=True,
+        onnx_dml_yolo=True,
+        onnx_dml_torch=True,
+        backend_name="Apple GPU (Core ML)",
+    )
 
 
 def _cpu_info(log_fn=print, note="ℹ️ No GPU found — using CPU"):
@@ -209,8 +286,18 @@ _BACKEND_PROBES = {
     "intel": (lambda log_fn: _xpu_info(log_fn) or _openvino_info(log_fn),
               "Intel GPU"),
     "directml": (lambda log_fn: _any_directml_info(log_fn), "DirectML"),
+    "apple": (lambda log_fn: _apple_info(log_fn), "Apple GPU (Core ML)"),
     "cpu": (lambda log_fn: _cpu_info(log_fn, "ℹ️ Processor, by choice"), "CPU"),
 }
+
+
+def _offered_here(backend) -> bool:
+    """Whether the settings screen offers ``backend`` on this platform."""
+    try:
+        from modules.system import compute_backend
+        return compute_backend.offered(backend)
+    except Exception:  # noqa: BLE001 - a missing module offers everything
+        return True
 
 
 def detect_best_device(log_fn=print, prefer=None):
@@ -220,11 +307,14 @@ def detect_best_device(log_fn=print, prefer=None):
 
     Priority: CUDA > Intel XPU > Intel/OpenVINO > DirectML (AMD) > CPU
 
+    On a Mac the order is Apple (Core ML) > CPU and nothing else is asked:
+    the other backends do not exist on macOS, and Apple exists nowhere else.
+
     DirectML sits last on purpose. It is the slowest of the accelerated paths
     and has the narrowest operator coverage, so it is worth having only where
     the alternative is the CPU — which on an AMD box is exactly the situation.
 
-    ``prefer`` — "cuda", "intel", "directml", "cpu", or None for the order
+    ``prefer`` — "cuda", "intel", "directml", "apple", "cpu", or None for the order
     above — is the user's choice from the settings screen, read from the
     environment when not passed. A backend that is not available here logs why
     and falls back to the automatic order rather than failing the run: a
@@ -248,6 +338,9 @@ def detect_best_device(log_fn=print, prefer=None):
         probe = _BACKEND_PROBES.get(chosen)
         if probe is None:
             log_fn(f"⚠️ Unknown compute backend {chosen!r} — using automatic")
+        elif not _offered_here(chosen):
+            log_fn(f"⚠️ {probe[1]} does not exist on this platform — "
+                   f"using automatic")
         else:
             run, label = probe
             info = run(log_fn)
@@ -255,6 +348,12 @@ def detect_best_device(log_fn=print, prefer=None):
                 return info
             log_fn(f"⚠️ {label} was chosen but is not available here — "
                    f"falling back to automatic")
+
+    # ---- A Mac: Apple's GPU or the processor, nothing else ---------------------
+    # CUDA, Intel's GPU plugin and DirectML do not exist on macOS, so asking
+    # them only adds lines to the log a Mac tester sends back.
+    if sys.platform == "darwin":
+        return _apple_info(log_fn) or _cpu_info(log_fn)
 
     # `VH_DIRECTML=force` predates the backend setting and still means the same
     # thing, so it keeps working for anyone with it in a script.
@@ -371,6 +470,9 @@ def _onnx_dml_info(log_fn=print):
     `modules/system/encoder_select.py` reads the backend name to prefer the AMF video
     encoders on an AMD box.
     """
+    # On a Mac the same probe answers for Core ML, which is _apple_info's.
+    if sys.platform == "darwin":
+        return None
     if _ort_dml is None or not _ort_dml.available():
         return None
     probe = _ort_dml.probe()
@@ -541,6 +643,20 @@ def describe_devices() -> list:
                 note(device, "OpenVINO")
     except Exception as e:
         _warn(f"OpenVINO device listing failed: {e}")
+
+    # Apple silicon. Neither torch's CUDA/XPU nor OpenVINO sees this GPU, so
+    # without these a Mac answers "no GPU found" — the same trap the DirectML
+    # block below exists for.
+    if sys.platform == "darwin":
+        chip = _apple_chip_name() or "Apple silicon"
+        gpu = f"{chip} GPU"
+        if _mps_available():
+            note(gpu, "PyTorch MPS (Metal)")
+        try:
+            if _ort_dml is not None and _ort_dml.available():
+                note(gpu, "Core ML (ONNX Runtime)")
+        except Exception as e:  # noqa: BLE001
+            _warn(f"Core ML probe failed: {e}")
 
     # DirectML last. It is the one runtime here that can name an AMD card, so
     # without it an AMD box answers this question with an empty list and the

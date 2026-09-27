@@ -14,6 +14,11 @@ torch
 # onnxruntime here: `onnxruntime` and `onnxruntime-gpu` install the same package
 # and would overwrite it.
 onnxruntime-directml; sys_platform == "win32"
+# The Mac's counterpart: the plain wheel carries Apple's Core ML provider, which
+# runs the same two ONNX models on the Apple GPU / Neural Engine (MIT; see
+# modules/system/ort_coreml.py). 1.20 is where the provider takes the named
+# options that file passes. Again the only onnxruntime on its platform.
+onnxruntime>=1.20; sys_platform == "darwin"
 pyyaml
 psutil  # memory readouts, and the --smoke-test process-tree watch (BSD-3)
 opencv-python>=4.7  # FaceDetectorYN (YuNet) + FaceRecognizerSF (SFace) need >=4.5.4
