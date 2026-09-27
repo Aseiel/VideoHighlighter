@@ -53,6 +53,26 @@ class TestNamingABackend:
 
         assert offered == ["auto", "cuda", "intel", "directml", "apple", "cpu"]
 
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    def test_a_pc_is_not_offered_the_mac_backend(self, platform):
+        offered = [name for name, _ in backend.choices(platform)]
+
+        assert offered == ["auto", "cuda", "intel", "directml", "cpu"]
+
+    def test_a_mac_is_offered_only_what_a_mac_has(self):
+        offered = [name for name, _ in backend.choices("darwin")]
+
+        assert offered == ["auto", "apple", "cpu"]
+
+    @pytest.mark.parametrize("name, platform, ok", [
+        ("apple", "darwin", True), ("metal", "darwin", True),
+        ("cuda", "darwin", False), ("directml", "darwin", False),
+        ("intel", "darwin", False), ("cpu", "darwin", True),
+        ("apple", "win32", False), ("cuda", "win32", True), ("nonsense", "win32", False),
+    ])
+    def test_what_can_be_chosen_where(self, name, platform, ok):
+        assert backend.offered(name, platform) is ok
+
     def test_the_labels_name_hardware_first(self):
         """"OpenVINO" is an implementation detail of the Intel path; the person
         choosing knows which card is in their machine."""
@@ -62,6 +82,31 @@ class TestNamingABackend:
         assert "Intel" in labels["intel"]
         assert "AMD" in labels["directml"]
         assert "Apple" in labels["apple"]
+
+
+class TestASettingFromAnotherPlatform:
+    def test_a_pc_backend_in_a_macs_config_is_not_published(self, monkeypatch):
+        """A config copied from a PC. The Mac's settings screen cannot show
+        "cuda", so a run choosing it would be choosing something invisible."""
+        monkeypatch.setattr(backend.sys, "platform", "darwin")
+        lines = []
+
+        got = backend.apply({"compute": {"backend": "cuda"}}, log=lines.append)
+
+        assert got is None
+        assert backend.ENV_VAR not in backend.os.environ
+        assert any("does not exist on this platform" in line for line in lines)
+
+    def test_the_mac_backend_cannot_be_set_on_a_pc(self, monkeypatch):
+        monkeypatch.setattr(backend.sys, "platform", "win32")
+
+        assert backend.set_now("apple", log=lambda *_: None) is None
+        assert backend.ENV_VAR not in backend.os.environ
+
+    def test_a_mac_can_choose_its_own(self, monkeypatch):
+        monkeypatch.setattr(backend.sys, "platform", "darwin")
+
+        assert backend.set_now("apple", log=lambda *_: None) == "apple"
 
 
 class TestReadingTheSetting:

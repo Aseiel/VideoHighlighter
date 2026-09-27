@@ -119,6 +119,23 @@ class TestTheProbeOnAMac:
 
 
 class TestEverywhereElseNothingChanged:
+    def test_the_mac_backend_asked_for_on_a_pc_is_not_tried(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(device_utils, "_TORCH_AVAILABLE", False)
+        monkeypatch.setattr(device_utils, "_dml", None)
+        monkeypatch.setattr(device_utils, "_ort_dml", None)
+        monkeypatch.setattr(device_utils, "_openvino_info", lambda log_fn=print: None)
+        tried = []
+        monkeypatch.setattr(device_utils, "_apple_info",
+                            lambda log_fn=print: tried.append("apple"))
+        lines = []
+
+        info = device_utils.detect_best_device(log_fn=lines.append, prefer="apple")
+
+        assert info.backend_name == "CPU"
+        assert tried == []
+        assert any("does not exist on this platform" in line for line in lines)
+
     def test_windows_still_asks_for_directml(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.setitem(sys.modules, "onnxruntime",
@@ -228,6 +245,37 @@ class TestTheDeviceProbeOnAMac:
         info = device_utils.detect_best_device(log_fn=lambda *_: None, prefer="apple")
 
         assert info.backend_name == "Apple GPU (Core ML)"
+
+    @pytest.mark.parametrize("pc_backend", ["cuda", "intel", "directml"])
+    def test_a_pc_backend_asked_for_on_a_mac_is_not_tried(self, monkeypatch,
+                                                         pc_backend):
+        _mac(monkeypatch)
+        tried = []
+        monkeypatch.setattr(device_utils, "_cuda_info",
+                            lambda log_fn=print: tried.append("cuda"))
+        monkeypatch.setattr(device_utils, "_xpu_info",
+                            lambda log_fn=print: tried.append("xpu"))
+        lines = []
+
+        info = device_utils.detect_best_device(log_fn=lines.append,
+                                               prefer=pc_backend)
+
+        assert info.backend_name == "Apple GPU (Core ML)"
+        assert tried == []
+        assert any("does not exist on this platform" in line for line in lines)
+
+    def test_automatic_on_a_mac_asks_nothing_but_apple(self, monkeypatch):
+        _mac(monkeypatch, providers=(CPU,))
+        tried = []
+        for probe in ("_cuda_info", "_xpu_info", "_openvino_info",
+                      "_any_directml_info"):
+            monkeypatch.setattr(device_utils, probe,
+                                lambda log_fn=print, _n=probe: tried.append(_n))
+
+        info = device_utils.detect_best_device(log_fn=lambda *_: None)
+
+        assert info.backend_name == "CPU"
+        assert tried == []
 
     def test_the_gpu_is_listed_by_name(self, monkeypatch):
         _mac(monkeypatch)

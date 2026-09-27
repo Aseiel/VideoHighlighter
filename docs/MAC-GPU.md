@@ -32,8 +32,9 @@ The log at the start of a run says what was found:
 ✅ Object detector: YOLOX on CoreMLExecutionProvider (yolox_s.onnx)
 ```
 
-**Settings → Compute** picks it by name ("Apple GPU (Core ML)") or turns it off
-("Processor only"), which is how to time a run with and without it.
+**Settings → Compute** on a Mac lists only Automatic, "Apple GPU (Core ML)" and
+"Processor only" — the PC backends do not exist on macOS. "Processor only" is
+how to time a run with and without Core ML.
 
 ## Switches (environment variables)
 

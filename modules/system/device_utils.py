@@ -291,14 +291,24 @@ _BACKEND_PROBES = {
 }
 
 
+def _offered_here(backend) -> bool:
+    """Whether the settings screen offers ``backend`` on this platform."""
+    try:
+        from modules.system import compute_backend
+        return compute_backend.offered(backend)
+    except Exception:  # noqa: BLE001 - a missing module offers everything
+        return True
+
+
 def detect_best_device(log_fn=print, prefer=None):
     """
     Detect the best available hardware and return a DeviceInfo with
     pre-resolved device strings for every consumer in the pipeline.
 
-    Priority: CUDA > Intel XPU > Intel/OpenVINO > Apple (Core ML) > DirectML (AMD) > CPU
+    Priority: CUDA > Intel XPU > Intel/OpenVINO > DirectML (AMD) > CPU
 
-    Apple and DirectML never compete: one is macOS-only, the other Windows'.
+    On a Mac the order is Apple (Core ML) > CPU and nothing else is asked:
+    the other backends do not exist on macOS, and Apple exists nowhere else.
 
     DirectML sits last on purpose. It is the slowest of the accelerated paths
     and has the narrowest operator coverage, so it is worth having only where
@@ -328,6 +338,9 @@ def detect_best_device(log_fn=print, prefer=None):
         probe = _BACKEND_PROBES.get(chosen)
         if probe is None:
             log_fn(f"⚠️ Unknown compute backend {chosen!r} — using automatic")
+        elif not _offered_here(chosen):
+            log_fn(f"⚠️ {probe[1]} does not exist on this platform — "
+                   f"using automatic")
         else:
             run, label = probe
             info = run(log_fn)
@@ -335,6 +348,12 @@ def detect_best_device(log_fn=print, prefer=None):
                 return info
             log_fn(f"⚠️ {label} was chosen but is not available here — "
                    f"falling back to automatic")
+
+    # ---- A Mac: Apple's GPU or the processor, nothing else ---------------------
+    # CUDA, Intel's GPU plugin and DirectML do not exist on macOS, so asking
+    # them only adds lines to the log a Mac tester sends back.
+    if sys.platform == "darwin":
+        return _apple_info(log_fn) or _cpu_info(log_fn)
 
     # `VH_DIRECTML=force` predates the backend setting and still means the same
     # thing, so it keeps working for anyone with it in a script.
@@ -352,11 +371,6 @@ def detect_best_device(log_fn=print, prefer=None):
 
     # ---- Intel, through torch's XPU build or through OpenVINO ---------------
     info = _xpu_info(log_fn) or _openvino_info(log_fn)
-    if info is not None:
-        return info
-
-    # ---- Apple silicon, through ONNX Runtime's Core ML provider --------------
-    info = _apple_info(log_fn)
     if info is not None:
         return info
 

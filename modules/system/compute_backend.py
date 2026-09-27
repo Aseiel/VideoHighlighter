@@ -24,6 +24,7 @@ rather than a run that refuses to start.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional
 
 from modules.system import directml_device
@@ -39,7 +40,8 @@ DIRECTML = "directml"
 APPLE = "apple"
 CPU = "cpu"
 
-# What the settings screen offers, in the order it offers them. Each label names
+# Every backend the app knows, in the order the settings screen lists them —
+# which of them it lists depends on the platform, see `choices()`. Each label names
 # the hardware first, because that is what somebody choosing knows about their
 # own machine — "OpenVINO" is an implementation detail of the Intel path, and
 # which of the two Intel paths answers depends on how torch was built.
@@ -63,6 +65,29 @@ _ALIASES = {
     "apple": APPLE, "mac": APPLE, "coreml": APPLE, "metal": APPLE, "mps": APPLE,
     "cpu": CPU, "processor": CPU, "none": CPU,
 }
+
+
+# A Mac has one accelerator and a PC never has it: CUDA, Intel's GPU plugin and
+# DirectML do not exist on macOS, and Core ML exists nowhere else. Offering the
+# others anyway is a menu of choices that can only fall back.
+_MAC_ONLY = (APPLE,)
+_NOT_ON_MAC = (CUDA, INTEL, DIRECTML)
+
+
+def choices(platform: Optional[str] = None) -> tuple:
+    """The (backend, label) pairs this platform can use, in display order.
+
+    ``platform`` is a ``sys.platform`` value; the running one when omitted.
+    """
+    platform = platform or sys.platform
+    skip = _NOT_ON_MAC if platform == "darwin" else _MAC_ONLY
+    return tuple((name, label) for name, label in CHOICES if name not in skip)
+
+
+def offered(backend, platform: Optional[str] = None) -> bool:
+    """True when ``backend`` can be chosen on this platform."""
+    name = normalise(backend)
+    return name is not None and name in dict(choices(platform))
 
 
 def normalise(value) -> Optional[str]:
@@ -108,6 +133,13 @@ def apply(config: dict | None, log=print) -> Optional[str]:
     backend = from_config(config)
     if backend is None:
         return None
+    if not offered(backend):
+        # A config carried over from another kind of machine — "cuda" from a
+        # PC on a Mac. The settings screen cannot show it, so publishing it
+        # would leave a run choosing something the user cannot see.
+        log(f"ℹ️ Compute backend {label_for(backend)!r} from the settings does "
+            f"not exist on this platform — using automatic")
+        return None
     return _publish(backend, log, note="")
 
 
@@ -119,7 +151,7 @@ def set_now(value, log=print) -> Optional[str]:
     makes the change visible to anything that already asked in this process.
     """
     backend = normalise(value)
-    if backend is None:
+    if backend is None or not offered(backend):
         return None
     return _publish(backend, log, note=" (applies to the next run)")
 

@@ -2875,20 +2875,31 @@ class VideoHighlighterGUI(QWidget):
         compute_box = QGroupBox("Compute")
         compute_layout = QFormLayout()
         self.backend_combo = QComboBox()
-        for _backend, _label in compute_backend.CHOICES:
+        # Only what this platform has: Apple's GPU on a Mac, the PC backends
+        # everywhere else (compute_backend.choices).
+        for _backend, _label in compute_backend.choices():
             self.backend_combo.addItem(_label, _backend)
-        self.backend_combo.setToolTip(
-            "Which accelerator the run should use.\n\n"
-            "Automatic takes the fastest this machine has: CUDA, then Intel,\n"
-            "then Apple or DirectML, then the processor. Naming one instead is how you\n"
-            "measure it against that choice \u2014 DirectML on an Intel card, say.\n\n"
-            "A backend this machine does not have falls back to automatic and\n"
-            "says so in the log, and every run reports the one it got.\n\n"
-            "DirectML drives object detection and action recognition in\n"
-            "every build; the rest of it needs a source install \u2014\n"
-            "see docs/AMD-GPU.md. On a Mac, Apple GPU (Core ML) moves the\n"
-            "same two to the GPU / Neural Engine (experimental)."
-        )
+        if sys.platform == "darwin":
+            self.backend_combo.setToolTip(
+                "Which accelerator the run should use.\n\n"
+                "Automatic uses the Apple GPU when Core ML can reach it, else\n"
+                "the processor. Processor only is how you time a run without it.\n\n"
+                "Apple GPU (Core ML) moves object detection and action\n"
+                "recognition to the GPU / Neural Engine (experimental) \u2014\n"
+                "see docs/MAC-GPU.md. Every run reports the backend it got."
+            )
+        else:
+            self.backend_combo.setToolTip(
+                "Which accelerator the run should use.\n\n"
+                "Automatic takes the fastest this machine has: CUDA, then Intel,\n"
+                "then DirectML, then the processor. Naming one instead is how you\n"
+                "measure it against that choice \u2014 DirectML on an Intel card, say.\n\n"
+                "A backend this machine does not have falls back to automatic and\n"
+                "says so in the log, and every run reports the one it got.\n\n"
+                "DirectML drives object detection and action recognition in\n"
+                "every build; the rest of it needs a source install \u2014\n"
+                "see docs/AMD-GPU.md."
+            )
         _saved_backend = (compute_backend.from_config(self.config_data)
                           or compute_backend.configured()
                           or compute_backend.AUTO)
