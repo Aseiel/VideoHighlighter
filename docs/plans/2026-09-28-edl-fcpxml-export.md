@@ -16,29 +16,29 @@ Pure data, no file writing and no Qt. Lives in
 
 ### Steps
 
-- [ ] Add `MediaSource`, `Span`, and `Sequence` as specified in the design.
-- [ ] Add `to_frames(seconds, num, den)` using `round(seconds * num / den)`.
-- [ ] Add the rate table: NTSC fractions count at their nominal rate, and the
+- [x] Add `MediaSource`, `Span`, and `Sequence` as specified in the design.
+- [x] Add `to_frames(seconds, num, den)` using `round(seconds * num / den)`.
+- [x] Add the rate table: NTSC fractions count at their nominal rate, and the
       whole rates 24, 25, 30, 48, 50, 60, 100, 120, and 240 are recognised.
-- [ ] FCPXML `frameDuration` follows that table, including `100/12000s` at
+- [x] FCPXML `frameDuration` follows that table, including `100/12000s` at
       120 fps and `100/24000s` at 240 fps.
-- [ ] EDL counts at the real rate when the frame number fits in two digits
+- [x] EDL counts at the real rate when the frame number fits in two digits
       (nominal fps ≤ 100). Above that, count at the largest whole divisor
       that is ≤ 60. For 120 and 240 that divisor is 60.
-- [ ] Any other fraction is reduced and counted at `round(num/den)`. It is
+- [x] Any other fraction is reduced and counted at `round(num/den)`. It is
       "unrecognised" only when it is neither a table row nor a whole number
       of frames per second.
-- [ ] `record_start` accepts only `00:00:00:00` and `01:00:00:00`.
+- [x] `record_start` accepts only `00:00:00:00` and `01:00:00:00`.
 
 ### Acceptance criteria
 
-- [ ] Five seconds at `30000/1001` is 150 frames, not `round(5 * 29.97)`.
-- [ ] Five seconds at `120/1` is 600 source frames. The EDL clock for that
+- [x] Five seconds at `30000/1001` is 150 frames, not `round(5 * 29.97)`.
+- [x] Five seconds at `120/1` is 600 source frames. The EDL clock for that
       clip is 60 fps. Five seconds at `240/1` is on the same 60 fps clock.
-- [ ] Half a second at `100/1` is frame 50.
-- [ ] A rate such as `90/1` is named, not reported as unrecognised. A
+- [x] Half a second at `100/1` is frame 50.
+- [x] A rate such as `90/1` is named, not reported as unrecognised. A
       non-whole fraction outside the table is reported as unrecognised.
-- [ ] No test in this task reads a media file or imports Qt.
+- [x] No test in this task reads a media file or imports Qt.
 
 ## Task 2 — CMX 3600 writer
 

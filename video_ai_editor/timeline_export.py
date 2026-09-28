@@ -1,6 +1,218 @@
+"""Edit-timeline export: a sequence model and the files an NLE can open.
+
+The timebase and the sequence types are pure data. Writers below them turn a
+:class:`Sequence` into CMX 3600 and FCPXML. Frame counts always come from the
+``r_frame_rate`` fraction. A float such as 29.97 is not a frame boundary.
+"""
+
+from __future__ import annotations
+
+import math
 import os
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from xml.dom import minidom
+
+RECORD_START_ZERO = "00:00:00:00"
+RECORD_START_HOUR = "01:00:00:00"
+RECORD_STARTS = (RECORD_START_ZERO, RECORD_START_HOUR)
+
+_SPAN_KINDS = ("speech", "detection", "face")
+
+# Real r_frame_rate, the integer CMX counts at, the FCPXML frameDuration
+# (the real frame, not the CMX clock), and the token after "p" in an
+# FFVideoFormat name. 120 and 240 are real rates in the XML and a 60-frame
+# clock in the EDL: a CMX frame field only holds 00–99.
+_RATE_TABLE = {
+    (24000, 1001): (24, 24, "1001/24000s", "2398"),
+    (24, 1): (24, 24, "100/2400s", "24"),
+    (25, 1): (25, 25, "100/2500s", "25"),
+    (30000, 1001): (30, 30, "1001/30000s", "2997"),
+    (30, 1): (30, 30, "100/3000s", "30"),
+    (48, 1): (48, 48, "100/4800s", "48"),
+    (50, 1): (50, 50, "100/5000s", "50"),
+    (60000, 1001): (60, 60, "1001/60000s", "5994"),
+    (60, 1): (60, 60, "100/6000s", "60"),
+    (100, 1): (100, 100, "100/10000s", "100"),
+    (120, 1): (120, 60, "100/12000s", "120"),
+    (240, 1): (240, 60, "100/24000s", "240"),
+}
+
+_NTSC_LABELS = {
+    (24000, 1001): "23.976",
+    (30000, 1001): "29.97",
+    (60000, 1001): "59.94",
+}
+
+
+class ExportError(ValueError):
+    """A sequence or a rate the exporter cannot describe."""
+
+
+def to_frames(seconds: float, num: int, den: int) -> int:
+    """Frame index at ``seconds`` on the real rate ``num/den``.
+
+    ``round(seconds * 29.97)`` is not this. Five seconds at 30000/1001 is
+    exactly 150 frames; the float product ``5 * 29.97`` is 149.85.
+    """
+    if num <= 0 or den <= 0:
+        raise ExportError(f"frame rate {num}/{den} is not a positive fraction")
+    return int(round(float(seconds) * num / den))
+
+
+def _reduce(num: int, den: int) -> tuple[int, int]:
+    if num <= 0 or den <= 0:
+        raise ExportError(f"frame rate {num}/{den} is not a positive fraction")
+    factor = math.gcd(int(num), int(den))
+    return int(num) // factor, int(den) // factor
+
+
+def edl_fps_for_nominal(nominal: int) -> int:
+    """CMX counter for a whole-number picture rate.
+
+    Two frame digits hold 00–99, so a rate of 100 still fits and a rate above
+    it does not. The coarsened clock is the largest whole divisor at or under
+    60, which is 60 for both 120 and 240.
+    """
+    if nominal < 1:
+        raise ExportError(f"nominal frame rate {nominal} is not positive")
+    if nominal <= 100:
+        return nominal
+    return max(divisor for divisor in range(1, 61) if nominal % divisor == 0)
+
+
+@dataclass(frozen=True)
+class Timebase:
+    """How one source file is counted in an EDL and in FCPXML.
+
+    ``fps_num/fps_den`` is the reduced ``r_frame_rate``. ``nominal`` is the
+    whole number of frames the picture steps at (30 for 29.97 non-drop, 120
+    for a 120 fps file). ``edl_fps`` is the clock the CMX timecode actually
+    uses, equal to ``nominal`` until ``nominal`` no longer fits in two digits.
+    ``frame_duration`` is the FCPXML value and always describes the real frame.
+    """
+
+    fps_num: int
+    fps_den: int
+    nominal: int
+    edl_fps: int
+    frame_duration: str
+    recognised: bool
+    rate_token: str
+
+    @classmethod
+    def from_fraction(cls, num: int, den: int) -> "Timebase":
+        num, den = _reduce(num, den)
+        known = _RATE_TABLE.get((num, den))
+        if known is not None:
+            nominal, edl_fps, duration, token = known
+            return cls(num, den, nominal, edl_fps, duration, True, token)
+        nominal = int(round(num / den))
+        if nominal < 1:
+            nominal = 1
+        # A whole number of frames per second is a rate we can name. Anything
+        # else that is not in the table is unrecognised: the dialog says so,
+        # and the file still uses the reduced fraction rather than 30.
+        whole = den == 1
+        return cls(
+            num, den, nominal, edl_fps_for_nominal(nominal),
+            f"{den}/{num}s", whole, str(nominal),
+        )
+
+    @property
+    def coarsened(self) -> bool:
+        """True when the EDL clock is coarser than the picture rate."""
+        return self.edl_fps != self.nominal
+
+    def describe(self) -> str:
+        """The rate line the export dialog shows."""
+        if not self.recognised:
+            return f"unrecognised, {self.fps_num}/{self.fps_den}"
+        pretty = _NTSC_LABELS.get((self.fps_num, self.fps_den))
+        if pretty is None:
+            pretty = str(self.nominal)
+        return f"{pretty} fps, {self.fps_num}/{self.fps_den}"
+
+
+def edl_frame_index(seconds: float, timebase: Timebase) -> int:
+    """Timecode frame index for ``seconds``, on ``timebase.edl_fps``.
+
+    Non-drop 29.97 numbers the real frame index at 30. A 120 fps file cannot:
+    the index is scaled onto the 60 fps clock, so five seconds is 300 EDL
+    frames rather than 600 source frames.
+    """
+    source = to_frames(seconds, timebase.fps_num, timebase.fps_den)
+    if not timebase.coarsened:
+        return source
+    return int(round(source * timebase.edl_fps / timebase.nominal))
+
+
+def record_start_seconds(value: str) -> int:
+    """Seconds of sequence clock for a dialog choice. Only two values exist."""
+    if value == RECORD_START_ZERO:
+        return 0
+    if value == RECORD_START_HOUR:
+        return 3600
+    raise ExportError(
+        f"record start must be {RECORD_START_ZERO} or {RECORD_START_HOUR}, "
+        f"got {value!r}")
+
+
+@dataclass(frozen=True)
+class MediaSource:
+    """One file the sequence cuts. Width and height are the display size."""
+
+    path: str
+    duration: float
+    fps_num: int
+    fps_den: int
+    width: int
+    height: int
+    has_audio: bool
+    audio_rate: int
+    audio_channels: int
+
+    def timebase(self) -> Timebase:
+        return Timebase.from_fraction(self.fps_num, self.fps_den)
+
+
+@dataclass(frozen=True)
+class Span:
+    """One stretch of speech, one detection class, or one face, in source seconds."""
+
+    kind: str
+    start: float
+    end: float
+    label: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in _SPAN_KINDS:
+            raise ExportError(
+                f"span kind must be one of {', '.join(_SPAN_KINDS)}, "
+                f"got {self.kind!r}")
+        if self.end < self.start:
+            raise ExportError(
+                f"span {self.kind!r} ends before it starts "
+                f"({self.start}..{self.end})")
+
+
+@dataclass(frozen=True)
+class Sequence:
+    """The edit timeline, in order, plus the spans that fall in those clips."""
+
+    title: str
+    source: MediaSource
+    clips: tuple[tuple[float, float], ...]
+    record_start: str = RECORD_START_ZERO
+    spans: tuple[Span, ...] = ()
+
+    def __post_init__(self) -> None:
+        record_start_seconds(self.record_start)
+        self.source.timebase()
+
+    def timebase(self) -> Timebase:
+        return self.source.timebase()
+
 
 class TimelineExporter:
     """Export edit timeline to various formats"""
