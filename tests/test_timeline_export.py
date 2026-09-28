@@ -731,3 +731,280 @@ def test_csv_frame_numbers_at_120_fps_use_120_not_60(tmp_path):
     assert rows[2][3] == "0.008333"
     assert result.skipped == 0
     assert "300" not in rows[1]
+
+
+# ---------------------------------------------------------------------------
+# Spans and markers
+# ---------------------------------------------------------------------------
+
+def _clip_source(path, num=30, den=1, *, audio=True):
+    return _media(path, num, den, audio=audio, duration=120.0)
+
+
+def test_speech_becomes_a_marker_and_a_locator(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    speech = Span(kind="speech", start=12.0, end=16.0, label="hello there")
+    media = _clip_source(source)
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    edl_path = tmp_path / "cut.edl"
+    xml_path = tmp_path / "cut.fcpxml"
+    TimelineExporter.to_edl(
+        [(10.0, 20.0)], str(source), str(edl_path),
+        source=media, spans=(speech,))
+    TimelineExporter.to_fcp_xml(
+        [(10.0, 20.0)], str(source), str(xml_path),
+        source=media, spans=(speech,))
+
+    edl = edl_path.read_text(encoding="utf-8").splitlines()
+    locators = [line for line in edl if line.startswith("* LOC:")]
+    assert locators == ["* LOC: 00:00:02:00 cyan Speech: hello there"]
+    audio_at = max(i for i, line in enumerate(edl) if " A     C" in line)
+    locator_at = edl.index(locators[0])
+    assert locator_at > audio_at
+
+    marker = _read_fcpxml(xml_path)[1].find(
+        "library/event/project/sequence/spine/asset-clip/marker")
+    assert marker.get("start") == "2s"
+    assert marker.get("duration") == "4s"
+    assert marker.get("value") == "Speech: hello there"
+    assert marker.get("note") == "hello there"
+
+
+def test_record_start_moves_the_locator_and_not_the_marker(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    speech = Span(kind="speech", start=12.0, end=16.0, label="hello there")
+    media = _clip_source(source, audio=False)
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    edl_path = tmp_path / "cut.edl"
+    xml_path = tmp_path / "cut.fcpxml"
+    TimelineExporter.to_edl(
+        [(10.0, 20.0)], str(source), str(edl_path),
+        source=media, spans=(speech,), record_start="01:00:00:00")
+    TimelineExporter.to_fcp_xml(
+        [(10.0, 20.0)], str(source), str(xml_path),
+        source=media, spans=(speech,), record_start="01:00:00:00")
+
+    edl = edl_path.read_text(encoding="utf-8")
+    assert "* LOC: 01:00:02:00 cyan Speech: hello there" in edl
+    assert "* LOC: 00:00:02:00" not in edl
+    marker = _read_fcpxml(xml_path)[1].find(
+        "library/event/project/sequence/spine/asset-clip/marker")
+    assert marker.get("start") == "2s"
+    assert marker.get("duration") == "4s"
+
+
+def test_a_span_that_misses_the_clip_writes_nothing(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    speech = Span(kind="speech", start=0.0, end=5.0, label="too early")
+    media = _clip_source(source, audio=False)
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    edl_path = tmp_path / "cut.edl"
+    xml_path = tmp_path / "cut.fcpxml"
+    TimelineExporter.to_edl(
+        [(10.0, 20.0)], str(source), str(edl_path),
+        source=media, spans=(speech,))
+    TimelineExporter.to_fcp_xml(
+        [(10.0, 20.0)], str(source), str(xml_path),
+        source=media, spans=(speech,))
+
+    assert "* LOC:" not in edl_path.read_text(encoding="utf-8")
+    assert _read_fcpxml(xml_path)[1].find(".//marker") is None
+    assert " V     C" in edl_path.read_text(encoding="utf-8")
+
+
+def test_detection_hits_join_when_they_are_within_two_seconds():
+    from video_ai_editor.timeline_export import spans_from_analysis
+    close = spans_from_analysis({
+        "actions": [
+            {"timestamp": 1.0, "action_name": "Person", "confidence": 0.01},
+            {"timestamp": 2.5, "action": "Person"},
+        ],
+    })
+    assert [(span.start, span.end, span.label) for span in close] == [
+        (1.0, 2.5, "Person"),
+    ]
+
+    apart = spans_from_analysis({
+        "actions": [
+            {"timestamp": 1.0, "action_name": "Person"},
+            {"timestamp": 4.0, "action_name": "Person"},
+        ],
+    })
+    assert [span.start for span in apart] == [1.0, 4.0]
+    assert all(span.kind == "detection" for span in apart)
+
+    joined = spans_from_analysis({
+        "actions": [{"timestamp": 1.0, "action_name": "Person"}],
+        "objects": [{"timestamp": 2.5, "objects": ["Person"], "confidence": 0.0}],
+    })
+    assert len(joined) == 1 and joined[0].end == 2.5
+
+    speech = spans_from_analysis({
+        "transcript": {"segments": [
+            {"start": 1.0, "end": 2.0, "text": "one"},
+            {"start": 2.1, "end": 3.0, "text": "two"},
+            {"start": 4.0, "end": 5.0, "text": "   "},
+        ]},
+    })
+    assert [(span.start, span.label) for span in speech] == [
+        (1.0, "one"), (2.1, "two"),
+    ]
+
+
+def test_unnamed_face_tracks_stay_separate():
+    from video_ai_editor.timeline_export import spans_from_analysis
+    spans = spans_from_analysis({
+        "object_bboxes": [{
+            "timestamp": 1.0,
+            "identity_names": [None, None, "Ada"],
+            "track_ids": [7, 8, 9],
+        }],
+    })
+    faces = [span for span in spans if span.kind == "face"]
+    unnamed = [span for span in faces if span.label == "Face"]
+    named = [span for span in faces if span.label == "Ada"]
+    assert len(unnamed) == 2
+    assert all(span.kind == "face" for span in unnamed)
+    assert len(named) == 1 and named[0].label == "Ada"
+
+
+def test_a_long_speech_locator_is_one_truncated_line(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    label = "alpha\n" + ("b" * 90)
+    speech = Span(kind="speech", start=12.0, end=16.0, label="* " + label)
+    media = _clip_source(source, audio=False)
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    edl_path = tmp_path / "cut.edl"
+    xml_path = tmp_path / "cut.fcpxml"
+    TimelineExporter.to_edl(
+        [(10.0, 20.0)], str(source), str(edl_path),
+        source=media, spans=(speech,))
+    TimelineExporter.to_fcp_xml(
+        [(10.0, 20.0)], str(source), str(xml_path),
+        source=media, spans=(speech,))
+
+    locators = [line for line in edl_path.read_text(encoding="utf-8").splitlines()
+                if line.startswith("* LOC:")]
+    assert len(locators) == 1
+    text = locators[0].split(" cyan ", 1)[1]
+    assert len(text) == 80
+    assert text.endswith("...")
+    assert "\n" not in text
+    assert "alpha b" in text
+
+    marker = _read_fcpxml(xml_path)[1].find(".//marker")
+    assert marker.get("note") == "alpha " + ("b" * 90)
+    assert marker.get("value") == "Speech: alpha " + ("b" * 90)
+    assert not marker.get("value").endswith("...")
+
+
+def test_an_empty_analysis_cache_writes_the_cut_and_no_markers(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    media = _clip_source(source, audio=False)
+
+    from video_ai_editor.timeline_export import spans_from_analysis, TimelineExporter
+    assert spans_from_analysis({}) == ()
+    assert spans_from_analysis(None) == ()
+    spans = spans_from_analysis({
+        "transcript": {"segments": []},
+        "actions": [],
+        "objects": [],
+        "object_bboxes": [],
+    })
+    edl_path = tmp_path / "cut.edl"
+    xml_path = tmp_path / "cut.fcpxml"
+    TimelineExporter.to_edl(
+        [(0.0, 2.0)], str(source), str(edl_path), source=media, spans=spans)
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 2.0)], str(source), str(xml_path), source=media, spans=spans)
+
+    edl = edl_path.read_text(encoding="utf-8")
+    assert " V     C" in edl
+    assert "* LOC:" not in edl
+    assert _read_fcpxml(xml_path)[1].find(".//marker") is None
+
+
+def test_marker_text_is_escaped_and_a_span_can_mark_two_clips(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    speech = Span(kind="speech", start=9.0, end=15.0, label="a < b & c")
+    media = _clip_source(source, audio=False)
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    xml_path = tmp_path / "cut.fcpxml"
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 10.0), (12.0, 20.0)], str(source), str(xml_path),
+        source=media, spans=(speech,))
+
+    text = xml_path.read_text(encoding="utf-8")
+    assert "a &lt; b &amp; c" in text
+    assert "a < b" not in text
+    markers = _read_fcpxml(xml_path)[1].findall(".//marker")
+    assert len(markers) == 2
+    assert markers[0].get("start") == "9s"
+    assert markers[0].get("duration") == "1s"
+    assert markers[1].get("start") == "0s"
+    assert markers[1].get("duration") == "3s"
+
+
+def test_a_single_hit_is_one_frame_and_a_short_overlap_is_dropped(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    media = _clip_source(source, audio=False)
+    hit = Span(kind="detection", start=5.0, end=5.0, label="Person")
+    short = Span(kind="detection", start=10.0, end=10.001, label="Gone")
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    xml_path = tmp_path / "cut.fcpxml"
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 20.0)], str(source), str(xml_path),
+        source=media, spans=(hit, short))
+
+    markers = _read_fcpxml(xml_path)[1].findall(".//marker")
+    assert len(markers) == 1
+    assert markers[0].get("value") == "Detection: Person"
+    assert markers[0].get("duration") == "1/30s"
+    assert markers[0].get("note") is None
+
+
+def test_locators_sort_by_time_then_speech_face_detection(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    media = _clip_source(source, audio=False)
+    spans = (
+        Span(kind="detection", start=4.0, end=5.0, label="Person"),
+        Span(kind="face", start=4.0, end=5.0, label="Ada"),
+        Span(kind="speech", start=4.0, end=5.0, label="hello"),
+    )
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    edl_path = tmp_path / "cut.edl"
+    TimelineExporter.to_edl(
+        [(0.0, 10.0)], str(source), str(edl_path),
+        source=media, spans=spans)
+
+    locators = [line for line in edl_path.read_text(encoding="utf-8").splitlines()
+                if line.startswith("* LOC:")]
+    assert locators == [
+        "* LOC: 00:00:04:00 cyan Speech: hello",
+        "* LOC: 00:00:04:00 green Face: Ada",
+        "* LOC: 00:00:04:00 yellow Detection: Person",
+    ]
+
+
+def test_spans_do_not_import_the_timeline_scene():
+    import inspect
+    import video_ai_editor.timeline_export as exporter
+
+    source = inspect.getsource(exporter)
+    assert "signal_timeline" not in source
+    assert "EVENT_RUN_GAP = 2.0" in source

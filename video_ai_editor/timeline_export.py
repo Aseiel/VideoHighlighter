@@ -22,6 +22,13 @@ RECORD_STARTS = (RECORD_START_ZERO, RECORD_START_HOUR)
 
 _SPAN_KINDS = ("speech", "detection", "face")
 
+# Same gap SignalTimelineScene uses to join sampled hits into one run.
+# Copied so this module does not import the timeline scene.
+EVENT_RUN_GAP = 2.0
+
+_KIND_ORDER = {"speech": 0, "face": 1, "detection": 2}
+_KIND_COLOR = {"speech": "cyan", "detection": "yellow", "face": "green"}
+
 # Real r_frame_rate, the integer CMX counts at, the FCPXML frameDuration
 # (the real frame, not the CMX clock), and the token after "p" in an
 # FFVideoFormat name. 120 and 240 are real rates in the XML and a 60-frame
@@ -277,6 +284,216 @@ def _quantise_clip(start: float, end: float, timebase: Timebase) -> tuple[int, i
     return src_in, src_out
 
 
+def _as_float(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_marker_text(label: str) -> str:
+    """One line. A leading ``*`` would look like a second EDL comment."""
+    text = " ".join(str(label).split())
+    if text.startswith("*"):
+        text = text[1:].lstrip()
+    return text
+
+
+def _display_line(kind: str, label: str) -> tuple[str, str | None]:
+    """The shared marker line, and the speech note (the transcript in full)."""
+    text = _clean_marker_text(label)
+    if kind == "speech":
+        if not text:
+            return "", None
+        return f"Speech: {text}", text
+    if kind == "detection":
+        if not text:
+            return "", None
+        return f"Detection: {text}", None
+    if not text or text == "Face":
+        return "Face", None
+    return f"Face: {text}", None
+
+
+def _truncate_edl(line: str, limit: int = 80) -> str:
+    """At most ``limit`` characters, still one line, ellipsis inside the limit."""
+    if len(line) <= limit:
+        return line
+    if limit <= 3:
+        return "." * limit
+    return line[:limit - 3] + "..."
+
+
+def _runs(times: list[float]) -> list[tuple[float, float]]:
+    """Hits more than ``EVENT_RUN_GAP`` apart start a new span.
+
+    A single hit has equal start and end. The writer treats that as one frame.
+    """
+    if not times:
+        return []
+    ordered = sorted(times)
+    start = previous = ordered[0]
+    runs: list[tuple[float, float]] = []
+    for time in ordered[1:]:
+        if time - previous > EVENT_RUN_GAP:
+            runs.append((start, previous))
+            start = time
+        previous = time
+    runs.append((start, previous))
+    return runs
+
+
+def _speech_spans(cache: dict) -> list[Span]:
+    transcript = cache.get("transcript") or {}
+    if not isinstance(transcript, dict):
+        return []
+    spans: list[Span] = []
+    for segment in transcript.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        label = str(segment.get("text") or "")
+        if not label.strip():
+            continue
+        start = _as_float(segment.get("start"))
+        if start is None:
+            continue
+        end = _as_float(segment.get("end"))
+        if end is None:
+            end = start
+        if end < start:
+            continue
+        spans.append(Span(kind="speech", start=start, end=end, label=label))
+    return spans
+
+
+def _detection_spans(cache: dict) -> list[Span]:
+    """Actions first, then objects. The same class name is one series of hits."""
+    hits: dict[str, list[float]] = {}
+
+    def add(name, timestamp) -> None:
+        if not isinstance(name, str):
+            return
+        cleaned = name.strip()
+        when = _as_float(timestamp)
+        if not cleaned or when is None:
+            return
+        hits.setdefault(cleaned, []).append(when)
+
+    for action in cache.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        add(action.get("action_name") or action.get("action") or action.get("class"),
+            action.get("timestamp", action.get("start_time", action.get("time"))))
+    for item in cache.get("objects") or []:
+        if not isinstance(item, dict):
+            continue
+        when = item.get("timestamp", item.get("time"))
+        for name in item.get("objects") or []:
+            add(name, when)
+
+    spans: list[Span] = []
+    for name, times in hits.items():
+        for start, end in _runs(times):
+            spans.append(Span(kind="detection", start=start, end=end, label=name))
+    return spans
+
+
+def _face_spans(cache: dict) -> list[Span]:
+    """One identity per name, or per track when the face has no name."""
+    groups: dict[tuple, list[float]] = {}
+    labels: dict[tuple, str] = {}
+    for entry in cache.get("object_bboxes") or []:
+        if not isinstance(entry, dict):
+            continue
+        if "identity_names" not in entry or "track_ids" not in entry:
+            continue
+        when = _as_float(entry.get("timestamp"))
+        if when is None:
+            continue
+        names = entry.get("identity_names") or []
+        tracks = entry.get("track_ids") or []
+        for index, track in enumerate(tracks):
+            raw = names[index] if index < len(names) else None
+            name = _clean_marker_text(raw) if isinstance(raw, str) else ""
+            if name and name != "Face":
+                key = ("name", name)
+                label = name
+            else:
+                key = ("track", track)
+                label = "Face"
+            groups.setdefault(key, []).append(when)
+            labels[key] = label
+    spans: list[Span] = []
+    for key, times in groups.items():
+        for start, end in _runs(times):
+            spans.append(Span(kind="face", start=start, end=end, label=labels[key]))
+    return spans
+
+
+def spans_from_analysis(cache) -> tuple[Span, ...]:
+    """Speech, detections, and faces in ``cache``.
+
+    Visibility, confidence, and the merge slider are display preferences.
+    They are not read. An empty cache produces an empty tuple.
+    """
+    if not isinstance(cache, dict):
+        return ()
+    return tuple(_speech_spans(cache) + _detection_spans(cache) + _face_spans(cache))
+
+
+@dataclass(frozen=True)
+class _Mark:
+    """One overlap of a span and a kept clip, in one clock's frame index."""
+
+    kind: str
+    label: str
+    line: str
+    note: str | None
+    src_in: int
+    src_out: int
+
+
+def _overlap_bounds(span: Span, clip_start: float, clip_end: float) -> tuple[float, float] | None:
+    """The seconds of ``span`` that fall inside the clip, or a point for one hit."""
+    if span.start == span.end:
+        if span.start < clip_start or span.start >= clip_end:
+            return None
+        return span.start, span.start
+    if span.end <= clip_start or span.start >= clip_end:
+        return None
+    return max(span.start, clip_start), min(span.end, clip_end)
+
+
+def _overlaps(spans, clip_start: float, clip_end: float,
+              clip_in: int, clip_out: int, index_of) -> list[_Mark]:
+    """Overlaps on ``index_of``'s clock. A zero-frame overlap is dropped.
+
+    A span whose start and end are the same time is one frame, clipped to
+    the clip.
+    """
+    marks: list[_Mark] = []
+    for span in spans:
+        bounds = _overlap_bounds(span, clip_start, clip_end)
+        if bounds is None:
+            continue
+        ov_start, ov_end = bounds
+        src_in = index_of(ov_start)
+        src_out = src_in + 1 if ov_end == ov_start else index_of(ov_end)
+        src_in = max(src_in, clip_in)
+        src_out = min(src_out, clip_out)
+        if src_out <= src_in:
+            continue
+        line, note = _display_line(span.kind, span.label)
+        if not line:
+            continue
+        marks.append(_Mark(span.kind, _clean_marker_text(span.label) or span.label,
+                           line, note, src_in, src_out))
+    marks.sort(key=lambda mark: (mark.src_in, _KIND_ORDER[mark.kind], mark.label))
+    return marks
+
+
 def _event_line(number: int, reel: str, track: str,
                 src_in: str, src_out: str, rec_in: str, rec_out: str) -> str:
     # Track is a 5-character field ("V    ", "A    "). Eight spaces follow C.
@@ -294,14 +511,18 @@ def cmx_text(sequence: Sequence) -> tuple[str, int]:
         raise ExportError("nothing to export — the edit timeline has no clips")
 
     timebase = sequence.timebase()
-    kept: list[tuple[int, int]] = []
+    kept: list[tuple[float, float, int, int, int]] = []
     skipped = 0
+    fps = timebase.edl_fps
+    record = record_start_seconds(sequence.record_start) * fps
     for start, end in sequence.clips:
         quantised = _quantise_clip(start, end, timebase)
         if quantised is None:
             skipped += 1
             continue
-        kept.append(quantised)
+        src_in, src_out = quantised
+        kept.append((float(start), float(end), src_in, src_out, record))
+        record += src_out - src_in
     if not kept:
         raise ExportError(
             f"every clip is shorter than one frame at {timebase.edl_fps} fps")
@@ -310,8 +531,6 @@ def cmx_text(sequence: Sequence) -> tuple[str, int]:
     reel = reel_name(stem)
     filename = os.path.basename(sequence.source.path)
     source_file = os.path.abspath(sequence.source.path)
-    fps = timebase.edl_fps
-    record = record_start_seconds(sequence.record_start) * fps
 
     lines = [
         f"TITLE: {stem}",
@@ -319,12 +538,11 @@ def cmx_text(sequence: Sequence) -> tuple[str, int]:
         "* SOURCE TIMES ARE FROM THE START OF THE FILE, NOT CAMERA TIMECODE",
         "",
     ]
-    for index, (src_in, src_out) in enumerate(kept):
+    locators: list[tuple[int, _Mark]] = []
+    for index, (start, end, src_in, src_out, rec_in) in enumerate(kept):
         number = _event_number(index)
         duration = src_out - src_in
-        rec_in = record
-        rec_out = record + duration
-        record = rec_out
+        rec_out = rec_in + duration
         src_in_tc = frames_to_timecode(src_in, fps)
         src_out_tc = frames_to_timecode(src_out, fps)
         rec_in_tc = frames_to_timecode(rec_in, fps)
@@ -340,6 +558,19 @@ def cmx_text(sequence: Sequence) -> tuple[str, int]:
             lines.append(f"* FROM CLIP NAME: {filename}")
         if index != len(kept) - 1:
             lines.append("")
+        for mark in _overlaps(
+                sequence.spans, start, end, src_in, src_out,
+                lambda seconds: edl_frame_index(seconds, timebase)):
+            locators.append((rec_in + (mark.src_in - src_in), mark))
+
+    if locators:
+        locators.sort(key=lambda item: (
+            item[0], _KIND_ORDER[item[1].kind], item[1].label))
+        lines.append("")
+        for record_frame, mark in locators:
+            timecode = frames_to_timecode(record_frame, fps)
+            text = _truncate_edl(mark.line)
+            lines.append(f"* LOC: {timecode} {_KIND_COLOR[mark.kind]} {text}")
 
     return "\n".join(lines) + "\n", skipped
 
@@ -475,20 +706,20 @@ def fcpxml_text(sequence: Sequence) -> tuple[str, int]:
     """FCPXML 1.9 for ``sequence``, and how many clips were skipped.
 
     Raises :class:`ExportError` when there is nothing to write. Does not
-    touch the disk. Spans become markers in a later step.
+    touch the disk. A span is a marker on each clip it overlaps.
     """
     if not sequence.clips:
         raise ExportError("nothing to export — the edit timeline has no clips")
 
     timebase = sequence.timebase()
-    kept: list[tuple[int, int]] = []
+    kept: list[tuple[float, float, int, int]] = []
     skipped = 0
     for start, end in sequence.clips:
         quantised = _source_clip(start, end, timebase)
         if quantised is None:
             skipped += 1
             continue
-        kept.append(quantised)
+        kept.append((float(start), float(end), quantised[0], quantised[1]))
     if not kept:
         raise ExportError(
             "every clip is shorter than one frame at "
@@ -529,7 +760,7 @@ def fcpxml_text(sequence: Sequence) -> tuple[str, int]:
     resources.append(asset)
 
     origin = _record_origin(sequence.record_start)
-    total_frames = sum(src_out - src_in for src_in, src_out in kept)
+    total_frames = sum(src_out - src_in for _, _, src_in, src_out in kept)
     sequence_attrib = {
         "format": "r1",
         "duration": frames_to_time(total_frames, timebase),
@@ -543,9 +774,10 @@ def fcpxml_text(sequence: Sequence) -> tuple[str, int]:
     sequence_el = ET.Element("sequence", sequence_attrib)
     spine = ET.SubElement(sequence_el, "spine")
     offset = origin
-    for index, (src_in, src_out) in enumerate(kept, start=1):
+    index_of = lambda seconds: to_frames(seconds, timebase.fps_num, timebase.fps_den)
+    for index, (start, end, src_in, src_out) in enumerate(kept, start=1):
         duration = frames_to_time(src_out - src_in, timebase)
-        ET.SubElement(spine, "asset-clip", {
+        clip = ET.SubElement(spine, "asset-clip", {
             "ref": "r2",
             "offset": offset,
             "name": f"Clip {index}",
@@ -553,6 +785,15 @@ def fcpxml_text(sequence: Sequence) -> tuple[str, int]:
             "duration": duration,
             "tcFormat": "NDF",
         })
+        for mark in _overlaps(sequence.spans, start, end, src_in, src_out, index_of):
+            attrib = {
+                "start": frames_to_time(mark.src_in - src_in, timebase),
+                "duration": frames_to_time(mark.src_out - mark.src_in, timebase),
+                "value": mark.line,
+            }
+            if mark.note is not None:
+                attrib["note"] = mark.note
+            ET.SubElement(clip, "marker", attrib)
         offset = _add_rational(offset, duration)
 
     project = ET.Element("project", {"name": sequence.title or _stem(source.path)})
