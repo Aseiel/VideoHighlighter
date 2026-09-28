@@ -263,15 +263,15 @@ case which can pass a fake probe. Everything else is given a `MediaSource`.
 
 ### Steps
 
-- [ ] Cover the acceptance criteria of Tasks 1 through 5 with the cases named
+- [x] Cover the acceptance criteria of Tasks 1 through 5 with the cases named
       in the design's Tests section.
-- [ ] Run `pytest tests/test_timeline_export.py tests/test_edl.py` and keep
+- [x] Run `pytest tests/test_timeline_export.py tests/test_edl.py` and keep
       both green.
 
 ### Acceptance criteria
 
-- [ ] `tests/test_edl.py` passes without modification.
-- [ ] The new tests fail if 120 fps FCPXML is written as 30 fps, if a 120 fps
+- [x] `tests/test_edl.py` passes without modification.
+- [x] The new tests fail if 120 fps FCPXML is written as 30 fps, if a 120 fps
       EDL frame field contains a number above 99, or if a locator is inserted
       between a clip's `V` and `A` lines.
 

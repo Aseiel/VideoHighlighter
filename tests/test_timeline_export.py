@@ -1444,3 +1444,175 @@ def test_export_command_help_mentions_fcpxml_and_start():
     assert "signal_timeline_viewer" not in source
     assert "edit_scene.clips" in source
     assert "output_path" in source
+
+
+# ---------------------------------------------------------------------------
+# Design cases
+# ---------------------------------------------------------------------------
+
+def _timecode_frame_fields(text: str) -> list[str]:
+    import re
+    return re.findall(r"\d{2}:\d{2}:\d{2}:(\d+)", text)
+
+
+def test_29_97_edl_reads_five_seconds(tmp_path):
+    """150 real frames, counted at 30, are five seconds of timecode."""
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.edl"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_edl(
+        [(0.0, 5.0)], str(source), str(out),
+        source=_media(source, 30000, 1001, audio=False))
+
+    text = out.read_text(encoding="utf-8")
+    assert "00:00:00:00 00:00:05:00 00:00:00:00 00:00:05:00" in text
+    assert to_frames(5.0, 30000, 1001) == 150
+    assert 5 * 29.97 != 150
+
+
+def test_thirty_fps_fcpxml_offset_starts_at_zero(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_fcp_xml(
+        [(10.0, 15.0), (0.0, 4.0)], str(source), str(out),
+        source=_media(source, 30, 1, audio=False))
+
+    root = _read_fcpxml(out)[1]
+    clips = root.findall("library/event/project/sequence/spine/asset-clip")
+    assert clips[0].get("offset") == "0s"
+    assert clips[0].get("start") == "10s"
+    assert clips[0].get("duration") == "5s"
+    assert clips[1].get("offset") == clips[0].get("duration")
+
+
+def test_half_a_second_at_100_fps_is_timecode_frame_50(tmp_path):
+    source = tmp_path / "x6.mp4"
+    source.write_bytes(b"")
+    edl_path = tmp_path / "cut.edl"
+    xml_path = tmp_path / "cut.fcpxml"
+    media = _media(source, 100, 1, audio=False)
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_edl([(0.0, 0.5)], str(source), str(edl_path), source=media)
+    TimelineExporter.to_fcp_xml([(0.0, 0.5)], str(source), str(xml_path), source=media)
+
+    assert "00:00:00:00 00:00:00:50 00:00:00:00 00:00:00:50" in edl_path.read_text(
+        encoding="utf-8")
+    root = _read_fcpxml(xml_path)[1]
+    frame = root.find("resources/format").get("frameDuration")
+    assert frame == "100/10000s"
+    clip = root.find("library/event/project/sequence/spine/asset-clip")
+    assert _frames(clip.get("duration"), frame) == 50
+
+
+def test_120_fps_fcpxml_is_not_written_as_30(tmp_path):
+    """A 30 fps rewrite would store five seconds as 150 frames of 100/3000s."""
+    source = tmp_path / "x6.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 5.0), (0.0, 1 / 120)], str(source), str(out),
+        source=_media(source, 120, 1, audio=False))
+
+    root = _read_fcpxml(out)[1]
+    fmt = root.find("resources/format")
+    frame = fmt.get("frameDuration")
+    clips = root.findall("library/event/project/sequence/spine/asset-clip")
+    assert frame == "100/12000s"
+    assert frame != "100/3000s"
+    assert "p120" in fmt.get("name")
+    assert "p30" not in fmt.get("name")
+    assert _frames(clips[0].get("duration"), frame) == 600
+    assert _frames(clips[0].get("duration"), frame) != 150
+    assert _frames(clips[1].get("duration"), frame) == 1
+
+
+def test_high_fps_edl_frame_fields_stay_within_two_digits(tmp_path):
+    """100 source frames at 120 is frame 100 on that clock, and 50 at 60.
+
+    Five seconds is an exact second on both clocks, so it cannot catch a
+    three-digit frame field. This duration can.
+    """
+    source = tmp_path / "x6.mp4"
+    source.write_bytes(b"")
+
+    from video_ai_editor.timeline_export import TimelineExporter
+
+    def written(num, seconds, name):
+        out = tmp_path / name
+        TimelineExporter.to_edl(
+            [(0.0, 5.0), (0.0, seconds)], str(source), str(out),
+            source=_media(source, num, 1, audio=True),
+            spans=(Span(kind="speech", start=1.0, end=2.0, label="hello"),))
+        return out.read_text(encoding="utf-8")
+
+    text = written(120, 100 / 120, "cut-120.edl")
+    fields = _timecode_frame_fields(text)
+    assert fields
+    assert all(len(field) == 2 and int(field) <= 99 for field in fields)
+    assert "00:00:00:50" in text
+    assert "00:00:05:00" in text
+    assert ":100" not in text
+
+    fast = written(240, 200 / 240, "cut-240.edl")
+    fast_fields = _timecode_frame_fields(fast)
+    assert fast_fields
+    assert all(len(field) == 2 and int(field) <= 99 for field in fast_fields)
+    assert "00:00:00:50" in fast
+    assert "00:00:05:00" in fast
+
+
+def test_a_locator_never_sits_between_picture_and_audio(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.edl"
+    spans = (
+        Span(kind="speech", start=1.0, end=2.0, label="first"),
+        Span(kind="speech", start=12.0, end=13.0, label="second"),
+    )
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_edl(
+        [(0.0, 5.0), (10.0, 20.0)], str(source), str(out),
+        source=_media(source, 30, 1, audio=True), spans=spans)
+
+    lines = out.read_text(encoding="utf-8").splitlines()
+    picture = [i for i, line in enumerate(lines) if " V     C" in line]
+    assert len(picture) == 2
+    for index in picture:
+        window = lines[index:index + 5]
+        assert all(not line.startswith("* LOC:") for line in window)
+        assert window[1].startswith("* FROM CLIP NAME:")
+        assert window[2].startswith("* SOURCE FILE:")
+        assert " A     C" in window[3]
+        assert window[0][:3] == window[3][:3]
+        assert window[4].startswith("* FROM CLIP NAME:")
+    last_audio = max(i for i, line in enumerate(lines) if " A     C" in line)
+    locators = [i for i, line in enumerate(lines) if line.startswith("* LOC:")]
+    assert len(locators) == 2
+    assert min(locators) > last_audio
+
+
+def test_a_zero_frame_clip_is_absent_from_both_files(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    edl_path = tmp_path / "cut.edl"
+    xml_path = tmp_path / "cut.fcpxml"
+    media = _media(source, 30, 1, audio=False)
+    clips = [(0.0, 0.001), (0.0, 1.0)]
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    edl = TimelineExporter.to_edl(clips, str(source), str(edl_path), source=media)
+    xml = TimelineExporter.to_fcp_xml(clips, str(source), str(xml_path), source=media)
+
+    assert edl.skipped == 1 and xml.skipped == 1
+    assert edl_path.read_text(encoding="utf-8").count(" V     C") == 1
+    assert len(_read_fcpxml(xml_path)[1].findall(
+        "library/event/project/sequence/spine/asset-clip")) == 1
