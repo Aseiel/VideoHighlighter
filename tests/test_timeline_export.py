@@ -20,10 +20,15 @@ from video_ai_editor.timeline_export import (
     Span,
     Timebase,
     cmx_text,
+    count_markers,
+    default_export_path,
     edl_frame_index,
     edl_fps_for_nominal,
+    export_summary,
+    record_start_for_format,
     record_start_seconds,
     reel_name,
+    skipped_note,
     to_frames,
 )
 
@@ -1149,3 +1154,120 @@ def test_probe_video_still_returns_a_float_frame_rate(monkeypatch):
     assert info["fps"] == pytest.approx(30000 / 1001)
     assert info["width"] == 1920 and info["height"] == 1080
     assert info["rotation"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Dialog helpers
+# ---------------------------------------------------------------------------
+
+def _sequence(num, den, clips, spans=()):
+    return Sequence(
+        title="clip", source=_source(num, den), clips=tuple(clips), spans=tuple(spans))
+
+
+def test_count_markers_is_one_overlap_per_clip():
+    speech = Span("speech", 1.0, 2.0, "hello")
+    assert count_markers(_sequence(30, 1, [(0.0, 5.0)], [speech])) == 1
+    assert count_markers(_sequence(30, 1, [(0.0, 5.0)], [
+        Span("speech", 8.0, 9.0, "later")])) == 0
+    across = Span("speech", 1.0, 5.0, "across")
+    assert count_markers(_sequence(30, 1, [(0.0, 2.0), (4.0, 6.0)], [across])) == 2
+
+
+def test_export_summary_names_the_fraction_and_only_coarsens_above_100():
+    ntsc = export_summary(2, 5.0, Timebase.from_fraction(30000, 1001), 1)
+    assert "29.97 fps, 30000/1001" in ntsc
+    assert "FCPXML keeps every frame" not in ntsc
+    assert "1 marker" in ntsc
+
+    high = export_summary(1, 5.0, Timebase.from_fraction(120, 1), 0)
+    assert "120 fps, 120/1" in high
+    assert "FCPXML keeps every frame" in high
+    assert "The EDL is counted at 60 fps." in high
+
+    hundred = export_summary(1, 1.0, Timebase.from_fraction(100, 1), 0)
+    assert "100 fps, 100/1" in hundred
+    assert "FCPXML keeps every frame" not in hundred
+
+
+def test_csv_forces_the_default_sequence_start():
+    assert record_start_for_format("CSV", RECORD_START_HOUR) == RECORD_START_ZERO
+    assert record_start_for_format("EDL (CMX 3600)", RECORD_START_HOUR) == RECORD_START_HOUR
+    assert record_start_for_format("FCPXML", RECORD_START_ZERO) == RECORD_START_ZERO
+    with pytest.raises(ExportError):
+        record_start_for_format("EDL (CMX 3600)", "02:00:00:00")
+
+
+def test_skipped_note_is_empty_until_a_clip_is_dropped():
+    assert skipped_note(0) == ""
+    assert skipped_note(1).startswith("\n1 clip was shorter")
+    note = skipped_note(2)
+    assert note.startswith("\n")
+    assert "2 clips were shorter" in note
+
+
+def test_default_export_path_uses_the_format_extension(tmp_path):
+    video = tmp_path / "morning.mp4"
+    edl, edl_filter = default_export_path(str(video), "*.edl")
+    xml, xml_filter = default_export_path(str(video), "*.fcpxml")
+    csv_path, csv_filter = default_export_path(str(video), "*.csv")
+    assert edl.endswith("morning_edit.edl")
+    assert xml.endswith("morning_edit.fcpxml")
+    assert csv_path.endswith("morning_edit.csv")
+    assert edl_filter == "EDL files (*.edl)"
+    assert xml_filter == "FCPXML files (*.fcpxml)"
+    assert csv_filter == "CSV files (*.csv)"
+    with pytest.raises(ExportError):
+        default_export_path(str(video), "*.xml")
+
+
+def test_prepare_export_probes_once_and_counts_a_marker(tmp_path, monkeypatch):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    calls = []
+
+    def once(path):
+        calls.append(path)
+        return _probe_document(rate="30000/1001", rotation=0, audio=False)
+
+    monkeypatch.setattr("modules.media.ffmpeg_tools.probe", once)
+    from video_ai_editor.timeline_export import prepare_export
+    media, spans, summary = prepare_export(
+        str(source),
+        [(0.0, 5.0)],
+        {"transcript": {"segments": [{"start": 1.0, "end": 2.0, "text": "hello"}]}},
+        5.0,
+    )
+    assert calls == [str(source)]
+    assert list(tmp_path.iterdir()) == [source]
+    assert (media.fps_num, media.fps_den) == (30000, 1001)
+    assert len(spans) == 1
+    assert "29.97 fps, 30000/1001" in summary
+    assert "1 marker" in summary
+    assert "FCPXML keeps every frame" not in summary
+
+
+def _method_source(source: str, name: str) -> str:
+    marker = f"def {name}("
+    start = source.index(marker)
+    nxt = source.find("\n    def ", start + len(marker))
+    return source[start:] if nxt == -1 else source[start:nxt]
+
+
+def test_the_export_button_writes_every_edit_clip_and_leaves_render_alone():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, "signal_timeline_viewer.py")
+    source = open(path, encoding="utf-8").read()
+    export = _method_source(source, "on_export_clicked")
+    assert "self.edit_scene.clips" in export
+    assert "isSelected" not in export
+    assert "remove_selected" not in export
+    assert "prepare_export" in export
+    assert "record_start" in export
+    assert "spans" in export
+    assert "*.fcpxml" in export or "default_export_path" in export
+    assert "*.xml" not in export
+    render = _method_source(source, "on_render_highlight_clicked")
+    assert "render_mode_combo" in render
+    assert "get_clip_times" in render
+    assert "_highlight.mp4" in render

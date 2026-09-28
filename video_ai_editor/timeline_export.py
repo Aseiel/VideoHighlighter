@@ -991,6 +991,95 @@ def _export_sequence(clips, video_path, source: MediaSource | None,
     )
 
 
+def count_markers(sequence: Sequence) -> int:
+    """Marker overlaps FCPXML would write, counted on the real frame clock.
+
+    A span that crosses two clips counts twice. A span that misses every
+    clip, and an overlap that quantises to zero frames, count as nothing.
+    """
+    timebase = sequence.timebase()
+
+    def index_of(seconds: float) -> int:
+        return to_frames(seconds, timebase.fps_num, timebase.fps_den)
+
+    total = 0
+    for start, end in sequence.clips:
+        quantised = _source_clip(start, end, timebase)
+        if quantised is None:
+            continue
+        src_in, src_out = quantised
+        total += len(_overlaps(
+            sequence.spans, start, end, src_in, src_out, index_of))
+    return total
+
+
+def export_summary(clip_count: int, duration: float, timebase: Timebase,
+                   markers: int) -> str:
+    """The info line under the format combo."""
+    mark = "marker" if markers == 1 else "markers"
+    text = (
+        f"Exporting {clip_count} clips, total duration: {duration:.1f}s. "
+        f"{timebase.describe()}. {markers} {mark}."
+    )
+    if timebase.coarsened:
+        text += (
+            f" FCPXML keeps every frame. "
+            f"The EDL is counted at {timebase.edl_fps} fps."
+        )
+    return text
+
+
+def record_start_for_format(format_name: str, chosen: str) -> str:
+    """Sequence start for this format. CSV has no sequence clock."""
+    if str(format_name).startswith("CSV"):
+        return RECORD_START_ZERO
+    if chosen not in RECORD_STARTS:
+        raise ExportError(
+            f"record start must be {RECORD_START_ZERO} or {RECORD_START_HOUR}, "
+            f"got {chosen!r}")
+    return chosen
+
+
+def skipped_note(count: int) -> str:
+    """Success-message suffix. Zero skips add nothing."""
+    if count <= 0:
+        return ""
+    if count == 1:
+        return "\n1 clip was shorter than one frame and was skipped."
+    return f"\n{count} clips were shorter than one frame and were skipped."
+
+
+def default_export_path(video_path: str, pattern: str) -> tuple[str, str]:
+    """Save path beside the source, and the file-dialog filter for ``pattern``."""
+    directory = os.path.dirname(os.path.abspath(str(video_path)))
+    stem = _stem(video_path)
+    filters = {
+        "*.edl": ("edl", "EDL files (*.edl)"),
+        "*.fcpxml": ("fcpxml", "FCPXML files (*.fcpxml)"),
+        "*.csv": ("csv", "CSV files (*.csv)"),
+    }
+    chosen = filters.get(pattern)
+    if chosen is None:
+        raise ExportError(f"unknown export pattern {pattern!r}")
+    extension, file_filter = chosen
+    return os.path.join(directory, f"{stem}_edit.{extension}"), file_filter
+
+
+def prepare_export(video_path, clips, cache, duration):
+    """Probe once and describe the export. Does not write a file.
+
+    A probe failure propagates. The summary counts markers on the real
+    frame clock, which is what FCPXML writes.
+    """
+    source = probe_media_source(str(video_path))
+    spans = spans_from_analysis(cache)
+    sequence = _export_sequence(
+        clips, video_path, source, RECORD_START_ZERO, spans)
+    summary = export_summary(
+        len(clips), float(duration), sequence.timebase(), count_markers(sequence))
+    return source, spans, summary
+
+
 class TimelineExporter:
     """Export edit timeline to various formats"""
 

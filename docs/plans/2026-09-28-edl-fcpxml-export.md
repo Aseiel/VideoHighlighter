@@ -210,28 +210,28 @@ copied here so this module does not import the timeline scene.
 
 ### Steps
 
-- [ ] Probe and build spans before the dialog. On probe failure, show the
+- [x] Probe and build spans before the dialog. On probe failure, show the
       error and do not open the dialog.
-- [ ] Keep the format combo, now the three formats from Task 4. Default save
+- [x] Keep the format combo, now the three formats from Task 4. Default save
       names stay `{stem}_edit` with `.edl`, `.fcpxml`, or `.csv`.
-- [ ] Add a sequence-start combo: `00:00:00:00` (preselected) and
+- [x] Add a sequence-start combo: `00:00:00:00` (preselected) and
       `01:00:00:00`. The second entry's tooltip says it matches a new Resolve
       timeline. Disable the combo while CSV is selected, and leave it on the
       default.
-- [ ] The info line shows clip count, duration, the frame rate as a fraction,
+- [x] The info line shows clip count, duration, the frame rate as a fraction,
       and the marker count. When the rate is over 100 fps, the line says the
       FCPXML keeps every frame and the EDL is counted at the coarsened rate.
-- [ ] Pass `record_start` and the spans into the writer. An empty edit
+- [x] Pass `record_start` and the spans into the writer. An empty edit
       timeline still shows the existing "add some clips" warning and writes
       nothing.
-- [ ] Show the skipped-clip count in the success message when it is not zero.
+- [x] Show the skipped-clip count in the success message when it is not zero.
 
 ### Acceptance criteria
 
-- [ ] Export still writes every clip on the edit timeline. The yellow
+- [x] Export still writes every clip on the edit timeline. The yellow
       highlight is not consulted.
-- [ ] CSV cannot be given a sequence start other than the default.
-- [ ] **Render Highlight Video** and the encoder combo are unchanged.
+- [x] CSV cannot be given a sequence start other than the default.
+- [x] **Render Highlight Video** and the encoder combo are unchanged.
 
 ## Task 8 — Chat command
 

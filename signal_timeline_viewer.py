@@ -53,7 +53,16 @@ from modules.system import startup_splash
 from modules.media.audio_device import follow_system_default
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
-from video_ai_editor.timeline_export import ExportError, TimelineExporter
+from video_ai_editor.timeline_export import (
+    RECORD_START_HOUR,
+    RECORD_START_ZERO,
+    ExportError,
+    TimelineExporter,
+    default_export_path,
+    prepare_export,
+    record_start_for_format,
+    skipped_note,
+)
 from video_ai_editor.waveform import WaveformVisualizer
 from video_ai_editor.timeline_bars import TimelineBar
 from video_ai_editor.signal_timeline import SignalTimelineScene, SignalTimelineView
@@ -4424,102 +4433,137 @@ class SignalTimelineWindow(QMainWindow):
     
     @Slot()
     def on_export_clicked(self):
-        """Export the edit timeline to EDL/XML for DaVinci Resolve"""
+        """Export every clip on the edit timeline."""
         if len(self.edit_scene.clips) == 0:
             QMessageBox.warning(self, "No Clips", "Add some clips to the edit timeline first!")
             return
-              
-        # Ask user for format
+
+        try:
+            source, spans, summary = prepare_export(
+                self.video_path,
+                self.edit_scene.clips,
+                getattr(self, "cache_data", None),
+                self.edit_scene.get_total_duration(),
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed",
+                                 f"Failed to export timeline:\n{str(e)}")
+            return
+
         formats = TimelineExporter.get_export_formats()
-        
-        # Create simple format selector
+
         dialog = QDialog(self)
         dialog.setWindowTitle("Export Timeline")
-        dialog.resize(400, 200)
-        
+        dialog.resize(440, 280)
+
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel("Select export format:"))
-        
+
         format_combo = QComboBox()
-        for name, _ in formats:
+        for name, _pattern in formats:
             format_combo.addItem(name)
         layout.addWidget(format_combo)
-        
-        # Info label
-        info = QLabel(f"Exporting {len(self.edit_scene.clips)} clips, "
-                    f"total duration: {self.edit_scene.get_total_duration():.1f}s")
+
+        layout.addWidget(QLabel("Sequence start:"))
+        start_combo = QComboBox()
+        start_combo.addItem("Start at 00:00:00:00", RECORD_START_ZERO)
+        start_combo.addItem("Start at 01:00:00:00", RECORD_START_HOUR)
+        start_combo.setItemData(
+            1, "Matches a new Resolve timeline.", Qt.ItemDataRole.ToolTipRole)
+        start_combo.setCurrentIndex(0)
+
+        def _sync_start_tooltip():
+            tip = start_combo.itemData(
+                start_combo.currentIndex(), Qt.ItemDataRole.ToolTipRole)
+            start_combo.setToolTip(tip or "")
+
+        start_combo.currentIndexChanged.connect(lambda _index: _sync_start_tooltip())
+        _sync_start_tooltip()
+        layout.addWidget(start_combo)
+
+        def _on_format_changed():
+            name = format_combo.currentText()
+            if name.startswith("CSV"):
+                start_combo.setCurrentIndex(0)
+                start_combo.setEnabled(False)
+            else:
+                start_combo.setEnabled(True)
+
+        format_combo.currentIndexChanged.connect(lambda _index: _on_format_changed())
+        _on_format_changed()
+
+        info = QLabel(summary)
+        info.setWordWrap(True)
         info.setStyleSheet("color: #a0ffa0; padding: 8px; background: #1a2a1a; border-radius: 4px;")
         layout.addWidget(info)
-        
-        # Buttons
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        
-        if dialog.exec() == QDialog.Accepted:
-            format_idx = format_combo.currentIndex()
-            format_name, format_pattern = formats[format_idx]
-            
-            # Ask for save location
-            from PySide6.QtWidgets import QFileDialog
-            
-            default_name = os.path.splitext(os.path.basename(self.video_path))[0] + "_edit"
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        format_name, format_pattern = formats[format_combo.currentIndex()]
+        try:
+            default_path, filter_str = default_export_path(
+                self.video_path, format_pattern)
+        except ExportError as e:
+            QMessageBox.warning(self, "Export", str(e))
+            return
+
+        from PySide6.QtWidgets import QFileDialog
+
+        file_path, _selected = QFileDialog.getSaveFileName(
+            self, "Save Timeline", default_path, filter_str
+        )
+        if not file_path:
+            return
+
+        record_start = record_start_for_format(
+            format_name, start_combo.currentData())
+        clips = self.edit_scene.clips
+        try:
             if format_name.startswith("EDL"):
-                default_path = os.path.join(os.path.dirname(self.video_path), f"{default_name}.edl")
-                filter_str = "EDL files (*.edl)"
+                result = TimelineExporter.to_edl(
+                    clips, self.video_path, file_path,
+                    source=source, record_start=record_start, spans=spans)
+                msg = f"EDL exported to: {os.path.basename(result)}"
             elif format_name.startswith("FCPXML"):
-                default_path = os.path.join(os.path.dirname(self.video_path), f"{default_name}.xml")
-                filter_str = "XML files (*.xml)"
+                result = TimelineExporter.to_fcp_xml(
+                    clips, self.video_path, file_path,
+                    source=source, record_start=record_start, spans=spans)
+                msg = f"FCPXML exported to: {os.path.basename(result)}"
             elif format_name.startswith("CSV"):
-                default_path = os.path.join(os.path.dirname(self.video_path), f"{default_name}.csv")
-                filter_str = "CSV files (*.csv)"
+                result = TimelineExporter.to_csv(
+                    clips, self.video_path, file_path,
+                    source=source, record_start=record_start, spans=spans)
+                msg = f"CSV exported to: {os.path.basename(result)}"
             else:
-                QMessageBox.warning(self, "Export",
-                                    f"Unknown export format: {format_name}")
-                return
-            
-            file_path, _ = QFileDialog.getSaveFileName(
-                self, "Save Timeline", default_path, filter_str
-            )
-            
-            if not file_path:
-                return
-            
-            # Export
-            try:
-                if format_name.startswith("EDL"):
-                    result = TimelineExporter.to_edl(self.edit_scene.clips, self.video_path, file_path)
-                    msg = f"EDL exported to: {os.path.basename(result)}"
-                elif format_name.startswith("FCPXML"):
-                    result = TimelineExporter.to_fcp_xml(self.edit_scene.clips, self.video_path, file_path)
-                    msg = f"FCPXML exported to: {os.path.basename(result)}"
-                elif format_name.startswith("CSV"):
-                    result = TimelineExporter.to_csv(self.edit_scene.clips, self.video_path, file_path)
-                    msg = f"CSV exported to: {os.path.basename(result)}"
+                raise ExportError(f"unknown export format {format_name!r}")
+
+            QMessageBox.information(
+                self, "Export Successful",
+                f"✅ Timeline exported successfully!\n\n{msg}"
+                f"{skipped_note(result.skipped)}")
+
+            reply = QMessageBox.question(self, "Open Folder",
+                                         "Open containing folder?",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                import subprocess
+                folder = os.path.dirname(file_path)
+                if sys.platform == 'win32':
+                    os.startfile(folder)
+                elif sys.platform == 'darwin':
+                    subprocess.run(['open', folder])
                 else:
-                    raise ExportError(f"unknown export format {format_name!r}")
-                
-                QMessageBox.information(self, "Export Successful", 
-                                    f"✅ Timeline exported successfully!\n\n{msg}")
-                
-                # Optional: Open containing folder
-                reply = QMessageBox.question(self, "Open Folder", 
-                                            "Open containing folder?",
-                                            QMessageBox.Yes | QMessageBox.No)
-                if reply == QMessageBox.Yes:
-                    import subprocess
-                    folder = os.path.dirname(file_path)
-                    if sys.platform == 'win32':
-                        os.startfile(folder)
-                    elif sys.platform == 'darwin':
-                        subprocess.run(['open', folder])
-                    else:
-                        subprocess.run(['xdg-open', folder])
-                        
-            except Exception as e:
-                QMessageBox.critical(self, "Export Failed", 
-                                    f"Failed to export timeline:\n{str(e)}")
+                    subprocess.run(['xdg-open', folder])
+
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed",
+                                 f"Failed to export timeline:\n{str(e)}")
     
     def update_edit_duration(self):
         """Update edit duration display"""
