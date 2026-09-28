@@ -86,37 +86,37 @@ Pure data, no file writing and no Qt. Lives in
 
 ### Steps
 
-- [ ] Write the document in the design: doctype, `fcpxml version="1.9"`, one
+- [x] Write the document in the design: doctype, `fcpxml version="1.9"`, one
       `format`, one `asset`, one `library` / `event` / `project` / `sequence`
       / `spine`, one `asset-clip` per kept clip.
-- [ ] Times are reduced rational seconds in the real frame duration. The
+- [x] Times are reduced rational seconds in the real frame duration. The
       asset duration is the whole file. The sequence duration is the sum of
       the clips.
-- [ ] `asset-clip` `start` is the source in-point. `offset` is the record
+- [x] `asset-clip` `start` is the source in-point. `offset` is the record
       start plus the durations before it. At `01:00:00:00` the first offset
       equals `tcStart`.
-- [ ] `frameDuration`, width, and height come from `MediaSource`. Width and
+- [x] `frameDuration`, width, and height come from `MediaSource`. Width and
       height are the display size. The format name uses the design's rate
       token, including `120` and `240` for those real rates.
-- [ ] `media-rep src` is a file URL from `urllib.request.pathname2url`.
-- [ ] Audio attributes follow the probe: absent when there is no audio
+- [x] `media-rep src` is a file URL from `urllib.request.pathname2url`.
+- [x] Audio attributes follow the probe: absent when there is no audio
       stream, otherwise the probed channel count and sample rate.
       `audioLayout="stereo"` only for two channels.
-- [ ] No `colorSpace`. Clip names are `Clip 1`, `Clip 2`, in edit order.
-- [ ] Same skip rule, same `.part` replace, and `output_path is None` writes
+- [x] No `colorSpace`. Clip names are `Clip 1`, `Clip 2`, in edit order.
+- [x] Same skip rule, same `.part` replace, and `output_path is None` writes
       `{stem}_edit.fcpxml` beside the source.
 
 ### Acceptance criteria
 
-- [ ] A two-clip sequence at `30000/1001` parses with `xml.etree`. Clip
+- [x] A two-clip sequence at `30000/1001` parses with `xml.etree`. Clip
       `start`, `duration`, and `offset` convert back to the frame counts.
       Sequence duration is the sum. Asset duration is the file length.
-- [ ] At 120 fps, `frameDuration` is `100/12000s` and a five-second clip is
+- [x] At 120 fps, `frameDuration` is `100/12000s` and a five-second clip is
       600 frames. At 240 fps, `frameDuration` is `100/24000s`.
-- [ ] A path containing a space is percent-encoded.
-- [ ] A 90° rotation swaps width and height on `format`.
-- [ ] No audio stream produces `hasAudio="0"` and no audio attributes.
-- [ ] `record_start="01:00:00:00"` sets `tcStart` to one hour and the first
+- [x] A path containing a space is percent-encoded.
+- [x] A 90° rotation swaps width and height on `format`.
+- [x] No audio stream produces `hasAudio="0"` and no audio attributes.
+- [x] `record_start="01:00:00:00"` sets `tcStart` to one hour and the first
       clip's `offset` equal to that `tcStart`.
 
 ## Task 4 — CSV, and dropping JSON

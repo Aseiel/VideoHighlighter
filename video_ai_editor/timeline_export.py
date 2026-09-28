@@ -11,6 +11,7 @@ import math
 import os
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from urllib.request import pathname2url
 from xml.dom import minidom
 
 RECORD_START_ZERO = "00:00:00:00"
@@ -373,6 +374,208 @@ def write_cmx(sequence: Sequence, output_path: str | None = None) -> WrittenExpo
     return WrittenExport(path=output_path, skipped=skipped)
 
 
+def _source_clip(start: float, end: float, timebase: Timebase) -> tuple[int, int] | None:
+    """Source in/out in real frames, or None when the clip has no frames.
+
+    FCPXML keeps every real frame. The EDL clock is coarser above 100 fps,
+    so a one-frame clip at 120 fps is kept here and dropped by the EDL.
+    """
+    if end <= start:
+        return None
+    src_in = to_frames(start, timebase.fps_num, timebase.fps_den)
+    src_out = to_frames(end, timebase.fps_num, timebase.fps_den)
+    if src_out <= src_in:
+        return None
+    return src_in, src_out
+
+
+def _format_rational(num: int, den: int) -> str:
+    """Reduced rational seconds, ``5s`` or ``1001/200s``."""
+    if den <= 0:
+        raise ExportError(f"time denominator {den} is not positive")
+    if num <= 0:
+        return "0s"
+    factor = math.gcd(int(num), int(den))
+    num //= factor
+    den //= factor
+    if den == 1:
+        return f"{num}s"
+    return f"{num}/{den}s"
+
+
+def _parse_rational(token: str) -> tuple[int, int]:
+    body = token[:-1] if token.endswith("s") else token
+    if "/" not in body:
+        return int(body), 1
+    num, den = body.split("/", 1)
+    return int(num), int(den)
+
+
+def _add_rational(left: str, right: str) -> str:
+    left_num, left_den = _parse_rational(left)
+    right_num, right_den = _parse_rational(right)
+    return _format_rational(
+        left_num * right_den + right_num * left_den,
+        left_den * right_den,
+    )
+
+
+def frames_to_time(frames: int, timebase: Timebase) -> str:
+    """``frames`` of the real frame duration, reduced.
+
+    A 30 fps file writes ``5s`` for 150 frames, not ``15000/3000s``.
+    """
+    if frames <= 0:
+        return "0s"
+    return _format_rational(int(frames) * timebase.fps_den, timebase.fps_num)
+
+
+def file_url(path: str) -> str:
+    """``file://`` URL. Spaces and non-ASCII are percent-encoded.
+
+    ``pathname2url`` leaves the leading slash, so a POSIX path becomes
+    ``file:///...`` and a Windows path becomes ``file:///C:/...``.
+    """
+    return "file://" + pathname2url(os.path.abspath(path))
+
+
+def _sequence_audio_rate(rate: int) -> str:
+    """FCPXML sequence rates are named (``48k``); the asset uses hertz."""
+    named = {44100: "44.1k", 88200: "88.2k", 176400: "176.4k"}
+    if rate in named:
+        return named[rate]
+    if rate > 0 and rate % 1000 == 0:
+        return f"{rate // 1000}k"
+    return str(rate)
+
+
+def _record_origin(record_start: str) -> str:
+    """Sequence ``tcStart``. One hour is ``3600s`` on every rate."""
+    seconds = record_start_seconds(record_start)
+    if seconds == 0:
+        return "0s"
+    return _format_rational(seconds, 1)
+
+
+def _serialize_fcpxml(root: ET.Element) -> str:
+    pretty = minidom.parseString(
+        ET.tostring(root, encoding="unicode")).toprettyxml(indent="  ")
+    lines = [line for line in pretty.splitlines() if line.strip()]
+    if lines and lines[0].startswith("<?xml"):
+        lines[0] = '<?xml version="1.0" encoding="UTF-8"?>'
+    else:
+        lines.insert(0, '<?xml version="1.0" encoding="UTF-8"?>')
+    lines.insert(1, "<!DOCTYPE fcpxml>")
+    return "\n".join(lines) + "\n"
+
+
+def fcpxml_text(sequence: Sequence) -> tuple[str, int]:
+    """FCPXML 1.9 for ``sequence``, and how many clips were skipped.
+
+    Raises :class:`ExportError` when there is nothing to write. Does not
+    touch the disk. Spans become markers in a later step.
+    """
+    if not sequence.clips:
+        raise ExportError("nothing to export — the edit timeline has no clips")
+
+    timebase = sequence.timebase()
+    kept: list[tuple[int, int]] = []
+    skipped = 0
+    for start, end in sequence.clips:
+        quantised = _source_clip(start, end, timebase)
+        if quantised is None:
+            skipped += 1
+            continue
+        kept.append(quantised)
+    if not kept:
+        raise ExportError(
+            "every clip is shorter than one frame at "
+            f"{timebase.fps_num}/{timebase.fps_den}")
+
+    source = sequence.source
+    filename = os.path.basename(source.path) or "untitled"
+    fmt = ET.Element("format", {
+        "id": "r1",
+        "name": f"FFVideoFormat{source.height}p{timebase.rate_token}",
+        "frameDuration": timebase.frame_duration,
+        "width": str(source.width),
+        "height": str(source.height),
+    })
+    asset_attrib = {
+        "id": "r2",
+        "name": filename,
+        "start": "0s",
+        "duration": frames_to_time(
+            to_frames(source.duration, timebase.fps_num, timebase.fps_den),
+            timebase,
+        ),
+        "hasVideo": "1",
+        "hasAudio": "1" if source.has_audio else "0",
+        "format": "r1",
+    }
+    if source.has_audio:
+        asset_attrib["audioSources"] = "1"
+        asset_attrib["audioChannels"] = str(source.audio_channels)
+        asset_attrib["audioRate"] = str(source.audio_rate)
+    asset = ET.Element("asset", asset_attrib)
+    ET.SubElement(asset, "media-rep", {
+        "kind": "original-media",
+        "src": file_url(source.path),
+    })
+    resources = ET.Element("resources")
+    resources.append(fmt)
+    resources.append(asset)
+
+    origin = _record_origin(sequence.record_start)
+    total_frames = sum(src_out - src_in for src_in, src_out in kept)
+    sequence_attrib = {
+        "format": "r1",
+        "duration": frames_to_time(total_frames, timebase),
+        "tcStart": origin,
+        "tcFormat": "NDF",
+    }
+    if source.has_audio and source.audio_channels == 2:
+        sequence_attrib["audioLayout"] = "stereo"
+    if source.has_audio and source.audio_rate:
+        sequence_attrib["audioRate"] = _sequence_audio_rate(source.audio_rate)
+    sequence_el = ET.Element("sequence", sequence_attrib)
+    spine = ET.SubElement(sequence_el, "spine")
+    offset = origin
+    for index, (src_in, src_out) in enumerate(kept, start=1):
+        duration = frames_to_time(src_out - src_in, timebase)
+        ET.SubElement(spine, "asset-clip", {
+            "ref": "r2",
+            "offset": offset,
+            "name": f"Clip {index}",
+            "start": frames_to_time(src_in, timebase),
+            "duration": duration,
+            "tcFormat": "NDF",
+        })
+        offset = _add_rational(offset, duration)
+
+    project = ET.Element("project", {"name": sequence.title or _stem(source.path)})
+    project.append(sequence_el)
+    event = ET.Element("event", {"name": "VideoHighlighter"})
+    event.append(project)
+    library = ET.Element("library")
+    library.append(event)
+    root = ET.Element("fcpxml", {"version": "1.9"})
+    root.append(resources)
+    root.append(library)
+    return _serialize_fcpxml(root), skipped
+
+
+def write_fcpxml(sequence: Sequence, output_path: str | None = None) -> WrittenExport:
+    """Write FCPXML 1.9. ``output_path`` defaults to ``{stem}_edit.fcpxml``."""
+    text, skipped = fcpxml_text(sequence)
+    if output_path is None:
+        directory = os.path.dirname(os.path.abspath(sequence.source.path))
+        output_path = os.path.join(
+            directory, f"{_stem(sequence.source.path)}_edit.fcpxml")
+    _write_text(output_path, text)
+    return WrittenExport(path=output_path, skipped=skipped)
+
+
 class TimelineExporter:
     """Export edit timeline to various formats"""
 
@@ -404,94 +607,31 @@ class TimelineExporter:
         return write_cmx(sequence, output_path)
     
     @staticmethod
-    def to_fcp_xml(clips, video_path, output_path=None, fps=30):
+    def to_fcp_xml(clips, video_path, output_path=None, fps=30, *,
+                   source: MediaSource | None = None,
+                   record_start: str = RECORD_START_ZERO,
+                   spans: tuple = ()):
+        """Write an FCPXML 1.9 sequence for ``clips``.
+
+        Pass ``source`` to use the probed frame rate, display size, and
+        audio. Without it, ``fps`` is a whole-number stand-in so existing
+        callers still get a file; the export dialog will probe instead.
         """
-        Export to Final Cut Pro XML format (DaVinci Resolve compatible)
-        
-        Args:
-            clips: List of (start_time, end_time) tuples in seconds
-            video_path: Path to source video
-            output_path: Output file path (None = auto-generate)
-            fps: Frames per second
-        """
-        if not clips:
-            return None
-            
-        if output_path is None:
-            base = os.path.splitext(video_path)[0]
-            output_path = f"{base}_edit.xml"
-        
-        video_name = os.path.basename(video_path)
-        
-        # Create XML structure
-        fcpxml = ET.Element("fcpxml", version="1.9")
-        resources = ET.SubElement(fcpxml, "resources")
-        library = ET.SubElement(fcpxml, "library")
-        event = ET.SubElement(library, "event", name="AI Video Edit")
-        project = ET.SubElement(event, "project", name="Edited Timeline")
-        sequence = ET.SubElement(project, "sequence", format="r1")
-        
-        # Add format
-        format_elem = ET.SubElement(resources, "format", 
-                                   id="r1",
-                                   name="FFVideoFormat1080p2997",
-                                   frameDuration="1001/30000",
-                                   width="1920",
-                                   height="1080")
-        
-        # Add asset
-        asset_id = f"asset-{hash(video_path) % 10000}"
-        asset = ET.SubElement(resources, "asset",
-                            id=asset_id,
-                            name=video_name,
-                            src=f"file://{video_path}")
-        
-        # Media duration
-        duration_sec = clips[-1][1] - clips[0][0] if clips else 60
-        duration_frames = int(duration_sec * fps)
-        
-        # Add sequence
-        spine = ET.SubElement(sequence, "spine")
-        
-        # Total duration in frames
-        total_duration = sum(end - start for start, end in clips)
-        sequence.set("duration", f"{int(total_duration * fps * 100)}s")
-        
-        # Add each clip
-        for i, (start, end) in enumerate(clips, 1):
-            duration = end - start
-            duration_frames = int(duration * fps * 100)
-            start_frames = int(start * fps * 100)
-            
-            clip = ET.SubElement(spine, "clip",
-                               name=f"Clip {i}",
-                               duration=f"{duration_frames}s",
-                               start=f"{start_frames}s")
-            
-            # Add video
-            video = ET.SubElement(clip, "video")
-            ET.SubElement(video, "offset", relative="start", value=f"{start_frames}s")
-            
-            # Add audio
-            audio = ET.SubElement(clip, "audio")
-            ET.SubElement(audio, "offset", relative="start", value=f"{start_frames}s")
-            
-            ET.SubElement(clip, "asset-ref", id=asset_id)
-        
-        # Pretty print
-        xml_str = ET.tostring(fcpxml, encoding='utf-8')
-        dom = minidom.parseString(xml_str)
-        pretty_xml = dom.toprettyxml(indent="  ")
-        
-        # Remove XML declaration if minidom adds it weird
-        lines = pretty_xml.split('\n')
-        if lines[0].startswith('<?xml'):
-            lines[0] = '<?xml version="1.0" encoding="utf-8"?>'
-        
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-        
-        return output_path
+        if source is None:
+            source = MediaSource(
+                path=str(video_path), duration=0.0,
+                fps_num=int(fps), fps_den=1,
+                width=0, height=0, has_audio=False,
+                audio_rate=0, audio_channels=0,
+            )
+        sequence = Sequence(
+            title=_stem(source.path or str(video_path)),
+            source=source,
+            clips=tuple((float(start), float(end)) for start, end in clips),
+            record_start=record_start,
+            spans=tuple(spans),
+        )
+        return write_fcpxml(sequence, output_path)
     
     @staticmethod
     def get_export_formats():

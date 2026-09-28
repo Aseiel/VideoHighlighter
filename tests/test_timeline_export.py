@@ -6,6 +6,7 @@ No media file and no Qt. The frame count is the r_frame_rate fraction.
 from __future__ import annotations
 
 import os
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -366,3 +367,273 @@ def test_a_reel_name_keeps_only_ascii_letters_and_digits():
     assert reel_name("my-clip") == "MYCLIP  "
     assert reel_name("—") == "REEL    "
     assert reel_name("longmorningname") == "LONGMORN"
+
+
+# ---------------------------------------------------------------------------
+# FCPXML 1.9
+# ---------------------------------------------------------------------------
+
+def _ratio(token: str) -> tuple[int, int]:
+    assert token.endswith("s")
+    body = token[:-1]
+    if "/" not in body:
+        return int(body), 1
+    num, den = body.split("/", 1)
+    return int(num), int(den)
+
+
+def _frames(time_value: str, frame_duration: str) -> int:
+    """How many real frames a rational time is, at ``frame_duration``."""
+    num, den = _ratio(time_value)
+    fd_num, fd_den = _ratio(frame_duration)
+    numerator = num * fd_den
+    denominator = den * fd_num
+    assert denominator and numerator % denominator == 0
+    return numerator // denominator
+
+
+def _read_fcpxml(path):
+    text = path.read_text(encoding="utf-8")
+    assert "\r" not in text
+    assert text.startswith(
+        '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE fcpxml>\n')
+    return text, ET.fromstring(text)
+
+
+def test_two_ntsc_clips_round_trip_to_frame_counts(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    result = TimelineExporter.to_fcp_xml(
+        [(10.0, 15.0), (0.0, 4.0)], str(source), str(out),
+        source=_media(source, 30000, 1001, duration=60.0))
+
+    text, root = _read_fcpxml(out)
+    assert root.tag == "fcpxml" and root.get("version") == "1.9"
+    assert "colorSpace" not in text
+    formats = root.findall("resources/format")
+    assets = root.findall("resources/asset")
+    clips = root.findall("library/event/project/sequence/spine/asset-clip")
+    assert len(formats) == 1 and len(assets) == 1 and len(clips) == 2
+    assert [clip.get("name") for clip in clips] == ["Clip 1", "Clip 2"]
+    assert all(clip.get("ref") == "r2" for clip in clips)
+
+    frame = formats[0].get("frameDuration")
+    assert frame == "1001/30000s"
+    assert formats[0].get("name") == "FFVideoFormat1080p2997"
+    sequence = root.find("library/event/project/sequence")
+    assert _frames(clips[0].get("start"), frame) == to_frames(10.0, 30000, 1001)
+    assert _frames(clips[0].get("duration"), frame) == 150
+    assert _frames(clips[1].get("start"), frame) == 0
+    assert _frames(clips[1].get("duration"), frame) == to_frames(4.0, 30000, 1001)
+    assert _frames(clips[0].get("offset"), frame) == 0
+    assert _frames(clips[1].get("offset"), frame) == _frames(clips[0].get("duration"), frame)
+    clip_frames = sum(_frames(clip.get("duration"), frame) for clip in clips)
+    assert _frames(sequence.get("duration"), frame) == clip_frames
+    assert _frames(assets[0].get("duration"), frame) == to_frames(60.0, 30000, 1001)
+    assert _frames(assets[0].get("duration"), frame) != clip_frames
+    assert result.skipped == 0
+
+
+def test_120_and_240_fps_keep_the_real_frame(tmp_path):
+    source = tmp_path / "x6.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    result = TimelineExporter.to_fcp_xml(
+        [(0.0, 5.0), (0.0, 1 / 120)], str(source), str(out),
+        source=_media(source, 120, 1, audio=False))
+
+    text, root = _read_fcpxml(out)
+    frame = root.find("resources/format").get("frameDuration")
+    assert frame == "100/12000s"
+    assert "p120" in root.find("resources/format").get("name")
+    clips = root.findall("library/event/project/sequence/spine/asset-clip")
+    assert _frames(clips[0].get("duration"), frame) == 600
+    assert _frames(clips[1].get("duration"), frame) == 1
+    assert result.skipped == 0
+    assert "p60" not in text
+
+    out240 = tmp_path / "fast.fcpxml"
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 1.0)], str(source), str(out240),
+        source=_media(source, 240, 1, audio=False))
+    _, root240 = _read_fcpxml(out240)
+    format240 = root240.find("resources/format")
+    assert format240.get("frameDuration") == "100/24000s"
+    assert "p240" in format240.get("name")
+    clip = root240.find("library/event/project/sequence/spine/asset-clip")
+    assert _frames(clip.get("duration"), format240.get("frameDuration")) == 240
+
+
+def test_a_path_with_a_space_is_percent_encoded(tmp_path):
+    source = tmp_path / "my movie.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 1.0)], str(source), str(out),
+        source=_media(source, 30, 1, audio=False))
+
+    src = _read_fcpxml(out)[1].find("resources/asset/media-rep").get("src")
+    assert src.startswith("file://")
+    assert "my%20movie.mp4" in src
+    assert " " not in src
+
+
+def test_display_size_is_what_format_uses_after_rotation(tmp_path):
+    """A 90° turn is already applied: stored 1920×1080 becomes 1080×1920."""
+    source = tmp_path / "phone.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+    media = _media(source, 30, 1, audio=False)
+    media = MediaSource(
+        path=media.path, duration=media.duration, fps_num=30, fps_den=1,
+        width=1080, height=1920, has_audio=False, audio_rate=0, audio_channels=0,
+    )
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_fcp_xml([(0.0, 1.0)], str(source), str(out), source=media)
+
+    fmt = _read_fcpxml(out)[1].find("resources/format")
+    assert fmt.get("width") == "1080"
+    assert fmt.get("height") == "1920"
+
+
+def test_a_silent_file_declares_no_audio(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 1.0)], str(source), str(out),
+        source=_media(source, 30, 1, audio=False))
+
+    text, root = _read_fcpxml(out)
+    asset = root.find("resources/asset")
+    assert asset.get("hasAudio") == "0"
+    for name in ("audioSources", "audioChannels", "audioRate", "audioLayout"):
+        assert asset.get(name) is None
+        assert name not in text
+
+
+def test_stereo_is_declared_only_for_two_channels(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    stereo = tmp_path / "stereo.fcpxml"
+    mono = tmp_path / "mono.fcpxml"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 1.0)], str(source), str(stereo),
+        source=_media(source, 30, 1, audio=True))
+    mono_media = MediaSource(
+        path=str(source), duration=120.0, fps_num=30, fps_den=1,
+        width=1920, height=1080, has_audio=True,
+        audio_rate=44100, audio_channels=1,
+    )
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 1.0)], str(source), str(mono), source=mono_media)
+
+    stereo_root = _read_fcpxml(stereo)[1]
+    asset = stereo_root.find("resources/asset")
+    sequence = stereo_root.find("library/event/project/sequence")
+    assert asset.get("audioChannels") == "2"
+    assert asset.get("audioRate") == "48000"
+    assert sequence.get("audioLayout") == "stereo"
+    assert sequence.get("audioRate") == "48k"
+    assert asset.get("audioLayout") is None
+
+    mono_text, mono_root = _read_fcpxml(mono)
+    assert mono_root.find("resources/asset").get("audioChannels") == "1"
+    assert mono_root.find("resources/asset").get("audioRate") == "44100"
+    assert "audioLayout" not in mono_text
+    assert mono_root.find("library/event/project/sequence").get("audioRate") == "44.1k"
+
+
+def test_one_hour_record_start_is_the_sequence_origin(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_fcp_xml(
+        [(10.0, 15.0), (0.0, 4.0)], str(source), str(out),
+        source=_media(source, 30, 1, audio=False),
+        record_start="01:00:00:00")
+
+    root = _read_fcpxml(out)[1]
+    sequence = root.find("library/event/project/sequence")
+    clips = root.findall("library/event/project/sequence/spine/asset-clip")
+    frame = root.find("resources/format").get("frameDuration")
+    assert sequence.get("tcStart") == "3600s"
+    assert clips[0].get("offset") == sequence.get("tcStart")
+    assert _frames(clips[0].get("offset"), frame) == 3600 * 30
+    assert _frames(clips[1].get("offset"), frame) == (
+        _frames(clips[0].get("offset"), frame)
+        + _frames(clips[0].get("duration"), frame))
+
+
+def test_a_zero_frame_clip_is_skipped_and_an_empty_list_writes_nothing(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    result = TimelineExporter.to_fcp_xml(
+        [(0.0, 0.001), (0.0, 1.0)], str(source), str(out),
+        source=_media(source, 30, 1, audio=False))
+    clips = _read_fcpxml(out)[1].findall(
+        "library/event/project/sequence/spine/asset-clip")
+    assert len(clips) == 1
+    assert result.skipped == 1
+
+    empty = tmp_path / "empty.fcpxml"
+    with pytest.raises(ExportError, match="no clips"):
+        TimelineExporter.to_fcp_xml([], str(source), str(empty),
+                                    source=_media(source, 30, 1))
+    assert not empty.exists()
+    assert not (tmp_path / "empty.fcpxml.part").exists()
+
+    gone = tmp_path / "gone.fcpxml"
+    with pytest.raises(ExportError, match="shorter than one frame"):
+        TimelineExporter.to_fcp_xml(
+            [(0.0, 0.001)], str(source), str(gone),
+            source=_media(source, 30, 1))
+    assert not gone.exists()
+
+
+def test_omitting_the_fcpxml_path_writes_beside_the_source(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    result = TimelineExporter.to_fcp_xml(
+        [(0.0, 1.0)], str(source), source=_media(source, 30, 1, audio=False))
+
+    assert result.path == str(tmp_path / "morning_edit.fcpxml")
+    assert os.path.isfile(result.path)
+
+
+def test_a_failed_fcpxml_replace_leaves_no_partial_file(tmp_path, monkeypatch):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    def fail_replace(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    from video_ai_editor.timeline_export import TimelineExporter
+    with pytest.raises(OSError, match="disk full"):
+        TimelineExporter.to_fcp_xml(
+            [(0.0, 1.0)], str(source), str(out),
+            source=_media(source, 30, 1, audio=False))
+
+    assert not out.exists()
+    assert not (tmp_path / "cut.fcpxml.part").exists()
