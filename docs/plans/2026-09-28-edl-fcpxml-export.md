@@ -144,44 +144,44 @@ copied here so this module does not import the timeline scene.
 
 ### Steps
 
-- [ ] Speech spans are `transcript.segments` entries that have text. Start,
+- [x] Speech spans are `transcript.segments` entries that have text. Start,
       end, and label come from the segment. Do not re-merge them.
-- [ ] Detection spans come from `actions`, then `objects`, grouped by class
+- [x] Detection spans come from `actions`, then `objects`, grouped by class
       name. Hits more than 2.0 seconds apart start a new span. The span runs
       from the first hit to the last. A single hit is one frame long.
-- [ ] Face spans come from `object_bboxes` entries that carry `identity_names`
+- [x] Face spans come from `object_bboxes` entries that carry `identity_names`
       and `track_ids`. Group by the name when there is one, otherwise by
       track id. The same 2.0 second gap. The label is the name, or `Face`.
-- [ ] Ignore the viewer's hidden rows, confidence sliders, and merge slider.
-- [ ] Clip each span to every exported clip it overlaps. Drop an overlap that
+- [x] Ignore the viewer's hidden rows, confidence sliders, and merge slider.
+- [x] Clip each span to every exported clip it overlaps. Drop an overlap that
       quantises to zero frames. A span that misses every clip is omitted.
-- [ ] Display line is `Speech: …`, `Detection: …`, or `Face: …` / `Face`.
+- [x] Display line is `Speech: …`, `Detection: …`, or `Face: …` / `Face`.
       Collapse whitespace. Strip a leading `*`.
-- [ ] EDL: after the last cut, one `* LOC:` per overlap, at the record time
+- [x] EDL: after the last cut, one `* LOC:` per overlap, at the record time
       of the overlap start. Color is `cyan`, `yellow`, or `green`. Text is
       one line, at most 80 characters, ending in `...` when cut. Order is
       record time, then speech, face, detection, then the label.
-- [ ] FCPXML: one `marker` child of the `asset-clip`, `start` measured from
+- [x] FCPXML: one `marker` child of the `asset-clip`, `start` measured from
       the first frame of that clip, `duration` the overlap. `value` is the
       display line without the 80-character cut. Speech also sets `note` to
       the full line. Escape both for XML.
-- [ ] The record-start choice moves the EDL locator and does not move the
+- [x] The record-start choice moves the EDL locator and does not move the
       marker's clip-relative `start`.
 
 ### Acceptance criteria
 
-- [ ] A transcript segment 12s–16s overlapping a clip 10s–20s writes one
+- [x] A transcript segment 12s–16s overlapping a clip 10s–20s writes one
       marker at 2s for 4s with `note` equal to the line, and one locator at
       the matching record time.
-- [ ] `01:00:00:00` adds one hour to that locator and leaves the marker
+- [x] `01:00:00:00` adds one hour to that locator and leaves the marker
       `start` at 2s.
-- [ ] A segment that ends before the first clip writes nothing in either file.
-- [ ] `Person` hits at 1.0s and 2.5s are one detection span. Hits at 1.0s and
+- [x] A segment that ends before the first clip writes nothing in either file.
+- [x] `Person` hits at 1.0s and 2.5s are one detection span. Hits at 1.0s and
       4.0s are two.
-- [ ] Two unnamed face tracks stay two spans, each labeled `Face`.
-- [ ] A speech locator longer than 80 characters is one line, ends with
+- [x] Two unnamed face tracks stay two spans, each labeled `Face`.
+- [x] A speech locator longer than 80 characters is one line, ends with
       `...`, and contains no newline.
-- [ ] An empty analysis cache writes the cut and no markers.
+- [x] An empty analysis cache writes the cut and no markers.
 
 ## Task 6 — Probe once, then export
 
