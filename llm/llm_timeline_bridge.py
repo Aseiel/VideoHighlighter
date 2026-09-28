@@ -19,6 +19,7 @@ Command format (embedded in LLM response text):
     [CMD:clear_clips]
     [CMD:save]
     [CMD:export format=edl]
+    [CMD:export format=fcpxml start=01:00:00:00]
     [CMD:visual_scan interval=60 target=some_description]
 
 Usage:
@@ -219,7 +220,7 @@ Available commands:
   [CMD:zoom level=NUMBER]                       — Set zoom (10-200, default ~50)
   [CMD:list_clips]                              — List current edit timeline clips
   [CMD:save]                                    — Save edit timeline to cache
-  [CMD:export format=edl]                       — Export timeline (edl or xml)
+  [CMD:export format=edl]                       — Export the edit timeline (edl, fcpxml, or xml). Optional start=00:00:00:00 or start=01:00:00:00
   [CMD:visual_scan interval=SECONDS target=DESCRIPTION] — Scan video frames looking for something
   [CMD:get_visual_findings]                     — List all visual search findings on the timeline
   [CMD:get_visual_findings query=NAME]          — List findings for one query only
@@ -442,22 +443,53 @@ Example:
         return "⚠️ Cache saving not available"
 
     def _cmd_export(self, p: dict) -> str:
+        """Write every edit-timeline clip beside the source. No dialog.
+
+        ``format=xml`` is FCPXML. ``start`` is ``00:00:00:00`` unless the
+        command says ``01:00:00:00``. Any other start is an error and writes
+        nothing. The path is always ``{stem}_edit.edl`` or ``.fcpxml``.
+        """
+        from video_ai_editor.timeline_export import (
+            RECORD_START_ZERO,
+            ExportError,
+            TimelineExporter,
+            default_export_path,
+            probe_media_source,
+            record_start_seconds,
+            skipped_note,
+            spans_from_analysis,
+        )
+
         fmt = p.get('format', 'edl').lower()
         clips = self._window.edit_scene.clips
         if not clips:
             return "⚠️ No clips to export"
+
+        if fmt == 'edl':
+            pattern, label, writer = '*.edl', 'EDL', TimelineExporter.to_edl
+        elif fmt in ('xml', 'fcpxml'):
+            pattern, label, writer = '*.fcpxml', 'FCPXML', TimelineExporter.to_fcp_xml
+        else:
+            return f"⚠️ Unknown format: {fmt}. Use 'edl', 'fcpxml', or 'xml'"
+
+        start = p.get('start', RECORD_START_ZERO)
         try:
-            from signal_timeline_viewer import TimelineExporter
-            if fmt in ('edl',):
-                result = TimelineExporter.to_edl(clips, self._window.video_path)
-                return f"✅ EDL exported: {result}"
-            elif fmt in ('xml', 'fcpxml'):
-                result = TimelineExporter.to_fcp_xml(clips, self._window.video_path)
-                return f"✅ XML exported: {result}"
-            else:
-                return f"⚠️ Unknown format: {fmt}. Use 'edl' or 'xml'"
-        except Exception as e:
-            return f"❌ Export failed: {e}"
+            record_start_seconds(start)
+        except ExportError as exc:
+            return f"❌ Export failed: {exc}"
+
+        video_path = self._window.video_path
+        try:
+            output_path, _file_filter = default_export_path(video_path, pattern)
+            source = probe_media_source(video_path)
+            spans = spans_from_analysis(getattr(self._window, 'cache_data', None))
+            result = writer(
+                clips, video_path, output_path,
+                source=source, record_start=start, spans=spans,
+            )
+            return f"✅ {label} exported: {result}{skipped_note(result.skipped)}"
+        except Exception as exc:
+            return f"❌ Export failed: {exc}"
 
     def _cmd_visual_scan(self, p: dict) -> str:
         """

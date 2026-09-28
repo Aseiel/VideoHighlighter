@@ -1271,3 +1271,176 @@ def test_the_export_button_writes_every_edit_clip_and_leaves_render_alone():
     assert "render_mode_combo" in render
     assert "get_clip_times" in render
     assert "_highlight.mp4" in render
+
+
+# ---------------------------------------------------------------------------
+# Chat command
+# ---------------------------------------------------------------------------
+
+class _EditClips:
+    def __init__(self, clips):
+        self.clips = list(clips)
+
+
+class _ChatWindow:
+    def __init__(self, video_path, clips, cache=None):
+        self.video_path = video_path
+        self.edit_scene = _EditClips(clips)
+        self.cache_data = cache
+
+
+_CHAT_CACHE = {
+    "transcript": {"segments": [{"start": 1.0, "end": 2.0, "text": "hello"}]},
+}
+
+
+def _chat_window(tmp_path, clips=((0.0, 5.0),), cache=_CHAT_CACHE):
+    video = tmp_path / "morning.mp4"
+    video.write_bytes(b"")
+    return video, _ChatWindow(str(video), clips, cache)
+
+
+def _install_probe(monkeypatch, **kwargs):
+    document = _probe_document(rotation=0, **kwargs)
+    calls = []
+
+    def once(path):
+        calls.append(path)
+        return document
+
+    monkeypatch.setattr("modules.media.ffmpeg_tools.probe", once)
+    return calls, document
+
+
+def test_chat_export_writes_beside_the_source(tmp_path, monkeypatch):
+    """format=edl with no path writes {stem}_edit.edl and does not open None."""
+    from llm.llm_timeline_bridge import TimelineBridge, parse_commands
+    from video_ai_editor.timeline_export import (
+        TimelineExporter,
+        media_source_from_probe,
+        spans_from_analysis,
+    )
+
+    video, window = _chat_window(tmp_path)
+    calls, document = _install_probe(monkeypatch, rate="30/1")
+    seen = {}
+    real = TimelineExporter.to_edl
+
+    def spy(clips, video_path, output_path=None, fps=30, **kwargs):
+        seen["output_path"] = output_path
+        seen["record_start"] = kwargs.get("record_start")
+        seen["spans"] = kwargs.get("spans")
+        return real(clips, video_path, output_path, fps, **kwargs)
+
+    monkeypatch.setattr(TimelineExporter, "to_edl", spy)
+    assert parse_commands("Please export. [CMD:export format=edl]") == [
+        ("export", {"format": "edl"}),
+    ]
+
+    _clean, results = TimelineBridge(window).process_response(
+        "Please export. [CMD:export format=edl]")
+    written = tmp_path / "morning_edit.edl"
+    assert written.is_file()
+    assert str(written) in results[0]
+    assert seen["output_path"] == str(written)
+    assert seen["record_start"] == RECORD_START_ZERO
+    assert len(seen["spans"]) == 1
+    assert not (tmp_path / "None").exists()
+    assert calls == [str(video)]
+    text = written.read_text(encoding="utf-8")
+    assert "* LOC:" in text and "Speech: hello" in text
+
+    media = media_source_from_probe(str(video), document)
+    dialog = real(
+        list(window.edit_scene.clips), str(video), str(tmp_path / "dialog.edl"),
+        source=media, record_start=RECORD_START_ZERO,
+        spans=spans_from_analysis(_CHAT_CACHE),
+    )
+    assert text == open(dialog, encoding="utf-8").read()
+
+
+def test_chat_export_start_matches_the_dialog(tmp_path, monkeypatch):
+    from llm.llm_timeline_bridge import TimelineBridge
+    from video_ai_editor.timeline_export import (
+        TimelineExporter,
+        media_source_from_probe,
+        spans_from_analysis,
+    )
+
+    video, window = _chat_window(tmp_path)
+    _calls, document = _install_probe(monkeypatch, rate="30/1")
+    bridge = TimelineBridge(window)
+    media = media_source_from_probe(str(video), document)
+    spans = spans_from_analysis(_CHAT_CACHE)
+    clips = list(window.edit_scene.clips)
+
+    rejected = bridge._cmd_export({"format": "edl", "start": "10:00:00:00"})
+    assert "10:00:00:00" in rejected
+    assert not (tmp_path / "morning_edit.edl").exists()
+    assert list(tmp_path.iterdir()) == [video]
+
+    explicit = bridge._cmd_export({"format": "edl", "start": "00:00:00:00"})
+    assert str(tmp_path / "morning_edit.edl") in explicit
+    dialog_zero = TimelineExporter.to_edl(
+        clips, str(video), str(tmp_path / "dialog-zero.edl"),
+        source=media, record_start=RECORD_START_ZERO, spans=spans)
+    assert (tmp_path / "morning_edit.edl").read_text(encoding="utf-8") == open(
+        dialog_zero, encoding="utf-8").read()
+
+    hour = bridge._cmd_export({"format": "edl", "start": "01:00:00:00"})
+    assert str(tmp_path / "morning_edit.edl") in hour
+    dialog_hour = TimelineExporter.to_edl(
+        clips, str(video), str(tmp_path / "dialog-hour.edl"),
+        source=media, record_start=RECORD_START_HOUR, spans=spans)
+    hour_text = (tmp_path / "morning_edit.edl").read_text(encoding="utf-8")
+    assert hour_text == open(dialog_hour, encoding="utf-8").read()
+    assert "01:00:00:00" in hour_text
+
+    xml = bridge._cmd_export({"format": "xml", "start": "01:00:00:00"})
+    fcpxml = tmp_path / "morning_edit.fcpxml"
+    assert fcpxml.is_file()
+    assert str(fcpxml) in xml
+    assert not (tmp_path / "morning_edit.xml").exists()
+    dialog_xml = TimelineExporter.to_fcp_xml(
+        clips, str(video), str(tmp_path / "dialog.fcpxml"),
+        source=media, record_start=RECORD_START_HOUR, spans=spans)
+    assert fcpxml.read_text(encoding="utf-8") == open(dialog_xml, encoding="utf-8").read()
+
+
+def test_chat_export_empty_timeline_and_failed_probe_write_nothing(tmp_path, monkeypatch):
+    from llm.llm_timeline_bridge import TimelineBridge
+
+    video, window = _chat_window(tmp_path, clips=())
+    calls, _document = _install_probe(monkeypatch, rate="30/1")
+    bridge = TimelineBridge(window)
+    empty = bridge._cmd_export({"format": "edl"})
+    assert "No clips" in empty
+    assert calls == []
+    assert list(tmp_path.iterdir()) == [video]
+
+    window.edit_scene.clips = [(0.0, 5.0)]
+
+    def fail(path):
+        raise RuntimeError(f"ffprobe failed: {path}")
+
+    monkeypatch.setattr("modules.media.ffmpeg_tools.probe", fail)
+    failed = bridge._cmd_export({"format": "fcpxml"})
+    assert "ffprobe failed" in failed
+    assert "Traceback" not in failed
+    assert not (tmp_path / "morning_edit.fcpxml").exists()
+    assert not (tmp_path / "morning_edit.fcpxml.part").exists()
+    assert list(tmp_path.iterdir()) == [video]
+
+
+def test_export_command_help_mentions_fcpxml_and_start():
+    import inspect
+    from llm.llm_timeline_bridge import TimelineBridge
+
+    text = TimelineBridge(None).get_available_commands_text()
+    assert "fcpxml" in text
+    assert "start=00:00:00:00" in text
+    assert "start=01:00:00:00" in text
+    source = inspect.getsource(TimelineBridge._cmd_export)
+    assert "signal_timeline_viewer" not in source
+    assert "edit_scene.clips" in source
+    assert "output_path" in source

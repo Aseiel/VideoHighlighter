@@ -239,22 +239,22 @@ copied here so this module does not import the timeline scene.
 
 ### Steps
 
-- [ ] Call the same `TimelineExporter` methods. `xml` remains an alias for
+- [x] Call the same `TimelineExporter` methods. `xml` remains an alias for
       FCPXML.
-- [ ] Write beside the source: `{stem}_edit.edl` or `{stem}_edit.fcpxml`.
+- [x] Write beside the source: `{stem}_edit.edl` or `{stem}_edit.fcpxml`.
       The reply includes that path.
-- [ ] Default `record_start` is `00:00:00:00`. `start=01:00:00:00` selects
+- [x] Default `record_start` is `00:00:00:00`. `start=01:00:00:00` selects
       the other. Any other `start` value is an error reply and writes nothing.
-- [ ] Include spans from the viewer's analysis cache. An empty timeline or a
+- [x] Include spans from the viewer's analysis cache. An empty timeline or a
       probe failure is a reply, not a traceback and not a file.
-- [ ] Update the command help string so it mentions `fcpxml` and `start`.
+- [x] Update the command help string so it mentions `fcpxml` and `start`.
 
 ### Acceptance criteria
 
-- [ ] `format=edl` with no path argument no longer opens `None`.
-- [ ] `start=01:00:00:00` matches a dialog export with that start. Omitting
+- [x] `format=edl` with no path argument no longer opens `None`.
+- [x] `start=01:00:00:00` matches a dialog export with that start. Omitting
       `start` matches the dialog default.
-- [ ] `start=00:00:00:00` is accepted. `start=10:00:00:00` is rejected.
+- [x] `start=00:00:00:00` is accepted. `start=10:00:00:00` is rejected.
 
 ## Task 9 — Tests
 
