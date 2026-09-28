@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from urllib.request import pathname2url
 from xml.dom import minidom
 
+from modules.media.video_probe import _rotation_from_stream
+
 RECORD_START_ZERO = "00:00:00:00"
 RECORD_START_HOUR = "01:00:00:00"
 RECORD_STARTS = (RECORD_START_ZERO, RECORD_START_HOUR)
@@ -894,6 +896,101 @@ def write_fcpxml(sequence: Sequence, output_path: str | None = None) -> WrittenE
     return WrittenExport(path=output_path, skipped=skipped)
 
 
+def _parse_rate(text: str) -> tuple[int, int] | None:
+    """``num/den`` from an ffprobe rate, or None when it is not a fraction."""
+    num_text, slash, den_text = str(text or "").partition("/")
+    if not slash:
+        return None
+    try:
+        return int(num_text), int(den_text)
+    except ValueError:
+        return None
+
+
+def _frame_rate(stream: dict) -> tuple[int, int]:
+    """``r_frame_rate``, or ``avg_frame_rate`` when that rate is ``0/0``."""
+    raw = stream.get("r_frame_rate")
+    parsed = _parse_rate(raw)
+    if parsed == (0, 0) or not raw:
+        parsed = _parse_rate(stream.get("avg_frame_rate"))
+    if parsed is None or parsed[0] <= 0 or parsed[1] <= 0:
+        raise ExportError("the probe did not report a frame rate")
+    return parsed
+
+
+def _as_int(value) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _positive_float(value) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if number > 0 else 0.0
+
+
+def media_source_from_probe(path: str, data: dict) -> MediaSource:
+    """One ``MediaSource`` from an ffprobe-shaped document.
+
+    Width and height are the display size: a 90° or 270° rotation swaps
+    the stored dimensions. The file's own rotation metadata is not rewritten.
+    """
+    if not isinstance(data, dict):
+        raise ExportError(f"the probe of {path} did not return a media description")
+    streams = data.get("streams") or []
+    video = next((stream for stream in streams
+                  if isinstance(stream, dict) and stream.get("codec_type") == "video"),
+                 None)
+    if video is None:
+        raise ExportError(f"no video stream in {path}")
+    fps_num, fps_den = _frame_rate(video)
+    container = data.get("format") if isinstance(data.get("format"), dict) else {}
+    duration = _positive_float(container.get("duration")) or _positive_float(
+        video.get("duration"))
+    width = _as_int(video.get("width"))
+    height = _as_int(video.get("height"))
+    if _rotation_from_stream(video) in (90, 270):
+        width, height = height, width
+    audio = next((stream for stream in streams
+                  if isinstance(stream, dict) and stream.get("codec_type") == "audio"),
+                 None)
+    return MediaSource(
+        path=str(path),
+        duration=duration,
+        fps_num=fps_num,
+        fps_den=fps_den,
+        width=width,
+        height=height,
+        has_audio=audio is not None,
+        audio_rate=_as_int(audio.get("sample_rate")) if audio else 0,
+        audio_channels=_as_int(audio.get("channels")) if audio else 0,
+    )
+
+
+def probe_media_source(path: str) -> MediaSource:
+    """Probe ``path`` once. A failure propagates and nothing is written."""
+    from modules.media.ffmpeg_tools import probe
+    return media_source_from_probe(path, probe(path))
+
+
+def _export_sequence(clips, video_path, source: MediaSource | None,
+                     record_start: str, spans) -> Sequence:
+    """Build the sequence. A missing ``source`` probes ``video_path`` once."""
+    if source is None:
+        source = probe_media_source(str(video_path))
+    return Sequence(
+        title=_stem(source.path or str(video_path)),
+        source=source,
+        clips=tuple((float(start), float(end)) for start, end in clips),
+        record_start=record_start,
+        spans=tuple(spans),
+    )
+
+
 class TimelineExporter:
     """Export edit timeline to various formats"""
 
@@ -904,24 +1001,12 @@ class TimelineExporter:
                spans: tuple = ()):
         """Write a CMX 3600 EDL for ``clips``.
 
-        Pass ``source`` to use the probed frame rate. Without it, ``fps`` is
-        a whole-number stand-in so existing callers still get a file; the
-        export dialog will probe instead of relying on that.
+        Pass ``source`` to skip probing. Without it, ``video_path`` is probed
+        once and ``fps`` is not used as a frame rate.
         """
-        if source is None:
-            source = MediaSource(
-                path=str(video_path), duration=0.0,
-                fps_num=int(fps), fps_den=1,
-                width=0, height=0, has_audio=False,
-                audio_rate=0, audio_channels=0,
-            )
-        sequence = Sequence(
-            title=_stem(source.path or str(video_path)),
-            source=source,
-            clips=tuple((float(start), float(end)) for start, end in clips),
-            record_start=record_start,
-            spans=tuple(spans),
-        )
+        del fps
+        sequence = _export_sequence(
+            clips, video_path, source, record_start, spans)
         return write_cmx(sequence, output_path)
     
     @staticmethod
@@ -931,24 +1016,12 @@ class TimelineExporter:
                    spans: tuple = ()):
         """Write an FCPXML 1.9 sequence for ``clips``.
 
-        Pass ``source`` to use the probed frame rate, display size, and
-        audio. Without it, ``fps`` is a whole-number stand-in so existing
-        callers still get a file; the export dialog will probe instead.
+        Pass ``source`` to skip probing. Without it, ``video_path`` is probed
+        once and ``fps`` is not used as a frame rate.
         """
-        if source is None:
-            source = MediaSource(
-                path=str(video_path), duration=0.0,
-                fps_num=int(fps), fps_den=1,
-                width=0, height=0, has_audio=False,
-                audio_rate=0, audio_channels=0,
-            )
-        sequence = Sequence(
-            title=_stem(source.path or str(video_path)),
-            source=source,
-            clips=tuple((float(start), float(end)) for start, end in clips),
-            record_start=record_start,
-            spans=tuple(spans),
-        )
+        del fps
+        sequence = _export_sequence(
+            clips, video_path, source, record_start, spans)
         return write_fcpxml(sequence, output_path)
 
     @staticmethod
@@ -960,21 +1033,12 @@ class TimelineExporter:
 
         Times are quantised to the real frame rate. ``record_start`` is
         accepted and ignored: a CSV has no sequence clock. Spans are not rows.
+        Pass ``source`` to skip probing. Without it, ``video_path`` is probed
+        once and ``fps`` is not used as a frame rate.
         """
-        if source is None:
-            source = MediaSource(
-                path=str(video_path), duration=0.0,
-                fps_num=int(fps), fps_den=1,
-                width=0, height=0, has_audio=False,
-                audio_rate=0, audio_channels=0,
-            )
-        sequence = Sequence(
-            title=_stem(source.path or str(video_path)),
-            source=source,
-            clips=tuple((float(start), float(end)) for start, end in clips),
-            record_start=record_start,
-            spans=tuple(spans),
-        )
+        del fps
+        sequence = _export_sequence(
+            clips, video_path, source, record_start, spans)
         return write_csv(sequence, output_path)
 
     @staticmethod

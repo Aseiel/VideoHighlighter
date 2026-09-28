@@ -187,21 +187,21 @@ copied here so this module does not import the timeline scene.
 
 ### Steps
 
-- [ ] When `source` is omitted, probe `video_path` once through
+- [x] When `source` is omitted, probe `video_path` once through
       `modules.media.ffmpeg_tools.probe`.
-- [ ] Read `r_frame_rate` as `num/den`, falling back to `avg_frame_rate` only
+- [x] Read `r_frame_rate` as `num/den`, falling back to `avg_frame_rate` only
       when `r_frame_rate` is `0/0`. Read container duration, stored width and
       height, and the first audio stream's presence, sample rate, and channel
       count.
-- [ ] Apply rotation with `video_probe._rotation_from_stream` on that same
+- [x] Apply rotation with `video_probe._rotation_from_stream` on that same
       video stream. Swap width and height when the result is 90 or 270.
-- [ ] A failed probe raises. Do not assume 30 fps.
+- [x] A failed probe raises. Do not assume 30 fps.
 
 ### Acceptance criteria
 
-- [ ] Tests that pass a `MediaSource` do not call ffprobe.
-- [ ] A probe failure produces no file.
-- [ ] `probe_video`'s public return value is unchanged. Callers outside
+- [x] Tests that pass a `MediaSource` do not call ffprobe.
+- [x] A probe failure produces no file.
+- [x] `probe_video`'s public return value is unchanged. Callers outside
       export still receive a float fps.
 
 ## Task 7 — Export dialog

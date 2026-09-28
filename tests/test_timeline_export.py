@@ -1008,3 +1008,144 @@ def test_spans_do_not_import_the_timeline_scene():
     source = inspect.getsource(exporter)
     assert "signal_timeline" not in source
     assert "EVENT_RUN_GAP = 2.0" in source
+
+
+# ---------------------------------------------------------------------------
+# Probe
+# ---------------------------------------------------------------------------
+
+def _probe_document(*, rate="30000/1001", average="30/1", rotation=-90,
+                    audio=True, duration="60.0", width=1920, height=1080):
+    video = {
+        "codec_type": "video",
+        "width": width,
+        "height": height,
+        "r_frame_rate": rate,
+        "avg_frame_rate": average,
+        "side_data_list": [{"rotation": rotation}],
+    }
+    streams = [video]
+    if audio:
+        streams.append({
+            "codec_type": "audio",
+            "sample_rate": "48000",
+            "channels": 2,
+        })
+    return {"streams": streams, "format": {"duration": duration}}
+
+
+def test_a_passed_source_does_not_probe(tmp_path, monkeypatch):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.edl"
+
+    def refuse(path):
+        raise AssertionError(f"probed {path}")
+
+    monkeypatch.setattr("modules.media.ffmpeg_tools.probe", refuse)
+    from video_ai_editor.timeline_export import TimelineExporter
+    media = _media(source, 30, 1, audio=False)
+    TimelineExporter.to_edl([(0.0, 1.0)], str(source), str(out), source=media)
+    TimelineExporter.to_fcp_xml(
+        [(0.0, 1.0)], str(source), str(tmp_path / "cut.fcpxml"), source=media)
+    TimelineExporter.to_csv(
+        [(0.0, 1.0)], str(source), str(tmp_path / "cut.csv"), source=media)
+    assert out.is_file()
+
+
+def test_a_failed_probe_writes_nothing(tmp_path, monkeypatch):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.edl"
+
+    def fail(path):
+        raise RuntimeError(f"ffprobe failed: {path}")
+
+    monkeypatch.setattr("modules.media.ffmpeg_tools.probe", fail)
+    from video_ai_editor.timeline_export import TimelineExporter
+    with pytest.raises(RuntimeError, match="ffprobe failed"):
+        TimelineExporter.to_edl([(0.0, 1.0)], str(source), str(out), fps=30)
+
+    assert not out.exists()
+    assert not (tmp_path / "cut.edl.part").exists()
+    assert list(tmp_path.iterdir()) == [source]
+
+
+def test_the_probe_sets_the_rate_display_size_and_audio(tmp_path, monkeypatch):
+    source = tmp_path / "phone.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+    calls = []
+
+    def once(path):
+        calls.append(path)
+        return _probe_document()
+
+    monkeypatch.setattr("modules.media.ffmpeg_tools.probe", once)
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_fcp_xml([(0.0, 5.0)], str(source), str(out), fps=30)
+
+    assert calls == [str(source)]
+    root = _read_fcpxml(out)[1]
+    fmt = root.find("resources/format")
+    assert fmt.get("frameDuration") == "1001/30000s"
+    assert fmt.get("width") == "1080"
+    assert fmt.get("height") == "1920"
+    assert "p2997" in fmt.get("name")
+    asset = root.find("resources/asset")
+    assert asset.get("hasAudio") == "1"
+    assert asset.get("audioRate") == "48000"
+    assert asset.get("audioChannels") == "2"
+    frame = fmt.get("frameDuration")
+    clip = root.find("library/event/project/sequence/spine/asset-clip")
+    assert _frames(clip.get("duration"), frame) == to_frames(5.0, 30000, 1001)
+    assert _frames(asset.get("duration"), frame) == to_frames(60.0, 30000, 1001)
+
+
+def test_a_zero_frame_rate_uses_the_average_and_a_real_rate_does_not(tmp_path, monkeypatch):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.fcpxml"
+
+    monkeypatch.setattr(
+        "modules.media.ffmpeg_tools.probe",
+        lambda path: _probe_document(rate="0/0", average="25/1", rotation=0, audio=False),
+    )
+    from video_ai_editor.timeline_export import TimelineExporter
+    TimelineExporter.to_fcp_xml([(0.0, 1.0)], str(source), str(out))
+    text, root = _read_fcpxml(out)
+    assert root.find("resources/format").get("frameDuration") == "100/2500s"
+    assert root.find("resources/asset").get("hasAudio") == "0"
+    for name in ("audioSources", "audioChannels", "audioRate", "audioLayout"):
+        assert name not in text
+
+    from video_ai_editor.timeline_export import media_source_from_probe
+    kept = media_source_from_probe("clip.mp4", _probe_document(
+        rate="24000/1001", average="24/1", rotation=0, audio=False))
+    assert (kept.fps_num, kept.fps_den) == (24000, 1001)
+
+
+def test_only_a_quarter_turn_swaps_the_stored_picture():
+    from video_ai_editor.timeline_export import media_source_from_probe
+
+    def sized(rotation):
+        source = media_source_from_probe(
+            "phone.mp4", _probe_document(rotation=rotation, audio=False))
+        return source.width, source.height
+
+    assert sized(-90) == (1080, 1920)
+    assert sized(90) == (1080, 1920)
+    assert sized(180) == (1920, 1080)
+    assert sized(0) == (1920, 1080)
+
+
+def test_probe_video_still_returns_a_float_frame_rate(monkeypatch):
+    from modules.media import video_probe
+
+    monkeypatch.setattr(video_probe, "probe", lambda path: _probe_document(rotation=0))
+    info = video_probe.probe_video("clip.mp4")
+    assert set(info) == {"duration", "width", "height", "fps", "rotation"}
+    assert type(info["fps"]) is float
+    assert info["fps"] == pytest.approx(30000 / 1001)
+    assert info["width"] == 1920 and info["height"] == 1080
+    assert info["rotation"] == 0
