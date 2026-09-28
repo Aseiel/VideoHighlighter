@@ -214,63 +214,194 @@ class Sequence:
         return self.source.timebase()
 
 
+@dataclass(frozen=True)
+class WrittenExport:
+    """A file that was written, and how many clips were shorter than a frame.
+
+    ``str`` and ``os.path`` both see :attr:`path`, so a caller that still
+    treats the return value as a path keeps working.
+    """
+
+    path: str
+    skipped: int
+
+    def __fspath__(self) -> str:
+        return self.path
+
+    def __str__(self) -> str:
+        return self.path
+
+
+def _stem(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0] or "untitled"
+
+
+def reel_name(stem: str) -> str:
+    """Eight-character CMX reel. The filename itself goes in a comment."""
+    cleaned = "".join(
+        ch for ch in stem.upper() if ch.isascii() and ch.isalnum())
+    if not cleaned:
+        cleaned = "REEL"
+    return f"{cleaned[:8]:<8}"
+
+
+def frames_to_timecode(frames: int, fps: int) -> str:
+    """``HH:MM:SS:FF`` at ``fps`` frames per timecode second. Non-drop."""
+    if fps < 1:
+        raise ExportError(f"timecode rate {fps} is not positive")
+    frames = max(0, int(frames))
+    frames_per_minute = 60 * fps
+    frames_per_hour = 3600 * fps
+    hours, frames = divmod(frames, frames_per_hour)
+    minutes, frames = divmod(frames, frames_per_minute)
+    seconds, frame = divmod(frames, fps)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frame:02d}"
+
+
+def _event_number(index: int) -> int:
+    """1..999, then 1 again. CMX event numbers are three digits."""
+    return (index % 999) + 1
+
+
+def _quantise_clip(start: float, end: float, timebase: Timebase) -> tuple[int, int] | None:
+    """Source in/out on the EDL clock, or None when the clip has no frames."""
+    if end <= start:
+        return None
+    src_in = edl_frame_index(start, timebase)
+    src_out = edl_frame_index(end, timebase)
+    if src_out <= src_in:
+        return None
+    return src_in, src_out
+
+
+def _event_line(number: int, reel: str, track: str,
+                src_in: str, src_out: str, rec_in: str, rec_out: str) -> str:
+    # Track is a 5-character field ("V    ", "A    "). Eight spaces follow C.
+    return (f"{number:03d}  {reel:8} {track:<5} C        "
+            f"{src_in} {src_out} {rec_in} {rec_out}")
+
+
+def cmx_text(sequence: Sequence) -> tuple[str, int]:
+    """CMX 3600 text for ``sequence``, and how many clips were skipped.
+
+    Raises :class:`ExportError` when there is nothing to write. Does not
+    touch the disk.
+    """
+    if not sequence.clips:
+        raise ExportError("nothing to export — the edit timeline has no clips")
+
+    timebase = sequence.timebase()
+    kept: list[tuple[int, int]] = []
+    skipped = 0
+    for start, end in sequence.clips:
+        quantised = _quantise_clip(start, end, timebase)
+        if quantised is None:
+            skipped += 1
+            continue
+        kept.append(quantised)
+    if not kept:
+        raise ExportError(
+            f"every clip is shorter than one frame at {timebase.edl_fps} fps")
+
+    stem = _stem(sequence.source.path)
+    reel = reel_name(stem)
+    filename = os.path.basename(sequence.source.path)
+    source_file = os.path.abspath(sequence.source.path)
+    fps = timebase.edl_fps
+    record = record_start_seconds(sequence.record_start) * fps
+
+    lines = [
+        f"TITLE: {stem}",
+        "FCM: NON-DROP FRAME",
+        "* SOURCE TIMES ARE FROM THE START OF THE FILE, NOT CAMERA TIMECODE",
+        "",
+    ]
+    for index, (src_in, src_out) in enumerate(kept):
+        number = _event_number(index)
+        duration = src_out - src_in
+        rec_in = record
+        rec_out = record + duration
+        record = rec_out
+        src_in_tc = frames_to_timecode(src_in, fps)
+        src_out_tc = frames_to_timecode(src_out, fps)
+        rec_in_tc = frames_to_timecode(rec_in, fps)
+        rec_out_tc = frames_to_timecode(rec_out, fps)
+
+        lines.append(_event_line(number, reel, "V",
+                                 src_in_tc, src_out_tc, rec_in_tc, rec_out_tc))
+        lines.append(f"* FROM CLIP NAME: {filename}")
+        lines.append(f"* SOURCE FILE: {source_file}")
+        if sequence.source.has_audio:
+            lines.append(_event_line(number, reel, "A",
+                                     src_in_tc, src_out_tc, rec_in_tc, rec_out_tc))
+            lines.append(f"* FROM CLIP NAME: {filename}")
+        if index != len(kept) - 1:
+            lines.append("")
+
+    return "\n".join(lines) + "\n", skipped
+
+
+def _write_text(path: str, text: str) -> None:
+    """Write ``text`` to ``path`` via a sibling ``.part`` file.
+
+    A failure removes the partial file. The destination is replaced only
+    after the partial file is complete.
+    """
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    partial = path + ".part"
+    try:
+        with open(partial, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        os.replace(partial, path)
+    except Exception:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        raise
+
+
+def write_cmx(sequence: Sequence, output_path: str | None = None) -> WrittenExport:
+    """Write a CMX 3600 EDL. ``output_path`` defaults to ``{stem}_edit.edl``."""
+    text, skipped = cmx_text(sequence)
+    if output_path is None:
+        directory = os.path.dirname(os.path.abspath(sequence.source.path))
+        output_path = os.path.join(directory, f"{_stem(sequence.source.path)}_edit.edl")
+    _write_text(output_path, text)
+    return WrittenExport(path=output_path, skipped=skipped)
+
+
 class TimelineExporter:
     """Export edit timeline to various formats"""
-    
+
     @staticmethod
-    def to_edl(clips, video_path, output_path=None, fps=30):
-        """Export to CMX3600 EDL - DaVinci Resolve compatible"""
-        
-        def seconds_to_timecode(seconds, fps=30, drop_frame=False):
-            """Convert seconds to SMPTE timecode"""
-            total_frames = int(round(seconds * fps))
-            hours = total_frames // (3600 * fps)
-            minutes = (total_frames // (60 * fps)) % 60
-            secs = (total_frames // fps) % 60
-            frames = total_frames % fps
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}:{frames:02d}"
-        
-        lines = []
-        
-        # Header
-        lines.append("TITLE: AI Video Editor Edit")
-        lines.append("FCM: NON-DROP FRAME")
-        lines.append("")
-        
-        # Reel name from filename (without extension)
-        reel_name = os.path.splitext(os.path.basename(video_path))[0]
-        # Limit reel name to 8 chars for compatibility
-        reel_name = reel_name[:8].upper()
-        
-        # Add source file reference
-        lines.append(f"* SOURCE FILE: {video_path}")
-        lines.append("")
-        
-        # Each clip
-        for i, (start, end) in enumerate(clips, 1):
-            duration = end - start
-            
-            # Calculate cumulative time for record track
-            record_start = sum(clips[j][1] - clips[j][0] for j in range(i-1))
-            record_end = record_start + duration
-            
-            # Convert to timecode
-            source_in = seconds_to_timecode(start, fps)
-            source_out = seconds_to_timecode(end, fps)
-            record_in = seconds_to_timecode(record_start, fps)
-            record_out = seconds_to_timecode(record_end, fps)
-            
-            # EDL entry - proper format for DaVinci Resolve
-            lines.append(f"{i:03d}  {reel_name:8} V     C        {source_in} {source_out} {record_in} {record_out}")
-            lines.append(f"* FROM CLIP NAME: {os.path.basename(video_path)}")
-            lines.append(f"* COMMENT: Clip {i} - {duration:.1f}s")
-            lines.append("")
-        
-        # Write file
-        with open(output_path, 'w') as f:
-            f.write('\n'.join(lines))
-        
-        return output_path
+    def to_edl(clips, video_path, output_path=None, fps=30, *,
+               source: MediaSource | None = None,
+               record_start: str = RECORD_START_ZERO,
+               spans: tuple = ()):
+        """Write a CMX 3600 EDL for ``clips``.
+
+        Pass ``source`` to use the probed frame rate. Without it, ``fps`` is
+        a whole-number stand-in so existing callers still get a file; the
+        export dialog will probe instead of relying on that.
+        """
+        if source is None:
+            source = MediaSource(
+                path=str(video_path), duration=0.0,
+                fps_num=int(fps), fps_den=1,
+                width=0, height=0, has_audio=False,
+                audio_rate=0, audio_channels=0,
+            )
+        sequence = Sequence(
+            title=_stem(source.path or str(video_path)),
+            source=source,
+            clips=tuple((float(start), float(end)) for start, end in clips),
+            record_start=record_start,
+            spans=tuple(spans),
+        )
+        return write_cmx(sequence, output_path)
     
     @staticmethod
     def to_fcp_xml(clips, video_path, output_path=None, fps=30):

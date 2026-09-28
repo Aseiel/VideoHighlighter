@@ -46,39 +46,39 @@ Pure data, no file writing and no Qt. Lives in
 
 ### Steps
 
-- [ ] Write UTF-8 with LF line endings. Title is the source stem.
-- [ ] Header is `TITLE`, `FCM: NON-DROP FRAME`, and one comment that source
+- [x] Write UTF-8 with LF line endings. Title is the source stem.
+- [x] Header is `TITLE`, `FCM: NON-DROP FRAME`, and one comment that source
       times count from the first frame of the file, not from a camera clock.
-- [ ] Each clip is a `V` event and, when `has_audio` is true, an `A` event
+- [x] Each clip is a `V` event and, when `has_audio` is true, an `A` event
       with the same in and out. They share an event number. The next clip
       takes the next number. Past 999 the number wraps to 001.
-- [ ] Event line spacing matches the design. Reel is the stem, uppercased,
+- [x] Event line spacing matches the design. Reel is the stem, uppercased,
       `A–Z` and `0–9` only, truncated to 8 characters, space-padded.
-- [ ] `* FROM CLIP NAME:` is the filename. `* SOURCE FILE:` is the absolute
+- [x] `* FROM CLIP NAME:` is the filename. `* SOURCE FILE:` is the absolute
       path.
-- [ ] Source columns count from the first frame of the file. Record columns
+- [x] Source columns count from the first frame of the file. Record columns
       start at `Sequence.record_start` and abut.
-- [ ] Apply the Task 1 EDL clock, so 120 and 240 fps cuts are rounded to the
+- [x] Apply the Task 1 EDL clock, so 120 and 240 fps cuts are rounded to the
       60 fps grid. A clip that becomes zero frames on that grid is skipped
       and counted.
-- [ ] Omit a final transition field. Every join is `C`.
-- [ ] `output_path is None` writes `{stem}_edit.edl` beside the source.
-- [ ] Write to `{path}.part` and replace the destination. A failed write
+- [x] Omit a final transition field. Every join is `C`.
+- [x] `output_path is None` writes `{stem}_edit.edl` beside the source.
+- [x] Write to `{path}.part` and replace the destination. A failed write
       leaves no half file.
 
 ### Acceptance criteria
 
-- [ ] At 30 fps, a clip from 10.0s to 15.0s is source `00:00:10:00`–`00:00:15:00`
+- [x] At 30 fps, a clip from 10.0s to 15.0s is source `00:00:10:00`–`00:00:15:00`
       and, at the default record start, record `00:00:00:00`–`00:00:05:00`.
       The next clip's record in is that record out.
-- [ ] `record_start="01:00:00:00"` moves only the record columns, by one hour.
-- [ ] A file with audio has an `A` line per clip. A file without audio has none.
-- [ ] A reel name longer than 8 characters is truncated, and the full filename
+- [x] `record_start="01:00:00:00"` moves only the record columns, by one hour.
+- [x] A file with audio has an `A` line per clip. A file without audio has none.
+- [x] A reel name longer than 8 characters is truncated, and the full filename
       survives in `FROM CLIP NAME`.
-- [ ] At 120 fps, a five-second clip reads as five seconds of 60 fps timecode,
+- [x] At 120 fps, a five-second clip reads as five seconds of 60 fps timecode,
       and a one-source-frame clip is absent and counted as skipped.
-- [ ] An empty clip list raises and leaves no file.
-- [ ] `modules/media/edl.py` is not imported.
+- [x] An empty clip list raises and leaves no file.
+- [x] `modules/media/edl.py` is not imported.
 
 ## Task 3 — FCPXML 1.9 writer
 
