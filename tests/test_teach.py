@@ -556,7 +556,7 @@ def test_box_verdicts_and_the_labeller_worklist(tmp_path):
                               renderer=lambda *a, **k: None)
     assert [i["class_name"] for i in record["items"]] == ["alpha widget"]
     result = boxes.apply_verdicts(p, record["sheet"], reject="1")
-    assert result == {"applied": 1, "errors": []}
+    assert result["applied"] == 1 and result["errors"] == []
     todo = boxes.labeler_worklist(p)
     assert [t["class"] for t in todo] == ["alpha widget"]
 

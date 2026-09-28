@@ -49,20 +49,34 @@ def next_step(project: Project) -> dict:
     if (project.task == "actions" and project.settings.focus
             and any(not s.focus_tried for s in project.samples)):
         return _step(project, "auto", "Crop samples to the people in them.", "focus")
-    unsorted = [s for s in project.samples if not s.scores and not s.unreadable]
-    if not scored or unsorted:
-        return _step(project, "auto", "Score every sample against every class.", "sort")
+    # An object class someone drew a box around is found region by region
+    # (``find``): its samples are decided by answering its boxes, so the
+    # whole-frame sort and the sample review are only for classes in words.
+    drawn = set()
+    if project.task == OBJECTS:
+        from modules.teach.boxes import seeded, store
+        drawn = seeded(store(project))
+    by_words = [n for n in names if n not in drawn]
 
-    no_examples = [n for n in names if counts[n]["accepted"] == 0 and not
+    unsorted = [s for s in project.samples if not s.scores and not s.unreadable]
+    if by_words and (not scored or unsorted):
+        return _step(project, "auto", "Score every sample against every class.", "sort")
+    if drawn:
+        from modules.teach.find import needed
+        if needed(project):
+            return _step(project, "auto", "Look for what was shown in every sample.", "find")
+
+    no_examples = [n for n in by_words if counts[n]["accepted"] == 0 and not
                    project.get_class(n).examples]
-    if no_examples and len(pending) and all(counts[n]["accepted"] == 0 for n in names):
+    if (no_examples and len(pending)
+            and all(counts[n]["accepted"] == 0 for n in by_words)):
         # Words alone sort weakly. One reviewed sheet turns into examples, and
         # every sort after it uses them.
         return _step(project, "judge", "Check the first guesses: accepted samples become "
                      "examples and every later sort sharpens. Or add example clips you "
                      "already have with `add-example`.", "review")
 
-    short = [n for n in names if counts[n]["accepted"] < counts[n]["target"]]
+    short = [n for n in by_words if counts[n]["accepted"] < counts[n]["target"]]
     ready = [n for n in names if counts[n]["accepted"] >= MIN_TO_TRAIN]
     if short and pending:
         worst = min(short, key=lambda n: counts[n]["accepted"] / max(counts[n]["target"], 1))
@@ -97,9 +111,12 @@ def next_step(project: Project) -> dict:
 
     if len(ready) < len(names):
         missing = [n for n in names if n not in ready]
+        more = (" Or `seed` another box around it, from a different side or "
+                "video: each one widens what is found." if drawn & set(missing) else "")
         return _step(project, "judge", f"Need at least {MIN_TO_TRAIN} accepted samples of "
                      f"{', '.join(repr(n) for n in missing)}. Add footage where they "
-                     "appear more, or review further.", "add-video", "<path or url>")
+                     "appear more, or review further." + more,
+                     "add-video", "<path or url>")
 
     from modules.teach import autolabel
     audits = {n: autolabel.audits_needed(project, n) for n in names + ["_none"]}

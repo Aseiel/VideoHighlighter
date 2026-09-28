@@ -87,12 +87,12 @@ def _rejected(labels: LabelStore) -> dict:
 
 
 def _crop_ready(labels: LabelStore) -> set:
-    """Classes with enough accepted boxes to be matched by their crops."""
+    """Classes matched by their crops: enough accepted boxes, or a seed."""
     counts: dict = {}
     for b in labels.accepted():
         if b.class_name and any(b.box):
             counts[b.class_name] = counts.get(b.class_name, 0) + 1
-    return {name for name, n in counts.items() if n >= MIN_CROP_EXAMPLES}
+    return {name for name, n in counts.items() if n >= MIN_CROP_EXAMPLES} | seeded(labels)
 
 
 def retryable(project: Project, labels: Optional[LabelStore] = None) -> list:
@@ -210,45 +210,72 @@ def propose(project: Project, detector, embedder, *,
             "pending": len(labels.pending())}
 
 
+SEED_SOURCE = "seed"          # a box drawn on purpose to say "this one" (``seed``)
+
+
+def crop_vectors(project: Project, labels: LabelStore, embedder, read_at) -> dict:
+    """``{class: [unit vectors]}``: CLIP vectors of each class's accepted boxes.
+
+    Cached, so each accepted box is embedded once, ever. Seed boxes first, so
+    the box someone drew on purpose is never the one ``MAX_CROP_EXAMPLES``
+    leaves out.
+    """
+    from modules.teach.cutoff import auto_decided, box_key
+
+    cache = embed_mod.VectorCache(project.root, getattr(embedder, "model_id", ""))
+    out: dict = {spec.name: [] for spec in project.classes}
+    # Only boxes someone looked at: one accepted by the cutoff would teach the
+    # class to look like the finder's own guesses.
+    unchecked = auto_decided(project)
+    boxes = sorted((b for b in labels.accepted() if box_key(b) not in unchecked),
+                   key=lambda b: b.source != SEED_SOURCE)
+    for box in boxes:
+        crops = out.get(box.class_name)
+        if crops is None or len(crops) >= MAX_CROP_EXAMPLES or not any(box.box):
+            continue
+        key = f"box:{box.video}@{box.time:.3f}:{','.join(f'{v:.4f}' for v in box.box)}"
+        vector = cache.get(key)
+        if vector is None:
+            frame = read_at(box.video, box.time)
+            if frame is None:
+                continue
+            h, w = frame.shape[:2]
+            x, y, bw, bh = box.pixels(w, h)
+            crop = frame[int(y):int(y + bh), int(x):int(x + bw)]
+            if not crop.size:
+                continue
+            vector = embed_mod.unit(embedder.images([crop]))[0]
+            cache.put(key, vector)
+        crops.append(vector)
+    cache.save()
+    return out
+
+
+def seeded(labels: LabelStore) -> set:
+    """Classes someone showed by drawing a box (``seed``)."""
+    return {b.class_name for b in labels.accepted() if b.source == SEED_SOURCE}
+
+
 def _class_vectors(project: Project, labels: LabelStore, embedder, read_at) -> tuple:
     """What each class looks like, as one CLIP vector.
 
     From the crops of its accepted boxes once there are a few — a picture of
-    the thing matches pictures far better than its name does — and from its
-    name and description until then. Crop vectors are cached, so each accepted
-    box is embedded once, ever.
+    the thing matches pictures far better than its name does — or from the
+    first one when someone drew it on purpose (``seed``). From its name and
+    description until then.
     """
-    cache = embed_mod.VectorCache(project.root, getattr(embedder, "model_id", ""))
+    crops = crop_vectors(project, labels, embedder, read_at)
+    drawn = seeded(labels)
     out, from_crops = {}, set()
     for spec in project.classes:
-        crops = []
-        for box in labels.accepted():
-            if box.class_name != spec.name or box.source == "hand" and not any(box.box):
-                continue
-            key = f"box:{box.video}@{box.time:.3f}:{','.join(f'{v:.4f}' for v in box.box)}"
-            vector = cache.get(key)
-            if vector is None:
-                frame = read_at(box.video, box.time)
-                if frame is None:
-                    continue
-                h, w = frame.shape[:2]
-                x, y, bw, bh = box.pixels(w, h)
-                crop = frame[int(y):int(y + bh), int(x):int(x + bw)]
-                if not crop.size:
-                    continue
-                vector = embed_mod.unit(embedder.images([crop]))[0]
-                cache.put(key, vector)
-            crops.append(vector)
-            if len(crops) >= MAX_CROP_EXAMPLES:
-                break
-        if len(crops) >= MIN_CROP_EXAMPLES:
-            out[spec.name] = embed_mod.unit(np.mean(crops, axis=0))
+        mine = crops.get(spec.name) or []
+        if len(mine) >= MIN_CROP_EXAMPLES or (mine and spec.name in drawn):
+            out[spec.name] = embed_mod.unit(np.mean(mine, axis=0))
             from_crops.add(spec.name)
         else:
             prompts = [PROMPTS[OBJECTS].format(spec.name)] + (
                 [spec.description] if spec.description else [])
             out[spec.name] = embed_mod.unit(embedder.texts(prompts).mean(axis=0))
-    cache.save()
     return out, from_crops
 
 
@@ -272,8 +299,17 @@ def _by_tiles(embedder, frame, class_vector):
     best = int(np.argmax(sims))
     if float(sims[best] - np.percentile(sims, 40)) < TILE_STANDOUT:
         return None
-    x1, y1, x2, y2 = tiles[best]
-    score = float(sims[best])
+    x1, y1, x2, y2 = shrink(embedder, frame, tiles[best], class_vector, float(sims[best]))
+    return (x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h), float(sims[best]), "category"
+
+
+def shrink(embedder, frame, rect, class_vector, score: float) -> tuple:
+    """Pull each side of a pixel ``rect`` in while the crop still looks like
+    the class (within ``SHRINK_TOLERANCE``), so a coarse region ends up
+    around the thing."""
+    from llm.category_scoring import crop_tiles
+
+    x1, y1, x2, y2 = rect
     for _ in range(SHRINK_STEPS):
         dx, dy = max(1, int((x2 - x1) * 0.15)), max(1, int((y2 - y1) * 0.15))
         options = [(x1 + dx, y1, x2, y2), (x1, y1 + dy, x2, y2),
@@ -286,7 +322,7 @@ def _by_tiles(embedder, frame, class_vector):
         if float(vs[pick]) < score - SHRINK_TOLERANCE:
             break
         (x1, y1, x2, y2), score = options[pick], max(score, float(vs[pick]))
-    return (x1 / w, y1 / h, (x2 - x1) / w, (y2 - y1) / h), score, "category"
+    return x1, y1, x2, y2
 
 
 def _normalise(det, width: int, height: int) -> tuple:
@@ -410,7 +446,16 @@ def apply_verdicts(project: Project, number: int, *, accept: str = "",
         labels.set_verdict(box, verdict)
         applied += 1
     labels.save()
-    return {"applied": applied, "errors": errors}
+    result = {"applied": applied, "errors": errors}
+    if any(item["n"] in decided for item in sheet["items"]):
+        # New answers can set or move a class's cutoff: apply it now, so the
+        # rest of the queue is accepted the moment enough has been checked,
+        # and turn found boxes into sample verdicts.
+        from modules.teach import cutoff, find
+        auto = cutoff.apply(project, labels)
+        result.update(auto_accepted=auto["auto_accepted"], taken_back=auto["taken_back"],
+                      samples_accepted=find.settle(project, labels)["accepted"])
+    return result
 
 
 # ---------------------------------------------------------------------------

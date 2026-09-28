@@ -1068,6 +1068,11 @@ class VideoHighlighterGUI(QWidget):
         self.update_banner = self._build_update_banner()
         root.addWidget(self.update_banner)
 
+        # --- Pro offer (hidden unless the user just hit something only Pro
+        # does; see modules/ui/pro_offer.py for when that is) ---
+        self.pro_banner = self._build_pro_banner()
+        root.addWidget(self.pro_banner)
+
         self.view_stack = QStackedWidget()
         root.addWidget(self.view_stack, 1)
 
@@ -2929,19 +2934,31 @@ class VideoHighlighterGUI(QWidget):
         compute_box = QGroupBox("Compute")
         compute_layout = QFormLayout()
         self.backend_combo = QComboBox()
-        for _backend, _label in compute_backend.CHOICES:
+        # Only what this platform has: Apple's GPU on a Mac, the PC backends
+        # everywhere else (compute_backend.choices).
+        for _backend, _label in compute_backend.choices():
             self.backend_combo.addItem(_label, _backend)
-        self.backend_combo.setToolTip(
-            "Which accelerator the run should use.\n\n"
-            "Automatic takes the fastest this machine has: CUDA, then Intel,\n"
-            "then DirectML, then the processor. Naming one instead is how you\n"
-            "measure it against that choice \u2014 DirectML on an Intel card, say.\n\n"
-            "A backend this machine does not have falls back to automatic and\n"
-            "says so in the log, and every run reports the one it got.\n\n"
-            "DirectML drives object detection and action recognition in\n"
-            "every build; the rest of it needs a source install \u2014\n"
-            "see docs/AMD-GPU.md."
-        )
+        if sys.platform == "darwin":
+            self.backend_combo.setToolTip(
+                "Which accelerator the run should use.\n\n"
+                "Automatic uses the Apple GPU when Core ML can reach it, else\n"
+                "the processor. Processor only is how you time a run without it.\n\n"
+                "Apple GPU (Core ML) moves object detection and action\n"
+                "recognition to the GPU / Neural Engine (experimental) \u2014\n"
+                "see docs/MAC-GPU.md. Every run reports the backend it got."
+            )
+        else:
+            self.backend_combo.setToolTip(
+                "Which accelerator the run should use.\n\n"
+                "Automatic takes the fastest this machine has: CUDA, then Intel,\n"
+                "then DirectML, then the processor. Naming one instead is how you\n"
+                "measure it against that choice \u2014 DirectML on an Intel card, say.\n\n"
+                "A backend this machine does not have falls back to automatic and\n"
+                "says so in the log, and every run reports the one it got.\n\n"
+                "DirectML drives object detection and action recognition in\n"
+                "every build; the rest of it needs a source install \u2014\n"
+                "see docs/AMD-GPU.md."
+            )
         _saved_backend = (compute_backend.from_config(self.config_data)
                           or compute_backend.configured()
                           or compute_backend.AUTO)
@@ -3395,6 +3412,79 @@ class VideoHighlighterGUI(QWidget):
         banner.setLayout(row)
         return banner
 
+    # --- Pro offer ---
+    def _build_pro_banner(self):
+        """The hidden-by-default "Pro can do this" strip.
+
+        Same shape as the update banner and for the same reason: it costs no
+        space while hidden and never interrupts. What it says, and when it is
+        allowed to say it, is decided in :mod:`modules.ui.pro_offer`.
+        """
+        banner = QWidget()
+        banner.setVisible(False)
+        banner.setStyleSheet(
+            "QWidget { background: #3b3552; border-radius: 4px; }"
+            "QLabel { color: #eeeaf6; background: transparent; }"
+        )
+        row = QHBoxLayout()
+        row.setContentsMargins(10, 6, 6, 6)
+        row.setSpacing(8)
+
+        self.pro_label = QLabel()
+        self.pro_label.setWordWrap(True)
+        row.addWidget(self.pro_label, 1)
+
+        try_btn = QPushButton("Try Pro free")
+        try_btn.clicked.connect(self._open_pro_page)
+        row.addWidget(try_btn)
+
+        never_btn = QPushButton("Don't suggest Pro")
+        never_btn.setToolTip("Switch these suggestions off. The About tab "
+                             "turns them back on.")
+        never_btn.clicked.connect(self._silence_pro_offer)
+        row.addWidget(never_btn)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedWidth(28)
+        close_btn.setToolTip("Not now")
+        close_btn.clicked.connect(lambda: self.pro_banner.setVisible(False))
+        row.addWidget(close_btn)
+
+        banner.setLayout(row)
+        return banner
+
+    def _show_pro_offer(self, offer):
+        """Put an offer on screen, if there is one. Returns whether it showed."""
+        if offer is None or not hasattr(self, "pro_banner"):
+            return False
+        from modules.ui import pro_offer
+
+        self.pro_label.setText(offer.text)
+        self.pro_banner.setVisible(True)
+        pro_offer.mark_shown(offer.moment)
+        print(f"pro_offer: showed '{offer.moment}'")
+        return True
+
+    def _open_pro_page(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        from modules.ui import pro_offer
+
+        QDesktopServices.openUrl(QUrl(pro_offer.PRO_URL))
+        self.pro_banner.setVisible(False)
+
+    def _silence_pro_offer(self):
+        from modules.ui import pro_offer
+
+        pro_offer.set_enabled(False)
+        self.pro_banner.setVisible(False)
+        chk = getattr(self, "pro_offer_chk", None)
+        if chk is not None:
+            chk.blockSignals(True)
+            chk.setChecked(False)
+            chk.blockSignals(False)
+
     def _start_update_check(self, force=False):
         """Kick off the manifest check in the background.
 
@@ -3591,6 +3681,8 @@ class VideoHighlighterGUI(QWidget):
         layout.addWidget(upd_group)
 
         # --- Upgrade to Pro ---
+        from modules.ui import pro_offer as _pro_offer
+
         pro_group = QGroupBox("VideoHighlighter Pro")
         pro_layout = QVBoxLayout(pro_group)
         pro_line = QLabel(
@@ -3598,13 +3690,23 @@ class VideoHighlighterGUI(QWidget):
             "expressions, the report and the assistant are all here. "
             "<b>Pro</b> teaches the app a vocabulary of its own: categories "
             "from your own example frames, search by example, open-vocabulary "
-            "detection, a live overlay, and a commercial licence.<br>"
-            f'👉 <a href="{WEBSITE_URL}">Learn more / Get Pro</a>'
+            "detection, a live overlay, and a commercial licence. "
+            f"Try it free for {_pro_offer.TRIAL_DAYS} days.<br>"
+            f'👉 <a href="{_pro_offer.PRO_URL}">Learn more / Start the trial</a>'
         )
         pro_line.setOpenExternalLinks(True)
         pro_line.setTextInteractionFlags(Qt.TextBrowserInteraction)
         pro_line.setWordWrap(True)
         pro_layout.addWidget(pro_line)
+
+        self.pro_offer_chk = QCheckBox(
+            "Mention Pro when I reach something only it can do")
+        self.pro_offer_chk.setChecked(_pro_offer.is_enabled())
+        self.pro_offer_chk.setToolTip(
+            "A one-line banner after, for example, a rule that can't be built "
+            "from this video's classes. Never at startup, never in a report.")
+        self.pro_offer_chk.toggled.connect(_pro_offer.set_enabled)
+        pro_layout.addWidget(self.pro_offer_chk)
         layout.addWidget(pro_group)
 
         # --- Contact & support ---
@@ -6035,6 +6137,22 @@ class VideoHighlighterGUI(QWidget):
             # No browser association is plausible on a stripped Windows install;
             # the path is more useful than a silent failure.
             self.append_log(f"⚠️ Could not open a browser. The report is at: {newest}")
+        self._offer_pro_for_report(os.path.splitext(newest)[0] + ".json")
+
+    def _offer_pro_for_report(self, json_path):
+        """After a report is opened: say so if only Pro could measure its gaps."""
+        import json
+
+        from modules.ui import pro_offer
+
+        if not pro_offer.may_offer("report_unmeasured"):
+            return
+        try:
+            with open(json_path, encoding="utf-8") as fh:
+                report = json.load(fh)
+        except (OSError, ValueError):
+            return
+        self._show_pro_offer(pro_offer.for_report(report))
 
     # ── AI summary of the highlight report ─────────────────────────────
     def _newest_why_report_json(self):
@@ -6328,6 +6446,8 @@ class VideoHighlighterGUI(QWidget):
                 "⚠️ No usable rule came back. Either the claim cannot be "
                 "expressed with the classes this video has, or the model named "
                 "one it does not have — the debug log says which.")
+            from modules.ui import pro_offer
+            self._show_pro_offer(pro_offer.for_unbuildable_rule())
             return
 
         answer = QMessageBox.question(

@@ -115,7 +115,8 @@ def detect_objects_in_frame(frame, model, objects_of_interest, draw_boxes=False,
     return objs, annotated_frame, bbox_data
 
 def directml_detector(prefer="large", log=print):
-    """The stock YOLOX detector on ONNX Runtime's DirectML provider, or None.
+    """The stock YOLOX detector on ONNX Runtime's GPU provider, or None —
+    DirectML on Windows, Core ML on a Mac (see ``ort_directml.gpu_provider``).
 
     OpenVINO only accelerates Intel GPUs; on an AMD or NVIDIA card it runs the
     detector on the processor. Where ``device_utils`` reports that ONNX Runtime
@@ -140,7 +141,7 @@ def directml_detector(prefer="large", log=print):
             f"({os.path.basename(onnx_path)})")
         return detector
     except Exception as e:
-        log(f"⚠️ DirectML detector unavailable, using OpenVINO: {e}")
+        log(f"⚠️ GPU detector (ONNX Runtime) unavailable, using OpenVINO: {e}")
         return None
 
 

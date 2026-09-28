@@ -76,6 +76,16 @@ def cmd_init(args, root):
             "settings": vars(project.settings)}
 
 
+def cmd_seed(args, root):
+    from modules.teach.seed import seed
+    return seed(root, args.video, args.time, args.box, args.cls, args.description or "")
+
+
+def cmd_find(args, project):
+    from modules.teach.find import find
+    return find(project, make_detector(), make_embedder())
+
+
 def cmd_add_class(args, project):
     spec = project.add_class(args.name, args.description or "",
                              target=args.target or project_mod.DEFAULT_TARGET)
@@ -467,6 +477,15 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--focus", action="store_true",
                    help="actions: crop samples to the people in them (modules/crop)")
 
+    s = sub.add_parser("seed", help="objects: start from one box drawn around the thing")
+    s.add_argument("--video", required=True)
+    s.add_argument("--time", type=float, required=True, help="seconds into the video")
+    s.add_argument("--box", required=True, help="x,y,w,h as fractions of the frame")
+    s.add_argument("--class", dest="cls", required=True)
+    s.add_argument("--description")
+
+    sub.add_parser("find", help="objects: look for seeded things in every sample")
+
     s = sub.add_parser("add-class", help="something to find")
     s.add_argument("name")
     s.add_argument("--description")
@@ -572,7 +591,7 @@ COMMANDS = {
     "add-video": cmd_add_video, "add-example": cmd_add_example, "cut": cmd_cut,
     "focus": cmd_focus, "sort": cmd_sort, "folders": cmd_folders,
     "review": cmd_review, "verdict": cmd_verdict, "boxes": cmd_boxes,
-    "build": cmd_build, "train": cmd_train, "status": cmd_status, "set": cmd_set,
+    "find": cmd_find, "build": cmd_build, "train": cmd_train, "status": cmd_status, "set": cmd_set,
     "auto": cmd_auto, "share": cmd_share,
 }
 
@@ -602,6 +621,10 @@ def run(argv=None) -> tuple:
                 result = cmd_init(args, root)
             elif args.command == "doctor":
                 result = cmd_doctor(args, root)
+            elif args.command == "seed":
+                result = cmd_seed(args, root)
+                from modules.teach.status import next_step
+                result.setdefault("next", next_step(Project.load(root)))
             elif args.command == "quick":
                 result = cmd_quick(args, root)
                 result.setdefault("next", result.get("stopped_at"))

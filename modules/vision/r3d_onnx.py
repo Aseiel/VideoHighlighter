@@ -115,7 +115,7 @@ def ensure_export(torch_model, model_name, num_classes, custom_weights=None,
     try:
         import torch
 
-        log(f"⏳ Exporting {model_name} to ONNX for DirectML (one-off)…")
+        log(f"⏳ Exporting {model_name} to ONNX for the GPU (one-off)…")
         dummy = torch.zeros(1, 3, CLIP_LENGTH, INPUT_SIZE, INPUT_SIZE)
         with torch.no_grad():
             torch.onnx.export(
@@ -168,13 +168,14 @@ class OnnxR3D:
 
     @property
     def on_gpu(self) -> bool:
-        """True only when DirectML really took the session.
+        """True only when a GPU provider (DirectML, or Core ML on a Mac)
+        really took the session.
 
         The distinction matters: an ORT session on the CPU provider is not
         faster than the torch model it displaced, and treating it as a GPU would
         put a device in the run's timing summary that never did any work.
         """
-        return self.backend == ort_directml.PROVIDER
+        return ort_directml.is_gpu_provider(self.backend)
 
     def predict(self, clip) -> np.ndarray:
         """Flat logits for one preprocessed clip."""

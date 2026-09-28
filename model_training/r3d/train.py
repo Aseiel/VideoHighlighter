@@ -78,6 +78,27 @@ from model_training.r3d.model import (
 )
 
 
+def _utf8_stdout() -> None:
+    """Let this module print its emoji on a non-UTF-8 console.
+
+    Called at import time rather than from main(): some of these prints happen
+    while the module is still loading, so a guard inside main() would run too
+    late. On a Windows console using a legacy codepage the first emoji raises
+    UnicodeEncodeError and kills the run before any training starts. Replacing
+    unencodable characters is the right trade - a mangled glyph in a log beats
+    a dead training run.
+    """
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_utf8_stdout()
+
+
+
 # =============================
 # R3D-specific dataset wrapper
 # =============================
@@ -310,6 +331,7 @@ def train_r3d(train_loader, val_loader, num_classes, label_to_idx, idx_to_label)
 # =============================
 # Main
 # =============================
+
 def main():
     parser = argparse.ArgumentParser(description="R3D 3D-CNN fine-tuning")
     parser.add_argument("--data-path", type=str, default=None)
@@ -324,6 +346,8 @@ def main():
     parser.add_argument("--no-onnx", action="store_true")
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable ROI cache (slow — runs the person detector every epoch)")
+    parser.add_argument("--device", type=str, default=None,
+                        help="cuda | xpu | cpu (default: best available)")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="DataLoader workers (default: 4)")
     parser.add_argument("--rebuild-cache", action="store_true",
@@ -359,6 +383,8 @@ def main():
         CONFIG["model_variant"] = args.model
     if args.resume:
         CONFIG["checkpoint_path"] = args.resume
+    if args.device:
+        CONFIG["device"] = args.device
     if args.epochs:
         CONFIG["base_epochs"] = args.epochs
     if args.batch_size:
@@ -446,8 +472,8 @@ def main():
     # ==============================
     # DataLoaders
     # ==============================
-    # With cache: safe to use num_workers > 0 (no YOLO model in workers)
-    # Without cache: must use num_workers=0 (YOLO can't be pickled)
+    # With cache: safe to use num_workers > 0 (no YOLOX model in workers)
+    # Without cache: must use num_workers=0 (detector can't be pickled)
     nw = CONFIG.get("num_workers", 4) if roi_cache is not None else 0
     pin = CONFIG["device"] == "cuda"
     pf = CONFIG.get("prefetch_factor", 2) if nw > 0 else None

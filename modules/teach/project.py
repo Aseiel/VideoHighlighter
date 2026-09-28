@@ -50,6 +50,9 @@ VERDICTS = (PENDING, ACCEPTED, REJECTED, NEGATIVE)
 
 # decided_by for auto-accepted samples.
 AUTO = "auto"
+# decided_by for samples accepted because their found box was accepted
+# without a question (``cutoff``); spot-checked through the boxes, not here.
+AUTO_BOX = "auto-box"
 
 # Proposal when no class stood out, and when every class scored low.
 UNSURE = "_unsure"
@@ -118,7 +121,9 @@ class Sample:
 
     @property
     def is_human(self) -> bool:
-        return self.is_decided and not self.is_auto
+        """Decided by someone looking, not by a rule: only these build
+        prototypes and the held-out set."""
+        return self.is_decided and self.decided_by not in (AUTO, AUTO_BOX)
 
     # label_store.segments() groups by these two names.
     @property
@@ -154,6 +159,9 @@ class Settings:
     # classifier without one has no way to say "none", so it names one of the
     # classes for everything; with one, it can decline. Empty = not trained on.
     background_class: str = ""
+    # Improve this project unattended while the app is idle (``background``).
+    # Set by teaching from the player; the From videos tab has a switch.
+    background: bool = False
 
 
 def slugify(text: str) -> str:

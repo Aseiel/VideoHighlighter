@@ -1465,7 +1465,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         r3d_half = False      # fp16 is uneven on DirectML
                         r3d_device = "cpu"    # torch's device; the model leaves it
                         r3d_onnx_dml = True
-                        log(f"🎯 Auto backend → DirectML via ONNX Runtime, using "
+                        log(f"🎯 Auto backend → ONNX Runtime on the GPU, using "
                             f"R3D ({_dev.backend_name}); it stays on the CPU if "
                             f"the export or the provider will not run")
                     else:

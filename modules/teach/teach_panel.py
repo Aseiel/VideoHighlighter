@@ -70,13 +70,16 @@ class TeachPanel(QWidget):
     """The loop for people who never open a terminal."""
 
     def __init__(self, parent=None, run_cli: Optional[Callable] = None,
-                 open_review: Optional[Callable] = None):
+                 open_review: Optional[Callable] = None,
+                 host_busy: Optional[Callable[[], bool]] = None):
         super().__init__(parent)
         from modules.teach import cli
         self._run_cli = run_cli or cli.run
         self._open_review = open_review
+        self._host_busy = host_busy or (lambda: False)
         self._thread = None
         self._job = None
+        self._review = None
 
         intro = QLabel(
             "Teach it something new from your own videos. Put a few short example "
@@ -126,6 +129,30 @@ class TeachPanel(QWidget):
             buttons.addWidget(b)
         buttons.addStretch(1)
 
+        from PySide6.QtWidgets import QApplication
+
+        from modules.teach import background
+        self.background_box = QCheckBox(
+            "Keep improving in the background while the app is idle")
+        self.background_box.setToolTip(
+            "Runs every step that needs nobody (finding, sorting, training) when you "
+            "have not touched the app for a couple of minutes, and keeps a few "
+            "questions for you. Your footage never leaves this computer.")
+        self.background_status = QLabel()
+        self.background_status.setWordWrap(True)
+        app = QApplication.instance()
+        self.idle = background.IdleWatch(app, self) if app is not None else None
+        self.background = background.BackgroundTeacher(self._background_root,
+                                                       self._free, parent=self)
+        self.background.started.connect(lambda: self._set_busy(True))
+        self.background.report.connect(self._background_report)
+        self.background_box.toggled.connect(self._set_background)
+        self.project.editingFinished.connect(self._show_background_setting)
+        self._last_background = ""
+        self._waiting: dict = {}
+        self.background.set_enabled(True)       # acts only on opted-in projects
+        self._show_background_setting()
+
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.output.setPlaceholderText("What happened, and what comes next, shows here.")
@@ -134,6 +161,8 @@ class TeachPanel(QWidget):
         layout.addWidget(intro)
         layout.addLayout(form)
         layout.addLayout(buttons)
+        layout.addWidget(self.background_box)
+        layout.addWidget(self.background_status)
         layout.addWidget(self.output, 1)
 
     def _with_browse(self, edit: QLineEdit, folder: bool) -> QWidget:
@@ -171,6 +200,11 @@ class TeachPanel(QWidget):
     def review(self):
         from modules.teach.cli import resolve_root
         root = resolve_root(self.project_arg())
+        if self._waiting and root not in self._waiting:
+            # Questions from something taught in the player: those first.
+            root = next(iter(self._waiting))
+            self.project.setText(root)
+            self._show_background_setting()
         if not os.path.exists(os.path.join(root, "project.json")):
             self.output.setPlainText("Start a project first.")
             return
@@ -183,9 +217,13 @@ class TeachPanel(QWidget):
         window = BoxReviewWindow(root) if self.wants_box_review(root) else ReviewWindow(root)
         # Deleted on close, so ``destroyed`` fires and the panel says what is next.
         window.setAttribute(Qt.WA_DeleteOnClose)
-        window.destroyed.connect(lambda *_: self._run(["status"]))
+        window.destroyed.connect(self._review_closed)
         self._review = window
         window.show()
+
+    def _review_closed(self, *_):
+        self._review = None
+        self._run(["status"])
 
     @staticmethod
     def wants_box_review(root: str) -> bool:
@@ -211,7 +249,70 @@ class TeachPanel(QWidget):
         from model_hub.gui import PublishWizard
         PublishWizard(self, model_path=onnx, draft=draft).exec()
 
+    # --- the background --------------------------------------------------------
+
+    def _panel_root(self) -> str:
+        from modules.teach.cli import resolve_root
+        root = resolve_root(self.project_arg())
+        return root if os.path.exists(os.path.join(root, "project.json")) else ""
+
+    def _roots(self) -> list:
+        """Projects set to improve in the background: those under the user
+        data (teaching from the player puts them there), and the panel's own."""
+        from modules.teach.background import opted_in
+        from modules.teach.project import Project
+        roots = opted_in()
+        mine = self._panel_root()
+        if mine and mine not in roots and Project.load(mine).settings.background:
+            roots.append(mine)
+        return roots
+
+    def _background_root(self) -> str:
+        from modules.teach.background import pick
+        root = pick(self._roots(), self._last_background)
+        self._last_background = root or self._last_background
+        return root
+
+    def _show_background_setting(self):
+        from modules.teach.project import Project
+        root = self._panel_root()
+        on = bool(root) and Project.load(root).settings.background
+        self.background_box.blockSignals(True)
+        self.background_box.setChecked(on)
+        self.background_box.blockSignals(False)
+
+    def _set_background(self, on: bool):
+        from modules.teach.project import Project
+        root = self._panel_root()
+        if not root:
+            self.output.setPlainText("Start a project first.")
+            self._show_background_setting()
+            return
+        project = Project.load(root)
+        project.settings.background = bool(on)
+        project.save()
+
+    def _free(self) -> bool:
+        """Nobody is using the app, and nothing else is writing the project."""
+        from modules.teach.background import IDLE_SECONDS
+        idle = self.idle.idle_seconds() if self.idle is not None else 0.0
+        return (idle >= IDLE_SECONDS and self._thread is None and self._review is None
+                and not self._host_busy())
+
+    def _background_report(self, report: dict):
+        from modules.teach.background import summary
+        self._set_busy(False)
+        self.background_status.setText(summary(report))
+        from modules.teach.background import waiting
+        self._waiting = waiting(self._roots())
+        n = sum(self._waiting.values())
+        self.review_btn.setText(f"Check guesses… ({n})" if n else "Check guesses…")
+
     def _run(self, args: list):
+        if self.background.running:
+            self.output.setPlainText("Improving in the background; this finishes its "
+                                     "current step first. Try again in a moment.")
+            return
         self._set_busy(True)
         self.output.setPlainText("Working… (" + " ".join(args) + ")")
         argv = ["--project", self.project_arg(), *args]
