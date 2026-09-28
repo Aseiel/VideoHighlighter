@@ -191,13 +191,35 @@ def _info(**kw):
     return update_check.UpdateInfo(version="9.9.9", manifest_url="https://x/m.json", **kw)
 
 
-def test_self_install_offered_where_the_install_can_be_written(monkeypatch, tmp_path):
+@pytest.fixture
+def windows_build(monkeypatch, tmp_path):
+    """A frozen Windows build with a release key and a writable install."""
     import sys
     from modules.system import app_paths
+    from modules.update import update_manifest
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(tmp_path / "VideoHighlighter.exe"))
     monkeypatch.setattr(app_paths, "_is_writable", lambda path: True)
+    monkeypatch.setattr(update_check, "_self_install_platform", lambda: True)
+    monkeypatch.setattr(update_manifest, "RELEASE_PUBLIC_KEY_HEX", "ab" * 32)
+    return tmp_path
+
+
+def test_self_install_offered_where_the_install_can_be_written(windows_build):
     assert _info().can_self_install
+
+
+def test_no_self_install_off_windows(windows_build, monkeypatch):
+    # A macOS .app is signed as a whole; swapping files inside it breaks it.
+    monkeypatch.setattr(update_check, "_self_install_platform", lambda: False)
+    assert not _info().can_self_install
+
+
+def test_no_self_install_from_a_build_without_a_release_key(windows_build, monkeypatch):
+    # It could only fail at "could not be verified" after the user clicked.
+    from modules.update import update_manifest
+    monkeypatch.setattr(update_manifest, "RELEASE_PUBLIC_KEY_HEX", "")
+    assert not _info().can_self_install
 
 
 def test_read_only_install_gets_the_download_page(monkeypatch, tmp_path):
@@ -213,3 +235,82 @@ def test_read_only_install_gets_the_download_page(monkeypatch, tmp_path):
 
 def test_no_manifest_means_no_self_install_anywhere():
     assert not update_check.UpdateInfo(version="9.9.9").can_self_install
+
+
+# --- where the channel file comes from, and which manifest it names ---------
+
+def _installed_manifest(root, base_url):
+    import json as _json
+    (root / "manifest.json").write_text(_json.dumps(
+        {"format": 1, "version": "0.1", "base_url": base_url, "files": []}))
+
+
+@pytest.fixture
+def install_root(tmp_path, monkeypatch):
+    from modules.update import update_apply
+    root = tmp_path / "app"
+    root.mkdir()
+    monkeypatch.setattr(update_apply, "install_root", lambda: str(root))
+    return root
+
+
+def test_the_update_host_comes_first_when_the_install_names_one(install_root):
+    _installed_manifest(install_root, "https://updates.example/vh/")
+    urls = update_check.channel_urls()
+    assert urls[0] == f"https://updates.example/vh/channels/{update_check._channel()}.json"
+    assert urls[-1] == update_check.manifest_url()
+
+
+def test_without_an_installed_manifest_only_the_site_is_asked(install_root):
+    assert update_check.channel_urls() == [update_check.manifest_url()]
+
+
+def test_a_plain_http_host_is_ignored(install_root):
+    _installed_manifest(install_root, "http://updates.example/vh")
+    assert update_check.channel_urls() == [update_check.manifest_url()]
+
+
+def test_the_site_answers_when_the_update_host_is_down(state_dir, install_root):
+    _installed_manifest(install_root, "https://updates.example/vh")
+    asked = []
+
+    def transport(url):
+        asked.append(url)
+        if url.startswith("https://updates.example"):
+            raise OSError("host down")
+        return _manifest()
+
+    info = update_check.check_for_update(current_version="0.9.0", transport=transport)
+    assert info is not None and info.version == "0.9.1"
+    assert len(asked) == 2
+
+
+def test_each_platform_gets_its_own_manifest(state_dir, monkeypatch):
+    from modules.update import update_manifest
+    payload = _manifest(manifests={"windows": "https://h/win/manifest.json"})
+
+    monkeypatch.setattr(update_manifest, "platform_key", lambda platform=None: "windows")
+    info = update_check.check_for_update(
+        current_version="0.9.0", force=True, transport=_serving(payload))
+    assert info.manifest_url == "https://h/win/manifest.json"
+
+    monkeypatch.setattr(update_manifest, "platform_key", lambda platform=None: "macos")
+    info = update_check.check_for_update(
+        current_version="0.9.0", force=True, transport=_serving(payload))
+    assert info.manifest_url == ""
+    assert not info.can_self_install
+
+
+def test_the_old_single_manifest_url_is_windows_only(state_dir, monkeypatch):
+    from modules.update import update_manifest
+    payload = _manifest(manifest_url="https://h/manifest.json")
+
+    monkeypatch.setattr(update_manifest, "platform_key", lambda platform=None: "windows")
+    assert update_check.check_for_update(
+        current_version="0.9.0", force=True,
+        transport=_serving(payload)).manifest_url == "https://h/manifest.json"
+
+    monkeypatch.setattr(update_manifest, "platform_key", lambda platform=None: "macos")
+    assert update_check.check_for_update(
+        current_version="0.9.0", force=True,
+        transport=_serving(payload)).manifest_url == ""

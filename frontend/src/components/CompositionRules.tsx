@@ -21,6 +21,8 @@ const BLANK: CompRule = {
   region: "",
   min_count: 1,
   max_count: 999,
+  relation: "inside",
+  outline: false,
   window_secs: 0.75,
   persist_secs: 0.5,
 }
@@ -54,8 +56,11 @@ export function CompositionRules() {
           Compose higher-level actions from spatial relationships between detected
           objects — e.g. if object A appears inside region B enough times, fire
           action X. Rows sharing an Event Name must all be satisfied together (AND).
-          Window smooths over flicker; Persist keeps an object alive through
-          occlusion. Saved to composition_rules.yaml.
+          Relation: inside (its centre is in the region), overlaps (most of it
+          is), touches (they meet). Outline decides on the real shapes inside the
+          boxes; a source like person.hand uses the body part. Window smooths over
+          flicker; Persist keeps an object alive through occlusion. Saved to
+          composition_rules.yaml.
         </p>
 
         <div className="overflow-x-auto rounded-md border">
@@ -68,6 +73,8 @@ export function CompositionRules() {
                 <TableHead className="min-w-24">Region</TableHead>
                 <TableHead className="w-20">Min</TableHead>
                 <TableHead className="w-20">Max</TableHead>
+                <TableHead className="w-28">Relation</TableHead>
+                <TableHead className="w-16">Outline</TableHead>
                 <TableHead className="w-24">Window (s)</TableHead>
                 <TableHead className="w-24">Persist (s)</TableHead>
                 <TableHead className="w-10" />
@@ -77,7 +84,7 @@ export function CompositionRules() {
               {rules.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={9}
+                    colSpan={11}
                     className="text-center text-sm text-muted-foreground"
                   >
                     No rules yet
@@ -113,6 +120,28 @@ export function CompositionRules() {
                         />
                       </TableCell>
                     ))}
+                    <TableCell className="p-1">
+                      <select
+                        value={r.relation ?? "inside"}
+                        onChange={(e) =>
+                          upd(i, { relation: e.target.value as CompRule["relation"] })
+                        }
+                        className="h-7 w-full rounded-md border bg-transparent px-1 text-sm"
+                        title="inside: its centre is in the region · overlaps: most of it is · touches: they meet"
+                      >
+                        <option value="inside">inside</option>
+                        <option value="overlaps">overlaps</option>
+                        <option value="touches">touches</option>
+                      </select>
+                    </TableCell>
+                    <TableCell className="p-1 text-center">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(r.outline)}
+                        onChange={(e) => upd(i, { outline: e.target.checked })}
+                        title="Decide on the real shapes, traced inside the boxes"
+                      />
+                    </TableCell>
                     <TableCell className="p-1">
                       <button
                         className="text-destructive hover:opacity-70"

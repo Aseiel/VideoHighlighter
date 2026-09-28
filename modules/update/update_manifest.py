@@ -13,6 +13,12 @@ An unsigned or mis-signed manifest is not "probably fine" — it is the exact
 shape an attack takes, since acting on a manifest means replacing executables.
 Verification fails closed, including when no key has been embedded yet.
 
+**Only a release meant for this install is applied.** A valid signature says
+the vendor published a manifest, not that it is the right one: the unsigned
+channel file that points at it could name last year's release, or the other
+edition's, or another platform's. ``release_problem`` refuses all three, and a
+release that declares it cannot be laid over a build as old as this one.
+
 **Only what we shipped is ever deleted.** A file is removed only if the
 *installed* manifest listed it and the new one does not. Anything else on disk
 is left alone, which is what keeps a user's imported models, edited config and
@@ -23,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -99,11 +106,64 @@ def verify_manifest(raw: bytes, signature: str) -> Optional[dict]:
     if not isinstance(manifest.get("files"), list):
         print("update_manifest: manifest has no file list; refusing.")
         return None
+    if str(manifest.get("compression") or "") not in ("", "gzip"):
+        # A blob encoding this build cannot read: every download would fail
+        # its hash, so say so here instead of after fetching gigabytes.
+        print("update_manifest: unsupported blob compression; refusing.")
+        return None
     for entry in manifest["files"]:
         if not isinstance(entry, dict) or not is_safe_relpath(entry.get("path")):
             print(f"update_manifest: unsafe path in manifest: {entry!r}")
             return None
     return manifest
+
+
+def platform_key(platform: Optional[str] = None) -> str:
+    """``"windows"``, ``"macos"`` or ``"linux"`` — the name a manifest uses."""
+    name = platform or sys.platform
+    if name.startswith("win"):
+        return "windows"
+    if name == "darwin":
+        return "macos"
+    return "linux"
+
+
+def release_problem(manifest: dict, *, current_version: str, edition: str,
+                    platform: str) -> Optional[str]:
+    """Why a *verified* manifest must not be applied to this install, or None.
+
+    The answer is a sentence for the user. ``platform`` is a ``platform_key``.
+
+    * **Edition.** Pro and free builds are signed by the same release key, so
+      only this field keeps one from being laid over the other.
+    * **Platform.** Every manifest before this field existed was a Windows
+      build, so a missing one means Windows.
+    * **Newer.** The channel file is unsigned; without this check whoever can
+      edit it can roll every install back to an old, signed, buggy release.
+    * **min_version.** A release that changes the install's layout (moving
+      PyTorch out of the bundle, say) can only be installed fresh, and says so.
+    """
+    from modules.update.update_check import is_newer
+
+    wanted = str(manifest.get("edition") or "").strip().lower()
+    if wanted != str(edition or "").strip().lower():
+        return (f"This update is for the {manifest.get('edition') or 'unknown'} "
+                f"edition, not this one.")
+
+    target = str(manifest.get("platform") or "windows").strip().lower()
+    if target != platform:
+        return f"This update is for {target}, not {platform}."
+
+    version = str(manifest.get("version") or "")
+    if not is_newer(version, current_version):
+        return (f"This update ({version or 'no version'}) is not newer than "
+                f"the version you have ({current_version}).")
+
+    floor = str(manifest.get("min_version") or "").strip()
+    if floor and is_newer(floor, current_version):
+        return (f"Version {version} cannot be installed over {current_version} "
+                f"in place. Download it and install it instead.")
+    return None
 
 
 def is_safe_relpath(path) -> bool:

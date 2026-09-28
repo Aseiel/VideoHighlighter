@@ -29,7 +29,7 @@ Usage
 -----
     python tools/build_manifest.py keygen --update-module
     python tools/build_manifest.py generate --root dist/VideoHighlighter \\
-        --version 0.9.1 --edition Pro
+        --version 0.9.1 --edition Pro --platform windows
     python tools/build_manifest.py sign --root dist/VideoHighlighter
     python tools/build_manifest.py verify --root dist/VideoHighlighter
 """
@@ -55,11 +55,18 @@ from modules.update.update_manifest import (  # noqa: E402
 )
 
 DEFAULT_KEY_PATH = os.path.join(".secrets", "release_signing_key.pem")
-_MODULE_PATH = os.path.join("modules", "update_manifest.py")
+_MODULE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "modules", "update", "update_manifest.py")
 
 # Never listed in the manifest: the manifest cannot contain its own hash, and
 # the signature covers the manifest rather than being covered by it.
 _SELF = {MANIFEST_FILENAME, SIGNATURE_FILENAME}
+
+# Top-level folders that are never the release's, even when present: the packs
+# install and update separately (modules/packs), and the updater's own staging
+# and trash. Listing them would hand the next update licence to delete them.
+_NOT_SHIPPED = {"packs", ".pack-staging", ".update-staging", ".update-old"}
 
 
 def _walk(root: str):
@@ -69,6 +76,8 @@ def _walk(root: str):
     identically — the updater joins them back with the local separator.
     """
     for dirpath, dirnames, filenames in os.walk(root):
+        if os.path.abspath(dirpath) == os.path.abspath(root):
+            dirnames[:] = [d for d in dirnames if d not in _NOT_SHIPPED]
         dirnames.sort()
         for name in sorted(filenames):
             absolute = os.path.join(dirpath, name)
@@ -98,6 +107,9 @@ def generate(args) -> int:
         "format": MANIFEST_FORMAT,
         "version": args.version,
         "edition": args.edition,
+        # Checked by the updater before anything is fetched: a genuine release
+        # for the other edition or another OS must not be laid over this one.
+        "platform": args.platform,
         "date": args.date or _dt.date.today().isoformat(),
         "notes": args.notes or "",
         # Filled in at publish time — where the individual files can be fetched.
@@ -105,6 +117,15 @@ def generate(args) -> int:
         "base_url": args.base_url or "",
         "files": files,
     }
+    if args.compression:
+        # How the blobs are stored on the host; the hashes stay those of the
+        # files themselves. Signed with the rest, so it cannot be switched.
+        manifest["compression"] = args.compression
+    if args.min_version:
+        # The oldest install this release can be laid over in place. Set it
+        # when the install's layout changes; older installs are then offered
+        # the download instead of an update that would leave them broken.
+        manifest["min_version"] = args.min_version
 
     out = args.out or os.path.join(root, MANIFEST_FILENAME)
     with open(out, "w", encoding="utf-8") as handle:
@@ -222,6 +243,12 @@ def main(argv=None) -> int:
     p_gen.add_argument("--root", required=True, help="Built bundle directory.")
     p_gen.add_argument("--version", required=True)
     p_gen.add_argument("--edition", default="Pro")
+    p_gen.add_argument("--platform", default="windows",
+                       choices=("windows", "macos", "linux"))
+    p_gen.add_argument("--compression", choices=("gzip",),
+                       help="Store blobs gzip-compressed on the host (files/<sha>.gz).")
+    p_gen.add_argument("--min-version", dest="min_version",
+                       help="Oldest version that may update to this one in place.")
     p_gen.add_argument("--date", help="Release date (default: today).")
     p_gen.add_argument("--notes", help="One line shown in the update banner.")
     p_gen.add_argument("--base-url", dest="base_url",

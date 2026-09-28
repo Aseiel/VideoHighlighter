@@ -5,8 +5,13 @@ A "composed event" fires when a configurable set of conditions holds
 consistently over a short time window. Two kinds of condition exist:
 
 *spatial* (``rules:``)
-    Count how many boxes of a *source* class have their centre inside a box of
-    a *region* class, and require the count to fall in a range.
+    Count how many detections of a *source* class stand in a relation to one
+    of a *region* class, and require the count to fall in a range. The
+    relation is ``inside`` (the source's centre is in the region — the
+    original, and the default), ``overlaps`` (at least ``min_overlap`` of the
+    source's area is in the region) or ``touches`` (they meet, or come within
+    ``max_gap``). Detections are boxes, or outlines where the cache carries
+    ``contours``; see ``modules/rules/shapes.py``.
 
 *signal* (``signals:``)
     Compare a per-second measurement against a threshold, or a per-second label
@@ -35,15 +40,38 @@ from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from modules.rules.shapes import RELATIONS, relates
+
+
+# Two points (body parts) closer than this, as a fraction of the frame, are the
+# same part seen again.
+POINT_MATCH = 0.05
+
+
+def _relation(value) -> str:
+    """A rule's ``relation``, checked: a typo must fail loudly at load, not
+    silently fall back to ``inside`` and fire on the wrong thing."""
+    relation = str(value or "inside").strip().lower()
+    if relation not in RELATIONS:
+        raise ValueError(f"relation must be one of {RELATIONS}, not {value!r}")
+    return relation
+
 
 @dataclass
 class _Rule:
-    """One condition: count how many *source* boxes have their centre inside
-    a *region* box, and verify the count falls in [min_count, max_count]."""
+    """One condition: count how many *source* detections stand in ``relation``
+    to some *region* detection, and verify the count falls in
+    [min_count, max_count]."""
     source_class: str
     region_class: str
     min_count: int = 1
     max_count: int = 999   # 999 = no upper limit
+    relation: str = "inside"
+    min_overlap: float = 0.5   # overlaps: share of the source's area inside
+    max_gap: float = 0.0       # touches: fraction of the frame width
+    # Ask for outlines of both classes (``modules/vision/outlines.py``). Off,
+    # the rule is decided on boxes, as it always was.
+    outline: bool = False
 
 
 @dataclass
@@ -160,6 +188,7 @@ class CompositionEngine:
             'objects':     list[str],
             'bboxes':      list[[x1n, y1n, wn, hn]],  # normalised top-left + size
             'confidences': list[float],
+            'contours':    list[list[[xn, yn]] | None],   # optional outlines
         }
 
     Returns
@@ -179,6 +208,13 @@ class CompositionEngine:
 
     def __init__(self, rules_path: str | Path):
         self._specs = self._load(Path(rules_path))
+        self.outliner = self._read_outliner(Path(rules_path))
+        # Rule classes that name a body part (``person.hand``): produced from
+        # the cache's keypoints, per frame, as point detections.
+        from modules.rules.body_parts import is_part
+        self._part_refs = {cls for spec in self._specs for rule in spec.rules
+                           for cls in (rule.source_class, rule.region_class)
+                           if is_part(cls)}
 
     # ------------------------------------------------------------------ public
 
@@ -192,6 +228,40 @@ class CompositionEngine:
         """
         return [s.name for s in self._specs]
 
+    @staticmethod
+    def _read_outliner(path: Path) -> str:
+        """The rules file's ``outliner:`` (``grabcut`` unless it says ``sam``)."""
+        if not path.exists():
+            return "grabcut"
+        with open(path, encoding='utf-8') as f:
+            raw = yaml.safe_load(f) or {}
+        name = str(raw.get('outliner') or 'grabcut').strip().lower()
+        if name not in ('grabcut', 'sam'):
+            raise ValueError(f"outliner must be 'grabcut' or 'sam', not {name!r}")
+        return name
+
+    @property
+    def outline_pairs(self) -> list:
+        """``(source, region, max_gap)`` for every enabled rule that asked for
+        outlines: what an outline pass has to trace, and next to what."""
+        from modules.rules.body_parts import base_class
+        return sorted({(base_class(rule.source_class), base_class(rule.region_class),
+                        rule.max_gap)
+                       for spec in self._specs if spec.enabled
+                       for rule in spec.rules if rule.outline})
+
+    @property
+    def keypoint_pairs(self) -> list:
+        """``(person class, other class, max_gap)`` for enabled rules naming a
+        body part: where a pose pass has to run, and next to what."""
+        from modules.rules.body_parts import base_class, is_part
+        return sorted({(base_class(a), base_class(b), rule.max_gap)
+                       for spec in self._specs if spec.enabled
+                       for rule in spec.rules
+                       for a, b in ((rule.source_class, rule.region_class),
+                                    (rule.region_class, rule.source_class))
+                       if is_part(a)})
+
     @property
     def object_classes(self) -> list:
         """Every detection class the *enabled* spatial rules read.
@@ -203,7 +273,10 @@ class CompositionEngine:
         will never look at. (``event_names`` includes them, deliberately, for
         the opposite reason: their previous output still has to be stripped.)
         """
-        return sorted({cls
+        from modules.rules.body_parts import base_class
+        # A body part is found on its class's detections: `person.hand` needs
+        # people detected, and asking a detector for "person.hand" finds nothing.
+        return sorted({base_class(cls)
                        for spec in self._specs if spec.enabled
                        for rule in spec.rules
                        for cls in (rule.source_class, rule.region_class)
@@ -251,6 +324,10 @@ class CompositionEngine:
         for entry in frames:
             ts = float(entry.get('timestamp', 0))
             dets = self._parse_frame(entry)
+            if self._part_refs:
+                from modules.rules.body_parts import part_detections
+                for ref, points in part_detections(entry, self._part_refs).items():
+                    dets[ref].extend(points)
 
             for spec in spatial_specs:
                 # --- expire old ghosts ---
@@ -266,14 +343,17 @@ class CompositionEngine:
                         existing = ghosts[spec.name][cls]
                         matched = False
                         for g in existing:
-                            if self._iou(g['box'], det['box']) > 0.3:
+                            if self._same_object(g, det):
                                 g['ts'] = ts
                                 g['box'] = det['box']
                                 g['conf'] = det['conf']
+                                g['contour'] = det.get('contour')
                                 matched = True
                                 break
                         if not matched:
-                            existing.append({'ts': ts, 'box': det['box'], 'conf': det['conf']})
+                            existing.append({'ts': ts, 'box': det['box'], 'conf': det['conf'],
+                                             'contour': det.get('contour'),
+                                             'point': det.get('point', False)})
 
                 # --- build effective detections = live ghosts ---
                 effective: dict = defaultdict(list)
@@ -405,12 +485,18 @@ class CompositionEngine:
                 # barely-there detections is not the same evidence as one firing
                 # on two solid ones, and now it does not claim to be.
                 confidence = min((m['conf'] for m in matched), default=0.0)
-                overlay_bboxes.append({
+                entry = {
                     'timestamp': ts,
                     'objects': [name],
                     'bboxes': [union] if union else [],
                     'confidences': [round(float(confidence), 3)] if union else [],
-                })
+                }
+                outlines = [m['contour'] for m in matched if m.get('contour')]
+                if outlines and union:
+                    # The shapes the event is about, for an overlay that can
+                    # draw them; one that cannot still has the box.
+                    entry['event_contours'] = [outlines]
+                overlay_bboxes.append(entry)
 
         return dict(sec_events), overlay_bboxes
 
@@ -533,6 +619,10 @@ class CompositionEngine:
                     region_class=r['region'],
                     min_count=int(r.get('min_count', 1)),
                     max_count=int(r.get('max_count', 999)),
+                    relation=_relation(r.get('relation')),
+                    min_overlap=float(r.get('min_overlap', 0.5)),
+                    max_gap=float(r.get('max_gap', 0.0)),
+                    outline=bool(r.get('outline', False)),
                 )
                 for r in ev.get('rules', [])
             ]
@@ -581,20 +671,39 @@ class CompositionEngine:
         objs = entry.get('objects', [])
         boxes = entry.get('bboxes', [])
         confs = entry.get('confidences', [])
+        contours = entry.get('contours') or []
         for i, cls in enumerate(objs):
             box = boxes[i] if i < len(boxes) else [0.0, 0.0, 0.0, 0.0]
             conf = confs[i] if i < len(confs) else 1.0
-            result[cls].append({'box': list(box), 'conf': float(conf)})
+            det = {'box': list(box), 'conf': float(conf)}
+            outline = contours[i] if i < len(contours) else None
+            if outline and len(outline) >= 3:
+                det['contour'] = [list(p) for p in outline]
+            result[cls].append(det)
         return result
 
     @staticmethod
-    def _centre_inside(source_box: list, region_box: list) -> bool:
-        """True if the centre of *source_box* falls inside *region_box*.
-        Both are [x1n, y1n, wn, hn] normalised."""
-        sx1, sy1, sw, sh = source_box
-        cx, cy = sx1 + sw / 2, sy1 + sh / 2
-        rx1, ry1, rw, rh = region_box
-        return rx1 <= cx <= rx1 + rw and ry1 <= cy <= ry1 + rh
+    def _as_used_by(det: dict, rule) -> dict:
+        """The detection as ``rule`` sees it: with its outline only if the rule
+        asked for outlines. Outlines traced for one rule sit in the cache for
+        every rule on those classes, and a rule that did not ask must keep
+        answering on boxes, exactly as it did before outlines existed."""
+        if rule.outline or 'contour' not in det:
+            return det
+        return {k: v for k, v in det.items() if k != 'contour'}
+
+    @classmethod
+    def _same_object(cls, ghost: dict, det: dict) -> bool:
+        """Whether a detection continues a remembered one.
+
+        Boxes by overlap. Points (body parts) have no area, so their IoU is
+        always 0 and every frame would add a duplicate that lingers for
+        ``persist_secs``, inflating every count: they are matched by distance.
+        """
+        if det.get('point') or ghost.get('point'):
+            (gx, gy), (dx, dy) = ghost['box'][:2], det['box'][:2]
+            return (gx - dx) ** 2 + (gy - dy) ** 2 <= POINT_MATCH ** 2
+        return cls._iou(ghost['box'], det['box']) > 0.3
 
     @staticmethod
     def _iou(a: list, b: list) -> float:
@@ -634,7 +743,9 @@ class CompositionEngine:
             # Claim source instances greedily; each source counts at most once
             claimed, claimed_idx = [], []
             for i, src in enumerate(sources):
-                if any(self._centre_inside(src['box'], rgn['box']) for rgn in regions):
+                if any(relates(self._as_used_by(src, rule), self._as_used_by(rgn, rule),
+                               rule.relation, rule.min_overlap, rule.max_gap)
+                       for rgn in regions):
                     claimed.append(src)
                     claimed_idx.append(i)
             count = len(claimed)

@@ -1261,6 +1261,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             _rules_path = composition_rules_path()
             _needed = signal_names(_rules_path)
             _was = set(composed_event_names or [])
+            _outlined = {}
             (object_detections, object_bboxes_cache,
              composed_event_names, _hits) = apply_rules(
                 object_detections, object_bboxes_cache,
@@ -1277,13 +1278,17 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                                 cache_dir=gui_config.get("cache_dir", "./cache"),
                                 needed=_needed, log_fn=log)
                          if _needed else None),
+                video_path=processed_video_path,
+                outline_stats=_outlined,
+                cancel=cancel_flag,
                 log_fn=log)
             # Only on a cached pass, and only when the rule set actually moved.
             # A fresh pass writes the whole cache further down; rewriting it
             # here as well would be the same file twice. The timeline reads the
             # cache directly, so without this it keeps showing the old layer
             # list while the report names the new events.
-            if using_cache and _was != set(composed_event_names or []):
+            if using_cache and (_was != set(composed_event_names or [])
+                                or _outlined.get("frames")):
                 write_back(processed_video_path, cached_data,
                            object_detections, object_bboxes_cache,
                            composed_event_names,

@@ -1,0 +1,83 @@
+name: Prune update host
+
+# Deletes update blobs (files/*) that no release worth keeping refers to:
+# the newest `keep` releases of each edition and platform, plus whatever a
+# channel file points at. An install always updates *to* one of those, so
+# nothing older is ever downloaded again. Manifests and signatures are never
+# deleted, and blobs younger than two days are never touched (a build uploads
+# its blobs minutes before its manifest). tools/publish_release.py `gc` does
+# the choosing and is tested; this only lists, downloads and deletes.
+#
+# Runs as a dry run unless `dry_run` is unticked: the summary lists what would
+# go, and how much space it frees.
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: 'Newest releases to keep per edition and platform'
+        default: '3'
+      dry_run:
+        description: 'Only report what would be deleted'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  R2_BUCKET: vh-updates
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+concurrency:
+  # Never alongside a publish: that is exactly when a blob is on the host
+  # before the manifest that needs it.
+  group: publish-update
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install cryptography
+      - name: Choose and delete
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          KEEP: ${{ inputs.keep }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$KEEP" =~ ^[1-9][0-9]*$ ]]; then echo "::error::keep must be a positive number"; exit 1; fi
+          ep="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3api list-objects-v2 --endpoint-url "$ep" --bucket "$R2_BUCKET" --prefix files/ \
+            --query 'Contents[].[Key,Size,LastModified]' --output json > listing.json
+          mkdir -p meta
+          aws s3 sync "s3://$R2_BUCKET/releases" meta/releases --endpoint-url "$ep" \
+            --exclude '*' --include '*/manifest.json' --only-show-errors
+          aws s3 sync "s3://$R2_BUCKET/channels" meta/channels --endpoint-url "$ep" --only-show-errors
+          python tools/publish_release.py gc --listing listing.json --root meta \
+            --keep "$KEEP" --out batches | tee gc.txt
+          {
+            echo "### Prune update host (keep $KEEP)"
+            echo '```'
+            cat gc.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: nothing deleted." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          for batch in batches/delete-*.json; do
+            [ -e "$batch" ] || continue
+            aws s3api delete-objects --endpoint-url "$ep" --bucket "$R2_BUCKET" \
+              --delete "file://$batch" > /dev/null
+          done
+          echo "Deleted." >> "$GITHUB_STEP_SUMMARY"

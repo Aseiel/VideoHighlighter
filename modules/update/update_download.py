@@ -22,12 +22,21 @@ the same code serves a public release host or a gated one.
 from __future__ import annotations
 
 import os
+import threading
+import time
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from modules.update.update_manifest import hash_file, is_safe_relpath, local_path
 
 TIMEOUT_SECONDS = 30
+WORKERS = 6
+# Waits before the second and third attempt at a file. A dropped connection
+# halfway through a multi-GB update should cost one file a few seconds, not
+# the user a "try again".
+RETRY_DELAYS = (2.0, 6.0)
 _CHUNK = 256 * 1024
 
 
@@ -53,7 +62,14 @@ def _default_opener(url: str, headers: dict):
                                   **https_certs.opener_kwargs())
 
 
-def file_url(base_url: str, entry: dict, layout: str = "content") -> str:
+# Blob encodings a signed manifest may declare. ``gzip`` blobs live at
+# ``files/<sha256>.gz``; the hash is always of the *decompressed* file, so
+# compression changes what travels and nothing about what is verified.
+COMPRESSIONS = ("", "gzip")
+
+
+def file_url(base_url: str, entry: dict, layout: str = "content",
+             compression: str = "") -> str:
     """Where to fetch one manifest entry from.
 
     ``content`` (the default) addresses files by their SHA-256 rather than by
@@ -74,9 +90,23 @@ def file_url(base_url: str, entry: dict, layout: str = "content") -> str:
     from urllib.parse import quote
 
     base = base_url.rstrip("/")
+    suffix = ".gz" if compression == "gzip" else ""
     if layout == "path":
-        return base + "/" + quote(entry["path"])
-    return base + "/files/" + quote(str(entry["sha256"]))
+        return base + "/" + quote(entry["path"]) + suffix
+    return base + "/files/" + quote(str(entry["sha256"])) + suffix
+
+
+def _is_permanent(exc: Exception) -> bool:
+    """Whether retrying ``exc`` is pointless.
+
+    A 4xx means the host answered and the blob is not there (or not ours to
+    have); asking again returns the same. Everything else — a reset, a timeout,
+    a 5xx from a CDN edge — is the kind of thing a second attempt fixes.
+    """
+    code = getattr(exc, "code", None)
+    # Except the 4xx that mean "not now": a timeout, and being rate-limited,
+    # which six parallel downloads make likely rather than rare.
+    return isinstance(code, int) and 400 <= code < 500 and code not in (408, 425, 429)
 
 
 def download_plan(
@@ -89,6 +119,8 @@ def download_plan(
     progress: Optional[Callable[[int, int, str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     opener: Optional[Callable] = None,
+    workers: int = WORKERS,
+    compression: str = "",
 ) -> DownloadResult:
     """Download every file in ``plan`` into ``staging_dir``.
 
@@ -96,20 +128,46 @@ def download_plan(
     arrives — often enough for a progress bar, not per chunk of every file.
     ``should_cancel()`` is polled between chunks so a user can stop a multi-GB
     download without waiting for it to finish.
+
+    Files are fetched ``workers`` at a time. An update is mostly small files —
+    Python modules, Qt plugins — and one at a time the round trips, not the
+    bytes, set the pace. Callbacks are still made one at a time, from whichever
+    worker has news, so a caller never sees two at once.
     """
+    if compression not in COMPRESSIONS:
+        raise ValueError(f"unsupported blob compression {compression!r}")
     result = DownloadResult()
     total = plan.download_bytes
     fetch = opener or _default_opener
+    lock = threading.Lock()
+    stop = threading.Event()
 
-    for entry in plan.download:
+    def cancelled() -> bool:
+        if stop.is_set():
+            return True
+        if should_cancel:
+            with lock:
+                if should_cancel():
+                    stop.set()
+        return stop.is_set()
+
+    def advance(count: int, relative: str) -> None:
+        with lock:
+            result.bytes_done += count
+            if progress:
+                progress(result.bytes_done, total, relative)
+
+    def fail(relative: str, reason: str) -> None:
+        with lock:
+            result.failed.append((relative, reason))
+
+    def one(entry: dict) -> None:
         relative = entry.get("path")
         if not is_safe_relpath(relative):
-            result.failed.append((str(relative), "unsafe path"))
-            continue
-
-        if should_cancel and should_cancel():
-            result.cancelled = True
-            return result
+            fail(str(relative), "unsafe path")
+            return
+        if cancelled():
+            return
 
         target = local_path(staging_dir, relative)
         expected = entry.get("sha256")
@@ -118,65 +176,97 @@ def download_plan(
         if os.path.exists(target):
             try:
                 if hash_file(target) == expected:
-                    result.staged.append(relative)
-                    result.bytes_done += int(entry.get("size", 0))
-                    if progress:
-                        progress(result.bytes_done, total, relative)
-                    continue
+                    with lock:
+                        result.staged.append(relative)
+                    advance(int(entry.get("size", 0)), relative)
+                    return
             except OSError:
                 pass
-            try:
-                os.remove(target)
-            except OSError:
-                pass
+            _remove(target)
 
         os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
         partial = target + ".part"
-        url = file_url(base_url, entry, layout)
+        url = file_url(base_url, entry, layout, compression)
 
-        try:
-            with fetch(url, headers or {}) as response:
-                with open(partial, "wb") as handle:
-                    while True:
-                        if should_cancel and should_cancel():
-                            result.cancelled = True
-                            handle.close()
-                            _remove(partial)
-                            return result
-                        block = response.read(_CHUNK)
-                        if not block:
-                            break
-                        handle.write(block)
-                        result.bytes_done += len(block)
-                        if progress:
-                            progress(result.bytes_done, total, relative)
-        except Exception as exc:
-            _remove(partial)
-            result.failed.append((relative, f"{type(exc).__name__}: {exc}"))
-            continue
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            written = 0
+            # Progress counts bytes of the file as it will be on disk, so the
+            # bar's total (the manifest's sizes) means the same either way.
+            inflate = (zlib.decompressobj(16 + zlib.MAX_WBITS)
+                       if compression == "gzip" else None)
+            try:
+                with fetch(url, headers or {}) as response:
+                    with open(partial, "wb") as handle:
+                        while True:
+                            if cancelled():
+                                break
+                            block = response.read(_CHUNK)
+                            if not block:
+                                if inflate is not None:
+                                    block = inflate.flush()
+                                    if not inflate.eof:
+                                        raise EOFError("compressed blob ended early")
+                                    inflate = None
+                                    if block:
+                                        handle.write(block)
+                                        written += len(block)
+                                        advance(len(block), relative)
+                                break
+                            if inflate is not None:
+                                block = inflate.decompress(block)
+                            handle.write(block)
+                            written += len(block)
+                            advance(len(block), relative)
+                if cancelled():
+                    _remove(partial)
+                    advance(-written, relative)
+                    return
+                break
+            except Exception as exc:
+                _remove(partial)
+                # Take back what this attempt counted, so a retry does not
+                # push the progress bar past 100%.
+                advance(-written, relative)
+                if attempt >= len(RETRY_DELAYS) or _is_permanent(exc) or cancelled():
+                    fail(relative, f"{type(exc).__name__}: {exc}")
+                    return
+                print(f"update_download: {relative}: {type(exc).__name__}: "
+                      f"{exc}; retrying")
+                time.sleep(RETRY_DELAYS[attempt])
 
         # The check that makes everything above safe to have done.
         try:
             actual = hash_file(partial)
         except OSError as exc:
             _remove(partial)
-            result.failed.append((relative, f"unreadable after download: {exc}"))
-            continue
+            fail(relative, f"unreadable after download: {exc}")
+            return
 
         if actual != expected:
             _remove(partial)
-            result.failed.append((relative, "hash mismatch"))
-            continue
+            fail(relative, "hash mismatch")
+            return
 
         try:
             os.replace(partial, target)
         except OSError as exc:
             _remove(partial)
-            result.failed.append((relative, f"could not stage: {exc}"))
-            continue
+            fail(relative, f"could not stage: {exc}")
+            return
 
-        result.staged.append(relative)
+        with lock:
+            result.staged.append(relative)
 
+    entries = list(plan.download)
+    if workers <= 1 or len(entries) <= 1:
+        for entry in entries:
+            one(entry)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for future in [pool.submit(one, entry) for entry in entries]:
+                future.result()
+
+    result.cancelled = stop.is_set()
     return result
 
 

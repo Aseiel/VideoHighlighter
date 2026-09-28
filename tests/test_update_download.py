@@ -17,6 +17,13 @@ from modules.update import update_apply, update_download
 from modules.update.update_manifest import UpdatePlan
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_wait(monkeypatch):
+    # Retries still happen, just without the real back-off between them.
+    monkeypatch.setattr(update_download, "RETRY_DELAYS", (0, 0))
+
+
+
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -121,6 +128,64 @@ def test_network_error_is_reported_not_raised(tmp_path):
     assert result.staged == ["a.py"]
     assert result.failed[0][0] == "b.py"
     assert not result.ok
+
+
+def test_a_dropped_connection_is_retried(tmp_path):
+    # One reset halfway through a big update should cost that file a retry,
+    # not the user a "try again".
+    good = _opener({"a.py": b"x"})
+    calls = {"n": 0}
+
+    def flaky(url, headers):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("connection reset")
+        return good(url, headers)
+
+    result = update_download.download_plan(
+        _plan(_entry("a.py", b"x")), BASE, str(tmp_path / "stage"), opener=flaky)
+    assert result.ok and result.staged == ["a.py"]
+    assert calls["n"] == 2
+    assert result.bytes_done == 1
+
+
+def test_a_missing_blob_is_not_retried(tmp_path):
+    import urllib.error
+    calls = {"n": 0}
+
+    def not_found(url, headers):
+        calls["n"] += 1
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
+
+    result = update_download.download_plan(
+        _plan(_entry("a.py", b"x")), BASE, str(tmp_path / "stage"), opener=not_found)
+    assert not result.ok
+    assert calls["n"] == 1
+
+
+def test_retries_give_up_and_count_no_bytes(tmp_path):
+    result = update_download.download_plan(
+        _plan(_entry("a.py", b"x")), BASE, str(tmp_path / "stage"),
+        opener=_opener({"a.py": b"x"}, fail={"a.py"}))
+    assert result.failed and result.failed[0][0] == "a.py"
+    assert result.bytes_done == 0
+
+
+def test_many_files_download_in_parallel_and_all_verify(tmp_path):
+    files = {f"_internal/mod{i}.py": f"payload {i}".encode() * (i + 1)
+             for i in range(40)}
+    plan = _plan(*(_entry(p, d) for p, d in files.items()))
+    seen = []
+    result = update_download.download_plan(
+        plan, BASE, str(tmp_path / "stage"), opener=_opener(files), workers=8,
+        progress=lambda done, total, path: seen.append(done))
+    assert result.ok
+    assert sorted(result.staged) == sorted(files)
+    assert result.bytes_done == plan.download_bytes
+    # Callbacks are serialised: the running total never goes backwards.
+    assert seen == sorted(seen) and seen[-1] == plan.download_bytes
+    for relative, data in files.items():
+        assert (tmp_path / "stage" / relative).read_bytes() == data
 
 
 def test_already_staged_files_are_not_refetched(tmp_path):
@@ -283,3 +348,23 @@ def test_download_then_apply_end_to_end(tmp_path):
 
     update_apply.sweep_old(str(root))
     assert not (root / update_apply.TRASH_DIRNAME).exists()
+
+
+
+@pytest.mark.parametrize("code, retried", [(404, False), (403, False), (429, True),
+                                           (408, True), (503, True)])
+def test_which_http_errors_are_worth_another_try(tmp_path, code, retried):
+    import urllib.error
+    good = _opener({"a.py": b"x"})
+    calls = {"n": 0}
+
+    def flaky(url, headers):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise urllib.error.HTTPError(url, code, "status", {}, None)
+        return good(url, headers)
+
+    result = update_download.download_plan(
+        _plan(_entry("a.py", b"x")), BASE, str(tmp_path / "stage"), opener=flaky)
+    assert result.ok is retried
+    assert calls["n"] == (2 if retried else 1)

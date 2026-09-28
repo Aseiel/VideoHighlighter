@@ -604,6 +604,13 @@ def _without_classes(bboxes: list, classes: set) -> list:
         trimmed["objects"] = [names[i] for i in keep]
         trimmed["bboxes"] = [boxes[i] for i in keep if i < len(boxes)]
         trimmed["confidences"] = [confs[i] for i in keep if i < len(confs)]
+        for aligned in ("contours", "keypoints"):
+            if entry.get(aligned) is not None:
+                # Aligned with the boxes, so trimmed with them; left as it was,
+                # every outline or pose after a removed class would sit on the
+                # wrong box.
+                values = entry.get(aligned) or []
+                trimmed[aligned] = [values[i] if i < len(values) else None for i in keep]
         out.append(trimmed)
     return out
 
@@ -759,6 +766,16 @@ def run_composition(video_path: str, *, cache_dir: str = "./cache",
     # The file's own length, so a closing edge guard knows where the end is.
     # Without it the engine falls back to how far the signals reach, which is
     # the same number for an audio rule and short of it for a spatial one.
+    # Outlines, for the rules that asked. Traced only where boxes cannot
+    # already answer, and kept in the cache so the next run reuses them.
+    outlined = False
+    if bboxes and (engine.outline_pairs or engine.keypoint_pairs):
+        from modules.rules.rule_inputs import trace_for_rules
+        report = trace_for_rules(video_path, bboxes, engine, cancel=cancel, log=log)
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()
+        outlined = any((s or {}).get("frames") for s in report.values())
+
     duration = ((cache.get("video_metadata") or {}).get("duration")
                 or (cache.get("video_duration") or None))
     composed, _composed_bb = engine.run(
@@ -795,7 +812,7 @@ def run_composition(video_path: str, *, cache_dir: str = "./cache",
     # from real detections. Written on every run so the list tracks the current
     # rules — a renamed or deleted rule stops being claimed as an event.
     out = {"objects": rebuilt, "composed_event_names": sorted(known)}
-    if detected:
+    if detected or outlined:
         # Only when a pass ran here. Composed boxes are still kept out (see
         # above); what goes back is the detector's own output, so the next run
         # finds the classes already there and skips straight to the rules.

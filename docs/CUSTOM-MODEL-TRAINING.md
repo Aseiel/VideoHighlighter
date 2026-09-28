@@ -389,8 +389,9 @@ shared files stay portable to the free edition:
 | `llm/example_mine.py` | scan a file → candidates | to do, no Qt, testable |
 | `modules/box_refine.py` | coarse region → fitted box | to do, isolated so refiners can be swapped and measured |
 | `modules/vision/label_store.py` | labels, verdicts, boxes on disk + COCO assembly | **done** — source-agnostic, segment-aware split |
-| `modules/train_rounds.py` | round history, held-out set, promote/reject a model | to do, pure, testable without a GPU |
-| `modules/review_queue.py` | what to ask the human next, ranked | to do, pure — the acquisition rules above |
+| `modules/teach/train.py` + `build.py` | round history, frozen held-out set, install only if better | **done** — for clips (actions) and boxes (objects); see docs/TEACH-A-MODEL.md |
+| `modules/teach/review.py` | what to ask the human next, ranked; contact sheets; verdicts | **done** — the acquisition rules above, driven from the command line |
+| `modules/teach/` | the whole loop from videos to model, one command per step, `status` naming the next | **done** — docs/TEACH-A-MODEL.md |
 | `training/train_yolox_run.py` | training with progress + cancel | **done** — fine-tunes on XPU/CUDA/CPU |
 | `training/train_estimate.py` | how long a run will take, said before it starts | **done** — measured speeds per device, refined by every run on this computer |
 | `modules/vision/training_preview.py` + `modules/ui/training_preview.py` | what the model finds each round on held-out frames; the "Watch it learn" window | **done** |
