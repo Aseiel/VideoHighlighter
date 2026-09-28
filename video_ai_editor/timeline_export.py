@@ -7,6 +7,8 @@ The timebase and the sequence types are pure data. Writers below them turn a
 
 from __future__ import annotations
 
+import csv
+import io
 import math
 import os
 import xml.etree.ElementTree as ET
@@ -565,6 +567,81 @@ def fcpxml_text(sequence: Sequence) -> tuple[str, int]:
     return _serialize_fcpxml(root), skipped
 
 
+_CSV_COLUMNS = (
+    "Clip", "Start (s)", "End (s)", "Duration (s)", "Frame in", "Frame out",
+)
+
+
+def _csv_seconds(frames: int, timebase: Timebase) -> str:
+    """Quantised seconds at a real frame boundary.
+
+    Six decimal places, then trailing zeros drop back to two, so a 30 fps
+    cut reads ``10.00`` and a 29.97 cut keeps the fraction the frame is.
+    """
+    if frames < 0:
+        return "-" + _csv_seconds(-frames, timebase)
+    numerator = int(frames) * timebase.fps_den
+    denominator = timebase.fps_num
+    scaled, remainder = divmod(numerator * 1_000_000, denominator)
+    # Half to even, matching the frame counter's rounding.
+    if remainder * 2 > denominator or (remainder * 2 == denominator and scaled % 2):
+        scaled += 1
+    whole, frac = divmod(int(scaled), 1_000_000)
+    digits = f"{frac:06d}".rstrip("0")
+    if len(digits) < 2:
+        digits = digits.ljust(2, "0")
+    return f"{whole}.{digits}"
+
+
+def csv_text(sequence: Sequence) -> tuple[str, int]:
+    """Spreadsheet rows for ``sequence``, and how many clips were skipped.
+
+    Columns are the quantised source range. There is no sequence clock and
+    no marker row. Raises :class:`ExportError` when there is nothing to write.
+    """
+    if not sequence.clips:
+        raise ExportError("nothing to export — the edit timeline has no clips")
+
+    timebase = sequence.timebase()
+    kept: list[tuple[int, int]] = []
+    skipped = 0
+    for start, end in sequence.clips:
+        quantised = _source_clip(start, end, timebase)
+        if quantised is None:
+            skipped += 1
+            continue
+        kept.append(quantised)
+    if not kept:
+        raise ExportError(
+            "every clip is shorter than one frame at "
+            f"{timebase.fps_num}/{timebase.fps_den}")
+
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(_CSV_COLUMNS)
+    for number, (src_in, src_out) in enumerate(kept, start=1):
+        writer.writerow([
+            number,
+            _csv_seconds(src_in, timebase),
+            _csv_seconds(src_out, timebase),
+            _csv_seconds(src_out - src_in, timebase),
+            src_in,
+            src_out,
+        ])
+    return buffer.getvalue(), skipped
+
+
+def write_csv(sequence: Sequence, output_path: str | None = None) -> WrittenExport:
+    """Write the clip spreadsheet. ``output_path`` defaults to ``{stem}_edit.csv``."""
+    text, skipped = csv_text(sequence)
+    if output_path is None:
+        directory = os.path.dirname(os.path.abspath(sequence.source.path))
+        output_path = os.path.join(
+            directory, f"{_stem(sequence.source.path)}_edit.csv")
+    _write_text(output_path, text)
+    return WrittenExport(path=output_path, skipped=skipped)
+
+
 def write_fcpxml(sequence: Sequence, output_path: str | None = None) -> WrittenExport:
     """Write FCPXML 1.9. ``output_path`` defaults to ``{stem}_edit.fcpxml``."""
     text, skipped = fcpxml_text(sequence)
@@ -632,24 +709,51 @@ class TimelineExporter:
             spans=tuple(spans),
         )
         return write_fcpxml(sequence, output_path)
-    
+
+    @staticmethod
+    def to_csv(clips, video_path, output_path=None, fps=30, *,
+               source: MediaSource | None = None,
+               record_start: str = RECORD_START_ZERO,
+               spans: tuple = ()):
+        """Write a spreadsheet of ``clips``.
+
+        Times are quantised to the real frame rate. ``record_start`` is
+        accepted and ignored: a CSV has no sequence clock. Spans are not rows.
+        """
+        if source is None:
+            source = MediaSource(
+                path=str(video_path), duration=0.0,
+                fps_num=int(fps), fps_den=1,
+                width=0, height=0, has_audio=False,
+                audio_rate=0, audio_channels=0,
+            )
+        sequence = Sequence(
+            title=_stem(source.path or str(video_path)),
+            source=source,
+            clips=tuple((float(start), float(end)) for start, end in clips),
+            record_start=record_start,
+            spans=tuple(spans),
+        )
+        return write_csv(sequence, output_path)
+
     @staticmethod
     def get_export_formats():
-        """Return list of available export formats"""
+        """The three formats the export dialog offers."""
         return [
-            ("EDL (CMX3600)", "*.edl"),
-            ("FCPXML (DaVinci Resolve)", "*.xml"),
+            ("EDL (CMX 3600)", "*.edl"),
+            ("FCPXML", "*.fcpxml"),
             ("CSV", "*.csv"),
-            ("JSON", "*.json")
         ]
-    
+
     @staticmethod
     def export_auto(clips, video_path, format='edl'):
-        """Auto-export based on format name"""
-        format = format.lower()
-        if format == 'edl':
+        """Dispatch ``format`` to its own writer. Unknown names write nothing."""
+        key = str(format).lower()
+        if key == "edl":
             return TimelineExporter.to_edl(clips, video_path)
-        elif format in ('fcpxml', 'xml', 'fcp'):
+        if key in ("fcpxml", "xml", "fcp"):
             return TimelineExporter.to_fcp_xml(clips, video_path)
-        else:
-            return None
+        if key == "csv":
+            return TimelineExporter.to_csv(clips, video_path)
+        raise ExportError(
+            f"unknown export format {format!r}; choose edl, fcpxml, or csv")

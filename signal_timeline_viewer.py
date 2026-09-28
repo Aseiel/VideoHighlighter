@@ -53,7 +53,7 @@ from modules.system import startup_splash
 from modules.media.audio_device import follow_system_default
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
-from video_ai_editor.timeline_export import TimelineExporter
+from video_ai_editor.timeline_export import ExportError, TimelineExporter
 from video_ai_editor.waveform import WaveformVisualizer
 from video_ai_editor.timeline_bars import TimelineBar
 from video_ai_editor.signal_timeline import SignalTimelineScene, SignalTimelineView
@@ -4471,9 +4471,13 @@ class SignalTimelineWindow(QMainWindow):
             elif format_name.startswith("FCPXML"):
                 default_path = os.path.join(os.path.dirname(self.video_path), f"{default_name}.xml")
                 filter_str = "XML files (*.xml)"
+            elif format_name.startswith("CSV"):
+                default_path = os.path.join(os.path.dirname(self.video_path), f"{default_name}.csv")
+                filter_str = "CSV files (*.csv)"
             else:
-                default_path = os.path.join(os.path.dirname(self.video_path), f"{default_name}.txt")
-                filter_str = "All files (*.*)"
+                QMessageBox.warning(self, "Export",
+                                    f"Unknown export format: {format_name}")
+                return
             
             file_path, _ = QFileDialog.getSaveFileName(
                 self, "Save Timeline", default_path, filter_str
@@ -4490,15 +4494,11 @@ class SignalTimelineWindow(QMainWindow):
                 elif format_name.startswith("FCPXML"):
                     result = TimelineExporter.to_fcp_xml(self.edit_scene.clips, self.video_path, file_path)
                     msg = f"FCPXML exported to: {os.path.basename(result)}"
+                elif format_name.startswith("CSV"):
+                    result = TimelineExporter.to_csv(self.edit_scene.clips, self.video_path, file_path)
+                    msg = f"CSV exported to: {os.path.basename(result)}"
                 else:
-                    # CSV fallback
-                    import csv
-                    with open(file_path, 'w', newline='') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(['Clip', 'Start (s)', 'End (s)', 'Duration (s)'])
-                        for i, (start, end) in enumerate(self.edit_scene.clips, 1):
-                            writer.writerow([i, f"{start:.2f}", f"{end:.2f}", f"{end-start:.2f}"])
-                    msg = f"CSV exported to: {os.path.basename(file_path)}"
+                    raise ExportError(f"unknown export format {format_name!r}")
                 
                 QMessageBox.information(self, "Export Successful", 
                                     f"✅ Timeline exported successfully!\n\n{msg}")

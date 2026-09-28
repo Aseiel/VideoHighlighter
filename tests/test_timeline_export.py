@@ -5,6 +5,7 @@ No media file and no Qt. The frame count is the r_frame_rate fraction.
 
 from __future__ import annotations
 
+import csv
 import os
 import xml.etree.ElementTree as ET
 
@@ -637,3 +638,96 @@ def test_a_failed_fcpxml_replace_leaves_no_partial_file(tmp_path, monkeypatch):
 
     assert not out.exists()
     assert not (tmp_path / "cut.fcpxml.part").exists()
+
+
+# ---------------------------------------------------------------------------
+# CSV
+# ---------------------------------------------------------------------------
+
+def test_export_formats_are_edl_fcpxml_and_csv():
+    from video_ai_editor.timeline_export import TimelineExporter
+    formats = TimelineExporter.get_export_formats()
+    assert formats == [
+        ("EDL (CMX 3600)", "*.edl"),
+        ("FCPXML", "*.fcpxml"),
+        ("CSV", "*.csv"),
+    ]
+
+
+def test_choosing_a_format_does_not_fall_through(tmp_path, monkeypatch):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    from video_ai_editor.timeline_export import TimelineExporter
+    calls = []
+    monkeypatch.setattr(TimelineExporter, "to_edl", lambda *a, **k: calls.append("edl"))
+    monkeypatch.setattr(TimelineExporter, "to_fcp_xml", lambda *a, **k: calls.append("fcpxml"))
+    monkeypatch.setattr(TimelineExporter, "to_csv", lambda *a, **k: calls.append("csv"))
+
+    TimelineExporter.export_auto([(0.0, 1.0)], str(source), format="edl")
+    TimelineExporter.export_auto([(0.0, 1.0)], str(source), format="csv")
+    TimelineExporter.export_auto([(0.0, 1.0)], str(source), format="fcpxml")
+    TimelineExporter.export_auto([(0.0, 1.0)], str(source), format="xml")
+    assert calls == ["edl", "csv", "fcpxml", "fcpxml"]
+
+    with pytest.raises(ExportError, match="unknown export format"):
+        TimelineExporter.export_auto([(0.0, 1.0)], str(source), format="json")
+    assert calls == ["edl", "csv", "fcpxml", "fcpxml"]
+    assert not (tmp_path / "morning_edit.csv").exists()
+    assert not (tmp_path / "morning_edit.edl").exists()
+
+
+def test_csv_quantises_to_real_frames_and_has_no_marker_or_record_start(tmp_path):
+    source = tmp_path / "morning.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.csv"
+    hour = tmp_path / "hour.csv"
+    speech = Span(kind="speech", start=12.0, end=16.0, label="hello there")
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    result = TimelineExporter.to_csv(
+        [(10.0, 15.02)], str(source), str(out),
+        source=_media(source, 30, 1, audio=False),
+        spans=(speech,))
+    TimelineExporter.to_csv(
+        [(10.0, 15.02)], str(source), str(hour),
+        source=_media(source, 30, 1, audio=False),
+        record_start="01:00:00:00", spans=(speech,))
+
+    text = out.read_text(encoding="utf-8")
+    assert "hello" not in text
+    assert "Speech" not in text
+    assert "01:00:00:00" not in text
+    assert text == hour.read_text(encoding="utf-8")
+    rows = list(csv.reader(text.splitlines()))
+    assert rows == [[
+        "Clip", "Start (s)", "End (s)", "Duration (s)", "Frame in", "Frame out",
+    ], [
+        "1", "10.00", "15.033333", "5.033333", "300", "451",
+    ]]
+    assert result.skipped == 0
+
+    ntsc = tmp_path / "ntsc.csv"
+    TimelineExporter.to_csv(
+        [(0.0, 5.0)], str(source), str(ntsc),
+        source=_media(source, 30000, 1001, audio=False))
+    ntsc_rows = list(csv.reader(ntsc.read_text(encoding="utf-8").splitlines()))
+    assert ntsc_rows[1] == ["1", "0.00", "5.005", "5.005", "0", "150"]
+
+
+def test_csv_frame_numbers_at_120_fps_use_120_not_60(tmp_path):
+    source = tmp_path / "x6.mp4"
+    source.write_bytes(b"")
+    out = tmp_path / "cut.csv"
+
+    from video_ai_editor.timeline_export import TimelineExporter
+    result = TimelineExporter.to_csv(
+        [(0.0, 5.0), (0.0, 1 / 120)], str(source), str(out),
+        source=_media(source, 120, 1, audio=False))
+
+    rows = list(csv.reader(out.read_text(encoding="utf-8").splitlines()))
+    assert rows[1][4:] == ["0", "600"]
+    assert rows[2][4:] == ["0", "1"]
+    assert rows[1][1:4] == ["0.00", "5.00", "5.00"]
+    assert rows[2][3] == "0.008333"
+    assert result.skipped == 0
+    assert "300" not in rows[1]

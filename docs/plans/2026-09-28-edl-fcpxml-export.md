@@ -123,18 +123,18 @@ Pure data, no file writing and no Qt. Lives in
 
 ### Steps
 
-- [ ] Move the spreadsheet into `TimelineExporter.to_csv`.
-- [ ] Columns are clip number, quantised start, end, and duration in seconds,
+- [x] Move the spreadsheet into `TimelineExporter.to_csv`.
+- [x] Columns are clip number, quantised start, end, and duration in seconds,
       plus frame in and frame out on the real frame rate (not the coarsened
       EDL clock).
-- [ ] `get_export_formats` returns EDL (`.edl`), FCPXML (`.fcpxml`), and CSV
+- [x] `get_export_formats` returns EDL (`.edl`), FCPXML (`.fcpxml`), and CSV
       (`.csv`). Remove JSON.
 
 ### Acceptance criteria
 
-- [ ] Choosing a format cannot fall through into another format's writer.
-- [ ] CSV has no marker rows and no sequence-start column.
-- [ ] Frame in and frame out at 120 fps use 120, not 60.
+- [x] Choosing a format cannot fall through into another format's writer.
+- [x] CSV has no marker rows and no sequence-start column.
+- [x] Frame in and frame out at 120 fps use 120, not 60.
 
 ## Task 5 — Spans and markers
 
