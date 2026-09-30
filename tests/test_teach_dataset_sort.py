@@ -97,6 +97,7 @@ def test_layout_follows_later_verdicts(tmp_path):
 
     out = dataset_sort.lay_out(project)[source.id]
     assert out["by_class"] == {"_unsure": 1, "alpha move": 1}
+    assert os.listdir(os.path.join(out["folder"], "_unsure")) == ["alpha move"]
     assert dataset_sort.pending_of(project, [source.id]) == 2
 
     project.decide(first, ACCEPTED, "alpha move", by="sheet:1")
@@ -138,7 +139,7 @@ def test_from_dataset_command_runs_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "make_embedder", FakeEmbedder)
 
     code, out = cli.run(["--project", str(tmp_path / "p"), "from-dataset",
-                         str(tmp_path / "ds"), "--videos", str(tmp_path / "film.mp4")])
+                         str(tmp_path / "ds"), "--videos", str(tmp_path / "film.mp4"), "--skip-checks"])
 
     assert code == 0, out
     video = next(iter(out["videos"].values()))

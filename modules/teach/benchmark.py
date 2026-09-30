@@ -122,12 +122,26 @@ def _videos(folder: str) -> list:
                   and os.path.isfile(os.path.join(folder, n)))
 
 
+def _misnamed(folder: str) -> list:
+    """Files named like a video with something after the extension
+    (``a.mp4 (1)``): no trainer reads them, and nothing says so."""
+    out = []
+    for name in os.listdir(folder):
+        lower = name.lower()
+        if lower.endswith(VIDEO_EXTENSIONS):
+            continue
+        if any(ext + " " in lower or ext + "(" in lower or ext + "." in lower
+               for ext in VIDEO_EXTENSIONS):
+            out.append(name)
+    return sorted(out)
+
+
 def read_dataset(root: str, aliases: Optional[dict] = None,
                  group_pattern: str = DEFAULT_GROUP) -> dict:
-    """``{"clips": [Clip], "skipped": [...], "splits": [...]}``."""
+    """``{"clips": [Clip], "skipped": [...], "splits": [...], "misnamed": [...]}``."""
     if not os.path.isdir(root):
         raise FileNotFoundError(f"no dataset folder {root}")
-    clips, skipped, splits = [], [], []
+    clips, skipped, splits, misnamed = [], [], [], []
     for split in SPLITS:
         split_dir = os.path.join(root, split)
         if not os.path.isdir(split_dir):
@@ -138,6 +152,7 @@ def read_dataset(root: str, aliases: Optional[dict] = None,
             if not os.path.isdir(path):
                 continue
             where = f"{split}/{folder}"
+            misnamed.extend(f"{where}/{n}" for n in _misnamed(path))
             if folder.startswith(("_", ".")):
                 skipped.append({"folder": where, "why": "starts with _"})
                 continue
@@ -155,7 +170,7 @@ def read_dataset(root: str, aliases: Optional[dict] = None,
                                   group_of(video, group_pattern)))
     if not splits:
         raise FileNotFoundError(f"{root} has none of {', '.join(SPLITS)}")
-    return {"clips": clips, "skipped": skipped, "splits": splits}
+    return {"clips": clips, "skipped": skipped, "splits": splits, "misnamed": misnamed}
 
 
 def duplicates(clips: Sequence[Clip]) -> list:
@@ -234,6 +249,8 @@ def report(data: dict, root: str = "", min_train: int = MIN_TO_TRAIN) -> dict:
             "examples": [[rel(c.path) for c in g] for g in same[:SHOWN_EXAMPLES]],
         },
         "skipped": data["skipped"],
+        "misnamed": {"files": len(data.get("misnamed", [])),
+                     "examples": data.get("misnamed", [])[:SHOWN_EXAMPLES]},
     }
 
 
@@ -280,6 +297,7 @@ def _ready(project: Project) -> bool:
 
 def simulate(clips: Sequence[Clip], embedder, work_dir: str, *, seeds: int = 5,
              sheet_size: int = 24, max_sheets: Optional[int] = None, rng_seed: int = 0,
+             settings: Optional[dict] = None,
              frame_reader: Optional[Callable] = None,
              progress: Optional[Callable] = None) -> dict:
     """Replay the teaching loop over ``train`` + ``val``, the folders answering.
@@ -287,7 +305,8 @@ def simulate(clips: Sequence[Clip], embedder, work_dir: str, *, seeds: int = 5,
     Each class starts with ``seeds`` examples, as if someone had picked them.
     Then, until nothing is left to decide: sort (which auto-accepts), draw a
     sheet, answer every tile from the folders — confirming or overturning
-    spot checks the way a person would — and sort again.
+    spot checks the way a person would — and sort again. ``settings``
+    overrides project settings, to compare them on the same dataset.
     """
     from modules.teach import autolabel, review
     from modules.teach.sort import sort_project
@@ -297,6 +316,10 @@ def simulate(clips: Sequence[Clip], embedder, work_dir: str, *, seeds: int = 5,
     if not pool:
         raise ValueError("no single-class clips in train or val to sort")
     project = _fresh_project(work_dir)
+    for key, value in (settings or {}).items():
+        if not hasattr(project.settings, key):
+            raise KeyError(f"no setting {key!r}")
+        setattr(project.settings, key, value)
     names = sorted({c.labels[0] for c in pool})
     project.classes = [ClassSpec(name=n) for n in names]
     truth, group = {}, {}
@@ -412,6 +435,9 @@ def _summary(project, truth, group, seeded_groups, first, curve, shown,
     return {
         "clips": total,
         "classes": len(project.classes),
+        "settings": {k: getattr(project.settings, k) for k in (
+            "gate", "margin", "floor", "auto_gate", "auto_margin", "auto_min_checked",
+            "auto_max_error", "prototypes_per_class", "frames_per_sample")},
         "examples_per_class": seeds,
         "sheets": sheets,
         "looked_at": looked_at,
@@ -427,6 +453,99 @@ def _summary(project, truth, group, seeded_groups, first, curve, shown,
         "per_class": per_class,
         "auto_confusions": dict(confusions.most_common(SHOWN_EXAMPLES)),
         "curve": curve,
+    }
+
+
+# ---------------------------------------------------------------------------
+# New footage, sorted by everything else
+# ---------------------------------------------------------------------------
+
+def sort_test(clips: Sequence[Clip], embedder, work_dir: str, *,
+              holdout: float = 0.2, max_examples: int = 200, rng_seed: int = 0,
+              settings: Optional[dict] = None, frame_reader: Optional[Callable] = None,
+              progress: Optional[Callable] = None) -> dict:
+    """``from-dataset`` on footage it has not seen, scored by the folders.
+
+    A share of the videos (by ``Clip.group``) is held out whole; the rest of
+    train and val are the examples, as ``from-dataset`` makes them; the
+    held-out clips are sorted once, with auto-accept, as a new video is. So
+    the numbers say what sorting a new video with this dataset gets right,
+    decides alone, and leaves to a person, before any review.
+    """
+    from modules.teach.dataset_sort import add_dataset
+    from modules.teach.sort import sort_project
+
+    say = progress or (lambda message: None)
+    pool = [c for c in clips if c.split in POOL_SPLITS and len(c.labels) == 1]
+    groups = sorted({c.group for c in pool})
+    if len(groups) < 2:
+        raise ValueError("clips come from one video: nothing to hold out "
+                         "(is --group finding the video in the file names?)")
+    rng = random.Random(rng_seed)
+    held = set(rng.sample(groups, max(1, round(len(groups) * holdout))))
+    examples = [c for c in pool if c.group not in held]
+    unseen = [c for c in pool if c.group in held]
+
+    project = _fresh_project(work_dir)
+    for key, value in (settings or {}).items():
+        if not hasattr(project.settings, key):
+            raise KeyError(f"no setting {key!r}")
+        setattr(project.settings, key, value)
+    add_dataset(project, examples, max_examples=max_examples, rng_seed=rng_seed)
+    truth = {}
+    for clip in unseen:
+        sid = sample_id(clip.path)
+        if sid in truth or project.get_sample(sid) is not None:
+            continue
+        truth[sid] = clip.labels[0]
+        project.samples.append(Sample(id=sid, source=clip.group, path=clip.path,
+                                      start=0.0, duration=0.0))
+    project.save()
+
+    def embedded(i, n):
+        if i == n or i % 200 == 0:
+            say(f"evaluate: CLIP vectors {i}/{n}")
+
+    say(f"evaluate: sorting {len(truth)} clips of {len(held)} held-out videos "
+        f"by {len(examples)} clips of the rest")
+    sort_project(project, embedder, frame_reader=frame_reader, progress=embedded)
+
+    names = set(project.class_names())
+    tested = [s for s in project.samples if s.id in truth]
+    per_class = defaultdict(lambda: {"clips": 0, "best_right": 0, "proposed": 0,
+                                     "proposed_right": 0, "auto": 0, "auto_wrong": 0})
+    confusions = Counter()
+    for sample in tested:
+        want = truth[sample.id]
+        row = per_class[want]
+        row["clips"] += 1
+        best = max(sample.scores, key=sample.scores.get) if sample.scores else ""
+        if best == want:
+            row["best_right"] += 1
+        elif best:
+            confusions[f"{want} -> {best}"] += 1
+        guess = sample.label if sample.is_auto else sample.proposed
+        if guess in names:
+            row["proposed"] += 1
+            row["proposed_right"] += guess == want
+        if sample.is_auto:
+            row["auto"] += 1
+            row["auto_wrong"] += sample.label != want
+
+    def total(key):
+        return sum(r[key] for r in per_class.values())
+
+    n = len(tested)
+    return {
+        "held_out_videos": len(held), "clips": n,
+        "examples": sum(len(c.examples) for c in project.classes),
+        "best_guess_right": round(total("best_right") / n, 3) if n else None,
+        "proposed": total("proposed"), "proposed_right": total("proposed_right"),
+        "left_to_check": n - total("auto"),
+        "auto_accepted": total("auto"), "auto_wrong": total("auto_wrong"),
+        "classes_without_examples": sorted({truth[s.id] for s in tested} - names),
+        "per_class": {k: dict(v) for k, v in sorted(per_class.items())},
+        "confusions": dict(confusions.most_common(SHOWN_EXAMPLES)),
     }
 
 

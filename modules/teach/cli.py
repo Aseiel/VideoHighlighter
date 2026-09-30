@@ -463,7 +463,12 @@ def cmd_evaluate(args, root):
         result["simulation"] = benchmark.simulate(
             data["clips"], make_embedder(), root, seeds=args.seeds,
             sheet_size=args.sheet_size, max_sheets=args.max_sheets,
-            rng_seed=args.rng, progress=say)
+            rng_seed=args.rng, settings=parse_settings(args.set), progress=say)
+    if not args.no_sort_test:
+        result["new_footage"] = benchmark.sort_test(
+            data["clips"], make_embedder(), root, holdout=args.holdout,
+            max_examples=args.max_examples, rng_seed=args.rng,
+            settings=parse_settings(args.set), progress=say)
     if args.weights:
         from modules.teach.sort import r3d_scorer
 
@@ -479,6 +484,9 @@ def cmd_evaluate(args, root):
     return result
 
 
+FROM_DATASET_CENTERS = 3
+
+
 def cmd_from_dataset(args, root):
     """A hand-sorted dataset as the examples, then new footage sorted by it."""
     from types import SimpleNamespace
@@ -490,12 +498,20 @@ def cmd_from_dataset(args, root):
     def say(message):
         print(message, file=sys.stderr)
 
+    if not args.skip_checks:
+        from modules.teach import doctor
+        doctor.require(root)
     if os.path.exists(os.path.join(root, project_mod.PROJECT_FILE)):
         project = Project.load(root)
     else:
         project = Project.create(root, project_mod.ACTIONS)
+        # A hand-sorted dataset has a class's many looks in it, and a single
+        # mean of them resembles none; several centres keep them apart.
+        project.settings.prototypes_per_class = FROM_DATASET_CENTERS
     if project.task != project_mod.ACTIONS:
         raise ValueError("a dataset of clips teaches actions; use an actions project")
+    if args.prototypes:
+        project.settings.prototypes_per_class = args.prototypes
     data = benchmark.read_dataset(args.dataset, benchmark.load_aliases(args.aliases),
                                   args.group)
     examples = dataset_sort.add_dataset(project, data["clips"],
@@ -538,20 +554,27 @@ def cmd_status(args, project):
     return report(project)
 
 
-def cmd_set(args, project):
+def parse_settings(pairs, settings=None) -> dict:
+    """``["key=value", ...]`` -> values typed like the settings they change."""
+    settings = settings or project_mod.Settings()
     known = project_mod.Settings.__dataclass_fields__
     changed = {}
-    for pair in args.pairs:
+    for pair in pairs or ():
         key, _, value = pair.partition("=")
         if key not in known:
             raise KeyError(f"no setting {key!r}; settings: {sorted(known)}")
-        current = getattr(project.settings, key)
+        current = getattr(settings, key)
         if isinstance(current, bool):
-            new = value.lower() in ("1", "true", "yes", "on")
+            changed[key] = value.lower() in ("1", "true", "yes", "on")
         else:
-            new = type(current)(value)
-        setattr(project.settings, key, new)
-        changed[key] = new
+            changed[key] = type(current)(value)
+    return changed
+
+
+def cmd_set(args, project):
+    changed = parse_settings(args.pairs, project.settings)
+    for key, value in changed.items():
+        setattr(project.settings, key, value)
     project.save()
     return {"settings": vars(project.settings), "changed": changed}
 
@@ -694,8 +717,17 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--sheet-size", type=int, default=24, dest="sheet_size")
     s.add_argument("--max-sheets", type=int, dest="max_sheets")
     s.add_argument("--rng", type=int, default=0, help="which examples are picked")
+    s.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                   help="a project setting for the simulation, e.g. "
+                        "prototypes_per_class=4; repeatable")
     s.add_argument("--no-simulate", action="store_true", dest="no_simulate",
-                   help="only test the model")
+                   help="skip replaying the review loop")
+    s.add_argument("--no-sort-test", action="store_true", dest="no_sort_test",
+                   help="skip sorting held-out videos by the rest")
+    s.add_argument("--holdout", type=float, default=0.2,
+                   help="share of videos held out as new footage")
+    s.add_argument("--max-examples", type=int, default=200, dest="max_examples",
+                   help="examples per class when sorting held-out videos")
     s.add_argument("--weights", help="a trained R3D .pth to test on val and test")
     s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
 
@@ -710,6 +742,10 @@ def parser() -> argparse.ArgumentParser:
                    help="examples per class (a prototype averages at most 200)")
     s.add_argument("--weights", help="a trained R3D .pth as a second opinion")
     s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
+    s.add_argument("--prototypes", type=int,
+                   help="centres per class (a new project gets 3; 1 = the mean)")
+    s.add_argument("--skip-checks", action="store_true", dest="skip_checks",
+                   help="do not run `doctor` first")
 
     s = sub.add_parser("by-class", help="rebuild by-class/<video>/<class>/ folders "
                                         "and timeline.csv from the verdicts")

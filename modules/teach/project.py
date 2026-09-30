@@ -144,6 +144,9 @@ class Settings:
     gate: float = 0.5                # calibrated score to propose a class
     margin: float = 0.1              # ... and its lead over the runner-up
     floor: float = 0.2               # below this for every class: NONE
+    # Centres per class prototype (``scoring``): 1 is the examples' mean; more
+    # suits a class shown in a few different ways.
+    prototypes_per_class: int = 1
     val_fraction: float = 0.2
     boxes_per_sample: int = 3        # frames labelled per accepted object sample
     epochs: int = 30

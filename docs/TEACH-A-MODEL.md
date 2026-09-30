@@ -248,7 +248,17 @@ whether a copy sits in another class or split), and videos whose clips are in
 more than one split. Folders starting with `_`, and folders with no video
 directly inside, are left out.
 
-`evaluate` answers "how much would I still have to look at?". Each class
+`evaluate` measures two things, and a model if given one.
+
+**New footage** (`new_footage`): a share of the videos (`--holdout`, 20%) is
+held out whole, found by `--group` in the clip names, and sorted by the rest,
+exactly as `from-dataset` sorts a new video. `best_guess_right` is how often
+the top-scoring class is right; `auto_accepted` / `auto_wrong` what went in
+unchecked and how much of it was wrong; `left_to_check` what a person would
+look at; `confusions` which classes are taken for which.
+
+**The review loop** (`simulation`): "how much would I still have to look at?"
+when teaching from scratch. Each class
 starts with `--seeds` examples (5), then it runs the loop the app runs: sort,
 auto-accept, a review sheet answered from the folders (spot checks confirmed
 or overturned the way a person would), sort again, until nothing is left to
@@ -264,11 +274,39 @@ The answer is printed and saved as `evaluate-<time>.json` in the project
 folder; the simulation's scratch project sits in `simulation/` beside it and
 keeps its CLIP vectors, so the second run skips the slow part.
 
+`--set key=value` (repeatable) runs both with a project setting changed, to
+compare on the same dataset, e.g. `--set prototypes_per_class=3`: each class
+scored by its nearest of three centres instead of the mean of its examples,
+which suits a class shown in a few different ways.
+
 `--aliases names.json` renames without touching the dataset:
 `{"misspelt folder": "class", "finer class": "coarser class", "unwanted": ""}`.
 The whole folder name is looked up first, then each `_` part. `--group` is the
 pattern that finds a clip's video in its file name (default: the leading
 number the app's clip names start with).
+
+## Sorting a new video by that dataset
+
+```bash
+$T from-dataset D:/dataset --videos D:/movies/new.mp4
+$T review --window        # the doubtful ones; the rest were decided
+$T by-class               # refresh the folders after reviewing
+```
+
+The dataset's `train` and `val` folders become the classes, named exactly as
+the folders are (so a model trained on the dataset agrees on names), and up
+to `--max-examples` (200) of each folder's clips their examples, used where
+they are. The video is cut into samples and sorted against them; confident
+samples are auto-accepted as in any project. `--weights model.pth` adds a
+trained R3D model as a second opinion: where it disagrees, the sample is
+asked about instead of accepted. A new project scores each class by its
+nearest of three centres (`--prototypes 1` for the plain mean).
+
+Each video's result is in `by-class/<video>/`: one folder per class with its
+samples named by where they start (`00h12m35s_0.93_auto.mp4`; `auto` decided
+alone, `guess` proposed, `checked` looked at), `_unsure/<best guess>/` for
+samples no class clearly won, and `timeline.csv` with every sample's best and
+second guess, scores and the model's opinion.
 
 ## For agents
 

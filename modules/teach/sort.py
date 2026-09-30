@@ -50,7 +50,8 @@ def build_prototypes(project: Project, vectors: dict, embedder) -> list:
                                     if s.is_human]))
         examples = [vectors[i] for i in ids if i in vectors]
         texts = embedder.texts(class_prompts(project, spec)) if not examples else []
-        proto = scoring.build_prototype(spec.name, examples, texts)
+        proto = scoring.build_prototype(spec.name, examples, texts,
+                                        centers=project.settings.prototypes_per_class)
         if proto is not None:
             prototypes.append(proto)
     negatives = [vectors[s.id] for s in project.samples

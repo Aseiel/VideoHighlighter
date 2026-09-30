@@ -226,3 +226,66 @@ def test_evaluate_command_saves_its_answer(tmp_path, monkeypatch):
     assert out["simulation"]["sheets"] <= 2
     with open(out["saved"], encoding="utf-8") as handle:
         assert json.load(handle)["simulation"]["clips"] == 98
+
+
+# --- new footage, sorted by everything else --------------------------------
+
+def test_sort_test_holds_out_whole_videos(tmp_path):
+    _make(str(tmp_path / "ds"), LAYOUT)       # clip names carry videos 1-4
+    clips = benchmark.read_dataset(str(tmp_path / "ds"))["clips"]
+    seen = []
+
+    def read(path, count, **_):
+        seen.append(path)
+        return _reader(AXES)(path, count)
+
+    out = benchmark.sort_test(clips, FakeEmbedder(), str(tmp_path / "work"),
+                              holdout=0.25, frame_reader=read)
+
+    assert out["held_out_videos"] == 1
+    # Every held-out clip is from one video, and none of them is an example.
+    assert 0 < out["clips"] < 98 and out["examples"] + out["clips"] == 98
+    assert out["best_guess_right"] == 1.0 and out["auto_wrong"] == 0
+    assert out["auto_accepted"] + out["left_to_check"] == out["clips"]
+    assert out["classes_without_examples"] == []
+
+
+def test_sort_test_needs_more_than_one_video(tmp_path):
+    _make(str(tmp_path / "ds"), {"train": {"alpha move": 4}})
+    clips = benchmark.read_dataset(str(tmp_path / "ds"), group_pattern="^(x)")["clips"]
+    clips = [benchmark.Clip(c.path, c.split, c.folder, c.labels, "one") for c in clips]
+    with pytest.raises(ValueError, match="one video"):
+        benchmark.sort_test(clips, FakeEmbedder(), str(tmp_path / "w"))
+
+
+def test_files_named_past_their_extension_are_reported(tmp_path):
+    _make(str(tmp_path / "ds"), {"train": {"alpha move": 2}})
+    (tmp_path / "ds" / "train" / "alpha move" / "7_temp_clip_1.mp4 (1)").write_bytes(b"x")
+    (tmp_path / "ds" / "train" / "alpha move" / "notes.txt").write_text("x")
+
+    out = benchmark.report(benchmark.read_dataset(str(tmp_path / "ds")))
+
+    assert out["misnamed"] == {"files": 1,
+                               "examples": ["train/alpha move/7_temp_clip_1.mp4 (1)"]}
+    assert out["counts"]["train"] == {"alpha move": 2}
+
+
+# --- several centres per class ----------------------------------------------
+
+def test_a_class_shown_two_ways_keeps_both(tmp_path):
+    from modules.teach import scoring
+
+    rng = np.random.default_rng(0)
+    looks = [_direction(0), _direction(1)]
+    examples = [looks[i % 2] + 0.05 * rng.normal(size=DIM) for i in range(12)]
+
+    one = scoring.build_prototype("alpha move", examples)
+    two = scoring.build_prototype("alpha move", examples, centers=2)
+
+    assert one.centers is None and two.centers.shape == (2, DIM)
+    probe = scoring._unit(np.stack([looks[0], looks[1]]))
+    # The mean sits between the two looks; the centres sit on them.
+    assert np.all(two.cosines(probe) > 0.95) and np.all(one.cosines(probe) < 0.8)
+    assert two.anchor > one.anchor
+    # Too few examples for a second centre: one mean, as before.
+    assert scoring.build_prototype("alpha move", examples[:5], centers=2).centers is None

@@ -9,8 +9,9 @@ footage is then added, cut, and sorted against them the usual way, and
 auto-accept, review and training all work as for any project.
 
 ``lay_out`` shows the result per video: its samples as hard links in
-``by-class/<video>/<class>/``, named by where they start in the video, and a
-``timeline.csv`` of every sample's guess. The folders are a view, rebuilt each
+``by-class/<video>/<class>/``, named by where they start in the video (those
+no class clearly won in ``_unsure/<best guess>/``), and a ``timeline.csv`` of
+every sample's guess. The folders are a view, rebuilt each
 time; the verdicts in ``samples.json`` are the record, as everywhere else.
 """
 from __future__ import annotations
@@ -146,6 +147,10 @@ def lay_out(project: Project, source_ids: Optional[Sequence[str]] = None) -> dic
             })
             if os.path.exists(sample.path):
                 target = os.path.join(root, _folder_name(folder))
+                if folder == UNSURE and best[0]:
+                    # Not proposed, but still best guessed as something: kept
+                    # by that guess, so checking them is mostly confirming.
+                    target = os.path.join(target, _folder_name(best[0]))
                 os.makedirs(target, exist_ok=True)
                 name = f"{_stamp(sample.start)}_{best[1]:.2f}_{how}.mp4"
                 _link(sample.path, os.path.join(target, name))
