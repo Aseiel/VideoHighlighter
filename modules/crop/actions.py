@@ -428,13 +428,18 @@ def copy_video_to_output(input_path, output_folder):
         return None
 
 
-def main(input_folder=None, output_folder=None, debug=None):
+def main(input_folder=None, output_folder=None, debug=None, ask_delete=False):
     """Crop every video in ``input_folder`` into ``output_folder``.
 
     Both default to config.py's folders, and ``debug`` to its DEBUG_MODE.
     modules/teach runs this over a project's samples with debug off. The
     helpers above read these as module globals, so they are swapped for the
     run and put back after, rather than threaded through every call.
+
+    ``ask_delete`` offers to delete the originals on the console afterwards.
+    Only the command line asks: a caller has no console to answer on (the
+    windowed exe has no stdin at all), so called, it never asks and never
+    deletes.
     """
     global INPUT_FOLDER, OUTPUT_FOLDER, DEBUG_MODE
     saved = (INPUT_FOLDER, OUTPUT_FOLDER, DEBUG_MODE)
@@ -443,12 +448,37 @@ def main(input_folder=None, output_folder=None, debug=None):
     if debug is not None:
         DEBUG_MODE = bool(debug)
     try:
-        return _run_batch()
+        return _run_batch(ask_delete=ask_delete)
     finally:
         INPUT_FOLDER, OUTPUT_FOLDER, DEBUG_MODE = saved
 
 
-def _run_batch():
+def _offer_to_delete(handled, ask):
+    """Delete the originals of ``handled`` if the person at the console says so."""
+    if not handled:
+        print("📁 No new videos were processed (all were already done)")
+        return
+    if not ask:
+        print("📁 Original videos kept intact")
+        return
+    print("\n" + "="*50)
+    response = input("❓ Do you want to delete the original videos? (y/n): ").strip().lower()
+
+    if response in ['y', 'yes']:
+        deleted_count = 0
+        for original_path in handled:
+            try:
+                os.remove(original_path)
+                print(f"🗑️ Deleted: {os.path.basename(original_path)}")
+                deleted_count += 1
+            except Exception as e:
+                print(f"❌ Error deleting {original_path}: {e}")
+        print(f"\n✅ Deleted {deleted_count} original video(s)")
+    else:
+        print("📁 Original videos kept intact")
+
+
+def _run_batch(ask_delete=False):
     # Created here rather than at import time. This module used to run
     # os.makedirs() at module level, so merely importing it — from a test, a
     # REPL, or another module — littered the current working directory with
@@ -850,31 +880,14 @@ def _run_batch():
                     debug_files = glob.glob(os.path.join(debug_folder, "*_debug.jpg"))
                     print(f"   {base_name}: {len(debug_files)} debug images")
 
-    if all_handled_videos:
-        print("\n" + "="*50)
-        response = input("❓ Do you want to delete the original videos? (y/n): ").strip().lower()
-
-        if response in ['y', 'yes']:
-            deleted_count = 0
-            for original_path in all_handled_videos:
-                try:
-                    os.remove(original_path)
-                    print(f"🗑️ Deleted: {os.path.basename(original_path)}")
-                    deleted_count += 1
-                except Exception as e:
-                    print(f"❌ Error deleting {original_path}: {e}")
-            print(f"\n✅ Deleted {deleted_count} original video(s)")
-        else:
-            print("📁 Original videos kept intact")
-    else:
-        print("📁 No new videos were processed (all were already done)")
+    _offer_to_delete(all_handled_videos, ask_delete)
 
     print("\n🎉 Batch processing complete!")
 
 if __name__ == "__main__":
     print("Script starting...")
     try:
-        main()
+        main(ask_delete=True)
     except Exception as e:
         print(f"\n❌ SCRIPT CRASHED: {e}")
         import traceback

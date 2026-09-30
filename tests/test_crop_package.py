@@ -55,6 +55,49 @@ def test_layering_is_one_directional():
     assert "modules.crop.actions" not in imports_of("zones")
 
 
+def test_a_called_cropper_never_asks_to_delete(monkeypatch):
+    """modules/teach calls main() from the app, where there is no console: the
+    windowed exe has no stdin, so a question raised after every crop was made
+    and before focus could record them. Called, it must not ask -- only the
+    command line does."""
+    from modules.crop import actions
+
+    seen = []
+    monkeypatch.setattr(actions, "_run_batch", lambda **kw: seen.append(kw))
+    actions.main(input_folder="in", output_folder="out", debug=False)
+    assert seen == [{"ask_delete": False}]
+
+
+def test_keeping_the_originals_never_reads_the_console(tmp_path, monkeypatch):
+    from modules.crop import actions
+
+    original = tmp_path / "clip.mp4"
+    original.write_bytes(b"x")
+
+    def no_console(*_):
+        raise AssertionError("input() called")
+
+    monkeypatch.setattr("builtins.input", no_console)
+    actions._offer_to_delete([str(original)], ask=False)
+    assert original.exists()
+
+
+def test_the_command_line_deletes_only_on_yes(tmp_path, monkeypatch):
+    from modules.crop import actions
+
+    kept, gone = tmp_path / "kept.mp4", tmp_path / "gone.mp4"
+    kept.write_bytes(b"x")
+    gone.write_bytes(b"x")
+
+    monkeypatch.setattr("builtins.input", lambda *_: "n")
+    actions._offer_to_delete([str(kept)], ask=True)
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    actions._offer_to_delete([str(gone)], ask=True)
+
+    assert kept.exists()
+    assert not gone.exists()
+
+
 def test_detector_score_floor_is_below_every_tuned_threshold():
     """The conf= arguments the cropper passes are applied after inference; the
     detector's own score_thr decides what exists at all. If the floor ever rises
