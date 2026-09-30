@@ -479,6 +479,60 @@ def cmd_evaluate(args, root):
     return result
 
 
+def cmd_from_dataset(args, root):
+    """A hand-sorted dataset as the examples, then new footage sorted by it."""
+    from types import SimpleNamespace
+
+    from modules.teach import benchmark, dataset_sort
+    from modules.teach.cut import cut_project
+    from modules.teach.sort import r3d_classifier, sort_project
+
+    def say(message):
+        print(message, file=sys.stderr)
+
+    if os.path.exists(os.path.join(root, project_mod.PROJECT_FILE)):
+        project = Project.load(root)
+    else:
+        project = Project.create(root, project_mod.ACTIONS)
+    if project.task != project_mod.ACTIONS:
+        raise ValueError("a dataset of clips teaches actions; use an actions project")
+    data = benchmark.read_dataset(args.dataset, benchmark.load_aliases(args.aliases),
+                                  args.group)
+    examples = dataset_sort.add_dataset(project, data["clips"],
+                                        max_examples=args.max_examples)
+    project.save()
+    say(f"from-dataset: {examples['classes']} classes, {examples['examples']} examples")
+    videos = []
+    if args.videos:
+        videos = cmd_add_video(SimpleNamespace(items=args.videos), project)["sources"]
+    cut = cut_project(project, progress=lambda s, i, n: say(f"cut {s}: {i}/{n}")
+                      if i == n or i % 50 == 0 else None)
+    classifier = None
+    if args.weights:
+        mapping = args.mapping or os.path.splitext(args.weights)[0] + "_mapping.json"
+        classifier = r3d_classifier(args.weights, mapping)
+
+    def embedded(i, n):
+        if i == n or i % 200 == 0:
+            say(f"from-dataset: CLIP vectors {i}/{n}")
+
+    sorted_ = sort_project(project, make_embedder(), model_classifier=classifier,
+                           progress=embedded)
+    project = Project.load(root)
+    shown = videos or [s.id for s in project.sources]
+    return {"project": project.root, "examples": examples, "cut": cut,
+            "auto_accepted": sorted_["auto"]["accepted"],
+            "videos": dataset_sort.lay_out(project, shown),
+            "still_to_check": dataset_sort.pending_of(project, shown),
+            "skipped_folders": data["skipped"]}
+
+
+def cmd_by_class(args, project):
+    """Rebuild by-class/ folders and timelines from the current verdicts."""
+    from modules.teach import dataset_sort
+    return {"videos": dataset_sort.lay_out(project, args.sources or None)}
+
+
 def cmd_status(args, project):
     from modules.teach.status import report
     return report(project)
@@ -645,6 +699,22 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--weights", help="a trained R3D .pth to test on val and test")
     s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
 
+    s = sub.add_parser("from-dataset", help="a hand-sorted dataset as the examples; "
+                                            "new videos cut and sorted by it")
+    s.add_argument("dataset", help="folder holding train/ (and val/)")
+    s.add_argument("--videos", nargs="+", default=[], help="files, folders or URLs")
+    s.add_argument("--aliases", help="JSON {name: name or \"\"} to rename or leave out")
+    s.add_argument("--group", default=r"^(\d+)_",
+                   help="regex for the video a clip came from, in its file name")
+    s.add_argument("--max-examples", type=int, default=200, dest="max_examples",
+                   help="examples per class (a prototype averages at most 200)")
+    s.add_argument("--weights", help="a trained R3D .pth as a second opinion")
+    s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
+
+    s = sub.add_parser("by-class", help="rebuild by-class/<video>/<class>/ folders "
+                                        "and timeline.csv from the verdicts")
+    s.add_argument("sources", nargs="*", help="source ids (default: every video)")
+
     s = sub.add_parser("set", help="change settings: key=value ...")
     s.add_argument("pairs", nargs="+")
     return p
@@ -657,7 +727,7 @@ COMMANDS = {
     "focus": cmd_focus, "sort": cmd_sort, "folders": cmd_folders,
     "review": cmd_review, "verdict": cmd_verdict, "boxes": cmd_boxes,
     "find": cmd_find, "build": cmd_build, "train": cmd_train, "status": cmd_status, "set": cmd_set,
-    "auto": cmd_auto, "share": cmd_share,
+    "auto": cmd_auto, "share": cmd_share, "by-class": cmd_by_class,
 }
 
 
@@ -694,6 +764,8 @@ def run(argv=None) -> tuple:
                 result = cmd_import(args, root)
             elif args.command == "evaluate":
                 result = cmd_evaluate(args, root)
+            elif args.command == "from-dataset":
+                result = cmd_from_dataset(args, root)
             elif args.command == "quick":
                 result = cmd_quick(args, root)
                 result.setdefault("next", result.get("stopped_at"))
