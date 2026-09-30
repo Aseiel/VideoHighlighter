@@ -109,3 +109,37 @@ changing it.
 
 This project ships no paid API keys. Bring your own if you want to use a hosted
 service.
+
+
+## Troubleshooting
+
+**Application not starting?** Check the debug log:
+- Windows: `debug.log` in `%APPDATA%\VideoHighlighter`
+- macOS: `~/Library/Application Support/VideoHighlighter/debug.log`
+- Linux: `~/.local/share/VideoHighlighter/debug.log`
+
+The app writes to this file before crashing, which usually includes the last
+detected error.
+
+**FFmpeg errors or video playback issues?** The installer bundles FFmpeg,
+but if you're running portable:
+```bash
+# Windows: download ffmpeg.exe and put it beside VideoHighlighter.exe
+# macOS: brew install ffmpeg
+# Linux: apt install ffmpeg
+```
+
+**No GPU acceleration detected?** See the vendor-specific guides:
+- Intel GPUs: [INTEL-GPU.md](INTEL-GPU.md)
+- AMD GPUs: [AMD-GPU.md](AMD-GPU.md) (uses DirectML on Windows)
+
+**Transcript errors?** Whisper models require download:
+- First run will take a minute to download `base` or `large-v3` model
+- Error messages like "No module named 'openai_whisper'" mean Python is not installed — run the installer instead
+
+**Report not loading?** Open reports in a modern browser (Chrome/Firefox/Edge).
+Older browsers may struggle with embedded players.
+
+**Performance issues on older hardware?** Increase `advanced.frame_skip` in
+`config.yaml` from `5` to `10` or higher. This reduces processing speed but
+improves responsiveness.
