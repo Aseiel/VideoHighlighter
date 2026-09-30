@@ -89,6 +89,15 @@ class Prototype:
     kind: str                 # "examples" or "text"
     n_examples: int = 0
     anchor: Optional[float] = None
+    # Several centres instead of one mean (``centers`` > 1): a sample scores
+    # its likeness to the nearest one. A class shown in a few different ways
+    # has a mean that sits between them and looks like none of them.
+    centers: Optional[np.ndarray] = None
+
+    def cosines(self, unit_rows: np.ndarray) -> np.ndarray:
+        if self.centers is not None:
+            return (unit_rows @ self.centers.T).max(axis=1)
+        return unit_rows @ self.vector
 
 
 def _unit(a) -> np.ndarray:
@@ -96,12 +105,45 @@ def _unit(a) -> np.ndarray:
     return a / np.maximum(np.linalg.norm(a, axis=-1, keepdims=True), 1e-8)
 
 
+# A centre needs this many examples of its own to be more than one clip's
+# quirks; with fewer, a class keeps fewer centres.
+MIN_PER_CENTER = 3
+
+
+def spherical_kmeans(stack: np.ndarray, k: int, iterations: int = 25,
+                     seed: int = 0) -> np.ndarray:
+    """``k`` unit centres for unit rows, by cosine. Deterministic for a seed."""
+    rng = np.random.default_rng(seed)
+    centers = [stack[int(rng.integers(len(stack)))]]
+    for _ in range(1, k):                       # k-means++: far from those chosen
+        nearest = (stack @ np.stack(centers).T).max(axis=1)
+        weights = np.clip(1.0 - nearest, 0.0, None) ** 2
+        if weights.sum() <= 1e-12:
+            break
+        centers.append(stack[int(rng.choice(len(stack), p=weights / weights.sum()))])
+    centers = np.stack(centers)
+    for _ in range(iterations):
+        assign = (stack @ centers.T).argmax(axis=1)
+        moved = np.stack([_unit(stack[assign == c].mean(axis=0)) if np.any(assign == c)
+                          else centers[c] for c in range(len(centers))])
+        if np.allclose(moved, centers, atol=1e-6):
+            break
+        centers = moved
+    return centers
+
+
 def build_prototype(name: str, example_vectors: Sequence = (),
-                    text_vectors: Sequence = ()) -> Optional[Prototype]:
+                    text_vectors: Sequence = (), centers: int = 1) -> Optional[Prototype]:
     examples = [v for v in example_vectors if v is not None][:MAX_EXAMPLES]
     if examples:
         stack = _unit(np.stack(examples))
         vector = _unit(stack.mean(axis=0))
+        k = min(int(centers), len(stack) // MIN_PER_CENTER)
+        if k > 1:
+            found = spherical_kmeans(stack, k)
+            proto = Prototype(name, vector, "examples", len(stack), None, found)
+            proto.anchor = float(proto.cosines(stack).mean())
+            return proto
         anchor = float((stack @ vector).mean()) if len(stack) >= 2 else None
         return Prototype(name, vector, "examples", len(stack), anchor)
     if len(text_vectors):
@@ -153,7 +195,8 @@ def score_samples(sample_ids: Sequence[str], sample_matrix: np.ndarray,
         return {}
     names = [p.name for p in prototypes]
     none_index = names.index(NONE) if NONE in names else None
-    raw = _unit(sample_matrix) @ np.stack([p.vector for p in prototypes]).T
+    rows = _unit(sample_matrix)
+    raw = np.stack([p.cosines(rows) for p in prototypes], axis=1)
     calibrated = calibrate(raw, prototypes)
     out = {}
     for i, sid in enumerate(sample_ids):

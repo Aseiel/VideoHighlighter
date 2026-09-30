@@ -50,7 +50,8 @@ def build_prototypes(project: Project, vectors: dict, embedder) -> list:
                                     if s.is_human]))
         examples = [vectors[i] for i in ids if i in vectors]
         texts = embedder.texts(class_prompts(project, spec)) if not examples else []
-        proto = scoring.build_prototype(spec.name, examples, texts)
+        proto = scoring.build_prototype(spec.name, examples, texts,
+                                        centers=project.settings.prototypes_per_class)
         if proto is not None:
             prototypes.append(proto)
     negatives = [vectors[s.id] for s in project.samples
@@ -161,12 +162,12 @@ def lay_out_folders(project: Project) -> dict:
     return {"folder": root, "files": len(placed)}
 
 
-def r3d_classifier(weights: str, mapping: str, *, wrapper_factory=None,
-                   frame_reader: Optional[Callable] = None) -> Callable:
-    """A trained round's R3D model as a proposer: ``path -> (label, confidence)``.
+def _r3d_model(weights: str, mapping: str, wrapper_factory=None,
+               frame_reader: Optional[Callable] = None) -> tuple:
+    """``(path -> probabilities over every output or None, idx_to_label)``.
 
     The same ``R3DModelWrapper`` action recognition uses in the app, loaded
-    with the round's weights, so what it proposes here is what the model will
+    with the round's weights, so what it says here is what the model will
     say in use. Sixteen frames spread over the clip, as it was trained on.
     """
     import json as _json
@@ -188,13 +189,44 @@ def r3d_classifier(weights: str, mapping: str, *, wrapper_factory=None,
                             custom_weights=weights, custom_num_classes=num_classes)
     read = frame_reader or embed_mod.read_frames
 
-    def classify(path: str):
+    def probabilities(path: str):
         frames = read(path, 16)
         if len(frames) != 16:
-            return "", 0.0
+            return None
         logits = np.asarray(model.predict_from_frames(frames), dtype=np.float64).ravel()
         probs = np.exp(logits - logits.max())
-        probs /= probs.sum()
+        return probs / probs.sum()
+
+    return probabilities, idx_to_label
+
+
+def r3d_scorer(weights: str, mapping: str, *, wrapper_factory=None,
+               frame_reader: Optional[Callable] = None) -> Callable:
+    """A trained R3D model as ``path -> {label: probability}`` ({} if unreadable).
+
+    Outputs a filtered (production) mapping leaves out are not reported.
+    """
+    probabilities, idx_to_label = _r3d_model(weights, mapping, wrapper_factory, frame_reader)
+
+    def score(path: str) -> dict:
+        probs = probabilities(path)
+        if probs is None:
+            return {}
+        return {label: float(probs[i]) for i, label in idx_to_label.items()
+                if i < len(probs)}
+
+    return score
+
+
+def r3d_classifier(weights: str, mapping: str, *, wrapper_factory=None,
+                   frame_reader: Optional[Callable] = None) -> Callable:
+    """A trained round's R3D model as a proposer: ``path -> (label, confidence)``."""
+    probabilities, idx_to_label = _r3d_model(weights, mapping, wrapper_factory, frame_reader)
+
+    def classify(path: str):
+        probs = probabilities(path)
+        if probs is None:
+            return "", 0.0
         best = int(np.argmax(probs))
         return idx_to_label.get(best, ""), float(probs[best])
 

@@ -229,6 +229,85 @@ round is scored on the same held-out samples (chosen once, never trained on),
 and a round is installed only if it beats the installed one. Earlier rounds
 stay in `runs/`.
 
+## Measuring it against a dataset you already sorted
+
+A dataset sorted by hand is the one thing that can say how well the automatic
+parts work, because its answers are known. It is read where it is, in the
+layout the trainers read (`train/<class>/`, `val/<class>/`, `test/<class>/`);
+nothing is copied or moved.
+
+```bash
+$T import D:/dataset                  # what it holds, and what would skew a measurement
+$T evaluate D:/dataset                # replay the loop, the folders answering
+$T evaluate D:/dataset --no-simulate --weights models/r3d_finetuned.pth
+```
+
+`import` reports clips per class and split, classes under the training
+minimum, classes in `val`/`test` that `train` lacks, identical files (and
+whether a copy sits in another class or split), and videos whose clips are in
+more than one split. Folders starting with `_`, and folders with no video
+directly inside, are left out.
+
+`evaluate` measures two things, and a model if given one.
+
+**New footage** (`new_footage`): a share of the videos (`--holdout`, 20%) is
+held out whole, found by `--group` in the clip names, and sorted by the rest,
+exactly as `from-dataset` sorts a new video. `best_guess_right` is how often
+the top-scoring class is right; `auto_accepted` / `auto_wrong` what went in
+unchecked and how much of it was wrong; `left_to_check` what a person would
+look at; `confusions` which classes are taken for which.
+
+**The review loop** (`simulation`): "how much would I still have to look at?"
+when teaching from scratch. Each class
+starts with `--seeds` examples (5), then it runs the loop the app runs: sort,
+auto-accept, a review sheet answered from the folders (spot checks confirmed
+or overturned the way a person would), sort again, until nothing is left to
+decide. `looked_at_share` is the part a person would have looked at;
+`auto_wrong` counts the samples that went in unchecked and wrong, split into
+those from the examples' own videos and from others. `first_sort` is how right
+the very first sort is, before any review. With `--weights`, a trained R3D
+model is also scored on `val` (per class) and `test`. A test folder named
+`<class>_<class>` shows both at once: `all_on_top` is both as the top two
+guesses, `top_is_one` the top guess being one of them.
+
+The answer is printed and saved as `evaluate-<time>.json` in the project
+folder; the simulation's scratch project sits in `simulation/` beside it and
+keeps its CLIP vectors, so the second run skips the slow part.
+
+`--set key=value` (repeatable) runs both with a project setting changed, to
+compare on the same dataset, e.g. `--set prototypes_per_class=3`: each class
+scored by its nearest of three centres instead of the mean of its examples,
+which suits a class shown in a few different ways.
+
+`--aliases names.json` renames without touching the dataset:
+`{"misspelt folder": "class", "finer class": "coarser class", "unwanted": ""}`.
+The whole folder name is looked up first, then each `_` part. `--group` is the
+pattern that finds a clip's video in its file name (default: the leading
+number the app's clip names start with).
+
+## Sorting a new video by that dataset
+
+```bash
+$T from-dataset D:/dataset --videos D:/movies/new.mp4
+$T review --window        # the doubtful ones; the rest were decided
+$T by-class               # refresh the folders after reviewing
+```
+
+The dataset's `train` and `val` folders become the classes, named exactly as
+the folders are (so a model trained on the dataset agrees on names), and up
+to `--max-examples` (200) of each folder's clips their examples, used where
+they are. The video is cut into samples and sorted against them; confident
+samples are auto-accepted as in any project. `--weights model.pth` adds a
+trained R3D model as a second opinion: where it disagrees, the sample is
+asked about instead of accepted. A new project scores each class by its
+nearest of three centres (`--prototypes 1` for the plain mean).
+
+Each video's result is in `by-class/<video>/`: one folder per class with its
+samples named by where they start (`00h12m35s_0.93_auto.mp4`; `auto` decided
+alone, `guess` proposed, `checked` looked at), `_unsure/<best guess>/` for
+samples no class clearly won, and `timeline.csv` with every sample's best and
+second guess, scores and the model's opinion.
+
 ## For agents
 
 Loop on `status` and run `next.command`. A `judge` step needs vision or a
