@@ -81,7 +81,12 @@ no contributor's hash moves.
   contributor anywhere in the range and the exception is void, whatever a
   trailer claims — read the `author` field, not the message.
 - It was pushed minutes ago and nobody has pulled or branched from it.
-- Only the message changes. `git diff <old> <new>` must come back empty.
+- Only the message, or the author, changes. `git diff <old> <new>` must come
+  back empty.
+- The author may change only from the maintainer (Przemek Kreft) or Claude, and
+  only to the maintainer: a commit pushed under the wrong identity is fixed with
+  `git commit --amend --no-edit --reset-author`, run as the maintainer. An
+  outside contributor's authorship is never changed, as above.
 
 Then `git commit --amend` and `git push --force-with-lease origin main`. Never a
 bare `--force`: the lease is the part that proves nobody pushed in between.
