@@ -3333,10 +3333,13 @@ class VideoHighlighterGUI(QWidget):
         # to be the answer for the same video.
         chat = getattr(self, "llm_chat", None)
         if chat is not None:
-            if on:
+            if on and not page.owns_chat(chat):
+                # Moving to Simple view: attach chat
                 page.attach_chat(chat)
             elif hasattr(self, "llm_tab_layout"):
-                page.release_chat(chat)
+                # Moving to Detailed view: ensure chat is in LLM tab layout
+                if page.owns_chat(chat):
+                    page.release_chat(chat)
                 if self.llm_tab_layout.indexOf(chat) < 0:
                     self.llm_tab_layout.addWidget(chat)
         if on:

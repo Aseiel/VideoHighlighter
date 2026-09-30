@@ -71,9 +71,8 @@ def build_brand_header(parent: QWidget | None = None) -> QWidget:
 
 def simple_start_enabled(default: bool = True) -> bool:
     stored = QSettings(SETTINGS_ORG, SETTINGS_APP).value(SETTINGS_KEY, None)
-    if stored is None:
-        return default
-    return str(stored).lower() in ("true", "1")
+    # Default to Simple view for new users and first-run. Parse stored value if present.
+    return stored is None or stored == "" or str(stored).lower() in ("true", "1")
 
 
 def persist_simple_start(on: bool) -> None:

@@ -130,6 +130,11 @@ VideoHighlighter occasionally has feelings about your footage. When it does:
 usually around. Bugs and ideas are welcome in
 [Issues](https://github.com/Aseiel/VideoHighlighter/issues).
 
+**Frequently asked questions.** [Read the FAQ](docs/FAQ/faq.md) for help with:
+- Choosing detectors and tuning scoring
+- Performance tips on CPU/GPU
+- Troubleshooting common issues
+
 ## License
 
 Copyright (C) 2026 Przemysław Kreft and Meric Donmezer.
@@ -143,12 +148,10 @@ Contributors keep copyright in their own work — see
 [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). VideoHighlighter is
 also offered under a separate commercial license by the copyright holders.
 
-## Background
+## Contributing
 
-This started as a personal tool to generate subtitles for videos, for my
-7-year-old son. Over time it turned into a highlights generator for movies,
-sports and personal footage. The goal is unchanged: speed up video analysis,
-generate highlights you can explain, and create subtitles automatically —
-without uploading footage you would rather keep local.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on code quality, testing,
+and what makes a good contribution. The project welcomes bug reports, small fixes,
+and feature proposals — please check the CLA before your first PR.
 
 ![Stars History](assets/star-history-2026630.png)

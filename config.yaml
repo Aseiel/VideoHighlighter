@@ -27,13 +27,15 @@ highlights:
   range_start_pct: 0
   range_end_pct: 100
 scoring:
-  scene_points: 1
-  motion_event_points: 0
-  motion_peak_points: 0
-  audio_peak_points: 0
-  loudness_burst_points: 0
-  keyword_points: 0
-  transcript_points: 0
+  # Each signal contributes points toward scoring a moment. Higher values =
+  # more likely to be kept (up to max_duration). The sum determines priority.
+  scene_points: 1           # Scene cuts get +1 point each (default, enabled)
+  motion_event_points: 0    # Motion events from user-taught action classes
+  motion_peak_points: 0     # Motion peaks when no action class matched
+  audio_peak_points: 0      # Audio peaks (crowd noise, reactions, etc.)
+  loudness_burst_points: 0  # Loud bursts detected automatically
+  keyword_points: 0         # Transcript keywords you named as "interesting"
+  transcript_points: 0      # Transcript presence for claims only
   object_points: 5
   action_points: 0
   # Expressions score only for the classes named here, e.g. [happy, surprise].
@@ -47,31 +49,37 @@ scoring:
   multi_signal_boost: 1.2
   min_signals_for_boost: 2
 actions:
-  interesting: []
-  require_objects: false
+  # Action classes you want detected. The app learns what these mean from
+  # your examples (see docs/DETECTION-GUIDE.md#2-actions for teaching).
+  interesting: []      # Empty = user-taught via Training panel only
+  require_objects: false  # Whether to also check for objects inside actions
 objects:
-  interesting: []
-  confidence: 30
+  # Object classes for detection. The app learns what these are from examples.
+  interesting: []      # Empty = all objects detected, you tune which matter
+  confidence: 30       # Minimum confidence threshold (0-100)
 keywords:
+  # Transcript keywords to highlight as "interesting". Named in config.yaml
+  # and learned via training examples, or listed here for direct matching.
   transcript_file: transcript.txt
   interesting: []
 transcript:
-  enabled: false
-  model: base
-  source_lang: en
-  search_keywords: []
+  enabled: false         # Enable Whisper transcripting for transcript analysis
+  model: base            # whisper-small, base, medium, large
+  source_lang: en        # Language of the source audio
+  search_keywords: []    # Keywords to find (e.g. ["goal", "pass"])
 subtitles:
-  enabled: false
-  source_lang: en
-  target_lang: pl
+  enabled: false         # Enable subtitle generation from transcript
+  source_lang: en        # Source language (must match transcript.source_lang)
+  target_lang: pl        # Target language for subtitles
 advanced:
-  frame_skip: 5
-  vr_mode: false
-  object_frame_skip: 10
-  sample_rate: 5
-  yolo_type: standard
-  yolo_model_size: n
-  yolo_custom_model_path: ''
+  # Performance and model options
+  frame_skip: 5            # Process every N frames (higher = faster but less precise)
+  vr_mode: false           # Enable for VR/360 footage detection
+  object_frame_skip: 10    # Object detection sampling interval
+  sample_rate: 5           # Audio analysis sample rate (Hz / 1000, e.g. 5 = 5kHz)
+  yolo_type: standard      # YOLOX model type (standard or pose)
+  yolo_model_size: n       # Model size: n, s, m, l, x (n = smallest/fastest)
+  yolo_custom_model_path: ''   # Custom model path for advanced users
   action_backend: auto
   r3d_model: r3d_18
   action_models: intel_only
