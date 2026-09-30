@@ -229,6 +229,47 @@ round is scored on the same held-out samples (chosen once, never trained on),
 and a round is installed only if it beats the installed one. Earlier rounds
 stay in `runs/`.
 
+## Measuring it against a dataset you already sorted
+
+A dataset sorted by hand is the one thing that can say how well the automatic
+parts work, because its answers are known. It is read where it is, in the
+layout the trainers read (`train/<class>/`, `val/<class>/`, `test/<class>/`);
+nothing is copied or moved.
+
+```bash
+$T import D:/dataset                  # what it holds, and what would skew a measurement
+$T evaluate D:/dataset                # replay the loop, the folders answering
+$T evaluate D:/dataset --no-simulate --weights models/r3d_finetuned.pth
+```
+
+`import` reports clips per class and split, classes under the training
+minimum, classes in `val`/`test` that `train` lacks, identical files (and
+whether a copy sits in another class or split), and videos whose clips are in
+more than one split. Folders starting with `_`, and folders with no video
+directly inside, are left out.
+
+`evaluate` answers "how much would I still have to look at?". Each class
+starts with `--seeds` examples (5), then it runs the loop the app runs: sort,
+auto-accept, a review sheet answered from the folders (spot checks confirmed
+or overturned the way a person would), sort again, until nothing is left to
+decide. `looked_at_share` is the part a person would have looked at;
+`auto_wrong` counts the samples that went in unchecked and wrong, split into
+those from the examples' own videos and from others. `first_sort` is how right
+the very first sort is, before any review. With `--weights`, a trained R3D
+model is also scored on `val` (per class) and `test`. A test folder named
+`<class>_<class>` shows both at once: `all_on_top` is both as the top two
+guesses, `top_is_one` the top guess being one of them.
+
+The answer is printed and saved as `evaluate-<time>.json` in the project
+folder; the simulation's scratch project sits in `simulation/` beside it and
+keeps its CLIP vectors, so the second run skips the slow part.
+
+`--aliases names.json` renames without touching the dataset:
+`{"misspelt folder": "class", "finer class": "coarser class", "unwanted": ""}`.
+The whole folder name is looked up first, then each `_` part. `--group` is the
+pattern that finds a clip's video in its file name (default: the leading
+number the app's clip names start with).
+
 ## For agents
 
 Loop on `status` and run `next.command`. A `judge` step needs vision or a

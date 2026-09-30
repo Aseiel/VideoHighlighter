@@ -438,6 +438,47 @@ def cmd_doctor(args, root):
     return doctor.run(root)
 
 
+def cmd_import(args, root):
+    """Read a hand-sorted dataset and say what it holds. Reads only."""
+    from modules.teach import benchmark
+
+    aliases = benchmark.load_aliases(args.aliases)
+    data = benchmark.read_dataset(args.dataset, aliases, args.group)
+    return benchmark.report(data, args.dataset, args.min_train)
+
+
+def cmd_evaluate(args, root):
+    """How the loop and a model do on a hand-sorted dataset; saved under root."""
+    import time
+
+    from modules.teach import benchmark
+
+    def say(message):
+        print(message, file=sys.stderr)
+
+    aliases = benchmark.load_aliases(args.aliases)
+    data = benchmark.read_dataset(args.dataset, aliases, args.group)
+    result = {"dataset": os.path.abspath(args.dataset), "aliases": aliases}
+    if not args.no_simulate:
+        result["simulation"] = benchmark.simulate(
+            data["clips"], make_embedder(), root, seeds=args.seeds,
+            sheet_size=args.sheet_size, max_sheets=args.max_sheets,
+            rng_seed=args.rng, progress=say)
+    if args.weights:
+        from modules.teach.sort import r3d_scorer
+
+        mapping = args.mapping or os.path.splitext(args.weights)[0] + "_mapping.json"
+        result["model"] = {"weights": os.path.abspath(args.weights), "mapping": mapping}
+        result["model"].update(benchmark.model_test(
+            data["clips"], r3d_scorer(args.weights, mapping), progress=say))
+    os.makedirs(root, exist_ok=True)
+    saved = os.path.join(root, time.strftime("evaluate-%Y%m%d-%H%M%S.json"))
+    with open(saved, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=1)
+    result["saved"] = saved
+    return result
+
+
 def cmd_status(args, project):
     from modules.teach.status import report
     return report(project)
@@ -580,6 +621,30 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="is this machine ready? (seconds; nothing is loaded)")
     sub.add_parser("share", help="the installed detector, drafted for the model hub")
 
+    s = sub.add_parser("import", help="read a hand-sorted train/val/test dataset: "
+                                      "what it holds (reads only)")
+    s.add_argument("dataset", help="folder holding train/, val/ and test/")
+    s.add_argument("--aliases", help="JSON {name: name or \"\"} to rename or leave out")
+    s.add_argument("--group", default=r"^(\d+)_",
+                   help="regex for the video a clip came from, in its file name")
+    s.add_argument("--min-train", type=int, default=project_mod.MIN_TO_TRAIN,
+                   dest="min_train")
+
+    s = sub.add_parser("evaluate", help="measure the loop (and a model) against a "
+                                        "hand-sorted dataset")
+    s.add_argument("dataset", help="folder holding train/, val/ and test/")
+    s.add_argument("--aliases", help="JSON {name: name or \"\"} to rename or leave out")
+    s.add_argument("--group", default=r"^(\d+)_",
+                   help="regex for the video a clip came from, in its file name")
+    s.add_argument("--seeds", type=int, default=5, help="examples each class starts with")
+    s.add_argument("--sheet-size", type=int, default=24, dest="sheet_size")
+    s.add_argument("--max-sheets", type=int, dest="max_sheets")
+    s.add_argument("--rng", type=int, default=0, help="which examples are picked")
+    s.add_argument("--no-simulate", action="store_true", dest="no_simulate",
+                   help="only test the model")
+    s.add_argument("--weights", help="a trained R3D .pth to test on val and test")
+    s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
+
     s = sub.add_parser("set", help="change settings: key=value ...")
     s.add_argument("pairs", nargs="+")
     return p
@@ -625,6 +690,10 @@ def run(argv=None) -> tuple:
                 result = cmd_seed(args, root)
                 from modules.teach.status import next_step
                 result.setdefault("next", next_step(Project.load(root)))
+            elif args.command == "import":
+                result = cmd_import(args, root)
+            elif args.command == "evaluate":
+                result = cmd_evaluate(args, root)
             elif args.command == "quick":
                 result = cmd_quick(args, root)
                 result.setdefault("next", result.get("stopped_at"))
