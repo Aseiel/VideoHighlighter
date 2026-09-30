@@ -120,7 +120,7 @@ jobs:
         run: |
           pip install numpy==2.2.6 mkl mkl-include
           pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install openvino==2026.2.1
+          pip install openvino==2026.4.0
           pip install -r requirements.txt
           # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
           # its declared requirements would let pip replace the torch above.
@@ -470,7 +470,7 @@ jobs:
         run: |
           pip install numpy==2.2.6 mkl mkl-include
           pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
-          pip install openvino==2026.2.1
+          pip install openvino==2026.4.0
           pip install -r requirements.txt
           pip install -r sidecar/requirements.txt
           # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
