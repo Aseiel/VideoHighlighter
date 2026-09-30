@@ -37,6 +37,7 @@ Before opening a PR, make sure:
 
 - Keep PRs focused — one feature/fix per PR is easier to review than a bundle of unrelated changes.
 - Briefly describe *what* changed and *why* in the PR description.
+- Bumping a runtime the models run on (OpenVINO, onnxruntime, torch, transformers, OpenCV)? Run the before/after benchmark in [docs/BENCHMARKS.md](./docs/BENCHMARKS.md) and put the table in the PR: same outputs, same speed.
 - If your change affects the `final_segments` pipeline (live preview / edit timeline), note which side it touches (pre-CompositionEngine vs post-filter).
 
 ## Code of Conduct
