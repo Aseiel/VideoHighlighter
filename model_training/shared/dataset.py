@@ -483,13 +483,20 @@ def validate_and_split_dataset(train_dataset, val_dataset, config):
     print(f"  Min train videos/action: {min_train}")
     print(f"  Min val videos/action:   {min_val}")
 
+    # Each split numbers its classes from its own folder list, so the same index
+    # names different classes whenever val lacks a folder train has. Every
+    # sample is therefore carried in *train's* numbering from here on: the
+    # auto-split below mixes the two splits, and a val index read against
+    # train's list (or the reverse) silently relabels the clip.
     train_counts, val_counts = {}, {}
     for vp, lbl in train_dataset.samples:
         action = train_dataset.idx_to_label[lbl]
         train_counts.setdefault(action, []).append((vp, lbl))
     for vp, lbl in val_dataset.samples:
         action = val_dataset.idx_to_label[lbl]
-        val_counts.setdefault(action, []).append((vp, lbl))
+        if action in train_dataset.label_to_idx:
+            val_counts.setdefault(action, []).append(
+                (vp, train_dataset.label_to_idx[action]))
 
     valid_actions = []
     new_train, new_val = [], []
@@ -561,11 +568,11 @@ def apply_dataset_split(train_dataset, val_dataset, valid_actions,
                 out.append((vp, new_label_to_idx[name]))
         return out
 
+    # validate_and_split_dataset hands back both lists in train's numbering.
     train_old = train_dataset.idx_to_label.copy()
-    val_old = val_dataset.idx_to_label.copy()
 
     train_dataset.samples = _remap(new_train_samples, train_old)
-    val_dataset.samples = _remap(new_val_samples, val_old)
+    val_dataset.samples = _remap(new_val_samples, train_old)
 
     for ds in (train_dataset, val_dataset):
         ds.labels = valid_actions

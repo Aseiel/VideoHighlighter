@@ -1743,12 +1743,17 @@ def validate_and_split_dataset(train_dataset, val_dataset):
             train_counts[action] = []
         train_counts[action].append((video_path, label))
     
+    # Kept in train's numbering: each split numbers its own folders, and the
+    # auto-split below mixes the two, so a val index read against train's
+    # list would relabel the clip whenever val lacks a folder train has.
     val_counts = {}
     for video_path, label in val_dataset.samples:
         action = val_dataset.idx_to_label[label]
+        if action not in train_dataset.label_to_idx:
+            continue
         if action not in val_counts:
             val_counts[action] = []
-        val_counts[action].append((video_path, label))
+        val_counts[action].append((video_path, train_dataset.label_to_idx[action]))
     
     # Determine which actions are valid and which need splitting
     valid_actions = []
@@ -2660,13 +2665,12 @@ if __name__ == "__main__":
                 mapped.append((video_path, new_label))
         return mapped
     
-    # Get original mappings BEFORE updating
+    # Get original mapping BEFORE updating; both lists are in train's numbering
     train_idx_to_label_original = train_dataset.idx_to_label.copy()
-    val_idx_to_label_original = val_dataset.idx_to_label.copy()
     
     # Map samples
     train_dataset.samples = map_samples(new_train_samples, train_idx_to_label_original)
-    val_dataset.samples = map_samples(new_val_samples, val_idx_to_label_original)
+    val_dataset.samples = map_samples(new_val_samples, train_idx_to_label_original)
     
     # Update dataset properties
     new_idx_to_label = {idx: action for action, idx in new_label_to_idx.items()}
