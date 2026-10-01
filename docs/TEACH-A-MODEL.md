@@ -246,16 +246,25 @@ $T evaluate D:/dataset --no-simulate --weights models/r3d_finetuned.pth
 minimum, classes in `val`/`test` that `train` lacks, identical files (and
 whether a copy sits in another class or split), and videos whose clips are in
 more than one split. Folders starting with `_`, and folders with no video
-directly inside, are left out.
+directly inside, are left out. `clips_without_a_video` counts the file names
+`--group` found no video in, and a `warning` appears when that is most of
+them: each such clip counts as a video of its own, and every "held-out
+videos" number below then holds nothing out.
 
-`evaluate` measures two things, and a model if given one.
+`evaluate` measures two things, and a model if given one. Classes with fewer
+than `--min-examples` clips (20, the training minimum) are left out of both
+and listed under `classes_left_out`: a class of one or two clips is that clip,
+not a class, and it attracts whatever looks a little like it.
 
 **New footage** (`new_footage`): a share of the videos (`--holdout`, 20%) is
 held out whole, found by `--group` in the clip names, and sorted by the rest,
-exactly as `from-dataset` sorts a new video. `best_guess_right` is how often
-the top-scoring class is right; `auto_accepted` / `auto_wrong` what went in
-unchecked and how much of it was wrong; `left_to_check` what a person would
-look at; `confusions` which classes are taken for which.
+exactly as `from-dataset` sorts a new video — with the settings `from-dataset`
+gives a new project, which `--set` changes from there. `best_guess_right` is
+how often the top-scoring class is right; `proposed` / `proposed_right` what
+was proposed and how much of it was right; `auto_accepted` / `auto_wrong`
+what went in unchecked and how much of it was wrong; `left_to_check` what a
+person would look at; `confusions` which classes are taken for which;
+`settings` and `scorer` what it ran with.
 
 **The review loop** (`simulation`): "how much would I still have to look at?"
 when teaching from scratch. Each class
@@ -275,15 +284,16 @@ folder; the simulation's scratch project sits in `simulation/` beside it and
 keeps its CLIP vectors, so the second run skips the slow part.
 
 `--set key=value` (repeatable) runs both with a project setting changed, to
-compare on the same dataset, e.g. `--set prototypes_per_class=3`: each class
-scored by its nearest of three centres instead of the mean of its examples,
-which suits a class shown in a few different ways.
+compare on the same dataset, e.g. `--set scorer=prototypes` for the nearest
+class centre instead of a trained layer, or `--set linear_precision=0.85` for
+fewer, surer proposals.
 
 `--aliases names.json` renames without touching the dataset:
 `{"misspelt folder": "class", "finer class": "coarser class", "unwanted": ""}`.
 The whole folder name is looked up first, then each `_` part. `--group` is the
-pattern that finds a clip's video in its file name (default: the leading
-number the app's clip names start with).
+pattern that finds a clip's video in its file name; by default the name before
+the first `_temp` or `_highlight`, which is how the app names what it cuts
+(`<video>_temp_clip_<n>`).
 
 ## Sorting a new video by that dataset
 
@@ -296,11 +306,31 @@ $T by-class               # refresh the folders after reviewing
 The dataset's `train` and `val` folders become the classes, named exactly as
 the folders are (so a model trained on the dataset agrees on names), and up
 to `--max-examples` (200) of each folder's clips their examples, used where
-they are. The video is cut into samples and sorted against them; confident
-samples are auto-accepted as in any project. `--weights model.pth` adds a
-trained R3D model as a second opinion: where it disagrees, the sample is
-asked about instead of accepted. A new project scores each class by its
-nearest of three centres (`--prototypes 1` for the plain mean).
+they are. Folders with fewer than `--min-examples` clips (20) are left out and
+listed. The video is cut into samples and sorted against them;
+`--weights model.pth` adds a trained R3D model as a second opinion: where it
+disagrees, the sample is asked about instead of accepted.
+
+A new project sorts with a **linear layer trained on the examples**
+(`scorer=linear`) rather than by each class's nearest centre. Its proposals
+are gated by the probability at which held-out videos of the dataset were
+right `linear_precision` (0.8) of the time, and auto-accept by the one at which
+they were right `linear_auto_precision` (0.9) of the time. Both are measured
+on the dataset's own videos, and a new video comes out lower. On one dataset,
+26 videos held out:
+
+| | centres | linear layer |
+|---|---|---|
+| best guess right | 22% | 39% |
+| proposals right | 25% | 65% |
+| auto-accepted unchecked (wrong) | 88 (68) | 1 (0) |
+
+So most of a new video is left to check, but what is proposed is right twice
+as often, and nothing goes in unchecked on a guess. `--scorer prototypes` (or
+`set scorer=prototypes`) sorts by centres again, with `--prototypes` of them per
+class (3; 1 for the plain mean). A class with fewer than
+`linear_min_examples` (5) checked samples is left out of the layer until it has
+them; the sort reports it under `linear.left_out`.
 
 Each video's result is in `by-class/<video>/`: one folder per class with its
 samples named by where they start (`00h12m35s_0.93_auto.mp4`; `auto` decided

@@ -50,10 +50,15 @@ SPLITS = ("train", "val", "test")
 # Where a pool of clips to sort is drawn from; test stays unseen.
 POOL_SPLITS = ("train", "val")
 PAIR_SEPARATOR = "_"
-# The app names cut clips "<video>_..._clip_<n>", so a leading number is the
-# video a clip came from. Clips of one video share a scene, a cast and a
-# camera, and are much easier to sort together than apart.
-DEFAULT_GROUP = r"^(\d+)_"
+# The video a clip came from. The app names what it cuts
+# "<video>_temp_clip_<n>" (pipeline.py), "<video>_temp_trimmed..." and
+# "<video>_highlight...", so the video is the name before the first of those.
+# Clips of one video share a scene, a cast and a camera, and are much easier
+# to sort together than apart -- so a pattern that finds no video makes every
+# clip its own, and "held-out videos" stop holding anything out. The old
+# default, a leading number, read titled names that way: on one dataset 1,154
+# "videos" where there were 136.
+DEFAULT_GROUP = r"^(.*?)(?:_temp|_highlight)"
 # Bytes hashed to tell identical files apart; only files of equal size are read.
 FINGERPRINT_BYTES = 256 * 1024
 SIMULATION_DIR = "simulation"
@@ -142,6 +147,7 @@ def read_dataset(root: str, aliases: Optional[dict] = None,
     if not os.path.isdir(root):
         raise FileNotFoundError(f"no dataset folder {root}")
     clips, skipped, splits, misnamed = [], [], [], []
+    ungrouped = 0
     for split in SPLITS:
         split_dir = os.path.join(root, split)
         if not os.path.isdir(split_dir):
@@ -166,11 +172,28 @@ def read_dataset(root: str, aliases: Optional[dict] = None,
                                 "clips": len(videos)})
                 continue
             for video in videos:
-                clips.append(Clip(os.path.abspath(video), split, folder, labels,
-                                  group_of(video, group_pattern)))
+                group = group_of(video, group_pattern)
+                ungrouped += group == os.path.splitext(os.path.basename(video))[0]
+                clips.append(Clip(os.path.abspath(video), split, folder, labels, group))
     if not splits:
         raise FileNotFoundError(f"{root} has none of {', '.join(SPLITS)}")
-    return {"clips": clips, "skipped": skipped, "splits": splits, "misnamed": misnamed}
+    return {"clips": clips, "skipped": skipped, "splits": splits, "misnamed": misnamed,
+            "group_pattern": group_pattern, "ungrouped": ungrouped}
+
+
+def big_enough(clips: Sequence[Clip], minimum: int = MIN_TO_TRAIN) -> tuple:
+    """``(clips, left_out)``: the single-class train/val clips of classes with
+    at least ``minimum`` of them, and how many each other class had.
+
+    A class built from a clip or two is not that class to a sorter, it is that
+    clip: it attracts whatever looks a little like it, and on one dataset a
+    one-clip class was the best guess for dozens of samples of a video that
+    never showed it. ``minimum`` 0 keeps everything.
+    """
+    pool = [c for c in clips if c.split in POOL_SPLITS and len(c.labels) == 1]
+    counts = Counter(c.labels[0] for c in pool)
+    left_out = {k: v for k, v in sorted(counts.items()) if v < minimum}
+    return [c for c in pool if c.labels[0] not in left_out], left_out
 
 
 def duplicates(clips: Sequence[Clip]) -> list:
@@ -241,6 +264,13 @@ def report(data: dict, root: str = "", min_train: int = MIN_TO_TRAIN) -> dict:
                               for split in data["splits"]},
         "videos": len(split_sets),
         "videos_in_several_splits": dict(shared),
+        "group_pattern": data.get("group_pattern", ""),
+        # Names the pattern found no video in count as a video each, which
+        # quietly breaks every "held-out videos" measurement.
+        "clips_without_a_video": data.get("ungrouped", 0),
+        **({"warning": f"--group found no video in {data['ungrouped']} of {len(clips)} "
+                       "file names; each counts as its own video, so held-out scores leak"}
+           if clips and data.get("ungrouped", 0) > len(clips) / 2 else {}),
         "duplicates": {
             "groups": len(same),
             "extra_copies": sum(len(g) - 1 for g in same),
@@ -299,20 +329,22 @@ def simulate(clips: Sequence[Clip], embedder, work_dir: str, *, seeds: int = 5,
              sheet_size: int = 24, max_sheets: Optional[int] = None, rng_seed: int = 0,
              settings: Optional[dict] = None,
              frame_reader: Optional[Callable] = None,
-             progress: Optional[Callable] = None) -> dict:
+             progress: Optional[Callable] = None,
+             minimum: int = MIN_TO_TRAIN) -> dict:
     """Replay the teaching loop over ``train`` + ``val``, the folders answering.
 
     Each class starts with ``seeds`` examples, as if someone had picked them.
     Then, until nothing is left to decide: sort (which auto-accepts), draw a
     sheet, answer every tile from the folders — confirming or overturning
     spot checks the way a person would — and sort again. ``settings``
-    overrides project settings, to compare them on the same dataset.
+    overrides project settings, to compare them on the same dataset. Classes
+    with fewer than ``minimum`` clips are left out (``big_enough``).
     """
     from modules.teach import autolabel, review
     from modules.teach.sort import sort_project
 
     say = progress or (lambda message: None)
-    pool = [c for c in clips if c.split in POOL_SPLITS and len(c.labels) == 1]
+    pool, left_out = big_enough(clips, minimum)
     if not pool:
         raise ValueError("no single-class clips in train or val to sort")
     project = _fresh_project(work_dir)
@@ -385,8 +417,10 @@ def simulate(clips: Sequence[Clip], embedder, work_dir: str, *, seeds: int = 5,
         if sheet % 10 == 0:
             say(f"evaluate: sheet {sheet}: {curve[-1]}")
 
-    return _summary(project, truth, group, seeded_groups, first, curve,
-                    shown, shown_by_class, audits, overturned, sheet, seeds)
+    summary = _summary(project, truth, group, seeded_groups, first, curve,
+                       shown, shown_by_class, audits, overturned, sheet, seeds)
+    summary["classes_left_out"] = left_out
+    return summary
 
 
 def _first_sort(project: Project, truth: dict) -> dict:
@@ -437,7 +471,8 @@ def _summary(project, truth, group, seeded_groups, first, curve, shown,
         "classes": len(project.classes),
         "settings": {k: getattr(project.settings, k) for k in (
             "gate", "margin", "floor", "auto_gate", "auto_margin", "auto_min_checked",
-            "auto_max_error", "prototypes_per_class", "frames_per_sample")},
+            "auto_max_error", "prototypes_per_class", "frames_per_sample", "scorer",
+            "linear_min_examples", "linear_precision")},
         "examples_per_class": seeds,
         "sheets": sheets,
         "looked_at": looked_at,
@@ -463,20 +498,22 @@ def _summary(project, truth, group, seeded_groups, first, curve, shown,
 def sort_test(clips: Sequence[Clip], embedder, work_dir: str, *,
               holdout: float = 0.2, max_examples: int = 200, rng_seed: int = 0,
               settings: Optional[dict] = None, frame_reader: Optional[Callable] = None,
-              progress: Optional[Callable] = None) -> dict:
+              progress: Optional[Callable] = None, minimum: int = MIN_TO_TRAIN) -> dict:
     """``from-dataset`` on footage it has not seen, scored by the folders.
 
     A share of the videos (by ``Clip.group``) is held out whole; the rest of
     train and val are the examples, as ``from-dataset`` makes them; the
     held-out clips are sorted once, with auto-accept, as a new video is. So
     the numbers say what sorting a new video with this dataset gets right,
-    decides alone, and leaves to a person, before any review.
+    decides alone, and leaves to a person, before any review. The project
+    starts from the settings ``from-dataset`` gives a new one
+    (``FROM_DATASET_SETTINGS``), and ``settings`` changes them from there.
     """
-    from modules.teach.dataset_sort import add_dataset
+    from modules.teach.dataset_sort import FROM_DATASET_SETTINGS, add_dataset
     from modules.teach.sort import sort_project
 
     say = progress or (lambda message: None)
-    pool = [c for c in clips if c.split in POOL_SPLITS and len(c.labels) == 1]
+    pool, left_out = big_enough(clips, minimum)
     groups = sorted({c.group for c in pool})
     if len(groups) < 2:
         raise ValueError("clips come from one video: nothing to hold out "
@@ -487,11 +524,11 @@ def sort_test(clips: Sequence[Clip], embedder, work_dir: str, *,
     unseen = [c for c in pool if c.group in held]
 
     project = _fresh_project(work_dir)
-    for key, value in (settings or {}).items():
+    for key, value in {**FROM_DATASET_SETTINGS, **(settings or {})}.items():
         if not hasattr(project.settings, key):
             raise KeyError(f"no setting {key!r}")
         setattr(project.settings, key, value)
-    add_dataset(project, examples, max_examples=max_examples, rng_seed=rng_seed)
+    add_dataset(project, examples, max_examples=max_examples, rng_seed=rng_seed, minimum=0)
     truth = {}
     for clip in unseen:
         sid = sample_id(clip.path)
@@ -508,7 +545,7 @@ def sort_test(clips: Sequence[Clip], embedder, work_dir: str, *,
 
     say(f"evaluate: sorting {len(truth)} clips of {len(held)} held-out videos "
         f"by {len(examples)} clips of the rest")
-    sort_project(project, embedder, frame_reader=frame_reader, progress=embedded)
+    sorted_ = sort_project(project, embedder, frame_reader=frame_reader, progress=embedded)
 
     names = set(project.class_names())
     tested = [s for s in project.samples if s.id in truth]
@@ -544,6 +581,12 @@ def sort_test(clips: Sequence[Clip], embedder, work_dir: str, *,
         "left_to_check": n - total("auto"),
         "auto_accepted": total("auto"), "auto_wrong": total("auto_wrong"),
         "classes_without_examples": sorted({truth[s.id] for s in tested} - names),
+        "classes_left_out": left_out,
+        "settings": {k: getattr(project.settings, k) for k in (
+            "scorer", "prototypes_per_class", "gate", "margin", "linear_precision",
+            "auto_gate", "auto_margin", "frames_per_sample")},
+        "scorer": sorted_.get("scorer"),
+        **({"linear": sorted_["linear"]} if "linear" in sorted_ else {}),
         "per_class": {k: dict(v) for k, v in sorted(per_class.items())},
         "confusions": dict(confusions.most_common(SHOWN_EXAMPLES)),
     }

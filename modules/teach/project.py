@@ -147,6 +147,20 @@ class Settings:
     # Centres per class prototype (``scoring``): 1 is the examples' mean; more
     # suits a class shown in a few different ways.
     prototypes_per_class: int = 1
+    # How samples are scored (``sort``): "prototypes" compares them with each
+    # class's centres; "linear" trains a layer on the samples a person sorted
+    # (``linear``), and needs every class to have ``linear_min_examples`` --
+    # until then the sort uses prototypes. Its proposals are gated by the
+    # probability at which held-out videos were right ``linear_precision`` of
+    # the time, in place of ``gate``, and auto-accept by the one at which they
+    # were right ``linear_auto_precision`` of the time, in place of
+    # ``auto_gate``. Both are measured on the examples' own videos, and a new
+    # video comes out lower: on one dataset, 0.8 here gave proposals right 65%
+    # of the time on held-out videos (0.7 gave 52%, 0.85 gave 86% of far fewer).
+    scorer: str = "prototypes"
+    linear_min_examples: int = 5
+    linear_precision: float = 0.8
+    linear_auto_precision: float = 0.9
     val_fraction: float = 0.2
     boxes_per_sample: int = 3        # frames labelled per accepted object sample
     epochs: int = 30

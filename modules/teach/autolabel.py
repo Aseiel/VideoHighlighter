@@ -88,9 +88,15 @@ def state(project: Project, name: str) -> dict:
     return {"on": True, "why": "", "checks": done, "overturned": wrong}
 
 
-def apply(project: Project) -> dict:
-    """Auto-decide what is obvious; take back what a tripped class decided."""
+def apply(project: Project, gate: float | None = None) -> dict:
+    """Auto-decide what is obvious; take back what a tripped class decided.
+
+    ``gate`` replaces ``auto_gate`` for this pass: a linear layer's scores are
+    probabilities, and ``sort`` passes the one held-out videos say is right
+    often enough (``linear_auto_precision``).
+    """
     settings = project.settings
+    class_gate = settings.auto_gate if gate is None else gate
     names = project.class_names()
     states = {n: state(project, n) for n in names + [NONE]}
 
@@ -113,7 +119,7 @@ def apply(project: Project) -> dict:
         if sample.model_proposed and sample.model_proposed != guess:
             continue
         if guess in names and states[guess]["on"]:
-            if (sample.scores.get(guess, 0.0) >= settings.auto_gate
+            if (sample.scores.get(guess, 0.0) >= class_gate
                     and sample.margin >= settings.auto_margin):
                 project.decide(sample, ACCEPTED, guess, by=AUTO)
                 decided[guess] = decided.get(guess, 0) + 1

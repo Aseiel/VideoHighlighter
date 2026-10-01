@@ -53,8 +53,9 @@ Pose features need `models/yolox/` and `models/rtmpose/`
 - Grouping without labels reached about 0.5 purity in the raw features and
   0.58 in the classifier's learned space: crops form a continuum, so density
   clustering (HDBSCAN) finds one blob — KMeans is used instead.
-- The source video has to be read from the name before the cutter's suffix
-  (`--group`). The reader's default, a leading number, counted 1,154 videos
-  where there were 136, and every "held-out video" score leaked.
+- The source video has to be read from the name before the cutter's suffix.
+  The reader's old default, a leading number, counted 1,154 videos where there
+  were 136, and every "held-out video" score leaked; the name before the
+  first `_temp`/`_highlight` is now the default (`modules/teach/benchmark.py`).
 - Classes under 20 clips are left out of the scores; a class built from one
   clip attracts whatever looks a little like it.

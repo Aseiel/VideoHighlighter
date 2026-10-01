@@ -26,7 +26,8 @@ from typing import Optional, Sequence
 
 from modules.teach import benchmark
 from modules.teach.project import (
-    ACCEPTED, NEGATIVE, NONE, PENDING, REJECTED, UNSURE, ClassSpec, Project, Sample,
+    ACCEPTED, MIN_TO_TRAIN, NEGATIVE, NONE, PENDING, REJECTED, UNSURE, ClassSpec, Project,
+    Sample,
 )
 
 LAYOUT_DIR = "by-class"
@@ -35,21 +36,33 @@ DATASET_SOURCE = "dataset"
 # A class prototype is the mean of at most this many examples
 # (``scoring.MAX_EXAMPLES``); embedding more costs time and changes nothing.
 DEFAULT_MAX_EXAMPLES = 200
+# What a new project made from a dataset is given. A dataset holds a class's
+# many looks, and one mean of them resembles none, so prototypes get several
+# centres; and it holds enough of every class to train on, which sorts new
+# footage better than any centre (``linear``). Measured with ``evaluate`` on
+# one dataset, 26 videos held out: best guess right 39% against 22% with
+# centres, proposals right 65% against 25%, and auto-accept took 1 clip
+# (right) where centres took 88 and 68 of them were wrong.
+FROM_DATASET_SETTINGS = {"prototypes_per_class": 3, "scorer": "linear"}
 
 
 def add_dataset(project: Project, clips: Sequence[benchmark.Clip], *,
-                max_examples: int = DEFAULT_MAX_EXAMPLES, rng_seed: int = 0) -> dict:
+                max_examples: int = DEFAULT_MAX_EXAMPLES, rng_seed: int = 0,
+                minimum: int = MIN_TO_TRAIN) -> dict:
     """Classes and examples from a dataset's single-class train and val clips.
 
     Safe to repeat: classes and examples already there are kept, and a class
-    gets new examples only up to ``max_examples``.
+    gets new examples only up to ``max_examples``. A class with fewer than
+    ``minimum`` clips is not added (``benchmark.big_enough``); ``left_out``
+    says which.
     """
+    kept, left_out = benchmark.big_enough(clips, minimum)
     pool = defaultdict(list)
-    for clip in clips:
-        if clip.split in benchmark.POOL_SPLITS and len(clip.labels) == 1:
-            pool[clip.labels[0]].append(clip)
+    for clip in kept:
+        pool[clip.labels[0]].append(clip)
     if not pool:
-        raise ValueError("no single-class clips in the dataset's train or val")
+        raise ValueError("no single-class clips in the dataset's train or val"
+                         + (f" with {minimum} or more per class" if left_out else ""))
     known = {s.id for s in project.samples}
     rng = random.Random(rng_seed)
     added = {}
@@ -80,7 +93,8 @@ def add_dataset(project: Project, clips: Sequence[benchmark.Clip], *,
             count += 1
         added[name] = count
     return {"classes": len(project.classes), "examples_added": added,
-            "examples": sum(len(c.examples) for c in project.classes)}
+            "examples": sum(len(c.examples) for c in project.classes),
+            "left_out": left_out}
 
 
 def _stamp(seconds: float) -> str:

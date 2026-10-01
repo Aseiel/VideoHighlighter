@@ -69,10 +69,43 @@ def test_labels_split_pairs_and_follow_aliases():
     assert benchmark.labels_of("a b whole", aliases) == ("alpha move", "beta move")
 
 
-def test_group_is_the_leading_video_number():
+def test_group_is_the_name_before_the_cutters_suffix():
     assert benchmark.group_of("14_highlight_temp_clip_8.mp4") == "14"
     assert benchmark.group_of("29_temp_clip_7_2.mp4") == "29"
+    assert benchmark.group_of("5_highlight_new_database_temp_clip_6.mp4.mp4") == "5"
+    # A titled video: the old default (a leading number) made each of these
+    # clips a video of its own, and held-out videos then held nothing out.
+    assert benchmark.group_of("Some Title Here_temp_trimmed_temp_clip_31_cropped_left.mp4") \
+        == "Some Title Here"
+    assert benchmark.group_of("Some Title Here_temp_trimmed_temp_clip_4.mp4") == "Some Title Here"
     assert benchmark.group_of("clip.mp4") == "clip"
+    assert benchmark.group_of("clip_7.mp4", r"^(clip)_") == "clip"
+
+
+def test_report_warns_when_most_names_hold_no_video(tmp_path):
+    folder = tmp_path / "train" / "alpha move"
+    folder.mkdir(parents=True)
+    for i in range(4):
+        (folder / f"take {i}.mp4").write_bytes(b"x")
+    (folder / "1_temp_clip_0.mp4").write_bytes(b"y")
+
+    out = benchmark.report(benchmark.read_dataset(str(tmp_path)))
+
+    assert out["clips_without_a_video"] == 4
+    assert "held-out scores leak" in out["warning"]
+
+
+def test_small_classes_are_left_out():
+    clips = [benchmark.Clip(f"/d/{c}/{i}.mp4", "train", c, (c,), str(i % 3))
+             for c, n in (("alpha move", 25), ("beta move", 3)) for i in range(n)]
+    clips.append(benchmark.Clip("/d/t.mp4", "test", "alpha move_beta move",
+                                ("alpha move", "beta move"), "9"))
+
+    kept, left_out = benchmark.big_enough(clips, 20)
+    assert {c.labels[0] for c in kept} == {"alpha move"} and len(kept) == 25
+    assert left_out == {"beta move": 3}
+    kept, left_out = benchmark.big_enough(clips, 0)
+    assert len(kept) == 28 and left_out == {}
 
 
 def test_read_skips_underscore_and_videoless_folders(tmp_path):

@@ -21,6 +21,7 @@ import os
 import sys
 
 from modules.teach import project as project_mod
+from modules.teach.benchmark import DEFAULT_GROUP
 from modules.teach.project import ACCEPTED, Project, Sample
 
 
@@ -459,16 +460,18 @@ def cmd_evaluate(args, root):
     aliases = benchmark.load_aliases(args.aliases)
     data = benchmark.read_dataset(args.dataset, aliases, args.group)
     result = {"dataset": os.path.abspath(args.dataset), "aliases": aliases}
+    result["set"] = list(args.set)
     if not args.no_simulate:
         result["simulation"] = benchmark.simulate(
             data["clips"], make_embedder(), root, seeds=args.seeds,
             sheet_size=args.sheet_size, max_sheets=args.max_sheets,
-            rng_seed=args.rng, settings=parse_settings(args.set), progress=say)
+            rng_seed=args.rng, settings=parse_settings(args.set), progress=say,
+            minimum=args.min_examples)
     if not args.no_sort_test:
         result["new_footage"] = benchmark.sort_test(
             data["clips"], make_embedder(), root, holdout=args.holdout,
             max_examples=args.max_examples, rng_seed=args.rng,
-            settings=parse_settings(args.set), progress=say)
+            settings=parse_settings(args.set), progress=say, minimum=args.min_examples)
     if args.weights:
         from modules.teach.sort import r3d_scorer
 
@@ -482,9 +485,6 @@ def cmd_evaluate(args, root):
         json.dump(result, handle, indent=1)
     result["saved"] = saved
     return result
-
-
-FROM_DATASET_CENTERS = 3
 
 
 def cmd_from_dataset(args, root):
@@ -505,19 +505,24 @@ def cmd_from_dataset(args, root):
         project = Project.load(root)
     else:
         project = Project.create(root, project_mod.ACTIONS)
-        # A hand-sorted dataset has a class's many looks in it, and a single
-        # mean of them resembles none; several centres keep them apart.
-        project.settings.prototypes_per_class = FROM_DATASET_CENTERS
+        for key, value in dataset_sort.FROM_DATASET_SETTINGS.items():
+            setattr(project.settings, key, value)
     if project.task != project_mod.ACTIONS:
         raise ValueError("a dataset of clips teaches actions; use an actions project")
     if args.prototypes:
         project.settings.prototypes_per_class = args.prototypes
+    if args.scorer:
+        project.settings.scorer = args.scorer
     data = benchmark.read_dataset(args.dataset, benchmark.load_aliases(args.aliases),
                                   args.group)
     examples = dataset_sort.add_dataset(project, data["clips"],
-                                        max_examples=args.max_examples)
+                                        max_examples=args.max_examples,
+                                        minimum=args.min_examples)
     project.save()
-    say(f"from-dataset: {examples['classes']} classes, {examples['examples']} examples")
+    say(f"from-dataset: {examples['classes']} classes, {examples['examples']} examples"
+        + (f"; left out (fewer than {args.min_examples} clips): "
+           + ", ".join(f"{k} {v}" for k, v in examples["left_out"].items())
+           if examples["left_out"] else ""))
     videos = []
     if args.videos:
         videos = cmd_add_video(SimpleNamespace(items=args.videos), project)["sources"]
@@ -537,6 +542,8 @@ def cmd_from_dataset(args, root):
     project = Project.load(root)
     shown = videos or [s.id for s in project.sources]
     return {"project": project.root, "examples": examples, "cut": cut,
+            "scorer": sorted_.get("scorer"),
+            **({"linear": sorted_["linear"]} if "linear" in sorted_ else {}),
             "auto_accepted": sorted_["auto"]["accepted"],
             "videos": dataset_sort.lay_out(project, shown),
             "still_to_check": dataset_sort.pending_of(project, shown),
@@ -702,7 +709,7 @@ def parser() -> argparse.ArgumentParser:
                                       "what it holds (reads only)")
     s.add_argument("dataset", help="folder holding train/, val/ and test/")
     s.add_argument("--aliases", help="JSON {name: name or \"\"} to rename or leave out")
-    s.add_argument("--group", default=r"^(\d+)_",
+    s.add_argument("--group", default=DEFAULT_GROUP,
                    help="regex for the video a clip came from, in its file name")
     s.add_argument("--min-train", type=int, default=project_mod.MIN_TO_TRAIN,
                    dest="min_train")
@@ -711,7 +718,7 @@ def parser() -> argparse.ArgumentParser:
                                         "hand-sorted dataset")
     s.add_argument("dataset", help="folder holding train/, val/ and test/")
     s.add_argument("--aliases", help="JSON {name: name or \"\"} to rename or leave out")
-    s.add_argument("--group", default=r"^(\d+)_",
+    s.add_argument("--group", default=DEFAULT_GROUP,
                    help="regex for the video a clip came from, in its file name")
     s.add_argument("--seeds", type=int, default=5, help="examples each class starts with")
     s.add_argument("--sheet-size", type=int, default=24, dest="sheet_size")
@@ -728,6 +735,9 @@ def parser() -> argparse.ArgumentParser:
                    help="share of videos held out as new footage")
     s.add_argument("--max-examples", type=int, default=200, dest="max_examples",
                    help="examples per class when sorting held-out videos")
+    s.add_argument("--min-examples", type=int, default=project_mod.MIN_TO_TRAIN,
+                   dest="min_examples",
+                   help="leave out classes with fewer clips than this (0 keeps all)")
     s.add_argument("--weights", help="a trained R3D .pth to test on val and test")
     s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
 
@@ -736,7 +746,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("dataset", help="folder holding train/ (and val/)")
     s.add_argument("--videos", nargs="+", default=[], help="files, folders or URLs")
     s.add_argument("--aliases", help="JSON {name: name or \"\"} to rename or leave out")
-    s.add_argument("--group", default=r"^(\d+)_",
+    s.add_argument("--group", default=DEFAULT_GROUP,
                    help="regex for the video a clip came from, in its file name")
     s.add_argument("--max-examples", type=int, default=200, dest="max_examples",
                    help="examples per class (a prototype averages at most 200)")
@@ -744,6 +754,12 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
     s.add_argument("--prototypes", type=int,
                    help="centres per class (a new project gets 3; 1 = the mean)")
+    s.add_argument("--scorer", choices=("linear", "prototypes"),
+                   help="how samples are scored (a new project: linear, trained on the "
+                        "dataset; prototypes: the nearest class centre)")
+    s.add_argument("--min-examples", type=int, default=project_mod.MIN_TO_TRAIN,
+                   dest="min_examples",
+                   help="leave out classes with fewer clips than this (0 keeps all)")
     s.add_argument("--skip-checks", action="store_true", dest="skip_checks",
                    help="do not run `doctor` first")
 
