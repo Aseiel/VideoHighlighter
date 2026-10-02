@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       rebuild_packs:
-        description: 'Build the packs from scratch (a new torch or CLIP) instead of using the published ones'
+        description: 'Build the packs from scratch (a new torch or model) instead of using the published ones'
         type: boolean
         default: false
 
@@ -107,6 +107,21 @@ jobs:
           [ordered]@{ name = "models-clip"; dep = "models-clip";
                       version = "clip-vit-base-patch32-ov-fp16"; bytes_installed = $bytes } |
             ConvertTo-Json | Set-Content build-packs/models-clip/pack.json -Encoding utf8
+      - name: Export the frame encoder into its own pack
+        # SigLIP2's image tower (Apache-2.0, ~186 MB), which taught action
+        # models are built on. Downloaded on first use into models/, where
+        # modules/vision/frame_encoder.py looks. The export is pinned to one
+        # model revision, so a rebuild gives the same bytes.
+        if: matrix.variant == 'packs' && inputs.rebuild_packs
+        shell: pwsh
+        run: |
+          $dest = "build-packs/models-frame-encoder/models"
+          python -m tools.export_frame_encoder --out "$dest/siglip2-base-patch16-256"
+          if ($LASTEXITCODE -ne 0) { throw "frame encoder export failed" }
+          $bytes = (Get-ChildItem $dest -Recurse -File | Measure-Object Length -Sum).Sum
+          [ordered]@{ name = "models-frame-encoder"; dep = "models-frame-encoder";
+                      version = "siglip2-base-patch16-256-onnx"; bytes_installed = $bytes } |
+            ConvertTo-Json | Set-Content build-packs/models-frame-encoder/pack.json -Encoding utf8
       - name: Fetch YOLOX detector models (Apache-2.0)
         run: python tools/get_yolox_model.py
       - name: Build EXE (${{ matrix.variant }})

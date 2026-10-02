@@ -18,11 +18,12 @@ from PySide6.QtCore import QEventLoop, Qt, QThread, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from modules.packs import pack_manager
-from modules.packs.pack_manager import CLIP_PACK, CUDA_PACK  # noqa: F401  (re-exported)
+from modules.packs.pack_manager import CLIP_PACK, CUDA_PACK, FRAME_ENCODER_PACK  # noqa: F401  (re-exported)
 
 _TITLES = {
     CUDA_PACK: "NVIDIA GPU acceleration",
     CLIP_PACK: "Visual search model",
+    FRAME_ENCODER_PACK: "Action model encoder",
 }
 
 

@@ -246,6 +246,14 @@ def test_install_model_pack(_isolated_roots):
     assert (exe / "models" / "clip-vit-base-patch32-ov" / "openvino_model.xml").is_file()
 
 
+def test_frame_encoder_pack_unpacks_where_the_encoder_looks():
+    """The pack's folder and probe file are the ones frame_encoder searches for:
+    a mismatch would install a model the app never finds."""
+    from modules.vision import frame_encoder
+    assert pm.MODEL_DIRS[pm.FRAME_ENCODER_PACK] == (frame_encoder.MODEL_DIRNAME,
+                                                    frame_encoder.MODEL_FILE)
+
+
 def test_failed_unpack_keeps_verified_archive_for_retry(_isolated_roots):
     exe, _ = _isolated_roots
     pack = _pack()
