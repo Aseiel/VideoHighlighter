@@ -35,6 +35,12 @@ models/actions/
 # every launch — slow, but never something to commit.
 models/clip-vit-base-patch32-ov/
 
+# The frame encoder (SigLIP2 image tower, ~186 MB, written by
+# tools/export_frame_encoder.py; a download or part of the build), and the
+# GPU kernels OpenVINO compiles for it. Generated, never committed.
+models/siglip2-base-patch16-256/
+ov-cache/
+
 # RTMPose keypoint IRs + ONNX/zip cache (installed via tools/get_rtmpose_model.py)
 models/rtmpose/
 

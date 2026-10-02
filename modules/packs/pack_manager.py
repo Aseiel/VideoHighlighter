@@ -71,16 +71,19 @@ APP_DIRNAME = "VideoHighlighter"
 
 # Where each model pack unpacks under models/, and the file that proves it is
 # there. The archive carries the folder itself; this is only so presence can be
-# checked without it. Same name as ClipDirName in videohighlighter-packs.iss
-# and BUNDLED_OV_DIRNAME in llm/clip_prefilter.py.
+# checked without it. Same names as ClipDirName in videohighlighter-packs.iss
+# and BUNDLED_OV_DIRNAME in llm/clip_prefilter.py, and as MODEL_DIRNAME and
+# MODEL_FILE in modules/vision/frame_encoder.py.
 MODEL_DIRS = {
     "models-clip": ("clip-vit-base-patch32-ov", "openvino_model.xml"),
+    "models-frame-encoder": ("siglip2-base-patch16-256", "vision.onnx"),
 }
 
 # The NVIDIA pack's names, so callers need not spell them.
 CUDA_PACK = "torch-cu128"
 CPU_PACK = "torch-cpu"
 CLIP_PACK = "models-clip"
+FRAME_ENCODER_PACK = "models-frame-encoder"
 
 # CUDA 12.x minor-version compatibility floor on Windows. PyTorch's cu128
 # wheels carry their own CUDA runtime, so what matters is the driver. A card
