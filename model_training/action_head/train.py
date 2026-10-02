@@ -3,12 +3,12 @@
     python -m model_training.action_head.train --data-path <dataset>
         [--out <folder>] [--name taught-actions] [--frames 4] [--folds 5]
         [--steps 750,1500,3000] [--min-clips 5] [--precision 0.7]
-        [--backend auto|intel|directml|cpu] [--cache <file.npz>]
+        [--backend auto|intel|directml|cpu] [--cache <file.npz>] [--aliases <file.json>]
 
 The dataset is the app's layout: ``train/``, ``val/`` (and ``test/``) holding
 one folder per class, clips directly inside. A folder named ``a_b`` shows two
-classes; those clips are reported and left out, because the head names one
-action per clip.
+classes. The head names one action per clip, so it trains on single-class
+clips; clips of two classes in ``test/`` are the confusion test (step 5).
 
 What it does:
 
@@ -24,6 +24,12 @@ What it does:
    right ``--precision`` of the time, at 80 % confidence. A class that never
    gets there is only ever a suggestion.
 4. **Trains the saved head on every clip** with the chosen length.
+5. **Scores ``test/``** with the fold heads, each clip by a head that never saw
+   its source video. A clip of two classes counts as found when the head's top
+   two guesses are exactly its two classes.
+6. **Scores ``val/`` as the dataset defines it** (trained on ``train/`` only),
+   next to how many of its clips share a source video with ``train/``: that
+   share is how much of the score is remembering the scene.
 
 Writes ``head.onnx`` and ``head.json`` (encoder id, frames, classes,
 thresholds, held-out scores) into the output folder. Nothing in them names a
@@ -98,15 +104,69 @@ def group_folds(y: np.ndarray, groups: np.ndarray, folds: int, seed: int) -> lis
     return list(splitter.split(np.zeros(len(y)), y, groups))
 
 
-def out_of_fold(x, y, n_classes, splits, steps, seed, log):
+def out_of_fold(x, y, groups, n_classes, splits, steps, seed, log,
+                x_extra=None, groups_extra=None):
+    """Held-out probabilities for every clip, and for ``x_extra`` (test clips)
+    the mean over the fold heads that never saw the clip's source video."""
     from model_training.action_head import head as H
     proba = np.zeros((len(y), n_classes), np.float32)
+    n_extra = 0 if x_extra is None else len(x_extra)
+    extra_sum = np.zeros((n_extra, n_classes), np.float32)
+    extra_n = np.zeros(n_extra)
     for i, (tr, te) in enumerate(splits, 1):
         model = H.train_head(x[tr], y[tr], n_classes, steps=steps, seed=seed)
         proba[te] = H.predict_proba(model, x[te])
+        if n_extra:
+            unseen = ~np.isin(groups_extra, groups[tr])
+            if unseen.any():
+                extra_sum[unseen] += H.predict_proba(model, x_extra[unseen])
+                extra_n[unseen] += 1
         log(f"    fold {i}/{len(splits)}: {np.mean(proba[te].argmax(1) == y[te]):.3f} "
             f"on {len(te)} clips")
-    return proba
+    extra = extra_sum / np.maximum(extra_n, 1)[:, None]
+    extra[extra_n == 0] = np.nan
+    return proba, extra
+
+
+def score_test(proba: np.ndarray, test_clips, classes, thresholds) -> dict:
+    """Test clips, scored by heads that never saw their source video.
+
+    Single-class clips: accuracy. Two-class clips (the confusion test): how
+    often the top guess is one of the two, how often the top two are exactly
+    the two, and what trust would do with them.
+    """
+    from model_training.action_head import trust
+    index = {c: k for k, c in enumerate(classes)}
+    out: dict = {}
+    scored = ~np.isnan(proba).any(1)
+    known = np.array([all(lb in index for lb in c.labels) for c in test_clips], bool)
+    n_labels = np.array([len(c.labels) for c in test_clips])
+    m = scored & known & (n_labels == 1)
+    if m.any():
+        y1 = np.array([index[c.labels[0]] for c, keep in zip(test_clips, m) if keep])
+        out["single"] = {"clips": int(m.sum()),
+                         "accuracy": round(float(np.mean(proba[m].argmax(1) == y1)), 4)}
+    m = scored & known & (n_labels == 2)
+    unknown = int((~known & (n_labels == 2)).sum())
+    if m.any():
+        pairs = [{index[lb] for lb in c.labels} for c, keep in zip(test_clips, m) if keep]
+        p = proba[m]
+        top2 = np.argsort(-p, 1)[:, :2]
+        first_right = np.array([t[0] in pr for t, pr in zip(top2, pairs)], bool)
+        both = np.array([set(t) == pr for t, pr in zip(top2, pairs)], bool)
+        trusted = trust.trusted_mask(p, thresholds)
+        out["two_actions"] = {
+            "clips": int(m.sum()),
+            "left_out_unknown_class": unknown,
+            "top1_is_one_of_them": round(float(first_right.mean()), 4),
+            "top2_are_both": round(float(both.mean()), 4),
+            "trusted_share": round(float(trusted.mean()), 4),
+            "trusted_into_one_of_them": (round(float(first_right[trusted].mean()), 4)
+                                         if trusted.any() else None),
+        }
+    elif unknown:
+        out["two_actions"] = {"clips": 0, "left_out_unknown_class": unknown}
+    return out
 
 
 def main(argv=None) -> int:
@@ -125,18 +185,21 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--backend", default=None, help="encoder route (compute.backend value)")
     ap.add_argument("--cache", default=None, help="feature cache file (.npz)")
+    ap.add_argument("--aliases", default=None,
+                    help="JSON of folder or class name -> class name (\"\" leaves it out), as teach uses")
     args = ap.parse_args(argv)
     log = print
 
     from model_training.action_head import features as Fx
     from model_training.action_head import head as H
     from model_training.action_head import trust
-    from modules.teach.benchmark import read_dataset
+    from modules.teach.benchmark import load_aliases, read_dataset
     from modules.vision import frame_encoder
 
     started = time.time()
-    data = read_dataset(args.data_path)
+    data = read_dataset(args.data_path, aliases=load_aliases(args.aliases))
     clips, notes = select_clips(data["clips"], args.min_clips)
+    test_clips = [c for c in data["clips"] if c.split == "test"]
     for note in notes:
         log(f"ℹ️ {note}")
     if not clips:
@@ -149,9 +212,15 @@ def main(argv=None) -> int:
         return 1
     cache = Fx.FeatureCache(args.cache or default_cache(args.data_path, encoder.encoder_id, args.frames),
                             encoder.encoder_id, args.frames, encoder.dims)
-    x, ok = Fx.encode_clips([c.path for c in clips], args.data_path, encoder, cache, log=log)
+    x, ok = Fx.encode_clips([c.path for c in clips + test_clips], args.data_path, encoder,
+                            cache, log=log)
+    x_test, ok_test = x[len(clips):], ok[len(clips):]
+    x, ok = x[:len(clips)], ok[:len(clips)]
     clips = [c for c, good in zip(clips, ok) if good]
     x = x[ok]
+    test_clips = [c for c, good in zip(test_clips, ok_test) if good]
+    x_test = x_test[ok_test]
+    g_test = np.array([c.group for c in test_clips])
     classes = sorted({c.labels[0] for c in clips})
     y = np.array([classes.index(c.labels[0]) for c in clips])
     groups = np.array([c.group for c in clips])
@@ -163,16 +232,29 @@ def main(argv=None) -> int:
     best = None
     for steps in [int(s) for s in str(args.steps).split(",") if s.strip()]:
         log(f"  {steps} steps")
-        proba = out_of_fold(x, y, len(classes), splits, steps, args.seed, log)
+        proba, proba_test = out_of_fold(x, y, groups, len(classes), splits, steps, args.seed,
+                                        log, x_extra=x_test, groups_extra=g_test)
         acc = float(np.mean(proba.argmax(1) == y))
         log(f"  {steps} steps: held-out accuracy {acc:.3f}")
         if best is None or acc > best[1] + 1e-9:
-            best = (steps, acc, proba)
-    steps, acc, proba = best
+            best = (steps, acc, proba, proba_test)
+    steps, acc, proba, proba_test = best
     pred = proba.argmax(1)
     thresholds = trust.trust_thresholds(proba, y, target=args.precision)
     trusted = trust.trusted_mask(proba, thresholds)
     sorted_precision = float(np.mean(pred[trusted] == y[trusted])) if trusted.any() else 0.0
+    test_scores = score_test(proba_test, test_clips, classes, thresholds) if test_clips else {}
+
+    in_train = np.array([c.split == "train" for c in clips], bool)
+    val_scores = None
+    if in_train.any() and (~in_train).any():
+        log(f"\nScoring val/ as the dataset defines it (training on train/ only)")
+        model = H.train_head(x[in_train], y[in_train], len(classes), steps=steps, seed=args.seed)
+        val_pred = H.predict_proba(model, x[~in_train]).argmax(1)
+        shared = np.isin(groups[~in_train], groups[in_train])
+        val_scores = {"clips": int((~in_train).sum()),
+                      "accuracy": round(float(np.mean(val_pred == y[~in_train])), 4),
+                      "clips_sharing_a_video_with_train": int(shared.sum())}
 
     log(f"\nTraining the saved head on all {len(clips)} clips ({steps} steps)")
     model = H.train_head(x, y, len(classes), steps=steps, seed=args.seed)
@@ -217,6 +299,8 @@ def main(argv=None) -> int:
             "trusted_share": round(float(trusted.mean()), 4),
             "trusted_precision": round(sorted_precision, 4),
         },
+        "test": test_scores,
+        "val_folder": val_scores,
         "per_class": per_class,
         "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
@@ -230,6 +314,25 @@ def main(argv=None) -> int:
     log(f"Trusted classes: {n_trusted} of {len(classes)}. Above their thresholds "
         f"{h['trusted_share']:.0%} of held-out clips are sorted, "
         f"{h['trusted_precision']:.0%} of them correctly")
+    if val_scores:
+        log(f"val/ as the dataset defines it (trained on train/ only): accuracy "
+            f"{val_scores['accuracy']:.3f} on {val_scores['clips']} clips, "
+            f"{val_scores['clips_sharing_a_video_with_train']} of which share a source video "
+            f"with train/")
+    if "single" in test_scores:
+        t = test_scores["single"]
+        log(f"test/, single action: accuracy {t['accuracy']:.3f} on {t['clips']} clips")
+    t = test_scores.get("two_actions")
+    if t and t["clips"]:
+        log(f"test/, two actions ({t['clips']} clips, each scored by heads that never saw "
+            f"its source video): top guess is one of the two {t['top1_is_one_of_them']:.0%}, "
+            f"top two are exactly the two {t['top2_are_both']:.0%}")
+        if t["trusted_into_one_of_them"] is not None:
+            log(f"  trusted: {t['trusted_share']:.0%} would be sorted, "
+                f"{t['trusted_into_one_of_them']:.0%} of those into one of their two actions")
+    if t and t["left_out_unknown_class"]:
+        log(f"  {t['left_out_unknown_class']} two-action clips name a class the head does "
+            f"not have and are not scored")
     width = max(len(c) for c in classes)
     log(f"\n{'class':{width}}  clips videos recall precision threshold")
     for name, row in sorted(per_class.items(), key=lambda kv: -kv[1]["clips"]):

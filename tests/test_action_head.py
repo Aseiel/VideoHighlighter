@@ -210,3 +210,29 @@ def test_a_class_right_by_luck_is_not_trusted():
     proba = np.array([[0.9, 0.1]] * 2 + [[0.2, 0.8]] * 50)
     y = np.array([0, 0] + [1] * 50)
     assert H.trust_thresholds(proba, y, target=0.7)[0] is None
+
+
+# ---------------------------------------------------------------------------
+# The test/ folder: single clips and the two-action confusion test
+# ---------------------------------------------------------------------------
+
+def test_score_test_two_actions_and_unknown_labels():
+    classes = ["a", "b", "c"]
+    clips = [Clip("test", ("a", "b"), "v1"), Clip("test", ("a", "c"), "v2"),
+             Clip("test", ("a", "x"), "v3"), Clip("test", ("c",), "v4")]
+    proba = np.array([[0.5, 0.4, 0.1],     # top two are exactly a, b
+                      [0.1, 0.8, 0.1],     # top guess b is neither a nor c
+                      [0.6, 0.2, 0.2],     # names a class the head does not have
+                      [0.1, 0.1, 0.8]])    # single clip, right
+    scores = T.score_test(proba, clips, classes, [0.3, 0.3, 0.3])
+    assert scores["single"] == {"clips": 1, "accuracy": 1.0}
+    two = scores["two_actions"]
+    assert two["clips"] == 2 and two["left_out_unknown_class"] == 1
+    assert two["top1_is_one_of_them"] == 0.5 and two["top2_are_both"] == 0.5
+    assert two["trusted_into_one_of_them"] == 0.5
+
+
+def test_score_test_skips_clips_no_head_could_score():
+    clips = [Clip("test", ("a", "b"), "v1")]
+    proba = np.full((1, 2), np.nan)
+    assert T.score_test(proba, clips, ["a", "b"], [None, None]) == {}
