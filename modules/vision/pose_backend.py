@@ -131,8 +131,10 @@ def _decode_simcc(simcc_x: np.ndarray, simcc_y: np.ndarray,
     """
     x_idx = simcc_x.argmax(axis=-1).astype(np.float32)
     y_idx = simcc_y.argmax(axis=-1).astype(np.float32)
-    x_val = simcc_x.max(axis=-1)
-    y_val = simcc_y.max(axis=-1)
+    # A non-finite head (a device computing at too low a precision) found
+    # nothing; left as NaN it would place every keypoint at the patch corner.
+    x_val = np.nan_to_num(simcc_x.max(axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
+    y_val = np.nan_to_num(simcc_y.max(axis=-1), nan=0.0, posinf=0.0, neginf=0.0)
 
     coords = np.stack([x_idx / split_ratio, y_idx / split_ratio], axis=-1)
     scores = np.minimum(x_val, y_val)
@@ -161,12 +163,17 @@ class RTMPoseOpenVINOEstimator:
 
         core = ov.Core()
         model = core.read_model(self.model_xml)
+        # f32 everywhere. At the Arc GPU's default f16, RTMPose's head overflows
+        # and every output is NaN (OpenVINO 2026.4, A750): any input, any box.
+        # NaN never passes a threshold, so it read as "no body" rather than an
+        # error. f32 costs ~1.5 ms a call there, still faster than the CPU.
+        config = {"INFERENCE_PRECISION_HINT": "f32"}
         try:
-            self._net = core.compile_model(model, device)
+            self._net = core.compile_model(model, device, config)
         except Exception:
             # Same fallback the detector makes: a missing or busy GPU should
             # degrade to CPU rather than take the feature down.
-            self._net = core.compile_model(model, "CPU")
+            self._net = core.compile_model(model, "CPU", config)
         self._out_x = self._net.output(0)
         self._out_y = self._net.output(1)
 
