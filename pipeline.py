@@ -298,7 +298,10 @@ def action_backend_summary(enable_r3d, r3d_model, r3d_device, r3d_onnx_dml,
         name = R3D_NAMES.get(r3d_model, r3d_model or "R3D")
         device = str(r3d_device or "cpu").lower()
         if r3d_onnx_dml:
-            where = "DirectML (ONNX Runtime; the processor if that cannot run it)"
+            # The same flag means Core ML on a Mac (modules/system/ort_coreml.py).
+            import sys
+            api = "Core ML" if sys.platform == "darwin" else "DirectML"
+            where = f"{api} (ONNX Runtime; the processor if that cannot run it)"
         elif device.startswith("cuda"):
             where = "CUDA"
         elif device.startswith("privateuseone") or "dml" in device:

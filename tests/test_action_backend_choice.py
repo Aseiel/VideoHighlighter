@@ -90,5 +90,13 @@ def test_the_log_names_what_runs_and_where(args, expected):
     assert action_backend_summary(*args) == expected
 
 
+@pytest.mark.parametrize("platform,api", [("win32", "DirectML"), ("darwin", "Core ML")])
+def test_the_onnx_runtime_route_is_named_for_the_platform(monkeypatch, platform, api):
+    """One flag, two APIs: ONNX Runtime drives DirectML on Windows and Core ML
+    on a Mac (modules/system/ort_coreml.py)."""
+    monkeypatch.setattr("sys.platform", platform)
+    assert action_backend_summary(True, "r3d_18", "cpu", True, "CPU") ==         f"R3D-18 on {api} (ONNX Runtime; the processor if that cannot run it)"
+
+
 def test_an_automatic_choice_says_so():
     assert action_backend_summary(False, "r3d_18", None, False, "CPU", auto=True) ==         "OpenVINO on CPU (chosen automatically)"
