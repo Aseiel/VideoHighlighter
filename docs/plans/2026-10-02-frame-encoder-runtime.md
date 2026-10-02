@@ -107,6 +107,54 @@ cheapest gain; the trust thresholds already keep them from sorting new
 footage wrongly. Training length barely matters: 750, 1,500 and 3,000 steps
 gave 0.528, 0.526 and 0.534.
 
+## Two actions in one clip
+
+`test/` of the hand-sorted dataset holds only clips showing two actions at
+once. It is a confusion test, and its question is whether both actions show
+up. Each clip was scored by heads that never saw its source video.
+
+**A head trained on single-action clips does not find the second action.**
+Both were in its top 2 in 0 % of the 265 clips and in its top 5 in 1 %. The
+second action ranked 20th-31st of 38, at or below chance: training on one
+answer per clip teaches the head that actions exclude each other. Scoring
+frame by frame, or a sigmoid head trained on singles only, changed nothing
+(0-2 %).
+
+**Taught pairs are found.** The head now gives every action its own sigmoid
+score, and a folder `a_b` teaches both. With `test/`'s pairs in training
+(`--teach-test`; each clip still scored only by heads that never saw its
+video), 3 seeds:
+
+| | single-action accuracy | balanced | both in top 2 | both in top 5 |
+|---|---|---|---|---|
+| singles only | 0.533 | 0.334 | 1-2 % | 7-15 % |
+| pairs taught | 0.527 | 0.320 | 45-48 % | 70-76 % |
+
+**Only the taught combinations.** With each pair type held out completely
+(no clip of that pair and no clip of its videos in training), both actions
+reached the top 2 in 2-4 % of clips. Every combination that matters needs
+examples of its own.
+
+**Trust:**
+- An action's held-out hits must now come from at least 3 source videos
+  (`--min-videos`). Clips of one video are near-copies, so a few videos must
+  not vouch for an action.
+- Each pair taught in 5+ clips gets its own threshold on the lower of its two
+  scores. A second action rarely reaches its single-action threshold.
+
+On this dataset 1 of 10 taught pairs is trusted so far. The pairs come from
+only 15 videos, which is little evidence.
+
+**Sorting new footage** (`tools/teach_lab/sort_with_head.py`, the app's
+encoder and the exported head, files hard-linked into
+`<action>/`, `<a>_<b>/` or `_unsure/`):
+- On 2,780 cropper clips of one unseen video, 43 % were sorted.
+- Where the earlier trusted sort also sorted a clip, the two agree 78 % of the
+  time.
+- A rare action trusted on 11 videos of the dataset took 19 clips of this
+  video with high scores. That video is believed to have none of it, so it
+  needs a look by eye before anything is concluded.
+
 ## Next
 
 - Step 2, continued: the Training tab and teach run this trainer instead of

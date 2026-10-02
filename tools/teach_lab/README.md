@@ -28,6 +28,7 @@ The class names are the dataset's own; nothing here knows any.
 | `regroup.py` | Trains that head on the whole dataset and groups a video's crops in its space; each group says which dataset classes its crops sit nearest to. `--raw` blends the backbones' own view back in |
 | `class_report.py` | Per class: clips, source videos, held-out recall and precision, what it is mistaken for, and how many of a new video's crops land in it |
 | `sort_trusted.py` | Sorts a video's crops only into classes that earned it: a per-class confidence threshold where the Wilson lower bound of held-out precision reaches a target; other classes are suggestions only |
+| `sort_with_head.py` | Sorts clips with a head from `model_training.action_head.train`, through the app's own frame encoder: hard links into `<action>/`, `<a>_<b>/` (a trusted pair, or two trusted actions) or `_unsure/`, plus every clip's top five in `sorted.csv`; can compare with an earlier sort |
 | `compare_split.py` | Scores the head on the action trainer's own `--split-by-source` split, with any frozen encoder (`--blocks`), next to the trainer's validation accuracy |
 | `siglip_base_features.py`, `r3d_features.py` | SigLIP2 base/16 per frame, and frozen torchvision r3d_18, for `compare_split.py` |
 | `bench_speed.py` | Model time per analysis window for every encoder above, torch XPU and OpenVINO GPU |
