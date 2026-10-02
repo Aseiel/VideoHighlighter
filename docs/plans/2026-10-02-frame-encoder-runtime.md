@@ -155,6 +155,32 @@ encoder and the exported head, files hard-linked into
   video with high scores. That video is believed to have none of it, so it
   needs a look by eye before anything is concluded.
 
+## What analysis must feed the head
+
+The head learned from the cropper's clips, so the input at analysis time
+matters as much as the model. Measured on one unseen video's 623 uncropped
+5-s samples, 4 frames each, scored by the same head. "Agrees" is how often
+the top guess is the action its cropper crops were sorted into:
+
+| input per window | extra cost | sorted (trusted) | agrees |
+|---|---|---|---|
+| whole frame | none | 16 % | 31 % |
+| one box around everyone (YOLOX, 10 % padding) | detector, 10 ms a frame | 19 % | 37 % |
+| one crop per person (2 largest, 20 % margin), best crop wins | detector + one encode per person | **40 %** | **54 %** |
+| the cropper itself (`modules/crop`), as in training | 7.4 s per 5-s window | 43 % | - |
+
+- **Per person, not merged.** The cropper makes a crop per person, and the
+  head was trained on those, so one box around everyone is barely better
+  than the whole frame.
+- **The cropper is too slow for analysis.** It calibrates over 40 frames,
+  tracks every frame and writes videos: about 90 minutes for an hour of
+  video on an Arc A750.
+- **Per-person crops on the sampled frames** come within 3 points of it, at
+  about a minute per hour of video.
+- **8 frames instead of 4** (two 4-frame views averaged) adds 1.7 points of
+  held-out accuracy (0.548 vs 0.531, 2 seeds) at twice the encoder time.
+  Training on two views alone adds nothing (0.535).
+
 ## Next
 
 - Step 2, continued: the Training tab and teach run this trainer instead of
