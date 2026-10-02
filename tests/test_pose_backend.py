@@ -99,6 +99,50 @@ def test_simcc_decode_marks_empty_predictions():
     assert scores[0, 0] == 0.0
 
 
+def test_simcc_decode_treats_a_non_finite_head_as_empty():
+    """A device computing at too low a precision returns NaN. That must decode
+    as "nothing found", not as a score no threshold passes with every keypoint
+    at the patch corner."""
+    coords, scores = _decode_simcc(np.full((1, 2, 384), np.nan, dtype=np.float32),
+                                   np.full((1, 2, 512), np.inf, dtype=np.float32))
+
+    assert (coords == -1.0).all()
+    assert (scores == 0.0).all()
+
+
+def _real_estimator_or_skip(device):
+    ir = find_default_rtmpose_ir()
+    if ir is None:
+        pytest.skip("RTMPose IR not installed (tools/get_rtmpose_model.py)")
+
+    import sys
+    from unittest.mock import MagicMock
+
+    if isinstance(sys.modules.get("openvino"), MagicMock):
+        pytest.skip("openvino is shimmed in this run")
+
+    import openvino as ov
+
+    if device not in ov.Core().available_devices:
+        pytest.skip(f"no {device} device")
+
+    from modules.vision.pose_backend import RTMPoseOpenVINOEstimator
+
+    return RTMPoseOpenVINOEstimator(ir, device=device)
+
+
+@pytest.mark.parametrize("device", ["CPU", "GPU"])
+def test_scores_are_finite_on_every_device(device):
+    """At the Arc GPU's default f16 every RTMPose output was NaN, and callers
+    saw "no body" in every frame without any error. Pin the precision."""
+    est = _real_estimator_or_skip(device)
+    frame = np.random.default_rng(0).integers(0, 255, (480, 640, 3), dtype=np.uint8)
+    out = est.estimate(frame, [(10, 10, 200, 400), (300, 50, 500, 460)])
+
+    assert all(np.isfinite(p.keypoints).all() for p in out)
+    assert all(np.isfinite(p.scores).all() for p in out)
+
+
 def test_estimate_returns_one_entry_per_box_in_order():
     """Callers index the result against their own box list, so a box that could
     not be estimated must come back empty rather than be dropped."""
