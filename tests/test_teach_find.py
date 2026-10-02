@@ -246,7 +246,7 @@ def test_seed_and_find_from_the_command_line(world, monkeypatch):
     assert code == 0 and result["seeds"] == 1
     assert result["next"]["args"] == ["find"]
     monkeypatch.setattr(cli, "make_detector", PatchDetector)
-    monkeypatch.setattr(cli, "make_embedder", PatchEmbedder)
+    monkeypatch.setattr(cli, "make_embedder", lambda *_: PatchEmbedder())
     monkeypatch.setattr(boxes, "_read_at", world["read_at"])
     monkeypatch.setattr(find, "_read_at", world["read_at"])
     code, result = cli.run(["--project", p.root, "find"])

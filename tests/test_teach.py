@@ -778,7 +778,7 @@ def test_auto_runs_unattended_steps_and_stops_where_someone_must_look(tmp_path, 
         return {"samples_made": 0}
 
     monkeypatch.setattr(cut, "cut_project", fake_cut)
-    monkeypatch.setattr(cli, "make_embedder", FakeEmbedder)
+    monkeypatch.setattr(cli, "make_embedder", lambda *_: FakeEmbedder())
     import modules.teach.embed as embed_mod
     monkeypatch.setattr(embed_mod, "read_frames", _reader(truth))
 

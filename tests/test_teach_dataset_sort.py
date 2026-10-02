@@ -174,7 +174,7 @@ def test_from_dataset_command_runs_end_to_end(tmp_path, monkeypatch):
     from modules.teach import cut, embed
     monkeypatch.setattr(cut, "cut_project", fake_cut)
     monkeypatch.setattr(embed, "read_frames", read)
-    monkeypatch.setattr(cli, "make_embedder", FakeEmbedder)
+    monkeypatch.setattr(cli, "make_embedder", lambda *_: FakeEmbedder())
 
     code, out = cli.run(["--project", str(tmp_path / "p"), "from-dataset",
                          str(tmp_path / "ds"), "--videos", str(tmp_path / "film.mp4"),
