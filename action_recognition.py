@@ -1540,6 +1540,22 @@ def softmax(x):
 # =============================
 # MAIN — Run action detection (OPTIMIZED + R3D CUDA)
 # =============================
+def _speed_text(frames_read, elapsed, sample_rate):
+    """How fast the video goes by, for the progress line and the final message.
+
+    It used to say "Processing: 303 FPS" -- analysed frames per second. With a
+    frame skip of 5 that is a fifth of the frames actually read, and raising
+    the frame skip made the run faster while the number fell, so the setting
+    looked useless. Count every frame read instead.
+    """
+    if elapsed <= 0 or frames_read <= 0:
+        return "starting"
+    text = f"{frames_read / elapsed:.0f} fps"
+    if sample_rate and sample_rate > 1:
+        text += f" (1 in {sample_rate} analysed)"
+    return text
+
+
 def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="action_log.csv",
                          debug=False, top_k=50, confidence_threshold=0.01, show_video=False,
                          num_requests=2, interesting_actions=None,
@@ -2189,13 +2205,10 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
                 if progress_callback and (current_time - last_gui_update > 0.1):
                     watchdog.beat('progress callback (GUI)')
                     elapsed = current_time - start_time
-                    processing_fps = processed_frames / elapsed if elapsed > 0 else 0
-                    engine_stats = encoder_engine.get_stats()
                     progress_msg = (
                         f"Frame {processed_frames}/{expected_processed_frames} | "
                         f"Detections: {detection_count} | "
-                        f"Processing: {processing_fps:.1f} FPS | "
-                        f"Inference: {engine_stats['inference_fps']:.1f} FPS | "
+                        f"Speed: {_speed_text(frame_id, elapsed, sample_rate)} | "
                         f"Backend: {_backend_label} | "
                         f"Models: {action_models}")
                     progress_callback(processed_frames, expected_processed_frames,
@@ -2364,11 +2377,9 @@ def run_action_detection(video_path, device="AUTO", sample_rate=5, log_file="act
 
     if progress_callback:
         total_time = time.time() - start_time
-        engine_stats = encoder_engine.get_stats()
         final_msg = (f"Complete! {detection_count} actions detected | "
-                     f"Processed {processed_frames} frames in {total_time:.1f}s | "
-                     f"Avg Processing: {processed_frames / total_time:.1f} FPS | "
-                     f"Avg Inference: {engine_stats['inference_fps']:.1f} FPS")
+                     f"{frame_id} frames in {total_time:.1f}s | "
+                     f"Speed: {_speed_text(frame_id, total_time, sample_rate)}")
         if r3d_wrapper:
             final_msg += f" | R3D time: {r3d_time:.1f}s"
         progress_callback(processed_frames, expected_processed_frames,
