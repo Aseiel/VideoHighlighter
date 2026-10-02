@@ -77,10 +77,40 @@ measured before.
   feature that needs the encoder.
 - **Pro:** exported by `build-release.yaml` and bundled with `models/`.
 
+## Step 2: the trainer, first run
+
+`python -m model_training.action_head.train --data-path <dataset>` (identical
+in both editions) runs the whole recipe:
+
+1. Encodes each clip once: 4 frames across it, decoded front to back, cached.
+2. Scores 5 folds by source video, which also pick the training length.
+3. Sets per-class trust thresholds from those held-out predictions.
+4. Trains the saved head on everything.
+
+It writes `head.onnx` (`features [N, frames, 768]` -> logits, standardisation
+inside) and `head.json` (encoder id, frames, classes, thresholds, held-out
+scores; no paths, no frames).
+
+On the hand-sorted dataset (`train/` + `val/` pooled; `test/` holds only
+two-class folders and is left out). Encoding 2,430 clips took 3 min on the A750
+(14 clips/s); the whole run took 8 min.
+
+| classes kept | clips | videos | held-out acc | balanced | top-3 | trusted classes | sorted / right |
+|---|---|---|---|---|---|---|---|
+| 5+ clips (38) | 2,430 | 134 | 0.534 | 0.355 | 0.674 | 20 | 43 % / 78 % |
+| 20+ clips (24) | 2,271 | 130 | 0.572 | 0.479 | 0.781 | 15 | 48 % / 76 % |
+
+The 20+ row is like for like with the earlier 5-fold measurement (0.577 at 8
+frames, squashed). The 14 classes with 5-19 clips cost about 4 points of
+accuracy and most of the balanced score. Collecting more of them is the
+cheapest gain; the trust thresholds already keep them from sorting new
+footage wrongly. Training length barely matters: 750, 1,500 and 3,000 steps
+gave 0.528, 0.526 and 0.534.
+
 ## Next
 
-2. Trainer: frozen encoder, then a per-clip vector cache, then the measured
-   head. Split by source video, class weights ^0.5, per-class trust
-   thresholds; the head is exported as ONNX.
-3. Analysis: one encoder pass per sampled frame, heads over 4-frame windows.
-4. Remove Intel and R3D.
+- Step 2, continued: the Training tab and teach run this trainer instead of
+  `model_training.intel` / `model_training.r3d`.
+- Step 3: analysis. One encoder pass per sampled frame, heads over 4-frame
+  windows, gated by the trust thresholds.
+- Step 4: remove Intel and R3D.
