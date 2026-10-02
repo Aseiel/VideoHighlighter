@@ -287,6 +287,32 @@ ACTION_BACKEND_SETTINGS = {
     "r3d_dml": (True, False, "cpu", True),      # fp16 is uneven on DirectML
 }
 
+R3D_NAMES = {"r3d_18": "R3D-18", "mc3_18": "MC3-18", "r2plus1d_18": "R(2+1)D-18"}
+
+
+def action_backend_summary(enable_r3d, r3d_model, r3d_device, r3d_onnx_dml,
+                           openvino_device, auto=False) -> str:
+    """One line for the log: which model family runs action recognition, on
+    what. The flags that decided it go to the debug log instead."""
+    if enable_r3d:
+        name = R3D_NAMES.get(r3d_model, r3d_model or "R3D")
+        device = str(r3d_device or "cpu").lower()
+        if r3d_onnx_dml:
+            where = "DirectML (ONNX Runtime; the processor if that cannot run it)"
+        elif device.startswith("cuda"):
+            where = "CUDA"
+        elif device.startswith("privateuseone") or "dml" in device:
+            where = "DirectML"
+        else:
+            where = "CPU (PyTorch)"
+        text = f"{name} on {where}"
+    else:
+        device = str(openvino_device or "AUTO").upper()
+        where = {"CPU": "CPU", "AUTO": "the device OpenVINO picks"}.get(
+            device, "Intel GPU" if device.startswith("GPU") else device)
+        text = f"OpenVINO on {where}"
+    return text + (" (chosen automatically)" if auto else "")
+
 
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log_fn=print, progress_fn=None, cancel_flag=None,
@@ -1409,7 +1435,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     (enable_r3d, r3d_half, r3d_device,
                      r3d_onnx_dml) = _explicit
                     if r3d_onnx_dml:
-                        log("🎯 Action backend → R3D on DirectML through "
+                        print("🎯 Action backend → R3D on DirectML through "
                             "ONNX Runtime; it stays on the CPU if the export or "
                             "the provider will not run")
                 else:  # "auto"
@@ -1430,7 +1456,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         enable_r3d = True
                         r3d_half = True
                         r3d_device = _dev.pytorch_device
-                        log(f"🎯 Auto backend → CUDA detected, using R3D ({_dev.backend_name})")
+                        print(f"🎯 Auto backend → CUDA detected, using R3D ({_dev.backend_name})")
                     elif _dev.dml_device:
                         enable_r3d = True
                         r3d_half = False  # FP16 is uneven on DirectML
@@ -1448,7 +1474,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         # operator coverage. _try_onnx() already waits for
                         # exactly this case and was never given permission.
                         r3d_onnx_dml = True
-                        log(f"🎯 Auto backend → DirectML detected, using R3D on "
+                        print(f"🎯 Auto backend → DirectML detected, using R3D on "
                             f"{_dev.dml_device} ({_dev.backend_name}); if that "
                             f"backend cannot run it, ONNX Runtime is tried on "
                             f"the same card before the CPU")
@@ -1465,13 +1491,20 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         r3d_half = False      # fp16 is uneven on DirectML
                         r3d_device = "cpu"    # torch's device; the model leaves it
                         r3d_onnx_dml = True
-                        log(f"🎯 Auto backend → ONNX Runtime on the GPU, using "
+                        print(f"🎯 Auto backend → ONNX Runtime on the GPU, using "
                             f"R3D ({_dev.backend_name}); it stays on the CPU if "
                             f"the export or the provider will not run")
                     else:
                         enable_r3d = False
                         r3d_half = False
-                        log(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
+                        print(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
+
+                log("🎯 Action recognition: " + action_backend_summary(
+                    enable_r3d, r3d_model, r3d_device, r3d_onnx_dml,
+                    openvino_device, auto=_explicit is None))
+                print(f"   action backend setting: {action_backend} | R3D model: {r3d_model} | "
+                      f"enable_r3d: {enable_r3d} | r3d_device: {r3d_device or 'auto'} | "
+                      f"onnx_dml: {r3d_onnx_dml} | OpenVINO device: {openvino_device}")
 
                 action_models_selection = gui_config.get("action_models", "mixed") or "mixed"
                 all_action_detections, action_bboxes_cache = run_action_detection(

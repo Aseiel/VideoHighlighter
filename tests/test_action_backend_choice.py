@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from pipeline import ACTION_BACKEND_SETTINGS
+from pipeline import ACTION_BACKEND_SETTINGS, action_backend_summary
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 
@@ -71,3 +71,24 @@ def test_every_dropdown_value_is_one_the_pipeline_handles():
     # it lives at the call site with the detection it depends on.
     unhandled = offered - set(ACTION_BACKEND_SETTINGS) - {"auto"}
     assert not unhandled, f"dropdown offers {unhandled}, pipeline handles none of it"
+
+
+@pytest.mark.parametrize("args,expected", [
+    # enable_r3d, r3d_model, r3d_device, r3d_onnx_dml, openvino_device
+    ((False, "r3d_18", None, False, "CPU"), "OpenVINO on CPU"),
+    ((False, "r3d_18", None, False, "GPU"), "OpenVINO on Intel GPU"),
+    ((False, "r3d_18", None, False, "GPU.1"), "OpenVINO on Intel GPU"),
+    ((False, "r3d_18", None, False, "AUTO"), "OpenVINO on the device OpenVINO picks"),
+    ((True, "r3d_18", "cuda", False, "AUTO"), "R3D-18 on CUDA"),
+    ((True, "r2plus1d_18", "cpu", False, "CPU"), "R(2+1)D-18 on CPU (PyTorch)"),
+    ((True, "r3d_18", "privateuseone:0", False, "CPU"), "R3D-18 on DirectML"),
+    ((True, "mc3_18", "cpu", True, "CPU"),
+     "MC3-18 on DirectML (ONNX Runtime; the processor if that cannot run it)"),
+])
+def test_the_log_names_what_runs_and_where(args, expected):
+    """One readable line in the log; the raw flags go to the debug log."""
+    assert action_backend_summary(*args) == expected
+
+
+def test_an_automatic_choice_says_so():
+    assert action_backend_summary(False, "r3d_18", None, False, "CPU", auto=True) ==         "OpenVINO on CPU (chosen automatically)"
