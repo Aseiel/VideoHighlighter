@@ -26,6 +26,7 @@ asked during preflight, before a run commits to anything.
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from typing import Optional
 
@@ -190,6 +191,14 @@ def decide(config: Mapping, entry: Mapping | None = None) -> dict:
         return {**fallback, "reason": "No Intel GPU, so Ollama it is."}
 
     if not genai_available():
+        if getattr(sys, "frozen", False):
+            # Nothing to install in the packaged app: the library is not in this
+            # build. Not something the user can act on, so `actionable` keeps it
+            # out of the run log (it still reaches the debug log).
+            return {**fallback, "actionable": False,
+                    "reason": (f"{card} could narrate several times faster through "
+                               f"OpenVINO, but this build does not include it, so "
+                               f"narration uses Ollama.")}
         return {**fallback,
                 "reason": (f"{card} is here and would run narration several "
                            f"times faster, but openvino-genai is not installed. "

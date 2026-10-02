@@ -19,6 +19,8 @@ being tested is the decision rather than anyone else's inference.
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from modules.narration import llm_acceleration
@@ -91,6 +93,17 @@ class TestWhyTheFastPathWasNotTaken:
         reason = llm_acceleration.decide({}, {})["reason"]
         assert "openvino-genai is not installed" in reason
         assert "Intel Arc A750" in reason
+
+    def test_the_packaged_build_does_not_ask_for_an_install(self, monkeypatch):
+        """There is no pip in the exe: the library being absent from the build
+        is not the user's to fix, so it stays out of the run log."""
+        _machine(monkeypatch, card="Intel Arc A750", genai=False)
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        got = llm_acceleration.decide({}, {})
+        assert "install" not in got["reason"].lower()
+        assert "this build does not include it" in got["reason"]
+        assert got["actionable"] is False
+        assert got["backend"] == "ollama"
 
     def test_a_missing_converted_model_says_it_is_a_conversion(self, monkeypatch, tmp_path):
         """The expensive case, and the one most likely to be silently skipped."""
