@@ -15,6 +15,12 @@ of its two scores, so a clip lands in:
                            the dataset's own folder convention for a clip
                            showing both
   <out>/_unsure/           nothing trusted: the guesses are in sorted.csv
+  <out>/_unsure-groups/gNN/  with --group-unsure K: the unsure clips again,
+                           grouped by look (k-means on the encoder's mean
+                           frame vector), so a group can be named at once.
+                           The raw vectors, not the head's: the head only
+                           knows the classes it was taught, and an unsure
+                           clip may be something new.
 
 Files are hard links (no copies; the clips folder is never changed).
 ``sorted.csv`` has every clip's top five actions with scores and what was
@@ -56,6 +62,8 @@ def main():
     ap.add_argument("--cache", default=None)
     ap.add_argument("--compare", default=None, help="an earlier sort's sorted.csv")
     ap.add_argument("--backend", default=None)
+    ap.add_argument("--group-unsure", type=int, default=0, metavar="K",
+                    help="also group the unsure clips into K look-alike groups")
     args = ap.parse_args()
 
     from model_training.action_head import features as Fx
@@ -101,8 +109,30 @@ def main():
             row[f"guess{r}"] = classes[k]
             row[f"score{r}"] = f"{scores[i, k]:.3f}"
         rows.append(row)
+    unsure = [i for i, r in enumerate(rows) if r["folder"] == "_unsure"]
+    if args.group_unsure and len(unsure) > args.group_unsure:
+        from sklearn.cluster import KMeans
+        v = x[unsure].mean(1)
+        v = v / np.linalg.norm(v, axis=1, keepdims=True).clip(1e-8)
+        km = KMeans(args.group_unsure, n_init=10, random_state=0).fit(v)
+        order = np.argsort(-np.bincount(km.labels_))          # g01 = the largest group
+        rank = {int(g): n for n, g in enumerate(order, 1)}
+        groups = []
+        for g in order:
+            members = [unsure[j] for j in np.flatnonzero(km.labels_ == g)]
+            guesses = Counter(rows[i]["guess1"] for i in members).most_common(3)
+            name = f"g{rank[int(g)]:02d}"
+            groups.append({"group": name, "clips": len(members),
+                           "head_guesses": [f"{k} ({n})" for k, n in guesses]})
+            for i in members:
+                rows[i]["group"] = name
+                place(paths[i], os.path.join("_unsure-groups", name), args.out)
+        with open(os.path.join(args.out, "_unsure-groups", "groups.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(groups, fh, indent=1, ensure_ascii=False)
     with open(os.path.join(args.out, "sorted.csv"), "w", newline="", encoding="utf-8") as fh:
-        wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        fields = list(rows[0]) + (["group"] if any("group" in r for r in rows) else [])
+        wr = csv.DictWriter(fh, fieldnames=fields, restval="")
         wr.writeheader()
         wr.writerows(rows)
 
