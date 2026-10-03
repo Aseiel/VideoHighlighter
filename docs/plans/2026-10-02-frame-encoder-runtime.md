@@ -107,6 +107,80 @@ cheapest gain; the trust thresholds already keep them from sorting new
 footage wrongly. Training length barely matters: 750, 1,500 and 3,000 steps
 gave 0.528, 0.526 and 0.534.
 
+## Two actions in one clip
+
+`test/` of the hand-sorted dataset holds only clips showing two actions at
+once. It is a confusion test, and its question is whether both actions show
+up. Each clip was scored by heads that never saw its source video.
+
+**A head trained on single-action clips does not find the second action.**
+Both were in its top 2 in 0 % of the 265 clips and in its top 5 in 1 %. The
+second action ranked 20th-31st of 38, at or below chance: training on one
+answer per clip teaches the head that actions exclude each other. Scoring
+frame by frame, or a sigmoid head trained on singles only, changed nothing
+(0-2 %).
+
+**Taught pairs are found.** The head now gives every action its own sigmoid
+score, and a folder `a_b` teaches both. With `test/`'s pairs in training
+(`--teach-test`; each clip still scored only by heads that never saw its
+video), 3 seeds:
+
+| | single-action accuracy | balanced | both in top 2 | both in top 5 |
+|---|---|---|---|---|
+| singles only | 0.533 | 0.334 | 1-2 % | 7-15 % |
+| pairs taught | 0.527 | 0.320 | 45-48 % | 70-76 % |
+
+**Only the taught combinations.** With each pair type held out completely
+(no clip of that pair and no clip of its videos in training), both actions
+reached the top 2 in 2-4 % of clips. Every combination that matters needs
+examples of its own.
+
+**Trust:**
+- An action's held-out hits must now come from at least 3 source videos
+  (`--min-videos`). Clips of one video are near-copies, so a few videos must
+  not vouch for an action.
+- Each pair taught in 5+ clips gets its own threshold on the lower of its two
+  scores. A second action rarely reaches its single-action threshold.
+
+On this dataset 1 of 10 taught pairs is trusted so far. The pairs come from
+only 15 videos, which is little evidence.
+
+**Sorting new footage** (`tools/teach_lab/sort_with_head.py`, the app's
+encoder and the exported head, files hard-linked into
+`<action>/`, `<a>_<b>/` or `_unsure/`):
+- On 2,780 cropper clips of one unseen video, 43 % were sorted.
+- Where the earlier trusted sort also sorted a clip, the two agree 78 % of the
+  time.
+- A rare action trusted on 11 videos of the dataset took 19 clips of this
+  video with high scores. That video is believed to have none of it, so it
+  needs a look by eye before anything is concluded.
+
+## What analysis must feed the head
+
+The head learned from the cropper's clips, so the input at analysis time
+matters as much as the model. Measured on one unseen video's 623 uncropped
+5-s samples, 4 frames each, scored by the same head. "Agrees" is how often
+the top guess is the action its cropper crops were sorted into:
+
+| input per window | extra cost | sorted (trusted) | agrees |
+|---|---|---|---|
+| whole frame | none | 16 % | 31 % |
+| one box around everyone (YOLOX, 10 % padding) | detector, 10 ms a frame | 19 % | 37 % |
+| one crop per person (2 largest, 20 % margin), best crop wins | detector + one encode per person | **40 %** | **54 %** |
+| the cropper itself (`modules/crop`), as in training | 7.4 s per 5-s window | 43 % | - |
+
+- **Per person, not merged.** The cropper makes a crop per person, and the
+  head was trained on those, so one box around everyone is barely better
+  than the whole frame.
+- **The cropper is too slow for analysis.** It calibrates over 40 frames,
+  tracks every frame and writes videos: about 90 minutes for an hour of
+  video on an Arc A750.
+- **Per-person crops on the sampled frames** come within 3 points of it, at
+  about a minute per hour of video.
+- **8 frames instead of 4** (two 4-frame views averaged) adds 1.7 points of
+  held-out accuracy (0.548 vs 0.531, 2 seeds) at twice the encoder time.
+  Training on two views alone adds nothing (0.535).
+
 ## Next
 
 - Step 2, continued: the Training tab and teach run this trainer instead of
