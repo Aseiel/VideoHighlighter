@@ -2118,12 +2118,15 @@ class VideoHighlighterGUI(QWidget):
         # "Auto" has picked DirectML since R3D learned to run through ONNX
         # Runtime; the old label predated that and named three of the four.
         self.action_backend_combo.addItem(
-            "Auto (CUDA / DirectML / OpenVINO / CPU)", "auto")
-        self.action_backend_combo.addItem("OpenVINO (Intel GPU / CPU)", "openvino")
-        self.action_backend_combo.addItem("R3D + CUDA (NVIDIA GPU)", "r3d_cuda")
+            "Auto (your action head if installed, else the old models)", "auto")
         self.action_backend_combo.addItem(
-            "R3D + DirectML (AMD / any DX12 card)", "r3d_dml")
-        self.action_backend_combo.addItem("R3D + CPU (PyTorch, slow)", "r3d_cpu")
+            "SigLIP2 + your trained action head", "siglip2")
+        # The Intel and R3D paths are being retired in favour of SigLIP2.
+        self.action_backend_combo.addItem(
+            "OpenVINO, Intel model (deprecated)", "openvino")
+        self.action_backend_combo.addItem("R3D + CUDA (deprecated)", "r3d_cuda")
+        self.action_backend_combo.addItem("R3D + DirectML (deprecated)", "r3d_dml")
+        self.action_backend_combo.addItem("R3D + CPU (deprecated)", "r3d_cpu")
         current_backend = advanced_cfg.get("action_backend", "auto")
         idx_ab = self.action_backend_combo.findData(current_backend)
         self.action_backend_combo.setCurrentIndex(idx_ab if idx_ab >= 0 else 0)
@@ -2241,8 +2244,15 @@ class VideoHighlighterGUI(QWidget):
             prev_data = self.action_models_combo.currentData()
             self.action_models_combo.blockSignals(True)
             self.action_models_combo.clear()
+            self.action_models_combo.setEnabled(backend != "siglip2")
 
-            if backend in ("openvino",):
+            if backend == "siglip2":
+                from modules.vision import action_siglip
+                head = action_siglip.installed_head_classes()
+                self.action_models_combo.addItem(
+                    f"Action head: {head[0]} ({len(head[1])} classes)" if head
+                    else "No action head installed - train one first", "siglip2")
+            elif backend in ("openvino",):
                 if self._intel_count:
                     self.action_models_combo.addItem(f"Intel Kinetics-400 ({self._intel_count} classes)", "intel_only")
                 if self._custom_ov_count:
@@ -4783,8 +4793,32 @@ class VideoHighlighterGUI(QWidget):
             self.objects_input.setText(", ".join(selected))
             self.append_log(f"✅ Loaded {len(selected)} object labels")
 
+    def _siglip_action_labels(self):
+        """``(head name, classes)`` when the action backend resolves to SigLIP2
+        and a head is installed, else None. With that backend the actions to
+        look for are the user's own classes, not a built-in label list."""
+        backend = self.action_backend_combo.currentData()
+        if backend not in ("siglip2", "auto"):
+            return None
+        from modules.vision import action_siglip
+        if backend == "auto" and not action_siglip.available():
+            return None
+        return action_siglip.installed_head_classes()
+
     def open_action_label_selector(self):
         """Open label selector based on current backend and action models settings."""
+        siglip = self._siglip_action_labels()
+        if siglip is not None:
+            name, labels = siglip
+            current = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
+            dlg = LabelSelectorDialog(
+                f"Select Action Labels (action head {name} — {len(labels)} classes)",
+                sorted(labels), current, self)
+            if dlg.exec() == QDialog.Accepted:
+                selected = dlg.get_selected_labels()
+                self.actions_input.setText(", ".join(selected))
+                self.append_log(f"✅ Loaded {len(selected)} action labels from {name}")
+            return
         backend = self.action_backend_combo.currentData()
         action_models = self.action_models_combo.currentData()
 
@@ -4882,6 +4916,10 @@ class VideoHighlighterGUI(QWidget):
         if backend in ("r3d_cuda", "r3d_cpu"):
             action_models = "intel_only"
 
+        siglip = self._siglip_action_labels()
+        if siglip is not None:
+            action_models = ("siglip2",) + tuple(siglip[1])
+
         if action_models == getattr(self, "_actions_completer_models", -1):
             return
         self._actions_completer_models = action_models
@@ -4889,7 +4927,10 @@ class VideoHighlighterGUI(QWidget):
         action_labels = []
         source = None
 
-        if action_models == "custom_only":
+        if siglip is not None:
+            action_labels = sorted(siglip[1])
+            source = f"action head {siglip[0]} ({len(action_labels)} classes)"
+        elif action_models == "custom_only":
             if os.path.exists(INTEL_CUSTOM_LABELS_FILE):
                 action_labels = self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)
                 source = f"Custom fine-tuned ({self._custom_ov_count} classes)"

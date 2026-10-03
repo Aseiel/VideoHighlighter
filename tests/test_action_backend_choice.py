@@ -61,15 +61,22 @@ def _dropdown_values() -> list:
 
 def test_the_dropdown_offers_the_backends_we_expect():
     assert _dropdown_values() == [
-        "auto", "openvino", "r3d_cuda", "r3d_dml", "r3d_cpu",
+        "auto", "siglip2", "openvino", "r3d_cuda", "r3d_dml", "r3d_cpu",
     ]
+
+
+def test_the_pipeline_branches_on_siglip2_before_the_old_backends():
+    src = (MAIN_PY.parent / "pipeline.py").read_text(encoding="utf-8")
+    branch = src.index('use_siglip = action_backend == "siglip2"')
+    assert branch < src.index("_explicit = ACTION_BACKEND_SETTINGS.get(action_backend)")
 
 
 def test_every_dropdown_value_is_one_the_pipeline_handles():
     offered = set(_dropdown_values())
     # "auto" is deliberately absent from the table: it probes the machine, so
-    # it lives at the call site with the detection it depends on.
-    unhandled = offered - set(ACTION_BACKEND_SETTINGS) - {"auto"}
+    # it lives at the call site with the detection it depends on. "siglip2" is
+    # not an Intel/R3D setting at all; the call site branches on it first.
+    unhandled = offered - set(ACTION_BACKEND_SETTINGS) - {"auto", "siglip2"}
     assert not unhandled, f"dropdown offers {unhandled}, pipeline handles none of it"
 
 
