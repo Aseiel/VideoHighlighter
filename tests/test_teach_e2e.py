@@ -76,7 +76,7 @@ def test_a_project_from_footage_to_a_dataset(tmp_path, monkeypatch):
                                 (5, RED, "circle"), (5, BLUE, "box"), (5, GREEN, "")])
     _video(tmp_path / "ex_red.mp4", [(5, RED, "circle")])
     _video(tmp_path / "ex_blue.mp4", [(5, BLUE, "box")])
-    monkeypatch.setattr(cli, "make_embedder", Histogram)
+    monkeypatch.setattr(cli, "make_embedder", lambda *_: Histogram())
     root = str(tmp_path / "project")
 
     def run(*args):
@@ -162,7 +162,7 @@ def test_an_object_project_from_footage_to_a_coco_dataset(tmp_path, monkeypatch)
             return [Det((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)),
                     Det((0, 0, 20, 20))]
 
-    monkeypatch.setattr(cli, "make_embedder", Histogram)
+    monkeypatch.setattr(cli, "make_embedder", lambda *_: Histogram())
     monkeypatch.setattr(cli, "make_detector", Detector)
     root = str(tmp_path / "objects")
 

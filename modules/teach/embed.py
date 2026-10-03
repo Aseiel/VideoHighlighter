@@ -1,10 +1,12 @@
-"""Samples and words as CLIP vectors, cached per project.
+"""Samples and words as vectors, cached per project.
 
 Everything that compares a sample with a class goes through an ``Embedder``:
-``images(frames_bgr)`` and ``texts(strings)``, both returning unit rows. The
-real one is the app's CLIP (``llm.clip_index.ClipEmbedder``: OpenVINO, or
-torch on NVIDIA); tests hand in a fake, which is why nothing above this module
-imports CLIP.
+``images(frames_bgr)`` and ``texts(strings)``, both returning unit rows. Two
+real ones: the app's CLIP (``llm.clip_index.ClipEmbedder``: OpenVINO, or
+torch on NVIDIA), and the frame encoder that taught action models are built
+on (``modules.vision.frame_encoder``, SigLIP2), which sorts by examples
+better but cannot read words until its text half ships. Tests hand in a
+fake, which is why nothing above this module imports either.
 
 A sample's vector is the mean of a few frames spread across it. One frame
 would describe a single instant of a clip that is about motion; every frame
@@ -58,6 +60,52 @@ class ClipBackend:
 
     def texts(self, texts: Sequence[str]) -> np.ndarray:
         return self._load().embed_texts(list(texts))
+
+
+class FrameEncoderBackend:
+    """The frame encoder behind the ``Embedder`` interface. Loaded on first use.
+
+    Examples only: SigLIP2's text half is not part of the encoder download, so
+    a class known only by its words needs CLIP. ``texts`` says so rather than
+    returning vectors from another model's space.
+    """
+
+    def __init__(self, backend: Optional[str] = None):
+        from modules.vision.frame_encoder import ENCODER_ID
+
+        self._backend = backend
+        self._encoder = None
+        self.model_id = ENCODER_ID
+
+    def _load(self):
+        if self._encoder is None:
+            from modules.vision import frame_encoder
+            encoder = frame_encoder.load(self._backend)
+            if encoder is None:
+                raise RuntimeError("the frame encoder is not installed or cannot run here")
+            self._encoder = encoder
+        return self._encoder
+
+    def images(self, frames_bgr: Sequence) -> np.ndarray:
+        if len(frames_bgr) == 0:
+            return np.zeros((0, 0), np.float32)
+        return unit(self._load().encode_bgr(list(frames_bgr)))
+
+    def texts(self, texts: Sequence[str]) -> np.ndarray:
+        raise RuntimeError("the frame encoder sorts by examples; a class with no examples "
+                           "yet needs CLIP (--embedder clip)")
+
+
+EMBEDDERS = ("clip", "frame-encoder")
+
+
+def make(name: str = "clip"):
+    """The embedder called ``name`` (one of ``EMBEDDERS``)."""
+    if name == "frame-encoder":
+        return FrameEncoderBackend()
+    if name == "clip":
+        return ClipBackend()
+    raise ValueError(f"unknown embedder {name!r}; one of {', '.join(EMBEDDERS)}")
 
 
 def unit(a) -> np.ndarray:

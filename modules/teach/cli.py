@@ -25,10 +25,10 @@ from modules.teach.benchmark import DEFAULT_GROUP
 from modules.teach.project import ACCEPTED, Project, Sample
 
 
-def make_embedder():
-    """The real CLIP. Tests replace this."""
-    from modules.teach.embed import ClipBackend
-    return ClipBackend()
+def make_embedder(name: str = "clip"):
+    """The real embedder: CLIP, or the frame encoder. Tests replace this."""
+    from modules.teach import embed
+    return embed.make(name)
 
 
 def make_detector():
@@ -461,15 +461,16 @@ def cmd_evaluate(args, root):
     data = benchmark.read_dataset(args.dataset, aliases, args.group)
     result = {"dataset": os.path.abspath(args.dataset), "aliases": aliases}
     result["set"] = list(args.set)
+    result["embedder"] = args.embedder
     if not args.no_simulate:
         result["simulation"] = benchmark.simulate(
-            data["clips"], make_embedder(), root, seeds=args.seeds,
+            data["clips"], make_embedder(args.embedder), root, seeds=args.seeds,
             sheet_size=args.sheet_size, max_sheets=args.max_sheets,
             rng_seed=args.rng, settings=parse_settings(args.set), progress=say,
             minimum=args.min_examples)
     if not args.no_sort_test:
         result["new_footage"] = benchmark.sort_test(
-            data["clips"], make_embedder(), root, holdout=args.holdout,
+            data["clips"], make_embedder(args.embedder), root, holdout=args.holdout,
             max_examples=args.max_examples, rng_seed=args.rng,
             settings=parse_settings(args.set), progress=say, minimum=args.min_examples)
     if args.weights:
@@ -535,9 +536,9 @@ def cmd_from_dataset(args, root):
 
     def embedded(i, n):
         if i == n or i % 200 == 0:
-            say(f"from-dataset: CLIP vectors {i}/{n}")
+            say(f"from-dataset: {args.embedder} vectors {i}/{n}")
 
-    sorted_ = sort_project(project, make_embedder(), model_classifier=classifier,
+    sorted_ = sort_project(project, make_embedder(args.embedder), model_classifier=classifier,
                            progress=embedded)
     project = Project.load(root)
     shown = videos or [s.id for s in project.sources]
@@ -738,6 +739,9 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--min-examples", type=int, default=project_mod.MIN_TO_TRAIN,
                    dest="min_examples",
                    help="leave out classes with fewer clips than this (0 keeps all)")
+    s.add_argument("--embedder", choices=("clip", "frame-encoder"), default="clip",
+                   help="what turns samples into vectors (frame-encoder: SigLIP2, "
+                        "examples only)")
     s.add_argument("--weights", help="a trained R3D .pth to test on val and test")
     s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
 
@@ -750,6 +754,9 @@ def parser() -> argparse.ArgumentParser:
                    help="regex for the video a clip came from, in its file name")
     s.add_argument("--max-examples", type=int, default=200, dest="max_examples",
                    help="examples per class (a prototype averages at most 200)")
+    s.add_argument("--embedder", choices=("clip", "frame-encoder"), default="clip",
+                   help="what turns samples into vectors (frame-encoder: SigLIP2, "
+                        "examples only)")
     s.add_argument("--weights", help="a trained R3D .pth as a second opinion")
     s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
     s.add_argument("--prototypes", type=int,

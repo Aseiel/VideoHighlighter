@@ -248,7 +248,7 @@ def test_model_test_scores_single_and_paired_clips(tmp_path):
 
 def test_evaluate_command_saves_its_answer(tmp_path, monkeypatch):
     _make(str(tmp_path / "ds"), LAYOUT)
-    monkeypatch.setattr(cli, "make_embedder", FakeEmbedder)
+    monkeypatch.setattr(cli, "make_embedder", lambda *_: FakeEmbedder())
     from modules.teach import embed
     monkeypatch.setattr(embed, "read_frames", _reader(AXES))
 
