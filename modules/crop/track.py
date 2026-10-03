@@ -928,13 +928,17 @@ class MultiActionDetector:
             return (int(w*7//8 - default_size), vertical_offset, int(w*7//8), vertical_offset + default_size)
 
 
-def get_multi_calibration(video_path, detector, num_frames=40, crop_count=3):
-    """Calibration that adapts to crop count and rounds to standard resolutions"""
+def get_multi_calibration(video_path, detector, num_frames=40, crop_count=3, planned_boxes=None):
+    """Calibration that adapts to crop count and rounds to standard resolutions.
+
+    With `planned_boxes` (from plan_slots) the size comes from those instead of
+    a fresh warm-up track over the first frames.
+    """
     cap = cv2.VideoCapture(video_path)
-    all_sizes = []
+    all_sizes = [(b[2] - b[0], b[3] - b[1]) for b in planned_boxes or [] if b is not None]
     tracker = MultiActionTracker(max_actions=3)
 
-    for idx in range(num_frames):
+    for idx in range(0 if all_sizes else num_frames):
         ret, frame = cap.read()
         if not ret:
             break
@@ -1059,3 +1063,113 @@ def has_good_tracking_quality(detector, action_idx: int) -> bool:
     history = detector.motion_histories[action_idx]
     missing = detector.missing_counters[action_idx]
     return len(history) >= 5 and missing < 10
+
+
+# ===== WHOLE-CLIP SLOT PLAN =====
+# The tracker above locks each slot on its first ~15 frames. When those frames
+# are unlucky — one person found, a limb boxed on its own, a hand box while the
+# bodies blink out — the crop is fixed on the wrong thing for the rest of the
+# clip. plan_slots() looks at the whole clip first and only at boxes that can
+# hold a person's crop, then fixes each slot where its person actually is.
+
+UPPER_BODY_KEYPOINTS = (0, 1, 2, 3, 4, 5, 6, 7, 8)  # head, shoulders, elbows
+
+
+def person_like_boxes(rgb, boxes, pose_model, min_upper_body=2, kp_conf=0.3):
+    """Boxes with some upper body (head, shoulders or elbows) in them.
+
+    A box over a leg or a hand is part of a person but cannot be a crop of its
+    own: it holds no action. RTMPose is top-down, so it is asked about each
+    box; a leg-only box comes back with none of those keypoints.
+    Without a pose model every box passes, as before.
+    """
+    if pose_model is None or not boxes:
+        return list(boxes)
+    poses = get_pose_keypoints_for_frame(rgb, pose_model, conf=0.15, person_boxes=boxes)
+    kept = []
+    for pose in poses:
+        kp = np.asarray(pose['keypoints'])
+        seen = sum(1 for i in UPPER_BODY_KEYPOINTS if i < len(kp) and kp[i][2] > kp_conf)
+        if seen >= min_upper_body:
+            kept.append(tuple(int(v) for v in pose['bbox']))
+    return kept
+
+
+def _inside(small, big):
+    """Share of `small` that lies inside `big`."""
+    ix = max(0, min(small[2], big[2]) - max(small[0], big[0]))
+    iy = max(0, min(small[3], big[3]) - max(small[1], big[1]))
+    area = max(1, (small[2] - small[0]) * (small[3] - small[1]))
+    return ix * iy / area
+
+
+def plan_slots(video_path, detector, pose_model, positions, stride=3,
+               min_height_share=0.4, min_presence=0.25, min_gap=0.15):
+    """Fix each crop slot from the whole clip.
+
+    Samples every `stride`-th frame, keeps person-like boxes, drops fragments
+    (shorter than `min_height_share` of the clip's typical person) and boxes
+    mostly inside a bigger one (a second box on the same body, or someone in
+    the same action), then groups what is left by horizontal position, one
+    group per slot, seeded at the slot's third of the frame.
+
+    Returns {position: box or None}. A slot is None when its group is seen in
+    fewer than `min_presence` of the sampled frames, or sits within `min_gap`
+    of the frame width of a neighbour (one person split in two).
+    """
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames = []  # per sampled frame: list of person-like boxes
+    width = height = 0
+    for idx in range(0, max(total, 1), stride):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        height, width = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = detector.predict(rgb, conf=PERSON_DETECTION_CONF_TRACKING, classes=[0], verbose=False)
+        boxes = [tuple(map(int, b.xyxy[0])) for r in result for b in r.boxes]
+        frames.append(person_like_boxes(rgb, boxes, pose_model))
+    cap.release()
+
+    plan = {p: None for p in positions}
+    heights = [b[3] - b[1] for fb in frames for b in fb]
+    if not heights or not width:
+        return plan
+    typical = float(np.median(heights))
+
+    samples = []  # (frame number, box)
+    for n, fb in enumerate(frames):
+        fb = [b for b in fb if (b[3] - b[1]) >= min_height_share * typical]
+        fb = [b for b in fb if not any(
+            o is not b and (o[2] - o[0]) * (o[3] - o[1]) > (b[2] - b[0]) * (b[3] - b[1])
+            and _inside(b, o) >= 0.8 for o in fb)]
+        samples += [(n, b) for b in fb]
+    if not samples:
+        return plan
+
+    seed = {"left": 1 / 6, "middle": 0.5, "center": 0.5, "right": 5 / 6}
+    centres = np.array([(b[0] + b[2]) / 2 / width for _, b in samples])
+    means = np.array([seed.get(p, 0.5) for p in positions])
+    for _ in range(20):
+        label = np.argmin(np.abs(centres[:, None] - means[None, :]), axis=1)
+        for k in range(len(means)):
+            if np.any(label == k):
+                means[k] = centres[label == k].mean()
+
+    groups = {}
+    for k, p in enumerate(positions):
+        members = [samples[i] for i in np.flatnonzero(label == k)]
+        presence = len({n for n, _ in members}) / len(frames)
+        if presence >= min_presence:
+            groups[p] = (means[k], presence, [b for _, b in members])
+    # One person split over two slots: keep the slot that sees them more often.
+    kept = sorted(groups.items(), key=lambda kv: kv[1][0])
+    for (pa, a), (pb, b) in zip(kept, kept[1:]):
+        if pa in groups and pb in groups and abs(a[0] - b[0]) < min_gap:
+            groups.pop(pa if a[1] < b[1] else pb)
+    for p, (_, _, members) in groups.items():
+        arr = np.array(members)
+        plan[p] = tuple(int(v) for v in np.median(arr, axis=0))
+    return plan

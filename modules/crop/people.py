@@ -204,6 +204,7 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
     combined_counts = []
     frame_details = []
     pose_filtered_counts = []  # track how many were filtered
+    largest_box_areas = []  # biggest kept box per frame, as a share of the frame
 
     for idx, frame_idx in enumerate(frame_indices):
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -369,6 +370,8 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
                     combined_count = 3
 
         bbox_counts.append(bbox_count)
+        largest_box_areas.append(max(
+            ((b[2] - b[0]) * (b[3] - b[1]) / frame_area for b, _ in merged_bbox), default=0.0))
         pose_counts.append(pose_count)
         combined_counts.append(combined_count)
         
@@ -479,6 +482,7 @@ def count_people_in_video(video_path, yolo_model, pose_model=None, sample_frames
             'raw_counts': combined_counts,
             'bbox_counts': bbox_counts,
             'pose_counts': pose_counts,
+            'largest_box_areas': largest_box_areas,
             'stats': {
                 'mean': float(mean_count),
                 'median': float(median_count),

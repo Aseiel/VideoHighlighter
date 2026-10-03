@@ -176,3 +176,114 @@ def test_keypoint_clustering_takes_a_list_of_per_person_arrays():
 
     assert len(far) == 2
     assert len(near) == 1
+
+
+# --- strategy and slot planning, on fake frames and a fake detector ----------
+
+class _Box:
+    def __init__(self, xyxy, conf=0.9):
+        import numpy as np
+        self.xyxy = [np.array(xyxy, dtype=float)]
+        self.conf = conf
+
+
+class _Result:
+    def __init__(self, boxes):
+        self.boxes = [_Box(b) for b in boxes]
+
+
+class _Detector:
+    """predict() answers with the same boxes on every frame, or per frame."""
+    def __init__(self, boxes_for):
+        self.boxes_for, self.calls = boxes_for, 0
+
+    def predict(self, frame, **_):
+        self.calls += 1
+        return [_Result(self.boxes_for(self.calls))]
+
+
+def _fake_cv2(frames=30, width=600, height=300):
+    import types
+
+    import numpy as np
+
+    class Cap:
+        def __init__(self, _path):
+            self.pos = 0
+
+        def get(self, prop):
+            return {7: frames, 3: width, 4: height}.get(prop, 0)
+
+        def set(self, _prop, value):
+            self.pos = int(value)
+
+        def read(self):
+            if self.pos >= frames:
+                return False, None
+            self.pos += 1
+            return True, np.zeros((height, width, 3), dtype=np.uint8)
+
+        def release(self):
+            pass
+
+    return types.SimpleNamespace(
+        VideoCapture=Cap, cvtColor=lambda f, _c: f, COLOR_BGR2RGB=4, COLOR_RGB2BGR=4,
+        CAP_PROP_FRAME_COUNT=7, CAP_PROP_FRAME_WIDTH=3, CAP_PROP_FRAME_HEIGHT=4,
+        CAP_PROP_POS_FRAMES=1)
+
+
+def test_zone_analysis_sees_the_detected_people(monkeypatch):
+    """The box-collecting loop in analyze_region_activity was once replaced by a
+    placeholder comment, so every zone saw 0 people for months and every 2-3
+    person clip fell back to left + centre. Pin that people are seen, and that
+    each counts in the one third holding their centre — counting every third a
+    box overlaps put most people in the centre too, so the centre always won."""
+    from modules.crop import zones
+
+    monkeypatch.setattr(zones, "cv2", _fake_cv2())
+    left_person = (20, 20, 160, 290)      # centre x=90, inside the left third
+    right_person = (440, 20, 580, 290)    # centre x=510, inside the right third
+    det = _Detector(lambda _n: [left_person, right_person])
+
+    _, people, _, _ = zones.analyze_region_activity("clip.mp4", det, None, sample_frames=5)
+
+    assert people["left"] == [1] * 5
+    assert people["center"] == [0] * 5
+    assert people["right"] == [1] * 5
+
+
+def test_only_boxes_with_upper_body_are_people(monkeypatch):
+    """A leg boxed on its own (its owner out of frame) holds no action and must
+    not get a crop. Top-down pose returns no head/shoulder/elbow joints for it."""
+    import numpy as np
+
+    from modules.crop import track
+
+    def pose_for(box, upper):
+        kp = np.zeros((17, 3), dtype=np.float32)
+        kp[[5, 6, 7] if upper else [13, 14, 15], 2] = 0.9
+        return {"bbox": box, "keypoints": kp}
+
+    body, leg = (100, 0, 300, 300), (0, 100, 60, 300)
+    monkeypatch.setattr(track, "get_pose_keypoints_for_frame",
+                        lambda *a, **k: [pose_for(body, True), pose_for(leg, False)])
+
+    assert track.person_like_boxes(None, [body, leg], pose_model=object()) == [body]
+    assert track.person_like_boxes(None, [body, leg], pose_model=None) == [body, leg]
+
+
+def test_slot_plan_drops_fragments_and_empty_slots(monkeypatch):
+    """Slots are fixed from the whole clip: a small box (a hand) is not a
+    person's crop, and a slot nobody stands in is dropped rather than locked
+    on whatever the first frames showed."""
+    from modules.crop import track
+
+    monkeypatch.setattr(track, "cv2", _fake_cv2(frames=30))
+    big_left, big_right = (20, 10, 180, 290), (420, 10, 580, 290)
+    hand_middle = (280, 120, 320, 160)
+    det = _Detector(lambda _n: [big_left, big_right, hand_middle])
+
+    plan = track.plan_slots("clip.mp4", det, None, ["left", "middle", "right"])
+
+    assert plan["middle"] is None
+    assert plan["left"] == big_left and plan["right"] == big_right

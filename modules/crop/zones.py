@@ -14,8 +14,17 @@ import numpy as np
 
 from modules.crop.core import calculate_iou
 from modules.crop.people import merge_overlapping_boxes
-from modules.crop.pose import analyze_pose_activity, get_pose_keypoints_for_frame
-from modules.crop.config import PERSON_DETECTION_CONF_ZONES
+from modules.crop.track import UPPER_BODY_KEYPOINTS
+from modules.crop.pose import (
+    analyze_pose_activity,
+    bbox_has_pose_support,
+    get_pose_keypoints_for_frame,
+)
+from modules.crop.config import (
+    MIN_PERSON_AREA_RATIO,
+    PERSON_DETECTION_CONF_ZONES,
+    POSE_VALIDATION_CONF_THRESHOLD,
+)
 
 
 def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20):
@@ -59,10 +68,48 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
             person_boxes=[tuple(map(int, b.xyxy[0])) for r in result for b in r.boxes],
         )
         raw_boxes = []
-        
-        # [existing detection code...]
-        
-        boxes = merge_overlapping_boxes(raw_boxes, iou_threshold=0.45)
+
+        for r in result:
+            for b in r.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                box_w, box_h = x2 - x1, y2 - y1
+                area = box_w * box_h
+                frame_area = frame_width * frame_height
+                aspect = box_w / max(box_h, 1)
+                conf = float(b.conf)
+
+                # TWO PATHS: Corner detection vs Regular detection
+                if is_in_corner(x1, y1, x2, y2, frame_width, frame_height):
+                    if area / frame_area >= MIN_PERSON_AREA_RATIO * 0.3:
+                        if 0.05 <= aspect <= 12:  # Wider range for distorted partials
+                            if conf > 0.20:
+                                if conf < POSE_VALIDATION_CONF_THRESHOLD:
+                                    if not bbox_has_pose_support((x1, y1, x2, y2), frame_poses):
+                                        continue  # No pose support for a low-conf detection
+                                raw_boxes.append((x1, y1, x2, y2, conf, True))
+                else:
+                    # REGULAR PATH: Standard thresholds for multi-person scenes
+                    if area / frame_area < MIN_PERSON_AREA_RATIO:
+                        continue
+                    if aspect < 0.08 or aspect > 10:
+                        continue
+                    if conf < POSE_VALIDATION_CONF_THRESHOLD:
+                        if not bbox_has_pose_support((x1, y1, x2, y2), frame_poses):
+                            continue  # No pose support for a low-conf detection
+                    raw_boxes.append((x1, y1, x2, y2, conf, False))
+
+        # Merge overlapping boxes (removes face+hand false splits)
+        merged = merge_overlapping_boxes(raw_boxes, iou_threshold=0.45)
+        boxes = [box for box, _ in merged]
+
+        # Only boxes with some upper body count as people here: a leg
+        # boxed on its own belongs to someone already counted, or to
+        # someone out of frame, and cannot carry a crop of its own.
+        if pose_model is not None:
+            heads = [p['bbox'] for p in frame_poses
+                     if sum(1 for i in UPPER_BODY_KEYPOINTS
+                            if i < len(p['keypoints']) and p['keypoints'][i][2] > 0.3) >= 2]
+            boxes = [b for b in boxes if any(calculate_iou(b, hb) > 0.5 for hb in heads)]
 
         # Get pose data for activity scoring
         pose_data = {}
@@ -76,17 +123,14 @@ def analyze_region_activity(video_path, yolo_model, pose_model, sample_frames=20
             zone_action_points = []  # NEW: Store actual action coordinates
 
             for box in boxes:
+                # Each person counts in ONE zone: the third holding the centre
+                # of their box. Counting every zone a box overlaps put most
+                # people in the centre zone too, so it always won and the
+                # person at an edge lost their crop.
                 box_center_x = (box[0] + box[2]) / 2
-                box_width = box[2] - box[0]
-                box_left = box[0]
-                box_right = box[2]
+                home = ('left', 'center', 'right')[min(int(box_center_x / zone_width), 2)]
 
-                # Calculate overlap with zone
-                overlap_start = max(zone_start, box_left)
-                overlap_end = min(zone_end, box_right)
-                overlap = max(0, overlap_end - overlap_start)
-                
-                if overlap > box_width * 0.3:
+                if home == zone_name:
                     zone_boxes.append(box)
 
                     # Calculate activity score AND collect active keypoints

@@ -27,6 +27,14 @@ A NOTE ON THE CONFIDENCE CONSTANTS BELOW
 INPUT_FOLDER = "input_videos"
 OUTPUT_FOLDER = "output_videos"
 MIN_PEOPLE_REQUIRED = 2
+# A close-up: the biggest person box covers this share of the frame (median
+# over the sampled frames). Then the other boxes are mostly limbs of the same
+# bodies, so splitting by person cuts one action apart; keep the clip whole.
+# None turns it off.
+CLOSEUP_AREA_RATIO = 0.90
+# 4+ people: a third of the frame gets a crop when it averages at least this
+# many people (each person counted once, in the third holding their centre).
+ZONE_PEOPLE_MIN = 0.5
 MAX_PEOPLE = 3
 PEOPLE_SAMPLE_FRAMES = 40
 

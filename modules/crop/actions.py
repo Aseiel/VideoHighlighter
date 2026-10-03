@@ -35,6 +35,7 @@ from modules.crop.track import (
     MultiActionDetector,
     calculate_motion_expansion,
     get_multi_calibration,
+    plan_slots,
 )
 from modules.crop.zones import (
     analyze_region_activity,
@@ -55,6 +56,8 @@ from modules.crop.config import (
     INPUT_FOLDER,
     MAX_PEOPLE,
     MIN_PEOPLE_REQUIRED,
+    CLOSEUP_AREA_RATIO,
+    ZONE_PEOPLE_MIN,
     OUTPUT_FOLDER,
     PADDING_COLOR,
     PEOPLE_SAMPLE_FRAMES,
@@ -138,6 +141,20 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
         os.makedirs(debug_video_folder, exist_ok=True)
         print(f"📊 Debug visualization enabled: {debug_video_folder}")
 
+    # Fix the slots from the whole clip before writing anything. A slot with no
+    # person behind it is dropped; with fewer than two left there is nothing
+    # to split, and the clip is kept whole.
+    plan = plan_slots(input_path, yolo_model, pose_model, positions)
+    print(f"🧭 Slot plan: " + ", ".join(
+        f"{p}={'-' if b is None else f'x{(b[0] + b[2]) // 2}'}" for p, b in plan.items()))
+    positions = [p for p in positions if plan[p] is not None]
+    crop_count = len(positions)
+    if crop_count < MIN_PEOPLE_REQUIRED:
+        print(f"   📋 Only {crop_count} slot(s) have a person - keeping the clip whole")
+        copied = copy_video_to_output(input_path, output_folder)
+        return [copied] if copied else []
+    position_text = f"{crop_count}-crop ({' & '.join(positions)})"
+
     output_files = []
     for position in positions:
         output_name = f"{base_name}_cropped_{position}.mp4"
@@ -145,7 +162,8 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
         output_files.append(output_path)
 
     print(f"🔍 Getting calibration for {crop_count} actions...")
-    TARGET_SIZE = get_multi_calibration(input_path, yolo_model, CALIBRATION_FRAMES, crop_count)
+    TARGET_SIZE = get_multi_calibration(input_path, yolo_model, CALIBRATION_FRAMES, crop_count,
+                                        planned_boxes=[plan[p] for p in positions])
     print(f"✅ Target size: {TARGET_SIZE[0]}x{TARGET_SIZE[1]}")
 
     cap = cv2.VideoCapture(input_path)
@@ -154,6 +172,12 @@ def process_video_with_dynamic_crops(input_path, output_folder, yolo_model, crop
 
     # Use ROI-based detector
     detector = MultiActionDetector(max_actions=MAX_PEOPLE, use_roi_detection=USE_ROI_DETECTION)
+    # Locked from the first frame on the planned boxes, instead of on whatever
+    # the first ~15 frames happened to show.
+    slot_index = {"left": 0, "middle": 1, "center": 1, "right": 2}
+    for p in positions:
+        detector.tracker.locked_actions[slot_index[p]] = plan[p]
+        detector.tracker.actions_confirmed[slot_index[p]] = True
     smoother = MultiSmoother(num_actions=MAX_PEOPLE, window_size=SMOOTHING_WINDOW)
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -581,17 +605,31 @@ def _run_batch(ask_delete=False):
         bbox_counts = people_info.get('bbox_counts', [])
         pose_counts = people_info.get('pose_counts', [])
 
+        low_yolo_frames = 0.0
+        pose_max = 0
+        pose_3plus_share = 0.0
         if bbox_counts and pose_counts:
-            low_yolo_frames = sum(1 for c in bbox_counts if c <= 1) / len(bbox_counts) if bbox_counts else 0
-            pose_max = max(pose_counts) if pose_counts else 0
-            
-            print(f"   📊 Corner check: Low YOLO frames={low_yolo_frames:.0%}, Pose max={pose_max}")
-            
-        if low_yolo_frames >= 0.7 and pose_max >= 3 and people_count <= 2:
+            low_yolo_frames = sum(1 for c in bbox_counts if c <= 1) / len(bbox_counts)
+            pose_max = max(pose_counts)
+            # Pose is top-down now: it estimates on the detector's boxes and
+            # cannot find a body the boxes missed, so a single frame with 3+
+            # skeletons is usually a close-up whose limbs got boxes of their
+            # own. Ask for the same share count_people_in_video() wants for 3.
+            pose_3plus_share = sum(1 for c in pose_counts if c >= 3) / len(pose_counts)
+
+            print(f"   📊 Corner check: Low YOLO frames={low_yolo_frames:.0%}, Pose max={pose_max}, "
+                  f"Pose 3+ in {pose_3plus_share:.0%} of frames")
+
+        largest = people_info.get('largest_box_areas', [])
+        closeup = bool(CLOSEUP_AREA_RATIO and largest
+                       and np.median(largest) >= CLOSEUP_AREA_RATIO)
+        if closeup:
+            print(f"   🔎 Close-up: biggest person covers {np.median(largest):.0%} of the frame")
+
+        if not closeup and low_yolo_frames >= 0.7 and pose_max >= 3 and people_count <= 2:
             print(f"   🚨 CORNER CASE DETECTED: YOLO sees 0-1, Pose sees up to {pose_max}")
-            
-            # SIMPLIFIED ZONE CHECK - just check if pose exists at all
-            if pose_max >= 3:  # If pose detected 3+ skeletons, that's enough evidence
+
+            if pose_3plus_share >= 0.20:
                 print(f"   ✅ Pose detected {pose_max} skeletons - Overriding without zone check!")
                 
                 # Use pose count to determine crop count
@@ -616,7 +654,7 @@ def _run_batch(ask_delete=False):
                 all_handled_videos.append(video_path)
                 continue
             else:
-                print(f"   ℹ️ Pose only detected {pose_max} skeletons, not enough for override")
+                print(f"   ℹ️ 3+ skeletons in only {pose_3plus_share:.0%} of frames, not enough for override")
                     # ===== END CORNER CASE OVERRIDE =====
 
         # STEP 2: Determine crop strategy
@@ -624,7 +662,10 @@ def _run_batch(ask_delete=False):
         positions = []
         strategy = ""
 
-        if people_count >= MIN_PEOPLE_REQUIRED:
+        if closeup:
+            strategy = "close-up-whole"
+            print(f"   📋 Close-up - keeping the clip whole")
+        elif people_count >= MIN_PEOPLE_REQUIRED:
             if people_count >= 4:
                 print(f"   👥👥 4+ people detected - analyzing distribution...")
 
@@ -642,14 +683,14 @@ def _run_batch(ask_delete=False):
 
                 # Count zones with significant people presence
                 zones_with_people = []
-                if left_avg >= 1.0:
+                if left_avg >= ZONE_PEOPLE_MIN:
                     zones_with_people.append('left')
-                if center_avg >= 1.0:
+                if center_avg >= ZONE_PEOPLE_MIN:
                     zones_with_people.append('center')
-                if right_avg >= 1.0:
+                if right_avg >= ZONE_PEOPLE_MIN:
                     zones_with_people.append('right')
 
-                print(f"   📍 Zones with people (avg >= 1.0): {zones_with_people}")
+                print(f"   📍 Zones with people (avg >= {ZONE_PEOPLE_MIN}): {zones_with_people}")
 
                 # Decision logic for 4+ people
                 if len(zones_with_people) >= 3:
