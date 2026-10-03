@@ -287,3 +287,21 @@ def test_slot_plan_drops_fragments_and_empty_slots(monkeypatch):
 
     assert plan["middle"] is None
     assert plan["left"] == big_left and plan["right"] == big_right
+
+
+def test_a_crop_takes_a_person_whole_and_one_action_stays_one_crop(monkeypatch):
+    """A crop edge never runs through someone: a slot covering a quarter of a
+    neighbour's width takes them whole. Two slots that then hold the same
+    people are one action, and become one slot."""
+    from modules.crop import track
+
+    monkeypatch.setattr(track, "cv2", _fake_cv2(frames=30))
+    left, right = (0, 10, 200, 290), (420, 10, 600, 290)
+    middle = (150, 10, 330, 290)          # overlaps the left person by 50 px of 200
+    det = _Detector(lambda _n: [left, middle, right])
+
+    plan = track.plan_slots("clip.mp4", det, None, ["left", "middle"])
+
+    assert plan["middle"] is None         # merged: the same people as "left"
+    assert plan["left"] == (0, 10, 330, 290)
+    assert plan.get("right") is None      # never asked for, never pulled in

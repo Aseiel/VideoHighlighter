@@ -1104,14 +1104,22 @@ def _inside(small, big):
 
 
 def plan_slots(video_path, detector, pose_model, positions, stride=3,
-               min_height_share=0.4, min_presence=0.25, min_gap=0.15):
+               min_height_share=0.4, min_presence=0.25, min_gap=0.15,
+               whole_person_share=0.25, same_action_overlap=0.5):
     """Fix each crop slot from the whole clip.
 
     Samples every `stride`-th frame, keeps person-like boxes, drops fragments
     (shorter than `min_height_share` of the clip's typical person) and boxes
     mostly inside a bigger one (a second box on the same body, or someone in
     the same action), then groups what is left by horizontal position, one
-    group per slot, seeded at the slot's third of the frame.
+    group per third of the frame, seeded at its centre. Every third gets a
+    group even when fewer slots were asked for, so a person in a third that
+    gets no crop is not pulled into a neighbour's crop.
+
+    A crop edge never cuts through a person: a slot that covers
+    `whole_person_share` or more of another person's width takes that person
+    whole. Two slots that then overlap by `same_action_overlap` of the
+    narrower one's width hold the same people, one action: they become one.
 
     Returns {position: box or None}. A slot is None when its group is seen in
     fewer than `min_presence` of the sampled frames, or sits within `min_gap`
@@ -1149,9 +1157,10 @@ def plan_slots(video_path, detector, pose_model, positions, stride=3,
     if not samples:
         return plan
 
-    seed = {"left": 1 / 6, "middle": 0.5, "center": 0.5, "right": 5 / 6}
+    thirds = ["left", "middle", "right"]
+    alias = {"center": "middle"}
     centres = np.array([(b[0] + b[2]) / 2 / width for _, b in samples])
-    means = np.array([seed.get(p, 0.5) for p in positions])
+    means = np.array([1 / 6, 0.5, 5 / 6])
     for _ in range(20):
         label = np.argmin(np.abs(centres[:, None] - means[None, :]), axis=1)
         for k in range(len(means)):
@@ -1159,7 +1168,7 @@ def plan_slots(video_path, detector, pose_model, positions, stride=3,
                 means[k] = centres[label == k].mean()
 
     groups = {}
-    for k, p in enumerate(positions):
+    for k, p in enumerate(thirds):
         members = [samples[i] for i in np.flatnonzero(label == k)]
         presence = len({n for n, _ in members}) / len(frames)
         if presence >= min_presence:
@@ -1169,7 +1178,31 @@ def plan_slots(video_path, detector, pose_model, positions, stride=3,
     for (pa, a), (pb, b) in zip(kept, kept[1:]):
         if pa in groups and pb in groups and abs(a[0] - b[0]) < min_gap:
             groups.pop(pa if a[1] < b[1] else pb)
-    for p, (_, _, members) in groups.items():
-        arr = np.array(members)
-        plan[p] = tuple(int(v) for v in np.median(arr, axis=0))
+    people = {p: tuple(int(v) for v in np.median(np.array(m), axis=0))
+              for p, (_, _, m) in groups.items()}
+    for asked in positions:
+        own = alias.get(asked, asked)
+        if own not in people:
+            continue
+        x1, y1, x2, y2 = people[own]
+        for other, (ox1, oy1, ox2, oy2) in people.items():
+            if other == own or ox2 <= ox1:
+                continue
+            covered = (min(x2, ox2) - max(x1, ox1)) / (ox2 - ox1)
+            if covered >= whole_person_share:
+                x1, y1, x2, y2 = min(x1, ox1), min(y1, oy1), max(x2, ox2), max(y2, oy2)
+        plan[asked] = (x1, y1, x2, y2)
+
+    merged = True
+    while merged:
+        merged = False
+        live = [p for p in positions if plan[p] is not None]
+        for a, b in zip(live, live[1:]):
+            ba, bb = plan[a], plan[b]
+            narrower = min(ba[2] - ba[0], bb[2] - bb[0])
+            if narrower > 0 and min(ba[2], bb[2]) - max(ba[0], bb[0]) >= same_action_overlap * narrower:
+                plan[a] = (min(ba[0], bb[0]), min(ba[1], bb[1]), max(ba[2], bb[2]), max(ba[3], bb[3]))
+                plan[b] = None
+                merged = True
+                break
     return plan
