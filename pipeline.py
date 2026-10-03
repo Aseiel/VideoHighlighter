@@ -1433,104 +1433,126 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 _dev = detect_best_device(log_fn=log)
                 openvino_device = getattr(_dev, "openvino_device", "AUTO") or "AUTO"
 
-                _explicit = ACTION_BACKEND_SETTINGS.get(action_backend)
-                if _explicit is not None:
-                    (enable_r3d, r3d_half, r3d_device,
-                     r3d_onnx_dml) = _explicit
-                    if r3d_onnx_dml:
-                        print("🎯 Action backend → R3D on DirectML through "
-                            "ONNX Runtime; it stays on the CPU if the export or "
-                            "the provider will not run")
-                else:  # "auto"
-                    # R3D needs a GPU to be worth it. On Intel it stays off —
-                    # R3D there could only run on the CPU, and OpenVINO on the
-                    # Intel GPU beats that (load_models AUTO → GPU).
-                    #
-                    # AMD is the case that changed. OpenVINO's GPU plugin is
-                    # Intel-only, so on an AMD box the "let OpenVINO have it"
-                    # branch *is* the CPU — there is no faster path being
-                    # protected, and DirectML competes with the processor rather
-                    # than with a GPU. R3D is a 3D CNN and DirectML's coverage
-                    # there is the open question, so this is not taken on faith:
-                    # R3DModelWrapper runs a real forward pass at load and demotes
-                    # itself to the CPU if the backend cannot execute it, leaving
-                    # the machine exactly where it was before.
-                    if _dev.pytorch_device == "cuda":
-                        enable_r3d = True
-                        r3d_half = True
-                        r3d_device = _dev.pytorch_device
-                        print(f"🎯 Auto backend → CUDA detected, using R3D ({_dev.backend_name})")
-                    elif _dev.dml_device:
-                        enable_r3d = True
-                        r3d_half = False  # FP16 is uneven on DirectML
-                        r3d_device = _dev.dml_device
-                        # ONNX Runtime gets a turn before the processor does.
-                        # torch-directml refuses a 5D tensor outright --
-                        # nn.Conv3d raises "input must be 4-dimensional", which
-                        # is the whole of R3D -- so the warm-up demotes the
-                        # model. Without this the demotion goes straight to the
-                        # CPU and takes a working card with it, because ONNX
-                        # Runtime's DirectML provider implements the same
-                        # convolution for up to four spatial dimensions and runs
-                        # this model: 20 Conv nodes, all 3D, measured here at
-                        # 27.9 ms a window. Two stacks, one API, different
-                        # operator coverage. _try_onnx() already waits for
-                        # exactly this case and was never given permission.
-                        r3d_onnx_dml = True
-                        print(f"🎯 Auto backend → DirectML detected, using R3D on "
-                            f"{_dev.dml_device} ({_dev.backend_name}); if that "
-                            f"backend cannot run it, ONNX Runtime is tried on "
-                            f"the same card before the CPU")
-                    elif getattr(_dev, "onnx_dml_torch", False):
-                        # Same card, the other runtime. This is the packaged
-                        # build on a DX12 box: torch cannot address the GPU
-                        # because torch-directml cannot be bundled, but ONNX
-                        # Runtime can, so R3D exports itself once and runs
-                        # there. Before this the branch fell through to
-                        # OpenVINO — which on AMD is the processor, since the
-                        # GPU plugin is Intel-only — so R3D was skipped on
-                        # exactly the machines that had a card going unused.
-                        enable_r3d = True
-                        r3d_half = False      # fp16 is uneven on DirectML
-                        r3d_device = "cpu"    # torch's device; the model leaves it
-                        r3d_onnx_dml = True
-                        print(f"🎯 Auto backend → ONNX Runtime on the GPU, using "
-                            f"R3D ({_dev.backend_name}); it stays on the CPU if "
-                            f"the export or the provider will not run")
-                    else:
-                        enable_r3d = False
-                        r3d_half = False
-                        print(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
+                # SigLIP2 with a taught action head replaces the Intel and R3D
+                # paths. "auto" takes it whenever the frame encoder and a head
+                # trained on it are installed; the old backends stay selectable
+                # until they are removed.
+                from modules.vision import action_siglip
+                use_siglip = action_backend == "siglip2" or (
+                    action_backend == "auto" and action_siglip.available())
+                if use_siglip:
+                    all_action_detections, action_bboxes_cache = (
+                        action_siglip.run_action_detection_siglip(
+                            processed_video_path,
+                            device=openvino_device,
+                            interesting_actions=interesting_actions,
+                            progress_callback=progress.update_progress,
+                            cancel_flag=cancel_flag,
+                            log=log,
+                        ))
+                    if draw_action_labels:
+                        log("ℹ️ The SigLIP2 action backend does not draw labels on the video yet")
+                else:
+                    log("⚠️ Intel / R3D action recognition is deprecated and will be removed; "
+                        "train an action head (SigLIP2) to replace it")
+                    _explicit = ACTION_BACKEND_SETTINGS.get(action_backend)
+                    if _explicit is not None:
+                        (enable_r3d, r3d_half, r3d_device,
+                         r3d_onnx_dml) = _explicit
+                        if r3d_onnx_dml:
+                            print("🎯 Action backend → R3D on DirectML through "
+                                "ONNX Runtime; it stays on the CPU if the export or "
+                                "the provider will not run")
+                    else:  # "auto"
+                        # R3D needs a GPU to be worth it. On Intel it stays off —
+                        # R3D there could only run on the CPU, and OpenVINO on the
+                        # Intel GPU beats that (load_models AUTO → GPU).
+                        #
+                        # AMD is the case that changed. OpenVINO's GPU plugin is
+                        # Intel-only, so on an AMD box the "let OpenVINO have it"
+                        # branch *is* the CPU — there is no faster path being
+                        # protected, and DirectML competes with the processor rather
+                        # than with a GPU. R3D is a 3D CNN and DirectML's coverage
+                        # there is the open question, so this is not taken on faith:
+                        # R3DModelWrapper runs a real forward pass at load and demotes
+                        # itself to the CPU if the backend cannot execute it, leaving
+                        # the machine exactly where it was before.
+                        if _dev.pytorch_device == "cuda":
+                            enable_r3d = True
+                            r3d_half = True
+                            r3d_device = _dev.pytorch_device
+                            print(f"🎯 Auto backend → CUDA detected, using R3D ({_dev.backend_name})")
+                        elif _dev.dml_device:
+                            enable_r3d = True
+                            r3d_half = False  # FP16 is uneven on DirectML
+                            r3d_device = _dev.dml_device
+                            # ONNX Runtime gets a turn before the processor does.
+                            # torch-directml refuses a 5D tensor outright --
+                            # nn.Conv3d raises "input must be 4-dimensional", which
+                            # is the whole of R3D -- so the warm-up demotes the
+                            # model. Without this the demotion goes straight to the
+                            # CPU and takes a working card with it, because ONNX
+                            # Runtime's DirectML provider implements the same
+                            # convolution for up to four spatial dimensions and runs
+                            # this model: 20 Conv nodes, all 3D, measured here at
+                            # 27.9 ms a window. Two stacks, one API, different
+                            # operator coverage. _try_onnx() already waits for
+                            # exactly this case and was never given permission.
+                            r3d_onnx_dml = True
+                            print(f"🎯 Auto backend → DirectML detected, using R3D on "
+                                f"{_dev.dml_device} ({_dev.backend_name}); if that "
+                                f"backend cannot run it, ONNX Runtime is tried on "
+                                f"the same card before the CPU")
+                        elif getattr(_dev, "onnx_dml_torch", False):
+                            # Same card, the other runtime. This is the packaged
+                            # build on a DX12 box: torch cannot address the GPU
+                            # because torch-directml cannot be bundled, but ONNX
+                            # Runtime can, so R3D exports itself once and runs
+                            # there. Before this the branch fell through to
+                            # OpenVINO — which on AMD is the processor, since the
+                            # GPU plugin is Intel-only — so R3D was skipped on
+                            # exactly the machines that had a card going unused.
+                            enable_r3d = True
+                            r3d_half = False      # fp16 is uneven on DirectML
+                            r3d_device = "cpu"    # torch's device; the model leaves it
+                            r3d_onnx_dml = True
+                            print(f"🎯 Auto backend → ONNX Runtime on the GPU, using "
+                                f"R3D ({_dev.backend_name}); it stays on the CPU if "
+                                f"the export or the provider will not run")
+                        else:
+                            enable_r3d = False
+                            r3d_half = False
+                            print(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
 
-                log("🎯 Action recognition: " + action_backend_summary(
-                    enable_r3d, r3d_model, r3d_device, r3d_onnx_dml,
-                    openvino_device, auto=_explicit is None))
-                print(f"   action backend setting: {action_backend} | R3D model: {r3d_model} | "
-                      f"enable_r3d: {enable_r3d} | r3d_device: {r3d_device or 'auto'} | "
-                      f"onnx_dml: {r3d_onnx_dml} | OpenVINO device: {openvino_device}")
+                    log("🎯 Action recognition: " + action_backend_summary(
+                        enable_r3d, r3d_model, r3d_device, r3d_onnx_dml,
+                        openvino_device, auto=_explicit is None))
+                    print(f"   action backend setting: {action_backend} | R3D model: {r3d_model} | "
+                          f"enable_r3d: {enable_r3d} | r3d_device: {r3d_device or 'auto'} | "
+                          f"onnx_dml: {r3d_onnx_dml} | OpenVINO device: {openvino_device}")
 
-                action_models_selection = gui_config.get("action_models", "mixed") or "mixed"
-                all_action_detections, action_bboxes_cache = run_action_detection(
-                    video_path=processed_video_path,
-                    sample_rate=sample_rate,
-                    debug=False,
-                    interesting_actions=interesting_actions,
-                    progress_callback=progress.update_progress,
-                    cancel_flag=cancel_flag,
-                    draw_bboxes=True,
-                    annotated_output=action_annotated_path,
-                    use_person_detection=True,
-                    max_people=2,
-                    include_model_type=False,
-                    enable_r3d=enable_r3d,
-                    r3d_model_name=r3d_model,
-                    r3d_half=r3d_half,
-                    r3d_device=r3d_device,
-                    r3d_onnx_dml=r3d_onnx_dml,
-                    action_models=action_models_selection,
-                    preview_fn=preview_fn,
-                    device=openvino_device,
-                )
+                    action_models_selection = gui_config.get("action_models", "mixed") or "mixed"
+                    all_action_detections, action_bboxes_cache = run_action_detection(
+                        video_path=processed_video_path,
+                        sample_rate=sample_rate,
+                        debug=False,
+                        interesting_actions=interesting_actions,
+                        progress_callback=progress.update_progress,
+                        cancel_flag=cancel_flag,
+                        draw_bboxes=True,
+                        annotated_output=action_annotated_path,
+                        use_person_detection=True,
+                        max_people=2,
+                        include_model_type=False,
+                        enable_r3d=enable_r3d,
+                        r3d_model_name=r3d_model,
+                        r3d_half=r3d_half,
+                        r3d_device=r3d_device,
+                        r3d_onnx_dml=r3d_onnx_dml,
+                        action_models=action_models_selection,
+                        preview_fn=preview_fn,
+                        device=openvino_device,
+                    )
 
                 check_cancellation(cancel_flag, log, "action recognition processing")
 
