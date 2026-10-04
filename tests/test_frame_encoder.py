@@ -285,3 +285,29 @@ def test_real_model_on_every_route_here():
         v = enc.encode_pixels(np.repeat(fe.probe_pixels(), 3, axis=0))
         assert v.shape == (3, fe.DIMS)
         assert min(fe._cosine(x, meta["probe"]) for x in v) > 0.999
+
+
+@pytest.mark.parametrize("device,expected", [
+    ("CPU", {"INFERENCE_PRECISION_HINT": "f32"}),
+    ("GPU", {}),
+    ("GPU.1", {}),
+])
+def test_openvino_processor_route_computes_in_fp32(monkeypatch, device, expected):
+    """OpenVINO's CPU plugin runs fp16 on ARM unless told otherwise, which is
+    what kept the Mac build's encoder below the fidelity bar."""
+    import types
+
+    compiled = []
+
+    class Core:
+        def set_property(self, props):
+            pass
+
+        def compile_model(self, path, dev, config=None):
+            compiled.append((dev, config))
+            return lambda pixels: [pixels]
+
+    monkeypatch.setitem(sys.modules, "openvino", types.SimpleNamespace(Core=Core))
+    monkeypatch.setattr(fe, "_compile_cache_dir", lambda: None)
+    fe._OpenVINORunner("vision.onnx", device)
+    assert compiled == [(device, expected)]

@@ -282,6 +282,18 @@ def _compile_cache_dir() -> Optional[str]:
         return None
 
 
+def openvino_config(device: str) -> dict:
+    """Compile options for an OpenVINO device.
+
+    A processor computes in fp32. OpenVINO's CPU plugin otherwise picks its
+    own precision per machine: fp16 on ARM (Apple silicon, where the vectors
+    measured 0.9977 against PyTorch's while ONNX Runtime gave 1.000000) and
+    bf16 on Xeons with AMX. A head trained on one machine's vectors has to read
+    the same vectors on every other, so the processor route may not drift.
+    """
+    return {"INFERENCE_PRECISION_HINT": "f32"} if device == "CPU" else {}
+
+
 class _OpenVINORunner:
     def __init__(self, model_path: str, device: str):
         import openvino as ov
@@ -289,7 +301,7 @@ class _OpenVINORunner:
         cache = _compile_cache_dir() if device.startswith("GPU") else None
         if cache:
             core.set_property({"CACHE_DIR": cache})
-        self._net = core.compile_model(model_path, device)
+        self._net = core.compile_model(model_path, device, openvino_config(device))
 
     def run(self, pixels: np.ndarray) -> np.ndarray:
         return np.array(self._net(pixels)[0], dtype=np.float32, copy=True)

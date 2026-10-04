@@ -161,7 +161,8 @@ def main() -> int:
         import openvino as ov
         core = ov.Core()
         for dev in [d for d in core.available_devices if d == "CPU" or d.startswith("GPU")]:
-            out = core.compile_model(onnx_path, dev)(check)[0]
+            # As the app compiles it: a check of other settings checks nothing.
+            out = core.compile_model(onnx_path, dev, fe.openvino_config(dev))(check)[0]
             cos = worst_cosine(out, reference) if np.isfinite(out).all() else float("nan")
             print(f"  OpenVINO {dev:9} worst cosine {cos:.6f}")
             failed |= not cos >= MIN_COSINE
