@@ -75,16 +75,21 @@ class ProviderProbe:
     without DirectML" are the same outcome and completely different problems.
     """
 
-    __slots__ = ("available", "reason", "version", "providers", "provider")
+    __slots__ = ("available", "reason", "version", "providers", "provider",
+                 "adapter_index", "adapter_name")
 
     def __init__(self, available=False, reason=None, version=None, providers=(),
-                 provider=None):
+                 provider=None, adapter_index=None, adapter_name=None):
         self.available = available
         self.reason = reason
         self.version = version
         self.providers = tuple(providers)
         # The GPU provider this probe was about: DirectML, or Core ML on a Mac.
         self.provider = provider
+        # The graphics card DirectML will bind, when the adapters could be
+        # listed. None on a Mac, and wherever DXGI could not be asked.
+        self.adapter_index = adapter_index
+        self.adapter_name = adapter_name
 
     def __repr__(self):  # pragma: no cover - diagnostics only
         state = "available" if self.available else f"unavailable ({self.reason})"
@@ -114,11 +119,105 @@ def is_gpu_provider(name) -> bool:
 
 
 def device_id() -> int:
-    """Which DX12 adapter to bind. 0 unless the user picked another."""
+    """Which DX12 adapter to bind: the user's pick, else the first graphics
+    card the probe found, else 0."""
+    raw = str(os.environ.get(DEVICE_ENV, "")).strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    found = probe().adapter_index
+    return found if found is not None else 0
+
+
+# What ONNX Runtime itself refuses to bind DirectML to (its IsSoftwareAdapter):
+# an adapter flagged as software, or Microsoft's Basic Render Driver.
+_DXGI_ADAPTER_FLAG_SOFTWARE = 2
+_MICROSOFT_VENDOR_ID = 0x1414
+_BASIC_RENDER_DEVICE_ID = 0x8C
+_DXGI_ERROR_NOT_FOUND = 0x887A0002 - (1 << 32)   # as a signed HRESULT
+
+
+def _dxgi_adapters():
+    """Every display adapter DXGI lists, as ``(index, name, is_hardware)``, or
+    None when DXGI could not be asked.
+
+    ``onnxruntime-directml`` reports ``DmlExecutionProvider`` whether or not
+    the machine has a graphics card, so the provider list alone said "GPU" on
+    a VM or a CI runner whose only adapter is Microsoft's software renderer.
+    Every session there then failed to bind it and fell back to the processor,
+    one "EP Error" per worker. The index is DXGI's, which is the numbering
+    DirectML's ``device_id`` uses.
+    """
+    if sys.platform != "win32":
+        return None
+    import ctypes  # noqa: PLC0415 - Windows only
+
+    class _GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                    ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+    class _LUID(ctypes.Structure):
+        _fields_ = [("LowPart", ctypes.c_uint32), ("HighPart", ctypes.c_int32)]
+
+    class _AdapterDesc1(ctypes.Structure):          # DXGI_ADAPTER_DESC1
+        _fields_ = [("Description", ctypes.c_wchar * 128),
+                    ("VendorId", ctypes.c_uint32), ("DeviceId", ctypes.c_uint32),
+                    ("SubSysId", ctypes.c_uint32), ("Revision", ctypes.c_uint32),
+                    ("DedicatedVideoMemory", ctypes.c_size_t),
+                    ("DedicatedSystemMemory", ctypes.c_size_t),
+                    ("SharedSystemMemory", ctypes.c_size_t),
+                    ("AdapterLuid", _LUID), ("Flags", ctypes.c_uint32)]
+
+    def call(obj, slot, *args, argtypes=()):
+        """COM method ``slot`` of ``obj``'s vtable."""
+        vtable = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        method = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtable[slot])
+        return method(obj, *args)
+
+    # Vtable slots: IUnknown::Release is 2, IDXGIFactory1::EnumAdapters1 is 12,
+    # IDXGIAdapter1::GetDesc1 is 10.
+    RELEASE, ENUM_ADAPTERS1, GET_DESC1 = 2, 12, 10
+    iid_factory1 = _GUID(0x770AAE78, 0xF26F, 0x4DBA,
+                         (ctypes.c_ubyte * 8)(0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87))
     try:
-        return max(0, int(str(os.environ.get(DEVICE_ENV, "")).strip() or 0))
-    except (TypeError, ValueError):
-        return 0
+        create = ctypes.WinDLL("dxgi").CreateDXGIFactory1
+        create.restype = ctypes.c_long
+        create.argtypes = [ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)]
+        factory = ctypes.c_void_p()
+        hr = create(ctypes.byref(iid_factory1), ctypes.byref(factory))
+        if hr < 0:
+            raise OSError(f"CreateDXGIFactory1 failed (0x{hr & 0xFFFFFFFF:08X})")
+        adapters = []
+        try:
+            for index in range(64):
+                adapter = ctypes.c_void_p()
+                hr = call(factory, ENUM_ADAPTERS1, index, ctypes.byref(adapter),
+                          argtypes=(ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)))
+                if hr == _DXGI_ERROR_NOT_FOUND:
+                    break
+                if hr < 0:
+                    raise OSError(f"EnumAdapters1({index}) failed (0x{hr & 0xFFFFFFFF:08X})")
+                desc = _AdapterDesc1()
+                try:
+                    hr = call(adapter, GET_DESC1, ctypes.byref(desc),
+                              argtypes=(ctypes.POINTER(_AdapterDesc1),))
+                finally:
+                    call(adapter, RELEASE)
+                if hr < 0:
+                    raise OSError(f"GetDesc1({index}) failed (0x{hr & 0xFFFFFFFF:08X})")
+                software = (desc.Flags & _DXGI_ADAPTER_FLAG_SOFTWARE
+                            or (desc.VendorId == _MICROSOFT_VENDOR_ID
+                                and desc.DeviceId == _BASIC_RENDER_DEVICE_ID)
+                            or _dml._is_software_adapter(desc.Description))
+                adapters.append((index, desc.Description, not software))
+        finally:
+            call(factory, RELEASE)
+        return adapters
+    except Exception as e:  # noqa: BLE001 - not knowing is answered by the provider list
+        print(f"⚠️ Could not list display adapters: {type(e).__name__}: {e}")
+        return None
 
 
 def probe(refresh: bool = False) -> ProviderProbe:
@@ -178,8 +277,26 @@ def probe(refresh: bool = False) -> ProviderProbe:
                                      providers=providers, provider=wanted)
         return _probe_cache
 
+    # The DirectML build lists its provider on any Windows machine, graphics
+    # card or not; whether there is one to bind is DXGI's to say. When DXGI
+    # cannot be asked, the provider list is all there is to go on.
+    adapter_index = adapter_name = None
+    if wanted == PROVIDER:
+        adapters = _dxgi_adapters()
+        if adapters is not None:
+            hardware = [(i, name) for i, name, real in adapters if real]
+            if not hardware:
+                listed = ", ".join(name for _, name, _ in adapters) or "none"
+                _probe_cache = ProviderProbe(
+                    reason=f"no graphics card DirectML can use (adapters: {listed})",
+                    version=version, providers=providers, provider=wanted)
+                return _probe_cache
+            adapter_index, adapter_name = hardware[0]
+
     _probe_cache = ProviderProbe(available=True, version=version,
-                                 providers=providers, provider=wanted)
+                                 providers=providers, provider=wanted,
+                                 adapter_index=adapter_index,
+                                 adapter_name=adapter_name)
     return _probe_cache
 
 

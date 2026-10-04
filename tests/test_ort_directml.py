@@ -47,6 +47,10 @@ def _clean_probe(monkeypatch):
     monkeypatch.delenv(directml_device.MODE_ENV, raising=False)
     monkeypatch.delenv(ort_directml.DEVICE_ENV, raising=False)
     directml_device.set_mode(None)
+    # One graphics card, whatever machine runs the tests: a GPU-less CI runner
+    # would otherwise answer every probe here with "no card".
+    monkeypatch.setattr(ort_directml, "_dxgi_adapters",
+                        lambda: [(0, "AMD Radeon RX 570", True)])
     ort_directml.reset_probe_cache()
     yield
     directml_device.set_mode(None)
@@ -111,6 +115,54 @@ class TestTheProbe:
         ort_directml.probe()
 
         assert len(calls) == 1
+
+
+
+class TestTheGraphicsCard:
+    """onnxruntime-directml lists its provider with or without a graphics card,
+    so the adapters decide. A CI runner has only Microsoft's software renderer,
+    which ONNX Runtime refuses to bind; calling that "DirectML" sent every
+    worker through a failed bind and on to the processor."""
+
+    def _adapters(self, monkeypatch, adapters):
+        monkeypatch.setattr(ort_directml, "_dxgi_adapters", lambda: adapters)
+        _install(monkeypatch, _FakeOrt(["DmlExecutionProvider", "CPUExecutionProvider"]))
+
+    def test_only_the_software_renderer_is_no_directml(self, monkeypatch):
+        self._adapters(monkeypatch, [(0, "Microsoft Basic Render Driver", False)])
+
+        assert not ort_directml.available()
+        assert "Microsoft Basic Render Driver" in ort_directml.unavailable_reason()
+        assert ort_directml.providers() == ["CPUExecutionProvider"]
+
+    def test_no_adapters_at_all_is_no_directml(self, monkeypatch):
+        self._adapters(monkeypatch, [])
+
+        assert not ort_directml.available()
+        assert "no graphics card" in ort_directml.unavailable_reason()
+
+    def test_the_first_real_card_is_the_one_bound(self, monkeypatch):
+        self._adapters(monkeypatch, [(0, "Microsoft Basic Render Driver", False),
+                                     (1, "AMD Radeon RX 570", True)])
+
+        probe = ort_directml.probe()
+
+        assert probe.available
+        assert probe.adapter_name == "AMD Radeon RX 570"
+        assert ort_directml.providers()[0][1] == {"device_id": 1}
+
+    def test_the_users_pick_still_wins(self, monkeypatch):
+        self._adapters(monkeypatch, [(0, "Microsoft Basic Render Driver", False),
+                                     (1, "AMD Radeon RX 570", True)])
+        monkeypatch.setenv(ort_directml.DEVICE_ENV, "0")
+
+        assert ort_directml.device_id() == 0
+
+    def test_when_dxgi_cannot_be_asked_the_provider_list_decides(self, monkeypatch):
+        self._adapters(monkeypatch, None)
+
+        assert ort_directml.available()
+        assert ort_directml.device_id() == 0
 
 
 class TestProviderList:

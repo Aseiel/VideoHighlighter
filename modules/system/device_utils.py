@@ -476,7 +476,9 @@ def _onnx_dml_info(log_fn=print):
     if _ort_dml is None or not _ort_dml.available():
         return None
     probe = _ort_dml.probe()
-    log_fn(f"✅ DirectML via ONNX Runtime {probe.version or ''}".rstrip())
+    card = getattr(probe, "adapter_name", None)
+    log_fn(f"✅ DirectML via ONNX Runtime {probe.version or ''}".rstrip()
+           + (f" on {card}" if card else ""))
     log_fn("   object detection and action recognition on the GPU; other "
            "torch models stay on the CPU (see docs/AMD-GPU.md)")
     return DeviceInfo(
