@@ -63,7 +63,7 @@ def test_simple_start_defaults_on_when_unset(monkeypatch):
     assert ss.simple_start_enabled() is True
 
 
-def test_chat_panel_moves_between_the_two_views():
+def test_chat_panel_moves_between_the_two_views(monkeypatch):
     """One LLMChatWidget, borrowed by whichever workspace is on screen.
 
     Building a second one would mean two model connections and two analysis
@@ -73,6 +73,11 @@ def test_chat_panel_moves_between_the_two_views():
     pytest.importorskip("PySide6")
     app_main = pytest.importorskip("main")
     from PySide6.QtWidgets import QApplication
+
+    # The window opens in the view this machine's user last chose, read from
+    # their real QSettings. A developer who left Detailed settings open would
+    # fail the first assertion, so start in Simple view whatever they chose.
+    monkeypatch.setattr(app_main, "simple_start_enabled", lambda default=True: True)
 
     QApplication.instance() or QApplication([])
     gui = app_main.VideoHighlighterGUI()
