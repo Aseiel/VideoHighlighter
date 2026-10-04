@@ -285,6 +285,45 @@ def test_the_site_answers_when_the_update_host_is_down(state_dir, install_root):
     assert len(asked) == 2
 
 
+def _two_sources(install_root, host, site):
+    """A transport where the update host and the site announce different things."""
+    _installed_manifest(install_root, "https://updates.example/vh")
+
+    def transport(url):
+        return host if url.startswith("https://updates.example") else site
+    return transport
+
+
+def test_a_newer_release_on_the_site_beats_a_stale_update_host(state_dir, install_root):
+    # The channel on the host still names the last signed release; the site
+    # already announces the next one. The install must hear about the next one.
+    transport = _two_sources(
+        install_root,
+        host=_manifest("0.9.1", manifests={"windows": "https://h/0.9.1/manifest.json"}),
+        site=_manifest("0.9.2"))
+    info = update_check.check_for_update(current_version="0.9.1", transport=transport)
+    assert info is not None and info.version == "0.9.2"
+    assert info.manifest_url == ""
+
+
+def test_on_a_tie_the_update_host_keeps_its_signed_manifest(state_dir, install_root,
+                                                          monkeypatch):
+    from modules.update import update_manifest
+    monkeypatch.setattr(update_manifest, "platform_key", lambda platform=None: "windows")
+    transport = _two_sources(
+        install_root,
+        host=_manifest("0.9.2", manifests={"windows": "https://h/0.9.2/manifest.json"}),
+        site=_manifest("0.9.2"))
+    info = update_check.check_for_update(current_version="0.9.1", transport=transport)
+    assert info.manifest_url == "https://h/0.9.2/manifest.json"
+
+
+def test_garbage_from_one_source_does_not_hide_the_other(state_dir, install_root):
+    transport = _two_sources(install_root, host=["not", "a", "dict"], site=_manifest("0.9.2"))
+    info = update_check.check_for_update(current_version="0.9.1", transport=transport)
+    assert info is not None and info.version == "0.9.2"
+
+
 def test_each_platform_gets_its_own_manifest(state_dir, monkeypatch):
     from modules.update import update_manifest
     payload = _manifest(manifests={"windows": "https://h/win/manifest.json"})

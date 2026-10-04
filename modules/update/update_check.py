@@ -36,7 +36,8 @@ identical in the Pro and free repos and picks its own channel at runtime.
 
 Where the channel file lives
 ----------------------------
-Two places, tried in order, first answer wins:
+Two places, both asked; the newest version announced wins, and on a tie the
+first one listed here:
 
 1. ``<base_url>/channels/<edition>.json`` on the update host, where
    ``base_url`` comes from the ``manifest.json`` this install shipped with.
@@ -44,9 +45,12 @@ Two places, tried in order, first answer wins:
    and ``.github/workflows/publish-update.yaml`` writes the channel file there
    once a release is signed. Nothing about the host is compiled into the code,
    so moving the bucket is a variable change, not a release.
-2. The marketing site, where the file is committed by hand. Every build from
-   before the update host existed reads only this one, and so does a run from
-   source, which has no ``manifest.json``.
+2. The marketing site. ``publish-update.yaml`` writes it too when it has a
+   token for the site's repository; otherwise it is committed by hand. Every
+   build from before the update host existed reads only this one, and so does
+   a run from source, which has no ``manifest.json``. Because the newest
+   answer wins, a release announced here for download only is still heard by
+   installs whose update host names an older one.
 
 The channel file names one signed release manifest per platform
 (``"manifests": {"windows": ...}``). A platform with no entry gets the
@@ -350,23 +354,30 @@ def check_for_update(
     fetch = transport or _get_json
     manifest = None
     try:
+        # Every source is asked and the newest answer wins. Stopping at the
+        # first one that answers let a stale channel on the update host hide a
+        # newer release announced on the site, so an install never heard of it.
+        # On a tie the earlier source keeps it: the update host comes first and
+        # is the one whose channel names signed manifests.
         for url in channel_urls():
             try:
-                manifest = fetch(url)
-                break
+                answer = fetch(url)
             except Exception as exc:
                 # Offline is the common case, not an error worth showing anyone.
                 print(f"update_check: no manifest at {url} "
                       f"({type(exc).__name__}: {exc})")
+                continue
+            if not isinstance(answer, dict):
+                print(f"update_check: {url} is not a JSON object; ignoring")
+                continue
+            if manifest is None or is_newer(str(answer.get("version", "")),
+                                            str(manifest.get("version", ""))):
+                manifest = answer
         if manifest is None:
             return None
     finally:
         if not force:
             mark_checked()
-
-    if not isinstance(manifest, dict):
-        print("update_check: manifest is not a JSON object; ignoring")
-        return None
 
     latest = str(manifest.get("version", "")).strip()
     if not is_newer(latest, current):
