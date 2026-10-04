@@ -794,6 +794,12 @@ jobs:
     if: ${{ !inputs.dry_run && !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     steps:
+      # Before the download: checkout cleans the workspace, artifacts included.
+      # Full history and tags, because the notes are the commits since the
+      # previous release tag and a shallow clone has neither.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Download all artifacts
         uses: actions/download-artifact@v4
       - name: Write the release notes
@@ -802,12 +808,18 @@ jobs:
           REPO: ${{ github.repository }}
           WEB: ${{ inputs.web_ui }}
         run: |
+          # What changed since the last release, drafted from the commits
+          # (tools/release_notes.py), then the downloads. The release is a
+          # draft, so the list gets edited into shape before it is published.
+          python3 tools/release_notes.py --out release-notes.md
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
           dl="https://github.com/$REPO/releases/download/$SLUG"
           portable=""
           for f in windows-build/*.7z.*; do
             n=$(basename "$f"); portable="$portable [.7z.${n##*.7z.}]($dl/$n)"
           done
           {
+            echo ""
             echo "## Download"
             echo ""
             echo "### [Install VideoHighlighter for Windows]($dl/00-VideoHighlighter-Windows-Setup.exe)"
@@ -846,7 +858,7 @@ jobs:
             echo ""
             echo "\`00-VideoHighlighter-Windows-Setup.zip\` is the older script-based"
             echo "installer, kept as a fallback."
-          } > release-notes.md
+          } >> release-notes.md
           cat release-notes.md
       - name: Create GitHub Release
         uses: ncipollo/release-action@v1
