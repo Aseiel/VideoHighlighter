@@ -365,10 +365,21 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 detail += f" ({failed} failed)"
             progress.update_progress(idx - 1, total_videos, "Batch Processing", detail)
             
-            # Auto-generate output filename
+            # Name the mp4. Callers that pass output_base (the GUI field) get
+            # that name; everyone else keeps <video>_highlight.mp4, which is
+            # what this loop wrote before the field existed.
             video_gui_config = gui_config.copy() if gui_config else {}
-            base_name = os.path.splitext(single_video_path)[0]  # Always use current video's name
-            video_gui_config["output_file"] = f"{base_name}_highlight.mp4"
+            if "output_base" in video_gui_config:
+                from modules.media.output_name import highlight_output_path
+                several = bool(video_gui_config.get("output_multiple", total_videos > 1))
+                video_gui_config["output_file"] = highlight_output_path(
+                    single_video_path,
+                    video_gui_config.get("output_base") or "",
+                    multiple=several,
+                )
+            else:
+                base_name = os.path.splitext(single_video_path)[0]
+                video_gui_config["output_file"] = f"{base_name}_highlight.mp4"
                         
             # Recursive call for single video
             try:
