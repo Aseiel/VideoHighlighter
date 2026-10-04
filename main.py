@@ -1129,11 +1129,54 @@ class VideoHighlighterGUI(QWidget):
         layout.addWidget(file_group)
 
         # --- Output filename ---
+        # Blank keeps <video>_highlight.mp4 (what a run writes today). Any other
+        # text is the mp4's base name and is passed through as output_base.
         out_layout = QHBoxLayout()
         self.output_input = QLineEdit(self.config_data.get("highlights", {}).get("output", "highlight.mp4"))
+        self.output_input.setPlaceholderText("empty = <video>_highlight.mp4")
+        self.output_input.setToolTip(
+            "Base name of the highlight mp4, written next to the source.\n"
+            "Leave empty for <video>_highlight.mp4.\n"
+            "One video: the name is used as the filename (.mp4 added if needed).\n"
+            "Several videos, or download-and-process: <video>_<name>.mp4 so they\n"
+            "do not overwrite each other."
+        )
         out_layout.addWidget(QLabel("Output base name:"))
         out_layout.addWidget(self.output_input)
         layout.addLayout(out_layout)
+
+        # Named snapshots beside config.yaml (presets/<name>.yaml). The live
+        # file is still config.yaml; loading a preset copies it onto the
+        # controls and save_config writes that back.
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("Presets:"))
+        self.preset_name_input = QLineEdit()
+        self.preset_name_input.setPlaceholderText("name")
+        self.preset_name_input.setToolTip(
+            "Save the current settings under this name. Stored as presets/<name>.yaml\n"
+            "next to config.yaml. config.yaml itself is unchanged until you load one."
+        )
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(160)
+        self.preset_combo.setToolTip("Settings presets saved next to config.yaml.")
+        self.preset_save_btn = QPushButton("Save")
+        self.preset_save_btn.setToolTip("Save the current controls under the name on the left.")
+        self.preset_save_btn.clicked.connect(self.save_named_preset)
+        self.preset_load_btn = QPushButton("Load")
+        self.preset_load_btn.setToolTip(
+            "Apply the selected preset to these controls and to config.yaml."
+        )
+        self.preset_load_btn.clicked.connect(self.load_named_preset)
+        self.preset_delete_btn = QPushButton("Delete")
+        self.preset_delete_btn.setToolTip("Delete the selected preset file. config.yaml is left as it is.")
+        self.preset_delete_btn.clicked.connect(self.delete_named_preset)
+        preset_layout.addWidget(self.preset_name_input)
+        preset_layout.addWidget(self.preset_combo, stretch=1)
+        preset_layout.addWidget(self.preset_save_btn)
+        preset_layout.addWidget(self.preset_load_btn)
+        preset_layout.addWidget(self.preset_delete_btn)
+        layout.addLayout(preset_layout)
+        self._refresh_presets()
 
         highlights_cfg = self.config_data.get("highlights", {})
         scoring_cfg = self.config_data.get("scoring", {})
@@ -1494,16 +1537,25 @@ class VideoHighlighterGUI(QWidget):
         points_layout.setSpacing(6)
 
         self.spin_scene_points = QSpinBox(); self.spin_scene_points.setRange(0,100); self.spin_scene_points.setValue(scoring_cfg.get("scene_points", 0))
-        self.spin_scene_points.setToolTip("Points awarded when a new scene cut is detected (abrupt visual change)")
+        self.spin_scene_points.setToolTip(
+            "Points on the second a scene cut starts (a jump in frame difference). "
+            "One hit per cut, not for the rest of the scene.")
 
         self.spin_motion_event_points = QSpinBox(); self.spin_motion_event_points.setRange(0,100); self.spin_motion_event_points.setValue(scoring_cfg.get("motion_event_points", 0))
-        self.spin_motion_event_points.setToolTip("Points for any frame with detected movement above the threshold")
+        self.spin_motion_event_points.setToolTip(
+            "Points on seconds where a sampled frame has motion "
+            "(contour area above the detector minimum). Not a spike-then-quiet — "
+            "that is motion peak points.")
 
         self.spin_motion_peak = QSpinBox(); self.spin_motion_peak.setRange(0,100); self.spin_motion_peak.setValue(scoring_cfg.get("motion_peak_points", 3))
-        self.spin_motion_peak.setToolTip("Points for a sudden burst of motion followed by stillness (e.g. a goal followed by replay, an explosion then calm)")
+        self.spin_motion_peak.setToolTip(
+            "Points when motion inside a scene rises above that scene's average, "
+            "then stays low for about 4 seconds of samples.")
 
         self.spin_audio_peak = QSpinBox(); self.spin_audio_peak.setRange(0,100); self.spin_audio_peak.setValue(scoring_cfg.get("audio_peak_points", 0))
-        self.spin_audio_peak.setToolTip("Points when audio intensity spikes (e.g. crowd roar, explosions, bells, loud impacts)")
+        self.spin_audio_peak.setToolTip(
+            "Points on seconds with a local waveform peak above -20 dB. "
+            "Not a loudness burst, which compares each moment to its own neighborhood.")
 
         self.spin_loudness_burst = QSpinBox(); self.spin_loudness_burst.setRange(0,100)
         self.spin_loudness_burst.setValue(scoring_cfg.get("loudness_burst_points", 0))
@@ -1517,18 +1569,28 @@ class VideoHighlighterGUI(QWidget):
             "stand out from itself and is not reported.")
 
         self.spin_keyword_points = QSpinBox(); self.spin_keyword_points.setRange(0,100); self.spin_keyword_points.setValue(scoring_cfg.get("keyword_points", 2))
-        self.spin_keyword_points.setToolTip("Points when a search keyword is found in speech (needs transcript enabled)")
+        self.spin_keyword_points.setToolTip(
+            "Points on each second of a transcript span that contains a search keyword. "
+            "Ignored unless transcript is enabled.")
         # Keyword scoring only works with a transcript — grey it out until then.
         self.spin_keyword_points.setEnabled(self.config_data.get("transcript", {}).get("enabled", False))
 
         self.spin_transcript_points = QSpinBox(); self.spin_transcript_points.setRange(0,100); self.spin_transcript_points.setValue(scoring_cfg.get("transcript_points", 2))
-        self.spin_transcript_points.setToolTip("Points for any moment where speech is detected, regardless of content")
+        self.spin_transcript_points.setToolTip(
+            "Stored with the run, but not added to any second. Keyword points are "
+            "what mark spoken words. Counts in the 'all points are 0' check only "
+            "while transcript is enabled.")
 
         self.spin_object = QSpinBox(); self.spin_object.setRange(0,100); self.spin_object.setValue(scoring_cfg.get("object_points", 1))
-        self.spin_object.setToolTip("Points when a configured object class is detected in the frame")
+        self.spin_object.setToolTip(
+            "Points on each second a class from the object field is detected. "
+            "With that field empty these points are not counted.")
 
         self.spin_action = QSpinBox(); self.spin_action.setRange(0,1000); self.spin_action.setValue(scoring_cfg.get("action_points", 10))
-        self.spin_action.setToolTip("Points when a configured action is recognized (e.g. punching, jumping, dancing)")
+        self.spin_action.setToolTip(
+            "Points on seconds an action from the action field is recognized. "
+            "Scaled by that action's confidence in this video (half, full, or 1.5x). "
+            "With that field empty these points are not counted.")
 
         self.spin_face_expression = QSpinBox(); self.spin_face_expression.setRange(0,100)
         self.spin_face_expression.setValue(scoring_cfg.get("face_expression_points", 0))
@@ -1699,8 +1761,18 @@ class VideoHighlighterGUI(QWidget):
         duration_form = QFormLayout()
 
         self.spin_max_duration = QSpinBox(); self.spin_max_duration.setRange(1,3600); self.spin_max_duration.setValue(highlights_cfg.get("max_duration", 420))
+        self.spin_max_duration.setToolTip(
+            "Stop the highlight at this many seconds. It may be shorter when "
+            "nothing else scored. Ignored when exact duration is above 0.")
         self.spin_exact_duration = QSpinBox(); self.spin_exact_duration.setRange(0,3600); self.spin_exact_duration.setValue(highlights_cfg.get("exact_duration", 0))
+        self.spin_exact_duration.setToolTip(
+            "Above 0, the highlight is this many seconds — low-scoring seconds "
+            "are used to fill it. 0 leaves max duration in charge, and the cut "
+            "can be shorter.")
         self.spin_clip_time = QSpinBox(); self.spin_clip_time.setRange(0,300); self.spin_clip_time.setValue(highlights_cfg.get("clip_time", 10))
+        self.spin_clip_time.setToolTip(
+            "Length of each fixed window, in seconds, around a scored second. "
+            "0 uses auto-segmentation (min/max clip and merge gap below).")
 
         duration_form.addRow("Max highlight duration (s):", self.spin_max_duration)
         duration_form.addRow("Exact duration (s, 0 = off):", self.spin_exact_duration)
@@ -1716,6 +1788,11 @@ class VideoHighlighterGUI(QWidget):
         self.slider_coverage.setValue(int(round(float(highlights_cfg.get("coverage", 0.0)) * 100)))
         self.slider_coverage.setTickPosition(QSlider.TicksBelow)
         self.slider_coverage.setTickInterval(25)
+        self.slider_coverage.setToolTip(
+            "0 takes the highest-scoring windows wherever they are. "
+            "100 gives each part of the video one share of the cut. "
+            "In between, those two are mixed. Only used when clip time is above 0; "
+            "time left over is still filled from the best moments.")
 
         coverage_row = QVBoxLayout()
         coverage_row.addWidget(self.slider_coverage)
@@ -1753,17 +1830,23 @@ class VideoHighlighterGUI(QWidget):
         self.spin_auto_min_clip = QSpinBox()
         self.spin_auto_min_clip.setRange(1, 30)
         self.spin_auto_min_clip.setValue(highlights_cfg.get("auto_min_clip", 2))
-        self.spin_auto_min_clip.setToolTip("Shortest clip the auto-cutter will produce")
+        self.spin_auto_min_clip.setToolTip(
+            "Shortest auto clip, in seconds. Shorter regions are padded. "
+            "Used only when clip time is 0.")
 
         self.spin_auto_max_clip = QSpinBox()
         self.spin_auto_max_clip.setRange(3, 120)
         self.spin_auto_max_clip.setValue(highlights_cfg.get("auto_max_clip", 30))
-        self.spin_auto_max_clip.setToolTip("Longest single clip before it gets trimmed to the best sub-window")
+        self.spin_auto_max_clip.setToolTip(
+            "Longest auto clip, in seconds. Longer regions are split into "
+            "back-to-back windows of this length. Used only when clip time is 0.")
 
         self.spin_auto_merge_gap = QSpinBox()
         self.spin_auto_merge_gap.setRange(0, 10)
         self.spin_auto_merge_gap.setValue(highlights_cfg.get("auto_merge_gap", 2))
-        self.spin_auto_merge_gap.setToolTip("Merge interest regions that are within this gap into one clip")
+        self.spin_auto_merge_gap.setToolTip(
+            "Interest regions closer than this many seconds become one region "
+            "before min/max length is applied. Used only when clip time is 0.")
 
         auto_seg_layout.addRow("Min clip length (s):", self.spin_auto_min_clip)
         auto_seg_layout.addRow("Max clip length (s):", self.spin_auto_max_clip)
@@ -1938,7 +2021,9 @@ class VideoHighlighterGUI(QWidget):
         self.frame_skip_spin = QSpinBox()
         self.frame_skip_spin.setRange(1, 30)
         self.frame_skip_spin.setValue(advanced_cfg.get("frame_skip", 5))
-        self.frame_skip_spin.setToolTip("Analyze every Nth frame for motion detection (higher = faster, less precise)")
+        self.frame_skip_spin.setToolTip(
+            "Motion and scene detection read every Nth frame. "
+            "Higher is faster and can miss a short cut or a brief motion.")
 
         motion_layout.addRow("Frame skip:", self.frame_skip_spin)
         self.vr_mode_chk = QCheckBox("VR side-by-side optimization")
@@ -1957,7 +2042,9 @@ class VideoHighlighterGUI(QWidget):
         self.obj_frame_skip_spin = QSpinBox()
         self.obj_frame_skip_spin.setRange(1, 60)
         self.obj_frame_skip_spin.setValue(advanced_cfg.get("object_frame_skip", 10))
-        self.obj_frame_skip_spin.setToolTip("Analyze every Nth frame for object detection (higher = faster, less precise)")
+        self.obj_frame_skip_spin.setToolTip(
+            "Object detection samples every Nth frame. "
+            "Higher is faster and can miss an object that is only briefly on screen.")
 
         self.yolo_type_combo = QComboBox()
         self.yolo_type_combo.addItem("Standard YOLOX (80 objects)", "standard")
@@ -4040,15 +4127,16 @@ class VideoHighlighterGUI(QWidget):
         # Define processing callback for immediate processing
         def process_video_callback(filepath, metadata):
             """Process video immediately after download using the pipeline.
-            Skips processing if *_highlight.mp4 already exists next to the file.
+            Skips processing if the highlight mp4 already exists next to the file.
             """
             try:
                 filename = os.path.basename(filepath)
-                base_name = os.path.splitext(filename)[0]
-                source_dir = os.path.dirname(filepath)
 
-                # Expected highlight output path
-                output_file = os.path.join(source_dir, f"{base_name}_highlight.mp4")
+                # Same naming as Run. A download batch is several files, so a
+                # custom base is prefixed with the source stem.
+                from modules.media.output_name import highlight_output_path
+                output_file = highlight_output_path(
+                    filepath, self.output_input.text().strip(), multiple=True)
 
                 # Decide whether to skip existing highlights
                 # If you later add a checkbox like self.skip_existing_highlights_chk, this will pick it up.
@@ -4541,8 +4629,252 @@ class VideoHighlighterGUI(QWidget):
             self.append_log(f"Traceback:\n{traceback.format_exc()}")
             return None
             
+    # --- Settings presets (presets/<name>.yaml next to config.yaml) ---
+    def _set_preset_controls_enabled(self, enabled: bool):
+        for widget in (self.preset_name_input, self.preset_combo,
+                       self.preset_save_btn, self.preset_load_btn,
+                       self.preset_delete_btn):
+            widget.setEnabled(enabled)
+
+    def _refresh_presets(self, select: str | None = None):
+        from modules.system.presets import list_presets
+        names = list_presets(CONFIG_FILE)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItems(names)
+        if select and select in names:
+            self.preset_combo.setCurrentText(select)
+        self.preset_combo.blockSignals(False)
+
+    def _set_combo_data(self, combo, value):
+        if value is None:
+            return
+        idx = combo.findData(value)
+        if idx < 0:
+            idx = combo.findText(str(value))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    def _select_object_model(self, yolo_type, path):
+        target = (yolo_type or "standard", path or "")
+        for i in range(self.object_model_combo.count()):
+            if self.object_model_combo.itemData(i) == target:
+                self.object_model_combo.setCurrentIndex(i)
+                return
+
+    def _apply_settings_to_widgets(self, data: dict):
+        """Push a config.yaml-shaped dict onto the controls. Missing keys stay."""
+        def has(section, key):
+            return isinstance(data.get(section), dict) and key in data[section]
+
+        def get(section, key, default=None):
+            block = data.get(section) or {}
+            return block.get(key, default)
+
+        video = data.get("video") or {}
+        if "paths" in video and isinstance(video["paths"], list):
+            self.file_list.clear()
+            for path in video["paths"]:
+                self.file_list.addItem(str(path))
+
+        dl = data.get("download") or {}
+        if "last_url" in dl:
+            self.download_url_input.setText(str(dl.get("last_url") or ""))
+        if "save_dir" in dl:
+            self.download_save_dir_input.setText(str(dl.get("save_dir") or ""))
+        if "auto_add" in dl:
+            self.auto_add_downloaded_chk.setChecked(bool(dl["auto_add"]))
+        if "auto_combine" in dl:
+            self.auto_combine_chk.setChecked(bool(dl["auto_combine"]))
+        self._set_combo_data(self.download_mode_combo, dl.get("download_mode"))
+        self._set_combo_data(self.process_mode_combo, dl.get("process_mode"))
+        if "concurrent_downloads" in dl:
+            self.concurrent_spinbox.setValue(int(dl["concurrent_downloads"]))
+        if "time_range_start" in dl:
+            self.download_start_input.setValue(int(dl["time_range_start"]))
+        if "time_range_end" in dl:
+            self.download_end_input.setValue(int(dl["time_range_end"]))
+
+        if has("highlights", "output"):
+            self.output_input.setText(str(get("highlights", "output") or ""))
+        for key, spin in (
+            ("clip_time", self.spin_clip_time),
+            ("max_duration", self.spin_max_duration),
+            ("exact_duration", self.spin_exact_duration),
+            ("auto_min_clip", self.spin_auto_min_clip),
+            ("auto_max_clip", self.spin_auto_max_clip),
+            ("auto_merge_gap", self.spin_auto_merge_gap),
+        ):
+            if has("highlights", key):
+                spin.setValue(int(get("highlights", key) or 0))
+        if has("highlights", "coverage"):
+            self.slider_coverage.setValue(int(round(float(get("highlights", "coverage") or 0) * 100)))
+        if has("highlights", "keep_temp"):
+            self.keep_temp_chk.setChecked(bool(get("highlights", "keep_temp")))
+            self.keep_temp_chk.setText(
+                "Keep temp clips: ON" if self.keep_temp_chk.isChecked() else "Keep temp clips: OFF")
+        if has("highlights", "export_separate_clips"):
+            self.export_clips_chk.setChecked(bool(get("highlights", "export_separate_clips")))
+            self.export_clips_chk.setText(
+                "Export clips: ON" if self.export_clips_chk.isChecked() else "Export clips: OFF")
+        self._set_combo_data(self.render_mode_combo, get("highlights", "render_mode") if has("highlights", "render_mode") else None)
+        if has("highlights", "use_time_range"):
+            self.use_time_range_chk.setChecked(bool(get("highlights", "use_time_range")))
+        if has("highlights", "range_start_pct"):
+            self.range_slider.setStart(int(get("highlights", "range_start_pct") or 0))
+        if has("highlights", "range_end_pct"):
+            self.range_slider.setEnd(int(get("highlights", "range_end_pct") or 100))
+
+        scoring_spins = (
+            ("scene_points", self.spin_scene_points),
+            ("motion_event_points", self.spin_motion_event_points),
+            ("motion_peak_points", self.spin_motion_peak),
+            ("audio_peak_points", self.spin_audio_peak),
+            ("loudness_burst_points", self.spin_loudness_burst),
+            ("keyword_points", self.spin_keyword_points),
+            ("transcript_points", self.spin_transcript_points),
+            ("object_points", self.spin_object),
+            ("action_points", self.spin_action),
+            ("face_expression_points", self.spin_face_expression),
+            ("beginning_points", self.spin_beginning_points),
+            ("ending_points", self.spin_ending_points),
+            ("beginning_seconds", self.spin_beginning_seconds),
+            ("ending_seconds", self.spin_ending_seconds),
+        )
+        for key, spin in scoring_spins:
+            if has("scoring", key):
+                spin.setValue(int(get("scoring", key) or 0))
+        if has("scoring", "face_expression_labels"):
+            chosen = {str(x).lower() for x in (get("scoring", "face_expression_labels") or [])}
+            for name, act in self._face_label_actions.items():
+                act.setChecked(name.lower() in chosen)
+            self._update_face_labels_button()
+
+        def as_csv(section, key):
+            items = get(section, key) or []
+            if isinstance(items, str):
+                return items
+            return ", ".join(str(x) for x in items)
+
+        if has("actions", "interesting"):
+            self.actions_input.setText(as_csv("actions", "interesting"))
+        if has("actions", "require_objects"):
+            self.actions_require_objects_chk.setChecked(bool(get("actions", "require_objects")))
+        if has("objects", "interesting"):
+            self.objects_input.setText(as_csv("objects", "interesting"))
+        if has("objects", "confidence"):
+            self.obj_confidence_spin.setValue(int(get("objects", "confidence") or 0))
+        keywords = data.get("keywords") or {}
+        transcript = data.get("transcript") or {}
+        kw = transcript.get("search_keywords", keywords.get("interesting"))
+        if kw is not None and ("search_keywords" in transcript or "interesting" in keywords):
+            text = kw if isinstance(kw, str) else ", ".join(str(x) for x in kw)
+            self.search_keywords_input.setText(text)
+        if "enabled" in transcript:
+            self.transcript_checkbox.setChecked(bool(transcript["enabled"]))
+        if "model" in transcript:
+            self.transcript_model_combo.setCurrentText(str(transcript["model"]))
+        if "source_lang" in transcript:
+            self.transcript_source_lang.setCurrentText(str(transcript["source_lang"]))
+        sub = data.get("subtitles") or {}
+        if "enabled" in sub:
+            self.subtitles_checkbox.setChecked(bool(sub["enabled"]))
+        if "target_lang" in sub:
+            self.subtitle_target_lang.setCurrentText(str(sub["target_lang"]))
+
+        adv = data.get("advanced") or {}
+        if "frame_skip" in adv:
+            self.frame_skip_spin.setValue(int(adv["frame_skip"]))
+        if "vr_mode" in adv:
+            self.vr_mode_chk.setChecked(bool(adv["vr_mode"]))
+        if "object_frame_skip" in adv:
+            self.obj_frame_skip_spin.setValue(int(adv["object_frame_skip"]))
+        if "sample_rate" in adv:
+            self.sample_rate_spin.setValue(int(adv["sample_rate"]))
+        if "yolo_type" in adv or "yolo_custom_model_path" in adv:
+            self._select_object_model(adv.get("yolo_type", "standard"),
+                                      adv.get("yolo_custom_model_path") or "")
+        if "yolo_model_size" in adv:
+            self._set_combo_data(self.yolo_model_combo, adv["yolo_model_size"])
+        if "action_backend" in adv:
+            self._set_combo_data(self.action_backend_combo, adv["action_backend"])
+        if "action_models" in adv:
+            self._set_combo_data(self.action_models_combo, adv["action_models"])
+        if "r3d_model" in adv:
+            self._set_combo_data(self.r3d_model_combo, adv["r3d_model"])
+
+        comp = data.get("compute") or {}
+        if "backend" in comp:
+            self._set_combo_data(self.backend_combo, comp["backend"])
+
+        vis = data.get("visualization") or {}
+        if "draw_object_boxes" in vis:
+            self.bbox_objects_chk.setChecked(bool(vis["draw_object_boxes"]))
+        if "draw_action_labels" in vis:
+            self.bbox_actions_chk.setChecked(bool(vis["draw_action_labels"]))
+        if "write_highlight_report" in vis:
+            self.why_report_chk.setChecked(bool(vis["write_highlight_report"]))
+        if "narrate_clips" in vis:
+            self.narrate_clips_chk.setChecked(bool(vis["narrate_clips"]))
+        if "narrate_chapters" in vis:
+            self.narrate_chapters_chk.setChecked(bool(vis["narrate_chapters"]))
+        if "report_serve_base" in vis:
+            self.serve_base_input.setText(str(vis.get("report_serve_base") or ""))
+        if "report_media_base" in vis:
+            self.media_base_input.setText(str(vis.get("report_media_base") or ""))
+
+        avoid = data.get("avoid") or {}
+        if "face_recognition_enabled" in avoid:
+            self.avoid_face_recognition_chk.setChecked(bool(avoid["face_recognition_enabled"]))
+        self.update_selection_info()
+        self._sync_simple_start()
+
+    def save_named_preset(self):
+        from modules.system.presets import safe_preset_name, save_preset
+        name = self.preset_name_input.text().strip() or self.preset_combo.currentText().strip()
+        safe = safe_preset_name(name)
+        if not safe:
+            self.append_log("⚠️ Preset name is empty or not usable as a filename.")
+            return
+        data = self.save_config()
+        path = save_preset(safe, data, CONFIG_FILE)
+        self.preset_name_input.clear()
+        self._refresh_presets(select=safe)
+        self.append_log(f"💾 Saved preset '{safe}' ({path})")
+
+    def load_named_preset(self):
+        from modules.system.presets import load_preset
+        name = self.preset_combo.currentText().strip()
+        if not name:
+            self.append_log("⚠️ No preset selected.")
+            return
+        try:
+            data = load_preset(name, CONFIG_FILE)
+        except Exception as exc:
+            self.append_log(f"⚠️ Could not load preset '{name}': {exc}")
+            return
+        # Carried keys with no widget (loudness_bursts, ui) come from here
+        # when save_config writes config.yaml back.
+        self.config_data = data
+        self._apply_settings_to_widgets(data)
+        self.config_data = self.save_config()
+        self.append_log(f"📂 Loaded preset '{name}' into the controls and config.yaml")
+
+    def delete_named_preset(self):
+        from modules.system.presets import delete_preset
+        name = self.preset_combo.currentText().strip()
+        if not name:
+            self.append_log("⚠️ No preset selected.")
+            return
+        if delete_preset(name, CONFIG_FILE):
+            self._refresh_presets()
+            self.append_log(f"🗑 Deleted preset '{name}'. config.yaml was not changed.")
+        else:
+            self.append_log(f"⚠️ Preset '{name}' is not on disk.")
+
     # --- Config persistence ---
     def load_config(self):
+
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
@@ -4664,6 +4996,7 @@ class VideoHighlighterGUI(QWidget):
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             yaml.dump(data, f, sort_keys=False, allow_unicode=True)
+        return data
             
     def closeEvent(self, event):
         self.save_config()
@@ -5423,19 +5756,14 @@ class VideoHighlighterGUI(QWidget):
         exact_duration_val = int(self.spin_exact_duration.value())
         exact_duration = exact_duration_val if exact_duration_val > 0 else None
         
-        # Get output base name from input
-        output_base = self.output_input.text().strip() or "highlight.mp4"
-        
-        # If multiple files, we'll handle output paths per file in the pipeline
-        # For single file, use the same directory as source video
-        if len(video_paths) == 1:
-            # Single file - use the same directory as source video
-            source_dir = os.path.dirname(video_paths[0])
-            output_file = os.path.join(source_dir, output_base)
-        else:
-            # Multiple files - the pipeline will handle appending '_highlight' to each
-            # But we still want to use the output_base as a template
-            output_file = output_base
+        # Blank → <video>_highlight.mp4. Otherwise the text is the base name.
+        # The worker always hands run_highlighter a list, so the name has to
+        # travel as output_base; the batch loop used to ignore output_file.
+        from modules.media.output_name import highlight_output_path
+        output_base = self.output_input.text().strip()
+        output_multiple = len(video_paths) != 1
+        output_file = highlight_output_path(
+            video_paths[0], output_base, multiple=output_multiple)
 
         exact_duration_val = int(self.spin_exact_duration.value())
         exact_duration = exact_duration_val if exact_duration_val > 0 else None
@@ -5483,6 +5811,8 @@ class VideoHighlighterGUI(QWidget):
             "export_separate_clips": self.export_clips_chk.isChecked(),
             "render_mode": self.render_mode_combo.currentData(),
             "output_file": output_file,
+            "output_base": output_base,
+            "output_multiple": output_multiple,
             "highlight_objects": highlight_objects,
             "interesting_actions": interesting_actions,
             "actions_require_objects": self.actions_require_objects_chk.isChecked(),
@@ -5567,6 +5897,7 @@ class VideoHighlighterGUI(QWidget):
         # Disable form inputs during processing
         self.file_list.setEnabled(False)
         self.output_input.setEnabled(False)
+        self._set_preset_controls_enabled(False)
         self.browse_btn.setEnabled(False)
         self.remove_btn.setEnabled(False)
         self.clear_btn.setEnabled(False)
@@ -5651,7 +5982,13 @@ class VideoHighlighterGUI(QWidget):
         form.setContentsMargins(8, 4, 8, 4)
         form.setSpacing(4)
         for label, field in rows:
-            form.addRow(label, field)
+            tip = field.toolTip() if hasattr(field, "toolTip") else ""
+            if isinstance(label, str) and tip:
+                lab = QLabel(label)
+                lab.setToolTip(tip)
+                form.addRow(lab, field)
+            else:
+                form.addRow(label, field)
         box.setLayout(form)
         return box
 
@@ -6063,6 +6400,7 @@ class VideoHighlighterGUI(QWidget):
         self.remove_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
         self.output_input.setEnabled(True)
+        self._set_preset_controls_enabled(True)
         self._sync_simple_start()
 
         # Reset task label style
@@ -6138,17 +6476,17 @@ class VideoHighlighterGUI(QWidget):
         """
         out = []
         video_paths = self.get_file_list()
-        output_base = self.output_input.text().strip() or "highlight.mp4"
+        from modules.media.output_name import highlight_output_path
+        output_base = self.output_input.text().strip()
+        multiple = len(video_paths) != 1
 
         for vp in video_paths:
             source_dir = os.path.dirname(vp)
-            # single-file run: <source dir>/<output name>
-            out.append(os.path.join(source_dir,
-                                    os.path.splitext(output_base)[0] + "_why.html"))
-            # batch run: the pipeline appends _highlight per input
+            named = highlight_output_path(vp, output_base, multiple=multiple)
+            out.append(os.path.splitext(named)[0] + "_why.html")
+            # Older runs always wrote <stem>_highlight, whatever the field said.
             base = os.path.splitext(os.path.basename(vp))[0]
             out.append(os.path.join(source_dir, f"{base}_highlight_why.html"))
-            # OUTPUT_FILE empty → pipeline falls back to the video's own stem
             out.append(os.path.splitext(vp)[0] + "_why.html")
 
         seen, uniq = set(), []

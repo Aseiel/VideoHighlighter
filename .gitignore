@@ -118,3 +118,6 @@ composition_rules.yaml
 composition_rules.yaml.*
 composition_rules.*.yaml
 labels/
+
+# Named GUI settings (presets/*.yaml next to config.yaml). User data.
+presets/
