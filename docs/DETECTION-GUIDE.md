@@ -15,7 +15,7 @@ the application.
 | Your question | Engine | Training needed? |
 |---|---|---|
 | "Where is this thing in the frame?" — a bounded object you can point at | **Object recognition** | Yes, unless it's one of the 80 COCO classes |
-| "What is happening here?" — motion, an activity unfolding over time | **Action recognition** | Yes, for anything outside Kinetics-400 |
+| "What is happening here?" — motion, an activity unfolding over time | **Action recognition** | No: type the action. Training helps where its name does not |
 | "Find where the video looks like X" — scene, setting, framing, mood | **CLIP search** | No |
 | "Find where several of the above hold at once" | **Composition engine** | No — it combines what the others produce |
 
@@ -53,19 +53,26 @@ at frame rate.
 
 **Answers:** what kind of motion is happening across this stretch of time.
 
-**Speed:** windowed — it classifies a clip of frames, not a single frame.
+**Speed:** windowed — 5-second windows every 2.5 seconds, four frames each.
+About 12 s for a 23-minute video on an Arc A750.
 
-**Vocabulary:** Kinetics-400 (400 everyday actions), plus custom models you
-train from folders of example clips. Backbones are torchvision video networks
-(`r3d_18`, `mc3_18`, `r2plus1d_18`).
+**Model:** SigLIP2 (Apache-2.0), downloaded once from Advanced → Action
+Recognition. Two ways to use it:
 
-**Strengths.** It is the only engine that sees *time*. Motion, rhythm, and the
-shape of an event over several seconds are invisible to everything else here.
+- **By name, no training.** Type any action. The 700 Kinetics-700 names are
+  suggested as you type, and a blank field means any of them. Every listed name
+  competes in every window, so an action counts only when the window looks more
+  like it than like the other 700 things people do. Read off the whole frame.
+- **By example.** Train a small model on folders of your own clips (Train →
+  Actions, or Train → From videos). When one is installed it is used instead,
+  on crops around the people in each window.
 
-**Limits — read this one before you build a dataset.** The model is fed an
-ROI crop, not the whole frame: a detector finds the region of interest and the
-network sees that zoomed region. Global spatial layout is cropped away before
-the model gets a vote.
+**Strengths.** It looks across several seconds, so it can tell actions that a
+single frame cannot, and by name it covers far more than any fixed list did.
+
+**Limits — read this one before you build a dataset.** A trained model is fed
+crops around people, not the whole frame. Global spatial layout is cropped
+away before the model gets a vote.
 
 The practical consequence: **it cannot separate classes that differ only by
 *where* something happens.** If two of your categories involve the same motion
@@ -135,10 +142,10 @@ two rules each needing one source genuinely require two distinct objects.
 
 ### An event the models have no word for
 
-This is what the engine is really for. Action recognition answers from a fixed
-list of 400 classes: ask it about anything outside that list and it returns the
-nearest thing inside it, with the confidence you would expect from a wrong
-answer. A rule is not limited that way. It describes a *relation* between
+This is what the engine is really for. Action recognition by name judges how
+a whole window looks, so an event defined by *where* things are relative to
+each other is not something a name can pin down. A rule is not limited that
+way. It describes a *relation* between
 detections — one class inside another, counted, holding steady over a window —
 so the event is whatever that relation means in your footage, under the name
 you gave it.
@@ -341,4 +348,4 @@ Add `--help` to either for the full option list.
 | A composition rule never fires | One of its classes isn't being detected. Check each class fires on its own before combining. |
 | A rule fires far longer than the event | Rules test state, not onset — it stays true while the thing is visible. |
 | Trained model confuses two categories | They probably differ only by location. Merge and split with a rule. |
-| Action recognition disabled at startup | PyTorch or torchvision isn't installed; the R3D backend needs both. |
+| No actions found | The action model is not installed (Advanced → Action Recognition offers it), or no window matched a typed action clearly enough. Try another wording, or leave the field blank to see what it does find. |

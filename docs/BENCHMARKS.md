@@ -31,8 +31,8 @@ release's versions of these first.
 it on every CPU and GPU device OpenVINO finds:
 
 - YOLOX-s and YOLOX-tiny (`models/yolox/`, from `tools/get_yolox_model.py`)
-- action recognition: the encoder and decoder the app loads
-  (`models/intel_action/.../FP32/`)
+- action recognition: the encoder and decoder the app loaded until 0.13.1
+  (`models/intel_action/.../FP32/`, no longer in the repo)
 
 ```bash
 python -m tools.bench_openvino_models --out before.json --save-outputs before.npz

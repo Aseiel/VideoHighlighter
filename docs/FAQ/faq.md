@@ -5,7 +5,7 @@
 ### What detector should I use?
 - **New to the app?** Start with CLIP search (no training needed) to explore your footage, then add trained detectors for specific needs.
 - **Finding objects?** Use YOLOX object detection (80 COCO classes by default, or train your own).
-- **Understanding activities?** Use action recognition (Kinetics-400 actions by default, or train custom actions).
+- **Understanding activities?** Use action recognition: type any action (Kinetics-700 names are suggested), or train your own.
 - **Want complex rules?** Use the Composition Engine to combine detections.
 
 ### How do I teach it what to look for?

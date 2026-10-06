@@ -18,7 +18,7 @@ Two kinds of model:
 
 | `--task` | a sample is | trains | the app then uses it as |
 |---|---|---|---|
-| `actions` | a 5 s clip, labelled as a whole | R3D (`model_training/r3d`) | the custom R3D action model |
+| `actions` | a 5 s clip, labelled as a whole | a head on SigLIP2 (`model_training/action_head`) | an action model in `models/actions/` |
 | `objects` | a place to look; labels are boxes | YOLOX (`training/train_yolox_run`) | a custom detector in `models/custom/` |
 
 Everything lives in one project folder (by default `<user data>/teach/<name>`),
@@ -136,7 +136,7 @@ suggest the name:
 $T suggest-names --clip a.mp4 --clip b.mp4 --clip c.mp4
 ```
 
-It ranks the labels the stock models already know (Kinetics-400 for actions,
+It ranks the labels the stock models already know (Kinetics-700 for actions,
 COCO for objects) by how well they describe the clips, and returns two checks:
 
 - `fit: "good"` → reusing that name is sensible: it means the same thing
@@ -239,7 +239,7 @@ nothing is copied or moved.
 ```bash
 $T import D:/dataset                  # what it holds, and what would skew a measurement
 $T evaluate D:/dataset                # replay the loop, the folders answering
-$T evaluate D:/dataset --no-simulate --weights models/r3d_finetuned.pth
+$T evaluate D:/dataset --no-simulate --head models/actions/my-actions
 ```
 
 `import` reports clips per class and split, classes under the training
@@ -274,7 +274,7 @@ or overturned the way a person would), sort again, until nothing is left to
 decide. `looked_at_share` is the part a person would have looked at;
 `auto_wrong` counts the samples that went in unchecked and wrong, split into
 those from the examples' own videos and from others. `first_sort` is how right
-the very first sort is, before any review. With `--weights`, a trained R3D
+the very first sort is, before any review. With `--head`, a trained action
 model is also scored on `val` (per class) and `test`. A test folder named
 `<class>_<class>` shows both at once: `all_on_top` is both as the top two
 guesses, `top_is_one` the top guess being one of them.
@@ -308,7 +308,7 @@ the folders are (so a model trained on the dataset agrees on names), and up
 to `--max-examples` (200) of each folder's clips their examples, used where
 they are. Folders with fewer than `--min-examples` clips (20) are left out and
 listed. The video is cut into samples and sorted against them;
-`--weights model.pth` adds a trained R3D model as a second opinion: where it
+`--head <folder>` adds a trained action model as a second opinion: where it
 disagrees, the sample is asked about instead of accepted.
 
 A new project sorts with a **linear layer trained on the examples**

@@ -163,12 +163,14 @@ not a finding.
 | --- | --- | --- |
 | Visual search (CLIP prefilter) | yes | Falls back to OpenVINO/CPU if the load fails. |
 | Video encoding (AMF) | yes, indirectly | See *The win that needs no model*. |
-| Action recognition (R3D) | yes, verified at load | 3D convolution is DirectML's least certain area, so this is proven, not assumed — see below. |
-| Action recognition (Intel encoder/decoder) | no | Deliberate: it is small enough that moving it buys nothing, and it exists only as OpenVINO IR. |
+| Action recognition (SigLIP2 frame encoder) | yes, verified at load | Runs on ONNX Runtime DirectML, and must reproduce a reference vector first; otherwise it moves to the processor. |
 | Object detection (stock YOLOX) | yes, through ONNX Runtime | Same export as the OpenVINO model. See below. |
 | Face, motion | no | Unchanged: OpenVINO on the CPU. |
 
-**R3D action recognition proves itself at load.** `pytorch_device` in
+*R3D and the Intel action model were removed in 0.13.1. The sections about
+them below are kept as the record of how the DirectML path was proven.*
+
+**R3D action recognition proved itself at load.** `pytorch_device` in
 `modules/system/device_utils.py` carries the DirectML string on an AMD box, which is
 what routes R3D there, and `auto` enables it — on AMD there is no faster path
 being displaced, because OpenVINO's GPU plugin is Intel-only and that branch is

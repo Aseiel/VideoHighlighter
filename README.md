@@ -39,7 +39,8 @@ GPUs.
   copies it off, cuts the highlights, builds the reel and lays music on the
   beat, as one resumable job.
 - **A match → the goals.** Write a rule for "ball inside net" and it scores that
-  event by name, instead of hoping a 400-class action model has a word for it.
+  event by where things are, instead of hoping an action model can tell it
+  from how the frame looks.
 - **A long interview, lecture or podcast → chapters and subtitles.** Local
   Whisper transcript, chaptered video, optional local translation.
 - **Dashcam or bodycam review → an account you can hand to someone.** The report

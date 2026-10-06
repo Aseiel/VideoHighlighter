@@ -67,31 +67,23 @@ the table above shows.
 | Feature | On the Intel GPU | Notes |
 | --- | --- | --- |
 | Object detection | yes, via OpenVINO IR | The heaviest per-frame stage, so the largest part of the win. Exported on first use — see below. |
-| Action recognition (Intel encoder/decoder) | yes | `action-recognition-0001`, which ships as OpenVINO IR. |
+| Action recognition (SigLIP2) | yes | The frame encoder runs on OpenVINO GPU, checked against a reference vector before use. |
 | Visual search (CLIP prefilter) | yes | Pre-converted to IR at build time by `tools/export_clip_ov.py`. |
 | Video encoding (QSV) | yes, indirectly | `modules/system/encoder_select.py` reads the vendor and prefers `h264_qsv` / `hevc_qsv`. Nothing to do with machine learning. |
-| Action recognition (R3D) | **no** | See below. |
 | Face, motion | no | OpenVINO on the processor. |
 
 **Detection reaches the GPU through OpenVINO's `AUTO` device, not through the
 app's own device choice.** The detector is YOLOX IR under `models/yolox/`,
 downloaded on first use, compiled with `AUTO`, which picks the Arc on its own.
 (The measurements below were taken with the earlier `yolo11n` detector.) The app's
-`openvino_device` field is `"GPU"` and drives the *action* encoder and decoder;
-it is not what puts the detector on the card.
+`openvino_device` field is `"GPU"` and is the device the action pass's person
+detector is given; it is not what puts the YOLOX detector on the card.
 
 The on-demand analysis in the viewer uses the same models, and fetches them on
 first use as a full run does.
 
-**R3D stays off on Intel, on purpose.** With the action backend on `auto`, R3D
-is enabled only where torch or ONNX Runtime can reach a GPU. Neither can here:
-`pytorch_device` is `"cpu"` and the ONNX Runtime DirectML flag is not set on an
-Intel branch. R3D would therefore run on the processor, and the OpenVINO decoder
-on the Arc beats that comfortably, so `auto` picks the decoder and leaves R3D
-alone.
-
-You can still force it. Choosing *R3D + CPU (PyTorch, slow)* does exactly what
-the label says on an Intel box, and the label is honest about the cost.
+The R3D and Intel action models were removed in 0.13.1; action recognition
+is SigLIP2 on whichever route the frame encoder proves works here.
 
 ## Why DirectML is present but loses here
 

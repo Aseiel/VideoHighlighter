@@ -12,15 +12,16 @@ The same two models that the AMD/DirectML path moves, through the same code:
 | Stage | On a Mac |
 |---|---|
 | Object detection (stock YOLOX) | Core ML |
-| Action recognition (R3D) | Core ML, exported to ONNX once on first use |
-| Everything else (CLIP, OpenVINO action models, Whisper, motion) | processor |
+| Action recognition (SigLIP2 frame encoder) | Core ML, checked against a reference vector before use |
+| Everything else (CLIP, Whisper, motion) | processor |
 
 torch can see the GPU through Metal (MPS) as well, and the log says so, but no
 model here uses it yet.
 
 Anything Core ML cannot run falls back to the processor: an operator it lacks
 runs on the CPU inside the same session, and a model that will not load at all
-leaves detection on OpenVINO and R3D on torch, with a line in the log.
+leaves detection on OpenVINO and the frame encoder on the processor, with a
+line in the log.
 
 ## Checking it
 

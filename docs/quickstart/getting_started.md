@@ -70,7 +70,7 @@ scoring:
 The app is "user-taught" — nothing is preloaded. You define:
 
 1. **Objects** — what to detect in the frame (via Training panel)
-2. **Actions** — what activities are happening (Kinetics-400 or custom)
+2. **Actions** — what activities are happening (type any action, or train your own)
 3. **Keywords** — transcript phrases to highlight (optional)
 
 See [`docs/DETECTION-GUIDE.md`](../DETECTION-GUIDE.md) for more about each detector type.
