@@ -827,8 +827,15 @@ jobs:
             echo "One file. Run it, click through, done. It installs the app with"
             echo "PyTorch for the processor, and downloads NVIDIA GPU acceleration"
             echo "(ticked when an NVIDIA card is found) and the visual search model"
-            echo "during setup. Installs per user, no admin rights needed, and a"
-            echo "per-user install updates itself in place from then on."
+            # Only a build that carries the release key offers "Download and
+            # install" (update_check.can_self_install). 0.13.0's notes promised
+            # in-place updates from a build that had none.
+            if grep -Eq '^RELEASE_PUBLIC_KEY_HEX = "[0-9a-fA-F]+"' modules/update/update_manifest.py; then
+              echo "during setup. Installs per user, no admin rights needed, and a"
+              echo "per-user install updates itself in place from then on."
+            else
+              echo "during setup. Installs per user, no admin rights needed."
+            fi
             echo ""
             echo "|  | Installer | Portable |"
             echo "|---|---|---|"
