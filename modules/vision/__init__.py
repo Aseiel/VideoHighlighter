@@ -11,6 +11,7 @@ here, so a member is imported as ``modules.vision.<name>``.
     face_emotions
     face_scan
     label_store
+    npu_detector
     onnx_detector
     pose_backend
     r3d_onnx
