@@ -29,8 +29,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MODELS = (
     ("yolox_s", "yolox/yolox_s.xml"),
     ("yolox_tiny", "yolox/yolox_tiny.xml"),
-    ("action_encoder_fp32", "intel_action/encoder/FP32/action-recognition-0001-encoder.xml"),
-    ("action_decoder_fp32", "intel_action/decoder/FP32/action-recognition-0001-decoder.xml"),
+    # Action recognition since 0.13.1 (the Intel encoder/decoder it replaced
+    # are measured in docs/BENCHMARKS.md's 2026.2.1 -> 2026.4.0 table).
+    ("siglip2_vision", "siglip2-base-patch16-256/vision.onnx"),
 )
 
 
