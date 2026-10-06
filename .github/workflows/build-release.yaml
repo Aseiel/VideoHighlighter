@@ -12,9 +12,9 @@ on:
         type: boolean
         default: false
       web_ui:
-        description: 'Also build the web UI (Tauri + sidecar). It bundles its own CUDA PyTorch, about 40 more Windows minutes'
+        description: 'Also build the web UI (Tauri + sidecar). It bundles its own CUDA PyTorch, about 40 more Windows minutes; untick for a quick run'
         type: boolean
-        default: false
+        default: true
       update_min_version:
         description: 'Oldest version that may update to this one in place (blank = any). Set it when the install layout changes'
         required: false
