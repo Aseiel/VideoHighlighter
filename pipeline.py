@@ -317,6 +317,43 @@ def action_backend_summary(enable_r3d, r3d_model, r3d_device, r3d_onnx_dml,
     return text + (" (chosen automatically)" if auto else "")
 
 
+def _wants_translated_subtitles(gui_config):
+    """The target language when this run writes translated subtitles, else None.
+
+    Read the way the subtitle step below reads it.
+    """
+    if not (gui_config.get("create_subtitles", False)
+            and gui_config.get("use_transcript", False)):
+        return None
+    source = (gui_config.get("transcript_source_lang")
+              or gui_config.get("source_lang", "en"))
+    target = gui_config.get("target_lang")
+    return target if target and target != source else None
+
+
+def _ollama_preflight(gui_config):
+    """Problems Ollama will cause at the end of this run, as log lines.
+
+    Never raises: this is a warning, and a probe that fails is not a reason to
+    stop a run that needs no model for its measurements.
+    """
+    problems = []
+    try:
+        from modules.narration.story_run import preflight
+        problems += preflight(gui_config)
+    except Exception as exc:
+        print(f"⚠️ Narration pre-flight failed: {exc}")
+    try:
+        if _wants_translated_subtitles(gui_config):
+            from modules.audio.transcript_srt import translation_problem
+            problem = translation_problem()
+            if problem:
+                problems.append(f"Subtitles: {problem}")
+    except Exception as exc:
+        print(f"⚠️ Translation pre-flight failed: {exc}")
+    return problems
+
+
 def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log_fn=print, progress_fn=None, cancel_flag=None,
                     preview_fn=None, timeline_fn=None):
@@ -421,7 +458,16 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
     # ========== SINGLE FILE PROCESSING ==========
     gui_config = gui_config or {}
     log = log_fn
-    
+
+    # Say now what would otherwise be discovered at the tail. Narration and
+    # subtitle translation both need Ollama and both run last, so a missing
+    # Ollama showed up an hour in, as one line in a long log (or only in the
+    # debug log), under a report with no written parts and subtitles still in
+    # the spoken language. Asked here it costs a second, while the user is
+    # still watching.
+    for _problem in _ollama_preflight(gui_config):
+        log(f"⚠️ {_problem}")
+
     # Create progress tracker
     progress = ProgressTracker(progress_fn, log_fn)
 
@@ -2801,17 +2847,39 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     progress.update_progress(int(95 + max(0.0, min(1.0, frac)) * 4),
                                              100, "Subtitles", details)
 
+                # Translate only when it can happen. Without Ollama (or its
+                # model) the files used to be written in the spoken language,
+                # named for the target one, under "subtitles created" in the
+                # log; the reason went to the debug log only.
+                translate_to = (TARGET_LANG if TARGET_LANG and TARGET_LANG != SOURCE_LANG
+                                else None)
+                if translate_to:
+                    from modules.audio.transcript_srt import translation_problem
+                    _why_not = translation_problem()
+                    if _why_not:
+                        log(f"⚠️ Subtitles not translated to {translate_to}: {_why_not}")
+                        translate_to = None
+
                 # Always create full subtitles
                 progress.update_progress(95, 100, "Pipeline", "Creating full-video subtitles...")
                 log("Creating subtitles for the full video...")
-                full_srt = f"{os.path.splitext(video_path)[0]}_{TARGET_LANG}.srt"
-                if TARGET_LANG and TARGET_LANG != SOURCE_LANG:
+                translated = None
+                if translate_to:
                     # Say which language it is translating out of: the default
                     # here was "en" regardless of what was actually spoken.
                     translated = translate_segments(transcript_segments,
                                                     source_lang=SOURCE_LANG,
-                                                    target_lang=TARGET_LANG,
+                                                    target_lang=translate_to,
                                                     progress_fn=sub_progress)
+                    if translated is transcript_segments:
+                        # translate_segments hands back the list it was given
+                        # when the model's answer could not be used.
+                        log(f"⚠️ Subtitles not translated to {translate_to}: the "
+                            "model's answer could not be used (details in the "
+                            "debug log).")
+                        translate_to = None
+                if translate_to:
+                    full_srt = f"{os.path.splitext(video_path)[0]}_{translate_to}.srt"
                     create_srt_file(translated, full_srt)
                 else:
                     # "auto" is a request to Whisper, not a language to name a
@@ -2825,14 +2893,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 if segments:
                     progress.update_progress(95, 100, "Pipeline", "Creating highlight subtitles...")
                     log("Creating subtitles that match highlight timing...")
-                    if TARGET_LANG and TARGET_LANG != SOURCE_LANG:
-                        highlight_srt_file = f"{base_name}_{TARGET_LANG}.srt"
+                    if translate_to:
+                        highlight_srt_file = f"{base_name}_{translate_to}.srt"
                         create_highlight_subtitles(
                             original_segments=transcript_segments,
                             highlight_segments=segments,
                             output_path=highlight_srt_file,
                             source_lang=SOURCE_LANG,
-                            target_lang=TARGET_LANG,
+                            target_lang=translate_to,
                             progress_fn=sub_progress
                         )
                     else:

@@ -302,17 +302,51 @@ def create_enhanced_transcript(segments: List[Dict], pause_threshold=2.0) -> str
 # TRANSLATION (LLM + FALLBACK)
 # --------------------------
 
-def get_llm_translator():
-    """Try to detect local LLM availability, return backend name or None"""
+# The model subtitles are translated with, through the `ollama` command. Named
+# here because `ollama run` pulls a model it does not have: a missing one turns
+# the first batch into a multi-gigabyte download inside a 120 s timeout, retried
+# for every batch and then every line — hours at the end of a run that look
+# exactly like a hang.
+TRANSLATION_MODEL = "llama3"
+
+
+def _ollama_list():
+    """The models `ollama list` names, or None when Ollama cannot be asked."""
+    import subprocess
     try:
-        import subprocess
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5,
-                        encoding='utf-8', errors='replace')
-        if result.returncode == 0:
-            return "ollama"
+        result = subprocess.run(["ollama", "list"], capture_output=True,
+                                text=True, timeout=5, encoding='utf-8',
+                                errors='replace')
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
+        return None
+    if result.returncode != 0:
+        return None
+    rows = result.stdout.strip().splitlines()[1:]   # NAME  ID  SIZE  MODIFIED
+    return [row.split()[0] for row in rows if row.split()]
+
+
+def translation_problem(model=TRANSLATION_MODEL):
+    """Why subtitles cannot be translated here, or None when they can.
+
+    Written to be shown to the user as-is, before the run as well as after it:
+    an untranslated subtitle file otherwise looks like a working run.
+    """
+    names = _ollama_list()
+    if names is None:
+        return ("Ollama is not running, so subtitles will be written in the "
+                "transcript's language, untranslated. Start Ollama, then run "
+                "again.")
+    base = model.split(":")[0]
+    if not any(n == model or n.split(":")[0] == base for n in names):
+        return (f"the translation model '{model}' is not pulled in Ollama, so "
+                f"subtitles will be written untranslated. Run:  ollama pull "
+                f"{model}")
     return None
+
+
+def get_llm_translator():
+    """"ollama" when subtitles can be translated here, otherwise None."""
+    return "ollama" if translation_problem() is None else None
 
 def translate_with_llm(text, source_lang="en", target_lang="pl", model="llama3",
                        gender=None):
@@ -465,9 +499,9 @@ def translate_segments(segments, source_lang="en", target_lang="pl",
     print(f"⏳ Translating {len(segments)} segments from {source_lang} to {target_lang}...")
 
     # --- Try LLM first ---
-    llm_backend = get_llm_translator()
-    if llm_backend:
-        print(f"🦙 Using local LLM ({llm_backend}) for translation (better quality)")
+    problem = translation_problem()
+    if problem is None:
+        print(f"🦙 Using local LLM (ollama, {TRANSLATION_MODEL}) for translation")
         
         # DEBUG — remove after confirming
         for seg in segments[:5]:
@@ -496,14 +530,14 @@ def translate_segments(segments, source_lang="en", target_lang="pl",
 
             print(f"✅ Translated {len(translated_segments)} segments via LLM")
             return translated_segments
-        else:
-            print(f"⚠️ LLM returned {len(translated_texts)} translations for {len(segments)} segments — keeping the originals")
+        problem = (f"the model returned {len(translated_texts)} translations "
+                   f"for {len(segments)} lines, so the originals were kept")
 
-    # No LLM backend. Leave the subtitles in the source language rather than
-    # routing them through a scraped web endpoint, and say so loudly: an
-    # untranslated SRT is otherwise indistinguishable from a working run.
-    print("❌ No translation backend available — subtitles left untranslated.")
-    print("   Install ollama and pull a model to enable translation.")
+    # Leave the subtitles in the source language rather than routing them
+    # through a scraped web endpoint, and say so loudly: an untranslated SRT is
+    # otherwise indistinguishable from a working run. Callers can tell by
+    # identity — the list handed in is the list handed back.
+    print(f"❌ Subtitles left untranslated: {problem}")
     return segments
 
 # --------------------------

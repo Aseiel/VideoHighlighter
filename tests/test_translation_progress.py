@@ -78,7 +78,7 @@ class TestBatchTranslationReports:
 
 class TestReachesTranslateSegments:
     def test_passed_down_from_translate_segments(self, ollama, monkeypatch):
-        monkeypatch.setattr(srt, "get_llm_translator", lambda: "ollama")
+        monkeypatch.setattr(srt, "translation_problem", lambda *a, **k: None)
         seen = []
         segments = [{"start": float(i), "end": i + 1.0, "text": f"line {i}"}
                     for i in range(12)]
@@ -87,7 +87,7 @@ class TestReachesTranslateSegments:
         assert any(d.startswith("Batch") for d in seen)
 
     def test_passed_down_from_create_srt_file(self, ollama, monkeypatch, tmp_path):
-        monkeypatch.setattr(srt, "get_llm_translator", lambda: "ollama")
+        monkeypatch.setattr(srt, "translation_problem", lambda *a, **k: None)
         seen = []
         segments = [{"start": 0.0, "end": 1.0, "text": "hello"}]
         srt.create_srt_file(segments, str(tmp_path / "out.srt"),

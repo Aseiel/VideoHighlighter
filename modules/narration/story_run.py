@@ -23,6 +23,7 @@ cannot spare one.
 """
 from __future__ import annotations
 
+import os
 from typing import Callable, Mapping, Optional
 
 # What a run does when nothing says otherwise: both, at both scales. They answer
@@ -53,6 +54,81 @@ def wanted(config: Mapping) -> tuple:
     """Which passes this run should make: ``(chapters, clips)``."""
     return (bool(config.get("narrate_chapters", DEFAULTS["narrate_chapters"])),
             bool(config.get("narrate_clips", DEFAULTS["narrate_clips"])))
+
+
+def preflight(config: Mapping) -> list:
+    """What will stop narration, found before the run instead of after it.
+
+    Returns plain-language problems, empty when narration should work; each is
+    written to be shown as-is: what is wrong, and the one thing to do about it.
+
+    Narration runs at the *tail* of the pipeline, after the analysis, the cut
+    and the report, so an unreachable model used to be discovered an hour in,
+    as one line among hundreds, under a report quietly missing its written
+    parts. Asked at the start, the same question costs a second.
+
+    Never raises and never blocks: a probe that cannot be made is not worth
+    reporting, since the run produces its measurements without any model.
+    Ported from Pro, where this also covers hosted models and the summary.
+    """
+    # Narration only runs over a written report (pipeline.py).
+    if not config.get("write_highlight_report", True):
+        return []
+    do_chapters, do_clips = wanted(config)
+    if not (do_chapters or do_clips):
+        return []
+
+    entry = _entry(config)
+    backend = entry.get("backend") or "ollama"
+    name = entry.get("model") or "llama3"
+    off = ("or untick the narration boxes under Highlight Report to stop "
+           "this warning")
+
+    if backend == "llama-cpp":
+        if not os.path.exists(name):
+            return [f"Narration is on but its model file is missing, so it will "
+                    f"be skipped: {name}. Pick a model, {off}."]
+        return []
+    if backend != "ollama":
+        return []
+
+    try:
+        from modules.narration.llm_discovery import ollama_models
+        available = ollama_models(refresh=True)
+    except Exception:
+        return []                       # cannot probe; say nothing
+
+    if not available:
+        return ["Narration is on, but Ollama is not running, so it will be "
+                "skipped and the report will have no written chapters or clip "
+                f"descriptions. Start Ollama first, {off}."]
+
+    base = name.split(":")[0]
+    if not any(m == name or m.split(":")[0] == base for m in available):
+        return [f"Narration is on, but the model '{name}' is not pulled in "
+                f"Ollama, so it will be skipped. Run:  ollama pull {name}  "
+                f"({off})."]
+
+    # Clips are described from their frames, so a model with no vision half
+    # narrates chapters and skips every clip. A different fix, so said now.
+    if do_clips and not _looks_like_vision(name):
+        return [f"Clip descriptions are on, but '{name}' has no vision half, "
+                "so clips cannot be described from their frames; only chapters "
+                "will be written. Choose a vision model to describe clips."]
+    return []
+
+
+# Substrings of model names that carry a vision half. Matched loosely on
+# purpose: this only decides whether to warn, and a wrong guess costs a
+# sentence, never a run. The authoritative answer is the model's own
+# `accepts_images()`, which needs it loaded — too slow to ask before a run.
+_VISION_MARKERS = ("vl", "vision", "llava", "minicpm-v", "moondream",
+                   "bakllava", "gemma3", "gemma4", "pixtral")
+
+
+def _looks_like_vision(name: str) -> bool:
+    lowered = str(name or "").lower()
+    return any(marker in lowered for marker in _VISION_MARKERS)
 
 
 def narrate_report_file(json_path: str,
