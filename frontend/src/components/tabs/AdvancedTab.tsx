@@ -8,9 +8,6 @@ import { SelectField } from "@/components/SelectField"
 import { CompositionRules } from "@/components/CompositionRules"
 import { pickModelFile } from "@/lib/files"
 import {
-  ACTION_BACKENDS,
-  ACTION_MODELS,
-  R3D_MODELS,
   YOLO_SIZES,
   YOLO_TYPES,
   type HighlighterConfig,
@@ -122,31 +119,11 @@ export function AdvancedTab({ cfg, set }: Props) {
           <CardTitle className="text-sm font-medium">Action Recognition</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2.5">
-          <NumberField
-            label="Frame skip"
-            value={cfg.sample_rate}
-            min={1}
-            onChange={(v) => set("sample_rate", v)}
-          />
-          <SelectField
-            label="Backend"
-            value={cfg.action_backend}
-            options={ACTION_BACKENDS}
-            onChange={(v) => set("action_backend", v)}
-          />
-          <SelectField
-            label="Models"
-            value={cfg.action_models}
-            options={ACTION_MODELS}
-            onChange={(v) => set("action_models", v)}
-          />
-          <SelectField
-            label="R3D model variant"
-            value={cfg.r3d_model}
-            options={R3D_MODELS}
-            onChange={(v) => set("r3d_model", v)}
-            disabled={cfg.action_backend === "openvino"}
-          />
+          <p className="text-sm text-muted-foreground">
+            SigLIP2: type any action, and Kinetics-700 names are suggested.
+            An action model you train in the desktop app is used when it is
+            installed.
+          </p>
         </CardContent>
       </Card>
 

@@ -26,7 +26,7 @@ env:
   # a build uses unless rebuild_packs is ticked, and where installers download
   # the NVIDIA and CLIP packs from. A new pack is published under a new tag,
   # and this line moves to it.
-  PACKS_BASE: https://github.com/Aseiel/VideoHighlighter/releases/download/packs-torch-2.7.1
+  PACKS_BASE: https://github.com/Aseiel/VideoHighlighter/releases/download/packs-torch-2.7.1-r1
 
 permissions:
   contents: read
@@ -108,10 +108,11 @@ jobs:
                       version = "clip-vit-base-patch32-ov-fp16"; bytes_installed = $bytes } |
             ConvertTo-Json | Set-Content build-packs/models-clip/pack.json -Encoding utf8
       - name: Export the frame encoder into its own pack
-        # SigLIP2's image tower (Apache-2.0, ~186 MB), which taught action
-        # models are built on. Downloaded on first use into models/, where
-        # modules/vision/frame_encoder.py looks. The export is pinned to one
-        # model revision, so a rebuild gives the same bytes.
+        # SigLIP2 (Apache-2.0): the image tower every action model is built
+        # on, the text tower for actions people type, and the Kinetics-700
+        # action names already encoded (~590 MB). Downloaded on first use into
+        # models/, where modules/vision/frame_encoder.py looks. The export is
+        # pinned to one model revision, so a rebuild gives the same bytes.
         if: matrix.variant == 'packs' && inputs.rebuild_packs
         shell: pwsh
         run: |
@@ -120,7 +121,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "frame encoder export failed" }
           $bytes = (Get-ChildItem $dest -Recurse -File | Measure-Object Length -Sum).Sum
           [ordered]@{ name = "models-frame-encoder"; dep = "models-frame-encoder";
-                      version = "siglip2-base-patch16-256-onnx"; bytes_installed = $bytes } |
+                      version = "siglip2-base-patch16-256-onnx-text"; bytes_installed = $bytes } |
             ConvertTo-Json | Set-Content build-packs/models-frame-encoder/pack.json -Encoding utf8
       - name: Fetch YOLOX detector models (Apache-2.0)
         run: python tools/get_yolox_model.py
@@ -136,20 +137,18 @@ jobs:
             --log-level WARN `
             --add-data "config.yaml;." `
             --add-data "yolo_objects_labels.json;." `
-            --add-data "kinetics_400_labels.json;." `
+            --add-data "kinetics_700_labels.json;." `
             --add-data "assets;assets" `
             --add-data "modules;modules" `
             --add-data "models;models" `
             --add-data "video_ai_editor/VRVideoOutput.qml;video_ai_editor" `
             --add-data "video_ai_editor/models;video_ai_editor/models" `
-            --hidden-import action_recognition `
             --hidden-import convert_pth_to_openvino `
             --hidden-import crop_actions `
             --hidden-import downloader `
             --hidden-import object_recognition `
             --hidden-import pipeline `
             --hidden-import signal_timeline_viewer `
-            --hidden-import sorter `
             --hidden-import video_picker_dialog `
             --hidden-import PySide6.QtCore `
             --hidden-import PySide6.QtGui `

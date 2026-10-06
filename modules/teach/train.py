@@ -13,7 +13,8 @@ Then:
   (``should_install``), or when asked. The previous model stays in its
   ``runs/`` folder, so going back is copying it again.
 
-Actions train in a subprocess (``model_training.r3d.train``): minutes to hours
+Actions train in a subprocess (``model_training.action_head.train``, a head on
+the SigLIP2 frame encoder): minutes on most machines
 of torch that must not take the caller down with it, and whose log is kept in
 ``runs/<n>/train.log``. Objects train in-process through the same functions
 the Training tab uses.
@@ -22,13 +23,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from typing import Callable, Optional
 
 from modules.teach.build import DATASET_DIR
-from modules.teach.project import ACTIONS, Project
+from modules.teach.project import ACTIONS, TRAIN, VAL, Project
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -85,16 +87,29 @@ def installed_detector_files(project: Project) -> Optional[dict]:
     return {"round": record.get("round"), "xml": xml, "classes": classes}
 
 
-def actions_command(dataset: str, run_dir: str, epochs: int) -> list:
-    return [sys.executable, "-m", "model_training.r3d.train",
+HEAD_DIR = "head"
+
+
+def actions_command(dataset: str, run_dir: str, sources: int) -> list:
+    """The head trainer on the built dataset. It picks its own training length
+    from out-of-fold scores, so a round has no epochs to pass. Trust needs
+    held-out hits from several source videos (three when there are); a
+    one-video project can only ask for one."""
+    return [sys.executable, "-m", "model_training.action_head.train",
             "--data-path", dataset,
-            "--model-save-path", os.path.join(run_dir, "r3d_finetuned.pth"),
-            "--checkpoint-dir", os.path.join(run_dir, "checkpoints"),
-            "--metrics-out", os.path.join(run_dir, "metrics.json"),
-            "--epochs", str(int(epochs)), "--no-viz",
-            # The held-out set was chosen from checked samples only; letting the
-            # trainer top it up from train/ would move unchecked ones into it.
-            "--keep-split"]
+            "--out", os.path.join(run_dir, HEAD_DIR),
+            "--min-videos", str(max(1, min(3, int(sources))))]
+
+
+def _sources(dataset: str) -> int:
+    """How many source videos the built dataset holds (names before _temp)."""
+    from modules.teach.benchmark import group_of
+
+    names = set()
+    for split in (TRAIN, VAL):
+        for root, _dirs, files in os.walk(os.path.join(dataset, split)):
+            names.update(group_of(f) for f in files if "_temp" in f)
+    return len(names) or 1
 
 
 def train_actions(project: Project, run_dir: str, *, epochs: int,
@@ -102,16 +117,21 @@ def train_actions(project: Project, run_dir: str, *, epochs: int,
     dataset = project.path(DATASET_DIR)
     log_path = os.path.join(run_dir, "train.log")
     with open(log_path, "w", encoding="utf-8", errors="replace") as log:
-        result = run(actions_command(dataset, run_dir, epochs), cwd=_REPO,
+        result = run(actions_command(dataset, run_dir, _sources(dataset)), cwd=_REPO,
                      stdout=log, stderr=subprocess.STDOUT)
     code = getattr(result, "returncode", 1)
-    metrics_path = os.path.join(run_dir, "metrics.json")
-    if code != 0 or not os.path.exists(metrics_path):
+    head = os.path.join(run_dir, HEAD_DIR)
+    meta_path = os.path.join(head, "head.json")
+    if code != 0 or not os.path.exists(meta_path):
         raise RuntimeError(f"training failed (exit {code}); see {log_path}")
-    with open(metrics_path, "r", encoding="utf-8") as handle:
-        metrics = json.load(handle)
-    metrics["log"] = log_path
-    return metrics
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    single = (meta.get("heldout") or {}).get("single") or {}
+    return {"balanced_accuracy": float(single.get("balanced_accuracy", 0.0)),
+            "accuracy": float(single.get("accuracy", 0.0)),
+            "classes": list(meta.get("classes", [])),
+            "trusted": sum(t is not None for t in meta.get("trust_thresholds", [])),
+            "head": head, "log": log_path}
 
 
 def train_objects(project: Project, run_dir: str, *, epochs: int,
@@ -132,10 +152,14 @@ def train_objects(project: Project, run_dir: str, *, epochs: int,
 def install(project: Project, record: dict) -> dict:
     """Put a round's model where the app loads it from."""
     if project.task == ACTIONS:
-        from modules.system.app_paths import import_r3d_action_model
-        classes, variant = import_r3d_action_model(record["metrics"]["weights"],
-                                                   record["metrics"]["mapping"])
-        where = {"slot": "R3D action model", "classes": classes, "variant": variant}
+        from modules.system.app_paths import action_models_dir
+        from modules.teach.project import slugify
+        dest = os.path.join(action_models_dir(), f"teach-{slugify(project.name)}")
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        shutil.copytree(record["metrics"]["head"], dest)
+        where = {"slot": "action model", "head": dest,
+                 "classes": list(record["metrics"].get("classes", []))}
     else:
         from modules.teach.project import slugify
         from training.export_yolox import install as install_detector

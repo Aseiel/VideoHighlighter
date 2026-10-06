@@ -28,7 +28,7 @@ import pytest
 from modules.system.device_utils import DeviceInfo
 
 PIPELINE_PY = Path(__file__).resolve().parent.parent / "pipeline.py"
-ACTION_PY = Path(__file__).resolve().parent.parent / "action_recognition.py"
+ACTION_PY = Path(__file__).resolve().parent.parent / "modules" / "vision" / "action_siglip.py"
 
 
 def _info(**kw) -> DeviceInfo:
@@ -53,47 +53,20 @@ def test_an_intel_gpu_still_gets_openvino():
     assert _info(openvino_device="GPU", use_openvino_yolo=True).openvino_device == "GPU"
 
 
-@pytest.mark.parametrize("device", ["CPU", "GPU", "AUTO"])
-def test_the_person_detector_uses_the_device_it_is_given(device, monkeypatch):
-    """It used to default to AUTO and pick the GPU whatever the run decided."""
-    from modules.vision import detection_backend as db
-    import action_recognition as ar
-
-    seen = {}
-
-    class StubDetector:
-        def __init__(self, xml, class_names=None, device="AUTO", score_thr=None):
-            seen["device"] = device
-
-    monkeypatch.setattr(db, "YoloxOpenVINODetector", StubDetector)
-    monkeypatch.setattr(db, "find_default_yolox_ir", lambda prefer=None: __file__)
-
-    detector = ar.ParallelYOLODetector(num_workers=1, skip_frames=4, device=device)
-    try:
-        assert seen["device"] == device
-    finally:
-        detector.shutdown()
-
-
 def test_the_pipeline_hands_that_device_to_the_action_run():
     """A run that decides the device and then does not pass it decides nothing."""
     src = PIPELINE_PY.read_text(encoding="utf-8")
-    assert re.search(r"openvino_device\s*=\s*getattr\(\s*_dev", src), \
-        "pipeline no longer derives the OpenVINO device from the detected backend"
-    call = src[src.index("run_action_detection("):]
-    call = call[:call.index("\n                )")]
-    assert "device=openvino_device" in call, \
-        "run_action_detection is not told which OpenVINO device the run chose"
+    assert re.search(r"openvino_device\s*=\s*getattr\(\s*_dev", src),         "pipeline no longer derives the OpenVINO device from the detected backend"
+    call = src[src.index("run_action_detection_siglip("):]
+    call = call[:call.index("))")]
+    assert "device=openvino_device" in call,         "the action run is not told which OpenVINO device the run chose"
 
 
 def test_the_action_run_builds_its_detector_with_that_device():
-    """Forwarding works only if the call site actually forwards.
-
-    The constructor test above passes a device in by hand, so it stays green
-    even if run_action_detection goes back to letting the detector default to
-    AUTO -- which is the exact regression that put it on the GPU.
-    """
+    """Forwarding works only if the action run passes it on to the person
+    detector, rather than letting it default to AUTO -- the exact regression
+    that put it on the GPU."""
     src = ACTION_PY.read_text(encoding="utf-8")
-    call = src[src.index("yolo_detector = ParallelYOLODetector("):]
+    call = src[src.index("YoloxPeopleDetector("):]
     call = call[:call.index(")")]
-    assert "device=device" in call,         "run_action_detection builds the person detector without the run's device"
+    assert "device=device" in call,         "the action run builds the person detector without the run's device"

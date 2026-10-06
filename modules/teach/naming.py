@@ -10,7 +10,7 @@ A class name does three jobs, and a bad one fails all of them quietly:
 
 So there are rules (``check_name``), and there is a way to let a few samples
 suggest a name (``suggest_names``): embed them, and rank the labels the app's
-stock models already know — Kinetics-400 for actions, COCO for objects, the
+stock models already know — Kinetics-700 for actions, COCO for objects, the
 two label files in the repo root — by how well each describes them. The answer
 is advice, never a decision:
 
@@ -51,7 +51,7 @@ _VAGUE = {"thing", "things", "object", "objects", "action", "actions", "stuff",
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 VOCAB_FILES = {
-    "actions": os.path.join(_REPO, "kinetics_400_labels.json"),
+    "actions": os.path.join(_REPO, "kinetics_700_labels.json"),
     "objects": os.path.join(_REPO, "yolo_objects_labels.json"),
 }
 

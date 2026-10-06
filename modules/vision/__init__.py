@@ -14,7 +14,6 @@ here, so a member is imported as ``modules.vision.<name>``.
     npu_detector
     onnx_detector
     pose_backend
-    r3d_onnx
     rtmpose_models
     tracking_backend
     training_preview

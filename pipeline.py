@@ -10,7 +10,6 @@ import yaml
 import csv
 import cv2
 from tqdm import tqdm
-from action_recognition import run_action_detection, load_models
 from object_recognition import run_object_detection_single
 # modules
 from modules.audio.audio_peaks import extract_audio_peaks
@@ -266,56 +265,6 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
         analysis_data["composed_event_names"] = sorted(set(composed_event_names))
 
     return analysis_data
-
-# action_backend -> (enable_r3d, r3d_half, r3d_device, r3d_onnx_dml) for the
-# choices that name a backend outright. "auto" is not here: it probes the
-# machine, so it lives at the call site with the detection it depends on.
-#
-# r3d_device is set explicitly so each label means what it says on every
-# machine. Without it the device came from whatever was detected, and
-# "R3D + CPU (PyTorch, slow)" would quietly become DirectML on an AMD box.
-#
-# r3d_dml asks for torch's "cpu" on purpose: the weights are exported once and
-# the forward pass leaves torch for an ONNX Runtime session on the DirectML
-# provider, which is the only way the packaged build reaches a DX12 card --
-# torch-directml cannot be bundled. Until now this was reachable only as a side
-# effect of the Compute setting, never as a request.
-ACTION_BACKEND_SETTINGS = {
-    "openvino": (False, False, None, False),
-    "r3d_cuda": (True, True, "cuda", False),    # FP16 on CUDA
-    "r3d_cpu": (True, False, "cpu", False),     # FP32 on CPU
-    "r3d_dml": (True, False, "cpu", True),      # fp16 is uneven on DirectML
-}
-
-R3D_NAMES = {"r3d_18": "R3D-18", "mc3_18": "MC3-18", "r2plus1d_18": "R(2+1)D-18"}
-
-
-def action_backend_summary(enable_r3d, r3d_model, r3d_device, r3d_onnx_dml,
-                           openvino_device, auto=False) -> str:
-    """One line for the log: which model family runs action recognition, on
-    what. The flags that decided it go to the debug log instead."""
-    if enable_r3d:
-        name = R3D_NAMES.get(r3d_model, r3d_model or "R3D")
-        device = str(r3d_device or "cpu").lower()
-        if r3d_onnx_dml:
-            # The same flag means Core ML on a Mac (modules/system/ort_coreml.py).
-            import sys
-            api = "Core ML" if sys.platform == "darwin" else "DirectML"
-            where = f"{api} (ONNX Runtime; the processor if that cannot run it)"
-        elif device.startswith("cuda"):
-            where = "CUDA"
-        elif device.startswith("privateuseone") or "dml" in device:
-            where = "DirectML"
-        else:
-            where = "CPU (PyTorch)"
-        text = f"{name} on {where}"
-    else:
-        device = str(openvino_device or "AUTO").upper()
-        where = {"CPU": "CPU", "AUTO": "the device OpenVINO picks"}.get(
-            device, "Intel GPU" if device.startswith("GPU") else device)
-        text = f"OpenVINO on {where}"
-    return text + (" (chosen automatically)" if auto else "")
-
 
 def _wants_translated_subtitles(gui_config):
     """The target language when this run writes translated subtitles, else None.
@@ -1453,163 +1402,37 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         action_bboxes_cache = []
         all_action_detections = []  # full raw detection stream (for the timeline "show all")
 
-        if not using_cache and interesting_actions:
+        # Actions run when some are typed, or when they are worth points with
+        # none typed (then any of the encoder's action list counts). Before, a
+        # blank field skipped the pass outright whatever the points said.
+        _action_points = float(gui_config.get("action_points", config.get("action_points", 10)) or 0)
+        if not using_cache and (interesting_actions or _action_points > 0):
             try:
-                # Get action label settings
-                draw_action_labels = gui_config.get("draw_action_labels", False)
-                action_annotated_path = None
-                if draw_action_labels:
-                    video_basename = os.path.splitext(os.path.basename(video_path))[0]
-                    temp_folder = os.path.dirname(video_path) or "."
-                    action_annotated_path = os.path.join(temp_folder, f"{video_basename}_actions_annotated.mp4")
-                    log(f"🎨 Action labels enabled, output: {action_annotated_path}")
-                
-                # Determine action backend from GUI config
-                action_backend = gui_config.get("action_backend", "auto")
-                r3d_model = gui_config.get("r3d_model", "r3d_18")
-
-                # r3d_device is passed explicitly so the two "R3D" choices below
-                # mean what their labels say on every machine. Without it the
-                # device came from whatever the machine reported, and "R3D + CPU
-                # (PyTorch, slow)" would quietly become DirectML on an AMD box.
-                r3d_device = None
-                r3d_onnx_dml = False
+                if gui_config.get("draw_action_labels", False):
+                    log("ℹ️ Drawing action labels onto the video is not available "
+                        "with the SigLIP2 action models yet")
 
                 # Which OpenVINO device this run may use is decided by the
-                # compute preference, not by OpenVINO's own AUTO. The DirectML
-                # branches of detect_best_device already declare
-                # openvino_device="CPU" -- "there is no OpenVINO GPU here" --
-                # which on AMD is simply true, because the GPU plugin is
-                # Intel-only. load_models asked AUTO regardless and took the
-                # Intel GPU anyway, so on an Arc "Compute: DirectML" put
-                # OpenVINO on the very card ONNX Runtime was driving. Two
-                # threads into the GPU plugin while DirectML held the device
-                # wedged the run for good, in encoder wait, with no error and
-                # no traceback. Detected once here and used by every branch.
+                # compute preference, not by OpenVINO's own AUTO: on an AMD
+                # box with an Intel iGPU, "Compute: DirectML" must not put the
+                # people detector on the card ONNX Runtime is driving.
                 from modules.system.device_utils import detect_best_device
                 _dev = detect_best_device(log_fn=log)
                 openvino_device = getattr(_dev, "openvino_device", "AUTO") or "AUTO"
 
-                # SigLIP2 with a taught action head replaces the Intel and R3D
-                # paths. "auto" takes it whenever the frame encoder and a head
-                # trained on it are installed; the old backends stay selectable
-                # until they are removed.
+                # SigLIP2: a head the user trained when one is installed,
+                # otherwise actions by name (typed, or the Kinetics-700 list).
                 from modules.vision import action_siglip
-                use_siglip = action_backend == "siglip2" or (
-                    action_backend == "auto" and action_siglip.available())
-                if use_siglip:
-                    all_action_detections, action_bboxes_cache = (
-                        action_siglip.run_action_detection_siglip(
-                            processed_video_path,
-                            device=openvino_device,
-                            interesting_actions=interesting_actions,
-                            progress_callback=progress.update_progress,
-                            cancel_flag=cancel_flag,
-                            log=log,
-                        ))
-                    if draw_action_labels:
-                        log("ℹ️ The SigLIP2 action backend does not draw labels on the video yet")
-                else:
-                    log("⚠️ Intel / R3D action recognition is deprecated and will be removed; "
-                        "train an action head (SigLIP2) to replace it")
-                    _explicit = ACTION_BACKEND_SETTINGS.get(action_backend)
-                    if _explicit is not None:
-                        (enable_r3d, r3d_half, r3d_device,
-                         r3d_onnx_dml) = _explicit
-                        if r3d_onnx_dml:
-                            print("🎯 Action backend → R3D on DirectML through "
-                                "ONNX Runtime; it stays on the CPU if the export or "
-                                "the provider will not run")
-                    else:  # "auto"
-                        # R3D needs a GPU to be worth it. On Intel it stays off —
-                        # R3D there could only run on the CPU, and OpenVINO on the
-                        # Intel GPU beats that (load_models AUTO → GPU).
-                        #
-                        # AMD is the case that changed. OpenVINO's GPU plugin is
-                        # Intel-only, so on an AMD box the "let OpenVINO have it"
-                        # branch *is* the CPU — there is no faster path being
-                        # protected, and DirectML competes with the processor rather
-                        # than with a GPU. R3D is a 3D CNN and DirectML's coverage
-                        # there is the open question, so this is not taken on faith:
-                        # R3DModelWrapper runs a real forward pass at load and demotes
-                        # itself to the CPU if the backend cannot execute it, leaving
-                        # the machine exactly where it was before.
-                        if _dev.pytorch_device == "cuda":
-                            enable_r3d = True
-                            r3d_half = True
-                            r3d_device = _dev.pytorch_device
-                            print(f"🎯 Auto backend → CUDA detected, using R3D ({_dev.backend_name})")
-                        elif _dev.dml_device:
-                            enable_r3d = True
-                            r3d_half = False  # FP16 is uneven on DirectML
-                            r3d_device = _dev.dml_device
-                            # ONNX Runtime gets a turn before the processor does.
-                            # torch-directml refuses a 5D tensor outright --
-                            # nn.Conv3d raises "input must be 4-dimensional", which
-                            # is the whole of R3D -- so the warm-up demotes the
-                            # model. Without this the demotion goes straight to the
-                            # CPU and takes a working card with it, because ONNX
-                            # Runtime's DirectML provider implements the same
-                            # convolution for up to four spatial dimensions and runs
-                            # this model: 20 Conv nodes, all 3D, measured here at
-                            # 27.9 ms a window. Two stacks, one API, different
-                            # operator coverage. _try_onnx() already waits for
-                            # exactly this case and was never given permission.
-                            r3d_onnx_dml = True
-                            print(f"🎯 Auto backend → DirectML detected, using R3D on "
-                                f"{_dev.dml_device} ({_dev.backend_name}); if that "
-                                f"backend cannot run it, ONNX Runtime is tried on "
-                                f"the same card before the CPU")
-                        elif getattr(_dev, "onnx_dml_torch", False):
-                            # Same card, the other runtime. This is the packaged
-                            # build on a DX12 box: torch cannot address the GPU
-                            # because torch-directml cannot be bundled, but ONNX
-                            # Runtime can, so R3D exports itself once and runs
-                            # there. Before this the branch fell through to
-                            # OpenVINO — which on AMD is the processor, since the
-                            # GPU plugin is Intel-only — so R3D was skipped on
-                            # exactly the machines that had a card going unused.
-                            enable_r3d = True
-                            r3d_half = False      # fp16 is uneven on DirectML
-                            r3d_device = "cpu"    # torch's device; the model leaves it
-                            r3d_onnx_dml = True
-                            print(f"🎯 Auto backend → ONNX Runtime on the GPU, using "
-                                f"R3D ({_dev.backend_name}); it stays on the CPU if "
-                                f"the export or the provider will not run")
-                        else:
-                            enable_r3d = False
-                            r3d_half = False
-                            print(f"🎯 Auto backend → no CUDA, using OpenVINO on {_dev.backend_name}")
-
-                    log("🎯 Action recognition: " + action_backend_summary(
-                        enable_r3d, r3d_model, r3d_device, r3d_onnx_dml,
-                        openvino_device, auto=_explicit is None))
-                    print(f"   action backend setting: {action_backend} | R3D model: {r3d_model} | "
-                          f"enable_r3d: {enable_r3d} | r3d_device: {r3d_device or 'auto'} | "
-                          f"onnx_dml: {r3d_onnx_dml} | OpenVINO device: {openvino_device}")
-
-                    action_models_selection = gui_config.get("action_models", "mixed") or "mixed"
-                    all_action_detections, action_bboxes_cache = run_action_detection(
-                        video_path=processed_video_path,
-                        sample_rate=sample_rate,
-                        debug=False,
+                all_action_detections, action_bboxes_cache = (
+                    action_siglip.run_action_detection_siglip(
+                        processed_video_path,
+                        device=openvino_device,
                         interesting_actions=interesting_actions,
                         progress_callback=progress.update_progress,
                         cancel_flag=cancel_flag,
-                        draw_bboxes=True,
-                        annotated_output=action_annotated_path,
-                        use_person_detection=True,
-                        max_people=2,
-                        include_model_type=False,
-                        enable_r3d=enable_r3d,
-                        r3d_model_name=r3d_model,
-                        r3d_half=r3d_half,
-                        r3d_device=r3d_device,
-                        r3d_onnx_dml=r3d_onnx_dml,
-                        action_models=action_models_selection,
+                        log=log,
                         preview_fn=preview_fn,
-                        device=openvino_device,
-                    )
+                    ))
 
                 check_cancellation(cancel_flag, log, "action recognition processing")
 
@@ -1865,9 +1688,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             log("⚠️ WARNING: object_points > 0 and objects were configured, "
                 "but no objects were detected in the video. Object scoring will contribute nothing.")
 
-        if ACTION_POINTS > 0 and not interesting_actions:
-            log("⚠️ WARNING: action_points > 0 but no interesting actions are configured. "
-                "Action scoring will contribute nothing — set action_points to 0 or add actions to detect.")
+        # A blank action list is no longer "nothing to score": it means any
+        # action on the action model's list. What can still score nothing is
+        # a pass that found none.
+        if ACTION_POINTS > 0 and not all_action_detections and not using_cache:
+            log("⚠️ WARNING: action_points > 0 but no actions were recognised in the "
+                "video. Action scoring will contribute nothing.")
 
         if KEYWORD_POINTS > 0 and not SEARCH_KEYWORDS:
             log("⚠️ WARNING: keyword_points > 0 but no search keywords are configured. "

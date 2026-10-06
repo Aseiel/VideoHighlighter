@@ -162,14 +162,6 @@ class TestWhatCountsAsTheGpu:
     def test_a_session_on_core_ml_is_on_the_gpu(self, name, gpu):
         assert ort_directml.is_gpu_provider(name) is gpu
 
-    def test_r3d_on_core_ml_counts_as_moved(self, monkeypatch):
-        from modules.vision import r3d_onnx
-        session = types.SimpleNamespace(
-            get_inputs=lambda: [types.SimpleNamespace(name="input")],
-            get_providers=lambda: [COREML, CPU])
-
-        assert r3d_onnx.OnnxR3D("r3d.onnx", session=session).on_gpu is True
-
 
 class TestTheDeviceProbeOnAMac:
     @pytest.fixture(autouse=True)

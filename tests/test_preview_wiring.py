@@ -70,7 +70,7 @@ def test_run_highlighter_call_sites_are_actually_found():
 
 
 @pytest.mark.parametrize("module, func", [
-    ("action_recognition.py", "run_action_detection"),
+    ("modules/vision/action_siglip.py", "run_action_detection_siglip"),
     ("object_recognition.py", "run_object_detection_single"),
 ])
 def test_detector_accepts_a_preview_hook(module, func):
@@ -105,8 +105,8 @@ def test_ondemand_runner_forwards_preview_fn(runner):
 
     detector_calls = [n for n in ast.walk(fn)
                       if isinstance(n, ast.Call)
-                      and getattr(n.func, "id", None) in
-                      ("run_action_detection", "run_object_detection_single")]
+                      and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) in
+                      ("run_action_detection_siglip", "run_object_detection_single")]
     assert detector_calls, f"{runner} calls no detector"
     for call in detector_calls:
         assert "preview_fn" in {kw.arg for kw in call.keywords}, (
@@ -145,9 +145,12 @@ def test_preview_failures_are_not_swallowed_silently():
     window nobody fed: both look identical from the outside and neither leaves
     a line in debug.log.
     """
-    for module in ("action_recognition.py", "object_recognition.py"):
+    # Where each module's preview block starts: the object pass inlines it,
+    # the action pass keeps it in a helper the frame loop calls.
+    for module, start in (("modules/vision/action_siglip.py", "def show("),
+                          ("object_recognition.py", "preview_fn is not None")):
         src = (REPO / module).read_text(encoding="utf-8")
-        head = src.index("preview_fn is not None")
+        head = src.index(start)
         tail = src.index("\n", src.index("_preview_failed = True", head))
         block = src[head:tail]
         assert "except Exception:\n" not in block, (

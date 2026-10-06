@@ -1235,7 +1235,7 @@ class SignalTimelineWindow(QMainWindow):
                 
                 if 'custom' in model:
                     color = '#00ff00'
-                elif 'cuda' in model or 'r3d' in model:
+                elif 'siglip' in model:
                     color = '#0080ff'
                 else:
                     color = '#00a5ff'

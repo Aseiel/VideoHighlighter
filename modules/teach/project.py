@@ -17,8 +17,9 @@ The two JSON files are the state. Everything else can be rebuilt from them and
 the sources, which is what makes every step safe to re-run and a project safe
 to leave half-done.
 
-**Two tasks.** ``actions`` teaches a clip classifier (R3D, which the app's
-action recognition loads); a sample's label is the whole clip. ``objects``
+**Two tasks.** ``actions`` teaches a clip classifier (a head on the SigLIP2
+frame encoder, which the app's action recognition loads); a sample's label is
+the whole clip. ``objects``
 teaches a detector (YOLOX); a sample is a place to look, and the labels are
 boxes on its frames.
 """

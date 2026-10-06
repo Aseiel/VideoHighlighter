@@ -88,7 +88,6 @@ except Exception:
     pass
 
 from modules.system.app_paths import resource_path as _resource_path, data_file as _data_file, config_path
-from modules.system.app_paths import action_model_file as _action_model_file
 from version import __version__, __edition__
 
 # --- Contact / support details shown in the About tab ---
@@ -102,11 +101,11 @@ REPO_URL = "https://github.com/Aseiel/VideoHighlighter"
 CONFIG_FILE = config_path("config.yaml")
 
 YOLO_OBJECTS_LABELS_FILE = _resource_path("yolo_objects_labels.json")
-KINETICS_400_LABELS_FILE = _resource_path("kinetics_400_labels.json")
-# Trained action models live in models/actions/ (the flat root locations stay
-# as a fallback) — see app_paths.action_model_file().
-INTEL_CUSTOM_LABELS_FILE = _action_model_file("intel_finetuned_classifier_3d_mapping.json")
-R3D_CUSTOM_LABELS_FILE = _action_model_file("r3d_finetuned_mapping.json")
+# Suggestions for the action field. SigLIP2 scores any action by name; this
+# list is what the field offers as you type (Kinetics-700-2020, CC BY 4.0).
+KINETICS_700_LABELS_FILE = _resource_path("kinetics_700_labels.json")
+# The analysis cache still records a sample rate; actions no longer read it.
+ACTION_SAMPLE_RATE = 5
 
 class LabelSelectorDialog(QDialog):
     """Dialog with search/filter and multi-select for labels."""
@@ -1863,11 +1862,14 @@ class VideoHighlighterGUI(QWidget):
         # Action keywords
         action_kw_layout = QHBoxLayout()
         self.actions_input = QLineEdit(",".join(self.config_data.get("actions", {}).get("interesting", [])))
-        self.actions_input.setPlaceholderText("high jump, high kick, archery")
+        self.actions_input.setPlaceholderText(
+            "type any action, e.g. high jump, dancing (blank = any)")
         action_kw_layout.addWidget(QLabel("Action keywords:"))
         action_kw_layout.addWidget(self.actions_input)
         self.load_actions_btn = QPushButton("Load Labels")
-        self.load_actions_btn.setToolTip("Load labels from kinetics_400_labels.json (or custom Intel model)")
+        self.load_actions_btn.setToolTip(
+            "Pick from your trained action model's actions and the Kinetics-700 list.\n"
+            "Any other action can be typed: SigLIP2 scores actions by name.")
         self.load_actions_btn.clicked.connect(self.open_action_label_selector)
         action_kw_layout.addWidget(self.load_actions_btn)
         basic_layout.addLayout(action_kw_layout, 2, 0, 1, 2)
@@ -2165,201 +2167,26 @@ class VideoHighlighterGUI(QWidget):
         advanced_layout.addWidget(object_box, 2, 0)
 
         # ── Group 3: Action Recognition ──
+        # One model family: SigLIP2. With a model the user trained, its
+        # actions; without one, any action by name, Kinetics-700 suggested.
+        # The Intel and R3D models are gone (0.13.1).
         action_box = QGroupBox("Action Recognition")
         action_layout = QFormLayout()
-
-        self.sample_rate_spin = QSpinBox()
-        self.sample_rate_spin.setRange(1, 30)
-        self.sample_rate_spin.setValue(advanced_cfg.get("sample_rate", 5))
-        self.sample_rate_spin.setToolTip("Sample every Nth frame for action recognition clips")
-
-        self.action_backend_combo = QComboBox()
-        # "Auto" has picked DirectML since R3D learned to run through ONNX
-        # Runtime; the old label predated that and named three of the four.
-        self.action_backend_combo.addItem(
-            "Auto (your action head if installed, else the old models)", "auto")
-        self.action_backend_combo.addItem(
-            "SigLIP2 + your trained action head", "siglip2")
-        # The Intel and R3D paths are being retired in favour of SigLIP2.
-        self.action_backend_combo.addItem(
-            "OpenVINO, Intel model (deprecated)", "openvino")
-        self.action_backend_combo.addItem("R3D + CUDA (deprecated)", "r3d_cuda")
-        self.action_backend_combo.addItem("R3D + DirectML (deprecated)", "r3d_dml")
-        self.action_backend_combo.addItem("R3D + CPU (deprecated)", "r3d_cpu")
-        current_backend = advanced_cfg.get("action_backend", "auto")
-        idx_ab = self.action_backend_combo.findData(current_backend)
-        self.action_backend_combo.setCurrentIndex(idx_ab if idx_ab >= 0 else 0)
-
-        self._intel_count = len(self.load_labels_from_json(KINETICS_400_LABELS_FILE)) if os.path.exists(KINETICS_400_LABELS_FILE) else 0
-        self._custom_ov_count = len(self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)) if os.path.exists(INTEL_CUSTOM_LABELS_FILE) else 0
-        self._r3d_custom_count = len(self.load_labels_from_json(R3D_CUSTOM_LABELS_FILE)) if os.path.exists(R3D_CUSTOM_LABELS_FILE) else 0
-
-        self.action_models_combo = QComboBox()
-
-        import_action_btn = QPushButton("Import model…")
-        import_action_btn.setToolTip(
-            "Copy a trained custom action model into the app's custom-model slot:\n"
-            "  • OpenVINO decoder (.xml + .bin)\n"
-            "  • R3D fine-tuned weights (.pth)\n"
-            "A same-named .json (labels / mapping) next to it is picked up "
-            "automatically, or you'll be asked to pick one.")
+        self.action_model_label = QLabel()
+        self.action_model_label.setWordWrap(True)
+        self.action_encoder_btn = QPushButton("Download…")
+        self.action_encoder_btn.setToolTip(
+            "Download the action model (SigLIP2, Apache-2.0). Needed once.")
+        self.action_encoder_btn.clicked.connect(self._download_action_encoder)
         action_model_row = QHBoxLayout()
-        action_model_row.addWidget(self.action_models_combo, 1)
-        action_model_row.addWidget(import_action_btn)
+        action_model_row.addWidget(self.action_model_label, 1)
+        action_model_row.addWidget(self.action_encoder_btn)
         action_model_widget = QWidget()
         action_model_widget.setLayout(action_model_row)
-
-        def _import_action_model():
-            src, _ = QFileDialog.getOpenFileName(
-                self, "Import custom action model", "",
-                "Action models (*.xml *.pth);;OpenVINO IR (*.xml);;"
-                "R3D weights (*.pth);;All files (*)")
-            if not src:
-                return
-            is_r3d = src.lower().endswith(".pth")
-            labels_src = ""
-            if not os.path.exists(os.path.splitext(src)[0] + ".json"):
-                prompt = ("R3D mapping file (idx_to_label + metadata JSON)" if is_r3d
-                          else "Labels file for this decoder (idx_to_label JSON)")
-                labels_src, _ = QFileDialog.getOpenFileName(
-                    self, prompt, "", "JSON (*.json);;All files (*)")
-            try:
-                # Fresh re-resolution (not the frozen *_LABELS_FILE constants) so
-                # the newly imported model's class count shows up immediately,
-                # without requiring an app restart.
-                if is_r3d:
-                    from modules.system.app_paths import (
-                        import_r3d_action_model, r3d_custom_action_paths)
-                    n_classes, variant = import_r3d_action_model(src, labels_src)
-                    if n_classes == 0:
-                        print("⚠️ R3D model imported without a mapping file — it won't "
-                              "be usable until one is provided")
-                    elif not variant:
-                        print("⚠️ R3D mapping has no model_variant — the loader will use "
-                              "the 'R3D model variant' dropdown selection")
-                    fresh = r3d_custom_action_paths()[1]
-                    self._r3d_custom_count = (
-                        len(self.load_labels_from_json(fresh)) if os.path.exists(fresh) else 0)
-                    select_mode = "r3d_custom_only"
-                else:
-                    from modules.system.app_paths import (
-                        import_custom_action_model, custom_action_decoder_paths)
-                    n_classes = import_custom_action_model(src, labels_src)
-                    if n_classes == 0:
-                        print("⚠️ Custom action decoder imported without a labels file "
-                              "— it won't be usable until one is provided")
-                    fresh = custom_action_decoder_paths()[2]
-                    self._custom_ov_count = (
-                        len(self.load_labels_from_json(fresh)) if os.path.exists(fresh) else 0)
-                    select_mode = "custom_only"
-
-                on_action_backend_changed(0)
-                idx = self.action_models_combo.findData(select_mode)
-                if idx < 0 and n_classes:
-                    # The mode isn't offered under the current Backend, so switch to
-                    # one that enables the just-imported model — preferring GPU —
-                    # instead of leaving the user to hunt through the dropdown:
-                    #   • R3D custom needs an R3D backend. "Auto" would *disable* R3D
-                    #     on a non-CUDA machine (see pipeline.py), which would make
-                    #     r3d_custom_only fail to load — so pick r3d_cuda when an
-                    #     NVIDIA GPU is present, else r3d_cpu (slow, but it runs).
-                    #   • OpenVINO custom → "Auto" (lists it, and uses the Intel
-                    #     GPU / CPU at runtime).
-                    if select_mode == "r3d_custom_only":
-                        try:
-                            from modules.system.device_utils import detect_best_device
-                            has_cuda = detect_best_device(
-                                log_fn=lambda *a, **k: None).pytorch_device == "cuda"
-                        except Exception:
-                            has_cuda = False
-                        target_backend = "r3d_cuda" if has_cuda else "r3d_cpu"
-                    else:
-                        target_backend = "auto"
-                    # Setting the combo fires on_action_backend_changed, which
-                    # rebuilds the models list, so re-query the index afterward.
-                    ab_idx = self.action_backend_combo.findData(target_backend)
-                    if ab_idx >= 0:
-                        self.action_backend_combo.setCurrentIndex(ab_idx)
-                        idx = self.action_models_combo.findData(select_mode)
-                if idx >= 0:
-                    self.action_models_combo.setCurrentIndex(idx)
-            except Exception as e:
-                print(f"⚠️ action model import failed: {e}")
-
-        import_action_btn.clicked.connect(_import_action_model)
-
-        self.r3d_model_combo = QComboBox()
-        self.r3d_model_combo.addItem("R3D-18 (fastest)", "r3d_18")
-        self.r3d_model_combo.addItem("MC3-18 (mixed convolution)", "mc3_18")
-        self.r3d_model_combo.addItem("R(2+1)D-18 (most accurate)", "r2plus1d_18")
-        current_r3d = advanced_cfg.get("r3d_model", "r3d_18")
-        idx_r3d = self.r3d_model_combo.findData(current_r3d)
-        self.r3d_model_combo.setCurrentIndex(idx_r3d if idx_r3d >= 0 else 0)
-
-        def on_action_backend_changed(index):
-            backend = self.action_backend_combo.currentData()
-            self.r3d_model_combo.setEnabled(backend in ("auto", "r3d_cuda", "r3d_cpu"))
-
-            prev_data = self.action_models_combo.currentData()
-            self.action_models_combo.blockSignals(True)
-            self.action_models_combo.clear()
-            self.action_models_combo.setEnabled(backend != "siglip2")
-
-            if backend == "siglip2":
-                from modules.vision import action_siglip
-                head = action_siglip.installed_head_classes()
-                self.action_models_combo.addItem(
-                    f"Action head: {head[0]} ({len(head[1])} classes)" if head
-                    else "No action head installed - train one first", "siglip2")
-            elif backend in ("openvino",):
-                if self._intel_count:
-                    self.action_models_combo.addItem(f"Intel Kinetics-400 ({self._intel_count} classes)", "intel_only")
-                if self._custom_ov_count:
-                    self.action_models_combo.addItem(f"Custom OpenVINO ({self._custom_ov_count} classes)", "custom_only")
-                if self._intel_count and self._custom_ov_count:
-                    total = self._intel_count + self._custom_ov_count
-                    self.action_models_combo.addItem(f"Mixed — both decoders ({total} classes)", "mixed")
-            elif backend in ("r3d_cuda", "r3d_cpu"):
-                if self._intel_count:
-                    self.action_models_combo.addItem(f"R3D Kinetics-400 pretrained ({self._intel_count} classes)", "intel_only")
-                if self._r3d_custom_count:
-                    self.action_models_combo.addItem(f"R3D fine-tuned ({self._r3d_custom_count} classes)", "r3d_custom_only")
-                if self._intel_count and self._r3d_custom_count:
-                    total = self._intel_count + self._r3d_custom_count
-                    self.action_models_combo.addItem(f"Mixed — both R3D ({total} classes)", "mixed")
-            else:
-                if self._intel_count:
-                    self.action_models_combo.addItem(f"Intel Kinetics-400 ({self._intel_count} classes)", "intel_only")
-                if self._custom_ov_count:
-                    self.action_models_combo.addItem(f"Custom OpenVINO ({self._custom_ov_count} classes)", "custom_only")
-                if self._r3d_custom_count:
-                    self.action_models_combo.addItem(f"R3D fine-tuned ({self._r3d_custom_count} classes)", "r3d_custom_only")
-                available = sum(1 for c in [self._intel_count, self._custom_ov_count, self._r3d_custom_count] if c > 0)
-                if available >= 2:
-                    total = self._intel_count + self._custom_ov_count + self._r3d_custom_count
-                    self.action_models_combo.addItem(f"Mixed — all models ({total} classes)", "mixed")
-
-            restore_idx = self.action_models_combo.findData(prev_data)
-            if restore_idx >= 0:
-                self.action_models_combo.setCurrentIndex(restore_idx)
-            self.action_models_combo.blockSignals(False)
-            self.update_actions_completer()
-
-        self.action_backend_combo.currentIndexChanged.connect(on_action_backend_changed)
-        self.action_models_combo.currentIndexChanged.connect(lambda: self.update_actions_completer())
-        on_action_backend_changed(0)
-        current_action_models = advanced_cfg.get("action_models", "mixed")
-        restore_idx = self.action_models_combo.findData(current_action_models)
-        if restore_idx >= 0:
-            self.action_models_combo.setCurrentIndex(restore_idx)
-
-        action_layout.addRow("Frame skip:", self.sample_rate_spin)
-        action_layout.addRow("Backend:", self.action_backend_combo)
-        action_layout.addRow("Models:", action_model_widget)
-        action_layout.addRow("R3D model variant:", self.r3d_model_combo)
-
+        action_layout.addRow("Model:", action_model_widget)
         action_box.setLayout(action_layout)
         advanced_layout.addWidget(action_box, 2, 1)
+        self._refresh_action_model_status()
 
         # ── Group 4: Bounding Box Visualization ──
         # ── Group 4: Composition Rules ──
@@ -4325,7 +4152,6 @@ class VideoHighlighterGUI(QWidget):
             "yolo_type": self.object_detector_choice()[0],
             "yolo_model_size": self.yolo_model_combo.currentData(),
             "yolo_custom_model_path": self.object_detector_choice()[1] or getattr(self, "_custom_pose_model", None),
-            "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
             "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
@@ -4333,9 +4159,6 @@ class VideoHighlighterGUI(QWidget):
             "write_highlight_report": self.why_report_chk.isChecked(),
             **self._report_config(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
-            "action_backend": self.action_backend_combo.currentData(),
-            "r3d_model": self.r3d_model_combo.currentData(),
-            "action_models": self.action_models_combo.currentData(),
             "object_confidence": self.obj_confidence_spin.value() / 100.0,
             "force_reprocess": self.force_reprocess_checkbox.isChecked(),
         }
@@ -4761,19 +4584,11 @@ class VideoHighlighterGUI(QWidget):
             self.vr_mode_chk.setChecked(bool(adv["vr_mode"]))
         if "object_frame_skip" in adv:
             self.obj_frame_skip_spin.setValue(int(adv["object_frame_skip"]))
-        if "sample_rate" in adv:
-            self.sample_rate_spin.setValue(int(adv["sample_rate"]))
         if "yolo_type" in adv or "yolo_custom_model_path" in adv:
             self._select_object_model(adv.get("yolo_type", "standard"),
                                       adv.get("yolo_custom_model_path") or "")
         if "yolo_model_size" in adv:
             self._set_combo_data(self.yolo_model_combo, adv["yolo_model_size"])
-        if "action_backend" in adv:
-            self._set_combo_data(self.action_backend_combo, adv["action_backend"])
-        if "action_models" in adv:
-            self._set_combo_data(self.action_models_combo, adv["action_models"])
-        if "r3d_model" in adv:
-            self._set_combo_data(self.r3d_model_combo, adv["r3d_model"])
 
         comp = data.get("compute") or {}
         if "backend" in comp:
@@ -4942,13 +4757,9 @@ class VideoHighlighterGUI(QWidget):
                 "frame_skip": int(self.frame_skip_spin.value()),
                 "vr_mode": self.vr_mode_chk.isChecked(),
                 "object_frame_skip": int(self.obj_frame_skip_spin.value()),
-                "sample_rate": int(self.sample_rate_spin.value()),
                 "yolo_type": self.object_detector_choice()[0],
                 "yolo_model_size": self.yolo_model_combo.currentData(),
                 "yolo_custom_model_path": self.object_detector_choice()[1],
-                "action_backend": self.action_backend_combo.currentData(),
-                "r3d_model": self.r3d_model_combo.currentData(),
-                "action_models": self.action_models_combo.currentData(),
             },
             "compute": {
                 "backend": self.backend_combo.currentData(),
@@ -5098,107 +4909,70 @@ class VideoHighlighterGUI(QWidget):
             self.objects_input.setText(", ".join(selected))
             self.append_log(f"✅ Loaded {len(selected)} object labels")
 
-    def _siglip_action_labels(self):
-        """``(head name, classes)`` when the action backend resolves to SigLIP2
-        and a head is installed, else None. With that backend the actions to
-        look for are the user's own classes, not a built-in label list."""
-        backend = self.action_backend_combo.currentData()
-        if backend not in ("siglip2", "auto"):
-            return None
-        from modules.vision import action_siglip
-        if backend == "auto" and not action_siglip.available():
-            return None
-        return action_siglip.installed_head_classes()
+    def _action_suggestions(self):
+        """``(where from, actions)`` the action field offers: a trained
+        model's own actions first when one is installed, then Kinetics-700.
+        Suggestions only; SigLIP2 scores any typed action."""
+        labels, sources = [], []
+        try:
+            from modules.vision import action_siglip
+            head = action_siglip.installed_head_classes()
+            if head and head[0] != action_siglip.TEXT_SOURCE:
+                labels += sorted(head[1])
+                sources.append(f"your model {head[0]} ({len(head[1])})")
+        except Exception as e:
+            print(f"⚠️ action model lookup failed: {e}")
+        if os.path.exists(KINETICS_700_LABELS_FILE):
+            k700 = self.load_labels_from_json(KINETICS_700_LABELS_FILE)
+            known = {l.lower() for l in labels}
+            labels += [l for l in k700 if l.lower() not in known]
+            sources.append(f"Kinetics-700 ({len(k700)})")
+        return " + ".join(sources) or "none", labels
+
+    def _refresh_action_model_status(self):
+        """Say which action model a run would use, and offer the download
+        when there is none."""
+        try:
+            from modules.vision import action_siglip, frame_encoder
+            installed = frame_encoder.is_installed()
+            head = action_siglip.installed_head_classes() if installed else None
+            if not installed:
+                text = ("Not installed. Action recognition needs the SigLIP2 action "
+                        "model, downloaded once.")
+            elif head and head[0] != action_siglip.TEXT_SOURCE:
+                text = (f"SigLIP2 with your trained model {head[0]} "
+                        f"({len(head[1])} actions)")
+            elif frame_encoder.has_text():
+                text = "SigLIP2: type any action; Kinetics-700 names are suggested"
+            else:
+                text = "SigLIP2: actions from the Kinetics-700 list"
+        except Exception as e:
+            installed, text = False, f"Unavailable ({e})"
+        self.action_model_label.setText(text)
+        self.action_encoder_btn.setVisible(not installed)
+        self._actions_completer_models = None
+        self.update_actions_completer()
+
+    def _download_action_encoder(self) -> bool:
+        from modules.packs import pack_ui
+        ok = pack_ui.ensure_pack(
+            self, pack_ui.FRAME_ENCODER_PACK,
+            why="Action recognition needs the SigLIP2 action model.")
+        self._refresh_action_model_status()
+        return ok
 
     def open_action_label_selector(self):
-        """Open label selector based on current backend and action models settings."""
-        siglip = self._siglip_action_labels()
-        if siglip is not None:
-            name, labels = siglip
-            current = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
-            dlg = LabelSelectorDialog(
-                f"Select Action Labels (action head {name} — {len(labels)} classes)",
-                sorted(labels), current, self)
-            if dlg.exec() == QDialog.Accepted:
-                selected = dlg.get_selected_labels()
-                self.actions_input.setText(", ".join(selected))
-                self.append_log(f"✅ Loaded {len(selected)} action labels from {name}")
-            return
-        backend = self.action_backend_combo.currentData()
-        action_models = self.action_models_combo.currentData()
-
-        # R3D-only always uses Kinetics-400
-        if backend in ("r3d_cuda", "r3d_cpu"):
-            action_models = "intel_only"
-
-        if action_models == "custom_only":
-            label_file = INTEL_CUSTOM_LABELS_FILE
-            title = f"Select Action Labels (Custom Fine-tuned — {self._custom_ov_count} classes)"
-        elif action_models == "intel_only":
-            label_file = KINETICS_400_LABELS_FILE
-            title = "Select Action Labels (Intel Kinetics-400 — 400 classes)"
-        elif action_models == "r3d_custom_only":
-            label_file = R3D_CUSTOM_LABELS_FILE
-            title = "Select Action Labels (R3D Fine-tuned)"
-        elif action_models == "mixed":
-            # Show labels tagged with source model
-            custom_labels = []
-            intel_labels = []
-            if os.path.exists(INTEL_CUSTOM_LABELS_FILE):
-                custom_labels = self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)
-            if os.path.exists(KINETICS_400_LABELS_FILE):
-                intel_labels = self.load_labels_from_json(KINETICS_400_LABELS_FILE)
-
-            tagged = []
-            custom_set = set(l.lower() for l in custom_labels)
-            intel_set = set(l.lower() for l in intel_labels)
-            # Labels in both → show tagged versions
-            overlap = custom_set & intel_set
-            for label in sorted(custom_labels):
-                if label.lower() in overlap:
-                    tagged.append(f"{label} [custom]")
-                else:
-                    tagged.append(label)
-            for label in sorted(intel_labels):
-                if label.lower() in overlap:
-                    tagged.append(f"{label} [intel]")
-                else:
-                    if label.lower() not in custom_set:  # avoid duplicates for non-overlap
-                        tagged.append(label)
-            tagged.sort()
-
-            if not tagged:
-                self.append_log("⚠️ No label files found")
-                return
-            current = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
-            overlap_count = len(overlap)
-            dlg = LabelSelectorDialog(
-                f"Select Action Labels (Mixed — {len(tagged)} labels, {overlap_count} shared)",
-                tagged, current, self)
-            if dlg.exec() == QDialog.Accepted:
-                selected = dlg.get_selected_labels()
-                self.actions_input.setText(", ".join(selected))
-                self.append_log(f"✅ Loaded {len(selected)} action labels (mixed)")
-            return
-        else:
-            label_file = KINETICS_400_LABELS_FILE
-            title = "Select Action Labels"
-
-        if not os.path.exists(label_file):
-            self.append_log(f"⚠️ Label file not found: {label_file}")
-            return
-
-        labels = self.load_labels_from_json(label_file)
+        """Pick actions from the suggestions; anything else can be typed."""
+        source, labels = self._action_suggestions()
         if not labels:
-            self.append_log(f"⚠️ No labels found in {label_file}")
+            self.append_log("⚠️ No action list found")
             return
-
         current = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
-        dlg = LabelSelectorDialog(title, labels, current, self)
+        dlg = LabelSelectorDialog(f"Select actions ({source})", labels, current, self)
         if dlg.exec() == QDialog.Accepted:
             selected = dlg.get_selected_labels()
             self.actions_input.setText(", ".join(selected))
-            self.append_log(f"✅ Loaded {len(selected)} action labels from {os.path.basename(label_file)}")
+            self.append_log(f"✅ Loaded {len(selected)} actions")
 
     def setup_label_completers(self):
         if os.path.exists(YOLO_OBJECTS_LABELS_FILE):
@@ -5209,68 +4983,15 @@ class VideoHighlighterGUI(QWidget):
                 self.objects_input.setCompleter(completer)
 
     def update_actions_completer(self):
-        """Update actions auto-complete labels based on selected backend and action models.
-
-        Called from several places that can fire in one cascade (a backend change
-        repopulates the model combo, which re-emits currentIndexChanged), so it
-        no-ops when the selection resolves to the labels already installed."""
-        backend = self.action_backend_combo.currentData()
-        action_models = self.action_models_combo.currentData()
-
-        # R3D-only always uses Kinetics-400
-        if backend in ("r3d_cuda", "r3d_cpu"):
-            action_models = "intel_only"
-
-        siglip = self._siglip_action_labels()
-        if siglip is not None:
-            action_models = ("siglip2",) + tuple(siglip[1])
-
-        if action_models == getattr(self, "_actions_completer_models", -1):
+        """Offer the action suggestions as the field's auto-complete. No-ops
+        when they have not changed."""
+        source, labels = self._action_suggestions()
+        key = (source, len(labels))
+        if key == getattr(self, "_actions_completer_models", None):
             return
-        self._actions_completer_models = action_models
-
-        action_labels = []
-        source = None
-
-        if siglip is not None:
-            action_labels = sorted(siglip[1])
-            source = f"action head {siglip[0]} ({len(action_labels)} classes)"
-        elif action_models == "custom_only":
-            if os.path.exists(INTEL_CUSTOM_LABELS_FILE):
-                action_labels = self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)
-                source = f"Custom fine-tuned ({self._custom_ov_count} classes)"
-        elif action_models == "intel_only":
-            if os.path.exists(KINETICS_400_LABELS_FILE):
-                action_labels = self.load_labels_from_json(KINETICS_400_LABELS_FILE)
-                source = "Intel Kinetics-400 (400 classes)"
-        elif action_models == "r3d_custom_only":
-            if os.path.exists(R3D_CUSTOM_LABELS_FILE):
-                action_labels = self.load_labels_from_json(R3D_CUSTOM_LABELS_FILE)
-                source = f"R3D fine-tuned ({len(action_labels)} classes)"
-        elif action_models == "mixed":
-            custom_labels = []
-            intel_labels = []
-            if os.path.exists(INTEL_CUSTOM_LABELS_FILE):
-                custom_labels = self.load_labels_from_json(INTEL_CUSTOM_LABELS_FILE)
-            if os.path.exists(KINETICS_400_LABELS_FILE):
-                intel_labels = self.load_labels_from_json(KINETICS_400_LABELS_FILE)
-            # Build tagged list for overlapping labels
-            custom_set = set(l.lower() for l in custom_labels)
-            intel_set = set(l.lower() for l in intel_labels)
-            overlap = custom_set & intel_set
-            tagged = []
-            for label in custom_labels:
-                tagged.append(f"{label} [custom]" if label.lower() in overlap else label)
-            for label in intel_labels:
-                if label.lower() in overlap:
-                    tagged.append(f"{label} [intel]")
-                elif label.lower() not in custom_set:
-                    tagged.append(label)
-            action_labels = sorted(set(tagged))
-            source = f"Mixed ({len(custom_labels)} custom + {len(intel_labels)} Kinetics-400, {len(overlap)} shared, {len(action_labels)} total)"
-
-        if action_labels:
-            completer = MultiCompleter(action_labels, self)
+        self._actions_completer_models = key
+        if labels:
+            completer = MultiCompleter(labels, self)
             completer.setMaxVisibleItems(10)
             self.actions_input.setCompleter(completer)
             print(f"🔤 Actions auto-complete: {source}")
@@ -5801,7 +5522,6 @@ class VideoHighlighterGUI(QWidget):
             "yolo_type": self.object_detector_choice()[0],
             "yolo_model_size": self.yolo_model_combo.currentData(),
             "yolo_custom_model_path": self.object_detector_choice()[1] or getattr(self, "_custom_pose_model", None),
-            "sample_rate": int(self.sample_rate_spin.value()),
             "auto_min_clip": float(self.spin_auto_min_clip.value()),
             "auto_max_clip": float(self.spin_auto_max_clip.value()),
             "auto_merge_gap": float(self.spin_auto_merge_gap.value()),
@@ -5809,8 +5529,6 @@ class VideoHighlighterGUI(QWidget):
             "write_highlight_report": self.why_report_chk.isChecked(),
             **self._report_config(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
-            "action_backend": self.action_backend_combo.currentData(),
-            "r3d_model": self.r3d_model_combo.currentData(),
             "avoid_enabled": self.avoid_face_recognition_chk.isChecked() and bool(avoid_ids),
             "avoid_method": getattr(self, "_avoid_method", "skip"),
             "avoid_identity_ids": avoid_ids,
@@ -5851,6 +5569,17 @@ class VideoHighlighterGUI(QWidget):
             config["range_end"] = int(end_pct * self.current_video_duration)
         else:
             config["use_time_range"] = False
+
+        # Actions need the SigLIP2 action model, a one-time download. Offered
+        # here, before the run, rather than found missing halfway through it.
+        if config.get("interesting_actions") or float(config.get("action_points", 0) or 0) > 0:
+            try:
+                from modules.vision import frame_encoder
+                if not frame_encoder.is_installed() and not self._download_action_encoder():
+                    self.append_log("⚠️ Running without action recognition: the action "
+                                    "model is not installed")
+            except Exception as e:
+                print(f"⚠️ action model check failed: {e}")
 
         # UI state changes
         self.process_progress_bar.setVisible(True)
@@ -6329,7 +6058,7 @@ class VideoHighlighterGUI(QWidget):
                             cfg_data = yaml.safe_load(_f) or {}
                     analysis_params = build_analysis_cache_params(
                         gui_config=config, config=cfg_data,
-                        sample_rate=int(self.sample_rate_spin.value()),
+                        sample_rate=ACTION_SAMPLE_RATE,
                         video_duration=video_duration,
                     )
                     cache = VideoAnalysisCache(cache_dir=config.get("cache_dir", "./cache"))
@@ -7130,7 +6859,7 @@ class VideoHighlighterGUI(QWidget):
             cap.release()
             
             # Build analysis params that match what was used
-            sample_rate = int(self.sample_rate_spin.value())
+            sample_rate = ACTION_SAMPLE_RATE
             
             # Load config.yaml defaults
             cfg_data = {}

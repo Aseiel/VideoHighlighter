@@ -230,10 +230,8 @@ def cmd_focus(args, project):
 def cmd_sort(args, project):
     from modules.teach import sort
     classifier = None
-    if args.model_xml:
-        base = os.path.splitext(args.model_xml)[0]
-        classifier = sort.sorter_classifier(args.model_xml, base + ".bin",
-                                            args.model_mapping or base + ".json")
+    if args.head:
+        classifier = sort.head_classifier(args.head)
     elif not args.no_model:
         # From round 2 the project's own model proposes too, and review asks
         # first about where it and CLIP disagree.
@@ -473,13 +471,12 @@ def cmd_evaluate(args, root):
             data["clips"], make_embedder(args.embedder), root, holdout=args.holdout,
             max_examples=args.max_examples, rng_seed=args.rng,
             settings=parse_settings(args.set), progress=say, minimum=args.min_examples)
-    if args.weights:
-        from modules.teach.sort import r3d_scorer
+    if args.head:
+        from modules.teach.sort import head_scorer
 
-        mapping = args.mapping or os.path.splitext(args.weights)[0] + "_mapping.json"
-        result["model"] = {"weights": os.path.abspath(args.weights), "mapping": mapping}
+        result["model"] = {"head": os.path.abspath(args.head)}
         result["model"].update(benchmark.model_test(
-            data["clips"], r3d_scorer(args.weights, mapping), progress=say))
+            data["clips"], head_scorer(args.head), progress=say))
     os.makedirs(root, exist_ok=True)
     saved = os.path.join(root, time.strftime("evaluate-%Y%m%d-%H%M%S.json"))
     with open(saved, "w", encoding="utf-8") as handle:
@@ -494,7 +491,7 @@ def cmd_from_dataset(args, root):
 
     from modules.teach import benchmark, dataset_sort
     from modules.teach.cut import cut_project
-    from modules.teach.sort import r3d_classifier, sort_project
+    from modules.teach.sort import head_classifier, sort_project
 
     def say(message):
         print(message, file=sys.stderr)
@@ -529,10 +526,7 @@ def cmd_from_dataset(args, root):
         videos = cmd_add_video(SimpleNamespace(items=args.videos), project)["sources"]
     cut = cut_project(project, progress=lambda s, i, n: say(f"cut {s}: {i}/{n}")
                       if i == n or i % 50 == 0 else None)
-    classifier = None
-    if args.weights:
-        mapping = args.mapping or os.path.splitext(args.weights)[0] + "_mapping.json"
-        classifier = r3d_classifier(args.weights, mapping)
+    classifier = head_classifier(args.head) if args.head else None
 
     def embedded(i, n):
         if i == n or i % 200 == 0:
@@ -643,9 +637,8 @@ def parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("sort", help="score and propose a class for every sample")
     s.add_argument("--folders", action="store_true", help="also lay out sorted/ folders")
-    s.add_argument("--model-xml", dest="model_xml",
-                   help="an Intel-encoder decoder IR for sorter.py to propose with")
-    s.add_argument("--model-mapping", dest="model_mapping")
+    s.add_argument("--head", help="a trained action head folder to propose with "
+                                  "(default: the project's installed round)")
     s.add_argument("--no-model", action="store_true", dest="no_model",
                    help="do not use the project's trained model as a second opinion")
 
@@ -742,8 +735,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--embedder", choices=("clip", "frame-encoder"), default="clip",
                    help="what turns samples into vectors (frame-encoder: SigLIP2, "
                         "examples only)")
-    s.add_argument("--weights", help="a trained R3D .pth to test on val and test")
-    s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
+    s.add_argument("--head", help="a trained action head folder to test on val and test")
 
     s = sub.add_parser("from-dataset", help="a hand-sorted dataset as the examples; "
                                             "new videos cut and sorted by it")
@@ -757,8 +749,7 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--embedder", choices=("clip", "frame-encoder"), default="clip",
                    help="what turns samples into vectors (frame-encoder: SigLIP2, "
                         "examples only)")
-    s.add_argument("--weights", help="a trained R3D .pth as a second opinion")
-    s.add_argument("--mapping", help="its mapping (default: <weights>_mapping.json)")
+    s.add_argument("--head", help="a trained action head folder as a second opinion")
     s.add_argument("--prototypes", type=int,
                    help="centres per class (a new project gets 3; 1 = the mean)")
     s.add_argument("--scorer", choices=("linear", "prototypes"),

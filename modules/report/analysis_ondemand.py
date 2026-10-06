@@ -68,9 +68,6 @@ def analysis_defaults() -> dict:
         # Which action decoders the main window is set to. Read here so an
         # on-demand run uses the models the user picked, rather than whatever
         # `run_action_detection`'s own defaults happen to be.
-        "action_backend": advanced_cfg.get("action_backend") or "auto",
-        "action_models": advanced_cfg.get("action_models") or "mixed",
-        "r3d_model": advanced_cfg.get("r3d_model") or "r3d_18",
         "whisper_model": transcript_cfg.get("model", "base") or "base",
         "language": transcript_cfg.get("source_lang", "en") or "en",
         "transcript_enabled": bool(transcript_cfg.get("enabled", False)),
@@ -305,46 +302,6 @@ def _actions_to_cache(dets) -> list:
     return out
 
 
-def _r3d_flags(action_backend: str, log=print) -> tuple:
-    """`(enable_r3d, r3d_half, r3d_device, r3d_onnx_dml)` for a backend choice —
-    the same mapping the pipeline applies, so an on-demand run picks the decoders
-    a full run would. `r3d_device` is None for "use whatever this machine
-    reports".
-
-    `r3d_onnx_dml` is permission, not a device: it says the model may move to
-    ONNX Runtime's DirectML provider if torch ends up on the processor. Only the
-    automatic branch grants it. "R3D + CPU (PyTorch, slow)" is a choice a user
-    can make on a DX12 box and it has to keep meaning the CPU there, which it
-    would not if the wrapper inferred the permission from the device alone.
-    """
-    if action_backend == "openvino":
-        return False, False, None, False
-    if action_backend == "r3d_cuda":
-        return True, True, "cuda", False    # FP16 on CUDA
-    if action_backend == "r3d_cpu":
-        return True, False, "cpu", False    # FP32 on the CPU, on every machine
-    # "auto": R3D needs a GPU to be worth it. On Intel it stays off, because
-    # OpenVINO on the Intel GPU beats R3D on the CPU. On AMD there is no such
-    # GPU path to protect — OpenVINO's plugin is Intel-only — so DirectML is
-    # competing with the processor and R3D goes there, at fp32, with the
-    # wrapper's warm-up free to demote it back if the backend cannot run it.
-    try:
-        from modules.system.device_utils import detect_best_device
-        dev = detect_best_device(log_fn=log)
-        if dev.pytorch_device == "cuda":
-            return True, True, "cuda", False
-        if dev.dml_device:
-            return True, False, dev.dml_device, False
-        # Same card, the other runtime — the packaged build's only DirectML.
-        # torch stays on the processor and the model does not: see
-        # modules/vision/r3d_onnx.py.
-        if getattr(dev, "onnx_dml_torch", False):
-            return True, False, "cpu", True
-    except Exception:
-        pass
-    return False, False, None, False
-
-
 def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
                 interesting_actions: Optional[list] = None,
                 progress: ProgressFn = None, cancel=None, log=print,
@@ -361,34 +318,20 @@ def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
     without showing anything — it detects over the whole video, exactly like
     the pipeline's stage, so it feeds the same window the pipeline does.
     Omitted, it detects silently as before."""
-    from action_recognition import run_action_detection
-    d = analysis_defaults()
-    sample_rate = sample_rate or d["sample_rate"]
+    # The same pass the pipeline runs: a head the user trained when one is
+    # installed, otherwise actions by name. A blank list means any action
+    # on the encoder's list (Kinetics-700).
+    from modules.vision import action_siglip
+    from modules.system.device_utils import detect_best_device
     keep = [a.strip() for a in (interesting_actions or []) if a and a.strip()] or None
-    enable_r3d, r3d_half, r3d_device, r3d_onnx_dml = _r3d_flags(
-        d["action_backend"], log=log)
-
-    detections, _bboxes = run_action_detection(
-        video_path=video_path,
-        sample_rate=sample_rate,
-        interesting_actions=keep,
-        progress_callback=progress,
-        cancel_flag=cancel,
-        draw_bboxes=False,
-        use_person_detection=True,
-        include_model_type=False,
-        # The decoders the main window is set to. Left at the function's own
-        # defaults this ran 'mixed' with R3D on, whatever the user picked —
-        # so choosing "OpenVINO (Intel GPU/CPU)" still loaded the R3D model
-        # and ran it on the CPU, ~70x slower than the decoder they asked for.
-        enable_r3d=enable_r3d,
-        r3d_model_name=d["r3d_model"],
-        r3d_half=r3d_half,
-        r3d_device=r3d_device,
-        r3d_onnx_dml=r3d_onnx_dml,
-        action_models=d["action_models"],
-        preview_fn=preview_fn,
-    )
+    try:
+        device = getattr(detect_best_device(log_fn=log), "openvino_device", "AUTO") or "AUTO"
+    except Exception:
+        device = "AUTO"
+    detections, _bboxes = action_siglip.run_action_detection_siglip(
+        video_path, device=device, interesting_actions=keep,
+        progress_callback=progress, cancel_flag=cancel, log=log,
+        preview_fn=preview_fn)
     if cancel is not None and cancel.is_set():
         raise _Cancelled()
     return _actions_to_cache(detections)

@@ -413,7 +413,7 @@ def run_object_detection_single(video_path, model, highlight_objects, log_fn=pri
                                     preview_fn(small, boxes, sec)
                                 except Exception as e:
                                     # Once, not per frame — see the same guard
-                                    # in action_recognition: a silently dropped
+                                    # in action_siglip: a silently dropped
                                     # preview frame is indistinguishable from a
                                     # preview nobody ever fed.
                                     if not _preview_failed:

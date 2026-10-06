@@ -156,24 +156,6 @@ def action_models_dir() -> str:
     return os.path.join(user_data_dir(), "models", "actions")
 
 
-def action_model_file(name: str) -> str:
-    """Resolve one of the fixed action-model slots for *reading*.
-
-    ``models/actions/<name>`` is where training writes and where the app looks
-    first. The flat locations ``data_file()`` checks stay as a fallback: models
-    trained before this folder existed live in the root, and a packaged exe
-    still honours a file dropped next to it. When neither exists the managed
-    path is returned, so a caller reporting "not found" names the new place.
-    """
-    managed = os.path.join(action_models_dir(), name)
-    if os.path.exists(managed):
-        return managed
-    legacy = data_file(name)
-    if os.path.exists(legacy):
-        return legacy
-    return managed
-
-
 def latest_custom_pose_model():
     """Custom keypoint models are not supported: the only trainer for them was
     AGPL, and nothing trained with it may ship. Kept so callers need no guard."""
@@ -303,114 +285,6 @@ def discover_object_models() -> list:
     except Exception as e:  # noqa: BLE001 - a broken install must not hide the rest
         print(f"⚠️ community model discovery failed: {e}")
     return out
-
-
-def custom_action_decoder_paths() -> tuple[str, str, str]:
-    """Where to read the user's custom fine-tuned OpenVINO action decoder from:
-    (xml, bin, labels_json).
-
-    ``models/actions/`` first — that is where the Intel trainer writes and where
-    the Advanced tab's "Import model…" button installs — then the legacy flat
-    locations ``data_file()`` resolves, so an older install keeps working."""
-    return (
-        action_model_file("action_classifier_3d.xml"),
-        action_model_file("action_classifier_3d.bin"),
-        action_model_file("intel_finetuned_classifier_3d_mapping.json"),
-    )
-
-
-def import_custom_action_model(decoder_xml_src: str, labels_json_src: str = "") -> int:
-    """Install a user-trained OpenVINO action decoder (+ its .bin, + a labels
-    mapping) into the writable user-data location, so it's picked up in place
-    of the bundled default — mirrors object_models_dir()'s import flow, but
-    for the single custom-action-decoder slot (no multi-model discovery here).
-
-    ``labels_json_src`` may be omitted — a same-named ``*.json`` next to
-    ``decoder_xml_src`` is used automatically if present (what the training
-    pipeline writes alongside the decoder).
-
-    Returns the number of classes found in the installed labels file (0 if
-    none), so the caller can report/validate the import.
-    """
-    # Always install into the managed folder, never over a legacy root copy the
-    # reader may still be resolving: models/actions/ wins the lookup, so the
-    # freshly imported model is the one that loads.
-    dest = action_models_dir()
-    os.makedirs(dest, exist_ok=True)
-    dst_xml = os.path.join(dest, "action_classifier_3d.xml")
-    dst_bin = os.path.join(dest, "action_classifier_3d.bin")
-    dst_labels = os.path.join(dest, "intel_finetuned_classifier_3d_mapping.json")
-    shutil.copy2(decoder_xml_src, dst_xml)
-
-    src_bin = os.path.splitext(decoder_xml_src)[0] + ".bin"
-    if os.path.exists(src_bin):
-        shutil.copy2(src_bin, dst_bin)
-
-    if not labels_json_src:
-        candidate = os.path.splitext(decoder_xml_src)[0] + ".json"
-        if os.path.exists(candidate):
-            labels_json_src = candidate
-
-    n_classes = 0
-    if labels_json_src and os.path.exists(labels_json_src):
-        shutil.copy2(labels_json_src, dst_labels)
-        try:
-            import json
-            with open(dst_labels, "r", encoding="utf-8") as f:
-                n_classes = len(json.load(f).get("idx_to_label", {}))
-        except Exception:
-            pass
-    return n_classes
-
-
-def r3d_custom_action_paths() -> tuple[str, str]:
-    """Where to read the user's custom fine-tuned R3D (PyTorch) action model
-    from: (weights_pth, mapping_json). ``models/actions/`` first, then the
-    legacy flat locations — same rule as custom_action_decoder_paths()."""
-    return (
-        action_model_file("r3d_finetuned.pth"),
-        action_model_file("r3d_finetuned_mapping.json"),
-    )
-
-
-def import_r3d_action_model(weights_pth_src: str, mapping_json_src: str = "") -> tuple[int, str]:
-    """Install a user-trained R3D (PyTorch) action model (+ its mapping JSON)
-    into the writable user-data location, alongside import_custom_action_model()
-    but for the R3D slot.
-
-    Unlike the OpenVINO decoder, the mapping JSON is effectively required — it
-    carries both the class labels (``idx_to_label``) and the
-    ``metadata.model_variant`` (r3d_18 / mc3_18 / r2plus1d_18) the loader needs
-    to rebuild the right architecture before loading the weights. A same-named
-    ``*.json`` next to the ``.pth`` is used automatically if present.
-
-    Returns ``(num_classes, model_variant)`` — ``model_variant`` is ``""`` when
-    the mapping omits it, in which case the loader falls back to the UI's
-    "R3D model variant" dropdown selection.
-    """
-    dest = action_models_dir()
-    os.makedirs(dest, exist_ok=True)
-    dst_pth = os.path.join(dest, "r3d_finetuned.pth")
-    dst_mapping = os.path.join(dest, "r3d_finetuned_mapping.json")
-    shutil.copy2(weights_pth_src, dst_pth)
-
-    if not mapping_json_src:
-        candidate = os.path.splitext(weights_pth_src)[0] + ".json"
-        if os.path.exists(candidate):
-            mapping_json_src = candidate
-
-    n_classes, variant = 0, ""
-    if mapping_json_src and os.path.exists(mapping_json_src):
-        shutil.copy2(mapping_json_src, dst_mapping)
-        try:
-            import json
-            with open(dst_mapping, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            n_classes = len(data.get("idx_to_label", {}))
-            variant = (data.get("metadata") or {}).get("model_variant", "") or ""
-        except Exception:
-            pass
-    return n_classes, variant
 
 
 def ffmpeg_exe() -> str:

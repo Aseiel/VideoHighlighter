@@ -1,7 +1,7 @@
 """Custom categories taught from example frames.
 
 The label-based backends can only report what their vocabulary already contains
-— Kinetics-400's activity list, COCO's 80 objects. Anything outside it has no
+— COCO's 80 objects, for one. Anything outside it has no
 output, at any threshold. This module removes the vocabulary: the user points at
 a few frames that show what they mean, and that becomes a matchable category. No
 dataset, no training run, no GPU.

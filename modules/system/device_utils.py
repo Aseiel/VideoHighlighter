@@ -6,7 +6,7 @@ Centralized device detection and resolution for the highlight pipeline.
 One source of truth for all device strings passed to:
   - YOLO / Ultralytics  (.pt models and OpenVINO models)
   - OpenVINO            (action recognition encoder/decoder)
-  - PyTorch / R3D       (action recognition CUDA model)
+  - PyTorch             (training, Whisper, CLIP)
   - Motion detection
 """
 
@@ -221,8 +221,8 @@ def _apple_info(log_fn=print):
     or None.
 
     The same two models move as on the packaged DirectML build, through the
-    same flags and the same code: YOLOX detection (`onnx_dml_yolo`) and R3D
-    action recognition (`onnx_dml_torch`), both on ONNX Runtime, which on macOS
+    same flags and the same code: YOLOX detection (`onnx_dml_yolo`) and, until
+    0.13.1 removed it, R3D (`onnx_dml_torch`), both on ONNX Runtime, which on macOS
     hands out Core ML instead of DirectML (`modules/system/ort_coreml.py`).
     The flag names predate the Mac; read them as "ONNX Runtime has the GPU".
 
@@ -325,7 +325,7 @@ def detect_best_device(log_fn=print, prefer=None):
         .yolo_pt_device    str   device for YOLO .pt models        "cuda:0" | "cpu"
         .yolo_ov_device    str   device for YOLO OpenVINO models    "cpu"
         .openvino_device   str   device hint for OpenVINO Core      "GPU" | "CPU" | "AUTO"
-        .pytorch_device    str   device for PyTorch / R3D           "cuda" | "cpu"
+        .pytorch_device    str   device for PyTorch                 "cuda" | "cpu"
         .motion_device     str   device for motion detection        "cuda:0" | "cpu"
         .dml_device        str   DirectML device, or None           "privateuseone:0"
         .use_openvino_yolo bool  True → load OpenVINO YOLO model
@@ -393,13 +393,9 @@ def detect_best_device(log_fn=print, prefer=None):
 def _directml_info(log_fn=print):
     """DeviceInfo for a usable DirectML device, or None.
 
-    **`pytorch_device` carries the DirectML string**, which is what routes the
-    R3D action-recognition model onto an AMD card. R3D is a 3D CNN, and 3D
-    convolution is the part of DirectML's operator coverage least likely to
-    hold up — so this is not taken on trust: `R3DModelWrapper._warmup()` runs a
-    real forward pass at load and moves the model to the CPU if the backend
-    cannot execute it. That turns the risk into a slow run with one explanatory
-    line, instead of an "operator not implemented" an hour into a job.
+    **`pytorch_device` carries the DirectML string**, for torch consumers that
+    can use the card. (It routed R3D action recognition here until 0.13.1;
+    actions now run on the SigLIP2 frame encoder, which picks its own route.)
 
     Every other consumer of this field asks `== "cuda"`, and all of them still
     correctly answer no. The Intel action encoder/decoder is deliberately left
@@ -455,9 +451,8 @@ def _onnx_dml_info(log_fn=print):
     * `onnx_dml_yolo` — the object detector loads an ONNX export instead of the
       Ultralytics model, which has no DirectML backend. Detection is the
       heaviest per-frame stage, so this is the larger half of the win.
-    * `onnx_dml_torch` — R3D action recognition exports itself once and runs
-      through the same runtime (`modules/vision/r3d_onnx.py`). torch stays on the
-      processor either way; what changes is that the *model* does not.
+    * `onnx_dml_torch` — R3D action recognition ran through the same runtime
+      until 0.13.1 removed it; nothing in the app reads the flag now.
 
     `pytorch_device` is still "cpu", and deliberately: it is torch's device, and
     torch genuinely has no GPU here. Everything else torch drives — the CLIP
@@ -520,8 +515,8 @@ def resolve_yolo_device(requested: str) -> str:
     # one on would trade a slow run for a failed one. A DirectML string can reach
     # here from a stale config, a CLI flag, or a worker process.
     #
-    # The consumers that can use DirectML (R3D action recognition, the CLIP
-    # prefilter) reach it through DeviceInfo.dml_device, never through this.
+    # The consumers that can use DirectML (the CLIP prefilter) reach it through
+    # DeviceInfo.dml_device, never through this.
     if _dml is not None and _dml.is_directml(requested):
         _warn(f"DirectML requested for the detector ({requested!r}), which has no "
               f"DirectML path — YOLO runs through Ultralytics. Using CPU. Action "

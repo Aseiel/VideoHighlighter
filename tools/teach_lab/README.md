@@ -32,12 +32,10 @@ The class names are the dataset's own; nothing here knows any.
 | `compare_split.py` | Scores the head on the action trainer's own `--split-by-source` split, with any frozen encoder (`--blocks`), next to the trainer's validation accuracy |
 | `siglip_base_features.py`, `r3d_features.py` | SigLIP2 base/16 per frame, and frozen torchvision r3d_18, for `compare_split.py` |
 | `bench_speed.py` | Model time per analysis window for every encoder above, torch XPU and OpenVINO GPU |
-| `decoder_ablation.py`, `recipe_ablation.py` | Different decoders, and the Intel trainer's own recipe changed one thing at a time, on that trainer's cached features |
-| `bench_app.py` | The app's action-recognition call, headless, on any code checkout (e.g. a release tag next to its exe): its stage summary and wall time, with and without the annotated video and person detection, and a decode-only floor |
+| `decoder_ablation.py` | Different decoders on cached features |
 | `zero_shot.py` | Open vocabulary without training: each clip matched to class names through SigLIP2's text tower |
 | `clip_frames.py` | The app's CLIP ViT-B/32 (its own loader and IR) on the same 8 frames as `siglip_base_features.py`, per frame |
 | `search_eval.py` | Visual search on several encoders, same clips: text queries, search by example (k averaged examples from other videos), nearest class mean, and the head |
-| `pose_regions.py` | YOLOX + RTMPose action regions (the `AdaptiveActionDetector` idea) and people boxes per frame, with SigLIP2 base on the whole frame and on each region, squashed and letterboxed |
 | `export_siglip.py`, `quantize_siglip.py` | SigLIP2's image and text towers to ONNX and OpenVINO IR, checked against PyTorch; INT8 versions (NNCF) checked on real frames |
 | `bench_cpu.py` | Every action-model candidate on this machine's processor (Intel encoder FP32/FP16/INT8, r3d_18 PyTorch and OpenVINO, SigLIP2 base/32 and base/16 FP16 and INT8), one window each |
 | `bench_dml.py` | The exported image towers on ONNX Runtime DirectML (old NVIDIA, AMD): output checked against the CPU, ms per window |
@@ -116,3 +114,5 @@ mean carries its classes too.
   classes held out of training, grouped from unseen videos, NMI 0.31-0.44
   learned vs 0.36-0.54 in the raw backbones. Content the dataset has no class
   for is better kept apart by the raw view -- hence `regroup.py --raw`.
+
+`recipe_ablation.py`, `bench_app.py` and `pose_regions.py` measured the Intel and R3D action models, which 0.13.1 removed; their results are in `docs/plans/2026-10-01-action-models-measured.md` and `docs/plans/2026-10-02-siglip2-search-pose-export.md`.

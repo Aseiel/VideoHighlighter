@@ -341,44 +341,32 @@ class AnnotatedVideoManager(QObject):
 
         def _run():
             try:
-                from action_recognition import run_action_detection
-
-                base, ext = os.path.splitext(self.video_path)
-                output = f"{base}_actions_annotated{ext}"
+                from modules.vision import action_siglip
 
                 # Pull interesting_actions from cache if available
                 actions_list = self.cache_data.get('interesting_actions', None)
-
-                print(f"🎬 Starting action detection → {os.path.basename(output)}")
                 if actions_list:
                     print(f"   Tracking actions: {actions_list}")
 
-                all_actions, action_bboxes = run_action_detection(
-                    video_path=self.video_path,
-                    device="AUTO",
-                    sample_rate=5,
-                    log_file=f"{base}_actions_bbox.csv",
-                    debug=False,
-                    top_k=10,
-                    confidence_threshold=0.01,
-                    draw_bboxes=True,
-                    annotated_output=output,
-                    use_person_detection=True,
-                    max_people=2,
+                # The SigLIP2 pass finds actions and where they are, but does
+                # not draw them into a new video; the boxes go to the cache,
+                # where the live overlay draws them over the player.
+                _, action_bboxes = action_siglip.run_action_detection_siglip(
+                    self.video_path,
                     interesting_actions=actions_list,
-                    include_model_type=True,
-                    enable_r3d=True,
                     progress_callback=self._action_progress_callback,
                 )
-
-                # Save bbox data to cache for real-time overlay
                 if action_bboxes:
                     self.cache_data['action_bboxes'] = action_bboxes
                     self._save_cache_to_disk()
                     print(f"💾 Saved {len(action_bboxes)} action bboxes to cache")
 
-                print(f"✅ Action bbox video saved: {output}")
-                QTimer.singleShot(0, lambda: self._on_generate_done(True, output, "actions"))
+                def _done(n=len(action_bboxes)):
+                    self.set_generating(False, "actions")
+                    self._set_status(
+                        f"✅ {n} action boxes saved; the live overlay shows them "
+                        "(actions are not drawn into a separate video)")
+                QTimer.singleShot(0, _done)
 
             except Exception as e:
                 traceback.print_exc()

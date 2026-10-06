@@ -1,7 +1,10 @@
 """Accepted samples -> the dataset layout training already reads.
 
 * ``actions``: ``dataset/train/<class>/*.mp4`` and ``dataset/val/<class>/*.mp4``,
-  what ``model_training.r3d`` and ``model_training.intel`` load.
+  what ``model_training.action_head`` loads. A clip is named
+  ``<source>_temp_<sample>`` when the project has two or more sources: the
+  trainer holds out whole source videos, and finds a clip's video as the name
+  before ``_temp``.
 * ``objects``: the COCO layout ``training.train_yolox_run`` loads, built by
   ``modules.vision.label_store.build_dataset`` from ``labels.json``.
 
@@ -115,6 +118,10 @@ def build_actions(project: Project) -> dict:
     written = 0
     background = background_folder(project)
     negatives = ([s for s in project.samples if s.verdict == NEGATIVE] if background else [])
+    chosen = [s for s in project.accepted() + negatives if s.split in (TRAIN, VAL)]
+    # One source cannot be held out against itself; its clips then stand
+    # alone, as they did for the earlier trainers.
+    by_source = len({s.source for s in chosen}) >= 2
     for sample in project.accepted() + negatives:
         if sample.split not in (TRAIN, VAL):
             continue
@@ -126,11 +133,13 @@ def build_actions(project: Project) -> dict:
             if not os.path.exists(src):
                 continue
             suffix = f"_{i}" if len(files) > 1 else ""
+            name = (f"{sample.source}_temp_{sample.id}" if by_source else sample.id)
             dst = os.path.join(root, sample.split, label,
-                               f"{sample.id}{suffix}{os.path.splitext(src)[1]}")
+                               f"{name}{suffix}{os.path.splitext(src)[1]}")
             _place(src, dst)
             written += 1
-    return {"dataset": root, "clips": written, "splits": splits}
+    return {"dataset": root, "clips": written, "splits": splits,
+            "sources": len({s.source for s in chosen})}
 
 
 def build_objects(project: Project, progress=None) -> dict:

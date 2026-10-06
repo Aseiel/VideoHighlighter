@@ -234,8 +234,8 @@ export default function App() {
   }, [cfg.yolo_type])
 
   useEffect(() => {
-    void getActionLabels(cfg.action_backend, cfg.action_models).then(setActionLabels)
-  }, [cfg.action_backend, cfg.action_models])
+    void getActionLabels().then(setActionLabels)
+  }, [])
 
   // Real duration for the first video drives the time-range slider.
   useEffect(() => {

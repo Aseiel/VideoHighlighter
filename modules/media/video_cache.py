@@ -82,6 +82,12 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
         "freeze_seconds": float(gui_config.get("freeze_seconds", 4)),
         "freeze_factor": float(gui_config.get("freeze_factor", 0.8)),
     }
+    # Actions moved from the Intel/R3D models to SigLIP2 in 0.13.1, so a cache
+    # holding the old models' actions must not be reused for a run that wants
+    # actions. Added only then: a run without actions keeps its cache, and
+    # with it a transcript that can take an hour to make again.
+    if interesting_actions or float(gui_config.get("action_points", 0) or 0) > 0:
+        params["action_detector"] = "siglip2"
     return params
 
 

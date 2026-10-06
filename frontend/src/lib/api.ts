@@ -374,17 +374,10 @@ export async function getObjectLabels(yoloType = "standard"): Promise<string[]> 
   }
 }
 
-/** Action vocabulary; depends on backend + model selection. */
-export async function getActionLabels(
-  backend = "auto",
-  models = "intel_only",
-): Promise<string[]> {
+/** Action suggestions: a trained model's actions, then Kinetics-700. */
+export async function getActionLabels(): Promise<string[]> {
   try {
-    const res = await fetch(
-      `${SIDECAR_BASE}/labels/actions?backend=${encodeURIComponent(
-        backend,
-      )}&models=${encodeURIComponent(models)}`,
-    )
+    const res = await fetch(`${SIDECAR_BASE}/labels/actions`)
     return (await res.json()).labels ?? []
   } catch {
     return []

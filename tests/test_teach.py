@@ -133,7 +133,7 @@ def test_objects_are_singular_and_stock_names_are_recognised():
 
 def test_the_stock_vocabularies_load():
     assert "person" in naming.load_vocabulary("objects")
-    assert len(naming.load_vocabulary("actions")) == 400
+    assert len(naming.load_vocabulary("actions")) == 700
 
 
 def test_suggestions_rank_the_label_that_describes_the_examples():
@@ -402,11 +402,13 @@ def _ready(project):
 
 def _fake_trainer(score):
     def run(cmd, **kw):
-        out = cmd[cmd.index("--metrics-out") + 1]
-        with open(out, "w") as fh:
-            json.dump({"balanced_accuracy": score, "weights": "w.pth",
-                       "mapping": "w_mapping.json",
-                       "per_class_accuracy": {"alpha move": score}}, fh)
+        out = cmd[cmd.index("--out") + 1]
+        os.makedirs(out, exist_ok=True)
+        with open(os.path.join(out, "head.json"), "w") as fh:
+            json.dump({"kind": "action-head", "classes": ["alpha move", "beta move"],
+                       "trust_thresholds": [0.5, None],
+                       "heldout": {"single": {"balanced_accuracy": score,
+                                              "accuracy": score}}}, fh)
 
         class R:
             returncode = 0
@@ -442,8 +444,29 @@ def test_a_failed_training_run_says_where_the_log_is(project):
 
 def test_actions_train_into_the_round_folder_not_over_the_installed_model():
     cmd = train.actions_command("/p/dataset", "/p/runs/001", 5)
-    assert cmd[cmd.index("--model-save-path") + 1].startswith("/p/runs/001")
-    assert "--metrics-out" in cmd
+    assert "model_training.action_head.train" in cmd
+    assert cmd[cmd.index("--out") + 1].startswith("/p/runs/001")
+    assert cmd[cmd.index("--min-videos") + 1] == "3"
+
+
+def test_a_one_video_project_asks_for_one_video_of_evidence():
+    cmd = train.actions_command("/p/dataset", "/p/runs/001", 1)
+    assert cmd[cmd.index("--min-videos") + 1] == "1"
+
+
+def test_clips_are_named_for_their_source_video_when_there_are_several(project):
+    from modules.teach.benchmark import group_of
+
+    _add_samples(project, [0] * 4)
+    project.add_source(project.sources[0].path + ".second.mp4")
+    for i, s in enumerate(project.samples):
+        if i % 2:
+            s.source = project.sources[-1].id
+        project.decide(s, ACCEPTED, "alpha move")
+    build.build(project)
+    names = [f for _r, _d, files in os.walk(project.path(build.DATASET_DIR))
+             for f in files if f.endswith(".mp4")]
+    assert names and {group_of(n) for n in names} == {s.id for s in project.sources}
 
 
 def test_better_means_higher_accuracy_or_lower_loss():
@@ -952,27 +975,34 @@ def test_accepting_a_none_of_these_guess_confirms_it(project):
 
 # --- round 2: the project's own model proposes too ----------------------------------
 
+class _FakeEncoder:
+    encoder_id = "enc"
+
+    def encode_bgr(self, frames):
+        return np.ones((len(frames), 3), np.float32)
+
+
+class _FakeHead:
+    """Says "beta" for everything: disagrees with CLIP on alpha samples."""
+    classes = ["alpha move", "beta move"]
+    frames = 4
+    encoder_id = "enc"
+
+    def __init__(self):
+        self.seen = None
+
+    def scores(self, features):
+        self.seen = features.shape
+        return np.array([[0.1, 0.95]])
+
+
 def test_a_trained_round_proposes_and_disagreements_are_reviewed_first(project, tmp_path):
-    weights = tmp_path / "r.pth"
-    weights.write_bytes(b"w")
-    mapping = tmp_path / "r_mapping.json"
-    mapping.write_text(json.dumps({"idx_to_label": {"0": "alpha move", "1": "beta move"},
-                                   "metadata": {"model_variant": "mc3_18"}}))
-    made = {}
-
-    class Wrapper:
-        def __init__(self, **kw):
-            made.update(kw)
-
-        def predict_from_frames(self, frames):
-            # Says "beta" for everything: disagrees with CLIP on alpha samples.
-            return np.array([0.0, 3.0])
-
-    classify = sort.r3d_classifier(str(weights), str(mapping), wrapper_factory=Wrapper,
-                                   frame_reader=lambda path, n: [np.zeros((4, 4, 3))] * n)
-    assert made["model_name"] == "mc3_18" and made["custom_num_classes"] == 2
+    head = _FakeHead()
+    classify = sort.head_classifier(str(tmp_path), encoder=_FakeEncoder(), head=head,
+                                    frame_reader=lambda path, n: [np.zeros((4, 4, 3))] * n)
     label, confidence = classify("x.mp4")
     assert label == "beta move" and confidence > 0.9
+    assert head.seen == (1, 4, 3)       # one clip, the head's own frame count
 
     truth = _add_samples(project, [0, 0, 1, -1])
     sort.sort_project(project, FakeEmbedder(), frame_reader=_reader(truth),
@@ -981,33 +1011,23 @@ def test_a_trained_round_proposes_and_disagreements_are_reviewed_first(project, 
     assert batch[0].model_proposed == "beta move" and batch[0].proposed == "alpha move"
 
 
-def test_round_model_reads_the_mapping_train_py_writes(tmp_path):
-    # Top-level variant, and a production mapping that dropped class 1: the
-    # head still has three outputs.
-    weights = tmp_path / "r.pth"
-    weights.write_bytes(b"w")
-    mapping = tmp_path / "r_mapping.json"
-    mapping.write_text(json.dumps({"idx_to_label": {"0": "alpha move", "2": "gamma move"},
-                                   "num_classes_total": 3, "model_variant": "r2plus1d_18"}))
-    made = {}
+def test_a_clip_too_short_for_the_head_proposes_nothing(tmp_path):
+    classify = sort.head_classifier(str(tmp_path), encoder=_FakeEncoder(), head=_FakeHead(),
+                                    frame_reader=lambda path, n: [np.zeros((4, 4, 3))])
+    assert classify("x.mp4") == ("", 0.0)
 
-    class Wrapper:
-        def __init__(self, **kw):
-            made.update(kw)
 
-        def predict_from_frames(self, frames):
-            return np.array([0.0, 0.0, 4.0])
-
-    classify = sort.r3d_classifier(str(weights), str(mapping), wrapper_factory=Wrapper,
-                                   frame_reader=lambda path, n: [np.zeros((4, 4, 3))] * n)
-    assert made["model_name"] == "r2plus1d_18" and made["custom_num_classes"] == 3
-    assert classify("x.mp4")[0] == "gamma move"
+def test_a_head_from_another_encoder_is_refused(tmp_path):
+    head = _FakeHead()
+    head.encoder_id = "other"
+    with pytest.raises(RuntimeError, match="other"):
+        sort.head_classifier(str(tmp_path), encoder=_FakeEncoder(), head=head)
 
 
 def test_only_an_installed_round_proposes(project, tmp_path):
     assert sort.round_classifier(project) is None
     project.rounds.append({"round": 1, "installed": False,
-                           "metrics": {"weights": "x", "mapping": "y"}})
+                           "metrics": {"head": str(tmp_path)}})
     assert sort.round_classifier(project) is None
 
 

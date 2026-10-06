@@ -33,7 +33,7 @@ def _p(*parts):
 datas = [
     (_p("config.yaml"), "."),
     (_p("yolo_objects_labels.json"), "."),
-    (_p("kinetics_400_labels.json"), "."),
+    (_p("kinetics_700_labels.json"), "."),
     (_p("modules"), "modules"),
 ]
 
@@ -46,12 +46,10 @@ binaries = []
 hiddenimports = [
     # The engine's top-level modules are imported lazily inside worker.py, so
     # PyInstaller's static analysis can't see them.
-    "action_recognition",
     "crop_actions",
     "downloader",
     "object_recognition",
     "pipeline",
-    "sorter",
     "llm.clip_prefilter",
     "llm.llm_module",
     "sidecar.worker",

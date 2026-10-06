@@ -750,13 +750,12 @@ class ObjectTrainingSection(QWidget):
 
 
 class ActionTrainingWorker(QObject):
-    """Drive the R3D trainer in a child process, reporting what it prints.
+    """Drive the action-head trainer in a child process, reporting what it prints.
 
-    A subprocess rather than an import, for one reason: ``model_training.r3d``
-    is an existing, working training script with its own configuration, cache
-    handling and ONNX export. Refactoring it to take progress callbacks would
-    be the larger and riskier change, and it would be a change to code that is
-    not broken. Reading its output costs a parser and leaves it alone.
+    ``model_training.action_head.train`` encodes every clip once with the
+    SigLIP2 frame encoder and trains a small head on the vectors, scored on
+    source videos it never saw. A subprocess, so a run is stopped by ending the
+    process and the trainer keeps its own logging; this reads that output.
 
     It also means cancelling is a terminated process rather than a cooperative
     flag, which for a run holding a large clip cache is the more reliable stop.
@@ -766,21 +765,16 @@ class ActionTrainingWorker(QObject):
     finished = Signal(str)
     error = Signal(str)
 
-    # "Epoch 3/30" from the trainer's own progress bar, and the per-epoch
-    # summary it prints afterwards. Everything else it says goes to the debug
-    # log unchanged.
-    _EPOCH = re.compile(r"Epoch\s+(\d+)\s*/\s*(\d+)")
-    _VAL = re.compile(r"Val\s+Loss:\s*([\d.]+)\s*\|\s*Acc:\s*([\d.]+)")
+    # What the head trainer prints on its way: clips encoded ("  120/400
+    # clips"), then held-out folds ("fold 2/5"), then the saved head.
+    _ENCODED = re.compile(r"^\s*(\d+)/(\d+) clips,")
+    _FOLD = re.compile(r"fold\s+(\d+)\s*/\s*(\d+)")
+    _HELDOUT = re.compile(r"Held out .*accuracy\s+([\d.]+)")
 
-    def __init__(self, data_path: str, epochs: int, batch_size: int,
-                 pipeline: str, variant: str, device: str):
+    def __init__(self, data_path: str, name: str):
         super().__init__()
         self._data_path = data_path
-        self._epochs = epochs
-        self._batch_size = batch_size
-        self._pipeline = pipeline
-        self._variant = variant
-        self._device = device
+        self._name = name
         self._process = None
         self._stop = False
 
@@ -802,8 +796,7 @@ class ActionTrainingWorker(QObject):
             os.path.dirname(os.path.abspath(__file__))))
         command = self._command(sys.executable)
         try:
-            self.progress.emit(
-                0, "Preparing clips - the first pass is slow...")
+            self.progress.emit(0, "Encoding the clips...")
             creation = 0
             if sys.platform.startswith("win"):
                 creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -842,49 +835,30 @@ class ActionTrainingWorker(QObject):
             self.error.emit(f"Could not run the action trainer: {exc}")
 
     def _command(self, python: str) -> list:
-        """The trainer to run, and its flags.
-
-        Two pipelines, because the hardware genuinely differs:
-
-        ``intel`` runs Intel's action-recognition encoder under OpenVINO and
-        trains only a decoder on top. The encoder is frozen, so its output is
-        cached once and every later epoch is fast. This is the path that
-        produced the classifier the app already ships.
-
-        ``r3d`` fine-tunes a 3D CNN end to end. More capable and far heavier,
-        and it wants a CUDA card.
-
-        Their flags are not the same: the Intel trainer picks its own device
-        and takes a decoder type, while the R3D one takes a device and a model
-        variant. So this builds each command rather than sharing one.
-        """
-        common = [
-            python, "-u", "-m", f"model_training.{self._pipeline}.train",
-            "--data-path", self._data_path,
-            "--epochs", str(self._epochs),
-            "--batch-size", str(self._batch_size),
-            "--no-viz",
-        ]
-        if self._pipeline == "intel":
-            # No --device: intel/config.py already resolves XPU itself, and
-            # the encoder half runs under OpenVINO regardless.
-            return common
-        return common + ["--model", self._variant, "--device", self._device]
+        """The head trainer on the chosen folder; the head is written where the
+        app looks for action models (models/actions/<name>)."""
+        return [python, "-u", "-m", "model_training.action_head.train",
+                "--data-path", self._data_path, "--name", self._name]
 
     def _read(self, line: str):
         """Turn one line of the trainer's output into a progress update."""
-        epoch = self._EPOCH.search(line)
-        if epoch:
-            done, total = int(epoch.group(1)), max(1, int(epoch.group(2)))
-            self.progress.emit(int(100 * done / total),
-                               f"Learning... round {done} of {total}")
+        encoded = self._ENCODED.search(line)
+        if encoded:
+            done, total = int(encoded.group(1)), max(1, int(encoded.group(2)))
+            self.progress.emit(int(60 * done / total), f"Encoding clips... {done} of {total}")
             return None
-        val = self._VAL.search(line)
-        if val:
+        fold = self._FOLD.search(line)
+        if fold:
+            done, total = int(fold.group(1)), max(1, int(fold.group(2)))
+            self.progress.emit(60 + int(35 * done / total),
+                               f"Testing on videos it has not seen... {done} of {total}")
+            return None
+        held = self._HELDOUT.search(line)
+        if held:
             # Accuracy is the one number here worth showing: unlike a loss, a
             # person can read it without knowing the model.
-            share = float(val.group(2)) * 100
-            return f"recognised {share:.0f}% of the clips it had not seen"
+            return (f"recognised {float(held.group(1)) * 100:.0f}% of the clips "
+                    f"from videos it had not seen")
         return None
 
 
@@ -897,8 +871,6 @@ class ActionTrainingSection(QWidget):
     thing, and a shared form would ask for the wrong input.
     """
 
-    DEFAULT_EPOCHS = 30
-    DEFAULT_BATCH = 4          # 3D clips are far heavier than stills
     # The trainer's own minimums: below these it skips the class.
     MIN_TRAIN_CLIPS = 5
     MIN_VAL_CLIPS = 2
@@ -908,8 +880,6 @@ class ActionTrainingSection(QWidget):
         self._thread: Optional[QThread] = None
         self._worker: Optional[ActionTrainingWorker] = None
         self._data_path = ""
-        self._device = "cpu"
-        self._pipeline = "intel"
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -938,42 +908,14 @@ class ActionTrainingSection(QWidget):
         self.classes_label.setWordWrap(True)
         root.addWidget(self.classes_label)
 
-        advanced = CollapsibleSection(
-            "Advanced", settings_key="training/actions_advanced")
-        form = QFormLayout()
-        self.epochs_spin = QSpinBox()
-        self.epochs_spin.setRange(1, 500)
-        self.epochs_spin.setValue(self.DEFAULT_EPOCHS)
-        form.addRow("Rounds of learning:", self.epochs_spin)
-
-        self.batch_spin = QSpinBox()
-        self.batch_spin.setRange(1, 32)
-        self.batch_spin.setValue(self.DEFAULT_BATCH)
-        form.addRow("Clips at a time:", self.batch_spin)
-
-        self.pipeline_combo = QComboBox()
-        self.pipeline_combo.addItem("Automatic (match my hardware)", "auto")
-        self.pipeline_combo.addItem("Intel - OpenVINO encoder", "intel")
-        self.pipeline_combo.addItem("NVIDIA - 3D CNN", "r3d")
-        self.pipeline_combo.currentIndexChanged.connect(self._choose_pipeline)
-        form.addRow("Method:", self.pipeline_combo)
-
-        self.variant_combo = QComboBox()
-        for variant, hint in (("r3d_18", "recommended"),
-                              ("mc3_18", "lighter"),
-                              ("r2plus1d_18", "slower, often better")):
-            self.variant_combo.addItem(f"{variant} - {hint}", variant)
-        form.addRow("3D CNN model:", self.variant_combo)
-        # Held so the row can be hidden: it belongs to the 3D CNN only, and a
-        # visible-but-irrelevant control reads as a setting that was ignored.
-        self._advanced_form = form
-        advanced.setContentLayout(form)
-        root.addWidget(advanced)
-
-        self.device_label = QLabel("")
+        self.device_label = QLabel(
+            "Each clip is read once by the SigLIP2 action model, then a small "
+            "model is trained on top: minutes, on a processor too. It is "
+            "scored on source videos it never saw, so name clips "
+            "<video>_temp_<n> to let it tell videos apart.")
         self.device_label.setWordWrap(True)
+        self.device_label.setStyleSheet("color:#999;")
         root.addWidget(self.device_label)
-        self._choose_pipeline()
 
         self.train_btn = QPushButton("Train an action model")
         self.train_btn.setStyleSheet(
@@ -999,82 +941,6 @@ class ActionTrainingSection(QWidget):
 
         root.addStretch()
         self.setLayout(root)
-
-    def _choose_pipeline(self) -> None:
-        """Decide which trainer to use, and say so before anything is started.
-
-        **Hardware detection goes through `modules.system.device_utils`, not a torch
-        probe.** That module is the app's single source of truth and it knows
-        something a torch probe cannot: the released build ships a *CUDA* torch
-        wheel, on which `torch.xpu` exists but reports `is_available()` False —
-        so on a packaged app an Intel Arc looks like no GPU at all. Its own
-        comment says so. `device_utils` falls through to asking OpenVINO, which
-        still sees the card. Probing torch here reproduced exactly that bug:
-        "No GPU found" on a machine with an A750 in it.
-
-        **Intel is not a fallback.** ``model_training/intel`` is a purpose-built
-        pipeline — Intel's action-recognition encoder run under OpenVINO with a
-        decoder trained on top — and it produced the classifier this app ships.
-        On an Intel machine it is the right answer, not a consolation for
-        lacking CUDA. The end-to-end 3D CNN is the better tool only where there
-        is an NVIDIA card to run it on.
-        """
-        backend, gpu_present = "CPU", False
-        try:
-            from modules.system.device_utils import detect_best_device
-            info = detect_best_device(log_fn=lambda *a, **k: None)
-            backend = str(getattr(info, "backend_name", "CPU"))
-            gpu_present = bool(getattr(info, "gpu_available", False))
-        except Exception as exc:                    # pragma: no cover - defensive
-            print(f"[training] device detection failed: {exc}")
-
-        has_cuda = backend.upper().startswith("CUDA")
-
-        # What torch itself can train on. Separate from the question above,
-        # because device_utils answers for the *inference* pipeline — where
-        # Intel deliberately goes through OpenVINO and its `pytorch_device`
-        # stays "cpu" — while training is the other case.
-        self._device = "cpu"
-        try:
-            import torch
-            if torch.cuda.is_available():
-                self._device = "cuda"
-            elif getattr(torch, "xpu", None) and torch.xpu.is_available():
-                self._device = "xpu"
-        except Exception:
-            pass
-
-        chosen = (self.pipeline_combo.currentData()
-                  if hasattr(self, "pipeline_combo") else "auto")
-        self._pipeline = ("r3d" if has_cuda else "intel") if chosen == "auto" else chosen
-
-        colour = "#999"
-        if self._pipeline == "intel":
-            where = {"cuda": "your NVIDIA GPU", "xpu": "your Intel GPU"}.get(
-                self._device, "the processor")
-            note = (f"Intel method, using {backend}. The encoder runs under "
-                    f"OpenVINO and only the decoder is trained ({where}), so "
-                    f"the first pass is slow and the rest are quick.")
-            if not gpu_present:
-                note += " No GPU found, so expect the first pass to be long."
-                colour = THEME.warning
-        else:
-            where = {"cuda": "your NVIDIA GPU", "xpu": "your Intel GPU"}.get(
-                self._device, "the processor")
-            note = f"3D CNN, training every layer on {where}."
-            if self._device == "cpu":
-                note += (" That is hours rather than minutes - the Intel "
-                         "method is usually the better choice here.")
-                colour = THEME.warning
-        self.device_label.setText(note)
-        self.device_label.setStyleSheet(f"color:{colour};")
-
-        # The 3D CNN variants mean nothing to the Intel method, which trains a
-        # decoder on a fixed encoder. Leaving the row on screen invites someone
-        # to pick r2plus1d_18 and then wonder why nothing about the run changed.
-        form = getattr(self, "_advanced_form", None)
-        if form is not None:
-            form.setRowVisible(self.variant_combo, self._pipeline == "r3d")
 
     def _browse(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose the clips folder")
@@ -1152,14 +1018,13 @@ class ActionTrainingSection(QWidget):
     def _start(self) -> None:
         if self._thread is not None:
             return
-        self._worker = ActionTrainingWorker(
-            data_path=self._data_path,
-            epochs=self.epochs_spin.value(),
-            batch_size=self.batch_spin.value(),
-            pipeline=self._pipeline,
-            variant=self.variant_combo.currentData(),
-            device=self._device,
-        )
+        from modules.vision import frame_encoder
+        if not frame_encoder.is_installed():
+            self._say("Training needs the SigLIP2 action model: download it from "
+                      "Advanced > Action Recognition first.", THEME.warning)
+            return
+        name = os.path.basename(self._data_path.rstrip(os.sep)) or "my-actions"
+        self._worker = ActionTrainingWorker(data_path=self._data_path, name=name)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

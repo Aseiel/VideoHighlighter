@@ -1446,33 +1446,29 @@ async def get_object_labels(yolo_type: str = "standard") -> dict:
 
 
 @app.get("/labels/actions")
-async def get_action_labels(backend: str = "auto", models: str = "intel_only") -> dict:
-    """Action vocabulary. Mirrors open_action_label_selector, including the
-    r3d_* backends forcing intel_only and the mixed mode's [custom]/[intel]
-    disambiguation suffixes for labels present in both sets."""
+async def get_action_labels(backend: str = "auto", models: str = "") -> dict:
+    """Action suggestions, as the desktop app offers them: a trained action
+    model's own actions first when one is installed, then Kinetics-700. Any
+    other action can be typed; SigLIP2 scores actions by name. ``backend`` and
+    ``models`` are accepted for older frontends and ignored (Intel and R3D
+    were removed in 0.13.1)."""
     from modules.system.app_paths import data_file
 
     try:
-        if backend in ("r3d_cuda", "r3d_cpu"):
-            models = "intel_only"
-
-        intel = _load_label_json(data_file("kinetics_400_labels.json"))
-        custom_ov = _load_label_json(
-            data_file("intel_finetuned_classifier_3d_mapping.json"))
-        r3d_custom = _load_label_json(data_file("r3d_finetuned_mapping.json"))
-
-        if models == "custom_only":
-            return {"ok": True, "labels": custom_ov}
-        if models == "r3d_custom_only":
-            return {"ok": True, "labels": r3d_custom}
-        if models == "mixed":
-            custom = custom_ov or r3d_custom
-            shared = set(custom) & set(intel)
-            labels = [f"{c} [custom]" if c in shared else c for c in custom]
-            labels += [f"{i} [intel]" if i in shared else i
-                       for i in intel if i not in set(custom) or i in shared]
-            return {"ok": True, "labels": labels, "shared": len(shared)}
-        return {"ok": True, "labels": intel}
+        labels, source = [], []
+        try:
+            from modules.vision import action_siglip
+            head = action_siglip.installed_head_classes()
+            if head and head[0] != action_siglip.TEXT_SOURCE:
+                labels += sorted(head[1])
+                source.append(head[0])
+        except Exception as exc:  # noqa: BLE001 - suggestions only
+            print(f"labels/actions: no trained model ({exc})")
+        known = {l.lower() for l in labels}
+        k700 = _load_label_json(data_file("kinetics_700_labels.json"))
+        labels += [l for l in k700 if l.lower() not in known]
+        source.append("Kinetics-700")
+        return {"ok": True, "labels": labels, "source": " + ".join(source)}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "labels": []}
 

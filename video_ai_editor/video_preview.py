@@ -122,7 +122,7 @@ class AnalysisOverlayWidget(QWidget):
             
             if 'custom' in model:
                 color = QColor(0, 255, 0, 220)
-            elif 'cuda' in model or 'r3d' in model:
+            elif 'siglip' in model:
                 color = QColor(0, 128, 255, 220)
             else:
                 color = QColor(0, 165, 255, 220)

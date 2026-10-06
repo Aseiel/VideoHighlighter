@@ -27,7 +27,7 @@ env:
   # The published packs (publish-packs.yaml): PyTorch for NVIDIA and for CPU,
   # and CLIP. Built once per torch version, reused by every release. A new
   # pack is published under a new tag, and this line moves to it.
-  PACKS_BASE: https://github.com/Aseiel/VideoHighlighter/releases/download/packs-torch-2.7.1
+  PACKS_BASE: https://github.com/Aseiel/VideoHighlighter/releases/download/packs-torch-2.7.1-r1
   # The update host (Cloudflare R2). tools/publish_release.py has the layout.
   R2_BUCKET: vh-updates
   # R2 rejects the CRC64 checksums newer AWS CLIs send by default.
@@ -171,20 +171,18 @@ jobs:
             --log-level WARN `
             --add-data "config.yaml;." `
             --add-data "yolo_objects_labels.json;." `
-            --add-data "kinetics_400_labels.json;." `
+            --add-data "kinetics_700_labels.json;." `
             --add-data "assets;assets" `
             --add-data "modules;modules" `
             --add-data "models;models" `
             --add-data "video_ai_editor/VRVideoOutput.qml;video_ai_editor" `
             --add-data "video_ai_editor/models;video_ai_editor/models" `
-            --hidden-import action_recognition `
             --hidden-import convert_pth_to_openvino `
             --hidden-import crop_actions `
             --hidden-import downloader `
             --hidden-import object_recognition `
             --hidden-import pipeline `
             --hidden-import signal_timeline_viewer `
-            --hidden-import sorter `
             --hidden-import video_picker_dialog `
             --hidden-import PySide6.QtCore `
             --hidden-import PySide6.QtGui `
@@ -572,11 +570,15 @@ jobs:
         run: python tools/get_yolox_model.py
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
+      - name: Export the action model (SigLIP2, Apache-2.0)
+        # Action recognition's only model since 0.13.1. A Mac build has no
+        # pack downloads, so it is bundled with models/, as CLIP is.
+        run: python -m tools.export_frame_encoder
       - name: Give OpenVINO a libtbb that codesign accepts
         # libtbb.12.dylib was deleted from the bundle in March because it could
         # not be ad-hoc signed. OpenVINO links against it, so `_pyopenvino` then
         # failed to load with "Library not loaded: @rpath/libtbb.12.dylib",
-        # which took the whole pipeline with it — action_recognition imports
+        # which took the whole pipeline with it — the pipeline imports
         # openvino at module scope. Deleting it is not an option; making it
         # signable is the job.
         #
@@ -641,20 +643,18 @@ jobs:
             --noconfirm \
             --add-data "config.yaml:." \
             --add-data "yolo_objects_labels.json:." \
-            --add-data "kinetics_400_labels.json:." \
+            --add-data "kinetics_700_labels.json:." \
             --add-data "assets:assets" \
             --add-data "modules:modules" \
             --add-data "models:models" \
             --add-data "video_ai_editor/VRVideoOutput.qml:video_ai_editor" \
             --add-data "video_ai_editor/models:video_ai_editor/models" \
-            --hidden-import action_recognition \
             --hidden-import convert_pth_to_openvino \
             --hidden-import crop_actions \
             --hidden-import downloader \
             --hidden-import object_recognition \
             --hidden-import pipeline \
             --hidden-import signal_timeline_viewer \
-            --hidden-import sorter \
             --hidden-import video_picker_dialog \
             --hidden-import transcript \
             --hidden-import transcript_srt \

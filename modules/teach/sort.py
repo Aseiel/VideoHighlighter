@@ -159,7 +159,7 @@ def sort_project(project: Project, embedder, *,
     """Score every sample; propose a class for every undecided one.
 
     ``model_classifier(path) -> (label, confidence)`` is the last round's model
-    (``sorter_classifier``), when there is one.
+    (``head_classifier``), when there is one.
     """
     if not project.classes:
         raise ValueError("add a class first")
@@ -263,73 +263,59 @@ def lay_out_folders(project: Project) -> dict:
     return {"folder": root, "files": len(placed)}
 
 
-def _r3d_model(weights: str, mapping: str, wrapper_factory=None,
-               frame_reader: Optional[Callable] = None) -> tuple:
-    """``(path -> probabilities over every output or None, idx_to_label)``.
+def _head_model(folder: str, *, encoder=None, head=None,
+                frame_reader: Optional[Callable] = None) -> tuple:
+    """``(path -> each action's score or None, classes)`` for a trained action
+    head (``head.onnx`` + ``head.json``).
 
-    The same ``R3DModelWrapper`` action recognition uses in the app, loaded
-    with the round's weights, so what it says here is what the model will
-    say in use. Sixteen frames spread over the clip, as it was trained on.
+    The frame encoder on the head's own number of frames, spread over the clip
+    as the trainer reads them, so what it says here is what the model will say
+    in use.
     """
-    import json as _json
+    from modules.vision import action_siglip, frame_encoder
 
-    with open(mapping, "r", encoding="utf-8") as handle:
-        data = _json.load(handle)
-    idx_to_label = {int(k): v for k, v in (data.get("idx_to_label") or {}).items()}
-    # train.py writes the variant at the top level; older mappings nest it.
-    variant = (data.get("model_variant")
-               or (data.get("metadata") or {}).get("model_variant") or "r3d_18")
-    # A filtered (production) mapping lists fewer labels than the head has
-    # outputs; the weights need the head's own size.
-    num_classes = int(data.get("num_classes_total")
-                      or (max(idx_to_label) + 1 if idx_to_label else 0))
-    if wrapper_factory is None:
-        from action_recognition import R3DModelWrapper as wrapper_factory
-    # "cuda" falls back to the processor by itself when no usable card is there.
-    model = wrapper_factory(model_name=variant, device_str="cuda", half_precision=False,
-                            custom_weights=weights, custom_num_classes=num_classes)
+    head = head or action_siglip.ActionHead(folder)
+    enc = encoder or frame_encoder.load(log=print)
+    if enc is None:
+        raise RuntimeError("the frame encoder is not available")
+    if head.encoder_id and head.encoder_id != enc.encoder_id:
+        raise RuntimeError(f"head trained on {head.encoder_id}, not {enc.encoder_id}")
     read = frame_reader or embed_mod.read_frames
 
-    def probabilities(path: str):
-        frames = read(path, 16)
-        if len(frames) != 16:
+    def scores(path: str):
+        frames = read(path, head.frames)
+        if len(frames) != head.frames:
             return None
-        logits = np.asarray(model.predict_from_frames(frames), dtype=np.float64).ravel()
-        probs = np.exp(logits - logits.max())
-        return probs / probs.sum()
+        return head.scores(enc.encode_bgr(frames)[None])[0]
 
-    return probabilities, idx_to_label
+    return scores, head.classes
 
 
-def r3d_scorer(weights: str, mapping: str, *, wrapper_factory=None,
-               frame_reader: Optional[Callable] = None) -> Callable:
-    """A trained R3D model as ``path -> {label: probability}`` ({} if unreadable).
-
-    Outputs a filtered (production) mapping leaves out are not reported.
-    """
-    probabilities, idx_to_label = _r3d_model(weights, mapping, wrapper_factory, frame_reader)
+def head_scorer(folder: str, *, encoder=None, head=None,
+                frame_reader: Optional[Callable] = None) -> Callable:
+    """A trained action head as ``path -> {label: score}`` ({} if unreadable)."""
+    scores, classes = _head_model(folder, encoder=encoder, head=head,
+                                  frame_reader=frame_reader)
 
     def score(path: str) -> dict:
-        probs = probabilities(path)
-        if probs is None:
-            return {}
-        return {label: float(probs[i]) for i, label in idx_to_label.items()
-                if i < len(probs)}
+        s = scores(path)
+        return {} if s is None else {c: float(v) for c, v in zip(classes, s)}
 
     return score
 
 
-def r3d_classifier(weights: str, mapping: str, *, wrapper_factory=None,
-                   frame_reader: Optional[Callable] = None) -> Callable:
-    """A trained round's R3D model as a proposer: ``path -> (label, confidence)``."""
-    probabilities, idx_to_label = _r3d_model(weights, mapping, wrapper_factory, frame_reader)
+def head_classifier(folder: str, *, encoder=None, head=None,
+                    frame_reader: Optional[Callable] = None) -> Callable:
+    """A trained round's action head as a proposer: ``path -> (label, score)``."""
+    scores, classes = _head_model(folder, encoder=encoder, head=head,
+                                  frame_reader=frame_reader)
 
     def classify(path: str):
-        probs = probabilities(path)
-        if probs is None:
+        s = scores(path)
+        if s is None:
             return "", 0.0
-        best = int(np.argmax(probs))
-        return idx_to_label.get(best, ""), float(probs[best])
+        best = int(np.argmax(s))
+        return classes[best], float(s[best])
 
     return classify
 
@@ -344,39 +330,11 @@ def round_classifier(project) -> Optional[Callable]:
         return None
     for record in reversed(project.rounds):
         metrics = record.get("metrics") or {}
-        if record.get("installed") and metrics.get("weights") and metrics.get("mapping"):
-            if _os.path.exists(metrics["weights"]) and _os.path.exists(metrics["mapping"]):
+        if record.get("installed") and metrics.get("head"):
+            if _os.path.isdir(metrics["head"]):
                 try:
-                    return r3d_classifier(metrics["weights"], metrics["mapping"])
+                    return head_classifier(metrics["head"])
                 except Exception as exc:        # a broken model must not stop the sort
                     print(f"teach.sort: round {record.get('round')} model unusable: {exc}")
                     return None
     return None
-
-
-def sorter_classifier(xml: str, bin_path: str, mapping: str) -> Callable:
-    """The last round's model, through sorter.py's own classify_clip.
-
-    Takes an Intel-encoder decoder as OpenVINO IR plus its mapping — the
-    kind sorter.py loads for the app's installed model (``teach sort
-    --model-xml``). Projects train R3D by default, which this does not read.
-    """
-    import json as _json
-
-    import sorter
-    from openvino.runtime import Core
-
-    with open(mapping, "r", encoding="utf-8") as handle:
-        idx_to_label = {int(k): v for k, v in _json.load(handle)["idx_to_label"].items()}
-    core = Core()
-    enc = core.compile_model(core.read_model(str(sorter.ENCODER_XML),
-                                             str(sorter.ENCODER_BIN)), "CPU")
-    dec = core.compile_model(core.read_model(xml, bin_path), "CPU")
-
-    def classify(path: str):
-        label, confidence, _, _ = sorter.classify_clip(
-            path, enc, enc.input(0), enc.output(0), dec, dec.input(0),
-            dec.output(0), idx_to_label)
-        return label or "", confidence
-
-    return classify

@@ -44,9 +44,6 @@ export interface HighlighterConfig {
   obj_confidence: number
   // Advanced — actions
   sample_rate: number
-  action_backend: string
-  r3d_model: string
-  action_models: string
   // Advanced — visualization
   draw_object_boxes: boolean
   draw_action_labels: boolean
@@ -99,9 +96,6 @@ export const DEFAULT_CONFIG: HighlighterConfig = {
   yolo_custom_model_path: "",
   obj_confidence: 30,
   sample_rate: 5,
-  action_backend: "auto",
-  r3d_model: "r3d_18",
-  action_models: "intel_only",
   draw_object_boxes: false,
   draw_action_labels: false,
   avoid_enabled: false,
@@ -138,23 +132,6 @@ export const YOLO_SIZES = [
   { value: "m", label: "Medium (balanced)" },
   { value: "l", label: "Large (accurate, slower)" },
   { value: "x", label: "Extra-Large (most accurate, slowest)" },
-]
-export const ACTION_BACKENDS = [
-  { value: "auto", label: "Auto (CUDA / OpenVINO / CPU)" },
-  { value: "openvino", label: "OpenVINO (Intel GPU / CPU)" },
-  { value: "r3d_cuda", label: "R3D + CUDA (NVIDIA GPU)" },
-  { value: "r3d_cpu", label: "R3D + CPU (PyTorch, slow)" },
-]
-export const R3D_MODELS = [
-  { value: "r3d_18", label: "R3D-18 (fastest)" },
-  { value: "mc3_18", label: "MC3-18 (mixed convolution)" },
-  { value: "r2plus1d_18", label: "R(2+1)D-18 (most accurate)" },
-]
-export const ACTION_MODELS = [
-  { value: "intel_only", label: "Kinetics-400 pretrained" },
-  { value: "custom_only", label: "Custom OpenVINO" },
-  { value: "r3d_custom_only", label: "R3D fine-tuned" },
-  { value: "mixed", label: "Mixed — all available models" },
 ]
 export const AVOID_METHODS = [
   { value: "skip", label: "Skip those moments" },
@@ -247,15 +224,12 @@ export function toGuiConfig(
     yolo_model_size: c.yolo_model_size,
     yolo_custom_model_path: c.yolo_custom_model_path || null,
     obj_confidence: c.obj_confidence,
-    action_models: c.action_models,
     sample_rate: c.sample_rate,
     auto_min_clip: c.auto_min_clip,
     auto_max_clip: c.auto_max_clip,
     auto_merge_gap: c.auto_merge_gap,
     draw_object_boxes: c.draw_object_boxes,
     draw_action_labels: c.draw_action_labels,
-    action_backend: c.action_backend,
-    r3d_model: c.r3d_model,
     avoid_enabled: c.avoid_enabled && avoidIds.length > 0,
     avoid_method: c.avoid_method,
     avoid_identity_ids: avoidIds,
@@ -361,9 +335,6 @@ export function fromConfigFile(
     yolo_type: pick(a.yolo_type, DEFAULT_CONFIG.yolo_type),
     yolo_model_size: pick(a.yolo_model_size, DEFAULT_CONFIG.yolo_model_size),
     yolo_custom_model_path: pick(a.yolo_custom_model_path, ""),
-    action_backend: pick(a.action_backend, DEFAULT_CONFIG.action_backend),
-    r3d_model: pick(a.r3d_model, DEFAULT_CONFIG.r3d_model),
-    action_models: pick(a.action_models, DEFAULT_CONFIG.action_models),
     draw_object_boxes: pick(vis.draw_object_boxes, false),
     draw_action_labels: pick(vis.draw_action_labels, false),
     avoid_enabled: pick(av.face_recognition_enabled, false),
@@ -448,9 +419,6 @@ export function toConfigFile(
       yolo_type: c.yolo_type,
       yolo_model_size: c.yolo_model_size,
       yolo_custom_model_path: c.yolo_custom_model_path,
-      action_backend: c.action_backend,
-      r3d_model: c.r3d_model,
-      action_models: c.action_models,
     },
     visualization: {
       draw_object_boxes: c.draw_object_boxes,
