@@ -73,6 +73,19 @@ INPUT_SIZE = 256
 DECODE_SHORT = 384
 DIMS = 768
 
+# The text tower, for actions people type (see action_siglip.TextActions).
+TEXT_FILE = "text.onnx"
+TEXT_TOKENIZER = "tokenizer.json"
+# The Kinetics-700 action names and their vectors, encoded at export.
+ACTIONS_FILE = "actions.npz"
+TEXT_LENGTH = 64
+PAD_ID = 0
+# Each action is written both ways and the two vectors averaged: on real
+# footage neither wording won on every window, and the average was steadier.
+TEXT_TEMPLATES = ("{}", "a photo of a person {}.")
+PROBE_TEXT = "a person riding a bicycle"
+TEXT_PROBE_MIN_COSINE = 0.99
+
 # A folder holding vision.onnx + encoder.json, for a source checkout or a test.
 DIR_ENV = "VH_FRAME_ENCODER_DIR"
 
@@ -394,6 +407,120 @@ def _check_route(runner, meta: dict) -> None:
     cos = _cosine(out[0], meta["probe"])
     if cos < PROBE_MIN_COSINE:
         raise RuntimeError(f"does not match the reference (cosine {cos:.4f})")
+
+
+# ---------------------------------------------------------------------------
+# The text tower: actions as words
+# ---------------------------------------------------------------------------
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, np.float32)
+    norm = np.linalg.norm(v, axis=-1, keepdims=True)
+    return v / np.where(norm > 0, norm, 1.0)
+
+
+def ensemble(per_template: Sequence[np.ndarray]) -> np.ndarray:
+    """One unit vector per text from its vectors under each template."""
+    return _unit(np.mean([_unit(v) for v in per_template], axis=0))
+
+
+_TOKENIZERS = {}
+
+
+def tokenize(texts: Sequence[str], tokenizer_path: str) -> np.ndarray:
+    """Texts -> int64 [N, 64] exactly as the export's transformers tokenizer
+    makes them: lowercased (SigLIP2's text tower was trained on lowercase),
+    the end token appended, cut to 64, padded with 0. The export checks the two
+    agree before it writes anything."""
+    from tokenizers import Tokenizer
+
+    tok = _TOKENIZERS.get(tokenizer_path)
+    if tok is None:
+        tok = Tokenizer.from_file(tokenizer_path)
+        tok.enable_truncation(TEXT_LENGTH)
+        tok.enable_padding(length=TEXT_LENGTH, pad_id=PAD_ID)
+        _TOKENIZERS[tokenizer_path] = tok
+    rows = tok.encode_batch([str(t).lower() for t in texts])
+    return np.array([r.ids for r in rows], dtype=np.int64).reshape(len(texts), TEXT_LENGTH)
+
+
+def has_text(folder: Optional[str] = None) -> bool:
+    """True when the encoder folder carries the text tower and the action list."""
+    folder = folder or find_model_dir()
+    return bool(folder) and all(os.path.isfile(os.path.join(folder, f))
+                                for f in (TEXT_FILE, TEXT_TOKENIZER, ACTIONS_FILE))
+
+
+def load_actions(folder: Optional[str] = None) -> Optional[tuple]:
+    """``(names, unit vectors [N, 768])`` of the action list shipped with the
+    encoder, or None when this encoder has none."""
+    folder = folder or find_model_dir()
+    if not folder or not os.path.isfile(os.path.join(folder, ACTIONS_FILE)):
+        return None
+    with np.load(os.path.join(folder, ACTIONS_FILE)) as data:
+        return [str(n) for n in data["labels"]], _unit(data["vectors"].astype(np.float32))
+
+
+def logit_scale(folder: Optional[str] = None) -> float:
+    """How sharply this encoder's image-text scores separate (SigLIP2's own
+    learned scale, recorded at export)."""
+    folder = folder or find_model_dir()
+    try:
+        return float(read_meta(folder).get("logit_scale", 100.0))
+    except Exception:  # noqa: BLE001
+        return 100.0
+
+
+class TextEncoder:
+    """The text tower on the processor. A run encodes a handful of typed
+    actions once, so the GPU would buy nothing but a second compile."""
+
+    def __init__(self, runner, folder: str, route: str):
+        self._runner = runner
+        self.folder = folder
+        self.label = route_label(route)
+        self._tokenizer = os.path.join(folder, TEXT_TOKENIZER)
+
+    def encode(self, texts: Sequence[str]) -> np.ndarray:
+        """Texts -> unit vectors [N, 768], each the average over TEXT_TEMPLATES."""
+        if not texts:
+            return np.zeros((0, DIMS), np.float32)
+        return ensemble([self._raw([t.format(x) for x in texts]) for t in TEXT_TEMPLATES])
+
+    def _raw(self, texts: Sequence[str]) -> np.ndarray:
+        ids = tokenize(texts, self._tokenizer)
+        return np.concatenate([self._runner.run(ids[i:i + CPU_BATCH])
+                               for i in range(0, len(ids), CPU_BATCH)])
+
+
+def load_text(log: LogFn = print, model_dir: Optional[str] = None) -> Optional[TextEncoder]:
+    """The text tower on the first processor route that reproduces the
+    export's probe, or None (with a line in ``log``)."""
+    folder = model_dir or find_model_dir()
+    if folder is None or not has_text(folder):
+        log(f"⚠️ The action encoder here has no text half, so typed actions "
+            f"cannot be scored (reinstall the action model encoder)")
+        return None
+    try:
+        meta = read_meta(folder).get("text") or {}
+        probe = meta["probe"]
+    except Exception as e:  # noqa: BLE001
+        log(f"⚠️ Text half of the action encoder is unusable: {e}")
+        return None
+    path = os.path.join(folder, TEXT_FILE)
+    ids = tokenize([meta.get("probe_text", PROBE_TEXT)], os.path.join(folder, TEXT_TOKENIZER))
+    for route in (OPENVINO_CPU, ONNX_CPU):
+        try:
+            runner = _open_route(route, path, None)
+            out = runner.run(ids)
+            if not np.isfinite(out).all() or _cosine(out[0], probe) < TEXT_PROBE_MIN_COSINE:
+                raise RuntimeError("does not match the reference")
+        except Exception as e:  # noqa: BLE001 - the next route is the answer
+            print(f"ℹ️ Text encoder: {route_label(route)} skipped ({type(e).__name__}: {e})")
+            continue
+        return TextEncoder(runner, folder, route)
+    log("⚠️ Text half of the action encoder could not run here")
+    return None
 
 
 def load(backend: Optional[str] = None, log: LogFn = print,

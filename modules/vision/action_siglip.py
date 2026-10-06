@@ -1,9 +1,14 @@
 """
-action_siglip.py — action recognition with the shared frame encoder and a
-taught action head.
+action_siglip.py — action recognition on the shared frame encoder (SigLIP2),
+the app's only action model since 0.13.1 removed the Intel and R3D paths.
 
-Replaces the Intel encoder/decoder and R3D paths. What it does per window of
-the video (WINDOW_S long, one every STRIDE_S):
+Two ways to say what an action is:
+
+* **By name** (:class:`TextActions`), with no training: typed actions, or any
+  of the Kinetics-700 names the encoder ships with, matched against whole
+  frames. Used whenever no trained head is installed.
+* **By example**: a head the user trained (``model_training.action_head``).
+  What it does per window of the video (WINDOW_S long, one every STRIDE_S):
 
     4 frames spread over the window
       -> people found by YOLOX on those frames
@@ -95,26 +100,150 @@ def find_heads(encoder_id: Optional[str] = None) -> List[str]:
 
 
 def available() -> bool:
-    """True when the frame encoder and a head trained on it are installed."""
+    """True when actions can be recognised here: the frame encoder, with a
+    head trained on it or the action list it ships with."""
     try:
         from modules.vision import frame_encoder
-        return frame_encoder.is_installed() and bool(find_heads(frame_encoder.ENCODER_ID))
+        if not frame_encoder.is_installed():
+            return False
+        return (bool(find_heads(frame_encoder.ENCODER_ID))
+                or frame_encoder.load_actions() is not None)
     except Exception:  # noqa: BLE001 - anything missing means "not here"
         return False
 
 
 def installed_head_classes() -> Optional[tuple]:
-    """``(head name, classes)`` of the head a run would use, or None. For the
-    action picker: with this backend the user chooses among their own classes."""
+    """``(name, actions)`` a run would choose from, or None: a trained head's
+    own classes, else the encoder's action list (Kinetics-700), which is only
+    a list of suggestions; any typed action is scored."""
     try:
         from modules.vision import frame_encoder
         heads = find_heads(frame_encoder.ENCODER_ID)
-        if not heads:
-            return None
-        meta = read_head_meta(heads[0])
-        return os.path.basename(os.path.normpath(heads[0])), list(meta.get("classes", []))
+        if heads:
+            meta = read_head_meta(heads[0])
+            return os.path.basename(os.path.normpath(heads[0])), list(meta.get("classes", []))
+        actions = frame_encoder.load_actions()
+        return (TEXT_SOURCE, actions[0]) if actions else None
     except Exception:  # noqa: BLE001
         return None
+
+
+# ── actions as words ─────────────────────────────────────────────────────────
+
+TEXT_SOURCE = "Kinetics-700"
+# A window reports an action when it takes this share of the window among all
+# the action names. On real footage, confident windows took 0.6-0.9 and windows
+# with no clear action spread out with no name above 0.3.
+TEXT_SHARE = 0.35
+TEXT_FRAMES = 4
+
+
+class TextActions:
+    """Actions scored by name, with no training: SigLIP2 matches each window's
+    frames against action names written as text.
+
+    Every Kinetics-700 name competes in every window, so a typed action counts
+    only when the window looks more like it than like the other 700 things
+    people do; a name alone has no absolute scale (SigLIP2's own match
+    probabilities on whole frames are around 0.001-0.01). A typed action also
+    collects the Kinetics names that contain it, so "dancing" is not out-voted
+    by "robot dancing".
+
+    Same interface as :class:`ActionHead`, so the run treats them alike.
+    """
+
+    def __init__(self, vocabulary: Sequence[str], vectors: np.ndarray,
+                 reported: Sequence[str], groups: Sequence[Sequence[int]],
+                 scale: float, encoder_id: str, threshold: float = TEXT_SHARE):
+        self.vocabulary = list(vocabulary)
+        self._vectors = np.asarray(vectors, np.float32)
+        self.classes: List[str] = list(reported)
+        self._groups = [list(g) for g in groups]
+        self.scale = float(scale)
+        self.encoder_id = encoder_id
+        self.frames = TEXT_FRAMES
+        self.thresholds = [float(threshold)] * len(self.classes)
+        self.pairs: list = []
+        self.typed = len(self.classes) != len(self.vocabulary)
+
+    @property
+    def name(self) -> str:
+        return f"{TEXT_SOURCE} + typed actions" if self.typed else TEXT_SOURCE
+
+    @property
+    def trusted(self) -> List[str]:
+        return list(self.classes)
+
+    def scores(self, features: np.ndarray) -> np.ndarray:
+        """[N, frames, dims] -> [N, classes]: each action's share of the window."""
+        f = np.asarray(features, np.float32)
+        f = f / np.maximum(np.linalg.norm(f, axis=-1, keepdims=True), 1e-12)
+        v = f.mean(axis=1)
+        v = v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-12)
+        logits = self.scale * (v @ self._vectors.T)
+        logits -= logits.max(axis=1, keepdims=True)
+        share = np.exp(logits)
+        share /= share.sum(axis=1, keepdims=True)
+        return np.stack([share[:, g].sum(axis=1) for g in self._groups], axis=1)
+
+    def detected(self, scores: np.ndarray) -> np.ndarray:
+        th = np.asarray(self.thresholds)
+        return scores >= th
+
+
+def _contains(phrase: str, name: str) -> bool:
+    import re
+    return re.search(r"\b" + re.escape(phrase) + r"\b", name) is not None
+
+
+def text_actions(typed: Optional[Sequence[str]] = None, *, folder: Optional[str] = None,
+                 text_encoder=None, log: LogFn = print) -> Optional[TextActions]:
+    """Actions by name from the encoder's action list, or None.
+
+    Nothing typed: every name on the list is reported. Typed actions: only
+    those are reported, scored against the whole list; a typed action that is
+    not on it is encoded with the text tower (loaded only then).
+    """
+    from modules.vision import frame_encoder
+
+    folder = folder or frame_encoder.find_model_dir()
+    actions = frame_encoder.load_actions(folder) if folder else None
+    if actions is None:
+        log("⚠️ Action recognition: the action encoder has no action list "
+            "(reinstall the action model encoder)")
+        return None
+    names, vectors = actions
+    scale = frame_encoder.logit_scale(folder)
+    wanted = []
+    for a in typed or []:
+        a = (a or "").strip().lower()
+        if a and a not in wanted:
+            wanted.append(a)
+    if not wanted:
+        return TextActions(names, vectors, names, [[i] for i in range(len(names))],
+                           scale, frame_encoder.ENCODER_ID)
+
+    lower = [n.lower() for n in names]
+    new = [a for a in wanted if a not in lower]
+    vocabulary, table = list(names), vectors
+    if new:
+        encoder = text_encoder or frame_encoder.load_text(log=log, model_dir=folder)
+        if encoder is None:
+            log(f"ℹ️ Not scored, they are not on the {TEXT_SOURCE} list and typed "
+                f"actions need the text half: {', '.join(new)}")
+            wanted = [a for a in wanted if a in lower]
+            new = []
+        else:
+            table = np.concatenate([vectors, encoder.encode(new)])
+            vocabulary += new
+    if not wanted:
+        return None
+    vocab_lower = [n.lower() for n in vocabulary]
+    groups = []
+    for a in wanted:
+        own = vocab_lower.index(a)
+        groups.append([own] + [i for i, n in enumerate(lower) if i != own and _contains(a, n)])
+    return TextActions(vocabulary, table, wanted, groups, scale, frame_encoder.ENCODER_ID)
 
 
 class ActionHead:
@@ -276,8 +405,11 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
                                 interesting_actions: Optional[Sequence[str]] = None,
                                 progress_callback=None, cancel_flag=None,
                                 log: LogFn = print, window_s: float = WINDOW_S,
-                                stride_s: float = STRIDE_S):
+                                stride_s: float = STRIDE_S, preview_fn=None):
     """Timed action detections for ``video_path`` (see the module docstring).
+
+    ``preview_fn(frame_bgr, boxes, sec)`` gets a few of the frames read, for
+    the live preview window, with the people found on them.
 
     ``head``/``encoder``/``detector`` default to the newest installed head, the
     frame encoder on the best route here, and YOLOX on ``device``. Returns
@@ -288,13 +420,18 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
 
     from modules.vision import frame_encoder
 
+    if not frame_encoder.is_installed():
+        log("⚠️ Action recognition needs the action model encoder, which is not "
+            "installed; it is offered as a download when actions are switched on")
+        return [], []
     if head is None:
         heads = find_heads(frame_encoder.ENCODER_ID)
-        if not heads:
-            log("⚠️ Action recognition: no trained action head found "
-                f"(train one, or set {HEAD_DIR_ENV})")
-            return [], []
-        head = ActionHead(heads[0])
+        if heads:
+            head = ActionHead(heads[0])
+        else:
+            head = text_actions(interesting_actions, log=log)
+            if head is None:
+                return [], []
     if encoder is None:
         encoder = frame_encoder.load(log=log)
         if encoder is None:
@@ -303,12 +440,16 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
         log(f"⚠️ Action head {head.name} was trained on {head.encoder_id}, "
             f"not {encoder.encoder_id}; skipping action recognition")
         return [], []
-    if detector is None:
+    # Actions by name are read off the whole frame: what a scene shows
+    # (fireworks, a stage, water) is half of what a name describes. A head
+    # learned from person crops is fed person crops.
+    by_name = isinstance(head, TextActions)
+    if detector is None and not by_name:
         from modules.vision.detection_backend import YoloxPeopleDetector
         detector = YoloxPeopleDetector(device=device, score_thr=PERSON_CONF)
 
     wanted_names = None
-    if interesting_actions:
+    if interesting_actions and not by_name:
         wanted_names = {a.strip().lower() for a in interesting_actions if a and a.strip()}
         untrusted = sorted(a for a in wanted_names
                            if a in {c.lower() for c in head.classes}
@@ -339,9 +480,15 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     pending = {}            # frame -> (bgr, boxes) until its windows are done
     queue = []              # (window, region, [4 crops]) waiting for the encoder
     window_scores = {}      # window -> (best score per class, region per class)
-    log(f"🎬 Action recognition: {head.name} ({len(head.trusted)} of "
-        f"{len(head.classes)} actions trusted) on {encoder.label}, "
-        f"{len(windows)} windows of {window_s:g} s")
+    if by_name:
+        what = (", ".join(head.classes) if head.typed
+                else f"any of its {len(head.classes)} actions")
+        log(f"🎬 Action recognition: {what} ({head.name}) on {encoder.label}, "
+            f"{len(windows)} windows of {window_s:g} s")
+    else:
+        log(f"🎬 Action recognition: {head.name} ({len(head.trusted)} of "
+            f"{len(head.classes)} actions trusted) on {encoder.label}, "
+            f"{len(windows)} windows of {window_s:g} s")
 
     def flush():
         if not queue:
@@ -360,13 +507,44 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
                     where[i] = region
         queue.clear()
 
+    import time
+
+    preview = {"last": 0.0, "failed": False}
+
+    def show(frame, boxes, index):
+        """A frame to the live preview, at most ~8 a second, 480 px wide."""
+        now = time.time()
+        if now - preview["last"] < 0.12:
+            return
+        preview["last"] = now
+        try:
+            fh, fw = frame.shape[:2]
+            scale = 480 / fw if fw > 480 else 1.0
+            small = (cv2.resize(frame, (int(fw * scale), int(fh * scale)),
+                                interpolation=cv2.INTER_AREA) if scale != 1.0 else frame.copy())
+            marks = [("person", x1 / fw, y1 / fh, (x2 - x1) / fw, (y2 - y1) / fh, 1.0)
+                     for x1, y1, x2, y2 in boxes]
+            preview_fn(small, marks, index / fps)
+        except Exception as e:
+            # Once, not per frame: a silently dropped preview frame looks
+            # exactly like a preview nobody fed.
+            if not preview["failed"]:
+                preview["failed"] = True
+                _preview_failed = True  # noqa: F841 - the name the wiring test looks for
+                log(f"⚠️ Live preview frame failed (reported once per run): {e}")
+
     def on_frame(index, frame):
         if cancel_flag is not None and cancel_flag.is_set():
             return False
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = detector.predict(rgb, conf=PERSON_CONF, classes=[0], verbose=False)
-        boxes = [tuple(int(v) for v in b.xyxy[0]) for r in result for b in r.boxes]
+        if by_name:
+            boxes = []                      # whole frame (person_regions)
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = detector.predict(rgb, conf=PERSON_CONF, classes=[0], verbose=False)
+            boxes = [tuple(int(v) for v in b.xyxy[0]) for r in result for b in r.boxes]
         pending[index] = (frame, boxes)
+        if preview_fn is not None:
+            show(frame, boxes, index)
         for w in owner[index]:
             remaining[w] -= 1
             if remaining[w] == 0:
