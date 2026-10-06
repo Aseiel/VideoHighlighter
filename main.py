@@ -1717,34 +1717,6 @@ class VideoHighlighterGUI(QWidget):
                 ("Intro (window, points):", intro_widget),
                 ("Outro (window, points):", outro_widget),
             )),
-            ("Speech", (
-                ("Keyword points (keywords in transcript):",
-                 self.spin_keyword_points),
-                ("Transcript points (all words):", self._points_row_with_button(
-                    self.spin_transcript_points, "transcript", "Transcribe",
-                    "Transcribe every video in the list to a _transcript.txt "
-                    "sidecar and cache it (uses the model/language in the "
-                    "Transcript tab). No highlights are cut.")),
-            )),
-            ("Objects && actions", (
-                ("Object points:", self._points_row_with_button(
-                    self.spin_object, "objects", "Objects",
-                    "Detect the classes from the 'Object detection' field below, "
-                    "across every video in the list, and cache them. No "
-                    "highlights are cut.")),
-                ("Action points:", self._points_row_with_button(
-                    self.spin_action, "actions", "Actions",
-                    "Detect the actions from the 'Action keywords' field below "
-                    "(blank = all actions), across every video in the list, and "
-                    "cache them. No highlights are cut.")),
-            )),
-            ("Face expression", (
-                ("Points, and which expressions:", face_row),
-            )),
-            ("Where in the video", (
-                ("Intro (window, points):", intro_widget),
-                ("Outro (window, points):", outro_widget),
-            )),
         )
         for title, rows in groups:
             points_layout.addWidget(self._points_group(title, rows))
