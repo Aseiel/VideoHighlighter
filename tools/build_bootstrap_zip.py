@@ -69,9 +69,11 @@ def _windows_assets(tag: str, *, pro: bool) -> tuple[str, ...]:
             f"VideoHighlighter-Windows-{tag}.7z.001",
             f"VideoHighlighter-Windows-{tag}.7z.002",
         )
+    # One volume since 0.13.0: PyTorch moved out into packs and the core
+    # archive is well under the 1900 MB volume size. The script asks GitHub for
+    # the real list first (use_latest); this is the offline fallback.
     return (
         f"VideoHighlighter-Windows-{tag}.7z.001",
-        f"VideoHighlighter-Windows-{tag}.7z.002",
     )
 
 
