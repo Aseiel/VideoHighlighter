@@ -5,8 +5,18 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import queue
 import threading
+import traceback
 
 from modules.media.video_regions import crop_frame_for_analysis, normalize_analysis_region
+
+class FrameReadError(Exception):
+    """The frame reader stopped on an error before the end of the video.
+
+    Not a RuntimeError on purpose: the pipeline reads a RuntimeError from this
+    step as a cancel and returns without a word, and this is the opposite of a
+    cancel — the user is waiting for a run that can no longer finish.
+    """
+
 
 def detect_scenes_motion_optimized(video_path,
                                scene_threshold=50.0,
@@ -91,46 +101,67 @@ def detect_scenes_motion_optimized(video_path,
         print(f"Device: {device}, min_area: {min_area}")
         print(f"Motion threshold: {motion_threshold}, Scene threshold: {scene_threshold}")
 
+    # (frame index, exception) when the reader died on an error. Read by the
+    # consumer once the queue runs dry, and raised from there.
+    loader_error = []
+
     def frame_loader():
         """Async frame loading with CPU downscaling and cancellation support"""
         frame_idx = 0
-        ret, frame = cap.read()
-        while ret and not stop_loading.is_set():
-            # Check for cancellation every 100 frames
-            if frame_idx % 100 == 0 and cancel_flag and cancel_flag.is_set():
-                break
-                
-            if frame_idx % frame_skip == 0:
-                frame = crop_frame_for_analysis(frame, analysis_region)
-
-                # Downscale on CPU to reduce GPU memory usage
-                if downscale_factor > 1:
-                    height, width = frame.shape[:2]
-                    new_height = height // downscale_factor
-                    new_width = width // downscale_factor
-                    frame = cv2.resize(frame, (new_width, new_height), 
-                                     interpolation=cv2.INTER_AREA)
-                
-                # Retry until the consumer drains the queue, rather than
-                # dropping the frame after a single 1s timeout.
-                while not stop_loading.is_set():
-                    if cancel_flag and cancel_flag.is_set():
-                        break
-                    try:
-                        frame_queue.put((frame_idx, frame.copy()), timeout=1)
-                        break
-                    except queue.Full:
-                        continue
-                if stop_loading.is_set() or (cancel_flag and cancel_flag.is_set()):
-                    break
-            ret, frame = cap.read()
-            frame_idx += 1
-        # Sentinel: never block forever here, or this thread outlives the
-        # release-guard in finally and the capture leaks every run.
         try:
-            frame_queue.put((None, None), timeout=1)
-        except queue.Full:
-            pass
+            ret, frame = cap.read()
+            while ret and not stop_loading.is_set():
+                # Check for cancellation every 100 frames
+                if frame_idx % 100 == 0 and cancel_flag and cancel_flag.is_set():
+                    break
+                
+                if frame_idx % frame_skip == 0:
+                    frame = crop_frame_for_analysis(frame, analysis_region)
+
+                    # Downscale on CPU to reduce GPU memory usage
+                    if downscale_factor > 1:
+                        height, width = frame.shape[:2]
+                        new_height = height // downscale_factor
+                        new_width = width // downscale_factor
+                        frame = cv2.resize(frame, (new_width, new_height), 
+                                         interpolation=cv2.INTER_AREA)
+                
+                    # Retry until the consumer drains the queue, rather than
+                    # dropping the frame after a single 1s timeout.
+                    while not stop_loading.is_set():
+                        if cancel_flag and cancel_flag.is_set():
+                            break
+                        try:
+                            frame_queue.put((frame_idx, frame.copy()), timeout=1)
+                            break
+                        except queue.Full:
+                            continue
+                    if stop_loading.is_set() or (cancel_flag and cancel_flag.is_set()):
+                        break
+                ret, frame = cap.read()
+                frame_idx += 1
+        except Exception as exc:
+            # Anything here (a damaged frame, a crop or resize error, memory on
+            # a large source) used to end the thread with no sentinel and no
+            # trace in the log, and the consumer then waited on an empty queue
+            # for good: the bar stopped and nothing said why.
+            loader_error.append((frame_idx, exc))
+            print(f"❌ Frame reader stopped after frame {frame_idx}: "
+                  f"{type(exc).__name__}: {exc}")
+            traceback.print_exc()
+        finally:
+            # Sentinel, retried like a frame. A single 1 s attempt was dropped
+            # whenever the queue was full and a GPU batch took longer than that,
+            # and the consumer then waited forever at the very end of the
+            # video. Still gives up once the consumer has stopped
+            # (stop_loading), so this thread cannot outlive the release-guard
+            # in finally and leak the capture.
+            while not stop_loading.is_set():
+                try:
+                    frame_queue.put((None, None), timeout=1)
+                    break
+                except queue.Full:
+                    continue
 
     def process_frame_batch_hybrid(frames_batch):
         """Fast GPU processing for scene detection with cancellation checks"""
@@ -337,10 +368,20 @@ def detect_scenes_motion_optimized(video_path,
                 # Check if we should continue waiting or if cancelled
                 if cancel_flag and cancel_flag.is_set():
                     break
+                # The reader is gone and left nothing behind, so no sentinel
+                # is coming; waiting on would be waiting forever.
+                if not loader_thread.is_alive() and frame_queue.empty():
+                    break
                 continue
         
         # Signal frame loader to stop
         stop_loading.set()
+
+        if loader_error:
+            at, exc = loader_error[0]
+            raise FrameReadError(
+                f"reading the video stopped after frame {at} of about "
+                f"{total_frames}: {type(exc).__name__}: {exc}") from exc
         
         # Process remaining frames only if not cancelled
         if frame_buffer and not (cancel_flag and cancel_flag.is_set()):
@@ -462,10 +503,15 @@ def detect_scenes_motion_optimized(video_path,
         elif debug and cancel_flag and cancel_flag.is_set():
             print(f"Motion detection cancelled - partial results: Scenes: {len(scenes)}, Motion events: {len(motion_events)}, Peaks: {len(motion_peaks)}")
 
+    except FrameReadError:
+        # Not folded into the partial result below: that would be cached as a
+        # full analysis of a video that was only read part of the way.
+        raise
     except Exception as e:
         # Always said: whatever was collected before the failure is returned,
         # and the run carries on as though the rest of the video had no motion.
         print(f"⚠️ Motion detection error: {e}")
+        traceback.print_exc()
     finally:
         # Cleanup
         try:
