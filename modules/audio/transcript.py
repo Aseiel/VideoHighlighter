@@ -123,6 +123,23 @@ def is_valid_speech(text):
         return False
     return True
 
+# Whisper sizes that are slow on a processor. On a CPU, "large" can take longer
+# than the video itself, and the bar moves once per 30 seconds of audio it
+# decodes, so a long video looks stuck; people closed the app mid-chunk, which
+# also left the chunk files beside the video (the cleanup never ran).
+_SLOW_ON_CPU = ("medium", "large")
+
+
+def cpu_model_warning(model_name, device):
+    """A line for the run log when this Whisper model will crawl here, else None."""
+    name = str(model_name or "")
+    if device != "cpu" or not name.startswith(_SLOW_ON_CPU):
+        return None
+    return (f"⚠️ Whisper '{name}' is running on the processor, which can take "
+            f"longer than the video itself. 'small' or 'base' is many times "
+            f"faster; with an NVIDIA card, install its GPU acceleration.")
+
+
 def _remove_chunks(video_dir, base):
     """Delete the `<base>_chunk_NNN.wav` files, if any are lying around."""
     try:
@@ -204,6 +221,9 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
     """
     device = "cuda" if cuda_usable(torch) else "cpu"
     log_fn(f"Using device for Whisper: {device}")
+    slow = cpu_model_warning(model_name, device)
+    if slow:
+        log_fn(slow)
 
     log_fn(f"🔤 Language parameter received: {language}")
 
