@@ -84,12 +84,18 @@
 
 #define Publisher "Aseiel"
 #define AppExe "VideoHighlighter.exe"
+; Held by the running app (modules/system/app_mutex.py). While it exists,
+; Setup and the uninstaller ask the user to close the app instead of
+; deleting around the files it has open. Named after AppName, so the Pro
+; installer waits only for Pro.
+#define AppMutex AppName + " is running"
 #define CudaPackName "torch-cu128"
 #define ClipDirName "clip-vit-base-patch32-ov"
 
 [Setup]
 AppId={{#AppId}
 AppName={#AppName}
+AppMutex={#AppMutex},Global\{#AppMutex}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
 WizardStyle=modern

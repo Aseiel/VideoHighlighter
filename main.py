@@ -7272,6 +7272,10 @@ if __name__ == "__main__":
         multiprocessing.set_start_method("spawn")
     except RuntimeError:
         pass
+    # Tells Setup and the uninstaller the app is open (AppMutex), so they wait
+    # for it to close instead of deleting around the files it holds.
+    from modules.system import app_mutex
+    app_mutex.hold(__edition__)
     reset_duration_method_cache()
     # Nobody should have to install ffmpeg: pip already brought one
     # (imageio-ffmpeg). Give it its plain name on PATH before anything runs it.

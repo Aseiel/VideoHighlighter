@@ -64,6 +64,11 @@
 
 #define Publisher "Aseiel"
 #define AppExe "VideoHighlighter.exe"
+; Held by the running app (modules/system/app_mutex.py). While it exists,
+; Setup and the uninstaller ask the user to close the app instead of
+; deleting around the files it has open. Named after AppName, so the Pro
+; installer waits only for Pro.
+#define AppMutex AppName + " is running"
 ; Top-level folder inside the archive: both editions archive ./dist/VideoHighlighter,
 ; which is PyInstaller's --name, so this does not follow the display name.
 #define PayloadRoot "VideoHighlighter"
@@ -89,6 +94,7 @@
 [Setup]
 AppId={{#AppId}
 AppName={#AppName}
+AppMutex={#AppMutex},Global\{#AppMutex}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
 AppPublisherURL=https://github.com/{#Repo}
