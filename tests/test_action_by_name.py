@@ -117,3 +117,36 @@ def test_the_app_tokenizer_pads_and_ends_like_the_export():
     first = ids[0].tolist()
     assert first[first.index(1) + 1:] == [fe.PAD_ID] * (fe.TEXT_LENGTH - first.index(1) - 1)
     assert ids[1, -1] == 1            # cut to 64, still ending in the end token
+
+
+def _shares_window(shares, dims=8):
+    """A unit frame vector whose shares over NAMES (logit scale 100) are
+    ``shares``: cosines ln(share)/100 plus a constant, the rest of its length
+    in a dimension no name uses."""
+    cos = np.log(np.asarray(shares, np.float64)) / 100.0 + 0.3
+    v = np.zeros(dims)
+    v[:len(cos)] = cos
+    v[-1] = np.sqrt(1.0 - (cos ** 2).sum())
+    return np.repeat(v.astype(np.float32)[None, None, :], 4, axis=1)
+
+
+def test_a_typed_action_counts_in_the_top_three_with_a_real_share(encoder_dir):
+    # A fight scene: the typed action is third, with 10 %, behind two
+    # neighbours. The first rule (35 % of the window) found it nowhere.
+    actions = a.text_actions(["cooking"], folder=encoder_dir)
+    window = _shares_window([0.5, 0.35, 0.10, 0.05])
+    shares = actions.scores(window)
+    assert actions.detected(shares)[0, 0]
+
+
+def test_a_typed_action_fourth_in_the_window_does_not_count(encoder_dir):
+    actions = a.text_actions(["dancing macarena"], folder=encoder_dir)
+    window = _shares_window([0.5, 0.3, 0.12, 0.08])
+    assert not actions.detected(actions.scores(window)).any()
+
+
+def test_the_speed_line_counts_every_frame_read():
+    line = a.action_speed_text(frames_read=33000, analysed=1100, seconds=10.0,
+                               encoded=2200, encode_seconds=4.0, where="OpenVINO GPU")
+    assert "3300 fps (1 in 30 analysed)" in line
+    assert "550 frames/s on OpenVINO GPU" in line

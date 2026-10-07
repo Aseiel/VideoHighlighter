@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import time as _time
 from typing import Callable, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -131,30 +132,40 @@ def installed_head_classes() -> Optional[tuple]:
 # ── actions as words ─────────────────────────────────────────────────────────
 
 TEXT_SOURCE = "Kinetics-700"
-# A window reports an action when it takes this share of the window among all
-# the action names. On real footage, confident windows took 0.6-0.9 and windows
-# with no clear action spread out with no name above 0.3.
-TEXT_SHARE = 0.35
 TEXT_FRAMES = 4
+# When an action counts, as (among the window's K strongest names, share).
+#
+# Nothing typed: the window's strongest action, and only a clear one. On real
+# footage confident windows took 0.6-0.9 of the share and windows with no
+# clear action spread out with no name above 0.3.
+#
+# Typed: among the 3 strongest, with 5 % (35x an even split over 700). A
+# typed action is one specific thing, and in the scenes it describes its near
+# neighbours split the share with it: on a 23-minute video "punching person
+# (boxing)" was the strongest name in 3 windows and in the top 3 in 12, yet
+# never above 0.15 - so the first rule found it nowhere. Actions the video
+# does not show ("dancing ballet", "surfing water") stayed at zero windows.
+ANY_RULE = (1, 0.35)
+TYPED_RULE = (3, 0.05)
 
 
 class TextActions:
     """Actions scored by name, with no training: SigLIP2 matches each window's
     frames against action names written as text.
 
-    Every Kinetics-700 name competes in every window, so a typed action counts
-    only when the window looks more like it than like the other 700 things
-    people do; a name alone has no absolute scale (SigLIP2's own match
-    probabilities on whole frames are around 0.001-0.01). A typed action also
-    collects the Kinetics names that contain it, so "dancing" is not out-voted
-    by "robot dancing".
+    Every Kinetics-700 name competes in every window, so an action counts only
+    when the window looks more like it than like nearly all of the other 700
+    things people do (ANY_RULE / TYPED_RULE); a name alone has no absolute
+    scale (SigLIP2's own match probabilities on whole frames are around
+    0.001-0.01). A typed action also collects the Kinetics names that contain
+    it, so "dancing" is not out-voted by "robot dancing".
 
     Same interface as :class:`ActionHead`, so the run treats them alike.
     """
 
     def __init__(self, vocabulary: Sequence[str], vectors: np.ndarray,
                  reported: Sequence[str], groups: Sequence[Sequence[int]],
-                 scale: float, encoder_id: str, threshold: float = TEXT_SHARE):
+                 scale: float, encoder_id: str, rule: Optional[tuple] = None):
         self.vocabulary = list(vocabulary)
         self._vectors = np.asarray(vectors, np.float32)
         self.classes: List[str] = list(reported)
@@ -162,9 +173,10 @@ class TextActions:
         self.scale = float(scale)
         self.encoder_id = encoder_id
         self.frames = TEXT_FRAMES
-        self.thresholds = [float(threshold)] * len(self.classes)
         self.pairs: list = []
         self.typed = len(self.classes) != len(self.vocabulary)
+        self.top_k, floor = rule or (TYPED_RULE if self.typed else ANY_RULE)
+        self.thresholds = [float(floor)] * len(self.classes)
 
     @property
     def name(self) -> str:
@@ -175,7 +187,8 @@ class TextActions:
         return list(self.classes)
 
     def scores(self, features: np.ndarray) -> np.ndarray:
-        """[N, frames, dims] -> [N, classes]: each action's share of the window."""
+        """[N, frames, dims] -> [N, classes]: each action's share of the window,
+        or 0 where it is not among the window's ``top_k`` strongest names."""
         f = np.asarray(features, np.float32)
         f = f / np.maximum(np.linalg.norm(f, axis=-1, keepdims=True), 1e-12)
         v = f.mean(axis=1)
@@ -184,7 +197,14 @@ class TextActions:
         logits -= logits.max(axis=1, keepdims=True)
         share = np.exp(logits)
         share /= share.sum(axis=1, keepdims=True)
-        return np.stack([share[:, g].sum(axis=1) for g in self._groups], axis=1)
+        out = np.zeros((len(share), len(self._groups)), np.float32)
+        for c, g in enumerate(self._groups):
+            mine = share[:, g].sum(axis=1)
+            rest = np.delete(share, g, axis=1)
+            k = min(self.top_k, rest.shape[1])
+            kth = -np.partition(-rest, k - 1, axis=1)[:, k - 1] if k else np.zeros(len(share))
+            out[:, c] = np.where(mine >= kth, mine, 0.0)
+        return out
 
     def detected(self, scores: np.ndarray) -> np.ndarray:
         th = np.asarray(self.thresholds)
@@ -490,10 +510,15 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             f"{len(head.classes)} actions trusted) on {encoder.label}, "
             f"{len(windows)} windows of {window_s:g} s")
 
+    timing = {"encode": 0.0, "encoded": 0}
+
     def flush():
         if not queue:
             return
+        t0 = _time.perf_counter()
         feats = encoder.encode_bgr([c for _, _, crops in queue for c in crops])
+        timing["encode"] += _time.perf_counter() - t0
+        timing["encoded"] += len(feats)
         feats = feats.reshape(len(queue), head.frames, -1)
         scores = head.scores(feats)
         for (w, region, _), s in zip(queue, scores):
@@ -563,8 +588,10 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             del pending[f]
         return True
 
-    _read_frames(video_path, owner.keys(), on_frame)
+    started = _time.perf_counter()
+    frames_read = _read_frames(video_path, owner.keys(), on_frame)
     flush()
+    elapsed = max(_time.perf_counter() - started, 1e-6)
 
     detections, bboxes = [], []
     last_second = int(np.ceil(total / fps))
@@ -588,4 +615,21 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     detections.sort(key=lambda d: (d[0], -d[3]))
     log(f"✅ Action recognition: {len(detections)} detections "
         f"({len({d[4] for d in detections})} actions) in {len(windows)} windows")
+    # The same two numbers the old action models printed: how fast the video
+    # went by (every frame read, not only the analysed ones), and how fast
+    # the model itself ran.
+    log(action_speed_text(frames_read, len(owner), elapsed, timing["encoded"],
+                          timing["encode"], encoder.label))
     return detections, bboxes
+
+
+def action_speed_text(frames_read: int, analysed: int, seconds: float,
+                      encoded: int, encode_seconds: float, where: str) -> str:
+    """'Speed: 1840 fps (1 in 37 analysed), 22 s; inference: 885 frames/s on
+    OpenVINO GPU'. Frames read is every frame the video went through; a run
+    that analyses fewer of them must look faster, not slower."""
+    ratio = f"1 in {max(1, round(frames_read / analysed))}" if analysed else "none"
+    infer = (f"{encoded / encode_seconds:.0f} frames/s" if encode_seconds > 0
+             else "n/a")
+    return (f"⏱ Speed: {frames_read / max(seconds, 1e-6):.0f} fps ({ratio} analysed), "
+            f"{seconds:.0f} s; inference: {infer} on {where}")
