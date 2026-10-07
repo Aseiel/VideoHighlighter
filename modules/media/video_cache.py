@@ -88,6 +88,11 @@ def build_analysis_cache_params(gui_config: dict, config: dict, sample_rate: int
     # with it a transcript that can take an hour to make again.
     if interesting_actions or float(gui_config.get("action_points", 0) or 0) > 0:
         params["action_detector"] = "siglip2"
+        # 8 frames per window finds different actions than 4. Recorded only
+        # when it is not the default, so caches made at 4 stay valid.
+        frames = int(gui_config.get("action_frames", 4) or 4)
+        if frames != 4:
+            params["action_frames"] = frames
     return params
 
 

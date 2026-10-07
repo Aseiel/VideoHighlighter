@@ -38,6 +38,15 @@ from PySide6.QtWidgets import (
 # Find annotated videos next to the original
 # ---------------------------------------------------------------------------
 
+def _action_frames() -> int:
+    """The "Frames per window" setting for actions by name (4 if unreadable)."""
+    try:
+        from modules.report.analysis_ondemand import analysis_defaults
+        return int(analysis_defaults()["action_frames"])
+    except Exception:
+        return 4
+
+
 def find_annotated_videos(video_path: str) -> dict[str, str]:
     if not video_path or not os.path.isfile(video_path):
         return {}
@@ -357,6 +366,7 @@ class AnnotatedVideoManager(QObject):
                     interesting_actions=actions_list,
                     progress_callback=self._action_progress_callback,
                     annotated_output=output,
+                    frames_per_window=_action_frames(),
                 )
                 # Save bbox data to cache for real-time overlay
                 if action_bboxes:

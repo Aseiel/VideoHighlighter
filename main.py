@@ -2184,6 +2184,22 @@ class VideoHighlighterGUI(QWidget):
         action_model_widget = QWidget()
         action_model_widget.setLayout(action_model_row)
         action_layout.addRow("Model:", action_model_widget)
+
+        # Frames per window, for actions by name: the trade measured in
+        # docs/plans/2026-10-07-action-frames.md. A trained model reads the
+        # number it was trained on, whatever this says.
+        self.action_frames_combo = QComboBox()
+        self.action_frames_combo.addItem("4 — faster, less strict", 4)
+        self.action_frames_combo.addItem("8 — about 1.5× slower, stricter", 8)
+        self.action_frames_combo.setToolTip(
+            "How many frames of each 5-second window SigLIP2 looks at when it\n"
+            "matches actions by name (typed, or the Kinetics-700 list).\n\n"
+            "Measured on a 23-minute video: 8 frames took 1.5× as long, found\n"
+            "nothing 4 frames missed, and dropped a few windows that only looked\n"
+            "like the action. A model you trained always uses its own count.")
+        idx_af = self.action_frames_combo.findData(int(advanced_cfg.get("action_frames", 4) or 4))
+        self.action_frames_combo.setCurrentIndex(idx_af if idx_af >= 0 else 0)
+        action_layout.addRow("Frames per window:", self.action_frames_combo)
         action_box.setLayout(action_layout)
         advanced_layout.addWidget(action_box, 2, 1)
         self._refresh_action_model_status()
@@ -4159,6 +4175,7 @@ class VideoHighlighterGUI(QWidget):
             "write_highlight_report": self.why_report_chk.isChecked(),
             **self._report_config(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
+            "action_frames": int(self.action_frames_combo.currentData() or 4),
             "object_confidence": self.obj_confidence_spin.value() / 100.0,
             "force_reprocess": self.force_reprocess_checkbox.isChecked(),
         }
@@ -4589,6 +4606,8 @@ class VideoHighlighterGUI(QWidget):
                                       adv.get("yolo_custom_model_path") or "")
         if "yolo_model_size" in adv:
             self._set_combo_data(self.yolo_model_combo, adv["yolo_model_size"])
+        if "action_frames" in adv:
+            self._set_combo_data(self.action_frames_combo, int(adv["action_frames"]))
 
         comp = data.get("compute") or {}
         if "backend" in comp:
@@ -4760,6 +4779,7 @@ class VideoHighlighterGUI(QWidget):
                 "yolo_type": self.object_detector_choice()[0],
                 "yolo_model_size": self.yolo_model_combo.currentData(),
                 "yolo_custom_model_path": self.object_detector_choice()[1],
+                "action_frames": int(self.action_frames_combo.currentData() or 4),
             },
             "compute": {
                 "backend": self.backend_combo.currentData(),
@@ -5529,6 +5549,7 @@ class VideoHighlighterGUI(QWidget):
             "write_highlight_report": self.why_report_chk.isChecked(),
             **self._report_config(),
             "draw_action_labels": self.bbox_actions_chk.isChecked(),
+            "action_frames": int(self.action_frames_combo.currentData() or 4),
             "avoid_enabled": self.avoid_face_recognition_chk.isChecked() and bool(avoid_ids),
             "avoid_method": getattr(self, "_avoid_method", "skip"),
             "avoid_identity_ids": avoid_ids,

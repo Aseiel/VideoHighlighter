@@ -1439,6 +1439,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         log=log,
                         preview_fn=preview_fn,
                         annotated_output=action_annotated_path,
+                        frames_per_window=int(gui_config.get("action_frames", 4) or 4),
                     ))
 
                 check_cancellation(cancel_flag, log, "action recognition processing")

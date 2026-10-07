@@ -67,6 +67,13 @@ Recognition. Two ways to use it:
   Actions, or Train → From videos). When one is installed it is used instead,
   on crops around the people in each window.
 
+**Frames per window** (Advanced → Action Recognition) sets how many frames of
+each window are read for actions by name: **4, faster** (the default), or
+**8, about 1.5× slower and stricter**: on the one video measured it found
+nothing 4 missed and dropped a few windows that only looked like the action.
+The numbers are in `docs/plans/2026-10-07-action-frames.md`. A trained model
+always reads its own number of frames.
+
 **Strengths.** It looks across several seconds, so it can tell actions that a
 single frame cannot, and by name it covers far more than any fixed list did.
 

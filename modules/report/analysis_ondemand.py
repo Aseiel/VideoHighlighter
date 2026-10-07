@@ -73,6 +73,7 @@ def analysis_defaults() -> dict:
         "transcript_enabled": bool(transcript_cfg.get("enabled", False)),
         "search_keywords": list(transcript_cfg.get("search_keywords", []) or []),
         "sample_rate": int(advanced_cfg.get("sample_rate", 5) or 5),
+        "action_frames": int(advanced_cfg.get("action_frames", 4) or 4),
         "frame_skip": int(advanced_cfg.get("frame_skip", 5) or 5),
     }
 
@@ -331,7 +332,7 @@ def run_actions(video_path: str, *, sample_rate: Optional[int] = None,
     detections, _bboxes = action_siglip.run_action_detection_siglip(
         video_path, device=device, interesting_actions=keep,
         progress_callback=progress, cancel_flag=cancel, log=log,
-        preview_fn=preview_fn)
+        preview_fn=preview_fn, frames_per_window=analysis_defaults()["action_frames"])
     if cancel is not None and cancel.is_set():
         raise _Cancelled()
     return _actions_to_cache(detections)

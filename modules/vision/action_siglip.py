@@ -133,6 +133,11 @@ def installed_head_classes() -> Optional[tuple]:
 
 TEXT_SOURCE = "Kinetics-700"
 TEXT_FRAMES = 4
+# Frames per window for actions by name, the "Frames per window" setting.
+# Measured on a 23-minute video (docs/plans/2026-10-07-action-frames.md): 8
+# took 1.5x as long, found nothing 4 missed, and dropped a few windows that
+# only looked like the action. A trained head always uses its own count.
+FRAMES_CHOICES = (4, 8)
 # When an action counts, as (among the window's K strongest names, share).
 #
 # Nothing typed: the window's strongest action, and only a clear one. On real
@@ -426,11 +431,16 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
                                 progress_callback=None, cancel_flag=None,
                                 log: LogFn = print, window_s: float = WINDOW_S,
                                 stride_s: float = STRIDE_S, preview_fn=None,
-                                annotated_output: Optional[str] = None):
+                                annotated_output: Optional[str] = None,
+                                frames_per_window: Optional[int] = None):
     """Timed action detections for ``video_path`` (see the module docstring).
 
     ``preview_fn(frame_bgr, boxes, sec)`` gets a few of the frames read, for
     the live preview window, with the people found on them.
+
+    ``frames_per_window``: frames read per window for actions by name
+    (FRAMES_CHOICES; default TEXT_FRAMES). A trained head reads the number it
+    was trained on, whatever this says.
 
     ``annotated_output``: also write a copy of the video with the actions drawn
     on it (:func:`write_annotated_video`), the file the timeline viewer offers
@@ -469,6 +479,8 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     # (fireworks, a stage, water) is half of what a name describes. A head
     # learned from person crops is fed person crops.
     by_name = isinstance(head, TextActions)
+    if by_name and frames_per_window:
+        head.frames = int(frames_per_window)
     # People are found in both modes: a trained head is fed crops of them, and
     # an action by name - scored on the whole frame - is drawn around them on
     # the timeline. A full-frame box has its outline on the frame's edge and
@@ -520,7 +532,8 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     if by_name:
         what = (", ".join(head.classes) if head.typed
                 else f"any of its {len(head.classes)} actions")
-        log(f"🎬 Looking for {what} ({head.name}), {len(windows)} windows of {window_s:g} s")
+        log(f"🎬 Looking for {what} ({head.name}), {len(windows)} windows of "
+            f"{window_s:g} s, {head.frames} frames each")
     else:
         log(f"🎬 Looking for the actions of {head.name} ({len(head.trusted)} of "
             f"{len(head.classes)} trusted), {len(windows)} windows of {window_s:g} s")
