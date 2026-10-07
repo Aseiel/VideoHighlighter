@@ -1408,9 +1408,15 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         _action_points = float(gui_config.get("action_points", config.get("action_points", 10)) or 0)
         if not using_cache and (interesting_actions or _action_points > 0):
             try:
+                # "Draw action labels": a copy of the video with the actions
+                # drawn on it, which the timeline viewer offers as a source.
+                action_annotated_path = None
                 if gui_config.get("draw_action_labels", False):
-                    log("ℹ️ Drawing action labels onto the video is not available "
-                        "with the SigLIP2 action models yet")
+                    video_basename = os.path.splitext(os.path.basename(video_path))[0]
+                    temp_folder = os.path.dirname(video_path) or "."
+                    action_annotated_path = os.path.join(
+                        temp_folder, f"{video_basename}_actions_annotated.mp4")
+                    log(f"🎨 Action labels enabled, output: {action_annotated_path}")
 
                 # Which OpenVINO device this run may use is decided by the
                 # compute preference, not by OpenVINO's own AUTO: on an AMD
@@ -1432,6 +1438,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         cancel_flag=cancel_flag,
                         log=log,
                         preview_fn=preview_fn,
+                        annotated_output=action_annotated_path,
                     ))
 
                 check_cancellation(cancel_flag, log, "action recognition processing")

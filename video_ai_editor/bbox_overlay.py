@@ -348,25 +348,24 @@ class AnnotatedVideoManager(QObject):
                 if actions_list:
                     print(f"   Tracking actions: {actions_list}")
 
-                # The SigLIP2 pass finds actions and where they are, but does
-                # not draw them into a new video; the boxes go to the cache,
-                # where the live overlay draws them over the player.
+                base, ext = os.path.splitext(self.video_path)
+                output = f"{base}_actions_annotated.mp4"
+                print(f"🎬 Starting action detection → {os.path.basename(output)}")
+
                 _, action_bboxes = action_siglip.run_action_detection_siglip(
                     self.video_path,
                     interesting_actions=actions_list,
                     progress_callback=self._action_progress_callback,
+                    annotated_output=output,
                 )
+                # Save bbox data to cache for real-time overlay
                 if action_bboxes:
                     self.cache_data['action_bboxes'] = action_bboxes
                     self._save_cache_to_disk()
                     print(f"💾 Saved {len(action_bboxes)} action bboxes to cache")
 
-                def _done(n=len(action_bboxes)):
-                    self.set_generating(False, "actions")
-                    self._set_status(
-                        f"✅ {n} action boxes saved; the live overlay shows them "
-                        "(actions are not drawn into a separate video)")
-                QTimer.singleShot(0, _done)
+                print(f"✅ Action bbox video saved: {output}")
+                QTimer.singleShot(0, lambda: self._on_generate_done(True, output, "actions"))
 
             except Exception as e:
                 traceback.print_exc()

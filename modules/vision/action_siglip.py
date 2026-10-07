@@ -425,11 +425,16 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
                                 interesting_actions: Optional[Sequence[str]] = None,
                                 progress_callback=None, cancel_flag=None,
                                 log: LogFn = print, window_s: float = WINDOW_S,
-                                stride_s: float = STRIDE_S, preview_fn=None):
+                                stride_s: float = STRIDE_S, preview_fn=None,
+                                annotated_output: Optional[str] = None):
     """Timed action detections for ``video_path`` (see the module docstring).
 
     ``preview_fn(frame_bgr, boxes, sec)`` gets a few of the frames read, for
     the live preview window, with the people found on them.
+
+    ``annotated_output``: also write a copy of the video with the actions drawn
+    on it (:func:`write_annotated_video`), the file the timeline viewer offers
+    as its "Actions" source.
 
     ``head``/``encoder``/``detector`` default to the newest installed head, the
     frame encoder on the best route here, and YOLOX on ``device``. Returns
@@ -464,9 +469,19 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     # (fireworks, a stage, water) is half of what a name describes. A head
     # learned from person crops is fed person crops.
     by_name = isinstance(head, TextActions)
-    if detector is None and not by_name:
-        from modules.vision.detection_backend import YoloxPeopleDetector
-        detector = YoloxPeopleDetector(device=device, score_thr=PERSON_CONF)
+    # People are found in both modes: a trained head is fed crops of them, and
+    # an action by name - scored on the whole frame - is drawn around them on
+    # the timeline. A full-frame box has its outline on the frame's edge and
+    # its label above the picture, so it was there and could not be seen.
+    if detector is None:
+        try:
+            from modules.vision.detection_backend import YoloxPeopleDetector
+            detector = YoloxPeopleDetector(device=device, score_thr=PERSON_CONF)
+        except Exception as e:  # noqa: BLE001 - boxes are a nicety by name
+            if not by_name:
+                raise
+            print(f"ℹ️ Action recognition: no person detector ({e}); boxes are the whole frame")
+            detector = None
 
     wanted_names = None
     if interesting_actions and not by_name:
@@ -500,17 +515,19 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     pending = {}            # frame -> (bgr, boxes) until its windows are done
     queue = []              # (window, region, [4 crops]) waiting for the encoder
     window_scores = {}      # window -> (best score per class, region per class)
+    people = f"people: YOLOX on {device}" if detector is not None else "no person boxes"
+    log(f"🎯 Action recognition: SigLIP2 on {encoder.label} ({people})")
     if by_name:
         what = (", ".join(head.classes) if head.typed
                 else f"any of its {len(head.classes)} actions")
-        log(f"🎬 Action recognition: {what} ({head.name}) on {encoder.label}, "
-            f"{len(windows)} windows of {window_s:g} s")
+        log(f"🎬 Looking for {what} ({head.name}), {len(windows)} windows of {window_s:g} s")
     else:
-        log(f"🎬 Action recognition: {head.name} ({len(head.trusted)} of "
-            f"{len(head.classes)} actions trusted) on {encoder.label}, "
-            f"{len(windows)} windows of {window_s:g} s")
+        log(f"🎬 Looking for the actions of {head.name} ({len(head.trusted)} of "
+            f"{len(head.classes)} trusted), {len(windows)} windows of {window_s:g} s")
+    analysed_every = max(1, round(total / max(1, len(owner))))
 
-    timing = {"encode": 0.0, "encoded": 0}
+    timing = {"encode": 0.0, "encoded": 0, "detect": 0.0, "hits": 0,
+              "start": _time.perf_counter()}
 
     def flush():
         if not queue:
@@ -521,6 +538,7 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
         timing["encoded"] += len(feats)
         feats = feats.reshape(len(queue), head.frames, -1)
         scores = head.scores(feats)
+        timing["hits"] += int(head.detected(scores).sum())
         for (w, region, _), s in zip(queue, scores):
             best, where = window_scores.get(w, (None, None))
             if best is None:
@@ -561,12 +579,13 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     def on_frame(index, frame):
         if cancel_flag is not None and cancel_flag.is_set():
             return False
-        if by_name:
-            boxes = []                      # whole frame (person_regions)
-        else:
+        boxes = []
+        if detector is not None:
+            t0 = _time.perf_counter()
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             result = detector.predict(rgb, conf=PERSON_CONF, classes=[0], verbose=False)
             boxes = [tuple(int(v) for v in b.xyxy[0]) for r in result for b in r.boxes]
+            timing["detect"] += _time.perf_counter() - t0
         pending[index] = (frame, boxes)
         if preview_fn is not None:
             show(frame, boxes, index)
@@ -575,20 +594,33 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             if remaining[w] == 0:
                 frames = windows[w]
                 regions = person_regions([pending[f][1] for f in frames], width, height)
-                for region in regions:
-                    x1, y1, x2, y2 = region
-                    queue.append((w, region, [pending[f][0][y1:y2, x1:x2] for f in frames]))
+                if by_name:
+                    # Scored on the whole frame, drawn around the people.
+                    queue.append((w, _box_for(regions, width, height),
+                                  [pending[f][0] for f in frames]))
+                else:
+                    for region in regions:
+                        x1, y1, x2, y2 = region
+                        queue.append((w, region, [pending[f][0][y1:y2, x1:x2] for f in frames]))
                 if len(queue) * head.frames >= ENCODE_BATCH:
                     flush()
                 if progress_callback:
-                    progress_callback(w + 1, len(windows), "Action recognition",
-                                      f"{(w + 1) * 100 // len(windows)}%")
+                    # What the old action models showed in the progress bar.
+                    took = _time.perf_counter() - timing["start"]
+                    rate = (f"{timing['encoded'] / timing['encode']:.0f} frames/s"
+                            if timing["encode"] > 0 else "starting")
+                    progress_callback(
+                        w + 1, len(windows), "Action Recognition",
+                        f"Window {w + 1}/{len(windows)} | Detections: {timing['hits']} | "
+                        f"Speed: {index / max(took, 1e-6):.0f} fps (1 in {analysed_every} "
+                        f"analysed) | Inference: {rate} | Backend: {encoder.label} | "
+                        f"Model: {head.name}")
         # A frame is kept only while a window still needs it.
         for f in [f for f in pending if all(remaining[w] == 0 for w in owner[f])]:
             del pending[f]
         return True
 
-    started = _time.perf_counter()
+    timing["start"] = started = _time.perf_counter()
     frames_read = _read_frames(video_path, owner.keys(), on_frame)
     flush()
     elapsed = max(_time.perf_counter() - started, 1e-6)
@@ -603,7 +635,7 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             name = head.classes[i]
             if wanted_names is not None and name.lower() not in wanted_names:
                 continue
-            x1, y1, x2, y2 = where[i]
+            x1, y1, x2, y2 = _drawable(where[i], width, height)
             box = [x1 / width, y1 / height, (x2 - x1) / width, (y2 - y1) / height]
             for sec in seconds:
                 if sec < 0 or sec * fps >= total:
@@ -620,7 +652,168 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     # the model itself ran.
     log(action_speed_text(frames_read, len(owner), elapsed, timing["encoded"],
                           timing["encode"], encoder.label))
+    if annotated_output and not (cancel_flag is not None and cancel_flag.is_set()):
+        write_annotated_video(video_path, annotated_output, bboxes, log=log,
+                              progress_callback=progress_callback, cancel_flag=cancel_flag)
+    if progress_callback:
+        progress_callback(len(windows), len(windows), "Action Recognition Complete",
+                          f"Complete! {len(detections)} detections | {frames_read} frames "
+                          f"in {elapsed:.1f}s | Speed: {frames_read / elapsed:.0f} fps")
+    # Where the time went, for the debug log (the old models' summary).
+    other = max(0.0, elapsed - timing["encode"] - timing["detect"])
+    print("🏁 Action recognition, where the time went:\n"
+          f"   total {elapsed:.1f}s for {frames_read} frames ({len(owner)} analysed, "
+          f"{len(windows)} windows)\n"
+          f"   encoder ({encoder.label}): {timing['encode']:.1f}s "
+          f"({timing['encode'] / elapsed:.0%}), {timing['encoded']} frames\n"
+          f"   people (YOLOX): {timing['detect']:.1f}s ({timing['detect'] / elapsed:.0%})\n"
+          f"   decoding and the rest: {other:.1f}s ({other / elapsed:.0%})")
     return detections, bboxes
+
+
+# ── the annotated video ──────────────────────────────────────────────────────
+# Drawn as the Intel/R3D pass drew it (action_recognition.py before 0.13.1):
+# the action's box in blue with its label under it, a "DETECTED ACTIONS" panel
+# top right with up to three actions and a bar each, and the time top left.
+
+ANNOTATED_MAX_HEIGHT = 1080          # larger sources are written at 1080 p
+_BOX_COLOUR = (255, 0, 0)            # BGR, the old "FULL BODY" action box
+_PANEL_COLOUR = (0, 255, 255)
+
+
+def draw_action_panel(frame, actions, max_labels: int = 3) -> None:
+    """``actions``: ``[(name, score), ...]`` best first, drawn top right."""
+    if not actions:
+        return
+    h, w = frame.shape[:2]
+    top = actions[:max_labels]
+    panel_w = min(400, max(200, int(w * 0.6)))
+    panel_h = 30 + len(top) * 35
+    x, y = w - panel_w - 10, 10
+    shade = frame.copy()
+    cv2 = _cv2()
+    cv2.rectangle(shade, (x, y), (x + panel_w, y + panel_h), (0, 0, 0), -1)
+    cv2.addWeighted(shade, 0.7, frame, 0.3, 0, frame)
+    cv2.rectangle(frame, (x, y), (x + panel_w, y + panel_h), _PANEL_COLOUR, 2)
+    cv2.putText(frame, "DETECTED ACTIONS", (x + 10, y + 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, _PANEL_COLOUR, 2)
+    row = y + 50
+    for i, (name, score) in enumerate(top):
+        cv2.putText(frame, f"{i + 1}. {name}", (x + 10, row),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, _PANEL_COLOUR, 1)
+        cv2.putText(frame, f"{score:.0%}", (x + panel_w - 60, row),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, _PANEL_COLOUR, 1)
+        bar = int((panel_w - 30) * max(0.0, min(1.0, score)))
+        cv2.rectangle(frame, (x + 10, row + 5), (x + 10 + bar, row + 10), _PANEL_COLOUR, -1)
+        row += 35
+
+
+def draw_action_box(frame, box_norm, name: str) -> None:
+    """The action's box (normalised x, y, w, h) with its label under it."""
+    cv2 = _cv2()
+    h, w = frame.shape[:2]
+    x, y, bw, bh = box_norm
+    x1, y1, x2, y2 = int(x * w), int(y * h), int((x + bw) * w), int((y + bh) * h)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), _BOX_COLOUR, 3)
+    label = f"ACTION: {name}"
+    (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+    ly = min(y2 + 5, h - lh - 15)
+    cv2.rectangle(frame, (x1, ly), (x1 + lw + 10, ly + lh + 10), _BOX_COLOUR, -1)
+    cv2.putText(frame, label, (x1 + 5, ly + lh + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (0, 0, 0), 2)
+
+
+def _cv2():
+    import cv2
+    return cv2
+
+
+def write_annotated_video(video_path: str, output_path: str, bboxes: Sequence[dict], *,
+                          log: LogFn = print, progress_callback=None,
+                          cancel_flag=None) -> bool:
+    """A copy of the video with each second's actions drawn on every frame of
+    it. ``bboxes`` is what the run returns (one entry per second and action).
+    Returns True when the file was written."""
+    import time
+
+    cv2 = _cv2()
+    by_second: dict = {}
+    for b in bboxes:
+        by_second.setdefault(int(b["timestamp"]), []).append(b)
+    for items in by_second.values():
+        items.sort(key=lambda b: -b["confidence"])
+
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if width <= 0 or height <= 0:
+        cap.release()
+        log(f"⚠️ Annotated actions video not written: cannot read {os.path.basename(video_path)}")
+        return False
+    if height > ANNOTATED_MAX_HEIGHT:
+        width, height = int(width * ANNOTATED_MAX_HEIGHT / height) // 2 * 2, ANNOTATED_MAX_HEIGHT
+    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        log(f"⚠️ Annotated actions video not written: cannot create {output_path}")
+        return False
+    log(f"🎨 Drawing the actions into {os.path.basename(output_path)}")
+    started, last_report, index = time.time(), 0.0, 0
+    try:
+        while True:
+            if cancel_flag is not None and cancel_flag.is_set():
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame.shape[0] != height:
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+            sec = int(index / fps)
+            items = by_second.get(sec, [])
+            if items:
+                draw_action_box(frame, items[0]["bbox"], items[0]["action_name"])
+                draw_action_panel(frame, [(b["action_name"], float(b["confidence"]))
+                                          for b in items])
+            cv2.putText(frame, f"{sec // 60:02d}:{sec % 60:02d}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+            writer.write(frame)
+            index += 1
+            now = time.time()
+            if progress_callback and total and now - last_report > 0.25:
+                last_report = now
+                progress_callback(index, total, "Drawing actions",
+                                  f"Frame {index}/{total} | "
+                                  f"{index / max(now - started, 1e-6):.0f} fps")
+    finally:
+        cap.release()
+        writer.release()
+    log(f"✅ Annotated video saved: {output_path} ({index} frames, "
+        f"{time.time() - started:.0f} s)")
+    return index > 0
+
+
+def _drawable(region, width: int, height: int) -> tuple:
+    """A box the timeline overlay can show. Its label sits just above the box,
+    so a box reaching the top of the frame (any close-up: people plus margin
+    fill the picture) had its label off screen and its outline on the frame's
+    edge, and looked like no box at all. Kept 10 % below the top and 2 % in
+    from the other edges."""
+    x1, y1, x2, y2 = region
+    nx1, ny1 = max(x1, int(0.02 * width)), max(y1, int(0.10 * height))
+    nx2, ny2 = min(x2, int(0.98 * width)), min(y2, int(0.98 * height))
+    return (nx1, ny1, nx2, ny2) if nx2 > nx1 and ny2 > ny1 else tuple(region)
+
+
+def _box_for(regions, width: int, height: int) -> tuple:
+    """Where to draw an action found on the whole frame: around the people in
+    the window, or, with nobody there, the frame inset enough that the label
+    above the box stays on screen."""
+    if regions and regions != [(0, 0, width, height)]:
+        return (min(r[0] for r in regions), min(r[1] for r in regions),
+                max(r[2] for r in regions), max(r[3] for r in regions))
+    return (0, 0, width, height)
 
 
 def action_speed_text(frames_read: int, analysed: int, seconds: float,

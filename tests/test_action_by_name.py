@@ -150,3 +150,14 @@ def test_the_speed_line_counts_every_frame_read():
                                encoded=2200, encode_seconds=4.0, where="OpenVINO GPU")
     assert "3300 fps (1 in 30 analysed)" in line
     assert "550 frames/s on OpenVINO GPU" in line
+
+
+def test_a_close_up_box_stays_inside_the_picture():
+    # People plus margin fill a close-up; the overlay puts the label above the
+    # box, so a box from the frame's top edge showed no label and no outline.
+    x1, y1, x2, y2 = a._drawable((0, 0, 640, 360), 640, 360)
+    assert y1 >= 0.10 * 360 and x1 > 0 and x2 < 640 and y2 < 360
+
+
+def test_a_box_around_people_is_kept_as_it_is():
+    assert a._drawable((100, 80, 300, 300), 640, 360) == (100, 80, 300, 300)
