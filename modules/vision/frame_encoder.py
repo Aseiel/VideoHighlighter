@@ -12,6 +12,10 @@ for accuracy (2-4 points more on held-out videos; measured in
 ``docs/plans/2026-10-02-siglip2-search-pose-export.md``), at the price of being
 about 4x slower on a processor.
 
+The one exception is a fine-tuned action model, which brings its own copy of
+the image tower, trained further, taking this encoder's input
+(:func:`load_tower`). Search and actions by name always use this one.
+
 The preprocessing is part of the id
 -----------------------------------
 :func:`preprocess` is exactly the pipeline that was measured best: shrink to
@@ -363,8 +367,11 @@ class FrameEncoder:
     encoder_id = ENCODER_ID
     dims = DIMS
 
-    def __init__(self, runner, route: str, folder: str, batch: Optional[int] = None):
+    def __init__(self, runner, route: str, folder: str, batch: Optional[int] = None,
+                 encoder_id: Optional[str] = None):
         self._runner = runner
+        if encoder_id:
+            self.encoder_id = encoder_id
         self.route = route
         self.label = route_label(route)
         self.folder = folder
@@ -397,14 +404,14 @@ class FrameEncoder:
         self._runner = None
 
 
-def _check_route(runner, meta: dict) -> None:
-    """Raise unless ``runner`` reproduces encoder.json's probe vector."""
+def _check_route(runner, probe: Sequence[float]) -> None:
+    """Raise unless ``runner`` reproduces the reference ``probe`` vector."""
     out = runner.run(probe_pixels())
     if out.shape != (1, DIMS):
         raise RuntimeError(f"returned shape {tuple(out.shape)}, expected (1, {DIMS})")
     if not np.isfinite(out).all():
         raise RuntimeError("returned non-finite numbers")
-    cos = _cosine(out[0], meta["probe"])
+    cos = _cosine(out[0], probe)
     if cos < PROBE_MIN_COSINE:
         raise RuntimeError(f"does not match the reference (cosine {cos:.4f})")
 
@@ -539,7 +546,33 @@ def load(backend: Optional[str] = None, log: LogFn = print,
     except Exception as e:  # noqa: BLE001
         log(f"⚠️ Frame encoder in {folder} is unusable: {e}")
         return None
+    return _load_on_routes(os.path.join(folder, MODEL_FILE), meta["probe"], ENCODER_ID,
+                           folder, backend, log)
 
+
+def load_tower(model_path: str, probe: Sequence[float], encoder_id: str,
+               backend: Optional[str] = None, log: LogFn = print) -> Optional[FrameEncoder]:
+    """An image tower that is not the shared encoder but takes its input: a
+    fine-tuned action model's own ``vision.onnx`` (see action_siglip). It is
+    fed :func:`preprocess` and must return :data:`DIMS` numbers per frame.
+
+    Loaded exactly like the shared encoder, on the same routes and with the
+    same proof: every route must reproduce ``probe``, the tower's vector for
+    :func:`probe_pixels` recorded when it was made. Returns None, with a line
+    in ``log``, when the file is missing or no route reproduces it.
+    """
+    if not os.path.isfile(model_path):
+        log(f"⚠️ Encoder {encoder_id}: {model_path} is missing")
+        return None
+    if len(probe) != DIMS:
+        log(f"⚠️ Encoder {encoder_id}: its probe has {len(probe)} numbers, not {DIMS}")
+        return None
+    return _load_on_routes(model_path, probe, encoder_id, os.path.dirname(model_path),
+                           backend, log)
+
+
+def _load_on_routes(model_path: str, probe: Sequence[float], encoder_id: str, folder: str,
+                    backend: Optional[str], log: LogFn) -> Optional[FrameEncoder]:
     if backend is None:
         try:
             from modules.system import compute_backend
@@ -549,17 +582,17 @@ def load(backend: Optional[str] = None, log: LogFn = print,
     intel_device, discrete = _openvino_gpu()
     order = route_order(backend, intel_gpu=intel_device is not None,
                         intel_discrete=discrete, cuda=_cuda_present())
-    model_path = os.path.join(folder, MODEL_FILE)
     for route in order:
         try:
             runner = _open_route(route, model_path, intel_device)
-            _check_route(runner, meta)
+            _check_route(runner, probe)
         except Exception as e:  # noqa: BLE001 - the next route is the answer
-            print(f"ℹ️ Frame encoder: {route_label(route)} skipped ({type(e).__name__}: {e})")
+            print(f"ℹ️ Frame encoder {encoder_id}: {route_label(route)} skipped "
+                  f"({type(e).__name__}: {e})")
             continue
-        encoder = FrameEncoder(runner, route, folder)
-        log(f"✅ Frame encoder: {ENCODER_ID} on {encoder.label}")
+        encoder = FrameEncoder(runner, route, folder, encoder_id=encoder_id)
+        log(f"✅ Frame encoder: {encoder_id} on {encoder.label}")
         return encoder
-    log(f"⚠️ Frame encoder: no route could run {ENCODER_ID} here "
+    log(f"⚠️ Frame encoder: no route could run {encoder_id} here "
         f"(tried {', '.join(route_label(r) for r in order)})")
     return None

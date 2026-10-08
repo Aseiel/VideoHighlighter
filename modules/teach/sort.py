@@ -268,14 +268,14 @@ def _head_model(folder: str, *, encoder=None, head=None,
     """``(path -> each action's score or None, classes)`` for a trained action
     head (``head.onnx`` + ``head.json``).
 
-    The frame encoder on the head's own number of frames, spread over the clip
-    as the trainer reads them, so what it says here is what the model will say
-    in use.
+    The encoder the head reads (its own, for a fine-tuned head) on the head's
+    own number of frames, spread over the clip as the trainer reads them, so
+    what it says here is what the model will say in use.
     """
-    from modules.vision import action_siglip, frame_encoder
+    from modules.vision import action_siglip
 
     head = head or action_siglip.ActionHead(folder)
-    enc = encoder or frame_encoder.load(log=print)
+    enc = encoder or action_siglip.encoder_for(head, log=print)
     if enc is None:
         raise RuntimeError("the frame encoder is not available")
     if head.encoder_id and head.encoder_id != enc.encoder_id:

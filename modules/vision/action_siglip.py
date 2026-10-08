@@ -28,6 +28,12 @@ A head is a folder with ``head.onnx`` and ``head.json`` as written by
 ``model_training.action_head.train``. Its classes are the user's own; nothing
 here names any of them.
 
+A fine-tuned head also trained the encoder, so it brings its own copy:
+``vision.onnx`` in its folder and an ``own_encoder`` block in ``head.json``
+(:func:`own_encoder`). It is run instead of the shared encoder, on the same
+routes and preprocessing; search and actions by name never use it
+(docs/plans/2026-10-08-fine-tuned-action-encoder.md).
+
 Returns the same thing run_action_detection() does, so the pipeline needs no
 second code path: ``[(timestamp, frame_id, action_id, score, name), ...]`` and
 a list of ``{timestamp, action_name, confidence, bbox, model_type}`` boxes.
@@ -45,6 +51,7 @@ HEAD_MODEL = "head.onnx"
 HEAD_META = "head.json"
 HEAD_KIND = "action-head"
 HEAD_DIR_ENV = "VH_ACTION_HEAD_DIR"
+OWN_ENCODER = "own_encoder"   # head.json block of a fine-tuned head (own_encoder())
 
 WINDOW_S = 5.0        # the dataset's clip length: the head learned that time scale
 STRIDE_S = 2.5        # windows overlap by half
@@ -82,33 +89,80 @@ def read_head_meta(folder: str) -> dict:
         raise ValueError(f"{HEAD_META} is not an action head (kind={meta.get('kind')!r})")
     if not os.path.isfile(os.path.join(folder, HEAD_MODEL)):
         raise ValueError(f"{HEAD_MODEL} is missing")
+    own_encoder(folder, meta)
     return meta
+
+
+def own_encoder(folder: str, meta: dict) -> Optional[dict]:
+    """The encoder a fine-tuned head brings, or None for a head on the shared
+    encoder. Raises ValueError with a sentence for the log when the block is
+    there but cannot be trusted.
+
+    ``head.json``::
+
+        "encoder": "<the head's own id, never the shared one>",
+        "own_encoder": {"file": "vision.onnx",
+                        "preprocess": "<the shared encoder's id>",
+                        "dims": 768, "probe": [768 numbers]}
+
+    ``preprocess`` says whose input the tower was trained on; the app has one
+    preprocessing (frame_encoder.preprocess), so it must be the shared
+    encoder's. ``probe`` is the tower's vector for frame_encoder.probe_pixels,
+    which every route must reproduce before it is used. Returns the block
+    with ``path`` added.
+    """
+    block = meta.get(OWN_ENCODER)
+    if block is None:
+        return None
+    from modules.vision import frame_encoder
+
+    if not isinstance(block, dict):
+        raise ValueError(f"{OWN_ENCODER} is not an object")
+    if not meta.get("encoder") or meta.get("encoder") == frame_encoder.ENCODER_ID:
+        raise ValueError(f"a head with its own encoder needs an encoder id of its own, "
+                         f"not {meta.get('encoder')!r}")
+    if block.get("preprocess") != frame_encoder.ENCODER_ID:
+        raise ValueError(f"its encoder takes {block.get('preprocess')!r} input; this app "
+                         f"prepares frames for {frame_encoder.ENCODER_ID}")
+    dims = frame_encoder.DIMS
+    if int(block.get("dims", 0)) != dims or len(block.get("probe") or []) != dims:
+        raise ValueError(f"its encoder does not describe {dims}-number vectors with a probe")
+    name = str(block.get("file") or "")
+    if not name or os.path.basename(name) != name:
+        raise ValueError(f"{OWN_ENCODER} file must be a file name in the head's folder")
+    path = os.path.join(folder, name)
+    if not os.path.isfile(path):
+        raise ValueError(f"{name} is missing")
+    return {**block, "path": path}
 
 
 def find_heads(encoder_id: Optional[str] = None) -> List[str]:
     """Head folders that can run here, newest first; ``VH_ACTION_HEAD_DIR``
-    wins. With ``encoder_id``, only heads trained on that encoder."""
+    wins. With ``encoder_id``, only heads trained on that encoder, and heads
+    that bring their own."""
     found = []
     for folder in _head_dirs():
         try:
             meta = read_head_meta(folder)
         except Exception:  # noqa: BLE001 - not a head, or a broken one
             continue
-        if encoder_id and meta.get("encoder") != encoder_id:
+        if encoder_id and meta.get("encoder") != encoder_id and OWN_ENCODER not in meta:
             continue
         found.append(folder)
     return found
 
 
 def available() -> bool:
-    """True when actions can be recognised here: the frame encoder, with a
-    head trained on it or the action list it ships with."""
+    """True when actions can be recognised here: a head that brings its own
+    encoder, or the frame encoder with a head trained on it or the action
+    list it ships with."""
     try:
         from modules.vision import frame_encoder
-        if not frame_encoder.is_installed():
-            return False
-        return (bool(find_heads(frame_encoder.ENCODER_ID))
-                or frame_encoder.load_actions() is not None)
+        installed = frame_encoder.is_installed()
+        for folder in find_heads(frame_encoder.ENCODER_ID):
+            if installed or OWN_ENCODER in read_head_meta(folder):
+                return True
+        return installed and frame_encoder.load_actions() is not None
     except Exception:  # noqa: BLE001 - anything missing means "not here"
         return False
 
@@ -282,6 +336,7 @@ class ActionHead:
         self.classes: List[str] = list(self.meta["classes"])
         self.frames = int(self.meta.get("frames", 4))
         self.encoder_id = self.meta.get("encoder")
+        self.own_encoder = own_encoder(folder, self.meta)
         self.thresholds = [None if t is None else float(t)
                            for t in self.meta.get("trust_thresholds", [None] * len(self.classes))]
         index = {c: i for i, c in enumerate(self.classes)}
@@ -317,6 +372,23 @@ class ActionHead:
             out[both, a] = True
             out[both, b] = True
         return out
+
+
+def encoder_for(head, backend: Optional[str] = None, log: LogFn = print):
+    """The encoder ``head`` reads: its own when it brings one (a fine-tuned
+    head), otherwise the shared frame encoder. None when it cannot load, after
+    a line in ``log``."""
+    from modules.vision import frame_encoder
+
+    own = getattr(head, "own_encoder", None)
+    if own:
+        return frame_encoder.load_tower(own["path"], own["probe"], head.encoder_id,
+                                        backend=backend, log=log)
+    return frame_encoder.load(backend, log=log)
+
+
+def _needs_shared_encoder(head) -> bool:
+    return not getattr(head, "own_encoder", None)
 
 
 # ── windows and crops ────────────────────────────────────────────────────────
@@ -447,7 +519,8 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     as its "Actions" source.
 
     ``head``/``encoder``/``detector`` default to the newest installed head, the
-    frame encoder on the best route here, and YOLOX on ``device``. Returns
+    encoder it reads on the best route here (:func:`encoder_for`), and YOLOX
+    on ``device``. Returns
     ``(detections, bboxes)``; ``([], [])`` when something needed is missing,
     after saying what in ``log``.
     """
@@ -455,20 +528,22 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
 
     from modules.vision import frame_encoder
 
-    if not frame_encoder.is_installed():
-        log("⚠️ Action recognition needs the action model encoder, which is not "
-            "installed; it is offered as a download when actions are switched on")
-        return [], []
     if head is None:
         heads = find_heads(frame_encoder.ENCODER_ID)
         if heads:
             head = ActionHead(heads[0])
-        else:
-            head = text_actions(interesting_actions, log=log)
-            if head is None:
-                return [], []
+    # A fine-tuned head brings its own encoder; anything else needs the shared one.
+    if (encoder is None and (head is None or _needs_shared_encoder(head))
+            and not frame_encoder.is_installed()):
+        log("⚠️ Action recognition needs the action model encoder, which is not "
+            "installed; it is offered as a download when actions are switched on")
+        return [], []
+    if head is None:
+        head = text_actions(interesting_actions, log=log)
+        if head is None:
+            return [], []
     if encoder is None:
-        encoder = frame_encoder.load(log=log)
+        encoder = encoder_for(head, log=log)
         if encoder is None:
             return [], []
     if head.encoder_id and head.encoder_id != encoder.encoder_id:
@@ -528,7 +603,8 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     queue = []              # (window, region, [4 crops]) waiting for the encoder
     window_scores = {}      # window -> (best score per class, region per class)
     people = f"people: YOLOX on {device}" if detector is not None else "no person boxes"
-    log(f"🎯 Action recognition: SigLIP2 on {encoder.label} ({people})")
+    tuned = "" if _needs_shared_encoder(head) else f", the head's own {encoder.encoder_id}"
+    log(f"🎯 Action recognition: SigLIP2 on {encoder.label}{tuned} ({people})")
     if by_name:
         what = (", ".join(head.classes) if head.typed
                 else f"any of its {len(head.classes)} actions")
