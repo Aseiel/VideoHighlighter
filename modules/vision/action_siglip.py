@@ -152,6 +152,56 @@ def find_heads(encoder_id: Optional[str] = None) -> List[str]:
     return found
 
 
+# Which trained model a run uses: Advanced > Action Recognition > Model,
+# saved as ``advanced.action_model``. Blank is the newest installed one,
+# NO_MODEL is none at all (actions by name), anything else is the folder name
+# of one installed model. The GUI publishes its choice in MODEL_ENV the moment
+# it changes, so a run in this process sees it before the config is saved;
+# other processes read the saved config.
+MODEL_ENV = "VH_ACTION_MODEL"
+NEWEST = ""
+NO_MODEL = "none"
+
+
+def chosen_model() -> str:
+    """The user's choice: :data:`NEWEST`, :data:`NO_MODEL` or a folder name."""
+    if MODEL_ENV in os.environ:
+        return os.environ[MODEL_ENV].strip()
+    try:
+        from modules.system.app_paths import config_path
+        import yaml
+        with open(config_path("config.yaml"), encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        return str((cfg.get("advanced") or {}).get("action_model") or NEWEST).strip()
+    except Exception:  # noqa: BLE001 - no config yet: the default
+        return NEWEST
+
+
+def choose_model(name: str) -> None:
+    """Publish the GUI's choice to this process (and processes it starts)."""
+    os.environ[MODEL_ENV] = (name or NEWEST).strip()
+
+
+def active_heads(encoder_id: Optional[str] = None) -> List[str]:
+    """:func:`find_heads` narrowed to the user's choice: the chosen model
+    alone, none with :data:`NO_MODEL`, all newest first otherwise. A chosen
+    model that is gone falls back to the newest, as if nothing was chosen.
+    ``VH_ACTION_HEAD_DIR`` still wins over the choice."""
+    heads = find_heads(encoder_id)
+    if os.environ.get(HEAD_DIR_ENV) and heads and \
+            os.path.normcase(os.path.abspath(heads[0])) == \
+            os.path.normcase(os.path.abspath(os.environ[HEAD_DIR_ENV])):
+        return heads[:1]
+    choice = chosen_model()
+    if choice.lower() == NO_MODEL:
+        return []
+    if choice:
+        named = [h for h in heads if os.path.basename(os.path.normpath(h)) == choice]
+        if named:
+            return named
+    return heads
+
+
 def available() -> bool:
     """True when actions can be recognised here: a head that brings its own
     encoder, or the frame encoder with a head trained on it or the action
@@ -159,7 +209,7 @@ def available() -> bool:
     try:
         from modules.vision import frame_encoder
         installed = frame_encoder.is_installed()
-        for folder in find_heads(frame_encoder.ENCODER_ID):
+        for folder in active_heads(frame_encoder.ENCODER_ID):
             if installed or OWN_ENCODER in read_head_meta(folder):
                 return True
         return installed and frame_encoder.load_actions() is not None
@@ -173,7 +223,7 @@ def installed_head_classes() -> Optional[tuple]:
     a list of suggestions; any typed action is scored."""
     try:
         from modules.vision import frame_encoder
-        heads = find_heads(frame_encoder.ENCODER_ID)
+        heads = active_heads(frame_encoder.ENCODER_ID)
         if heads:
             meta = read_head_meta(heads[0])
             return os.path.basename(os.path.normpath(heads[0])), list(meta.get("classes", []))
@@ -518,7 +568,8 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     on it (:func:`write_annotated_video`), the file the timeline viewer offers
     as its "Actions" source.
 
-    ``head``/``encoder``/``detector`` default to the newest installed head, the
+    ``head``/``encoder``/``detector`` default to the chosen installed head
+    (:func:`active_heads`: the newest unless the user picked one), the
     encoder it reads on the best route here (:func:`encoder_for`), and YOLOX
     on ``device``. Returns
     ``(detections, bboxes)``; ``([], [])`` when something needed is missing,
@@ -529,7 +580,7 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     from modules.vision import frame_encoder
 
     if head is None:
-        heads = find_heads(frame_encoder.ENCODER_ID)
+        heads = active_heads(frame_encoder.ENCODER_ID)
         if heads:
             head = ActionHead(heads[0])
     # A fine-tuned head brings its own encoder; anything else needs the shared one.

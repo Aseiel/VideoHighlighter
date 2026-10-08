@@ -1052,6 +1052,14 @@ class VideoHighlighterGUI(QWidget):
         # probes a device, so worker processes — which inherit the environment
         # and nothing else — make the same choice the GUI shows.
         compute_backend.apply(self.config_data)
+        # The same for the trained action model a run uses (Advanced > Action
+        # Recognition), so a run in this process sees the saved choice.
+        try:
+            from modules.vision import action_siglip
+            action_siglip.choose_model(str(
+                (self.config_data.get("advanced") or {}).get("action_model") or ""))
+        except Exception as e:                      # noqa: BLE001
+            print(f"⚠️ Action model choice not applied: {e}")
 
         # Window root: update banner + a stack of (Simple start | full UI).
         # Simple start is the first-run alternative for issue #20; every
@@ -2172,18 +2180,35 @@ class VideoHighlighterGUI(QWidget):
         # The Intel and R3D models are gone (0.13.1).
         action_box = QGroupBox("Action Recognition")
         action_layout = QFormLayout()
-        self.action_model_label = QLabel()
-        self.action_model_label.setWordWrap(True)
+        # Which trained model a run uses: the newest by default, one by name,
+        # or none (actions by name). Import brings in a model made elsewhere.
+        self.action_model_combo = QComboBox()
+        self.action_model_combo.setToolTip(
+            "Which of your trained action models a run uses.\n"
+            "The newest one, unless you pick one; \"None\" matches actions by\n"
+            "name instead (type any action; Kinetics-700 names are suggested).")
+        self.action_model_combo.currentIndexChanged.connect(self._on_action_model_chosen)
+        self.action_import_btn = QPushButton("Import…")
+        self.action_import_btn.setToolTip(
+            "Add an action model made elsewhere: a folder with head.onnx and\n"
+            "head.json (and vision.onnx for a fine-tuned model). It is checked,\n"
+            "copied into your action models and chosen.")
+        self.action_import_btn.clicked.connect(self._import_action_model)
         self.action_encoder_btn = QPushButton("Download…")
         self.action_encoder_btn.setToolTip(
             "Download the action model (SigLIP2, Apache-2.0). Needed once.")
         self.action_encoder_btn.clicked.connect(self._download_action_encoder)
         action_model_row = QHBoxLayout()
-        action_model_row.addWidget(self.action_model_label, 1)
+        action_model_row.setContentsMargins(0, 0, 0, 0)
+        action_model_row.addWidget(self.action_model_combo, 1)
+        action_model_row.addWidget(self.action_import_btn)
         action_model_row.addWidget(self.action_encoder_btn)
         action_model_widget = QWidget()
         action_model_widget.setLayout(action_model_row)
         action_layout.addRow("Model:", action_model_widget)
+        self.action_model_label = QLabel()
+        self.action_model_label.setWordWrap(True)
+        action_layout.addRow("", self.action_model_label)
 
         # Frames per window, for actions by name: the trade measured in
         # docs/plans/2026-10-07-action-frames.md. A trained model reads the
@@ -4610,6 +4635,8 @@ class VideoHighlighterGUI(QWidget):
             self._set_combo_data(self.yolo_model_combo, adv["yolo_model_size"])
         if "action_frames" in adv:
             self._set_combo_data(self.action_frames_combo, int(adv["action_frames"]))
+        if "action_model" in adv:
+            self._set_action_model_choice(str(adv.get("action_model") or ""))
 
         comp = data.get("compute") or {}
         if "backend" in comp:
@@ -4782,6 +4809,7 @@ class VideoHighlighterGUI(QWidget):
                 "yolo_model_size": self.yolo_model_combo.currentData(),
                 "yolo_custom_model_path": self.object_detector_choice()[1],
                 "action_frames": int(self.action_frames_combo.currentData() or 4),
+                "action_model": (self.config_data.get("advanced") or {}).get("action_model", ""),
             },
             "compute": {
                 "backend": self.backend_combo.currentData(),
@@ -4951,29 +4979,91 @@ class VideoHighlighterGUI(QWidget):
             sources.append(f"Kinetics-700 ({len(k700)})")
         return " + ".join(sources) or "none", labels
 
+    def _fill_action_model_combo(self):
+        """The choices: the newest model, each installed one, or none."""
+        from modules.vision import action_models, action_siglip
+        choice = action_siglip.chosen_model()
+        combo = self.action_model_combo
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem("Newest trained model", action_siglip.NEWEST)
+            for m in action_models.installed():
+                kind = ", fine-tuned" if m["fine_tuned"] else ""
+                combo.addItem(f"{m['name']} ({len(m['classes'])} actions{kind})", m["name"])
+            combo.addItem("None: actions by name", action_siglip.NO_MODEL)
+            index = combo.findData(choice)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
+
     def _refresh_action_model_status(self):
         """Say which action model a run would use, and offer the download
         when there is none."""
         try:
             from modules.vision import action_siglip, frame_encoder
+            self._fill_action_model_combo()
             installed = frame_encoder.is_installed()
-            head = action_siglip.installed_head_classes() if installed else None
-            if not installed:
+            heads = action_siglip.active_heads(frame_encoder.ENCODER_ID)
+            head = action_siglip.installed_head_classes() if (installed or heads) else None
+            choice = action_siglip.chosen_model()
+            gone = bool(choice and choice.lower() != action_siglip.NO_MODEL
+                        and self.action_model_combo.findData(choice) < 0)
+            if not installed and not heads:
                 text = ("Not installed. Action recognition needs the SigLIP2 action "
                         "model, downloaded once.")
             elif head and head[0] != action_siglip.TEXT_SOURCE:
-                text = (f"SigLIP2 with your trained model {head[0]} "
+                text = (f"In use: your trained model {head[0]} "
                         f"({len(head[1])} actions)")
             elif frame_encoder.has_text():
-                text = "SigLIP2: type any action; Kinetics-700 names are suggested"
+                text = ("In use: SigLIP2 by name; type any action, Kinetics-700 names "
+                        "are suggested")
             else:
-                text = "SigLIP2: actions from the Kinetics-700 list"
+                text = "In use: SigLIP2, actions from the Kinetics-700 list"
+            if gone:
+                text = f"{choice} is not installed any more, so the newest is used. " + text
         except Exception as e:
             installed, text = False, f"Unavailable ({e})"
         self.action_model_label.setText(text)
         self.action_encoder_btn.setVisible(not installed)
         self._actions_completer_models = None
         self.update_actions_completer()
+
+    def _set_action_model_choice(self, name: str) -> None:
+        """Use ``name`` (or the newest, or none) from the next run on, and keep
+        it with the settings."""
+        from modules.vision import action_siglip
+        action_siglip.choose_model(name)
+        self.config_data.setdefault("advanced", {})["action_model"] = name or ""
+        self._refresh_action_model_status()
+
+    def _on_action_model_chosen(self, index):
+        if index < 0:
+            return
+        self._set_action_model_choice(self.action_model_combo.itemData(index) or "")
+
+    def _import_action_model(self):
+        """Bring in an action model made elsewhere and use it."""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose the action model's folder (head.onnx + head.json)")
+        if not folder:
+            return
+        from PySide6.QtWidgets import QMessageBox
+
+        from modules.vision import action_models
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            dest = action_models.import_model(folder, log=print)
+        except Exception as e:                      # noqa: BLE001 - said to the user
+            QApplication.restoreOverrideCursor()
+            print(f"⚠️ Action model not imported from {folder}: {e}")
+            QMessageBox.warning(self, "Import action model", f"Not imported: {e}.")
+            return
+        QApplication.restoreOverrideCursor()
+        name = os.path.basename(dest)
+        self._set_action_model_choice(name)
+        self.append_log(f"✅ Imported the action model {name}; actions use it from the "
+                        f"next run (Advanced → Action Recognition).")
 
     def _download_action_encoder(self) -> bool:
         from modules.packs import pack_ui
@@ -5890,15 +5980,15 @@ class VideoHighlighterGUI(QWidget):
             print(f"⚠️ Could not report the installed model: {e}")
 
     def _on_action_model_installed(self, folder):
-        """A trained action model is in the action models folder: the Actions
-        pass uses the newest one from the next run, so name it where the
-        action model is shown, and say so where the user reads what changed."""
+        """A trained action model is in the action models folder. Somebody who
+        just trained one wants it used, so it is chosen; say so where the user
+        reads what changed."""
         try:
-            self._refresh_action_model_status()
+            name = os.path.basename(os.path.normpath(folder))
+            self._set_action_model_choice(name)
             self.append_log(
-                f"✅ Your action model is installed ({os.path.basename(folder)}). "
-                f"Actions use it from the next run; Advanced → Action Recognition "
-                f"shows which model is in use.")
+                f"✅ Your action model {name} is installed and chosen. Actions use it "
+                f"from the next run; Advanced → Action Recognition picks another.")
         except Exception as e:                     # pragma: no cover - defensive
             print(f"⚠️ Could not report the installed action model: {e}")
 

@@ -130,3 +130,20 @@ def _no_device_choice_leaks():
             directml_device.set_mode(None)
         except Exception:
             pass
+
+
+# The trained action model a run uses is the user's choice, read from the
+# environment or else from config.yaml. Tests start from "the newest", whatever
+# the checkout's own config.yaml says, and a test that picks one (os.environ,
+# through action_siglip.choose_model) does not steer the tests after it.
+@pytest.fixture(autouse=True)
+def _no_action_model_choice_leaks():
+    before = os.environ.get("VH_ACTION_MODEL")
+    os.environ["VH_ACTION_MODEL"] = ""
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("VH_ACTION_MODEL", None)
+        else:
+            os.environ["VH_ACTION_MODEL"] = before

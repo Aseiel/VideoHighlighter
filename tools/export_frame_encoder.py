@@ -42,39 +42,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np  # noqa: E402
 
 from modules.vision import frame_encoder as fe  # noqa: E402
+# Shared with installing a fine-tuned action model, which the app does itself.
+from modules.vision.onnx_weights import store_weights_fp16  # noqa: E402,F401
 
 OPSET = 17
-# Tensors smaller than this stay fp32: they are biases and norms, where fp16
-# saves nothing worth having.
-MIN_FP16_ELEMENTS = 1024
 MIN_COSINE = 0.9999
 # The int8 embedding table moves text vectors a little more than fp16 does.
 MIN_TEXT_COSINE = 0.999
 KINETICS_700 = "kinetics_700_labels.json"
-
-
-def store_weights_fp16(model):
-    """Store every large fp32 initializer as fp16, with a Cast back to fp32 in
-    front of its users. Both runtimes fold the Cast at load."""
-    from onnx import TensorProto, helper, numpy_helper
-
-    graph = model.graph
-    casts = []
-    for init in graph.initializer:
-        if init.data_type != TensorProto.FLOAT:
-            continue
-        weights = numpy_helper.to_array(init)
-        half = weights.astype(np.float16)
-        if weights.size < MIN_FP16_ELEMENTS or not np.isfinite(half).all():
-            continue
-        name = init.name
-        init.CopyFrom(numpy_helper.from_array(half, name + "__fp16"))
-        casts.append(helper.make_node("Cast", [name + "__fp16"], [name],
-                                      to=TensorProto.FLOAT, name=name + "__to_fp32"))
-    nodes = list(graph.node)
-    del graph.node[:]
-    graph.node.extend(casts + nodes)
-    return model, len(casts)
 
 
 def store_embedding_int8(model):
