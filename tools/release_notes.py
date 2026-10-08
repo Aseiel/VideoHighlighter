@@ -148,12 +148,18 @@ def collect(since: Optional[str], until: str) -> list[Commit]:
     span = f"{since}..{until}" if since else until
     raw = _git("log", "--no-merges", "--reverse",
                f"--format=%H{_FIELD}%s{_FIELD}%b{_RECORD}", span)
+    return parse_log(raw)
+
+
+def parse_log(raw: str) -> list[Commit]:
     commits = []
     for record in raw.split(_RECORD):
-        record = record.strip()
+        # Not a bare strip(): Python counts \x1e and \x1f as whitespace, so it
+        # would eat the separator before an empty body and leave two fields.
+        record = record.strip("\r\n")
         if record:
             sha, subject, body = record.split(_FIELD, 2)
-            commits.append(Commit(sha, subject, body))
+            commits.append(Commit(sha, subject, body.strip()))
     return commits
 
 

@@ -1,4 +1,4 @@
-from tools.release_notes import Commit, classify, render, subjects
+from tools.release_notes import Commit, classify, parse_log, render, subjects
 
 
 def _c(subject):
@@ -81,3 +81,11 @@ def test_stacked_pull_requests_list_a_change_once():
 def test_tools_work_is_internal():
     assert classify("tools(teach_lab): measure a thing")[0] is None
 
+
+def test_a_commit_without_a_body_parses():
+    # git log --format=%H\x1f%s\x1f%b\x1e: an empty body leaves the record
+    # ending in its separator, which a bare strip() used to swallow.
+    raw = ("a" * 40 + "\x1ffix: one\x1f\x1e\n"
+           + "b" * 40 + "\x1ffeat: two\x1fbody line\n\x1e\n")
+    assert parse_log(raw) == [Commit("a" * 40, "fix: one", ""),
+                              Commit("b" * 40, "feat: two", "body line")]
