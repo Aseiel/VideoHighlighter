@@ -96,7 +96,12 @@ def actions_command(dataset: str, run_dir: str, sources: int) -> list:
     held-out hits from several source videos (three when there are); a
     one-video project can only ask for one."""
     return [sys.executable, "-m", "model_training.action_head.train",
-            "--data-path", dataset,
+            *actions_args(dataset, run_dir, sources)]
+
+
+def actions_args(dataset: str, run_dir: str, sources: int) -> list:
+    """The trainer's arguments, without the interpreter (see actions_command)."""
+    return ["--data-path", dataset,
             "--out", os.path.join(run_dir, HEAD_DIR),
             "--min-videos", str(max(1, min(3, int(sources))))]
 
@@ -112,14 +117,37 @@ def _sources(dataset: str) -> int:
     return len(names) or 1
 
 
+def _train_in_process(args: list, log) -> int:
+    """The head trainer in this process, every line into ``log``.
+
+    Not ``sys.executable -m ...``: in the packaged app ``sys.executable`` is
+    the app itself, and a child started that way opened a second copy of the
+    app instead of training."""
+    def write(text):
+        log.write(f"{text}\n")
+        log.flush()
+    try:
+        from model_training.action_head import train as trainer
+        return trainer.main(args, log=write)
+    except Exception:                                  # noqa: BLE001 - into the log
+        import traceback
+        log.write(traceback.format_exc())
+        return 1
+
+
 def train_actions(project: Project, run_dir: str, *, epochs: int,
-                  run: Callable = subprocess.run) -> dict:
+                  run: Optional[Callable] = None) -> dict:
+    """``run`` (a ``subprocess.run`` stand-in) runs the trainer as a command;
+    left out, it runs in this process, which also works in the packaged app."""
     dataset = project.path(DATASET_DIR)
     log_path = os.path.join(run_dir, "train.log")
     with open(log_path, "w", encoding="utf-8", errors="replace") as log:
-        result = run(actions_command(dataset, run_dir, _sources(dataset)), cwd=_REPO,
-                     stdout=log, stderr=subprocess.STDOUT)
-    code = getattr(result, "returncode", 1)
+        if run is None:
+            code = _train_in_process(actions_args(dataset, run_dir, _sources(dataset)), log)
+        else:
+            result = run(actions_command(dataset, run_dir, _sources(dataset)), cwd=_REPO,
+                         stdout=log, stderr=subprocess.STDOUT)
+            code = getattr(result, "returncode", 1)
     head = os.path.join(run_dir, HEAD_DIR)
     meta_path = os.path.join(head, "head.json")
     if code != 0 or not os.path.exists(meta_path):
@@ -179,7 +207,7 @@ def install(project: Project, record: dict) -> dict:
 
 def train_round(project: Project, *, epochs: Optional[int] = None,
                 install_policy: str = "if-better",
-                run: Callable = subprocess.run,
+                run: Optional[Callable] = None,
                 progress: Optional[Callable] = None) -> dict:
     """Train on the built dataset; record the round; maybe install it.
 

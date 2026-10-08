@@ -2934,6 +2934,8 @@ class VideoHighlighterGUI(QWidget):
             train_layout = QVBoxLayout()
             self.training_panel = TrainingPanel(parent=self)
             self.training_panel.model_installed.connect(self._on_model_installed)
+            self.training_panel.action_model_installed.connect(
+                self._on_action_model_installed)
             train_layout.addWidget(self.training_panel)
             train_tab.setLayout(train_layout)
             tabs.addTab(self._scrollable(train_tab), "Train")
@@ -5886,6 +5888,19 @@ class VideoHighlighterGUI(QWidget):
                 f"Pick it under Advanced → object model.")
         except Exception as e:                     # pragma: no cover - defensive
             print(f"⚠️ Could not report the installed model: {e}")
+
+    def _on_action_model_installed(self, folder):
+        """A trained action model is in the action models folder: the Actions
+        pass uses the newest one from the next run, so name it where the
+        action model is shown, and say so where the user reads what changed."""
+        try:
+            self._refresh_action_model_status()
+            self.append_log(
+                f"✅ Your action model is installed ({os.path.basename(folder)}). "
+                f"Actions use it from the next run; Advanced → Action Recognition "
+                f"shows which model is in use.")
+        except Exception as e:                     # pragma: no cover - defensive
+            print(f"⚠️ Could not report the installed action model: {e}")
 
     def toggle_run(self, *args, simple=False):
         """Run / Pause / Resume - single button.

@@ -51,6 +51,7 @@ import os
 import sys
 import time
 from collections import Counter
+from typing import Callable, Optional
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
@@ -63,6 +64,17 @@ HEAD_FILE = "head.onnx"
 META_FILE = "head.json"
 DEFAULT_NAME = "taught-actions"
 POOL_SPLITS = ("train", "val")
+DEFAULT_STEPS = "750,1500,3000"   # training lengths compared on held-out videos
+STOPPED = 130          # main()'s return code when ``should_stop`` ended the run
+
+
+class Stopped(Exception):
+    """``should_stop`` said so: the run ends between two steps, saving nothing."""
+
+
+def _check(should_stop) -> None:
+    if should_stop is not None and should_stop():
+        raise Stopped()
 
 
 def _utf8_stdout() -> None:
@@ -118,7 +130,7 @@ def group_folds(strat: np.ndarray, groups: np.ndarray, folds: int, seed: int) ->
 
 
 def out_of_fold(x, targets, groups, splits, steps, seed, log,
-                x_extra=None, groups_extra=None):
+                x_extra=None, groups_extra=None, should_stop=None):
     """Held-out scores for every clip, and for ``x_extra`` (test clips) the
     mean over the fold heads that never saw the clip's source video (NaN when
     none qualifies)."""
@@ -129,6 +141,7 @@ def out_of_fold(x, targets, groups, splits, steps, seed, log,
     extra_sum = np.zeros((n_extra, n_classes), np.float32)
     extra_n = np.zeros(n_extra)
     for i, (tr, te) in enumerate(splits, 1):
+        _check(should_stop)
         model = H.train_head(x[tr], targets[tr], n_classes, steps=steps, seed=seed)
         scores[te] = H.predict_proba(model, x[te])
         if n_extra:
@@ -161,15 +174,19 @@ def _log_scores(log, title: str, s: dict) -> None:
             f"something else detected too {t['wrong_detected']:.0%}")
 
 
-def main(argv=None) -> int:
-    _utf8_stdout()
+def main(argv=None, *, log: Callable[[str], None] = print,
+         should_stop: Optional[Callable[[], bool]] = None) -> int:
+    """The command line, callable in-process too: the app's Train > Actions
+    runs it on a worker thread (``log`` gets every line, ``should_stop`` is
+    asked between steps). Returns 0 when saved, 1 on a problem it explained,
+    ``STOPPED`` when stopped."""
     ap = argparse.ArgumentParser(description="Train a taught-action head on the frame encoder")
     ap.add_argument("--data-path", required=True)
     ap.add_argument("--out", default=None, help="output folder (default: models/actions/<name>)")
     ap.add_argument("--name", default=DEFAULT_NAME)
     ap.add_argument("--frames", type=int, default=4)
     ap.add_argument("--folds", type=int, default=5)
-    ap.add_argument("--steps", default="750,1500,3000",
+    ap.add_argument("--steps", default=DEFAULT_STEPS,
                     help="training lengths to compare on held-out videos")
     ap.add_argument("--min-clips", type=int, default=5)
     ap.add_argument("--precision", type=float, default=0.7,
@@ -184,8 +201,14 @@ def main(argv=None) -> int:
     ap.add_argument("--teach-test", action="store_true",
                     help="also learn from test/ (still scored only by heads that never saw each video)")
     args = ap.parse_args(argv)
-    log = print
+    try:
+        return _train(args, log, should_stop)
+    except Stopped:
+        log("⏹️ Stopped; nothing was saved")
+        return STOPPED
 
+
+def _train(args, log, should_stop) -> int:
     from model_training.action_head import features as Fx
     from model_training.action_head import head as H
     from model_training.action_head import trust
@@ -213,7 +236,8 @@ def main(argv=None) -> int:
                             encoder.encoder_id, args.frames, encoder.dims)
     n = len(clips)
     x_all, ok = Fx.encode_clips([c.path for c in clips + extra], args.data_path, encoder,
-                                cache, log=log)
+                                cache, log=log, should_stop=should_stop)
+    _check(should_stop)
     x, x_extra = x_all[:n][ok[:n]], x_all[n:][ok[n:]]
     clips = [c for c, good in zip(clips, ok[:n]) if good]
     extra = [c for c, good in zip(extra, ok[n:]) if good]
@@ -238,7 +262,7 @@ def main(argv=None) -> int:
         log(f"  {steps} steps")
         scores, scores_extra = out_of_fold(x, targets, groups, folds, steps, args.seed, log,
                                            x_extra=x_extra if extra else None,
-                                           groups_extra=g_extra)
+                                           groups_extra=g_extra, should_stop=should_stop)
         acc = float(np.mean(scores[single].argmax(1) == targets[single].argmax(1)))
         log(f"  {steps} steps: held-out single-action accuracy {acc:.3f}")
         if best is None or acc > best[1] + 1e-9:
@@ -281,6 +305,7 @@ def main(argv=None) -> int:
                       "accuracy": round(float(np.mean(val_pred == targets[in_val].argmax(1))), 4),
                       "clips_sharing_a_video_with_train": int(shared.sum())}
 
+    _check(should_stop)
     log(f"\nTraining the saved head on all {len(clips)} clips ({steps} steps)")
     model = H.train_head(x, targets, len(classes), steps=steps, seed=args.seed)
     out = args.out or default_out(args.name)
@@ -362,4 +387,5 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    _utf8_stdout()
     sys.exit(main())

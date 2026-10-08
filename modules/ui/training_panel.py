@@ -750,15 +750,21 @@ class ObjectTrainingSection(QWidget):
 
 
 class ActionTrainingWorker(QObject):
-    """Drive the action-head trainer in a child process, reporting what it prints.
+    """Run the action-head trainer on this worker's thread, reporting what it says.
 
     ``model_training.action_head.train`` encodes every clip once with the
     SigLIP2 frame encoder and trains a small head on the vectors, scored on
-    source videos it never saw. A subprocess, so a run is stopped by ending the
-    process and the trainer keeps its own logging; this reads that output.
+    source videos it never saw. Every line it logs goes to the debug log and
+    is read for progress here.
 
-    It also means cancelling is a terminated process rather than a cooperative
-    flag, which for a run holding a large clip cache is the more reliable stop.
+    **In this process, not a child one.** It used to run as
+    ``sys.executable -m model_training.action_head.train``, which is right from
+    source and wrong in the packaged app: there ``sys.executable`` is the app
+    itself, so pressing Train opened a second copy of the app, sat at 0 %, and
+    the copy rotated the first one's debug log away. Object training already
+    runs in-process for the same reason. Stopping is cooperative: the trainer
+    asks ``should_stop`` between clips and between held-out folds, a few
+    seconds apart at most, and saves nothing when stopped.
     """
 
     progress = Signal(int, str)
@@ -769,76 +775,71 @@ class ActionTrainingWorker(QObject):
     # clips"), then held-out folds ("fold 2/5"), then the saved head.
     _ENCODED = re.compile(r"^\s*(\d+)/(\d+) clips,")
     _FOLD = re.compile(r"fold\s+(\d+)\s*/\s*(\d+)")
+    # Each training length it compares ("  750 steps") runs every fold again.
+    _ROUND = re.compile(r"^\s*\d+ steps$")
     _HELDOUT = re.compile(r"Held out .*accuracy\s+([\d.]+)")
 
     def __init__(self, data_path: str, name: str):
         super().__init__()
         self._data_path = data_path
         self._name = name
-        self._process = None
         self._stop = False
+        self._note = ""
+        self._last = ""
+        self._round = 0
+
+    @property
+    def out_dir(self) -> str:
+        """Where the trained model lands: the app's action models folder,
+        where the action pass finds it (newest first)."""
+        from model_training.action_head.train import default_out
+        return default_out(self._name)
 
     def cancel(self) -> None:
         self._stop = True
-        process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                process.terminate()
-            except Exception:                       # pragma: no cover - defensive
-                pass
+
+    def _log(self, text: str) -> None:
+        for line in str(text).splitlines():
+            line = line.rstrip()
+            if line:
+                print(f"[actions] {line}")   # the debug log keeps everything
+                self._last = line
+                self._note = self._read(line) or self._note
 
     @Slot()
     def run(self) -> None:
-        import subprocess
-        import sys
-
-        repo_root = os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.abspath(__file__))))
-        command = self._command(sys.executable)
         try:
             self.progress.emit(0, "Encoding the clips...")
-            creation = 0
-            if sys.platform.startswith("win"):
-                creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            # The trainers print emoji, and a Windows console here is cp1250:
-            # without this the child dies on UnicodeEncodeError at its first
-            # line of output, long before it touches the user's data. Inside
-            # the app the same prints survive because debug_console tees them
-            # through a UTF-8 stream; a subprocess gets the raw console.
-            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
-            self._process = subprocess.Popen(
-                command, cwd=repo_root, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                errors="replace", bufsize=1, creationflags=creation, env=env,
-            )
-            note = ""
-            for line in self._process.stdout:
-                line = line.rstrip()
-                if line:
-                    print(f"[actions] {line}")   # the debug log keeps everything
-                    note = self._read(line) or note
-            code = self._process.wait()
-
-            if self._stop:
+            try:
+                from model_training.action_head import train
+            except ImportError as exc:
+                import traceback
+                traceback.print_exc()
+                self.error.emit(
+                    f"Action training is not available in this installation "
+                    f"({exc}).")
+                return
+            code = train.main(self._args(), log=self._log,
+                              should_stop=lambda: self._stop)
+            if self._stop or code == train.STOPPED:
                 self.error.emit("Stopped.")
                 return
             if code != 0:
+                reason = self._last.lstrip("❌⚠️ ").strip()
                 self.error.emit(
-                    f"Training stopped with exit code {code}. The debug log "
-                    f"has the trainer's own output.")
+                    f"Training did not finish: {reason or 'see the debug log'}.")
                 return
             self.progress.emit(100, "Done.")
-            self.finished.emit(note)
+            self.finished.emit(self._note)
         except Exception as exc:                    # noqa: BLE001
             import traceback
             traceback.print_exc()
             self.error.emit(f"Could not run the action trainer: {exc}")
 
-    def _command(self, python: str) -> list:
+    def _args(self) -> list:
         """The head trainer on the chosen folder; the head is written where the
         app looks for action models (models/actions/<name>)."""
-        return [python, "-u", "-m", "model_training.action_head.train",
-                "--data-path", self._data_path, "--name", self._name]
+        return ["--data-path", self._data_path, "--name", self._name]
 
     def _read(self, line: str):
         """Turn one line of the trainer's output into a progress update."""
@@ -847,11 +848,18 @@ class ActionTrainingWorker(QObject):
             done, total = int(encoded.group(1)), max(1, int(encoded.group(2)))
             self.progress.emit(int(60 * done / total), f"Encoding clips... {done} of {total}")
             return None
+        if self._ROUND.search(line):
+            self._round += 1
+            return None
         fold = self._FOLD.search(line)
         if fold:
+            from model_training.action_head.train import DEFAULT_STEPS
             done, total = int(fold.group(1)), max(1, int(fold.group(2)))
-            self.progress.emit(60 + int(35 * done / total),
-                               f"Testing on videos it has not seen... {done} of {total}")
+            rounds = len(DEFAULT_STEPS.split(","))
+            step = max(0, min(self._round, rounds) - 1)
+            self.progress.emit(60 + int(35 * (step + done / total) / rounds),
+                               f"Testing on videos it has not seen... "
+                               f"{step * total + done} of {rounds * total}")
             return None
         held = self._HELDOUT.search(line)
         if held:
@@ -870,6 +878,9 @@ class ActionTrainingSection(QWidget):
     the object one - the example a user has to supply is a different kind of
     thing, and a shared form would ask for the wrong input.
     """
+
+    # The folder of a model it saved, for the host to say so and pick it up.
+    model_installed = Signal(str)
 
     # The trainer's own minimums: below these it skips the class.
     MIN_TRAIN_CLIPS = 5
@@ -1053,11 +1064,17 @@ class ActionTrainingSection(QWidget):
 
     @Slot(str)
     def _on_finished(self, note: str) -> None:
+        folder = self._worker.out_dir if self._worker is not None else ""
         self._teardown()
         message = "Your action model is ready."
         if note:
             message += f" It {note}."
+        if folder:
+            message += (f" Saved in {folder}; the Actions pass uses it from the next run "
+                        f"(Advanced > Action Recognition names it).")
         self._say(message, THEME.success)
+        if folder:
+            self.model_installed.emit(folder)
 
     @Slot(str)
     def _on_error(self, message: str) -> None:
@@ -1068,7 +1085,9 @@ class ActionTrainingSection(QWidget):
         self._set_running(False)
         if self._thread is not None:
             self._thread.quit()
-            self._thread.wait(5000)
+            # The trainer stops between steps (a held-out fold at most, seconds);
+            # a QThread dropped while still running takes the app down with it.
+            self._thread.wait(60000)
             self._thread = None
         self._worker = None
 
@@ -1094,6 +1113,7 @@ class TrainingPanel(QWidget):
     """
 
     model_installed = Signal(object)
+    action_model_installed = Signal(str)     # the trained action model's folder
 
     def __init__(self, parent=None, store_path: str = ""):
         super().__init__(parent)
@@ -1102,6 +1122,7 @@ class TrainingPanel(QWidget):
         self.objects = ObjectTrainingSection(store_path=store_path)
         self.objects.model_installed.connect(self.model_installed)
         self.actions = ActionTrainingSection()
+        self.actions.model_installed.connect(self.action_model_installed)
 
         tabs = QTabWidget()
         # First: the automated loop (modules/teach), cutting, sorting and

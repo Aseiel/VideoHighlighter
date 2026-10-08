@@ -196,6 +196,7 @@ jobs:
             --collect-submodules whisper `
             --collect-submodules yolox `
             --collect-submodules model_hub `
+            --collect-submodules model_training `
             --collect-submodules huggingface_hub `
             --collect-submodules keyring `
             --copy-metadata keyring `
@@ -668,6 +669,7 @@ jobs:
             --collect-submodules whisper \
             --collect-submodules yolox \
             --collect-submodules model_hub \
+            --collect-submodules model_training \
             --collect-submodules huggingface_hub \
             --collect-submodules keyring \
             --copy-metadata keyring \
