@@ -116,25 +116,37 @@ LogFn = Callable[[str], None]
 # Preprocessing
 # ---------------------------------------------------------------------------
 
-def preprocess(frames_bgr: Sequence[np.ndarray]) -> np.ndarray:
-    """BGR frames of any size -> float32 [N, 3, 256, 256] in [-1, 1], RGB."""
+def prepare_frame(frame: np.ndarray) -> np.ndarray:
+    """A BGR frame of any size -> uint8 RGB [256, 256, 3]: the resizing half
+    of :func:`preprocess`. The action trainer's frame cache stores this, so a
+    fine-tune sees exactly the pixels the app will feed it."""
     import cv2
 
-    out = np.empty((len(frames_bgr), 3, INPUT_SIZE, INPUT_SIZE), np.float32)
-    for i, frame in enumerate(frames_bgr):
-        if frame.ndim == 2:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        elif frame.shape[2] == 4:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-        h, w = frame.shape[:2]
-        scale = DECODE_SHORT / min(h, w)
-        if scale < 1:
-            frame = cv2.resize(frame, (int(w * scale), int(h * scale)),
-                               interpolation=cv2.INTER_AREA)
-        frame = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
-        rgb = frame[:, :, ::-1].astype(np.float32)
-        out[i] = (rgb / 255.0 - 0.5).transpose(2, 0, 1) / 0.5
-    return out
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    elif frame.shape[2] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    h, w = frame.shape[:2]
+    scale = DECODE_SHORT / min(h, w)
+    if scale < 1:
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)),
+                           interpolation=cv2.INTER_AREA)
+    frame = cv2.resize(frame, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+    return np.ascontiguousarray(frame[:, :, ::-1])
+
+
+def scale_pixels(rgb_u8: np.ndarray) -> np.ndarray:
+    """uint8 RGB [N, 256, 256, 3] -> float32 [N, 3, 256, 256] in [-1, 1]: the
+    scaling half of :func:`preprocess`."""
+    rgb = np.asarray(rgb_u8).astype(np.float32)
+    return np.ascontiguousarray((rgb / 255.0 - 0.5).transpose(0, 3, 1, 2) / 0.5)
+
+
+def preprocess(frames_bgr: Sequence[np.ndarray]) -> np.ndarray:
+    """BGR frames of any size -> float32 [N, 3, 256, 256] in [-1, 1], RGB."""
+    if len(frames_bgr) == 0:
+        return np.empty((0, 3, INPUT_SIZE, INPUT_SIZE), np.float32)
+    return scale_pixels(np.stack([prepare_frame(f) for f in frames_bgr]))
 
 
 def probe_pixels() -> np.ndarray:

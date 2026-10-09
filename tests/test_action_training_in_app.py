@@ -156,6 +156,73 @@ def test_worker_calls_the_trainer_in_process(worker_env, monkeypatch):
     assert worker.out_dir.endswith(os.path.join("actions", "clips"))
 
 
+def test_worker_fine_tune_adds_the_flag_and_its_phases(worker_env, monkeypatch):
+    """With the image model checked: the flag goes to the trainer, the bar
+    walks decode -> encode -> frozen folds -> fine-tune folds -> final run and
+    never goes backwards, and the note says which model was saved."""
+    train, panel = worker_env
+    calls = []
+
+    def fake_main(argv, *, log, should_stop):
+        calls.append(argv)
+        log("  50/100 clips decoded, 20.0/s, about 0.0 min left")
+        log("  100/100 clips, 50.0/s, about 0.0 min left")
+        log("Scoring on unseen source videos (5 folds)")
+        log("  750 steps")
+        log("    fold 5/5: 0.500 on 10 single-action clips")
+        log("\nFine-tuning the top 4 image-model blocks on xpu, scored on unseen source "
+            "videos (5 folds x 10 epochs)")
+        log("  fine-tune fold 1/5: 80 clips to learn from, 20 held out")
+        log("      epoch 5/10: loss 0.300, 60 s, held-out 0.600")
+        log("  fine-tune fold 1/5: 0.600 after 10 epochs (best 0.600 at epoch 5), 600 s")
+        log("  fine-tune fold 5/5: 80 clips to learn from, 20 held out")
+        log("      epoch 10/10: loss 0.300, 60 s, held-out 0.600")
+        log("\nFinal model: training the head on all 100 clips (750 steps), then "
+            "fine-tuning with it (9 epochs)")
+        log("      final epoch 9/9: loss 0.300, 60 s")
+        log("\nHeld out (whole source videos never seen), single action (40 clips): "
+            "accuracy 0.600, balanced 0.500, top-3 0.900")
+        log(train.SAVED_FINETUNED)
+        return 0
+
+    monkeypatch.setattr(train, "main", fake_main)
+    worker = panel.ActionTrainingWorker(data_path="d", name="n", finetune_blocks=4)
+    seen = _run(worker)
+    assert calls == [["--data-path", "d", "--name", "n", "--finetune-blocks", "4"]]
+    percents = [p for p, _ in seen["progress"]]
+    # decode 0-15, encode 15-25, frozen folds 25-35, fine-tune folds 35-90, final 90-99.
+    assert percents == [0, 7, 25, 28, 35, 40, 90, 90, 99, 100], seen["progress"]
+    assert "round 1 of 5, epoch 5 of 10" in seen["progress"][5][1]
+    assert seen["finished"] == ["recognised 60% of the clips from videos it had not seen; "
+                                "the image model was fine-tuned too"]
+
+    def frozen_kept(argv, *, log, should_stop):
+        log(train.SAVED_FROZEN)
+        return 0
+
+    monkeypatch.setattr(train, "main", frozen_kept)
+    seen = _run(panel.ActionTrainingWorker(data_path="d", name="n", finetune_blocks=4))
+    assert "small model was kept" in seen["finished"][0]
+
+
+def test_image_model_checkbox_needs_a_card_pytorch_trains_on(worker_env):
+    _, panel = worker_env
+    section = panel.ActionTrainingSection()
+    box = section.finetune_box
+    assert not box.isEnabled() and not box.isChecked()          # off until the probe
+    section._on_device_found("xpu", "Intel Arc A750")
+    assert box.isEnabled() and "Intel Arc A750" in box.toolTip()
+    box.setChecked(True)
+    for device in ("privateuseone:0", "cpu"):                   # DirectML, processor
+        section._on_device_found(device, "")
+        assert not box.isEnabled() and not box.isChecked()
+        assert "Intel Arc or NVIDIA" in box.toolTip()
+    section._on_device_found("cuda", "NVIDIA")
+    assert box.isEnabled() and not box.isChecked()              # never ticked for the user
+    assert panel.can_finetune("cuda:0") and not panel.can_finetune("dml")
+    section.close()
+
+
 def test_worker_stop_is_passed_to_the_trainer(worker_env, monkeypatch):
     train, panel = worker_env
 

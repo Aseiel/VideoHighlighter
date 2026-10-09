@@ -33,7 +33,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
+    QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QMessageBox,
     QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -220,6 +220,12 @@ def _probe_training_device() -> tuple:
     except Exception:                           # noqa: BLE001
         pass
     return device, name
+
+
+def can_finetune(device: str) -> bool:
+    """True for a torch device the image model fine-tunes on: Intel (XPU) or
+    NVIDIA (CUDA). DirectML and the processor are not offered in the GUI."""
+    return str(device).startswith(("xpu", "cuda"))
 
 
 def _elapsed(seconds: float) -> str:
@@ -765,6 +771,11 @@ class ActionTrainingWorker(QObject):
     runs in-process for the same reason. Stopping is cooperative: the trainer
     asks ``should_stop`` between clips and between held-out folds, a few
     seconds apart at most, and saves nothing when stopped.
+
+    With ``finetune_blocks`` it also fine-tunes the image model's top blocks
+    (``--finetune-blocks``, about an hour on a graphics card). Its progress
+    then has three more phases: decoding every clip into the frame cache
+    first, and after the frozen folds the fine-tune's folds and its final run.
     """
 
     progress = Signal(int, str)
@@ -778,15 +789,27 @@ class ActionTrainingWorker(QObject):
     # Each training length it compares ("  750 steps") runs every fold again.
     _ROUND = re.compile(r"^\s*\d+ steps$")
     _HELDOUT = re.compile(r"Held out .*accuracy\s+([\d.]+)")
+    # Fine-tuning only: clips decoded into the frame cache, then the
+    # fine-tune's folds ("fine-tune fold 2/5") and epochs ("epoch 3/10"), then
+    # the final run ("final epoch 3/9").
+    _DECODED = re.compile(r"^\s*(\d+)/(\d+) clips decoded,")
+    _FT_START = "Fine-tuning the top"
+    _FT_FOLD = re.compile(r"fine-tune fold\s+(\d+)\s*/\s*(\d+)")
+    _EPOCH = re.compile(r"^\s*(final )?epoch\s+(\d+)\s*/\s*(\d+)")
+    _FINAL = "Final model:"
 
-    def __init__(self, data_path: str, name: str):
+    def __init__(self, data_path: str, name: str, finetune_blocks: int = 0):
         super().__init__()
         self._data_path = data_path
         self._name = name
+        self._finetune_blocks = int(finetune_blocks)
         self._stop = False
         self._note = ""
+        self._saved = ""
         self._last = ""
         self._round = 0
+        self._phase = ""
+        self._ft_fold = (0, 1)
 
     @property
     def out_dir(self) -> str:
@@ -830,7 +853,7 @@ class ActionTrainingWorker(QObject):
                     f"Training did not finish: {reason or 'see the debug log'}.")
                 return
             self.progress.emit(100, "Done.")
-            self.finished.emit(self._note)
+            self.finished.emit("; ".join(n for n in (self._note, self._saved) if n))
         except Exception as exc:                    # noqa: BLE001
             import traceback
             traceback.print_exc()
@@ -839,27 +862,80 @@ class ActionTrainingWorker(QObject):
     def _args(self) -> list:
         """The head trainer on the chosen folder; the head is written where the
         app looks for action models (models/actions/<name>)."""
-        return ["--data-path", self._data_path, "--name", self._name]
+        args = ["--data-path", self._data_path, "--name", self._name]
+        if self._finetune_blocks > 0:
+            args += ["--finetune-blocks", str(self._finetune_blocks)]
+        return args
+
+    def _span(self, phase: str) -> tuple:
+        """The share of the bar a phase fills, (start, width) in percent."""
+        if self._finetune_blocks > 0:
+            return {"decode": (0, 15), "encode": (15, 10), "folds": (25, 10),
+                    "finetune": (35, 55), "final": (90, 9)}[phase]
+        return {"encode": (0, 60), "folds": (60, 35)}[phase]
+
+    def _emit(self, phase: str, done: float, total: float, message: str) -> None:
+        """``done`` of ``total`` through ``phase``, on the bar."""
+        start, width = self._span(phase)
+        self.progress.emit(start + int(width * max(0.0, min(done, total)) / total), message)
 
     def _read(self, line: str):
         """Turn one line of the trainer's output into a progress update."""
+        from model_training.action_head import train as trainer
+        if line.startswith(trainer.SAVED_FINETUNED):
+            self._saved = "the image model was fine-tuned too"
+            return None
+        if line.startswith(trainer.SAVED_FROZEN) and self._finetune_blocks > 0:
+            self._saved = ("fine-tuning the image model did not do better on videos it "
+                           "had not seen, so the small model was kept")
+            return None
+        if self._finetune_blocks > 0:
+            decoded = self._DECODED.search(line)
+            if decoded:
+                done, total = int(decoded.group(1)), max(1, int(decoded.group(2)))
+                self._emit("decode", done, total, f"Reading the clips... {done} of {total}")
+                return None
+            if line.startswith(self._FT_START):
+                self._phase = "finetune"
+                self._emit("finetune", 0, 1, "Training the image model...")
+                return None
+            if line.startswith(self._FINAL):
+                self._phase = "final"
+                self._emit("final", 0, 1, "Training the final model...")
+                return None
+            ft_fold = self._FT_FOLD.search(line)
+            if ft_fold:
+                self._ft_fold = (int(ft_fold.group(1)), max(1, int(ft_fold.group(2))))
+                return None
+            epoch = self._EPOCH.search(line)
+            if epoch:
+                done, total = int(epoch.group(2)), max(1, int(epoch.group(3)))
+                if self._phase == "final":
+                    self._emit("final", done, total,
+                               f"Training the final model... epoch {done} of {total}")
+                else:
+                    fold, folds = self._ft_fold
+                    self._emit("finetune", fold - 1 + done / total, folds,
+                               f"Training the image model on videos it has not seen... "
+                               f"round {fold} of {folds}, epoch {done} of {total}")
+                return None
         encoded = self._ENCODED.search(line)
         if encoded:
             done, total = int(encoded.group(1)), max(1, int(encoded.group(2)))
-            self.progress.emit(int(60 * done / total), f"Encoding clips... {done} of {total}")
+            self._emit("encode", done, total, f"Encoding clips... {done} of {total}")
             return None
         if self._ROUND.search(line):
             self._round += 1
             return None
         fold = self._FOLD.search(line)
-        if fold:
+        if fold and not self._phase:
             from model_training.action_head.train import DEFAULT_STEPS
             done, total = int(fold.group(1)), max(1, int(fold.group(2)))
             rounds = len(DEFAULT_STEPS.split(","))
             step = max(0, min(self._round, rounds) - 1)
-            self.progress.emit(60 + int(35 * (step + done / total) / rounds),
-                               f"Testing on videos it has not seen... "
-                               f"{step * total + done} of {rounds * total}")
+            self._emit("folds", step + done / total, rounds,
+                       f"Testing on videos it has not seen... "
+                       f"{step * total + done} of {rounds * total}")
             return None
         held = self._HELDOUT.search(line)
         if held:
@@ -882,15 +958,23 @@ class ActionTrainingSection(QWidget):
     # The folder of a model it saved, for the host to say so and pick it up.
     model_installed = Signal(str)
 
+    # From the probe thread: the torch device and the card's name.
+    _device_found = Signal(str, str)
+
     # The trainer's own minimums: below these it skips the class.
     MIN_TRAIN_CLIPS = 5
     MIN_VAL_CLIPS = 2
+    # Blocks the checkbox fine-tunes: the best single-action accuracy measured
+    # (docs/plans/2026-10-08-overfitting-and-siglip2-fine-tune.md).
+    FINETUNE_BLOCKS = 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._thread: Optional[QThread] = None
         self._worker: Optional[ActionTrainingWorker] = None
         self._data_path = ""
+        self._probing = False
+        self._device_found.connect(self._on_device_found)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -928,6 +1012,16 @@ class ActionTrainingSection(QWidget):
         self.device_label.setStyleSheet("color:#999;")
         root.addWidget(self.device_label)
 
+        # Off by default: an hour on a graphics card and a 186 MB model, for a
+        # few points more on videos it has not seen. Enabled once the probe
+        # finds a card PyTorch can train on.
+        self.finetune_box = QCheckBox(
+            "Also train the image model (graphics card, about an hour; the model "
+            "is 186 MB instead of 2 MB)")
+        self.finetune_box.setEnabled(False)
+        self.finetune_box.setToolTip("Choose a clips folder first.")
+        root.addWidget(self.finetune_box)
+
         self.train_btn = QPushButton("Train an action model")
         self.train_btn.setStyleSheet(
             f"QPushButton{{background:{THEME.success};color:white;"
@@ -958,6 +1052,40 @@ class ActionTrainingSection(QWidget):
         if path:
             self._load_folder(path)
 
+    def _probe_device(self) -> None:
+        """Find out, off the GUI thread (it imports torch), whether this
+        computer can fine-tune the image model."""
+        if self._probing:
+            return
+        self._probing = True
+        self.finetune_box.setToolTip("Looking for a graphics card...")
+        import threading
+
+        def probe():
+            try:
+                device, name = _probe_training_device()
+            except Exception as exc:    # noqa: BLE001
+                print(f"[training] device probe failed: {exc}")
+                device, name = "cpu", ""
+            self._device_found.emit(device, name)
+
+        threading.Thread(target=probe, daemon=True).start()
+
+    @Slot(str, str)
+    def _on_device_found(self, device: str, name: str) -> None:
+        if can_finetune(device):
+            self.finetune_box.setEnabled(True)
+            self.finetune_box.setToolTip(
+                f"Trains the top {self.FINETUNE_BLOCKS} blocks of the image model with the "
+                f"action model on {name or device}. Saved only if it does better on videos "
+                f"it has not seen than the small model.")
+        else:
+            self.finetune_box.setChecked(False)
+            self.finetune_box.setEnabled(False)
+            self.finetune_box.setToolTip(
+                "Needs an Intel Arc or NVIDIA graphics card that PyTorch can train on; "
+                "none was found here. The small model trains on any computer.")
+
     def _load_folder(self, path: str) -> None:
         """Check the folder is laid out the way the trainer reads it.
 
@@ -967,6 +1095,7 @@ class ActionTrainingSection(QWidget):
         The minimums are the trainer's own: below them it skips a class, so
         they are worth stating here rather than after a wasted run.
         """
+        self._probe_device()
         train_root = os.path.join(path, "train")
         val_root = os.path.join(path, "val")
         if not os.path.isdir(train_root):
@@ -1035,7 +1164,10 @@ class ActionTrainingSection(QWidget):
                       "Advanced > Action Recognition first.", THEME.warning)
             return
         name = os.path.basename(self._data_path.rstrip(os.sep)) or "my-actions"
-        self._worker = ActionTrainingWorker(data_path=self._data_path, name=name)
+        blocks = (self.FINETUNE_BLOCKS
+                  if self.finetune_box.isEnabled() and self.finetune_box.isChecked() else 0)
+        self._worker = ActionTrainingWorker(data_path=self._data_path, name=name,
+                                            finetune_blocks=blocks)
         self._thread = QThread(self)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
@@ -1054,6 +1186,7 @@ class ActionTrainingSection(QWidget):
         self.train_btn.setVisible(not running)
         self.cancel_btn.setVisible(running)
         self.progress_bar.setVisible(running)
+        self.finetune_box.setVisible(not running)
         if running:
             self.progress_bar.setValue(0)
 

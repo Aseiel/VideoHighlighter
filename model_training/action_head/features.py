@@ -36,6 +36,14 @@ def read_frames(path: str, k: int) -> list:
     when the file cannot be read. A frame count the container gets wrong
     costs a second pass with the true count, never a frame from the wrong
     place."""
+    return read_frame_sets(path, (k,))
+
+
+def read_frame_sets(path: str, counts: Sequence[int], convert=None) -> list:
+    """For each ``k`` in ``counts``, ``k`` frames evenly across the clip, all
+    in one front-to-back pass and concatenated in that order (``(4, 8)`` gives
+    12 frames: 4 across the clip, then 8). ``convert`` is applied to each
+    decoded frame once. [] when the file cannot be read."""
     import cv2
 
     def one_pass(targets):
@@ -48,23 +56,26 @@ def read_frames(path: str, k: int) -> list:
                 if index in wanted:
                     ok, frame = cap.retrieve()
                     if ok:
-                        out[index] = frame
+                        out[index] = frame if convert is None else convert(frame)
                 index += 1
         finally:
             cap.release()
         return out, index
+
+    def targets_for(n):
+        return [t for k in counts for t in sample_indices(n, k)]
 
     cap = cv2.VideoCapture(path)
     count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     cap.release()
     if count <= 0:
         count = 1_000_000                  # unknown: count it on the way
-    targets = sample_indices(count, k)
+    targets = targets_for(count)
     got, decoded = one_pass(targets)
     if len(got) < len(set(targets)):
         if decoded <= 0:
             return []
-        targets = sample_indices(decoded, k)
+        targets = targets_for(decoded)
         got, _ = one_pass(targets)
         if len(got) < len(set(targets)):
             return []

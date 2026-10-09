@@ -1,6 +1,9 @@
 # Fine-tuning SigLIP2 in the action trainer
 
-Status: design, for review. No code yet.
+Status: built (2026-10-09) with the proposed answers to all four questions at
+the end: the fine-tune is saved only when it beats the frozen head, the GUI
+has the checkbox, the frame cache is kept, the GUI fine-tunes 4 blocks. Where
+the code differs from this design, see "As built" at the end.
 
 Follows `2026-10-08-overfitting-and-siglip2-fine-tune.md` (top 4 blocks
 fine-tuned with the head: held-out top-1 0.533 -> 0.603, sorted with
@@ -271,3 +274,63 @@ with the installed overnight model (33.9 % of reviewed labels found).
    or deleted at the end unless `--frame-cache` is given?
 4. **Default `--finetune-blocks` in the GUI: 4** (best single-action
    accuracy, measured) or 8-12 (better at pairs, 1.6-2x slower)?
+
+## As built (2026-10-09)
+
+Everything above, with these differences:
+
+- **`tower.py` only exports.** `store_weights_fp16` had already moved to
+  `modules/vision/onnx_weights.py` (with the Import button), so
+  `tools/export_frame_encoder.py` is unchanged. `tower.py` writes the fp32
+  `vision.onnx` (checked against PyTorch, worst cosine >= 0.9999), `head.onnx`
+  (checked on the tower's own vectors) and `head.json`. It then hands the
+  folder to `action_models.install_export`, the code Import uses: fp16
+  weights, the probe, checks on ONNX Runtime and OpenVINO CPU, and
+  `read_head_meta`, all in staging. The fp32 export is deleted afterwards. As
+  in `install_export`, the probe comes from ONNX Runtime on the fp32 export,
+  not from PyTorch; the two agree to the cosine above.
+- **The start check** compares the torch tower with the vector the shared
+  encoder returns for `probe_pixels()` on the route it loaded on. That route
+  already reproduced `encoder.json`'s probe when it loaded, so it is the same
+  proof, and a test can run it without a real encoder.
+- **Decoding runs on threads, not a process pool.** In the packaged app a
+  process pool starts copies of the app (the bug b0bfd8e fixed for the
+  trainer itself). OpenCV decodes outside the GIL, so this costs nothing:
+  measured 19 clips/s, 2.5 min for the 2,695-clip dataset, not 10 min.
+- **When a run needs clips the cache lacks**, the cache is rebuilt: the rows
+  it has are copied and only the new or edited clips are decoded.
+- **The fold heads are reused.** The frozen folds keep the head of every fold
+  at the chosen length, and each one starts that fold's fine-tune.
+- **`val/` as the dataset defines it** is not scored for the fine-tuned model:
+  that would take one more LP-FT on `train/` only. The frozen head's score is
+  kept in `head.json` as `finetune.frozen_val_folder`.
+- **No time estimate before a processor run.** Each epoch's line already
+  says how long it took.
+- When the frozen head is saved because the fine-tune did not beat it,
+  `head.json` records the attempt as `finetune_not_saved` (its accuracy, the
+  frozen accuracy, accuracy by epoch, settings).
+
+Tests: `tests/test_action_finetune.py` (9, a tiny random SigLIP tower on the
+processor in a child process) and `tests/test_action_training_in_app.py`
+(the flag, the progress phases, the checkbox gating).
+
+**Real run** (the same dataset, aliases and `--teach-test` as the overnight
+model, `--finetune-blocks 4`, Arc A750): 71 min in all; decoding 2.5 min,
+about 60 s per epoch, 10 to 11 min per fold. On the same 5 folds:
+
+| | frozen | fine-tuned (10 epochs) | overnight script |
+|---|---|---|---|
+| held-out top-1 | 0.521 | **0.593** | 0.603 (frozen 0.533) |
+| balanced | 0.311 | 0.372 | |
+| top-3 | 0.724 | 0.778 | 0.781 |
+| sorted with confidence | 44 % at 74 % | 59 % at 74 % | 57 % |
+| test pairs, both in top 2 | 47 % | 48 % | |
+
+The gain over the frozen head is the overnight one (+0.07). The best epoch was
+the 10th, so the final model trained for 10. The fp16 tower matches the fp32
+export to a worst cosine of 0.9999998 on ONNX Runtime and OpenVINO CPU, and the
+app loads it on OpenVINO GPU.
+
+Not ported to Pro yet: `modules/vision/frame_encoder.py` and
+`model_training/action_head/*` are shared files; the checkbox goes into Pro's
+`training_panel.py` by hand.
