@@ -191,7 +191,9 @@ class SignalTimelineScene(QGraphicsScene):
         self.event_colors = self._color_palette(len(self.event_types), start_hue=45)
         
         # Merge threshold (seconds) — 0 = no merging
-        self.merge_threshold = 0.0
+        # Joins hits that touch or nearly touch; the Merge Signals slider
+        # starts here too, so the two never disagree on first open.
+        self.merge_threshold = 0.5
         self.bars = []
         self.row_labels = []
         self.avoid_ranges = []  # [(start, end)] user-marked ranges excluded from highlights
@@ -1294,19 +1296,8 @@ class SignalTimelineScene(QGraphicsScene):
             else:
                 color = QColor(180, 220, 120)
 
-            # Build intervals for this action type
-            intervals = []
-            for action in actions:
-                timestamp = action.get('timestamp', 0)
-                confidence = action.get('confidence', 0.5)
-                intervals.append((timestamp, timestamp + 0.5, {
-                    'label': action_type,
-                    'type': action_type,
-                    'confidence': confidence
-                }))
-
             # Merge nearby intervals of the same type
-            merged = self._merge_intervals(intervals)
+            merged = self._merge_intervals(self._action_intervals(action_type, actions))
 
             for start, end, meta in merged:
                 count = meta.get('merged_count', 1)
@@ -1334,6 +1325,36 @@ class SignalTimelineScene(QGraphicsScene):
         
         return y_pos + self.layer_height + self.layer_spacing
     
+    @staticmethod
+    def _action_intervals(action_type, actions):
+        """One (start, end, meta) per detection — what the ACTIONS row merges."""
+        intervals = []
+        for action in actions:
+            timestamp = action.get('timestamp', 0)
+            intervals.append((timestamp, timestamp + 0.5, {
+                'label': action_type,
+                'type': action_type,
+                'confidence': action.get('confidence', 0.5),
+            }))
+        return intervals
+
+    def action_bar_counts(self):
+        """How many bars each action category draws at the current merge gap.
+
+        Built from the same intervals and merge as the ACTIONS row, so the
+        number beside a category in the Layers panel is what the row shows.
+        Hidden categories are counted too: their number says what ticking them
+        would bring back. The confidence filter does apply, as it does to bars.
+        """
+        groups = defaultdict(list)
+        for action in self._actions_list():
+            if not self._action_confidence_ok(action):
+                continue
+            name = (action.get('action_name') or action.get('action') or 'Unknown')
+            groups[name.strip().title()].append(action)
+        return {name: len(self._merge_intervals(self._action_intervals(name, acts)))
+                for name, acts in groups.items()}
+
     def draw_improved_objects_layer(self, y_pos):
         """Draw object detections organized by class with filtering"""
         self.row_labels.append(("OBJECTS", y_pos))
@@ -1458,7 +1479,7 @@ class SignalTimelineScene(QGraphicsScene):
             # sampled second, so adjacent hits are one continuous event and
             # drawing them as separate one-second bars misrepresents it. Done
             # here rather than via _merge_intervals because that honours
-            # self.merge_threshold, which defaults to 0 (no merging) and is a
+            # self.merge_threshold, which is a user setting (0 = no merging) and a
             # display preference for detections — event contiguity is not
             # optional. The tolerance absorbs sampling gaps when object detection
             # ran with a frame skip coarser than one second.
@@ -2199,6 +2220,9 @@ class SignalTimelineScene(QGraphicsScene):
         action_name = action_name.strip().title()
         if not self.visible_actions.get(action_name, True):
             return False
+        return self._action_confidence_ok(action_data)
+
+    def _action_confidence_ok(self, action_data):
         confidence = action_data.get('confidence')
         if confidence is not None:
             if confidence > 1.0:

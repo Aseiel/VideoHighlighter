@@ -9,6 +9,7 @@ Complete Signal Timeline Viewer with Filters and Edit Timeline
 import sys
 import os
 import bisect
+import time
 import threading
 from pathlib import Path
 import json
@@ -321,7 +322,10 @@ class SignalLabelPanel(QWidget):
                     break
 
                 current = self._current_time_fn() if self._current_time_fn else 0.0
+                current = self._prev_origin(name, direction, current)
                 target = self._find_target(timestamps, current, direction)
+                if direction == "prev" and target is not None:
+                    self._last_prev = (name, time.monotonic(), target)
                 if target is not None:
                     self.seek_requested.emit(target)
                 return
@@ -417,6 +421,24 @@ class SignalLabelPanel(QWidget):
             edit.removeEventFilter(self)
             edit.hide()
             edit.deleteLater()
+
+    def _prev_origin(self, name, direction, current):
+        """Where ◀ measures "previous" from.
+
+        One click returns to the start of the group the playhead is in, so a
+        group can be watched again and again with the arrow. A double-click
+        steps to the group before: the second click measures from where the
+        first one landed. Measuring from the playhead instead found it already
+        past that start during playback, so the second click restarted the same
+        group, and stepping back further needed a pause.
+        """
+        last = getattr(self, "_last_prev", None)
+        if direction != "prev" or not last or last[0] != name:
+            return current
+        interval_s = QApplication.styleHints().mouseDoubleClickInterval() / 1000.0
+        if time.monotonic() - last[1] <= interval_s:
+            return last[2]
+        return current
 
     @staticmethod
     def _find_target(timestamps, current, direction):
@@ -1632,6 +1654,115 @@ class SignalTimelineWindow(QMainWindow):
 
         self._apply_event_fold()
 
+    def refresh_action_checkboxes(self):
+        """One checkbox per action category, nested under the ACTIONS layer.
+
+        The objects list below, for actions: a category is a row on the
+        timeline, so this panel is where it gets shown and hidden. Drives the
+        same scene state as the Advanced dialog, so the two cannot disagree.
+        """
+        box = getattr(self, '_action_box', None)
+        scene = getattr(self, 'signal_scene', None)
+        if box is None or scene is None:
+            return
+
+        layout = box.layout()
+        while layout.count():                       # drop the previous rows
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.action_checkboxes = {}
+
+        names = [a for a in (getattr(scene, 'action_types', []) or [])
+                 if a and a != 'Unknown']
+        if names:
+            layout.addWidget(self._build_action_header())
+
+        # Bars as the ACTIONS row draws them at the current merge gap, so the
+        # number moves with the Merge Signals slider and matches the timeline.
+        counts = scene.action_bar_counts()
+
+        for name in names:
+            n = counts.get(name, 0)
+            checkbox = QCheckBox(f"{name} ({n})")
+            checkbox.setChecked(scene.visible_actions.get(name, True))
+            checkbox.setToolTip(
+                f"Show the '{name}' row ({n} bar{'s' if n != 1 else ''} at the "
+                f"current merge gap), and let ◀ ▶ stop on it")
+            # setChecked runs before this connect, so it can't fire the toggle.
+            checkbox.stateChanged.connect(
+                lambda state, a=name: self._toggle_action(a, state)
+            )
+            layout.addWidget(checkbox)
+            self.action_checkboxes[name] = checkbox
+
+        self._apply_action_fold()
+
+    def _build_action_header(self) -> QWidget:
+        """'Show: all / none' quick toggles above the action list."""
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 0, 0, 2)
+        hl.setSpacing(6)
+        label = QLabel("Show:")
+        label.setStyleSheet("color:#888;font-size:8pt;")
+        hl.addWidget(label)
+        all_btn = self._mini_button("all", "Show every action")
+        all_btn.setFixedSize(24, 16)
+        all_btn.clicked.connect(lambda: self._set_all_action_rows(True))
+        hl.addWidget(all_btn)
+        none_btn = self._mini_button("none", "Hide every action")
+        none_btn.setFixedSize(30, 16)
+        none_btn.clicked.connect(lambda: self._set_all_action_rows(False))
+        hl.addWidget(none_btn)
+        hl.addStretch()
+        return header
+
+    def _apply_action_fold(self):
+        """Show/hide the action list; folded, the caret carries the count."""
+        box = getattr(self, '_action_box', None)
+        fold = getattr(self, '_action_fold', None)
+        if box is None or fold is None:
+            return
+        boxes = getattr(self, 'action_checkboxes', {})
+        expanded = getattr(self, '_action_rows_expanded', True)
+
+        box.setVisible(bool(boxes) and expanded)
+        fold.setVisible(bool(boxes))
+        shown = sum(1 for cb in boxes.values() if cb.isChecked())
+        total = len(boxes)
+        if expanded:
+            fold.setText("▾")
+            fold.setToolTip("Hide the action list")
+        else:
+            fold.setText("▸" if shown == total else f"▸ {shown}/{total}")
+            fold.setToolTip(f"Show the action list ({shown}/{total} visible)")
+
+    def _toggle_action_fold(self):
+        self._action_rows_expanded = not getattr(self, '_action_rows_expanded', True)
+        self._apply_action_fold()
+
+    def _toggle_action(self, name: str, state):
+        visible = (state == Qt.CheckState.Checked.value)
+        self.signal_scene.set_action_filter(name, visible)
+        self._apply_action_fold()     # the collapsed caret tracks the count
+        self.statusBar().showMessage(
+            f"Showing '{name}'" if visible
+            else f"Hiding '{name}' — ◀ ▶ now skip it",
+            2000,
+        )
+
+    def _set_all_action_rows(self, visible: bool):
+        """Show or hide every action at once — one rebuild, not one per action."""
+        self.signal_scene.set_all_actions_visible(visible)
+        self.refresh_action_checkboxes()
+        self.statusBar().showMessage(
+            "Showing all actions" if visible
+            else "Hid all actions — ◀ ▶ have nothing to step",
+            2000,
+        )
+
     def refresh_object_checkboxes(self):
         """One checkbox per detected class, nested under the OBJECTS layer.
 
@@ -2267,6 +2398,7 @@ class SignalTimelineWindow(QMainWindow):
         startup_splash.stage("Reloading signals…")
         self.signal_scene.reload_cache_data(self.cache_data)
         self.refresh_event_checkboxes()   # composed events may have just appeared
+        self.refresh_action_checkboxes()
         self.refresh_object_checkboxes()  # and so may object classes
 
         # Audio waveform may have just been added.
@@ -3125,6 +3257,7 @@ class SignalTimelineWindow(QMainWindow):
         # A composition run can introduce events that did not exist when the
         # Layers panel was built, so its nested list has to be rebuilt too.
         self.refresh_event_checkboxes()
+        self.refresh_action_checkboxes()
         self.refresh_object_checkboxes()
         if hasattr(self, "label_panel"):
             self.label_panel.refresh_labels()
@@ -3504,6 +3637,31 @@ class SignalTimelineWindow(QMainWindow):
             )
             self.layer_checkboxes[layer_name] = checkbox
 
+            if layer_name == 'actions':
+                # Same shape as objects below: the checkbox shows the group,
+                # the caret expands a checkbox per action category.
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(4)
+                row_layout.addWidget(checkbox)
+                row_layout.addStretch()
+                self._action_fold = self._mini_button("▾", "Hide the action list")
+                self._action_fold.setFixedSize(34, 16)
+                self._action_fold.setVisible(False)   # nothing to fold until detections exist
+                self._action_fold.clicked.connect(self._toggle_action_fold)
+                row_layout.addWidget(self._action_fold)
+                layer_layout.addWidget(row)
+
+                self._action_rows_expanded = True
+                self._action_box = QWidget()
+                act_layout = QVBoxLayout(self._action_box)
+                act_layout.setContentsMargins(18, 0, 0, 0)   # reads as a child row
+                act_layout.setSpacing(2)
+                self._action_box.setVisible(False)
+                layer_layout.addWidget(self._action_box)
+                continue
+
             if layer_name == 'objects':
                 # Same shape as the events group below it. Built here for the
                 # same reason: an object class is a row on the timeline, and
@@ -3604,6 +3762,7 @@ class SignalTimelineWindow(QMainWindow):
         layout.addWidget(layer_group)
         self.refresh_visual_query_checkboxes()
         self.refresh_event_checkboxes()
+        self.refresh_action_checkboxes()
         self.refresh_object_checkboxes()
 
         # Avoid ranges — exclude a dragged-selection range from highlight selection
@@ -3636,13 +3795,15 @@ class SignalTimelineWindow(QMainWindow):
         self.merge_slider = QSlider(Qt.Orientation.Horizontal)
         self.merge_slider.setMinimum(0)
         self.merge_slider.setMaximum(50)  # 0 to 5.0 seconds
-        self.merge_slider.setValue(0)
+        # Tenths of a second; matches the scene's default merge_threshold.
+        self.merge_slider.setValue(int(round(self.signal_scene.merge_threshold * 10)))
         self.merge_slider.setTickInterval(10)
         self.merge_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.merge_slider.valueChanged.connect(self.on_merge_changed)
         merge_row.addWidget(self.merge_slider)
 
-        self.merge_value_label = QLabel("Off")
+        self.merge_value_label = QLabel(
+            f"{self.merge_slider.value() / 10:.1f}s" if self.merge_slider.value() else "Off")
         self.merge_value_label.setStyleSheet(f"color: {THEME.accent}; font-weight: bold; min-width: 36px;")
         merge_row.addWidget(self.merge_value_label)
 
@@ -4035,6 +4196,7 @@ class SignalTimelineWindow(QMainWindow):
         """Actually apply the merge threshold after debounce"""
         if hasattr(self, 'signal_scene') and hasattr(self, '_pending_merge_value'):
             self.signal_scene.set_merge_threshold(self._pending_merge_value)
+            self.refresh_action_checkboxes()   # bar counts follow the gap
 
     def on_wpeak_sensitivity_changed(self, value):
         """Waveform-peak sensitivity slider (0..100 %), debounced so a drag
@@ -4058,7 +4220,8 @@ class SignalTimelineWindow(QMainWindow):
         """Toggle the ACTIONS row between all detections and highlight-only."""
         if hasattr(self, 'signal_scene'):
             self.signal_scene.set_show_only_highlight_actions(bool(state))
-    
+            self.refresh_action_checkboxes()   # categories and counts follow the source
+
     @Slot(float)
     def on_time_clicked(self, time):
         # Clicking the signal timeline hands control back to the main video
@@ -4629,6 +4792,7 @@ class SignalTimelineWindow(QMainWindow):
         # disagree — which is how a class hidden in one place comes back
         # ticked in the other.
         self.refresh_event_checkboxes()
+        self.refresh_action_checkboxes()
         self.refresh_object_checkboxes()
     
     def show_all_filters(self):
