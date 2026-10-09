@@ -136,6 +136,22 @@ def check_gpu_availability(log_fn=print):
 # Keep old name as alias for backward compatibility
 check_xpu_availability = check_gpu_availability
 
+def _actions_to_cache(dets):
+    """Action detection tuples in the cache's on-disk shape."""
+    out = []
+    for detection in dets or []:
+        if len(detection) >= 5:
+            timestamp, frame_id, action_id, score, action_name = detection[:5]
+            out.append({
+                "timestamp": float(timestamp),
+                "frame_id": int(frame_id),
+                "action_id": int(action_id),
+                "confidence": float(score),
+                "action_name": str(action_name)
+            })
+    return out
+
+
 def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                          object_detections, action_detections, scenes,
                          motion_events, motion_peaks, audio_peaks, source_lang="en",
@@ -166,21 +182,6 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
             if any(keyword in segment_text for keyword in keyword_set):
                 filtered_transcript_segments.append(segment)
     
-    # Ensure action_detections is in a cacheable format
-    def _actions_to_cache(dets):
-        out = []
-        for detection in dets or []:
-            if len(detection) >= 5:
-                timestamp, frame_id, action_id, score, action_name = detection[:5]
-                out.append({
-                    "timestamp": float(timestamp),
-                    "frame_id": int(frame_id),
-                    "action_id": int(action_id),
-                    "confidence": float(score),
-                    "action_name": str(action_name)
-                })
-        return out
-
     actions_for_cache = _actions_to_cache(action_detections)            # highlight-selected
     # Full raw detection stream for the timeline "show all" view; falls back to the
     # selected list if the caller didn't pass it.
@@ -1406,7 +1407,14 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         # none typed (then any of the encoder's action list counts). Before, a
         # blank field skipped the pass outright whatever the points said.
         _action_points = float(gui_config.get("action_points", config.get("action_points", 10)) or 0)
-        if not using_cache and (interesting_actions or _action_points > 0):
+        # A cached run whose action pass came back empty is re-run here, not
+        # scored at 0 until the user runs actions on demand (analysis_plan).
+        action_backfill = needs_backfill(
+            "actions", {"action_points": _action_points}, using_cache=using_cache,
+            values=(action_detections, cached_data.get("actions_all") if using_cache else ()))
+        if action_backfill:
+            log(_describe_backfill("actions"))
+        if (not using_cache and (interesting_actions or _action_points > 0)) or action_backfill:
             try:
                 # "Draw action labels": a copy of the video with the actions
                 # drawn on it, which the timeline viewer offers as a source.
@@ -1560,6 +1568,20 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         elif not interesting_actions:
             log("ℹ️ No interesting actions specified, skipping action recognition")
             action_detections = []
+
+        # Keep the backfilled actions, as the motion/audio backfill above does:
+        # only these keys change, in the blob exactly as it was loaded.
+        if (action_backfill and all_action_detections and use_cache
+                and not (cancel_flag and cancel_flag.is_set())):
+            try:
+                cached_data["actions"] = _actions_to_cache(action_detections)
+                cached_data["actions_all"] = _actions_to_cache(all_action_detections)
+                if action_bboxes_cache:
+                    cached_data["action_bboxes"] = action_bboxes_cache
+                cache.save(processed_video_path, cached_data, params=analysis_params)
+                log("💾 Cached the actions data - the next run reuses it.")
+            except Exception as e:
+                log(f"⚠️ Could not cache the backfilled actions: {e}")
 
         # ========== SAVE TO CACHE IF NOT USING CACHE ==========
         if not using_cache and use_cache and not (cancel_flag and cancel_flag.is_set()):

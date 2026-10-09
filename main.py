@@ -5515,9 +5515,9 @@ class VideoHighlighterGUI(QWidget):
         highlight_objects = [s.strip() for s in self.objects_input.text().split(",") if s.strip()]
         object_points = int(self.spin_object.value()) if highlight_objects else 0
         
-        # Action points only count if actions are configured
-        interesting_actions = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
-        action_points = int(self.spin_action.value()) if interesting_actions else 0
+        # Action points count with the list blank too: the pipeline then runs
+        # actions over every category the installed model knows.
+        action_points = int(self.spin_action.value())
         
         # Transcript and keyword points only count if transcript is enabled
         use_transcript = self.transcript_checkbox.isChecked()

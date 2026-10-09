@@ -48,6 +48,11 @@ GATED_ARTIFACTS: dict[str, tuple[str, ...]] = {
     # scenes + motion_events + motion_peaks all come from one detector pass.
     "motion": ("scene_points", "motion_event_points", "motion_peak_points"),
     "audio_peaks": ("audio_peak_points",),
+    # With no actions typed, the points alone switch the pass on (every class
+    # the installed model knows counts), and a blank list is the same cache
+    # key as before - so a cache whose action pass came back empty kept
+    # scoring 0 for actions until the user re-ran them on demand.
+    "actions": ("action_points",),
 }
 
 # Settings that gate an artifact *and* are part of the cache signature, so
@@ -56,6 +61,8 @@ GATED_ARTIFACTS: dict[str, tuple[str, ...]] = {
 # signature" apart from "nobody thought about it".
 SIGNATURE_GATED: dict[str, tuple[str, ...]] = {
     "objects": ("highlight_objects",),
+    # Typed actions are in the signature; the points that also gate the pass
+    # are not, and are declared in GATED_ARTIFACTS above.
     "actions": ("interesting_actions",),
     "transcript": ("use_transcript", "search_keywords"),
 }

@@ -29,6 +29,7 @@ MOTION_ON = {"scene_points": 5, "motion_event_points": 0, "motion_peak_points": 
 MOTION_OFF = {"scene_points": 0, "motion_event_points": 0, "motion_peak_points": 0}
 AUDIO_ON = {"audio_peak_points": 3}
 AUDIO_OFF = {"audio_peak_points": 0}
+ACTIONS_ON = {"action_points": 5}
 
 
 class TestGate:
@@ -73,6 +74,16 @@ class TestTheRerunBug:
         assert needs_backfill("audio_peaks", AUDIO_ON, using_cache=True,
                               values=([],)) is True
 
+    def test_the_same_for_actions_with_none_typed(self):
+        """Blank actions + points: the cache key matches, the list was empty."""
+        assert needs_backfill("actions", ACTIONS_ON, using_cache=True,
+                              values=([], [])) is True
+
+    def test_cached_actions_are_left_alone(self):
+        found = [{"timestamp": 3.0, "action_name": "x", "confidence": 0.4}]
+        assert needs_backfill("actions", ACTIONS_ON, using_cache=True,
+                              values=([], found)) is False
+
     def test_a_populated_cache_is_left_alone(self):
         """The cache doing its job must not be mistaken for the bug."""
         assert needs_backfill("motion", MOTION_ON, using_cache=True,
@@ -101,8 +112,9 @@ class TestPlan:
     def test_reports_each_artifact_independently(self):
         config = {**MOTION_ON, **AUDIO_OFF}
         result = plan(config, using_cache=True,
-                      values={"motion": ([], [], []), "audio_peaks": ([],)})
-        assert result == {"motion": True, "audio_peaks": False}
+                      values={"motion": ([], [], []), "audio_peaks": ([],),
+                              "actions": ([],)})
+        assert result == {"motion": True, "audio_peaks": False, "actions": False}
 
     def test_a_missing_value_is_treated_as_empty_not_an_error(self):
         result = plan(MOTION_ON, using_cache=True, values={})
@@ -152,7 +164,7 @@ class TestTheInvariant:
         """The known offenders, named. Regression cover for the found bugs."""
         declared = {n for names in GATED_ARTIFACTS.values() for n in names}
         for name in ("scene_points", "motion_event_points",
-                     "motion_peak_points", "audio_peak_points"):
+                     "motion_peak_points", "audio_peak_points", "action_points"):
             assert name in declared
 
 
