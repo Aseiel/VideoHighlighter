@@ -242,5 +242,8 @@ On `main` since 0.13.1:
   across the clip, top blocks only, LP-FT. The frozen + head row (0.50) is
   its likely floor. Reaching 0.57 would take a bigger gain than SigLIP2 got
   from the same treatment. Measuring it would settle question 2.
+- **Adding DINOv2 and V-JEPA 2 to the fine-tuned model:** measured in
+  `2026-10-09-fine-tune-plus-dinov2-vjepa2.md` (68-70 % sorted with
+  confidence instead of 57-58 %, for ~15 min more training).
 - **Seeds:** each setting ran once (seed 0). The fold-by-fold wins make the
   direction safe; the exact sizes are ±1-2 points.
