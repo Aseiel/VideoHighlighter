@@ -150,3 +150,39 @@ def test_remote_is_told_apart_from_local():
     assert not ollama_host.is_remote("127.0.0.1")
     assert ollama_host.is_remote("192.168.1.118")
     assert ollama_host.is_remote("https://ai.example.com")
+
+
+# --- setup commands for the other machine -----------------------------------
+
+@pytest.mark.parametrize("system", ollama_host.SETUP_SYSTEMS)
+def test_every_system_binds_ollama_to_the_network(system):
+    text = ollama_host.server_setup(system, "http://192.168.1.102:11434")
+    assert "OLLAMA_HOST" in text and "0.0.0.0" in text
+
+
+def test_windows_opens_the_firewall_on_the_port_the_app_dials():
+    text = ollama_host.server_setup("Windows", "http://192.168.1.102:11434")
+    assert "-LocalPort 11434" in text
+    # Public stays closed: opening a model server to café Wi-Fi is not the ask.
+    assert "Public" not in text.split("New-NetFirewallRule", 1)[1].splitlines()[0]
+
+
+def test_a_moved_port_is_followed_everywhere():
+    text = ollama_host.server_setup("Windows", "http://box.lan:12000")
+    assert "0.0.0.0:12000" in text and "-LocalPort 12000" in text
+    assert "11434" not in text
+    assert "12000/tcp" in ollama_host.server_setup("Linux", "http://box.lan:12000")
+
+
+@pytest.mark.parametrize("system", ollama_host.SETUP_SYSTEMS)
+def test_every_command_is_one_pasteable_line(system):
+    # Quotes and parentheses balance on each line — a string split across lines
+    # pastes as a shell left waiting for its closing quote.
+    for line in ollama_host.server_setup(system).splitlines():
+        assert line.count("'") % 2 == 0 and line.count('"') % 2 == 0, line
+        assert line.count("(") == line.count(")"), line
+
+
+def test_an_unknown_system_is_an_error_not_an_empty_string():
+    with pytest.raises(ValueError):
+        ollama_host.server_setup("Amiga")

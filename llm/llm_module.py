@@ -205,6 +205,43 @@ def _unreachable_hint(base_url: str) -> str:
     return "Start with: ollama serve"
 
 
+# The context every Ollama call starts with. Small on purpose: an 11B vision
+# model only fits an 8 GB Intel Arc at 2048 (5e5130e). A request that needs more
+# grows it - see `_OllamaBackend._grown_context`.
+DEFAULT_NUM_CTX = 2048
+
+_CTX_EXCEEDED = re.compile(
+    r"request \((\d+) tokens\) exceeds the available context size")
+
+
+def _ollama_error(resp) -> str:
+    """The reason Ollama gave for refusing a request, not just its status.
+
+    ``raise_for_status`` reports "400 Bad Request", which says nothing; the body
+    says what was wrong. Newer servers nest the runner's JSON error as a string
+    inside their own, so that is unwrapped too.
+    """
+    import json as _json
+    try:
+        text = resp.text
+    except Exception:                                   # pragma: no cover - defensive
+        return f"HTTP {resp.status_code}"
+    detail = text
+    for _ in range(2):
+        try:
+            parsed = _json.loads(detail)
+        except (ValueError, TypeError):
+            break
+        err = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(err, dict):
+            detail = err.get("message") or str(err)
+        elif isinstance(err, str):
+            detail = err
+        else:
+            break
+    return (detail or f"HTTP {resp.status_code}").strip()
+
+
 class _OllamaBackend(_LLMBackend):
     """Talks to an Ollama server - localhost by default, wherever it was set.
 
@@ -220,6 +257,32 @@ class _OllamaBackend(_LLMBackend):
         # load() where the server will say, and otherwise discovered by the
         # first call that comes back as reasoning only.
         self._thinks = False
+        # Starts small and only grows: Ollama reloads the model whenever
+        # num_ctx changes, so shrinking back after a big request would pay that
+        # reload again on the next one.
+        self._num_ctx = DEFAULT_NUM_CTX
+        # The model's own ceiling, from /api/show; None until the server says.
+        self._max_ctx: Optional[int] = None
+
+    def _grown_context(self, detail: str, max_tokens: int) -> Optional[int]:
+        """A context that fits the refused request, or None if none will.
+
+        The server reports exactly how many tokens the request took, so this is
+        a measurement, not an estimate: that plus room for the reply, rounded up
+        to a power of two so a run of slightly different prompts settles on one
+        size instead of reloading the model for each.
+        """
+        found = _CTX_EXCEEDED.search(detail or "")
+        if not found:
+            return None
+        reply = max_tokens if max_tokens and max_tokens > 0 else DEFAULT_NUM_CTX
+        needed = int(found.group(1)) + reply
+        size = DEFAULT_NUM_CTX
+        while size < needed:
+            size *= 2
+        if self._max_ctx:
+            size = min(size, self._max_ctx)
+        return size if size > self._num_ctx and size >= needed else None
 
     @staticmethod
     def available() -> bool:
@@ -261,7 +324,11 @@ class _OllamaBackend(_LLMBackend):
                 shown = requests.post(f"{self.base_url}/api/show",
                                       json={"model": self.model}, timeout=5)
                 if shown.ok:
-                    capabilities = shown.json().get("capabilities") or []
+                    info = shown.json()
+                    capabilities = info.get("capabilities") or []
+                    for key, value in (info.get("model_info") or {}).items():
+                        if key.endswith(".context_length") and isinstance(value, int):
+                            self._max_ctx = value
             except Exception as exc:
                 print(f"   (could not read capabilities for {self.model}: {exc})")
 
@@ -308,7 +375,7 @@ class _OllamaBackend(_LLMBackend):
             "think": False,
             "options": {
                 "num_predict": max_tokens,
-                "num_ctx": 2048,
+                "num_ctx": self._num_ctx,
                 "temperature": temperature,
                 "repeat_penalty": 1.3,
                 "repeat_last_n": 128,
@@ -340,7 +407,25 @@ class _OllamaBackend(_LLMBackend):
             timeout=120,
         ) as resp:
             t_headers_received = _time.perf_counter()
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                detail = _ollama_error(resp)
+                grown = self._grown_context(detail, max_tokens)
+                if grown:
+                    # Terminates: the context only grows, and a size that is
+                    # not larger than the current one is never retried.
+                    print(f"[ollama] {detail} - retrying with num_ctx="
+                          f"{grown} (was {self._num_ctx}); kept for this "
+                          f"session.")
+                    self._num_ctx = grown
+                    return self.generate(
+                        prompt, system=system, max_tokens=max_tokens,
+                        temperature=temperature,
+                        stream_callback=stream_callback, images=images,
+                        cancellation_token=cancellation_token)
+                print(f"[ollama] {self.base_url} refused the request "
+                      f"({resp.status_code}): {detail}")
+                raise RuntimeError(f"Ollama ({self.model}) refused the "
+                                   f"request: {detail}")
             for line in resp.iter_lines():
                 if not line:
                     continue

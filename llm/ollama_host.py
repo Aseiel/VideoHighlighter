@@ -168,3 +168,65 @@ def is_remote(base_url=None) -> bool:
     """
     host = urlsplit(resolve(base_url)).hostname or ""
     return host.lower() not in {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+# --- making a server on another machine reachable ---------------------------
+#
+# The app can point at another box, but out of the box that box will not
+# answer: Ollama binds to 127.0.0.1, and on Windows the firewall drops 11434
+# without a reply, so from here it looks like a dead host rather than a closed
+# door. The fix is on the *other* machine, where nothing of ours runs, so all
+# the app can do is hand the user the exact lines to paste there. They live
+# here rather than in the dialog so the text is testable without Qt.
+
+SETUP_SYSTEMS = ("Windows", "Linux", "macOS")
+
+
+def _port(base_url=None) -> int:
+    try:
+        return urlsplit(resolve(base_url)).port or DEFAULT_PORT
+    except ValueError:                                  # pragma: no cover - defensive
+        return DEFAULT_PORT
+
+
+def server_setup(system: str, base_url=None) -> str:
+    """Commands to run on the Ollama machine so this one can reach it.
+
+    The port follows the host the app is pointed at, so a server moved off
+    11434 is opened on the port the app will actually dial.
+    """
+    port = _port(base_url)
+    bind = "0.0.0.0" if port == DEFAULT_PORT else f"0.0.0.0:{port}"
+    if system == "Windows":
+        return (
+            "# On the PC that runs Ollama, in PowerShell as Administrator - not\n"
+            "# Command Prompt: right-click Start > Terminal (Admin). The prompt\n"
+            "# should start with PS.\n"
+            "# First: this must say Private, not Public. If it says Public, switch\n"
+            "# it in Settings > Network & internet > (your network) > Private.\n"
+            "Get-NetConnectionProfile | Select Name,NetworkCategory\n"
+            f'[Environment]::SetEnvironmentVariable("OLLAMA_HOST", "{bind}", "Machine")\n'
+            f'New-NetFirewallRule -DisplayName "Ollama (LAN)" -Direction Inbound '
+            f"-Protocol TCP -LocalPort {port} -Action Allow -Profile Private,Domain\n"
+            "# Now quit Ollama from its tray icon and start it again from the\n"
+            "# Start menu (not from this window: it would miss OLLAMA_HOST).\n"
+            f"# Check: this should list 0.0.0.0:{port}, not 127.0.0.1:{port}\n"
+            f"netstat -ano | findstr :{port}\n"
+        )
+    if system == "Linux":
+        return (
+            "# On the machine that runs Ollama (installed as a systemd service)\n"
+            "sudo mkdir -p /etc/systemd/system/ollama.service.d\n"
+            f"printf '[Service]\\nEnvironment=\"OLLAMA_HOST={bind}\"\\n' "
+            "| sudo tee /etc/systemd/system/ollama.service.d/lan.conf\n"
+            "sudo systemctl daemon-reload && sudo systemctl restart ollama\n"
+            "# Only if ufw is enabled:\n"
+            f"sudo ufw allow {port}/tcp\n"
+        )
+    if system == "macOS":
+        return (
+            "# On the Mac that runs Ollama\n"
+            f'launchctl setenv OLLAMA_HOST "{bind}"\n'
+            "# Now quit Ollama from the menu bar and open it again.\n"
+        )
+    raise ValueError(f"unknown system: {system!r}")

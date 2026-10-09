@@ -726,6 +726,13 @@ class LLMChatWidget(QWidget):
         # typing an address rewrites the field under the cursor.
         self.ollama_host_input.editingFinished.connect(self._on_ollama_host_edited)
         ollama_inner.addWidget(self.ollama_host_input)
+        self.ollama_setup_btn = QPushButton("Other PC setup…")
+        fit_width(self.ollama_setup_btn)
+        self.ollama_setup_btn.setToolTip(
+            "What to run on another PC so this one can use its Ollama,\n"
+            "with a Copy button and a connection test.")
+        self.ollama_setup_btn.clicked.connect(self._show_ollama_setup)
+        ollama_inner.addWidget(self.ollama_setup_btn)
         self.ollama_row_widget.setLayout(ollama_inner)
         settings_layout.addWidget(self.ollama_row_widget)
 
@@ -1833,6 +1840,13 @@ class LLMChatWidget(QWidget):
         if self.backend_combo.currentData() == "ollama":
             self._refresh_models()
 
+    def _show_ollama_setup(self):
+        from modules.ui.ollama_setup_dialog import OllamaSetupDialog
+        dialog = OllamaSetupDialog(self, host=resolve_ollama_host())
+        dialog.exec()
+        if dialog.connected and self.backend_combo.currentData() == "ollama":
+            self._refresh_models()
+
     def _populate_recent_gguf(self):
         """Fill model combo with recently used GGUF files."""
         self.model_combo.clear()
@@ -1861,32 +1875,47 @@ class LLMChatWidget(QWidget):
             self.gguf_path_input.setText(path)
 
     def _refresh_models(self):
-        self.model_combo.clear()
         backend = self.backend_combo.currentData()
-        
+        # Whatever was typed survives a refresh — the combo is editable, and a
+        # name typed while the server was down is still the one the user wants.
+        typed = self.model_combo.currentText().strip() if backend == "ollama" else ""
+        self.model_combo.clear()
+
         if backend == "llama-cpp":
             self.model_combo.addItem("(select GGUF file below)")
             return
-            
+
         if backend == "ollama":
             host = resolve_ollama_host()
+            remote = ollama_is_remote(host)
             # Named only when it is not the default: on localhost the URL is
             # noise, and on another machine it is the whole answer.
-            where = f" at {host}" if ollama_is_remote(host) else ""
+            where = f" at {host}" if remote else ""
             models = get_ollama_models(host)
             if models:
                 for m in models:
                     self.model_combo.addItem(m)
+                if typed in models:
+                    self.model_combo.setCurrentText(typed)
+                self.status_label.setToolTip("")
                 self.status_label.setText(
                     f"Found {len(models)} Ollama models{where}")
                 self.status_label.setStyleSheet("color:#4CAF50;font-style:italic;")
             else:
-                for m in ["llama3.2", "llama3.2-vision", "llava", "bakllava", "llava-llama3"]:
-                    self.model_combo.addItem(m)
+                # No list rather than a made-up one: tags the server never
+                # offered read as "these are available", which is the opposite
+                # of what just happened.
+                self.model_combo.setCurrentText(typed)
                 self.status_label.setText(
-                    f"No Ollama answered{where or ' on this machine'} - showing "
-                    "defaults (vision models recommended)")
-                self.status_label.setStyleSheet("color:#ff9800;font-style:italic;")
+                    f"No Ollama answered{where or ' on this machine'}")
+                self.status_label.setToolTip(
+                    "Ollama on another PC only answers itself until it is set "
+                    "up.\n\"Other PC setup…\" has the commands to run there. "
+                    "You can still type a model name."
+                    if remote else
+                    "Start Ollama, then press Refresh. You can still type a "
+                    "model name.")
+                self.status_label.setStyleSheet("color:#f44336;font-style:italic;")
 
     def _browse_gguf(self):
         path, _ = QFileDialog.getOpenFileName(
