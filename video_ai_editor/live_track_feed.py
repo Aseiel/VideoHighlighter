@@ -36,11 +36,14 @@ _LUMA_SHIFT = {
 _MAX_TRACK_W = 1280     # luma wider than this is decimated; the tracker gains nothing from more
 
 
-def luma_of(vframe, crop_left_half: bool = False) -> Optional[np.ndarray]:
-    """The frame's luma as a contiguous uint8 array, at most _MAX_TRACK_W wide."""
+def luma_of(vframe, span: tuple[float, float] = (0.0, 1.0)) -> Optional[np.ndarray]:
+    """The frame's luma as a contiguous uint8 array, at most _MAX_TRACK_W wide,
+    cropped to the columns ``span`` covers (fractions of the width)."""
     w, h = vframe.width(), vframe.height()
     if w <= 0 or h <= 0:
         return None
+    x0 = int(round(span[0] * w))
+    x1 = max(x0 + 1, int(round(span[1] * w)))
     shift = _LUMA_SHIFT.get(vframe.pixelFormat())
     if shift is None:
         img = vframe.toImage()
@@ -49,15 +52,14 @@ def luma_of(vframe, crop_left_half: bool = False) -> Optional[np.ndarray]:
         from video_ai_editor.live_face import qimage_to_bgr
         bgr = qimage_to_bgr(img)
         gray = bgr.mean(axis=2).astype(np.uint8)
-        return gray[:, : w // 2] if crop_left_half else gray
-    cw = w // 2 if crop_left_half else w
-    k = max(1, math.ceil(cw / _MAX_TRACK_W))
+        return np.ascontiguousarray(gray[:, x0:x1])
+    k = max(1, math.ceil((x1 - x0) / _MAX_TRACK_W))
     if not _map_readonly(vframe):
         return None
     try:
         dt, bpp = (np.uint16, 2) if shift else (np.uint8, 1)
         y = np.frombuffer(vframe.bits(0), dtype=dt).reshape(h, vframe.bytesPerLine(0) // bpp)
-        y = y[::k, :cw:k]
+        y = y[::k, x0:x1:k]
         y = (y >> shift).astype(np.uint8) if shift else np.ascontiguousarray(y)
     finally:
         vframe.unmap()
@@ -83,7 +85,7 @@ class LiveTrackFeed(QObject):
         super().__init__(parent)
         self._tracker = LiveBoxTracker(identity_key="identity_id")
         self._enabled = False
-        self._vr_mode = False
+        self._span = (0.0, 1.0)
         self._cond = threading.Condition()
         self._frame = None
         self._detections: list = []        # [(results, w, h, t)] waiting for the thread
@@ -102,8 +104,14 @@ class LiveTrackFeed(QObject):
                 self._reset = True
                 self._detections.clear()
 
-    def set_vr_mode(self, enabled: bool) -> None:
-        self._vr_mode = enabled
+    def set_crop(self, span: tuple[float, float]) -> None:
+        """Track within the columns ``span`` covers, as fractions of the frame
+        width — the same part of the frame the detector is given (the left
+        half for side-by-side VR). Tracks are dropped when it changes."""
+        span = (float(span[0]), float(span[1]))
+        if span == self._span:
+            return
+        self._span = span
         with self._cond:
             self._reset = True
 
@@ -145,7 +153,7 @@ class LiveTrackFeed(QObject):
     def _process(self, vframe, pending, reset):
         if reset:
             self._tracker.reset()
-        gray = luma_of(vframe, crop_left_half=self._vr_mode)
+        gray = luma_of(vframe, self._span)
         if gray is None:
             return
         gh, gw = gray.shape

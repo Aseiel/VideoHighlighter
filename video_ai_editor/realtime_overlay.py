@@ -944,6 +944,11 @@ class OverlayView(QGraphicsView):
         px = max(px, self._MIN_DISPLAY_W)
         return int(-(-px // 256) * 256)
 
+    def visible_span(self) -> tuple[float, float]:
+        """The columns on screen, as fractions of the frame width — the part
+        the live face worker is given (the left half in VR mode)."""
+        return (0.0, 0.5) if self._vr_mode else (0.0, 1.0)
+
     def contextMenuEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         hit = None
@@ -1141,7 +1146,7 @@ class RealtimeOverlayPreview(QWidget):
         # the face tracker follows from here rather than from every caller.
         tracks = getattr(self, "_face_tracks", None)
         if tracks is not None:
-            tracks.set_vr_mode(getattr(self._view, "_vr_mode", False))
+            tracks.set_crop(self._view.visible_span())
 
     def _load_detections_lazy(self):
         """Load bbox data lazily from cache."""
@@ -1428,7 +1433,7 @@ class RealtimeOverlayPreview(QWidget):
         if self._live_face is not None:
             self._live_face.set_enabled(want)
             if self._face_tracks is not None:
-                self._face_tracks.set_vr_mode(getattr(self._view, "_vr_mode", False))
+                self._face_tracks.set_crop(self._view.visible_span())
                 self._face_tracks.set_enabled(want)
             if not want and self._live_overlay is not None:
                 self._live_overlay.clear()

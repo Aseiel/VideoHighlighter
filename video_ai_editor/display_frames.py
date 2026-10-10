@@ -76,11 +76,15 @@ def _map_readonly(vframe) -> bool:
     return vframe.map(QVideoFrame.MapMode.ReadOnly)
 
 
-def downscale_nv12_planes(vframe, target_w: int, crop_left_half: bool = False):
-    """Shrink a P010/NV12 QVideoFrame to ``target_w`` wide (optionally cropping
-    to the left half first), returning 8-bit ``(y, uv)`` planes — ``y`` is
-    (h, w), ``uv`` is (h/2, w/2, 2) interleaved — or None for any other pixel
-    format or a frame that won't map.
+def downscale_nv12_planes(vframe, target_w: int, crop_left_half: bool = False,
+                          x_span: Optional[tuple[int, int]] = None):
+    """Shrink a P010/NV12 QVideoFrame to ``target_w`` wide, returning 8-bit
+    ``(y, uv)`` planes — ``y`` is (h, w), ``uv`` is (h/2, w/2, 2) interleaved —
+    or None for any other pixel format or a frame that won't map.
+
+    ``x_span`` crops to pixel columns ``(x0, x1)`` first; ``crop_left_half``
+    is shorthand for the left half. ``x0`` is moved down to an even column,
+    since each chroma sample covers a pair of pixels.
 
     Reads the mapped planes in place (no copy) and resizes them at their native
     bit depth, so the 10->8 bit shift and the caller's colour conversion run on
@@ -94,7 +98,11 @@ def downscale_nv12_planes(vframe, target_w: int, crop_left_half: bool = False):
     if not is_p010 and fmt != QVideoFrameFormat.PixelFormat.Format_NV12:
         return None
     w, h = vframe.width(), vframe.height()
-    crop_w = (w // 2) if crop_left_half else w
+    if x_span is None:
+        x_span = (0, w // 2 if crop_left_half else w)
+    x0 = max(0, min(int(x_span[0]), w))
+    x0 -= x0 % 2
+    crop_w = min(int(x_span[1]), w) - x0
     crop_w -= crop_w % 2
     if w <= 0 or h <= 1 or crop_w <= 0:
         return None
@@ -108,8 +116,8 @@ def downscale_nv12_planes(vframe, target_w: int, crop_left_half: bool = False):
         dt, bpp = (np.uint16, 2) if is_p010 else (np.uint8, 1)
         y = np.frombuffer(vframe.bits(0), dtype=dt).reshape(h, vframe.bytesPerLine(0) // bpp)
         uv = np.frombuffer(vframe.bits(1), dtype=dt).reshape(h // 2, vframe.bytesPerLine(1) // bpp)
-        y = y[:, :crop_w]
-        uv = uv[:, :crop_w].reshape(h // 2, crop_w // 2, 2)
+        y = y[:, x0:x0 + crop_w]
+        uv = uv[:, x0:x0 + crop_w].reshape(h // 2, crop_w // 2, 2)
         y_small = cv2.resize(y, (tw, th), interpolation=cv2.INTER_AREA)
         uv_small = cv2.resize(uv, (tw // 2, th // 2), interpolation=cv2.INTER_AREA)
     finally:
