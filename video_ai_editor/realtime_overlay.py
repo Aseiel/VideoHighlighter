@@ -43,6 +43,8 @@ from typing import Optional, Dict, List, Set, Tuple
 from collections import defaultdict
 from video_ai_editor.face_identity import FaceIdentityBank
 from video_ai_editor.live_face import LiveFaceController, LiveFaceOverlay
+from video_ai_editor.display_frames import DisplayFrameFeed
+from video_ai_editor.live_track_feed import LiveTrackFeed
 
 from PySide6.QtCore import Qt, QRectF, QTimer, QUrl, QPointF, Signal, QSizeF
 from PySide6.QtGui import (
@@ -831,6 +833,7 @@ class OverlayView(QGraphicsView):
     identity_context_requested = Signal(object, object)   # (identity_id, global_pos)
     empty_context_requested = Signal(object, object)      # (scene_pos, global_pos) — right-click on nothing
     teach_region_requested = Signal(object)               # (scene QRectF) — box drawn in teach mode
+    fitted = Signal()                                     # scene re-fitted: size, VR or source changed
 
     def __init__(self, scene: OverlayScene, parent=None):
         super().__init__(scene, parent)
@@ -921,7 +924,26 @@ class OverlayView(QGraphicsView):
             # Show left half only — right eye view is identical for SBS content
             rect = QRectF(0, 0, rect.width() / 2, rect.height())
         self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
-        
+        self.fitted.emit()
+
+    # Smallest display frame worth asking for. 1280 keeps scene captures
+    # (capture_frame_*) at the scene's own resolution; in VR the live face
+    # worker crops the left half of this frame, so 1920 keeps that half at 960.
+    _MIN_DISPLAY_W = 1280
+    _MIN_DISPLAY_W_VR = 1920
+
+    def display_width_needed(self) -> int:
+        """Width, in source-frame pixels, a frame needs for this view to show
+        it at full sharpness — the visible device pixels, doubled in VR mode
+        since only the left half of the frame is on screen. Rounded up to 256
+        so dragging the window edge doesn't resize the frames on every step."""
+        px = self.viewport().width() * self.devicePixelRatioF()
+        if self._vr_mode:
+            px *= 2
+            px = max(px, self._MIN_DISPLAY_W_VR)
+        px = max(px, self._MIN_DISPLAY_W)
+        return int(-(-px // 256) * 256)
+
     def contextMenuEvent(self, event):
         scene_pos = self.mapToScene(event.pos())
         hit = None
@@ -976,6 +998,7 @@ class RealtimeOverlayPreview(QWidget):
         self._max_cached_buckets = max_cached_buckets
 
         self._init_ui()
+        self._view.fitted.connect(self._retarget_display)
         self._view.identity_context_requested.connect(self._on_identity_context)
         self._view.empty_context_requested.connect(self._on_empty_context)
         self._view.teach_region_requested.connect(self._on_teach_region)
@@ -983,6 +1006,7 @@ class RealtimeOverlayPreview(QWidget):
         self._init_player()
         
         self._face_bank = None
+        self._face_tracks = None     # LiveTrackFeed: moves face boxes every frame between detections
         self._live_face = None
         self._live_overlay = None
         # True while the mode combo is on "Live (real-time)". Real-time inference
@@ -1090,7 +1114,14 @@ class RealtimeOverlayPreview(QWidget):
         self._player = QMediaPlayer()
         self._audio = follow_system_default(QAudioOutput())
         self._player.setAudioOutput(self._audio)
-        self._player.setVideoOutput(self._scene.video_item)
+        # Frames go through DisplayFrameFeed, which shrinks them to what the view
+        # shows before the video item paints them (see display_frames.py) — the
+        # item converting a 4K/7K frame on the UI thread every frame was what
+        # made playback, and live faces, lag. The live face worker still taps
+        # the item's own sink, so it gets the shrunk frame too.
+        self._display_feed = DisplayFrameFeed(self._scene.video_item.videoSink(), parent=self)
+        self._retarget_display()
+        self._player.setVideoSink(self._display_feed.input_sink)
         self._player.setSource(QUrl.fromLocalFile(self.video_path))
         self._audio.setVolume(0.8)
 
@@ -1101,6 +1132,16 @@ class RealtimeOverlayPreview(QWidget):
         self._scene.video_item.nativeSizeChanged.connect(
             lambda _: self._view._fit_video()
         )
+
+    def _retarget_display(self):
+        feed = getattr(self, "_display_feed", None)
+        if feed is not None:
+            feed.set_target_width(self._view.display_width_needed())
+        # VR toggles reach the view (set_vr_mode -> _fit_video -> fitted), so
+        # the face tracker follows from here rather than from every caller.
+        tracks = getattr(self, "_face_tracks", None)
+        if tracks is not None:
+            tracks.set_vr_mode(getattr(self._view, "_vr_mode", False))
 
     def _load_detections_lazy(self):
         """Load bbox data lazily from cache."""
@@ -1373,7 +1414,12 @@ class RealtimeOverlayPreview(QWidget):
                 bank=self._face_bank,
                 video_sink=self._scene.video_item.videoSink(),   # the frame tap
             )
-            self._live_face.results_ready.connect(self._live_overlay.update_boxes)
+            # Detections (about twice a second) correct the tracker; the
+            # tracker's boxes — one per displayed frame — are what's drawn.
+            if self._face_tracks is None:
+                self._face_tracks = LiveTrackFeed(self._scene.video_item.videoSink(), parent=self)
+                self._face_tracks.results_ready.connect(self._live_overlay.update_boxes)
+            self._live_face.detected_at.connect(self._face_tracks.add_detections)
             # Inherit current VR state (user may have enabled VR before live face)
             vr = getattr(self._view, "_vr_mode", False)
             self._live_face.set_vr_mode(vr)
@@ -1381,6 +1427,9 @@ class RealtimeOverlayPreview(QWidget):
 
         if self._live_face is not None:
             self._live_face.set_enabled(want)
+            if self._face_tracks is not None:
+                self._face_tracks.set_vr_mode(getattr(self._view, "_vr_mode", False))
+                self._face_tracks.set_enabled(want)
             if not want and self._live_overlay is not None:
                 self._live_overlay.clear()
 

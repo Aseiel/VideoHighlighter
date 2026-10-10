@@ -83,50 +83,32 @@ def vframe_to_bgr(vframe, max_w: int, vr_crop_left_half: bool = False) -> Option
     Mean pixel error vs. the old path: 0.3/255 (max 3/255) — well within
     tolerance for downscaled inference input. Falls back to the old path for
     any other pixel format.
+
+    Reading the planes in place and resizing them before the 10->8 bit shift
+    (display_frames.downscale_nv12_planes) took that same frame from ~100ms to
+    ~14ms — the full-size bytes() copies and shift were most of what was left.
     """
     import cv2
-    from PySide6.QtMultimedia import QVideoFrame, QVideoFrameFormat
+    from video_ai_editor.display_frames import downscale_nv12_planes
 
     w, h = vframe.width(), vframe.height()
     if w <= 0 or h <= 0:
         return None
     crop_w = (w // 2) if vr_crop_left_half else w
 
-    fmt = vframe.pixelFormat()
-    is_p010 = fmt == QVideoFrameFormat.PixelFormat.Format_P010
-    is_nv12 = fmt == QVideoFrameFormat.PixelFormat.Format_NV12
-
-    if (is_p010 or is_nv12) and crop_w > max_w and vframe.map(QVideoFrame.MapMode.ReadOnly):
+    if crop_w > max_w:
         try:
-            target_w = max_w - (max_w % 2)
-            target_h = int(h * target_w / crop_w)
-            target_h -= target_h % 2
-
-            y_stride = vframe.bytesPerLine(0)
-            uv_stride = vframe.bytesPerLine(1)
-            if is_p010:
-                y16 = np.frombuffer(bytes(vframe.bits(0)), dtype=np.uint16).reshape(h, y_stride // 2)
-                uv16 = np.frombuffer(bytes(vframe.bits(1)), dtype=np.uint16).reshape(h // 2, uv_stride // 2)
-                y8 = (y16[:, :crop_w] >> 8).astype(np.uint8)
-                uv8 = (uv16[:, :crop_w] >> 8).astype(np.uint8)
-            else:  # NV12 — already 8-bit
-                y8_full = np.frombuffer(bytes(vframe.bits(0)), dtype=np.uint8).reshape(h, y_stride)
-                uv8_full = np.frombuffer(bytes(vframe.bits(1)), dtype=np.uint8).reshape(h // 2, uv_stride)
-                y8 = y8_full[:, :crop_w]
-                uv8 = uv8_full[:, :crop_w]
-
-            uv8 = uv8.reshape(h // 2, crop_w // 2, 2)   # de-interleave U,V as 2 channels
-            y_small = cv2.resize(y8, (target_w, target_h), interpolation=cv2.INTER_AREA)
-            uv_small = cv2.resize(uv8, (target_w // 2, target_h // 2), interpolation=cv2.INTER_AREA)
-
-            nv12_small = np.empty((target_h + target_h // 2, target_w), dtype=np.uint8)
-            nv12_small[:target_h] = y_small
-            nv12_small[target_h:] = uv_small.reshape(target_h // 2, target_w)
-            return cv2.cvtColor(nv12_small, cv2.COLOR_YUV2BGR_NV12)
+            planes = downscale_nv12_planes(vframe, max_w, crop_left_half=vr_crop_left_half)
         except Exception as e:
             print(f"⚠️ vframe_to_bgr raw-plane path failed ({e}), falling back to toImage()")
-        finally:
-            vframe.unmap()
+            planes = None
+        if planes is not None:
+            y_small, uv_small = planes
+            th, tw = y_small.shape
+            nv12_small = np.empty((th + th // 2, tw), dtype=np.uint8)
+            nv12_small[:th] = y_small
+            nv12_small[th:] = uv_small.reshape(th // 2, tw)
+            return cv2.cvtColor(nv12_small, cv2.COLOR_YUV2BGR_NV12)
 
     # Fallback: Qt's full-resolution conversion, crop, then resize.
     img = vframe.toImage()
@@ -155,18 +137,25 @@ class LiveFaceWorker(QObject):
     """
 
     results_ready = Signal(list, int, int)
+    # The same results plus the time (s) of the frame they came from — what a
+    # per-frame tracker (live_track_feed.py) needs to correct itself.
+    detected_at = Signal(list, int, int, float)
 
     # Max dimension (width) passed to InsightFace. Larger frames are downsampled
     # first — InsightFace resizes to 640×640 internally anyway, so running on a
     # 4K frame just wastes numpy allocation and BGR copy time.
     MAX_INFERENCE_W = 960
 
-    def __init__(self, bank, auto_enroll: bool = True, interval_ms: int = 500,
+    # How often the worker checks for a submitted frame. The controller's
+    # _SUBMIT_INTERVAL sets the detection rate; this only bounds how long a
+    # submitted frame waits — at 500 ms it waited up to half a second, which
+    # was most of how far the boxes trailed the picture.
+    def __init__(self, bank, auto_enroll: bool = True, interval_ms: int = 30,
                  learn_threshold: float = 0.55):
         super().__init__()
         self._bank = bank
         self._auto_enroll = auto_enroll
-        self._interval_ms = interval_ms  # default 500ms — face recog on CPU is slow
+        self._interval_ms = interval_ms
         self._latest_vframe = None       # raw QVideoFrame, converted on worker thread
         self._mutex = QMutex()
         self._timer: Optional[QTimer] = None
@@ -209,6 +198,7 @@ class LiveFaceWorker(QObject):
 
         self._busy = True
         try:
+            pts = vframe.startTime() / 1e6
             # GPU→CPU conversion (+ VR crop + downsample) happens here on the
             # worker thread (not main thread). vframe_to_bgr downscales huge
             # P010/NV12 frames on the raw planes, before the expensive
@@ -238,6 +228,7 @@ class LiveFaceWorker(QObject):
                     "det_score": f["det_score"],
                 })
             self.results_ready.emit(results, w, h)
+            self.detected_at.emit(results, w, h, pts)
         except Exception as e:
             print(f"⚠️ LiveFaceWorker error: {e}")
         finally:
@@ -255,6 +246,7 @@ class LiveFaceController(QObject):
     """
 
     results_ready = Signal(list, int, int)   # forwarded from the worker
+    detected_at = Signal(list, int, int, float)
 
     # Minimum seconds between frame submissions to the worker.
     # Face recognition on CPU is slow — no point sending 60 frames/s.
@@ -270,6 +262,7 @@ class LiveFaceController(QObject):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.start_processing)
         self._worker.results_ready.connect(self._on_results)
+        self._worker.detected_at.connect(self.detected_at)
         self._thread.start()
 
         self._video_sink = video_sink
@@ -319,6 +312,10 @@ class LiveFaceController(QObject):
             pass
         try:
             self._worker.results_ready.disconnect(self._on_results)
+        except Exception:
+            pass
+        try:
+            self._worker.detected_at.disconnect(self.detected_at)
         except Exception:
             pass
 
