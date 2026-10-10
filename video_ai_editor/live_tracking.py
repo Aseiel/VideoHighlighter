@@ -42,7 +42,9 @@ from typing import Optional
 
 import numpy as np
 
-TRACKING, UNCERTAIN, LOST = "tracking", "uncertain", "lost"
+TRACKING = "tracking"
+UNCERTAIN = "uncertain"
+LOST = "lost"
 
 
 # ──────────────────────────────────────────────────────────────────
