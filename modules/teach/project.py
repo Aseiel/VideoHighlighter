@@ -110,6 +110,14 @@ class Sample:
     # What auto-accept said, kept after a person re-checks it: the record the
     # spot checks are scored from (``autolabel``).
     auto_label: str = ""
+    # The look-alike group it was put in before anything was named (``group``);
+    # -1 when it never was.
+    group: int = -1
+    # What it was shown as when a person decided it, and what made that guess
+    # ("group", "sort" or "auto"): how often the machine was right is measured
+    # from these (``health.sorting``).
+    shown_guess: str = ""
+    guess_from: str = ""
 
     @property
     def is_decided(self) -> bool:
@@ -134,6 +142,29 @@ class Sample:
     @property
     def time(self) -> float:
         return self.start
+
+
+# Group states (``group``). A group is OPEN until someone says what it is:
+# NAMED (a class), NOTHING (none of the classes) or MIXED (more than one thing;
+# its samples go to review one by one, or it is SPLIT into smaller groups).
+OPEN = "open"
+NAMED = "named"
+NOTHING = "nothing"
+MIXED = "mixed"
+SPLIT = "split"
+GROUP_STATES = (OPEN, NAMED, NOTHING, MIXED, SPLIT)
+
+
+@dataclass
+class GroupSpec:
+    id: int
+    members: list = field(default_factory=list)    # sample ids, most typical first
+    tightness: float = 0.0          # mean likeness to the group's centre
+    state: str = OPEN
+    name: str = ""                  # the class, once NAMED
+    shown: list = field(default_factory=list)      # members a person was shown
+    wrong: list = field(default_factory=list)      # ... and said did not belong
+    parent: int = -1                # the group it was split from
 
 
 @dataclass
@@ -199,6 +230,7 @@ class Project:
         self.sources: list = []
         self.settings = Settings()
         self.rounds: list = []
+        self.groups: list = []
         self.samples: list = []
 
     # --- paths -------------------------------------------------------------
@@ -242,6 +274,7 @@ class Project:
         project.settings = Settings(**{k: v for k, v in data.get("settings", {}).items()
                                        if k in known})
         project.rounds = list(data.get("rounds", []))
+        project.groups = [GroupSpec(**g) for g in data.get("groups", [])]
         try:
             with open(project.path(SAMPLES_FILE), "r", encoding="utf-8") as handle:
                 project.samples = [Sample(**s) for s in json.load(handle)]
@@ -259,6 +292,7 @@ class Project:
             "sources": [asdict(s) for s in self.sources],
             "settings": asdict(self.settings),
             "rounds": self.rounds,
+            "groups": [asdict(g) for g in self.groups],
         }
         _write_json(self.path(PROJECT_FILE), data)
         _write_json(self.path(SAMPLES_FILE), [asdict(s) for s in self.samples])
@@ -301,11 +335,15 @@ class Project:
         # Everywhere the name is recorded, or it quietly splits in two: the
         # spot-check record, the last model's guesses, and object boxes.
         for sample in self.samples:
-            for attr in ("label", "proposed", "auto_label", "model_proposed"):
+            for attr in ("label", "proposed", "auto_label", "model_proposed",
+                         "shown_guess"):
                 if getattr(sample, attr) == old:
                     setattr(sample, attr, clean)
             if old in sample.scores:
                 sample.scores[clean] = sample.scores.pop(old)
+        for group in self.groups:
+            if group.name == old:
+                group.name = clean
         if os.path.exists(self.path(LABELS_FILE)):
             from modules.vision.label_store import LabelStore
             labels = LabelStore(self.path(LABELS_FILE)).load()
@@ -340,9 +378,20 @@ class Project:
                 return sample
         return None
 
+    def get_group(self, group_id: int) -> Optional[GroupSpec]:
+        for group in self.groups:
+            if group.id == int(group_id):
+                return group
+        return None
+
     def decide(self, sample: Sample, verdict: str, label: str = "",
-               by: str = "") -> None:
-        """Record a verdict. ACCEPTED needs a class; the others clear it."""
+               by: str = "", guess: Optional[str] = None,
+               guess_from: str = "") -> None:
+        """Record a verdict. ACCEPTED needs a class; the others clear it.
+
+        ``guess`` is what the sample was shown as when a person decided it,
+        and ``guess_from`` what made that guess; kept to measure the sorting.
+        """
         if verdict not in VERDICTS:
             raise ValueError(f"verdict must be one of {VERDICTS}")
         if verdict == ACCEPTED:
@@ -354,6 +403,8 @@ class Project:
             sample.label = ""
         sample.verdict = verdict
         sample.decided_by = by
+        if guess is not None and by not in (AUTO, AUTO_BOX):
+            sample.shown_guess, sample.guess_from = guess, guess_from
         if by == AUTO:
             sample.auto_label = label if verdict == ACCEPTED else NONE
 

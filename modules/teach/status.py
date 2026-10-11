@@ -36,9 +36,10 @@ def next_step(project: Project) -> dict:
     pending = [s for s in project.samples if s.verdict == PENDING]
     scored = [s for s in project.samples if s.scores]
 
-    if not names:
+    if not names and not project.sources:
         return _step(project, "judge", "Say what to find: add a class (name + a few "
-                     "words describing it). `check-name` first if unsure what to call it.",
+                     "words describing it), or add a video and name what it holds group "
+                     "by group. `check-name` first if unsure what to call it.",
                      "add-class", "<name>", "--description", "<what it looks like>")
     if not project.sources:
         return _step(project, "judge", "Give it footage: a few videos where the classes "
@@ -49,6 +50,24 @@ def next_step(project: Project) -> dict:
     if (project.task == "actions" and project.settings.focus
             and any(not s.focus_tried for s in project.samples)):
         return _step(project, "auto", "Crop samples to the people in them.", "focus")
+    # Footage first, names after: group the samples by look, then name the
+    # groups (``group``). Every group is said for before anything is sorted,
+    # so nothing is sorted into a class list that is still being made.
+    from modules.teach.project import OPEN, SPLIT
+    open_groups = [g for g in project.groups if g.state == OPEN]
+    if not names and not project.groups:
+        return _step(project, "auto", "Group the samples by look, so they can be named "
+                     "group by group.", "group")
+    if open_groups:
+        first = open_groups[0]
+        return _step(project, "judge", f"Say what each group shows: {len(open_groups)} of "
+                     f"{sum(1 for g in project.groups if g.state != SPLIT)} groups "
+                     "have no name yet.", "name-group", str(first.id), "--name", "<class>")
+    if not names:
+        return _step(project, "judge", "Nothing is named yet: name a group as a class "
+                     "(reopen one), or add a class.", "add-class", "<name>",
+                     "--description", "<what it looks like>")
+
     # An object class someone drew a box around is found region by region
     # (``find``): its samples are decided by answering its boxes, so the
     # whole-frame sort and the sample review are only for classes in words.

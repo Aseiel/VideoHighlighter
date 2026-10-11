@@ -1258,9 +1258,17 @@ class TrainingPanel(QWidget):
         self.actions.model_installed.connect(self.action_model_installed)
 
         tabs = QTabWidget()
-        # First: the automated loop (modules/teach), cutting, sorting and
-        # labelling by itself from example clips and videos. The two tabs after
-        # it train from data that is already labelled.
+        # First: datasets made step by step from your own footage (cut, group,
+        # name, check, health). Then the automated loop (modules/teach),
+        # cutting, sorting and labelling by itself from example clips and
+        # videos. The two tabs after them train from data already labelled.
+        try:
+            from modules.teach.dataset_panel import DatasetsPanel
+            self.datasets = DatasetsPanel()
+            tabs.addTab(self.datasets, "Datasets")
+        except Exception as exc:                # pragma: no cover - never cost the rest
+            self.datasets = None
+            print(f"[training] datasets panel unavailable: {exc}")
         try:
             from modules.teach.teach_panel import TeachPanel
             self.teach = TeachPanel()

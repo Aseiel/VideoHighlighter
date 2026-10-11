@@ -361,7 +361,11 @@ def apply_verdicts(project: Project, number: int, *, accept: str = "",
                           "say which class it is (relabel) instead of accepting")
             continue
         try:
-            project.decide(sample, verdict, label, by=f"{by}:{number}")
+            # What the tile asked to be confirmed, and whether auto-accept or
+            # the sort said it: the record the sorting is measured from.
+            project.decide(sample, verdict, label, by=f"{by}:{number}",
+                           guess=by_n[n]["proposed"],
+                           guess_from="auto" if sample.is_auto else "sort")
         except ValueError as exc:
             errors.append(f"tile {n}: {exc}")
     if errors:
@@ -428,7 +432,10 @@ def from_folders(project: Project, confirm: Sequence[str] = ()) -> dict:
             if verdict == PENDING:
                 sample.verdict, sample.label, sample.decided_by = PENDING, "", ""
             else:
-                project.decide(sample, verdict, label, by="folders")
+                guess = placed.get(name, "")
+                project.decide(sample, verdict, label, by="folders",
+                               guess=guess if guess in names or guess == NONE else UNSURE,
+                               guess_from="auto" if sample.is_auto else "sort")
             key = label or verdict
             tally[key] = tally.get(key, 0) + 1
     project.save()

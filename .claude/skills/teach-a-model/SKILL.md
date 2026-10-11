@@ -42,6 +42,10 @@ guesses; they click the wrong ones and press Enter.
   like two things and propose two classes.
 - Put the user's example clips in with `add-example`: they make sorting far
   better than words alone.
+- No examples and no names yet: add the videos and run `auto`; it cuts and
+  groups them. Look at each group with `group-sheet N` and answer with
+  `name-group N --name <class> --wrong <tiles>`, `--nothing` or `--mixed`.
+  `health` says when the dataset is fit to train.
 
 ## Reviewing (judge steps)
 

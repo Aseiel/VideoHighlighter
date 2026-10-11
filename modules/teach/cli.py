@@ -551,6 +551,59 @@ def cmd_by_class(args, project):
     return {"videos": dataset_sort.lay_out(project, args.sources or None)}
 
 
+def cmd_group(args, project):
+    from modules.teach import group
+    return group.group_samples(project, make_embedder(), k=args.k, split=args.split,
+                               progress=lambda i, n: print(f"embedded {i}/{n}",
+                                                          file=sys.stderr)
+                               if i == n or i % 50 == 0 else None)
+
+
+def cmd_group_sheet(args, project):
+    from modules.teach import group
+    return group.render_group_sheet(project, args.id, shown=args.shown)
+
+
+def cmd_name_group(args, project):
+    from modules.teach import group
+    return group.name_group(project, args.id, name=args.name or "", nothing=args.nothing,
+                            mixed=args.mixed, reopen=args.reopen, wrong=args.wrong or "",
+                            shown=args.shown, description=args.description or "")
+
+
+def cmd_health(args, project):
+    from modules.teach import health
+    return health.report(project)
+
+
+def cmd_projects(args, root):
+    """Every project under the user data folder (or ``--project``, a folder of
+    projects), with how far along and how healthy each one is."""
+    from modules.teach import health
+    from modules.teach.status import next_step
+
+    parent = os.path.abspath(args.project) if args.project else project_mod.projects_root()
+    out = []
+    for entry in sorted(os.listdir(parent)) if os.path.isdir(parent) else []:
+        folder = os.path.join(parent, entry)
+        if not os.path.exists(os.path.join(folder, project_mod.PROJECT_FILE)):
+            continue
+        try:
+            project = Project.load(folder)
+            found = health.checks(project)
+            decided = sum(1 for s in project.samples if s.verdict != project_mod.PENDING)
+            out.append({"name": project.name, "project": project.root,
+                        "task": project.task, "created": project.created,
+                        "videos": len(project.sources), "samples": len(project.samples),
+                        "decided": decided, "classes": project.class_names(),
+                        "rounds": len(project.rounds),
+                        "health": health.verdict(found),
+                        "next": next_step(project)})
+        except Exception as exc:            # one broken project must not hide the rest
+            out.append({"name": entry, "project": folder, "error": str(exc)})
+    return {"folder": parent, "projects": out}
+
+
 def cmd_status(args, project):
     from modules.teach.status import report
     return report(project)
@@ -586,8 +639,9 @@ def cmd_set(args, project):
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m modules.teach",
                                 description=__doc__.split("\n\n")[0])
-    p.add_argument("--project", required=True,
-                   help="project folder, or a name under the app's user data")
+    p.add_argument("--project",
+                   help="project folder, or a name under the app's user data "
+                        "(every command but `projects` needs one)")
     sub = p.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("init", help="start a project")
@@ -673,6 +727,32 @@ def parser() -> argparse.ArgumentParser:
                    help="import: the labeller's points are already checked")
     s.add_argument("--window", action="store_true",
                    help="review: by clicking, in a window, instead of a sheet image")
+
+    s = sub.add_parser("group", help="group undecided samples by look, to name "
+                                     "group by group")
+    s.add_argument("--k", type=int, help="how many groups (default: from the number "
+                                         "of samples)")
+    s.add_argument("--split", type=int, help="split this (mixed) group instead")
+
+    s = sub.add_parser("group-sheet", help="draw a group's tiles as one image")
+    s.add_argument("id", type=int)
+    s.add_argument("--shown", type=int, default=12)
+
+    s = sub.add_parser("name-group", help="say what a group is")
+    s.add_argument("id", type=int)
+    what = s.add_mutually_exclusive_group(required=True)
+    what.add_argument("--name", help="the class its tiles show")
+    what.add_argument("--nothing", action="store_true",
+                      help="its tiles show none of the classes")
+    what.add_argument("--mixed", action="store_true",
+                      help="more than one thing: check it sample by sample")
+    what.add_argument("--reopen", action="store_true", help="undo what was said")
+    s.add_argument("--wrong", help="tile numbers that do not belong, e.g. 3,7-8")
+    s.add_argument("--shown", type=int, default=12, help="tiles the group showed")
+    s.add_argument("--description")
+
+    sub.add_parser("health", help="is the dataset healthy, and how good was the sorting")
+    sub.add_parser("projects", help="every project, how far along and how healthy")
 
     sub.add_parser("build", help="write the dataset")
 
@@ -778,6 +858,8 @@ COMMANDS = {
     "review": cmd_review, "verdict": cmd_verdict, "boxes": cmd_boxes,
     "find": cmd_find, "build": cmd_build, "train": cmd_train, "status": cmd_status, "set": cmd_set,
     "auto": cmd_auto, "share": cmd_share, "by-class": cmd_by_class,
+    "group": cmd_group, "group-sheet": cmd_group_sheet, "name-group": cmd_name_group,
+    "health": cmd_health,
 }
 
 
@@ -799,6 +881,14 @@ def run(argv=None) -> tuple:
         return 2, {"error": (lines[-1].split(" error: ", 1)[-1] if lines
                             else "bad arguments"),
                    "usage": "\n".join(lines[:-1])}
+    if args.command == "projects":
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                return 0, cmd_projects(args, None)
+        except OSError as exc:
+            return 2, {"error": f"{type(exc).__name__}: {exc}"}
+    if not args.project:
+        return 2, {"error": "--project is required"}
     root = resolve_root(args.project)
     try:
         with contextlib.redirect_stdout(sys.stderr):

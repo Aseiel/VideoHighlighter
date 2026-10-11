@@ -32,6 +32,45 @@ an examples folder and the videos, press **Start**, then **Check guesses…**
 when it asks, and **Train** when it says it's ready. Every button runs the
 command of the same name below, so the two always agree.
 
+**Training → Datasets** is the other way in: no examples needed. **New
+dataset…**, add a video, and it is cut into 5 s samples and grouped by look.
+Say what each group shows (click any tile that does not belong first), mark
+groups as *nothing interesting* or *mixed*, check the guesses for the rest,
+and the **Health** page says whether it is ready to train and how often the
+automatic sorting was right. The list shows every dataset you have, so you
+can pick one up where you left it.
+
+## Footage first, names after (command line)
+
+The same as the Datasets tab:
+
+```bash
+T="python -m modules.teach --project my-first"
+$T init --task actions
+$T add-video ~/Videos/clip1.mp4
+$T auto                           # cut, then group: stops at "name the groups"
+$T group-sheet 1                  # review/group-001.jpg: the group's first 12 tiles
+$T name-group 1 --name "<name>" --wrong 3,7    # tiles 3 and 7 do not belong
+$T name-group 2 --nothing         # none of these (trained as `background`)
+$T name-group 3 --mixed           # more than one thing; or: group --split 3
+$T sort && $T review --window     # the rest of every group, as usual
+$T health                         # ready to train? how good was the sorting?
+```
+
+Naming a group decides only the tiles that were shown and not marked wrong;
+the rest of the group is sorted and reviewed like any sample. Groups of
+look-alike samples are often one scene or one video rather than one thing
+(`docs/training/negative/clusters-are-videos.md`), so a group's unseen
+members are never labelled on its say-so.
+
+`health` checks every group was named, that what auto-accept decided was
+spot-checked, that each class has enough samples (5 or training leaves it
+out; 20 to be solid) from 3+ videos, that no single video is most of a
+class, and that there is a "none of these" class. Its `sorting` part counts,
+for every sample a person decided, whether the guess they were shown (from a
+group, the sort or auto-accept) was right, and what the wrong ones really
+were. `projects` lists every project with its health.
+
 ## The quickest way (command line)
 
 First, on a new machine:
