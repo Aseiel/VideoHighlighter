@@ -9,6 +9,14 @@ project's samples.
 
 Only for ``actions``. The cropper's output names start with the input's stem,
 so each focused file is traced back to its sample by name.
+
+**A crop is a sample.** A five-second shot often holds two people doing two
+different things, and a sample has one label. So an undecided sample the
+cropper found people in is *replaced* by one sample per crop: grouped, sorted,
+reviewed and trained on by itself. The whole sample is kept in
+``replaced.json`` (never sorted or trained on). A sample someone already
+decided keeps its crops attached instead (``focus_paths``), trained under its
+label as before, so no decision changes meaning under it.
 """
 from __future__ import annotations
 
@@ -17,7 +25,14 @@ import os
 import shutil
 from typing import Callable, Optional
 
-from modules.teach.project import ACTIONS, Project
+from modules.teach.project import ACTIONS, OPEN, PENDING, Project, Sample
+
+
+def _crop_id(sample_id: str, path: str) -> str:
+    """The crop's file name; a shot the cropper kept whole is written under the
+    sample's own name, and a crop never shares an id with what it replaced."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return stem if stem != sample_id else f"{sample_id}_whole"
 
 
 def focus_project(project: Project, *, cropper: Optional[Callable] = None) -> dict:
@@ -53,14 +68,37 @@ def focus_project(project: Project, *, cropper: Optional[Callable] = None) -> di
 
         cropper(inbox, out_dir)
 
-    made = 0
+    made, crops, replaced = 0, {}, set()
     for sample in todo:
         found = sorted(p for p in glob.glob(os.path.join(out_dir, sample.id + "*"))
                        if os.path.isfile(p))
-        sample.focus_paths = found
         sample.focus_tried = True
         made += bool(found)
+        if found and sample.verdict == PENDING:
+            crops[sample.id] = [
+                Sample(id=_crop_id(sample.id, path), source=sample.source,
+                       path=path, start=sample.start, duration=sample.duration,
+                       focus_tried=True, crop_of=sample.id)
+                for path in found]
+            replaced.add(sample.id)
+        else:
+            sample.focus_paths = found
+
+    if replaced:
+        kept = []
+        for sample in project.samples:
+            if sample.id in replaced:
+                project.replaced.append(sample)
+                kept.extend(crops[sample.id])      # in the sample's place: time order
+            else:
+                kept.append(sample)
+        project.samples = kept
+        # Groups nobody has said anything about were groups of whole samples;
+        # the crops are grouped afresh. Decided groups keep what was decided.
+        project.groups = [g for g in project.groups
+                          if g.state != OPEN or not replaced.intersection(g.members)]
     shutil.rmtree(inbox, ignore_errors=True)
     project.save()
     return {"cropped": made, "nothing_found": len(todo) - made,
+            "split": len(replaced), "crops": sum(len(c) for c in crops.values()),
             "samples_total": len(project.samples)}

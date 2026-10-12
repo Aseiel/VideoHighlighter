@@ -237,3 +237,118 @@ def test_cli_group_name_health_and_projects(tmp_path, monkeypatch):
     code, out = cli.run(["--project", str(tmp_path / "projects"), "projects"])
     assert code == 0 and [x["name"] for x in out["projects"]] == ["mine"]
     assert out["projects"][0]["health"] == health.NOT_READY
+
+
+# --- crops as samples -----------------------------------------------------------
+
+def _two_people_cropper(p):
+    """Writes a left and a right crop for every sample in the inbox."""
+    def cropper(inbox, out):
+        for name in os.listdir(inbox):
+            stem = name[:-4]
+            for side in ("left", "right"):
+                open(os.path.join(out, f"{stem}_cropped_{side}.mp4"), "wb").close()
+    return cropper
+
+
+def test_each_crop_becomes_its_own_sample_and_open_groups_are_regrouped(bare):
+    from modules.teach import focus
+    p, truth = bare
+    _group(p, truth, k=3)
+    named = p.groups[0]
+    decided = p.get_sample(named.members[0])
+    group.name_group(p, named.id, name="alpha move", shown=1)
+    p.settings.focus = True
+    out = focus.focus_project(p, cropper=_two_people_cropper(p))
+    assert out["split"] == 31 and out["crops"] == 62
+    # The decided sample keeps its crops attached; the rest are replaced.
+    assert decided in p.samples and len(decided.focus_paths) == 2
+    crops = [s for s in p.samples if s.crop_of]
+    assert len(crops) == 62 and all(s.focus_tried and s.verdict == PENDING for s in crops)
+    assert crops[0].id.endswith("_cropped_left") and crops[0].path.endswith(".mp4")
+    # Open groups went with their whole samples; the named one stayed.
+    assert [g.id for g in p.groups] == [named.id]
+    again = Project.load(p.root)
+    assert len(again.replaced) == 31 and len(again.samples) == 63
+    assert status.next_step(again)["args"][0] == "sort"      # a class exists now
+
+
+def test_with_nothing_named_crops_are_grouped_next(bare):
+    from modules.teach import focus
+    p, truth = bare
+    _group(p, truth, k=3)
+    p.settings.focus = True
+    assert status.next_step(p)["args"] == ["focus"]
+    focus.focus_project(p, cropper=_two_people_cropper(p))
+    assert p.groups == [] and status.next_step(p)["args"] == ["group"]
+    crop_truth = {os.path.basename(s.path): truth[s.crop_of + ".mp4"] for s in p.samples}
+    group.group_samples(p, FakeEmbedder(), k=3, frame_reader=_reader(crop_truth))
+    assert sum(len(g.members) for g in p.groups) == 64
+
+
+def test_a_shot_kept_whole_gets_its_own_id(bare):
+    from modules.teach import focus
+    p, truth = bare
+    p.settings.focus = True
+
+    def cropper(inbox, out):
+        for name in os.listdir(inbox):
+            open(os.path.join(out, name), "wb").close()      # one person: copied
+    focus.focus_project(p, cropper=cropper)
+    assert all(s.id == s.crop_of + "_whole" for s in p.samples)
+    assert {s.id for s in p.replaced}.isdisjoint(s.id for s in p.samples)
+
+
+# --- moving by hand -------------------------------------------------------------
+
+def test_move_to_a_new_class_decides_and_records_the_guess(bare):
+    p, truth = bare
+    ids = [s.id for s in p.samples[:3]]
+    p.samples[0].proposed = NONE
+    out = group.move_samples(p, ids, to_class="beta move")
+    assert out["class_added"] == "beta move" and out["moved"] == 3
+    s = p.get_sample(ids[0])
+    assert s.verdict == ACCEPTED and s.label == "beta move" and s.is_human
+    assert s.shown_guess == NONE and s.guess_from == "sort"
+    assert health.sorting(p)["by_source"]["sort"]["wrong"] == 1
+
+
+def test_moving_a_group_decided_sample_counts_against_the_group(bare):
+    p, truth = bare
+    _group(p, truth, k=3)
+    g = p.groups[0]
+    group.name_group(p, g.id, name="alpha move", shown=4)
+    group.move_samples(p, [g.shown[0]], reject=True)
+    assert g.wrong == [g.shown[0]]
+    assert health.sorting(p)["groups"]["wrong"] == 1
+    group.move_samples(p, [g.shown[0]], undecided=True)
+    assert p.get_sample(g.shown[0]).verdict == PENDING
+
+
+def test_move_between_groups_and_into_a_new_one(bare):
+    p, truth = bare
+    _group(p, truth, k=3)
+    a, b = p.groups[0], p.groups[1]
+    moving = a.members[:2]
+    group.move_samples(p, moving, to_group=b.id)
+    assert not set(moving) & set(a.members) and set(moving) <= set(b.members)
+    out = group.move_samples(p, moving, new_group=True)
+    fresh = p.get_group(out["group_added"])
+    assert fresh.members == moving and fresh.state == OPEN
+    assert all(p.get_sample(i).group == fresh.id for i in moving)
+
+
+def test_cli_move_by_group_tiles(tmp_path, monkeypatch):
+    root = str(tmp_path / "mine")
+    p = Project.create(root, ACTIONS)
+    truth = _add_samples(p, [0] * 6 + [1] * 6)
+    monkeypatch.setattr(cli, "make_embedder", lambda name="clip": FakeEmbedder())
+    from modules.teach import embed
+    monkeypatch.setattr(embed, "read_frames", _reader(truth))
+    code, out = cli.run(["--project", root, "group", "--k", "2"])
+    first = out["groups"][0]["id"]
+    code, out = cli.run(["--project", root, "move", "--group", str(first), "--tiles",
+                         "1-2", "--nothing"])
+    assert code == 0 and out["moved"] == 2 and out["verdict"] == NEGATIVE
+    code, out = cli.run(["--project", root, "move", "--samples", "nope", "--reject"])
+    assert code == 2

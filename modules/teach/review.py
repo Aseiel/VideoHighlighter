@@ -155,6 +155,8 @@ def caption(sample) -> str:
         text = f"{name}? ({score:.2f})" if name else "unsure"
     elif sample.proposed == NONE:
         text = "none of these"
+    elif sample.proposed_by == "rule":
+        text = f"{sample.proposed} (rule)"
     else:
         text = f"{sample.proposed} ({sample.scores.get(sample.proposed, 0):.2f})"
     if sample.model_proposed and sample.model_proposed != sample.proposed:
@@ -365,7 +367,8 @@ def apply_verdicts(project: Project, number: int, *, accept: str = "",
             # the sort said it: the record the sorting is measured from.
             project.decide(sample, verdict, label, by=f"{by}:{number}",
                            guess=by_n[n]["proposed"],
-                           guess_from="auto" if sample.is_auto else "sort")
+                           guess_from="auto" if sample.is_auto
+                           else sample.proposed_by or "sort")
         except ValueError as exc:
             errors.append(f"tile {n}: {exc}")
     if errors:
@@ -435,7 +438,8 @@ def from_folders(project: Project, confirm: Sequence[str] = ()) -> dict:
                 guess = placed.get(name, "")
                 project.decide(sample, verdict, label, by="folders",
                                guess=guess if guess in names or guess == NONE else UNSURE,
-                               guess_from="auto" if sample.is_auto else "sort")
+                               guess_from="auto" if sample.is_auto
+                               else sample.proposed_by or "sort")
             key = label or verdict
             tally[key] = tally.get(key, 0) + 1
     project.save()

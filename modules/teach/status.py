@@ -77,6 +77,11 @@ def next_step(project: Project) -> dict:
         drawn = seeded(store(project))
     by_words = [n for n in names if n not in drawn]
 
+    from modules.teach import evidence
+    if evidence.todo(project):
+        return _step(project, "auto", "Find objects in every sample with the dataset's "
+                     "detector, for the rules.", "detect")
+
     unsorted = [s for s in project.samples if not s.scores and not s.unreadable]
     if by_words and (not scored or unsorted):
         return _step(project, "auto", "Score every sample against every class.", "sort")

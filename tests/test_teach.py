@@ -658,7 +658,7 @@ def test_a_sample_the_cropper_or_the_proposer_found_nothing_in_is_not_asked_abou
     assert "v002__example.mp4" in seen                  # examples are cropped too
     assert not status.next_step(p)["command"].endswith(" focus")
     assert focus.focus_project(p, cropper=lambda *a: seen.append("again")) == {
-        "cropped": 0, "nothing_found": 0, "samples_total": 3}
+        "cropped": 0, "nothing_found": 0, "split": 0, "crops": 0, "samples_total": 3}
 
     o = _object_project(tmp_path)
 

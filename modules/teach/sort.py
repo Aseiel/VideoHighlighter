@@ -189,6 +189,7 @@ def sort_project(project: Project, embedder, *,
         if sample.id not in results:
             continue
         sample.scores, sample.proposed, sample.margin = results[sample.id]
+        sample.proposed_by = "sort"
         if model_classifier is not None and sample.verdict == PENDING:
             try:
                 label, confidence = model_classifier(sample.focus_paths[0]
@@ -201,6 +202,13 @@ def sort_project(project: Project, embedder, *,
         if sample.verdict == PENDING:
             tally[sample.proposed] = tally.get(sample.proposed, 0) + 1
     project.save()
+
+    # Rules over the objects found come after the encoder, so where one fires
+    # its guess is the one review checks (and it never rides on the encoder's
+    # confidence into auto-accept).
+    from modules.teach import evidence
+    rules = evidence.apply_rules(project) if os.path.exists(
+        evidence.rules_path(project)) else None
 
     from modules.teach import autolabel
     # A layer's scores are probabilities, not prototype likeness: auto-accept
@@ -215,6 +223,7 @@ def sort_project(project: Project, embedder, *,
         "prototypes": {p.name: {"from": p.kind, "examples": p.n_examples}
                        for p in prototypes},
         **({"linear": linear_info} if linear_info else {}),
+        **({"rules": rules} if rules else {}),
     }
 
 

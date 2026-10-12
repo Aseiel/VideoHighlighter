@@ -571,6 +571,52 @@ def cmd_name_group(args, project):
                             shown=args.shown, description=args.description or "")
 
 
+def cmd_move(args, project):
+    from modules.teach import group
+    ids = [i for i in (args.samples or "").split(",") if i.strip()]
+    if args.group is not None and args.tiles:
+        from modules.teach.review import parse_numbers
+        shown = group.tiles(project, args.group, args.shown)
+        ids += [shown[n - 1].id for n in parse_numbers(args.tiles) if 0 < n <= len(shown)]
+    return group.move_samples(project, ids, to_class=args.to_class or "",
+                              nothing=args.nothing, reject=args.reject,
+                              undecided=args.undecided, to_group=args.to_group,
+                              new_group=args.new_group,
+                              description=args.description or "")
+
+
+def cmd_detect(args, project):
+    from modules.teach import evidence
+    return evidence.detect_samples(project, progress=lambda i, n: print(
+        f"detected {i}/{n}", file=sys.stderr) if i == n or i % 25 == 0 else None)
+
+
+def cmd_rules(args, project):
+    """The rules file (made from a template with --init), and how each rule did."""
+    from modules.teach import evidence
+    path = evidence.init_rules(project) if args.init else evidence.rules_path(project)
+    if not os.path.exists(path):
+        return {"rules": path, "exists": False,
+                "message": "no rules yet: `rules --init` writes a template to fill in"}
+    added = []
+    if args.add_classes:
+        for name in evidence.rule_classes(project):
+            if project.get_class(name) is None:
+                project.add_class(name)
+                added.append(name)
+        project.save()
+    guesses = evidence.rule_guesses(project)
+    fired = {}
+    for cls, _share in guesses.values():
+        fired[cls] = fired.get(cls, 0) + 1
+    record = evidence.rule_record(project)
+    return {"rules": path, "exists": True, "fired": fired,
+            **({"classes_added": added} if added else {}),
+            "events": {e: v[0] for e, v in evidence.rule_events(project).items()},
+            "checked": record,
+            "trusted": [c for c in record if evidence.trusted(project, c, record)]}
+
+
 def cmd_health(args, project):
     from modules.teach import health
     return health.report(project)
@@ -602,6 +648,20 @@ def cmd_projects(args, root):
         except Exception as exc:            # one broken project must not hide the rest
             out.append({"name": entry, "project": folder, "error": str(exc)})
     return {"folder": parent, "projects": out}
+
+
+def cmd_delete(args, project):
+    """The whole project folder, to the Recycle Bin. Footage added from disk
+    stays where it is; footage downloaded from a link lives in the project and
+    goes with it. A model installed from it stays installed."""
+    from PySide6.QtCore import QFile
+
+    root = project.root
+    if not QFile.moveToTrash(root):
+        raise RuntimeError(f"could not move {root} to the Recycle Bin (is a file in it "
+                           "still open?); close it and try again, or delete the folder "
+                           "by hand")
+    return {"deleted": root, "name": project.name}
 
 
 def cmd_status(args, project):
@@ -751,8 +811,31 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--shown", type=int, default=12, help="tiles the group showed")
     s.add_argument("--description")
 
+    s = sub.add_parser("move", help="put samples in a class, nothing, unusable, back to "
+                                    "undecided, or another group")
+    s.add_argument("--samples", help="sample ids, comma-separated")
+    s.add_argument("--group", type=int, help="with --tiles: tile numbers of this group")
+    s.add_argument("--tiles", help="tile numbers of --group, e.g. 3,7-8")
+    s.add_argument("--shown", type=int, default=12, help="tiles the group showed")
+    where = s.add_mutually_exclusive_group(required=True)
+    where.add_argument("--to-class", dest="to_class")
+    where.add_argument("--nothing", action="store_true", help="none of the classes")
+    where.add_argument("--reject", action="store_true", help="unusable")
+    where.add_argument("--undecided", action="store_true", help="undo a decision")
+    where.add_argument("--to-group", type=int, dest="to_group")
+    where.add_argument("--new-group", action="store_true", dest="new_group")
+    s.add_argument("--description")
+
+    sub.add_parser("detect", help="find objects in every sample with the dataset's "
+                                  "detector (detector_model, detector_classes)")
+    s = sub.add_parser("rules", help="rules naming a class from the objects found")
+    s.add_argument("--init", action="store_true", help="write a template rules.yaml")
+    s.add_argument("--add-classes", action="store_true", dest="add_classes",
+                   help="add the classes the rules name in `class:` keys")
+
     sub.add_parser("health", help="is the dataset healthy, and how good was the sorting")
     sub.add_parser("projects", help="every project, how far along and how healthy")
+    sub.add_parser("delete", help="move the whole project folder to the Recycle Bin")
 
     sub.add_parser("build", help="write the dataset")
 
@@ -859,7 +942,7 @@ COMMANDS = {
     "find": cmd_find, "build": cmd_build, "train": cmd_train, "status": cmd_status, "set": cmd_set,
     "auto": cmd_auto, "share": cmd_share, "by-class": cmd_by_class,
     "group": cmd_group, "group-sheet": cmd_group_sheet, "name-group": cmd_name_group,
-    "health": cmd_health,
+    "health": cmd_health, "move": cmd_move, "detect": cmd_detect, "rules": cmd_rules, "delete": cmd_delete,
 }
 
 
@@ -914,7 +997,7 @@ def run(argv=None) -> tuple:
                     raise FileNotFoundError(f"no project at {root}; run init first")
                 project = Project.load(root)
                 result = COMMANDS[args.command](args, project)
-                if args.command not in ("status", "auto"):
+                if args.command not in ("status", "auto", "delete"):
                     from modules.teach.status import next_step
                     result = dict(result or {})
                     result.setdefault("next", next_step(Project.load(root)))

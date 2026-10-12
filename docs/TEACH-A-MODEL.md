@@ -53,6 +53,8 @@ $T group-sheet 1                  # review/group-001.jpg: the group's first 12 t
 $T name-group 1 --name "<name>" --wrong 3,7    # tiles 3 and 7 do not belong
 $T name-group 2 --nothing         # none of these (trained as `background`)
 $T name-group 3 --mixed           # more than one thing; or: group --split 3
+$T move --group 3 --tiles 2,5 --to-class "<name>"   # or --samples <ids>; also
+                                  # --nothing, --reject, --undecided, --to-group N
 $T sort && $T review --window     # the rest of every group, as usual
 $T health                         # ready to train? how good was the sorting?
 ```
@@ -69,7 +71,30 @@ out; 20 to be solid) from 3+ videos, that no single video is most of a
 class, and that there is a "none of these" class. Its `sorting` part counts,
 for every sample a person decided, whether the guess they were shown (from a
 group, the sort or auto-accept) was right, and what the wrong ones really
-were. `projects` lists every project with its health.
+were. `projects` lists every project with its health, and `delete` moves one
+to the Recycle Bin (the Datasets list's **Delete…**, which asks first).
+
+## Rules from objects found
+
+Some classes look nearly alike to an image encoder and differ only in how many
+of something there are, or what touches what. A detector counts. Point the
+dataset at your own detector and its class names, find objects in every
+sample, and write rules in the composition engine's format:
+
+```bash
+$T set detector_model=<model.onnx> detector_classes=<labels.json or a,b,c>
+$T detect                         # ~12 frames per sample, cached in detections.json
+$T rules --init                   # rules.yaml: an event named after a class is its rule
+$T sort                           # a rule that fires overrides the encoder's guess
+$T rules                          # how often each rule fired, and was right when checked
+```
+
+A rule's guess is reviewed like any other and shows in Health as its own
+source. Once a rule has been checked `rule_auto_min_checked` times (10) and
+was right `rule_auto_precision` of them (95%), it decides alone, under the same
+spot checks as auto-accept. The detector is used where it is, never bundled,
+and nothing is trained on it: its detections only propose labels you confirm.
+In the app: **Check guesses → Rules from objects found**.
 
 ## The quickest way (command line)
 

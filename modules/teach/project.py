@@ -36,6 +36,8 @@ FORMAT = 1
 PROJECT_FILE = "project.json"
 SAMPLES_FILE = "samples.json"
 LABELS_FILE = "labels.json"
+# Whole samples the cropper replaced with one sample per person (``focus``).
+REPLACED_FILE = "replaced.json"
 
 ACTIONS = "actions"
 OBJECTS = "objects"
@@ -118,6 +120,12 @@ class Sample:
     # from these (``health.sorting``).
     shown_guess: str = ""
     guess_from: str = ""
+    # For a person-focused crop: the whole sample it was cut from (``focus``).
+    crop_of: str = ""
+    # What made ``proposed``: "sort" (the encoder) or "rule" (objects found,
+    # ``evidence``); and the class a rule says, whether or not it was used.
+    proposed_by: str = ""
+    rule_guess: str = ""
 
     @property
     def is_decided(self) -> bool:
@@ -208,6 +216,16 @@ class Settings:
     # classifier without one has no way to say "none", so it names one of the
     # classes for everything; with one, it can decline. Empty = not trained on.
     background_class: str = ""
+    # Objects found in each sample, and rules naming a class from them
+    # (``evidence``): the user's own detector, its class names (a labels file
+    # or comma-separated), frames read per sample, the share of a sample's
+    # seconds a rule must hold for, and when a rule may decide alone.
+    detector_model: str = ""
+    detector_classes: str = ""
+    detector_frames: int = 12
+    rule_min_share: float = 0.4
+    rule_auto_min_checked: int = 10
+    rule_auto_precision: float = 0.95
     # Improve this project unattended while the app is idle (``background``).
     # Set by teaching from the player; the From videos tab has a switch.
     background: bool = False
@@ -232,6 +250,8 @@ class Project:
         self.rounds: list = []
         self.groups: list = []
         self.samples: list = []
+        # Whole samples replaced by their crops: kept, never sorted or trained on.
+        self.replaced: list = []
 
     # --- paths -------------------------------------------------------------
 
@@ -280,6 +300,11 @@ class Project:
                 project.samples = [Sample(**s) for s in json.load(handle)]
         except FileNotFoundError:
             project.samples = []
+        try:
+            with open(project.path(REPLACED_FILE), "r", encoding="utf-8") as handle:
+                project.replaced = [Sample(**s) for s in json.load(handle)]
+        except FileNotFoundError:
+            project.replaced = []
         return project
 
     def save(self) -> None:
@@ -296,6 +321,8 @@ class Project:
         }
         _write_json(self.path(PROJECT_FILE), data)
         _write_json(self.path(SAMPLES_FILE), [asdict(s) for s in self.samples])
+        if self.replaced:
+            _write_json(self.path(REPLACED_FILE), [asdict(s) for s in self.replaced])
 
     # --- classes -----------------------------------------------------------
 

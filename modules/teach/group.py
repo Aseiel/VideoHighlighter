@@ -34,8 +34,8 @@ import numpy as np
 from modules.teach import embed as embed_mod
 from modules.teach import scoring
 from modules.teach.project import (
-    ACCEPTED, ACTIONS, MIXED, NAMED, NEGATIVE, NONE, NOTHING, OBJECTS, OPEN, PENDING,
-    SPLIT, GroupSpec, Project,
+    ACCEPTED, ACTIONS, AUTO, MIXED, NAMED, NEGATIVE, NONE, NOTHING, OBJECTS, OPEN,
+    PENDING, REJECTED, SPLIT, UNSURE, GroupSpec, Project,
 )
 
 # Tiles a person is shown per group: enough to see what holds it together,
@@ -48,6 +48,8 @@ MIN_GROUP = 3
 # without one, an action model has no way to say "none".
 BACKGROUND = "background"
 DECIDED_BY = "group"
+# decided_by for samples someone moved by hand (``move_samples``).
+MOVED_BY = "move"
 
 
 def default_k(n: int) -> int:
@@ -290,6 +292,100 @@ def name_group(project: Project, group_id: int, *, name: str = "",
                    "left_for_review": len(wrong_n)
                    + sum(1 for s in project.samples if s.group == group.id
                          and s.verdict == PENDING and s.id not in group.shown)})
+    return result
+
+
+def _guess_before(project: Project, sample) -> tuple:
+    """``(guess, from)`` a sample showed before someone moved it: what
+    auto-accept said, or the sort's proposal. Kept to measure the sorting."""
+    if sample.decided_by == AUTO:
+        return (sample.label if sample.verdict == ACCEPTED else NONE), "auto"
+    if sample.proposed in project.class_names() or sample.proposed == NONE:
+        return sample.proposed, sample.proposed_by or "sort"
+    return UNSURE, "sort"
+
+
+def move_samples(project: Project, sample_ids, *, to_class: str = "",
+                 nothing: bool = False, reject: bool = False, undecided: bool = False,
+                 to_group: Optional[int] = None, new_group: bool = False,
+                 description: str = "") -> dict:
+    """Put samples somewhere by hand: a class, "none of these", unusable, back
+    to undecided, or another group. Exactly one destination.
+
+    A class, nothing and unusable are a person's decision, like a verdict in
+    review. A group only changes where the samples are shown. Moving a sample
+    a group decided out of that group's class counts against the group.
+    """
+    chosen = [bool(to_class.strip()), nothing, reject, undecided, to_group is not None,
+              new_group]
+    if sum(chosen) != 1:
+        raise ValueError("say one of: --to-class <class>, --nothing, --reject, "
+                         "--undecided, --to-group N, --new-group")
+    ids = list(dict.fromkeys(i.strip() for i in sample_ids if i and i.strip()))
+    samples = [project.get_sample(i) for i in ids]
+    missing = [i for i, s in zip(ids, samples) if s is None]
+    if missing:
+        raise KeyError(f"no sample {missing[0]}")
+    if not samples:
+        raise ValueError("no samples to move")
+    result = {"moved": len(samples)}
+
+    if to_group is not None or new_group:
+        if new_group:
+            target = GroupSpec(id=max((g.id for g in project.groups), default=0) + 1)
+            project.groups.append(target)
+            result["group_added"] = target.id
+        else:
+            target = project.get_group(to_group)
+            if target is None:
+                raise KeyError(f"no group {to_group}")
+            if target.state == SPLIT:
+                raise ValueError(f"group {to_group} was split; move to one of its parts")
+        moving = {s.id for s in samples}
+        for g in project.groups:
+            if g is not target:
+                g.members = [m for m in g.members if m not in moving]
+        target.members += [s.id for s in samples if s.id not in target.members]
+        for sample in samples:
+            sample.group = target.id
+        result["group"] = target.id
+        project.save()
+        return result
+
+    label = ""
+    if undecided:
+        verdict = PENDING
+    elif reject:
+        verdict = REJECTED
+    elif nothing:
+        verdict = NEGATIVE
+        if project.task == ACTIONS and not project.settings.background_class:
+            project.settings.background_class = BACKGROUND
+            result["background_class"] = BACKGROUND
+    else:
+        from modules.teach.naming import normalize_name
+        label = normalize_name(to_class)
+        if project.get_class(label) is None:
+            project.add_class(label, description)
+            result["class_added"] = label
+        verdict = ACCEPTED
+
+    for sample in samples:
+        if sample.decided_by.startswith(DECIDED_BY + ":"):
+            # A group said this; someone now says otherwise.
+            g = project.get_group(int(sample.decided_by.split(":", 1)[1]))
+            if (g is not None and sample.id in g.shown and sample.id not in g.wrong
+                    and (verdict != sample.verdict or label != sample.label)):
+                g.wrong.append(sample.id)
+        if verdict == PENDING:
+            sample.verdict, sample.label, sample.decided_by = PENDING, "", ""
+            sample.shown_guess, sample.guess_from = "", ""
+            continue
+        guess, guess_from = _guess_before(project, sample)
+        project.decide(sample, verdict, label, by=MOVED_BY, guess=guess,
+                       guess_from=guess_from)
+    project.save()
+    result.update({"verdict": verdict, **({"label": label} if label else {})})
     return result
 
 

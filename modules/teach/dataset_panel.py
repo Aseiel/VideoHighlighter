@@ -14,38 +14,57 @@ cannot disagree. Pages only *read* the project to show it.
 """
 from __future__ import annotations
 
+import html
+import io
 import os
+import re
+import sys
+import threading
 from typing import Callable, Optional
 
-from PySide6.QtCore import QObject, QThread, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QImage, QPixmap
+from PySide6.QtCore import QObject, QSize, QThread, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
+    QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea,
     QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from modules.teach.teach_panel import _Job, describe
 
 GREEN, AMBER, RED, GREY = "#2e9d57", "#d4a017", "#c0392b", "#7f8c8d"
+BLUE = "#3a8ee6"
+# Tiles a folder in Browse shows at once; "Show more" adds as many again.
+PAGE = 240
 LEVEL_COLOURS = {"ok": GREEN, "warn": AMBER, "bad": RED}
 HEALTH_TEXT = {"ready": ("Healthy", GREEN), "needs_videos": ("Needs more videos", AMBER),
                "not_ready": ("Not ready", RED)}
 STATE_TEXT = {"open": ("not named yet", AMBER), "named": ("named", GREEN),
               "nothing": ("nothing interesting", GREY), "mixed": ("mixed", AMBER)}
 SOURCE_TEXT = {"group": "Groups (tiles you were shown)", "sort": "Sorting (review guesses)",
+               "rule": "Rules (objects found)",
                "auto": "Auto-accept (spot checks)"}
 THUMB_WIDTH = 168
 TILES_PER_ROW = 6
 
-STEPS = ("Videos", "Groups", "Check guesses", "Health")
-VIDEOS, GROUPS, CHECK, HEALTH = range(4)
+STEPS = ("Videos", "Groups", "Browse", "Check guesses", "Health")
+VIDEOS, GROUPS, BROWSE, CHECK, HEALTH = range(5)
 # Which page a `status` next step belongs on.
 STEP_OF = {"add-video": VIDEOS, "cut": VIDEOS, "focus": VIDEOS, "group": GROUPS,
            "name-group": GROUPS, "add-class": GROUPS, "sort": CHECK, "review": CHECK,
-           "boxes": CHECK, "find": CHECK, "add-example": CHECK, "build": HEALTH,
+           "boxes": CHECK, "find": CHECK, "add-example": CHECK, "detect": CHECK, "build": HEALTH,
            "train": HEALTH}
+# What a command (or an ``auto: <step>`` line) is doing, for the progress line.
+DOING = {"add-video": "Adding videos", "cut": "Cutting into samples",
+         "focus": "Cropping samples to the people in them",
+         "group": "Grouping samples that look alike", "sort": "Sorting samples",
+         "build": "Writing the dataset", "train": "Training", "auto": "Working",
+         "delete": "Deleting"}
+# Progress lines with a count in them: cut, embedding, the cropper's per-video
+# "[i/n]" (and not its per-frame "Frame i/n", which would make the bar jump).
+COUNTED = re.compile(r"(?:^cut \S+:|embedded|vectors|\[)\s*(\d+)/(\d+)")
 
 
 def _item(text, colour: str = "", align_right: bool = False) -> QTableWidgetItem:
@@ -95,11 +114,58 @@ def _clock(seconds: float) -> str:
 
 # --- running commands -----------------------------------------------------------
 
+class _Lines(io.TextIOBase):
+    """``sys.stderr`` while a command runs. Everything still goes where it went
+    (the debug log); each line the command's own thread writes is also handed
+    to ``say``, which is how the panel shows progress the CLI prints."""
+
+    def __init__(self, original, say: Callable):
+        self.original, self.say = original, say
+        self.thread = threading.get_ident()
+        self._partial = ""
+
+    def write(self, s: str) -> int:
+        if self.original is not None:
+            self.original.write(s)
+        if self.say is not None and threading.get_ident() == self.thread:
+            *lines, self._partial = re.split(r"[\r\n]", self._partial + s)
+            for line in lines:
+                if line.strip():
+                    self.say(line.strip())
+        return len(s)
+
+    def flush(self):
+        if self.original is not None:
+            self.original.flush()
+
+    def isatty(self):
+        return False
+
+    @property
+    def encoding(self):
+        return getattr(self.original, "encoding", None) or "utf-8"
+
+
+def _with_progress(fn: Callable, say: Callable) -> Callable:
+    def run():
+        lines = _Lines(sys.stderr, say)
+        sys.stderr = lines
+        try:
+            return fn()
+        finally:
+            lines.say = None
+            if sys.stderr is lines:     # unless someone swapped it since
+                sys.stderr = lines.original
+    return run
+
+
 class Runner(QObject):
-    """One ``modules.teach`` command at a time, off the UI thread."""
+    """One ``modules.teach`` command at a time, off the UI thread. ``progress``
+    is each line of what the command prints while it works."""
 
     started = Signal(list)
     finished = Signal(list, int, dict)
+    progress = Signal(str)
 
     def __init__(self, parent=None, run_cli: Optional[Callable] = None):
         super().__init__(parent)
@@ -118,7 +184,8 @@ class Runner(QObject):
             return False
         self._argv = list(argv)
         self._thread = QThread(self)
-        self._job = _Job(lambda: self._run_cli(self._argv))
+        self._job = _Job(_with_progress(lambda: self._run_cli(self._argv),
+                                        self.progress.emit))
         self._job.moveToThread(self._thread)
         self._thread.started.connect(self._job.run)
         self._job.done.connect(self._done)
@@ -232,7 +299,9 @@ class NewDatasetDialog(QDialog):
         self.task.addItem("Objects: a thing visible in one frame", "objects")
         self.focus = QCheckBox("Crop samples to the people in them")
         self.focus.setToolTip("Actions only. Each sample becomes one clip per person, "
-                              "which is what action models are trained and used on.")
+                              "labelled on its own: two people doing two things in one "
+                              "shot become two samples.")
+        self.focus.setChecked(True)
         self.task.currentIndexChanged.connect(
             lambda: self.focus.setEnabled(self.task.currentData() == "actions"))
         form = QFormLayout()
@@ -296,12 +365,19 @@ class ListPage(QWidget):
         self.open_btn.clicked.connect(self.open_selected)
         self.folder_btn = QPushButton("Show folder")
         self.folder_btn.clicked.connect(self.show_folder)
+        self.delete_btn = QPushButton("Delete…")
+        self.delete_btn.setToolTip("Move the selected dataset to the Recycle Bin (Del)")
+        self.delete_btn.clicked.connect(self.delete_selected)
+        delete_key = QShortcut(QKeySequence.Delete, self.table)
+        delete_key.setContext(Qt.WidgetShortcut)
+        delete_key.activated.connect(self.delete_selected)
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh)
         buttons = QHBoxLayout()
         for b in (self.new_btn, self.open_btn, self.folder_btn):
             buttons.addWidget(b)
         buttons.addStretch(1)
+        buttons.addWidget(self.delete_btn)
         buttons.addWidget(self.refresh_btn)
         layout = QVBoxLayout(self)
         layout.addWidget(title)
@@ -342,6 +418,25 @@ class ListPage(QWidget):
         os.makedirs(root, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(root))
 
+    def delete_selected(self):
+        row = self.table.currentRow()
+        if not 0 <= row < len(self.projects) or self.runner.busy:
+            return
+        p = self.projects[row]
+        sure = QMessageBox(QMessageBox.Warning, "Delete dataset",
+                           f"Delete the dataset <b>{html.escape(p['name'])}</b>?", parent=self)
+        sure.setInformativeText(
+            f"Its {_count(p['samples'], 'sample')}, groups, labels and trained rounds "
+            "go to the Recycle Bin (a dataset too big for the Bin is deleted for "
+            "good). Videos you added from your disk stay where they are; videos "
+            "downloaded from a link are kept inside the dataset and go with it. A "
+            "model you installed from it stays installed.")
+        sure.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        sure.button(QMessageBox.Yes).setText("Delete")
+        sure.setDefaultButton(QMessageBox.Cancel)
+        if sure.exec() == QMessageBox.Yes:
+            self.runner.run(["--project", p["project"], "delete"])
+
     def new(self):
         dialog = NewDatasetDialog(self, taken=[os.path.basename(p["project"])
                                                for p in self.projects])
@@ -369,9 +464,17 @@ class VideosPage(QWidget):
         self.add_url = QPushButton("Add from a link…")
         self.add_url.clicked.connect(self.ask_url)
         self.prepare = QPushButton("Cut into samples and group them")
-        self.prepare.setToolTip("Cuts every new video into 5 s samples (crops them to "
-                                "people if the dataset is set to), then groups them.")
+        self.prepare.setToolTip("Cuts every new video into 5 s samples (one per person "
+                                "when cropping is on), then groups them.")
         self.prepare.clicked.connect(lambda: self.wizard.command(["auto"]))
+        self.crop = QCheckBox("Crop samples to the people in them: one sample per person")
+        self.crop.setToolTip(
+            "A shot often holds two people doing two different things, and a sample "
+            "has one label. Cropped, each person is a sample of their own, grouped and "
+            "labelled by itself. Applies to samples not decided yet; the cropper takes "
+            "a few seconds per sample.")
+        self.crop.clicked.connect(
+            lambda on: self.wizard.command(["set", f"focus={'true' if on else 'false'}"]))
         buttons = QHBoxLayout()
         for b in (self.add_files, self.add_folder, self.add_url):
             buttons.addWidget(b)
@@ -380,24 +483,39 @@ class VideosPage(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(intro)
         layout.addWidget(self.list, 1)
+        layout.addWidget(self.crop)
         layout.addLayout(buttons)
-        self.buttons = [self.add_files, self.add_folder, self.add_url, self.prepare]
+        self.buttons = [self.add_files, self.add_folder, self.add_url, self.prepare,
+                        self.crop]
 
     def show_project(self, project, next_step: dict):
         self.list.clear()
-        per_source = {}
+        per_source, crops, whole = {}, {}, {}
         for s in project.samples:
             per_source[s.source] = per_source.get(s.source, 0) + 1
+            if s.crop_of:
+                crops[s.source] = crops.get(s.source, 0) + 1
+        for s in project.replaced:
+            whole[s.source] = whole.get(s.source, 0) + 1
         for source in project.sources:
             name = os.path.basename(source.path) or source.url
             state = (f"{per_source.get(source.id, 0)} samples" if source.cut
                      else "not cut yet")
+            if crops.get(source.id):
+                state += (f" ({crops[source.id]} people crops from "
+                          f"{whole.get(source.id, 0)} shots)")
             length = f" · {_clock(source.duration)}" if source.duration else ""
             self.list.addItem(f"{source.id}   {name}{length}   ·   {state}")
         if not project.sources:
             self.list.addItem("No videos yet: add one below.")
-        waiting = (next_step.get("args") or [""])[0] in ("cut", "focus", "group")
-        self.prepare.setEnabled(waiting)
+        step = (next_step.get("args") or [""])[0]
+        self.prepare.setText("Crop to people and group them" if step == "focus"
+                             else "Group them" if step == "group"
+                             else "Cut into samples and group them")
+        self.prepare.setEnabled(step in ("cut", "focus", "group"))
+        self.crop.setVisible(project.task == "actions")
+        self.crop.setChecked(project.settings.focus)
+        self.crop.setEnabled(True)
         for b in (self.add_files, self.add_folder, self.add_url):
             b.setEnabled(True)
 
@@ -420,42 +538,187 @@ class VideosPage(QWidget):
 
 
 class Thumb(QLabel):
-    """One sample in a group: click marks it as not belonging, double-click plays."""
+    """One sample as a picture. Click selects it, Shift-click a range,
+    double-click plays it. ``flag`` is a colour for what it already is."""
 
-    toggled = Signal()
+    clicked = Signal(object, object)          # the thumb, the keyboard modifiers
 
-    def __init__(self, n: int, sample, editable: bool, wrong: bool, parent=None):
+    def __init__(self, n: int, sample, mark: str = RED, flag: str = "",
+                 tip: str = "", parent=None):
         super().__init__(parent)
-        self.n, self.sample, self.editable, self.wrong = n, sample, editable, wrong
+        self.n, self.sample, self.mark, self.flag = n, sample, mark, flag
+        self.selected = False
         self.setFixedSize(THUMB_WIDTH + 8, THUMB_WIDTH * 9 // 16 + 8)
         self.setAlignment(Qt.AlignCenter)
-        self.setToolTip(f"{n}: {sample.source} at {_clock(sample.start)}.  "
-                        + ("Click: does not belong.  " if editable else "")
-                        + "Double-click: play.")
+        self.setToolTip(f"{n}: {sample.source} at {_clock(sample.start)}"
+                        + (f"\n{tip}" if tip else "")
+                        + f"\n{os.path.abspath(sample.path)}"
+                        + "\nClick: select.  Shift-click: select a range.  "
+                          "Double-click: play.")
         self.picture: Optional[QPixmap] = None
         self.refresh()
+
+    # Group cards call a selected tile "wrong": it does not belong there.
+    @property
+    def wrong(self) -> bool:
+        return self.selected
 
     def set_picture(self, pixmap: QPixmap):
         self.picture = pixmap
         self.refresh()
 
+    def set_selected(self, on: bool):
+        if on != self.selected:
+            self.selected = on
+            self.refresh()
+
     def refresh(self):
-        colour = RED if self.wrong else ("#444" if self.editable else GREEN)
+        colour = self.mark if self.selected else (self.flag or "#444")
         self.setStyleSheet(f"QLabel {{ border: 4px solid {colour}; background:#111; "
-                           "color:#ddd; }}")
+                           "color:#ddd; }")
         if self.picture is not None:
             self.setPixmap(self.picture)
         else:
             self.setText(str(self.n))
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self.editable:
-            self.wrong = not self.wrong
-            self.refresh()
-            self.toggled.emit()
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self, event.modifiers())
 
     def mouseDoubleClickEvent(self, event):
         QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(self.sample.path)))
+
+
+class TileGrid(QWidget):
+    """Thumbs in rows as wide as there is room for; keeps which are selected
+    (Shift-click for a range)."""
+
+    changed = Signal()
+    CELL = THUMB_WIDTH + 12
+
+    def __init__(self, thumbnails: "Thumbnails", columns: int = TILES_PER_ROW,
+                 parent=None):
+        super().__init__(parent)
+        self.thumbnails, self.columns = thumbnails, columns
+        self.thumbs: list = []
+        self._last = None
+        self.grid = QGridLayout(self)
+        self.grid.setSpacing(4)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        thumbnails.ready.connect(self._thumb)
+
+    def add(self, thumb: Thumb):
+        i = len(self.thumbs)
+        pixmap = self.thumbnails.get(thumb.sample.id)
+        if pixmap is not None:
+            thumb.set_picture(pixmap)
+        thumb.clicked.connect(self._clicked)
+        self.grid.addWidget(thumb, i // self.columns, i % self.columns)
+        self.thumbs.append(thumb)
+
+    def load(self):
+        self.thumbnails.want([(t.sample.id, t.sample.path) for t in self.thumbs
+                              if t.picture is None])
+
+    # Reflow to the width there is: a fixed number of columns either leaves a
+    # wide window half empty or hides tiles behind a sideways scroll bar.
+
+    def minimumSizeHint(self) -> QSize:          # noqa: N802 (Qt override)
+        return QSize(self.CELL, super().minimumSizeHint().height())
+
+    def resizeEvent(self, event):                # noqa: N802 (Qt override)
+        super().resizeEvent(event)
+        columns = max(1, (event.size().width() + 4) // self.CELL)
+        if columns != self.columns:
+            self.columns = columns
+            for thumb in self.thumbs:
+                self.grid.removeWidget(thumb)
+            for i, thumb in enumerate(self.thumbs):
+                self.grid.addWidget(thumb, i // columns, i % columns)
+            self.updateGeometry()
+
+    def _thumb(self, sample_id: str):
+        for thumb in self.thumbs:
+            if thumb.sample.id == sample_id:
+                thumb.set_picture(self.thumbnails.get(sample_id))
+
+    def _clicked(self, thumb: Thumb, modifiers):
+        if modifiers & Qt.ShiftModifier and self._last in self.thumbs:
+            a, b = sorted((self.thumbs.index(self._last), self.thumbs.index(thumb)))
+            for t in self.thumbs[a:b + 1]:
+                t.set_selected(True)
+        else:
+            thumb.set_selected(not thumb.selected)
+        self._last = thumb
+        self.changed.emit()
+
+    def select_all(self, on: bool = True):
+        for t in self.thumbs:
+            t.set_selected(on)
+        self.changed.emit()
+
+    def selected(self) -> list:
+        return [t for t in self.thumbs if t.selected]
+
+
+def describe_sample(sample) -> tuple:
+    """``(text, colour)``: what a sample is now, for a tooltip and its border."""
+    from modules.teach.project import ACCEPTED, NEGATIVE, REJECTED
+    who = ("auto" if not sample.is_human else
+           "group" if sample.decided_by.startswith("group:") else "you")
+    if sample.verdict == ACCEPTED:
+        return f"{sample.label} (decided by {who})", GREEN
+    if sample.verdict == NEGATIVE:
+        return f"nothing interesting (decided by {who})", GREY
+    if sample.verdict == REJECTED:
+        return f"unusable (decided by {who})", RED
+    guess = sample.proposed if sample.proposed and not sample.proposed.startswith("_") \
+        else ""
+    return (f"not decided; guess: {guess}" if guess else "not decided"), ""
+
+
+def move_menu(wizard, ids: list, parent=None, here_group: Optional[int] = None) -> QMenu:
+    """Every place selected samples can be moved to, each one ``move`` command."""
+    project = wizard.project
+    menu = QMenu(parent)
+    joined = ",".join(ids)
+
+    def go(*where):
+        wizard.command(["move", "--samples", joined, *where])
+
+    def new_class():
+        from modules.teach.naming import check_name, normalize_name
+        name, ok = QInputDialog.getText(parent, "New class", "What do these show?")
+        if not ok or not name.strip():
+            return
+        blocking = [x for x in check_name(normalize_name(name), project.class_names(),
+                                          project.task, vocabulary=[]) if x.blocking]
+        if blocking:
+            QMessageBox.information(parent, "New class",
+                                    "\n".join(x.message for x in blocking))
+            return
+        go("--to-class", name.strip())
+
+    for name in project.class_names():
+        menu.addAction(name, lambda n=name: go("--to-class", n))
+    menu.addAction("New class…", new_class)
+    menu.addSeparator()
+    menu.addAction("Nothing interesting", lambda: go("--nothing"))
+    menu.addAction("Unusable (bad cut, unclear)", lambda: go("--reject"))
+    menu.addAction("Back to not decided", lambda: go("--undecided"))
+    menu.addSeparator()
+    groups = menu.addMenu("Group")
+    for g in project.groups:
+        if g.state == "split" or g.id == here_group:
+            continue
+        label = f"Group {g.id}" + (f" ({g.name})" if g.name else
+                                   f" ({g.state})" if g.state != "open" else "")
+        groups.addAction(label, lambda i=g.id: go("--to-group", str(i)))
+    groups.addSeparator()
+    groups.addAction("New group", lambda: go("--new-group"))
+    for action in menu.actions():
+        action.setEnabled(bool(ids) and action.isEnabled())
+    return menu
 
 
 class GroupCard(QFrame):
@@ -468,18 +731,15 @@ class GroupCard(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
         editable = self.state == "open"
         wrong = set(spec.wrong)
-        self.thumbs = []
-        grid = QGridLayout()
-        grid.setSpacing(4)
+        self.tiles = TileGrid(wizard.thumbnails)
         for n, sample in enumerate(group_mod.tiles(project, self.id), 1):
-            thumb = Thumb(n, sample, editable, sample.id in wrong)
-            pixmap = wizard.thumbnails.get(sample.id)
-            if pixmap is not None:
-                thumb.set_picture(pixmap)
-            thumb.toggled.connect(self._count)
-            grid.addWidget(thumb, (n - 1) // TILES_PER_ROW, (n - 1) % TILES_PER_ROW)
-            self.thumbs.append(thumb)
-        wizard.thumbnails.want([(t.sample.id, t.sample.path) for t in self.thumbs])
+            text, colour = describe_sample(sample)
+            flag = AMBER if sample.id in wrong else ("" if editable else colour)
+            self.tiles.add(Thumb(n, sample, mark=RED if editable else BLUE, flag=flag,
+                                 tip=text))
+        self.tiles.load()
+        self.thumbs = self.tiles.thumbs
+        self.tiles.changed.connect(self._count)
 
         text, colour = STATE_TEXT.get(self.state, (self.state, GREY))
         if self.state == "named":
@@ -494,6 +754,7 @@ class GroupCard(QFrame):
                              "thing, not one scene.")
         self.hint = QLabel()
         self.hint.setStyleSheet("color:#999;")
+        self.editable = editable
 
         row = QHBoxLayout()
         if editable:
@@ -505,6 +766,7 @@ class GroupCard(QFrame):
             self.name.lineEdit().returnPressed.connect(self.name_it)
             self.name.setMinimumWidth(220)
             name_btn = QPushButton("Name it")
+            name_btn.setToolTip("The tiles shown, except the selected ones, are this.")
             name_btn.clicked.connect(self.name_it)
             nothing = QPushButton("Nothing interesting")
             nothing.setToolTip("These show none of the things to find. The model "
@@ -516,35 +778,55 @@ class GroupCard(QFrame):
             mixed.clicked.connect(lambda: self.say(["--mixed"]))
             for w in (self.name, name_btn, nothing, mixed):
                 row.addWidget(w)
-            self._count()
         else:
             if self.state == "mixed":
                 split = QPushButton("Split into smaller groups")
                 split.clicked.connect(
                     lambda: self.wizard.command(["group", "--split", str(self.id)]))
                 row.addWidget(split)
-                self.hint.setText("Its samples are checked one by one in step 3 unless "
-                                  "you split it.")
-            elif wrong:
-                self.hint.setText(f"{len(wrong)} marked as not belonging: they are "
-                                  "checked in step 3.")
             change = QPushButton("Change")
             change.clicked.connect(lambda: self.say(["--reopen"]))
             row.addWidget(change)
+        self.move_btn = QPushButton("Move selected to…")
+        self.move_btn.clicked.connect(self._move)
+        show_all = QPushButton(f"Show all {info['size']}")
+        show_all.setToolTip("Every sample of this group, in Browse")
+        show_all.clicked.connect(lambda: self.wizard.browse(("group", self.id)))
+        row.addWidget(self.move_btn)
+        row.addWidget(show_all)
         row.addWidget(self.hint, 1)
+        self._wrong_before = len(wrong)
+        self._count()
 
         layout = QVBoxLayout(self)
         layout.addWidget(title)
-        layout.addLayout(grid)
+        layout.addWidget(self.tiles)
         layout.addLayout(row)
 
     def _count(self):
-        n = sum(t.wrong for t in self.thumbs)
-        self.hint.setText(f"{n} marked as not belonging" if n
-                          else "Click any tile that does not belong.")
+        n = len(self.tiles.selected())
+        self.move_btn.setEnabled(n > 0)
+        if n:
+            self.hint.setText(f"{n} selected" + (": naming leaves them out"
+                                                 if self.editable else ""))
+        elif self.editable:
+            self.hint.setText("Select tiles that do not belong, then name the group.")
+        elif self.state == "mixed":
+            self.hint.setText("Checked one by one in step 4 unless you split it.")
+        elif self._wrong_before:
+            self.hint.setText(f"Named with {self._wrong_before} left out as not "
+                              "belonging" + (" (amber)." if any(
+                                  t.flag == AMBER for t in self.thumbs) else "."))
+        else:
+            self.hint.setText("")
 
     def wrong(self) -> str:
-        return ",".join(str(t.n) for t in self.thumbs if t.wrong)
+        return ",".join(str(t.n) for t in self.tiles.selected())
+
+    def _move(self):
+        ids = [t.sample.id for t in self.tiles.selected()]
+        move_menu(self.wizard, ids, self, here_group=self.id).exec(
+            self.move_btn.mapToGlobal(self.move_btn.rect().bottomLeft()))
 
     def name_it(self):
         name = self.name.currentText().strip()
@@ -577,7 +859,8 @@ class GroupsPage(QWidget):
         intro = QLabel("<h3>2 · Groups</h3>Samples that look alike are shown together. "
                        "For each group, click any tile that does not belong, then say "
                        "what the rest show. Only the tiles you saw are labelled; the rest "
-                       "of each group is checked in step 3.")
+                       "of each group is checked in step 4. Select tiles and use Move "
+                       "to put them anywhere; Show all lists a whole group.")
         intro.setWordWrap(True)
         self.progress = QLabel()
         self.k = QSpinBox()
@@ -605,7 +888,6 @@ class GroupsPage(QWidget):
         layout.addLayout(top)
         layout.addWidget(self.scroll, 1)
         self.buttons = [self.regroup]
-        wizard.thumbnails.ready.connect(self._thumb)
 
     def _regroup(self):
         args = ["group"]
@@ -613,18 +895,12 @@ class GroupsPage(QWidget):
             args += ["--k", str(self.k.value())]
         self.wizard.command(args)
 
-    def _thumb(self, sample_id: str):
-        pixmap = self.wizard.thumbnails.get(sample_id)
-        for card in self.cards:
-            for thumb in card.thumbs:
-                if thumb.sample.id == sample_id:
-                    thumb.set_picture(pixmap)
-
     def show_project(self, project, next_step: dict):
         from modules.teach import group as group_mod
         position = self.scroll.verticalScrollBar().value()
         for card in self.cards:
             self.body.removeWidget(card)
+            card.hide()
             card.deleteLater()
         self.cards = []
         found = group_mod.summary(project)
@@ -648,11 +924,193 @@ class GroupsPage(QWidget):
         self.scroll.verticalScrollBar().setValue(position)
 
 
+class BrowsePage(QWidget):
+    """Every sample, folder by folder: a group, a class, nothing, unusable or not
+    decided. Select some and move them anywhere."""
+
+    def __init__(self, wizard, parent=None):
+        super().__init__(parent)
+        self.wizard = wizard
+        self.key = ("pending",)
+        self.limit = PAGE
+        intro = QLabel("<h3>3 · Browse</h3>Everything, like folders. Pick one on the "
+                       "left, select samples (Shift-click for a range), and move them "
+                       "where they belong. Double-click plays one.")
+        intro.setWordWrap(True)
+        self.folders = QListWidget()
+        self.folders.setFixedWidth(230)
+        self.folders.currentItemChanged.connect(self._picked)
+        self.header = QLabel()
+        self.count = QLabel()
+        self.count.setStyleSheet("color:#999;")
+        self.all_btn = QPushButton("Select all")
+        self.all_btn.clicked.connect(lambda: self.tiles.select_all(True))
+        self.none_btn = QPushButton("Clear")
+        self.none_btn.clicked.connect(lambda: self.tiles.select_all(False))
+        self.move_btn = QPushButton("Move selected to…")
+        self.move_btn.clicked.connect(self._move)
+        self.copy_btn = QPushButton("Copy paths")
+        self.copy_btn.setToolTip("The selected samples' files, one per line")
+        self.copy_btn.clicked.connect(self._copy_paths)
+        self.reveal_btn = QPushButton("Show in folder")
+        self.reveal_btn.setToolTip("Open the folder holding the first selected sample")
+        self.reveal_btn.clicked.connect(self._reveal)
+        self.more_btn = QPushButton("Show more")
+        self.more_btn.clicked.connect(self._more)
+        bar = QHBoxLayout()
+        bar.addWidget(self.header, 1)
+        bar.addWidget(self.count)
+        for b in (self.all_btn, self.none_btn, self.copy_btn, self.reveal_btn,
+                  self.move_btn):
+            bar.addWidget(b)
+        self.holder = QVBoxLayout()
+        body = QWidget()
+        body.setLayout(self.holder)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(body)
+        right = QVBoxLayout()
+        right.addLayout(bar)
+        right.addWidget(self.scroll, 1)
+        right.addWidget(self.more_btn)
+        middle = QHBoxLayout()
+        middle.addWidget(self.folders)
+        middle.addLayout(right, 1)
+        layout = QVBoxLayout(self)
+        layout.addWidget(intro)
+        layout.addLayout(middle, 1)
+        self.tiles = TileGrid(wizard.thumbnails)
+        self.holder.addWidget(self.tiles)
+        self.holder.addStretch(1)
+        self.buttons = [self.move_btn, self.all_btn, self.none_btn, self.more_btn,
+                        self.copy_btn, self.reveal_btn]
+        self._showing = False
+
+    # The folders and what is in each.
+
+    @staticmethod
+    def folder_list(project) -> list:
+        from modules.teach.project import ACCEPTED, NEGATIVE, PENDING, REJECTED
+        readable = [s for s in project.samples if not s.unreadable]
+        out = [(("pending",), "Not decided",
+                [s for s in readable if s.verdict == PENDING])]
+        for name in project.class_names():
+            out.append((("class", name), name,
+                        [s for s in readable if s.verdict == ACCEPTED and s.label == name]))
+        out.append((("none",), "Nothing interesting",
+                    [s for s in readable if s.verdict == NEGATIVE]))
+        out.append((("rejected",), "Unusable",
+                    [s for s in readable if s.verdict == REJECTED]))
+        by_id = {s.id: s for s in readable}
+        for g in project.groups:
+            if g.state == "split":
+                continue
+            label = f"Group {g.id}" + (f" · {g.name}" if g.name else
+                                       f" · {g.state}" if g.state != "open" else "")
+            out.append((("group", g.id), label,
+                        [by_id[i] for i in g.members if i in by_id]))
+        return out
+
+    def show_project(self, project, next_step: dict):
+        self._showing = True
+        folders = self.folder_list(project)
+        self.folders.clear()
+        current = 0
+        for i, (key, label, samples) in enumerate(folders):
+            item = QListWidgetItem(f"{label}   ({len(samples)})")
+            item.setData(Qt.UserRole, key)
+            if key[0] == "class":
+                item.setForeground(QColor(GREEN))
+            elif key[0] == "group":
+                item.setForeground(QColor("#999"))
+            self.folders.addItem(item)
+            if key == self.key:
+                current = i
+        self._folders = {key: (label, samples) for key, label, samples in folders}
+        self.folders.setCurrentRow(current)
+        self._showing = False
+        self.key = folders[current][0]
+        self._fill(keep_scroll=True)
+
+    def show_folder(self, key):
+        self.key, self.limit = key, PAGE
+        for i in range(self.folders.count()):
+            if self.folders.item(i).data(Qt.UserRole) == key:
+                self.folders.setCurrentRow(i)
+                return
+
+    def _picked(self, item, _previous=None):
+        if self._showing or item is None:
+            return
+        key = item.data(Qt.UserRole)
+        if key != self.key:
+            self.key, self.limit = key, PAGE
+        self._fill()
+
+    def _more(self):
+        self.limit += PAGE
+        self._fill(keep_scroll=True)
+
+    def _fill(self, keep_scroll: bool = False):
+        position = self.scroll.verticalScrollBar().value()
+        self.holder.removeWidget(self.tiles)
+        self.tiles.hide()               # gone now, not when Qt gets round to it
+        self.tiles.deleteLater()
+        self.tiles = TileGrid(self.wizard.thumbnails, columns=TILES_PER_ROW)
+        self.tiles.changed.connect(self._count)
+        self.holder.insertWidget(0, self.tiles)
+        label, samples = self._folders.get(self.key, ("", []))
+        for n, sample in enumerate(samples[:self.limit], 1):
+            text, colour = describe_sample(sample)
+            self.tiles.add(Thumb(n, sample, mark=BLUE, flag=colour, tip=text))
+        self.tiles.load()
+        self.header.setText(f"<b>{label}</b>")
+        self.more_btn.setVisible(len(samples) > self.limit)
+        self.more_btn.setText(f"Show more ({len(samples) - self.limit} not shown)")
+        self._count()
+        if keep_scroll:
+            self.scroll.verticalScrollBar().setValue(position)
+        else:
+            self.scroll.verticalScrollBar().setValue(0)
+
+    def _count(self):
+        label, samples = self._folders.get(self.key, ("", []))
+        n = len(self.tiles.selected())
+        shown = min(len(samples), self.limit)
+        self.count.setText(f"{n} of {shown} selected" if n else
+                           f"{len(samples)} samples")
+        self.move_btn.setEnabled(n > 0 and not self.wizard.runner.busy)
+        self.copy_btn.setEnabled(n > 0)
+        self.reveal_btn.setEnabled(n > 0)
+        for b in (self.all_btn, self.none_btn, self.more_btn):
+            b.setEnabled(not self.wizard.runner.busy)
+
+    def selected_paths(self) -> list:
+        return [os.path.abspath(t.sample.path) for t in self.tiles.selected()]
+
+    def _copy_paths(self):
+        from PySide6.QtWidgets import QApplication
+        paths = self.selected_paths()
+        QApplication.clipboard().setText("\n".join(paths))
+        self.wizard.message.setText(f"Copied {_count(len(paths), 'path')}.")
+
+    def _reveal(self):
+        paths = self.selected_paths()
+        if paths:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(paths[0])))
+
+    def _move(self):
+        ids = [t.sample.id for t in self.tiles.selected()]
+        here = self.key[1] if self.key[0] == "group" else None
+        move_menu(self.wizard, ids, self, here_group=here).exec(
+            self.move_btn.mapToGlobal(self.move_btn.rect().bottomLeft()))
+
+
 class CheckPage(QWidget):
     def __init__(self, wizard, parent=None):
         super().__init__(parent)
         self.wizard = wizard
-        intro = QLabel("<h3>3 · Check guesses</h3>What you named becomes the examples, and "
+        intro = QLabel("<h3>4 · Check guesses</h3>What you named becomes the examples, and "
                        "every other sample gets a guess. Check them a batch at a time: "
                        "each tile already shows its guess, so click only the wrong ones "
                        "and press Enter. After a class has 5 checked samples, its "
@@ -677,12 +1135,104 @@ class CheckPage(QWidget):
         buttons.addWidget(self.auto_btn)
         buttons.addStretch(1)
         buttons.addWidget(self.review_btn)
+
+        # Rules: a detector of your own counts objects in each sample, and
+        # rules say which combination is which class (modules/teach/evidence).
+        rules_box = QFrame()
+        rules_box.setFrameShape(QFrame.StyledPanel)
+        rules_title = QLabel("<b>Rules from objects found</b> (optional) — for classes "
+                             "that look alike but differ in how many of something "
+                             "there are, or what touches what.")
+        rules_title.setWordWrap(True)
+        self.detector = QLineEdit()
+        self.detector.setPlaceholderText("your detector model (.onnx or .xml)")
+        self.detector.editingFinished.connect(
+            lambda: self._set("detector_model", self.detector.text().strip()))
+        self.det_classes = QLineEdit()
+        self.det_classes.setPlaceholderText("its class names: a labels file, or a, b, c")
+        self.det_classes.editingFinished.connect(
+            lambda: self._set("detector_classes", self.det_classes.text().strip()))
+        pick_model = QPushButton("Choose…")
+        pick_model.clicked.connect(lambda: self._pick(self.detector, "detector_model",
+                                                      "Models (*.onnx *.xml)"))
+        pick_classes = QPushButton("Choose…")
+        pick_classes.clicked.connect(lambda: self._pick(
+            self.det_classes, "detector_classes", "Labels (*.json *.txt);;All files (*)"))
+        self.detect_btn = QPushButton("Find objects")
+        self.detect_btn.setToolTip("Run the detector over every sample not seen yet "
+                                   "(a few minutes for several hundred)")
+        self.detect_btn.clicked.connect(lambda: self.wizard.command(["detect"]))
+        self.rules_btn = QPushButton("Edit rules…")
+        self.rules_btn.setToolTip("Opens this dataset's rules.yaml (made from a template "
+                                  "the first time). Sort again after saving it.")
+        self.rules_btn.clicked.connect(self._edit_rules)
+        self.rules_note = QLabel()
+        self.rules_note.setWordWrap(True)
+        self.rules_note.setStyleSheet("color:#999;")
+        form = QGridLayout()
+        form.addWidget(QLabel("Detector"), 0, 0)
+        form.addWidget(self.detector, 0, 1)
+        form.addWidget(pick_model, 0, 2)
+        form.addWidget(QLabel("Classes"), 1, 0)
+        form.addWidget(self.det_classes, 1, 1)
+        form.addWidget(pick_classes, 1, 2)
+        rules_row = QHBoxLayout()
+        rules_row.addWidget(self.detect_btn)
+        rules_row.addWidget(self.rules_btn)
+        rules_row.addWidget(self.rules_note, 1)
+        box = QVBoxLayout(rules_box)
+        box.addWidget(rules_title)
+        box.addLayout(form)
+        box.addLayout(rules_row)
+
         layout = QVBoxLayout(self)
         layout.addWidget(intro)
         layout.addWidget(self.table, 1)
         layout.addWidget(self.note)
         layout.addLayout(buttons)
-        self.buttons = [self.sort_btn, self.review_btn, self.auto_btn]
+        layout.addWidget(rules_box)
+        self.buttons = [self.sort_btn, self.review_btn, self.auto_btn, self.detect_btn,
+                        self.rules_btn]
+
+    def _set(self, key: str, value: str):
+        project = self.wizard.project
+        if project is None or getattr(project.settings, key) == value:
+            return
+        self.wizard.command(["set", f"{key}={value}"])
+
+    def _pick(self, edit: QLineEdit, key: str, pattern: str):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose", edit.text(), pattern)
+        if path:
+            edit.setText(path)
+            self._set(key, path)
+
+    def _edit_rules(self):
+        from modules.teach import evidence
+        path = evidence.init_rules(self.wizard.project)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        self.wizard.message.setText(f"Rules: {path} — save it, then Sort again.")
+
+    def show_rules(self, project):
+        from modules.teach import evidence
+        self.detector.setText(project.settings.detector_model)
+        self.det_classes.setText(project.settings.detector_classes)
+        has_detector = bool(project.settings.detector_model)
+        seen = len(evidence.load(project)["samples"]) if has_detector else 0
+        waiting = len(evidence.todo(project))
+        bits = []
+        if has_detector:
+            bits.append(f"objects found in {seen} samples"
+                        + (f", {waiting} not looked at yet" if waiting else ""))
+        rule_guesses = sum(1 for s in project.samples if s.rule_guess)
+        if os.path.exists(evidence.rules_path(project)):
+            bits.append(f"rules guessed {rule_guesses}")
+            record = evidence.rule_record(project)
+            for cls, row in sorted(record.items()):
+                trust = " — decides alone" if evidence.trusted(project, cls, record) else ""
+                bits.append(f"{cls}: right {row['right']} of {row['checked']} checked{trust}")
+        self.rules_note.setText(" · ".join(bits) or "No detector set.")
+        self.detect_btn.setEnabled(has_detector and waiting > 0)
+        self.rules_btn.setEnabled(True)
 
     def show_project(self, project, next_step: dict, report: dict):
         from modules.teach.project import NONE, PENDING
@@ -703,6 +1253,7 @@ class CheckPage(QWidget):
         bits.append("Next: " + next_step.get("why", ""))
         self.note.setText(" ".join(bits))
         has_classes = bool(project.classes)
+        self.show_rules(project)
         self.auto_btn.setEnabled(True)
         self.sort_btn.setEnabled(has_classes)
         self.review_btn.setEnabled(has_classes and pending > 0)
@@ -712,7 +1263,7 @@ class HealthPage(QWidget):
     def __init__(self, wizard, parent=None):
         super().__init__(parent)
         self.wizard = wizard
-        title = QLabel("<h3>4 · Health</h3>")
+        title = QLabel("<h3>5 · Health</h3>")
         self.banner = QLabel()
         self.banner.setWordWrap(True)
         self.checks = _table(["", "Check", "Class", "What it found", "What to do"])
@@ -838,9 +1389,20 @@ class Wizard(QWidget):
         self.next = QLabel()
         self.next.setWordWrap(True)
         self.next.setStyleSheet("color:#999;")
+        self.where = QLabel()
+        self.where.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.where.setStyleSheet("color:#999;")
+        self.where.setToolTip("Where this dataset is kept (select to copy)")
+        folder = QPushButton("Open folder")
+        folder.clicked.connect(lambda: QDesktopServices.openUrl(
+            QUrl.fromLocalFile(self.root)) if self.root else None)
+        heading = QVBoxLayout()
+        heading.addWidget(self.title)
+        heading.addWidget(self.where)
         top = QHBoxLayout()
         top.addWidget(back)
-        top.addWidget(self.title, 1)
+        top.addLayout(heading, 1)
+        top.addWidget(folder)
 
         self.steps = QListWidget()
         self.steps.setFixedWidth(170)
@@ -849,9 +1411,10 @@ class Wizard(QWidget):
         self.pages = QStackedWidget()
         self.videos = VideosPage(self)
         self.groups = GroupsPage(self)
+        self.browser = BrowsePage(self)
         self.check = CheckPage(self)
         self.health = HealthPage(self)
-        for page in (self.videos, self.groups, self.check, self.health):
+        for page in self.all_pages():
             self.pages.addWidget(page)
         self.steps.currentRowChanged.connect(self.pages.setCurrentIndex)
         middle = QHBoxLayout()
@@ -861,13 +1424,28 @@ class Wizard(QWidget):
         self.message = QLabel()
         self.message.setWordWrap(True)
         self.message.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # While a command runs: what it is doing, and how far (when it says).
+        self.doing = ""
+        self.bar = QProgressBar()
+        self.bar.setVisible(False)
+        runner.started.connect(self._started)
+        runner.progress.connect(self.show_progress)
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(self.next)
         layout.addLayout(middle, 1)
+        layout.addWidget(self.bar)
         layout.addWidget(self.message)
 
+    def all_pages(self) -> tuple:
+        return (self.videos, self.groups, self.browser, self.check, self.health)
+
     # --- showing ---------------------------------------------------------------
+
+    def browse(self, key):
+        """Show one folder (a group, a class...) in Browse."""
+        self.browser.show_folder(key)
+        self.steps.setCurrentRow(BROWSE)
 
     def open(self, root: str):
         self.root = root
@@ -892,9 +1470,11 @@ class Wizard(QWidget):
                            f"<span style='color:#999'>{project.task} · "
                            f"{_count(len(project.sources), 'video')} · "
                            f"{_count(len(project.samples), 'sample')}</span>")
+        self.where.setText(project.root)
         self.next.setText("Next: " + step.get("why", ""))
         self.videos.show_project(project, step)
         self.groups.show_project(project, step)
+        self.browser.show_project(project, step)
         self.check.show_project(project, step, report)
         self.health.show_project(project, step, report)
         self._mark_steps(project, report)
@@ -902,14 +1482,15 @@ class Wizard(QWidget):
             # Here footage comes first, whatever `status` would start with.
             self.steps.setCurrentRow(STEP_OF.get((step.get("args") or [""])[0], VIDEOS)
                                      if project.sources else VIDEOS)
-        if self.runner.busy:
-            self.set_busy(True)
+        self.set_busy(self.runner.busy)
 
     def _mark_steps(self, project, report):
         groups = report["groups"]
         done = [
             bool(project.sources) and all(s.cut for s in project.sources),
             bool(groups["total"]) and not groups["open"],
+            bool(project.samples) and all(s.verdict != "pending" or s.unreadable
+                                          for s in project.samples),
             bool(project.classes) and not any(
                 c.get("spot_checks_owed") for c in report["classes"].values())
             and any(c["by_person"] for c in report["classes"].values()),
@@ -936,10 +1517,22 @@ class Wizard(QWidget):
                                  % (RED, "<br>".join(str(e) for e in errors)))
         elif command == "name-group":
             self.message.setText(self._named(result))
+        elif command == "move":
+            self.message.setText(self._moved(result))
         else:
             self.message.setText(describe(result).replace("\n", "<br>"))
         jump = command in ("auto", "add-video", "group")
         self.reload(jump=jump)
+
+    @staticmethod
+    def _moved(result: dict) -> str:
+        n = _count(result.get("moved", 0), "sample")
+        if "group" in result:
+            return f"Moved {n} to group {result['group']}."
+        where = {"accepted": repr(result.get("label", "")), "negative": "nothing interesting",
+                 "rejected": "unusable", "pending": "not decided"}.get(
+            result.get("verdict"), result.get("verdict", ""))
+        return f"Moved {n} to {where}."
 
     @staticmethod
     def _named(result: dict) -> str:
@@ -952,7 +1545,7 @@ class Wizard(QWidget):
         else:
             text = f"Group {result['group']} reopened"
         if result.get("left_for_review"):
-            text += f", {result['left_for_review']} left to check in step 3"
+            text += f", {result['left_for_review']} left to check in step 4"
         if result.get("background_class"):
             text += (f". 'Nothing interesting' is trained as "
                      f"{result['background_class']!r}")
@@ -960,13 +1553,39 @@ class Wizard(QWidget):
 
     def set_busy(self, busy: bool):
         """Busy: nothing can be pressed. Not busy: ``reload`` sets each button."""
-        if busy:
-            for page in (self.videos, self.groups, self.check, self.health):
+        if busy and self.bar.isHidden():
+            for page in self.all_pages():
                 for b in page.buttons:
                     b.setEnabled(False)
-            self.message.setText("Working…")
+            self.message.setText(f"{self.doing or 'Working'}…")
+        self.bar.setVisible(busy)
         for card in self.groups.cards:
             card.setEnabled(not busy)
+        self.browser.tiles.setEnabled(not busy)
+
+    def _started(self, argv: list):
+        command = argv[2] if argv[:1] == ["--project"] and len(argv) > 2 else argv[0]
+        self.doing = DOING.get(command, "Working")
+        self.bar.setRange(0, 0)                 # busy, no count yet
+
+    def show_progress(self, line: str):
+        """One line the running command printed: its step, and a count if any."""
+        if line.startswith("auto: "):
+            self.doing = DOING.get(line.split()[1] if len(line.split()) > 1 else "",
+                                   self.doing)
+            self.bar.setRange(0, 0)
+            line = ""
+        counted = COUNTED.search(line)
+        if counted:
+            done, total = int(counted.group(1)), max(int(counted.group(2)), 1)
+            self.bar.setRange(0, total)
+            self.bar.setValue(min(done, total))
+            self.bar.setFormat(f"{done} of {total}")
+        text = f"{self.doing}…"
+        if line:
+            text += ("<br><span style='color:#999'>%s</span>"
+                     % html.escape(line if len(line) <= 160 else line[:159] + "…"))
+        self.message.setText(text)
 
     def open_review(self):
         from modules.teach.review_window import BoxReviewWindow, ReviewWindow
@@ -1016,7 +1635,8 @@ class DatasetsPanel(QWidget):
         self.list.refresh()
 
     def _busy(self, busy: bool):
-        for b in (self.list.new_btn, self.list.open_btn, self.list.refresh_btn):
+        for b in (self.list.new_btn, self.list.open_btn, self.list.delete_btn,
+                  self.list.refresh_btn):
             b.setEnabled(not busy)
         if self.stack.currentWidget() is self.wizard:
             self.wizard.set_busy(busy)
@@ -1032,6 +1652,10 @@ class DatasetsPanel(QWidget):
                 self.list.refresh()
             else:
                 self.open(result["created"])
+        elif command == "delete":
+            if result.get("error"):
+                QMessageBox.warning(self, "Delete dataset", result["error"])
+            self.list.refresh()
         elif self.stack.currentWidget() is self.wizard:
             self.wizard.finished(argv, code, result)
 
