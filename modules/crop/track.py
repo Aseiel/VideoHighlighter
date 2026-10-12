@@ -29,6 +29,7 @@ from modules.crop.config import (
     ROI_CONFIDENCE_THRESHOLD,
     ROI_SMOOTHING,
     ROI_SMOOTH_WINDOW,
+    SAME_ACTION_OVERLAP,
     USE_POSE_ESTIMATION,
     USE_POSE_FOR_ROI,
 )
@@ -1105,7 +1106,7 @@ def _inside(small, big):
 
 def plan_slots(video_path, detector, pose_model, positions, stride=3,
                min_height_share=0.4, min_presence=0.25, min_gap=0.15,
-               whole_person_share=0.25, same_action_overlap=0.5):
+               whole_person_share=0.25, same_action_overlap=SAME_ACTION_OVERLAP):
     """Fix each crop slot from the whole clip.
 
     Samples every `stride`-th frame, keeps person-like boxes, drops fragments
@@ -1120,6 +1121,7 @@ def plan_slots(video_path, detector, pose_model, positions, stride=3,
     `whole_person_share` or more of another person's width takes that person
     whole. Two slots that then overlap by `same_action_overlap` of the
     narrower one's width hold the same people, one action: they become one.
+    `same_action_overlap=None` (config.SAME_ACTION_OVERLAP) never merges.
 
     Returns {position: box or None}. A slot is None when its group is seen in
     fewer than `min_presence` of the sampled frames, or sits within `min_gap`
@@ -1193,7 +1195,7 @@ def plan_slots(video_path, detector, pose_model, positions, stride=3,
                 x1, y1, x2, y2 = min(x1, ox1), min(y1, oy1), max(x2, ox2), max(y2, oy2)
         plan[asked] = (x1, y1, x2, y2)
 
-    merged = True
+    merged = same_action_overlap is not None
     while merged:
         merged = False
         live = [p for p in positions if plan[p] is not None]

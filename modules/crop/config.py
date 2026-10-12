@@ -32,6 +32,13 @@ MIN_PEOPLE_REQUIRED = 2
 # bodies, so splitting by person cuts one action apart; keep the clip whole.
 # None turns it off.
 CLOSEUP_AREA_RATIO = 0.90
+# Two crop slots overlapping by this share of the narrower one's width hold
+# the same people, so they become one crop (and a clip left with one crop is
+# kept whole). That kept one interaction from being cut into the action and
+# somebody's back, but in close footage it also kept two actions side by side
+# together (1 of 18 split on the reviewed windows). None never merges: each
+# planned slot with a person gets its own crop, and the tracker follows it.
+SAME_ACTION_OVERLAP = None
 # 4+ people: a third of the frame gets a crop when it averages at least this
 # many people (each person counted once, in the third holding their centre).
 ZONE_PEOPLE_MIN = 0.5

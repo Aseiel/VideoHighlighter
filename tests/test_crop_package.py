@@ -300,8 +300,25 @@ def test_a_crop_takes_a_person_whole_and_one_action_stays_one_crop(monkeypatch):
     middle = (150, 10, 330, 290)          # overlaps the left person by 50 px of 200
     det = _Detector(lambda _n: [left, middle, right])
 
-    plan = track.plan_slots("clip.mp4", det, None, ["left", "middle"])
+    plan = track.plan_slots("clip.mp4", det, None, ["left", "middle"],
+                            same_action_overlap=0.5)
 
     assert plan["middle"] is None         # merged: the same people as "left"
     assert plan["left"] == (0, 10, 330, 290)
     assert plan.get("right") is None      # never asked for, never pulled in
+
+
+def test_by_default_two_slots_are_never_merged(monkeypatch):
+    """config.SAME_ACTION_OVERLAP is None: every slot with a person keeps its
+    crop, even one that took a neighbour whole."""
+    from modules.crop import config, track
+
+    assert config.SAME_ACTION_OVERLAP is None
+    monkeypatch.setattr(track, "cv2", _fake_cv2(frames=30))
+    left, right = (0, 10, 200, 290), (420, 10, 600, 290)
+    middle = (150, 10, 330, 290)
+    det = _Detector(lambda _n: [left, middle, right])
+
+    plan = track.plan_slots("clip.mp4", det, None, ["left", "middle"])
+
+    assert plan["left"] is not None and plan["middle"] is not None
