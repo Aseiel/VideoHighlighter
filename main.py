@@ -737,10 +737,29 @@ class SignalRunWorker(QThread):
         if self.kind == "audio":
             return aod.run_audio(video_path, progress=progress, cancel=c, log=self.log.emit)
         if self.kind == "objects":
-            result = aod.run_objects(video_path, p.get("objects") or [],
-                                     progress=progress, cancel=c, log=self.log.emit,
-                                     preview_fn=preview_fn)
-            return {"objects": result}
+            # The patch form, so the boxes are cached too: they are what the
+            # composition rules and the overlay read, and a pass that dropped
+            # them had to be run again in full to get them.
+            classes = p.get("objects") or []
+            patch = aod.run_objects_patch(video_path, classes, progress=progress,
+                                          cancel=c, log=self.log.emit,
+                                          preview_fn=preview_fn)
+            patch["object_bboxes"] = aod.fold_object_boxes(
+                video_path, patch["object_bboxes"], classes)
+            return patch
+        if self.kind == "composition":
+            # Applying the rules is milliseconds, but fetching what they read
+            # need not be: a rule naming a class the cache lacks starts a
+            # detection pass here, and one naming a vocal signal decodes the
+            # audio. Both report and both are interruptible, so the run looks
+            # like every other on-demand run rather than a frozen window.
+            def detect_fn(classes, progress=None, cancel=None):
+                return aod.run_objects_patch(
+                    video_path, classes, progress=progress,
+                    cancel=cancel if cancel is not None else c,
+                    log=self.log.emit, preview_fn=preview_fn)
+            return aod.run_composition(video_path, progress=progress, cancel=c,
+                                       detect_fn=detect_fn, log=self.log.emit)
         if self.kind == "actions":
             result = aod.run_actions(video_path, interesting_actions=p.get("actions") or [],
                                      progress=progress, cancel=c, log=self.log.emit,
@@ -2153,6 +2172,11 @@ class VideoHighlighterGUI(QWidget):
             select_path=advanced_cfg.get("yolo_custom_model_path", "") or "",
         )
         self.object_model_combo.currentIndexChanged.connect(on_object_model_changed)
+        # On-demand analysis (the timeline viewer) reads the detector from
+        # config.yaml, so a model picked here must reach the file now, not at
+        # exit. `activated` is the user's pick only, never a programmatic set
+        # while the window is still loading its settings.
+        self.object_model_combo.activated.connect(lambda _i: self.save_config())
 
         current_model = advanced_cfg.get("yolo_model_size", "n")
         on_object_model_changed()
@@ -2707,6 +2731,8 @@ class VideoHighlighterGUI(QWidget):
         comp_add_signal_btn.clicked.connect(
             lambda: _comp_add_table_row(kind='Signal'))
         comp_save_btn.clicked.connect(_comp_save_rules)
+        # Run Rules saves the table first, so what runs is what is on screen.
+        self._comp_save_rules = _comp_save_rules
         _comp_load_rules()
 
         # ── Group 5: Bounding Box Visualization ──
@@ -5486,6 +5512,9 @@ class VideoHighlighterGUI(QWidget):
         """
         self._report_only = bool(report_only)
         self._simple_run = bool(simple)
+        # What runs now is what config.yaml says from now on, so a timeline
+        # opened on this result analyses on demand with the same detector.
+        self.save_config()
         video_paths = self.get_file_list()
         
         if not video_paths:
@@ -5903,6 +5932,45 @@ class VideoHighlighterGUI(QWidget):
                 self.append_log("⚠️ Type at least one object class first (e.g. person, car).")
                 return
             params["objects"] = objs
+        elif kind == "composition":
+            # Run applies what is on screen. The engine reads the file, so a
+            # table edit that was never saved would run the *previous* rules
+            # and report a result for thresholds nobody could see any more.
+            saver = getattr(self, "_comp_save_rules", None)
+            if saver is not None and saver(quiet=True):
+                self.append_log("💾 Saved the edited rules first.")
+
+            # Checked once here rather than per video: a missing or empty rules
+            # file fails identically for every file.
+            from modules.system.app_paths import composition_rules_path
+            rules_path = composition_rules_path()
+            if not rules_path:
+                self.append_log("⚠️ No composition rules saved yet — add rules "
+                                "above and press Save Rules first.")
+                return
+            try:
+                from video_ai_editor.composition_engine import CompositionEngine
+                engine = CompositionEngine(rules_path)
+                names = engine.event_names
+                classes = engine.object_classes
+            except Exception as e:
+                self.append_log(f"⚠️ Could not read {rules_path}: {e}")
+                return
+            if not names:
+                self.append_log("⚠️ No events defined in the rules file — add a "
+                                "rule above and press Save Rules first.")
+                return
+
+            # Said up front: these two turn a seconds-long run into a long one.
+            from modules.rules import composition_signals
+            signals = sorted(composition_signals.signal_names(rules_path))
+            self.append_log(f"🧩 Applying {len(names)} rule(s): {', '.join(names)}")
+            if classes:
+                self.append_log(f"   objects: {', '.join(classes)} — detected "
+                                "per video where the cache has none")
+            if signals:
+                self.append_log(f"   signals: {', '.join(signals)} — measured "
+                                "from the file, cached after the first run")
         elif kind == "actions":
             # Blank = detect every action (same as the timeline viewer).
             params["actions"] = [s.strip() for s in self.actions_input.text().split(",") if s.strip()]
@@ -6906,6 +6974,8 @@ class VideoHighlighterGUI(QWidget):
 
     def open_timeline_viewer(self):
         """Open timeline viewer for the selected video"""
+        # Its on-demand analysis reads config.yaml: give it what is on screen.
+        self.save_config()
         video_paths = self.get_file_list()
         
         if not video_paths:

@@ -86,14 +86,20 @@ def test_detector_accepts_a_preview_hook(module, func):
 
 
 ONDEMAND_CALLERS = ("main.py", "signal_timeline_viewer.py")
-ONDEMAND_RUNNERS = ("run_actions", "run_objects")
+ONDEMAND_RUNNERS = ("run_actions", "run_objects", "run_objects_patch")
 
 
 @pytest.mark.parametrize("runner", ONDEMAND_RUNNERS)
 def test_ondemand_runner_forwards_preview_fn(runner):
-    """`run_actions`/`run_objects` take a preview hook and hand it to the
-    detector — an on-demand run detects over the whole video exactly as the
-    pipeline's stage does, so it has the same frames to show."""
+    """Each on-demand runner takes a preview hook and hands it on — an
+    on-demand run detects over the whole video exactly as the pipeline's stage
+    does, so it has the same frames to show.
+
+    "Hands it on" covers a runner that delegates to another one rather than
+    calling the detector itself (`run_objects` is the names-only view of
+    `run_objects_patch`): the hook is dropped just as completely by a wrapper
+    that forgets it, and the window looks just as broken.
+    """
     tree = ast.parse((REPO / "modules" / "report" / "analysis_ondemand.py")
                      .read_text(encoding="utf-8"))
     fn = next((n for n in ast.walk(tree)
@@ -103,12 +109,13 @@ def test_ondemand_runner_forwards_preview_fn(runner):
     accepted = {a.arg for a in fn.args.args + fn.args.kwonlyargs}
     assert "preview_fn" in accepted, f"{runner} does not accept preview_fn"
 
-    detector_calls = [n for n in ast.walk(fn)
-                      if isinstance(n, ast.Call)
-                      and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) in
-                      ("run_action_detection_siglip", "run_object_detection_single")]
-    assert detector_calls, f"{runner} calls no detector"
-    for call in detector_calls:
+    onward = ("run_action_detection_siglip", "run_object_detection_single",
+              "run_objects_patch")
+    calls = [n for n in ast.walk(fn)
+             if isinstance(n, ast.Call)
+             and (getattr(n.func, "id", None) or getattr(n.func, "attr", None)) in onward]
+    assert calls, f"{runner} calls neither a detector nor another runner"
+    for call in calls:
         assert "preview_fn" in {kw.arg for kw in call.keywords}, (
             f"{runner} accepts preview_fn but does not pass it on — the hook is "
             f"dropped and the preview window stays on its placeholder.")

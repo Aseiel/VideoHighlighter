@@ -381,6 +381,22 @@ def run_objects(video_path: str, objects: list, *, progress: ProgressFn = None,
 
     `preview_fn` feeds the live preview window, as in `run_actions`.
     """
+    return run_objects_patch(video_path, objects, progress=progress, cancel=cancel,
+                             log=log, preview_fn=preview_fn)["objects"]
+
+
+def run_objects_patch(video_path: str, objects: list, *,
+                      progress: ProgressFn = None, cancel=None, log=print,
+                      preview_fn=None) -> dict:
+    """One object-detection pass as a cache patch: `objects` *and*
+    `object_bboxes`.
+
+    The boxes are kept because this pass is the expensive one and they are the
+    only thing the composition engine and the overlay can read: an on-demand
+    run that dropped them left a video whose `objects` list said a class was
+    there while no rule about it could ever fire, and the fix was a full
+    pipeline run. (The same as the Pro edition's.)
+    """
     objects = [o.strip() for o in (objects or []) if o and o.strip()]
     if not objects:
         raise ValueError("No object classes given — type at least one (e.g. person, car).")
@@ -395,7 +411,7 @@ def run_objects(video_path: str, objects: list, *, progress: ProgressFn = None,
             "Object detector unavailable — no usable model "
             "(run tools/get_yolox_model.py, or import a custom model).")
 
-    det_by_sec, _bboxes = run_object_detection_single(
+    det_by_sec, bboxes = run_object_detection_single(
         video_path, model, objects,
         log_fn=log, progress_fn=progress,
         frame_skip=d["object_frame_skip"],
@@ -406,10 +422,13 @@ def run_objects(video_path: str, objects: list, *, progress: ProgressFn = None,
     if cancel is not None and cancel.is_set():
         raise _Cancelled()
 
-    return [
-        {"timestamp": int(sec), "objects": [str(o) for o in objs], "count": len(objs)}
-        for sec, objs in sorted(det_by_sec.items())
-    ]
+    return {
+        "objects": [
+            {"timestamp": int(sec), "objects": [str(o) for o in objs], "count": len(objs)}
+            for sec, objs in sorted(det_by_sec.items())
+        ],
+        "object_bboxes": list(bboxes or []),
+    }
 
 
 # --------------------------------------------------------------------------- #
