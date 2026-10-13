@@ -24,6 +24,11 @@ one-action clips. Measured on unseen footage, whole frames sorted 16 % of
 windows against 40 % for per-person crops and 43 % for the real cropper, which
 costs ~7 s per 5-s window (docs/plans/2026-10-03-automatic-sorting.md).
 
+* **Both** in one run: with a head in use, typed actions that are not the
+  head's own are scored by name alongside it (whole frames, the shared
+  encoder), as the Intel/R3D "mixed" mode ran a trained model next to the
+  Kinetics ones. A blank action field reports the head's actions only.
+
 A head is a folder with ``head.onnx`` and ``head.json`` as written by
 ``model_training.action_head.train``. Its classes are the user's own; nothing
 here names any of them.
@@ -220,7 +225,8 @@ def available() -> bool:
 def installed_head_classes() -> Optional[tuple]:
     """``(name, actions)`` a run would choose from, or None: a trained head's
     own classes, else the encoder's action list (Kinetics-700), which is only
-    a list of suggestions; any typed action is scored."""
+    a list of suggestions; any typed action is scored (by name when it is not
+    the head's)."""
     try:
         from modules.vision import frame_encoder
         heads = active_heads(frame_encoder.ENCODER_ID)
@@ -441,6 +447,31 @@ def _needs_shared_encoder(head) -> bool:
     return not getattr(head, "own_encoder", None)
 
 
+def _beside_head(head, encoder, names: Sequence[str], log: LogFn = print):
+    """``(scorer, encoder, True)`` for typed ``names`` a head does not have,
+    scored by name on whole frames beside it, or None (after saying why).
+
+    They share the head's windows, so they read its frame count. A head on the
+    shared encoder lends it; a fine-tuned head's own tower cannot read text,
+    so the shared encoder is loaded next to it."""
+    from modules.vision import frame_encoder
+
+    shared = encoder if _needs_shared_encoder(head) else None
+    if shared is None:
+        if not frame_encoder.is_installed():
+            log("ℹ️ Typed actions beside a trained model need the action model "
+                "encoder, which is not installed")
+            return None
+        shared = frame_encoder.load(log=log)
+        if shared is None:
+            return None
+    text = text_actions(names, log=log)
+    if text is None:
+        return None
+    text.frames = head.frames
+    return text, shared, True
+
+
 # ── windows and crops ────────────────────────────────────────────────────────
 
 def window_frames(total_frames: int, fps: float, k: int,
@@ -562,7 +593,12 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
 
     ``frames_per_window``: frames read per window for actions by name
     (FRAMES_CHOICES; default TEXT_FRAMES). A trained head reads the number it
-    was trained on, whatever this says.
+    was trained on, whatever this says, and so do actions by name scored
+    beside it (they share its windows).
+
+    With a head in use, typed actions that are not among its classes are
+    scored by name in the same pass (:func:`text_actions`, whole frames, the
+    shared encoder); their action ids follow the head's.
 
     ``annotated_output``: also write a copy of the video with the actions drawn
     on it (:func:`write_annotated_video`), the file the timeline viewer offers
@@ -622,6 +658,9 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             detector = None
 
     wanted_names = None
+    # What each window is scored by: (scorer, its encoder, by name). A head
+    # comes first; typed actions it does not have follow, by name.
+    parts = [(head, encoder, by_name)]
     if interesting_actions and not by_name:
         wanted_names = {a.strip().lower() for a in interesting_actions if a and a.strip()}
         untrusted = sorted(a for a in wanted_names
@@ -632,7 +671,11 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             log(f"ℹ️ Not reported, the head's held-out evidence is too thin to trust: "
                 f"{', '.join(untrusted)}")
         if unknown:
-            log(f"ℹ️ Not in action head {head.name}: {', '.join(unknown)}")
+            extra = _beside_head(head, encoder, unknown, log)
+            if extra is None:
+                log(f"ℹ️ Not in action head {head.name}: {', '.join(unknown)}")
+            else:
+                parts.append(extra)
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -651,8 +694,8 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             owner.setdefault(f, []).append(w)
     remaining = {w: len(set(frames)) for w, frames in enumerate(windows)}
     pending = {}            # frame -> (bgr, boxes) until its windows are done
-    queue = []              # (window, region, [4 crops]) waiting for the encoder
-    window_scores = {}      # window -> (best score per class, region per class)
+    queue = []              # (part, window, region, [4 crops]) waiting for the encoder
+    window_scores = [{} for _ in parts]  # per part: window -> (best per class, region per class)
     people = f"people: YOLOX on {device}" if detector is not None else "no person boxes"
     tuned = "" if _needs_shared_encoder(head) else f", the head's own {encoder.encoder_id}"
     log(f"🎯 Action recognition: SigLIP2 on {encoder.label}{tuned} ({people})")
@@ -664,6 +707,9 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     else:
         log(f"🎬 Looking for the actions of {head.name} ({len(head.trusted)} of "
             f"{len(head.classes)} trusted), {len(windows)} windows of {window_s:g} s")
+    for extra, extra_encoder, _ in parts[1:]:
+        log(f"🎬 And by name beside it: {', '.join(extra.classes)} "
+            f"({extra.name}, whole frames, SigLIP2 on {extra_encoder.label})")
     analysed_every = max(1, round(total / max(1, len(owner))))
 
     timing = {"encode": 0.0, "encoded": 0, "detect": 0.0, "hits": 0,
@@ -672,22 +718,26 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
     def flush():
         if not queue:
             return
-        t0 = _time.perf_counter()
-        feats = encoder.encode_bgr([c for _, _, crops in queue for c in crops])
-        timing["encode"] += _time.perf_counter() - t0
-        timing["encoded"] += len(feats)
-        feats = feats.reshape(len(queue), head.frames, -1)
-        scores = head.scores(feats)
-        timing["hits"] += int(head.detected(scores).sum())
-        for (w, region, _), s in zip(queue, scores):
-            best, where = window_scores.get(w, (None, None))
-            if best is None:
-                window_scores[w] = (s.copy(), [region] * len(s))
-            else:
-                better = s > best
-                best[better] = s[better]
-                for i in np.flatnonzero(better):
-                    where[i] = region
+        for p, (scorer, part_encoder, _) in enumerate(parts):
+            items = [q for q in queue if q[0] == p]
+            if not items:
+                continue
+            t0 = _time.perf_counter()
+            feats = part_encoder.encode_bgr([c for _, _, _, crops in items for c in crops])
+            timing["encode"] += _time.perf_counter() - t0
+            timing["encoded"] += len(feats)
+            feats = feats.reshape(len(items), scorer.frames, -1)
+            scores = scorer.scores(feats)
+            timing["hits"] += int(scorer.detected(scores).sum())
+            for (_, w, region, _), s in zip(items, scores):
+                best, where = window_scores[p].get(w, (None, None))
+                if best is None:
+                    window_scores[p][w] = (s.copy(), [region] * len(s))
+                else:
+                    better = s > best
+                    best[better] = s[better]
+                    for i in np.flatnonzero(better):
+                        where[i] = region
         queue.clear()
 
     import time
@@ -734,14 +784,16 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             if remaining[w] == 0:
                 frames = windows[w]
                 regions = person_regions([pending[f][1] for f in frames], width, height)
-                if by_name:
-                    # Scored on the whole frame, drawn around the people.
-                    queue.append((w, _box_for(regions, width, height),
-                                  [pending[f][0] for f in frames]))
-                else:
-                    for region in regions:
-                        x1, y1, x2, y2 = region
-                        queue.append((w, region, [pending[f][0][y1:y2, x1:x2] for f in frames]))
+                for p, (_, _, whole) in enumerate(parts):
+                    if whole:
+                        # Scored on the whole frame, drawn around the people.
+                        queue.append((p, w, _box_for(regions, width, height),
+                                      [pending[f][0] for f in frames]))
+                    else:
+                        for region in regions:
+                            x1, y1, x2, y2 = region
+                            queue.append((p, w, region,
+                                          [pending[f][0][y1:y2, x1:x2] for f in frames]))
                 if len(queue) * head.frames >= ENCODE_BATCH:
                     flush()
                 if progress_callback:
@@ -767,23 +819,27 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
 
     detections, bboxes = [], []
     last_second = int(np.ceil(total / fps))
-    for w in sorted(window_scores):
-        scores, where = window_scores[w]
-        hits = head.detected(scores[None, :])[0]
-        seconds = window_seconds(windows, w, fps, last_second)
-        for i in np.flatnonzero(hits):
-            name = head.classes[i]
-            if wanted_names is not None and name.lower() not in wanted_names:
-                continue
-            x1, y1, x2, y2 = _drawable(where[i], width, height)
-            box = [x1 / width, y1 / height, (x2 - x1) / width, (y2 - y1) / height]
-            for sec in seconds:
-                if sec < 0 or sec * fps >= total:
+    first_id = 0            # action ids run on across parts, so they never collide
+    for p, (scorer, _, _) in enumerate(parts):
+        for w in sorted(window_scores[p]):
+            scores, where = window_scores[p][w]
+            hits = scorer.detected(scores[None, :])[0]
+            seconds = window_seconds(windows, w, fps, last_second)
+            for i in np.flatnonzero(hits):
+                name = scorer.classes[i]
+                if p == 0 and wanted_names is not None and name.lower() not in wanted_names:
                     continue
-                detections.append((float(sec), int(sec * fps), int(i), float(scores[i]), name))
-                bboxes.append({"timestamp": float(sec), "action_name": name,
-                               "confidence": float(scores[i]), "bbox": box,
-                               "model_type": MODEL_TYPE})
+                x1, y1, x2, y2 = _drawable(where[i], width, height)
+                box = [x1 / width, y1 / height, (x2 - x1) / width, (y2 - y1) / height]
+                for sec in seconds:
+                    if sec < 0 or sec * fps >= total:
+                        continue
+                    detections.append((float(sec), int(sec * fps), first_id + int(i),
+                                       float(scores[i]), name))
+                    bboxes.append({"timestamp": float(sec), "action_name": name,
+                                   "confidence": float(scores[i]), "bbox": box,
+                                   "model_type": MODEL_TYPE})
+        first_id += len(scorer.classes)
     detections.sort(key=lambda d: (d[0], -d[3]))
     log(f"✅ Action recognition: {len(detections)} detections "
         f"({len({d[4] for d in detections})} actions) in {len(windows)} windows")

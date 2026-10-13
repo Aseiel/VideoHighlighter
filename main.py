@@ -5041,6 +5041,8 @@ class VideoHighlighterGUI(QWidget):
             elif head and head[0] != action_siglip.TEXT_SOURCE:
                 text = (f"In use: your trained model {head[0]} "
                         f"({len(head[1])} actions)")
+                if frame_encoder.has_text():
+                    text += "; any other typed action is scored by name beside it"
             elif frame_encoder.has_text():
                 text = ("In use: SigLIP2 by name; type any action, Kinetics-700 names "
                         "are suggested")
