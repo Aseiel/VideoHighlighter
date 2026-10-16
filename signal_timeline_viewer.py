@@ -613,6 +613,7 @@ class SignalTimelineWindow(QMainWindow):
             try:
                 if hasattr(self, 'realtime_preview') and self.realtime_preview:
                     self.realtime_preview.shutdown_live_face()
+                    self.realtime_preview.shutdown_outlines()
             except Exception:
                 pass
 

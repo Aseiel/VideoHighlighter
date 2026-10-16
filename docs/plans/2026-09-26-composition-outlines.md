@@ -163,11 +163,11 @@ went from 24% to 67%. Outlines added at most 0.02 to the same separation.
 
 | piece | effort | notes |
 |---|---|---|
-| SAM measured on real footage, licence confirmed, packaged | 1 day | steps above |
+| ~~SAM measured on real footage, licence confirmed~~ | done | SlimSAM-77 card: Apache-2.0. Measured 2026-10-16: outlines did not make decisions more accurate on compact, adjacent parts; see [OUTLINES.md](../OUTLINES.md). Packaging (OpenVINO export, so `transformers` is not imported: that import alone takes ~20 s) is still open |
 | ~~Draw outlines in the timeline overlay~~ | done | a traced shape is drawn solid, its box dashed behind it |
 | ~~`Relation` and `Outline` columns in the Advanced tab~~ | done | `min_overlap` / `max_gap` are still YAML-only (kept on save) |
 | ~~Body-part sources from pose~~ | done | `source: person.hand` (or any COCO-17 keypoint, or the groups hand / foot / head / knee / elbow / shoulder / hip). Pose runs on demand only where the person's box meets the region's, and is cached as `keypoints` |
-| Outlines in the *live* overlay (every frame, while playing) | hard; not recommended | needs real-time segmentation. Composition is an offline reading of cached detections, and that's where outlines pay |
+| ~~Boxes / Outlines switch in the player overlay~~ | done | outlines traced in the background around the playhead, at the detector's rate rather than every frame, and written to the cache (`video_ai_editor/outline_feed.py`). For understanding a trained model's accuracy; see [OUTLINES.md](../OUTLINES.md) |
 
 Things that are *not* needed:
 

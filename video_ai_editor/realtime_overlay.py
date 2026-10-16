@@ -100,6 +100,55 @@ def _palette_color(i: int) -> QColor:
     return QColor.fromHsvF((i * 0.618) % 1.0, 0.85, 0.92)
 
 
+# The overlay's shape switch (Boxes / Outlines), remembered between runs.
+_SHAPE_SETTINGS = ("VideoHighlighter", "overlay")
+_SHAPE_KEY = "show_outlines"
+# How far ahead of the playhead outlines are traced, so they are ready when
+# the video gets there (seconds).
+OUTLINE_LOOKAHEAD = 2.0
+
+
+def _load_shape_setting() -> bool:
+    try:
+        from PySide6.QtCore import QSettings
+        return QSettings(*_SHAPE_SETTINGS).value(_SHAPE_KEY, False, type=bool)
+    except Exception:
+        return False
+
+
+def _save_shape_setting(show_outlines: bool) -> None:
+    try:
+        from PySide6.QtCore import QSettings
+        QSettings(*_SHAPE_SETTINGS).setValue(_SHAPE_KEY, bool(show_outlines))
+    except Exception:
+        pass
+
+
+def missing_outlines(entry: dict, hidden: set | frozenset = frozenset()) -> list[int]:
+    """Indices of the detections in a cache entry that have no outline yet and
+    whose class is shown. ``[]`` in ``contours`` means "tried, nothing found"
+    and is not tried again."""
+    names = entry.get('objects') or []
+    boxes = entry.get('bboxes') or []
+    contours = entry.get('contours') or []
+    return [i for i, name in enumerate(names)
+            if i < len(boxes) and isinstance(boxes[i], (list, tuple)) and len(boxes[i]) >= 4
+            and str(name) not in hidden
+            and not (i < len(contours) and contours[i] is not None)]
+
+
+def store_outlines(entry: dict, indices: list[int], outlines: list) -> None:
+    """Write traced outlines into a cache entry's ``contours`` (aligned with
+    its ``bboxes``), without replacing any that are already there."""
+    names = entry.get('objects') or []
+    contours = list(entry.get('contours') or [])
+    contours += [None] * (len(names) - len(contours))
+    for i, outline in zip(indices, outlines):
+        if i < len(contours) and contours[i] is None:
+            contours[i] = outline or []
+    entry['contours'] = contours
+
+
 def action_abbrev(name: str) -> str:
     """Short code from a class name: initials of its words, e.g.
     'jump' -> 'J', 'high five' -> 'HF', 'sit down' -> 'SD'."""
@@ -362,6 +411,28 @@ class LazyBBoxLoader:
             'type': 'action'
         }]
     
+    def object_entries_near(self, time_seconds: float, before: float, after: float) -> List[dict]:
+        """The cache's object entries from ``before`` seconds behind to ``after``
+        ahead, nearest first: what an outline pass should trace next. The
+        entries themselves, not copies, so outlines written into them land in
+        the cache."""
+        self._ensure_loaded()
+        found = []
+        for bucket in range(int((time_seconds - before) * 10), int((time_seconds + after) * 10) + 1):
+            for entry_type, entry in self._timestamp_index.get(bucket, ()):
+                if entry_type == 'object':
+                    found.append(entry)
+        found.sort(key=lambda e: abs(float(e.get('timestamp', 0)) - time_seconds))
+        return found
+
+    def invalidate(self, time_seconds: float):
+        """Forget the converted boxes at ``time_seconds``, so the next lookup
+        reads the entry again (after outlines were written into it)."""
+        bucket = int(time_seconds * 10)
+        self._bucket_cache.pop(bucket, None)
+        if bucket in self._bucket_access_order:
+            self._bucket_access_order.remove(bucket)
+
     def get_all_class_names(self) -> set[str]:
         """All formatted class names present, matching BBoxOverlayItem.class_name
         (objects raw, actions prefixed with their abbreviation)."""
@@ -431,6 +502,7 @@ class BBoxOverlayItem(QGraphicsRectItem):
         parent: QGraphicsItem | None = None,
         color: QColor | None = None,
         contours: list | None = None,
+        show_outline: bool = True,
     ):
         super().__init__(parent)
         self.class_name = class_name
@@ -439,8 +511,10 @@ class BBoxOverlayItem(QGraphicsRectItem):
         self.bbox_norm = bbox  # stored normalised, mapped to scene in update_geometry
         # Normalised outlines inside the box, when traced. With one, the shape
         # is what is drawn and the box stays only as a faint dashed frame: the
-        # rule was decided on the shape, so the shape is what to show.
-        self.contours_norm = [c for c in (contours or []) if c and len(c) >= 3]
+        # rule was decided on the shape, so the shape is what to show. With the
+        # overlay's shape switch on "Boxes", outlines are not drawn at all.
+        self.contours_norm = ([c for c in (contours or []) if c and len(c) >= 3]
+                              if show_outline else [])
 
         if color is None:
             color = color_for_class(class_name)
@@ -584,6 +658,9 @@ class OverlayScene(QGraphicsScene):
         # class_name -> QColor, mirroring the timeline's palette (built on load)
         self._class_colors: dict[str, QColor] = {}
 
+        # The shape switch: draw traced outlines (True) or boxes only (False).
+        self.show_outlines: bool = True
+
         # Video dimensions (updated when native size changes)
         self._video_w: float = 1920
         self._video_h: float = 1080
@@ -720,6 +797,7 @@ class OverlayScene(QGraphicsScene):
                         timestamp=ts,
                         color=self._class_colors.get(bbox['class_name']),
                         contours=bbox.get('contours'),
+                        show_outline=self.show_outlines,
                     )
                     scene_r = self.sceneRect()
                     item.update_geometry(scene_r.width(), scene_r.height())
@@ -812,6 +890,30 @@ class OverlayScene(QGraphicsScene):
         """Get number of items currently in scene."""
         return len(self._all_bbox_items)
     
+    def set_show_outlines(self, show: bool):
+        """Switch between boxes and outlines. Items are styled when made, so
+        they are rebuilt; the next ``update_time`` makes them again."""
+        if show == self.show_outlines:
+            return
+        self.show_outlines = show
+        self.clear_items()
+
+    def drop_timestamp(self, timestamp: float):
+        """Remove the items made for one moment, and make the next
+        ``update_time`` read it again: its entry has new outlines."""
+        stale = [it for it in self._all_bbox_items if it.timestamp == timestamp]
+        if not stale:
+            return
+        for item in stale:
+            self.removeItem(item)
+            self._all_bbox_items.remove(item)
+        bucket = int(timestamp * 10)
+        self._bbox_items[bucket] = [it for it in self._bbox_items.get(bucket, [])
+                                    if it.timestamp != timestamp]
+        if hasattr(self, '_bbox_loader'):
+            self._bbox_loader.invalidate(timestamp)
+        self._visible_bucket = -1
+
     def clear_items(self):
         """Remove all bbox items to free memory."""
         for item in self._all_bbox_items:
@@ -1001,6 +1103,11 @@ class RealtimeOverlayPreview(QWidget):
         self._overlay_enabled = False
         self._detection_count = 0
         self._max_cached_buckets = max_cached_buckets
+        # Shape switch (Boxes / Outlines): the background outliner, made on
+        # first use, and which cache entry each of its jobs fills.
+        self._outline_feed = None
+        self._outline_jobs: dict = {}
+        self._outline_bucket = None
 
         self._init_ui()
         self._view.fitted.connect(self._retarget_display)
@@ -1081,6 +1188,27 @@ class RealtimeOverlayPreview(QWidget):
         self._filter_btn.setEnabled(False)
         self._filter_actions: dict[str, QAction] = {}
         controls.addWidget(self._filter_btn)
+
+        # Shape switch: the box the detector gave, or the outline inside it.
+        self._shape_combo = QComboBox()
+        self._shape_combo.addItems(["▭ Boxes", "✏️ Outlines"])
+        self._shape_combo.setToolTip(
+            "Boxes: the rectangles the detector gave.\n"
+            "Outlines: the shape inside each box, traced in the background\n"
+            "(Segment Anything, prompted with the box) for what is on screen.\n\n"
+            "For understanding how accurate a trained model is: a box says\n"
+            "roughly where, an outline shows what the model actually picked\n"
+            "out, and a wrong one is easy to spot. An outline is a second\n"
+            "model's reading of the box, so the box stays dashed behind it.\n"
+            "Fast on a GPU; on a CPU outlines arrive more slowly."
+        )
+        self._shape_combo.setCurrentIndex(1 if _load_shape_setting() else 0)
+        self._scene.show_outlines = self._shape_combo.currentIndex() == 1
+        self._shape_combo.currentIndexChanged.connect(self._on_shape_changed)
+        controls.addWidget(self._shape_combo)
+        self._shape_label = QLabel("")
+        self._shape_label.setStyleSheet("color: #888; font-size: 11px;")
+        controls.addWidget(self._shape_label)
 
         controls.addStretch()
 
@@ -1332,10 +1460,15 @@ class RealtimeOverlayPreview(QWidget):
             pos_sec = self._player.position() / 1000.0
             window = self._window_slider.value() / 10.0
             self._scene.update_time(pos_sec, window)
+            self._outline_bucket = None
+            self._request_outlines(pos_sec)
         else:
             # Clear items when overlay is off to free memory
             self._scene.clear_items()
             self._bbox_loader.clear_cache()
+            if self._outline_feed is not None:
+                self._outline_feed.clear()
+            self._outline_jobs.clear()
 
         # In real-time mode the same checkbox gates the face-recognition worker,
         # so unchecking it actually stops processing (not just hides cached boxes).
@@ -1350,6 +1483,89 @@ class RealtimeOverlayPreview(QWidget):
         time_sec = position_ms / 1000.0
         window = self._window_slider.value() / 10.0
         self._scene.update_time(time_sec, window)
+        self._request_outlines(time_sec)
+
+    # ── Shape switch: boxes or outlines ────────────────────────────
+
+    def _on_shape_changed(self, index: int):
+        outlines = index == 1
+        _save_shape_setting(outlines)
+        self._scene.set_show_outlines(outlines)
+        self._outline_bucket = None
+        if not outlines and self._outline_feed is not None:
+            self._outline_feed.clear()
+            self._outline_jobs.clear()
+        if outlines:
+            self._ensure_outline_feed().warm_up()
+        self._update_shape_label()
+        if self._overlay_enabled:
+            pos_sec = self._player.position() / 1000.0
+            self._scene.update_time(pos_sec, self._window_slider.value() / 10.0)
+            self._request_outlines(pos_sec)
+
+    def _ensure_outline_feed(self):
+        if self._outline_feed is None:
+            from video_ai_editor.outline_feed import OutlineFeed
+            self._outline_feed = OutlineFeed(self.video_path, parent=self)
+            self._outline_feed.traced.connect(self._on_outlines_traced)
+            self._outline_feed.status.connect(self._on_outline_status)
+            self._outliner_name = ""
+        return self._outline_feed
+
+    def _request_outlines(self, time_sec: float):
+        """Queue outlines for the detections around the playhead (once per
+        100 ms bucket), nearest first."""
+        if not (self._overlay_enabled and self._scene.show_outlines):
+            return
+        bucket = int(time_sec * 10)
+        if bucket == self._outline_bucket:
+            return
+        self._outline_bucket = bucket
+        feed = self._ensure_outline_feed()
+        feed.set_playhead(time_sec)
+        hidden = self._scene._hidden_classes
+        for entry in self._bbox_loader.object_entries_near(time_sec, 0.5, OUTLINE_LOOKAHEAD):
+            need = missing_outlines(entry, hidden)
+            key = id(entry)
+            if need:
+                boxes = entry['bboxes']
+                if feed.submit(key, [list(boxes[i][:4]) for i in need],
+                               float(entry.get('timestamp', 0))):
+                    self._outline_jobs[key] = (entry, need)
+        self._update_shape_label()
+
+    def _on_outlines_traced(self, key, outlines: list):
+        job = self._outline_jobs.pop(key, None)
+        if job is None:
+            return
+        entry, need = job
+        store_outlines(entry, need, outlines)
+        if self._overlay_enabled and self._scene.show_outlines:
+            self._scene.drop_timestamp(float(entry.get('timestamp', 0)))
+            pos_sec = self._player.position() / 1000.0
+            self._scene.update_time(pos_sec, self._window_slider.value() / 10.0)
+        self._update_shape_label()
+
+    def _on_outline_status(self, text: str):
+        self._outliner_name = text
+        self._update_shape_label()
+
+    def _update_shape_label(self):
+        feed = self._outline_feed
+        if not self._scene.show_outlines or feed is None:
+            self._shape_label.setText("")
+            return
+        parts = [self._outliner_name or "outlines"]
+        parts.append(f"{feed.traced_count} traced")
+        if feed.pending():
+            parts.append(f"{feed.pending()} queued")
+        self._shape_label.setText(" · ".join(parts))
+
+    def shutdown_outlines(self):
+        if self._outline_feed is not None:
+            self._outline_feed.stop()
+            self._outline_feed = None
+        self._outline_jobs.clear()
 
     def _on_window_changed(self, value):
         window = value / 10.0
@@ -1365,6 +1581,10 @@ class RealtimeOverlayPreview(QWidget):
     def set_cache_data(self, cache_data: dict):
         """Update detection data (e.g. after new analysis)."""
         self.cache_data = cache_data
+        if self._outline_feed is not None:
+            self._outline_feed.clear()
+        self._outline_jobs.clear()
+        self._outline_bucket = None
         self._bbox_loader = LazyBBoxLoader(self.cache_data, self._max_cached_buckets)
         self._load_detections_lazy()
 
@@ -1605,6 +1825,7 @@ class RealtimeOverlayPreview(QWidget):
         self.clear_cache()
         self._memory_timer.stop()
         self.shutdown_live_face()
+        self.shutdown_outlines()
         super().closeEvent(event)
 
 

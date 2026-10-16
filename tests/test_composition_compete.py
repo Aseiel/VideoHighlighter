@@ -190,7 +190,10 @@ def test_a_table_save_keeps_it():
 
 
 def test_a_web_ui_save_keeps_it(tmp_path, monkeypatch):
-    from sidecar.server import CompRulesRequest, get_composition_rules, save_composition_rules
+    # The web UI (sidecar) is not in every edition.
+    server = pytest.importorskip("sidecar.server")
+    CompRulesRequest = server.CompRulesRequest
+    get_composition_rules, save_composition_rules = server.get_composition_rules, server.save_composition_rules
 
     rules = tmp_path / "composition_rules.yaml"
     rules.write_text(textwrap.dedent("""
