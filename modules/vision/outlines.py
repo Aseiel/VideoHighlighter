@@ -45,6 +45,8 @@ SIMPLIFY_TOLERANCE = 0.002
 MIN_FILL = 0.05
 
 DEFAULT_SAM_MODEL = "Zigeng/SlimSAM-uniform-77"
+# What the SAM processor returns for post-processing only: moved, never cast.
+_SIZE_KEYS = ("original_sizes", "reshaped_input_sizes")
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +138,7 @@ class SamOutliner:
             from transformers import SamModel, SamProcessor
 
             if self.device == "auto":
-                self.device = "cuda" if torch.cuda.is_available() else "cpu"
+                self.device = pick_device(torch)
             self._processor = SamProcessor.from_pretrained(self.model_id)
             self._model = SamModel.from_pretrained(self.model_id).to(self.device).eval()
 
@@ -153,7 +155,7 @@ class SamOutliner:
         inputs = self._processor(images=image,
                                  input_boxes=[[[float(v) for v in b] for b in boxes_px]],
                                  return_tensors="pt")
-        inputs = {k: v.to(self.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+        inputs = to_device(inputs, self.device)
         with torch.inference_mode():
             out = self._model(**inputs, multimask_output=False)
         masks = self._processor.image_processor.post_process_masks(
@@ -168,6 +170,33 @@ class SamOutliner:
                 continue
             result.append(mask_to_contour(m, frame_size=(width, height)))
         return result
+
+
+def pick_device(torch) -> str:
+    """CUDA, then an Intel GPU (``torch.xpu``, in builds that have it), then CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None and xpu.is_available():
+        return "xpu"
+    return "cpu"
+
+
+def to_device(inputs, device) -> dict:
+    """The processor's tensors on ``device``, floating ones as float32 first.
+
+    The processor returns some prompts (``input_boxes``) as float64, which an
+    Intel GPU cannot hold at all, and the model runs in float32 anyway. The
+    sizes post-processing reads are moved as they are.
+    """
+    out = {}
+    for key, value in inputs.items():
+        if hasattr(value, "to"):
+            if key not in _SIZE_KEYS and value.is_floating_point():
+                value = value.float()
+            value = value.to(device)
+        out[key] = value
+    return out
 
 
 def make_outliner(name: str = "grabcut"):

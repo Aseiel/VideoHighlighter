@@ -171,6 +171,12 @@ def test_sam_glue_turns_box_prompts_into_outlines(cv2, monkeypatch):
         def to(self, device):
             return self
 
+        def is_floating_point(self):
+            return self.a.dtype.kind == "f"
+
+        def float(self):
+            return T(self.a.astype(np.float32))
+
         def __getitem__(self, i):
             return T(self.a[i])
 
@@ -209,6 +215,84 @@ def test_sam_glue_turns_box_prompts_into_outlines(cv2, monkeypatch):
     assert result[1] is None
     xs = [p[0] for p in result[0]]
     assert min(xs) == pytest.approx(0.1) and max(xs) == pytest.approx(0.395)
+
+
+class _Tensor:
+    """Just enough of a tensor to record what ``to_device`` does to it."""
+
+    def __init__(self, dtype, moves=None):
+        self.dtype, self.moves = dtype, list(moves or [])
+
+    def is_floating_point(self):
+        return self.dtype.startswith("float")
+
+    def float(self):
+        return _Tensor("float32", self.moves)
+
+    def to(self, device):
+        return _Tensor(self.dtype, self.moves + [device])
+
+
+def test_processor_floats_reach_the_device_as_float32():
+    """Intel GPUs have no float64: the processor's float64 boxes are cast on
+    the CPU, before the move. Sizes for post-processing move unchanged."""
+    moved = outlines.to_device({
+        "pixel_values": _Tensor("float32"),
+        "input_boxes": _Tensor("float64"),
+        "original_sizes": _Tensor("float64"),
+        "reshaped_input_sizes": _Tensor("int64"),
+        "note": "not a tensor",
+    }, "xpu")
+    assert moved["input_boxes"].dtype == "float32"
+    assert moved["pixel_values"].dtype == "float32"
+    assert moved["original_sizes"].dtype == "float64"
+    assert moved["reshaped_input_sizes"].dtype == "int64"
+    assert all(moved[k].moves == ["xpu"] for k in moved if k != "note")
+    assert moved["note"] == "not a tensor"
+
+
+def _torch_with(cuda: bool, xpu=None):
+    import types
+
+    fake = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: cuda))
+    if xpu is not None:
+        fake.xpu = types.SimpleNamespace(is_available=lambda: xpu)
+    return fake
+
+
+@pytest.mark.parametrize("cuda, xpu, expected", [
+    (True, True, "cuda"),
+    (False, True, "xpu"),
+    (False, False, "cpu"),
+    (False, None, "cpu"),          # a torch build with no xpu module at all
+])
+def test_auto_device_finds_intel_gpus_too(cuda, xpu, expected):
+    assert outlines.pick_device(_torch_with(cuda, xpu)) == expected
+
+
+def test_auto_device_is_resolved_on_load(monkeypatch):
+    import types
+
+    loaded = {}
+
+    class Loader:
+        @classmethod
+        def from_pretrained(cls, model_id):
+            return cls()
+
+        def to(self, device):
+            loaded["device"] = device
+            return self
+
+        def eval(self):
+            return self
+
+    monkeypatch.setitem(sys.modules, "torch", _torch_with(False, True))
+    monkeypatch.setitem(sys.modules, "transformers",
+                        types.SimpleNamespace(SamModel=Loader, SamProcessor=Loader))
+    sam = outlines.SamOutliner()
+    sam._load()
+    assert sam.device == "xpu" and loaded["device"] == "xpu"
 
 
 def test_the_pipeline_path_traces_on_copies_and_reports_it(tmp_path, monkeypatch):
