@@ -204,6 +204,19 @@ def relates(source: dict, region: dict, relation: str = INSIDE,
     raise ValueError(f"relation must be one of {RELATIONS}, not {relation!r}")
 
 
+def closeness(source: dict, region: dict) -> tuple:
+    """How close ``source`` is to ``region``, as a key: larger is closer.
+
+    Ranked by the share of the source's area inside the region; between
+    shapes that hold equal shares (none, or all of it), the smaller gap; and
+    then the nearer centre, so a source wholly inside two nested regions goes
+    to the one it sits in the middle of.
+    """
+    ps, pr = as_polygon(source), as_polygon(region)
+    (sx, sy), (rx, ry) = centroid(ps), centroid(pr)
+    return (overlap_fraction(ps, pr), -gap(ps, pr), -math.hypot(sx - rx, sy - ry))
+
+
 def simplify(points: Sequence, tolerance: float) -> list:
     """Ramer-Douglas-Peucker: drop points closer than ``tolerance`` to the
     line through their neighbours. Keeps stored outlines to a few dozen points."""

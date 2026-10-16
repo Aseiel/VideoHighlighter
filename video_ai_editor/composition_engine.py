@@ -13,6 +13,10 @@ consistently over a short time window. Two kinds of condition exist:
     ``max_gap``). Detections are boxes, or outlines where the cache carries
     ``contours``; see ``modules/rules/shapes.py``.
 
+    A rule may name rival region classes in ``compete_with``: a source then
+    counts only if it is closer to the rule's region than to any of them. See
+    ``_Rule.compete_with``.
+
 *signal* (``signals:``)
     Compare a per-second measurement against a threshold, or a per-second label
     against a set of accepted values.
@@ -40,7 +44,7 @@ from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from modules.rules.shapes import RELATIONS, relates
+from modules.rules.shapes import RELATIONS, closeness, relates
 
 
 # Two points (body parts) closer than this, as a fraction of the frame, are the
@@ -55,6 +59,22 @@ def _relation(value) -> str:
     if relation not in RELATIONS:
         raise ValueError(f"relation must be one of {RELATIONS}, not {value!r}")
     return relation
+
+
+def _rivals(value, region: str) -> tuple:
+    """A rule's ``compete_with``: one class or a list of them, checked."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"compete_with must be a class or a list of classes, not {value!r}")
+    names = []
+    for v in value:
+        name = str(v or "").strip()
+        if name and name != region and name not in names:
+            names.append(name)
+    return tuple(names)
 
 
 @dataclass
@@ -72,6 +92,22 @@ class _Rule:
     # Ask for outlines of both classes (``modules/vision/outlines.py``). Off,
     # the rule is decided on boxes, as it always was.
     outline: bool = False
+    # Region classes that compete with this rule's region for each source. A
+    # source counts only if it is closer to this rule's region than to any of
+    # these (``shapes.closeness``: overlap, then gap, then centres); on an
+    # exact tie it counts, as it would without them.
+    #
+    # Rules are judged one at a time, so when two region classes sit side by
+    # side in the frame one source meets both, and a rule on each fires on the
+    # same thing. Naming the neighbour gives each source to one of them.
+    #
+    # It lives on the rule, and is decided from the detections alone, so it
+    # holds across events: a rule on ``b`` that names ``a`` reaches the
+    # opposite verdict on the same source, in whatever event it sits, without
+    # the two rules knowing of each other. A file-wide "assign to the closest"
+    # would make one event's answer depend on which other events exist, and on
+    # whether they are ticked. Empty, the rule answers exactly as before.
+    compete_with: tuple = ()
 
 
 @dataclass
@@ -213,7 +249,8 @@ class CompositionEngine:
         # the cache's keypoints, per frame, as point detections.
         from modules.rules.body_parts import is_part
         self._part_refs = {cls for spec in self._specs for rule in spec.rules
-                           for cls in (rule.source_class, rule.region_class)
+                           for cls in (rule.source_class, rule.region_class,
+                                       *rule.compete_with)
                            if is_part(cls)}
 
     # ------------------------------------------------------------------ public
@@ -245,10 +282,11 @@ class CompositionEngine:
         """``(source, region, max_gap)`` for every enabled rule that asked for
         outlines: what an outline pass has to trace, and next to what."""
         from modules.rules.body_parts import base_class
-        return sorted({(base_class(rule.source_class), base_class(rule.region_class),
-                        rule.max_gap)
+        # A rival is compared on outlines too, so it needs them traced as well.
+        return sorted({(base_class(rule.source_class), base_class(region), rule.max_gap)
                        for spec in self._specs if spec.enabled
-                       for rule in spec.rules if rule.outline})
+                       for rule in spec.rules if rule.outline
+                       for region in (rule.region_class, *rule.compete_with)})
 
     @property
     def keypoint_pairs(self) -> list:
@@ -258,8 +296,9 @@ class CompositionEngine:
         return sorted({(base_class(a), base_class(b), rule.max_gap)
                        for spec in self._specs if spec.enabled
                        for rule in spec.rules
-                       for a, b in ((rule.source_class, rule.region_class),
-                                    (rule.region_class, rule.source_class))
+                       for region in (rule.region_class, *rule.compete_with)
+                       for a, b in ((rule.source_class, region),
+                                    (region, rule.source_class))
                        if is_part(a)})
 
     @property
@@ -276,10 +315,13 @@ class CompositionEngine:
         from modules.rules.body_parts import base_class
         # A body part is found on its class's detections: `person.hand` needs
         # people detected, and asking a detector for "person.hand" finds nothing.
+        # Rivals in `compete_with` are read too: one never detected would let
+        # every source through, the answer the rule exists to avoid.
         return sorted({base_class(cls)
                        for spec in self._specs if spec.enabled
                        for rule in spec.rules
-                       for cls in (rule.source_class, rule.region_class)
+                       for cls in (rule.source_class, rule.region_class,
+                                   *rule.compete_with)
                        if cls})
 
     def run(self, bbox_cache: list[dict],
@@ -623,6 +665,7 @@ class CompositionEngine:
                     min_overlap=float(r.get('min_overlap', 0.5)),
                     max_gap=float(r.get('max_gap', 0.0)),
                     outline=bool(r.get('outline', False)),
+                    compete_with=_rivals(r.get('compete_with'), r['region']),
                 )
                 for r in ev.get('rules', [])
             ]
@@ -745,7 +788,7 @@ class CompositionEngine:
             for i, src in enumerate(sources):
                 if any(relates(self._as_used_by(src, rule), self._as_used_by(rgn, rule),
                                rule.relation, rule.min_overlap, rule.max_gap)
-                       for rgn in regions):
+                       for rgn in regions) and self._wins(rule, src, effective):
                     claimed.append(src)
                     claimed_idx.append(i)
             count = len(claimed)
@@ -760,6 +803,23 @@ class CompositionEngine:
             all_matched.extend(claimed)
             all_matched.extend(regions)
         return True, all_matched
+
+    @classmethod
+    def _wins(cls, rule, src: dict, effective: dict) -> bool:
+        """Whether ``src`` is at least as close to ``rule``'s region class as
+        to every class in its ``compete_with``. Each class is as close as its
+        closest detection; a rival with none in the frame cannot win."""
+        if not rule.compete_with:
+            return True
+        source = cls._as_used_by(src, rule)
+
+        def best(region_class):
+            return max((closeness(source, cls._as_used_by(rgn, rule))
+                        for rgn in effective.get(region_class, [])), default=None)
+
+        own = best(rule.region_class)
+        return all(rival is None or own >= rival
+                   for rival in map(best, rule.compete_with))
 
     @staticmethod
     def _union_box(boxes: list) -> list | None:

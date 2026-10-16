@@ -130,6 +130,35 @@ without a column was deleted on Save.
   deleted all signal conditions, signal-only events and event fields such as
   `min_duration_secs`. It now merges onto the file the same way.
 
+### 5. Competing regions (done): `compete_with`
+
+```yaml
+- {source: <holder>, region: <a>, compete_with: [<b>]}
+- {source: <holder>, region: <b>, compete_with: [<a>]}   # may sit in another event
+```
+
+Rules are judged one at a time, so when two region classes sit side by side a
+single source meets both and a rule on each fires. With `compete_with`, a
+source counts for the rule only if it is closer to the rule's region than to
+every class named there: more of its area inside, then the smaller gap, then
+the nearer centre. Each rule decides from the detections alone, so this holds
+across events with no rule knowing of the other. Without the field a rule
+answers exactly as before. YAML-only for now, and kept on save like the other
+fields with no column.
+
+Measured on real footage (2026-10-16, 666 clips, decisions by this engine), on
+plain boxes, for the rule on the region that is easier to confuse:
+
+| relation | AUC, off → on | that rule's false positives on the neighbour's clips |
+|---|---|---|
+| `inside` | 0.65 → 0.71 | 17% → 8% |
+| `touches` | 0.47 → 0.69 | 45% → 16% |
+| `overlaps` 0.1 | 0.51 → 0.69 | 40% → 15% |
+
+An event that needs one source on each region gains too: with `touches`,
+sources were claimed by the first rule even when nearer the second, and recall
+went from 24% to 67%. Outlines added at most 0.02 to the same separation.
+
 ## What is left, and how hard
 
 | piece | effort | notes |
@@ -153,7 +182,7 @@ Things that are *not* needed:
 - `modules/rules/shapes.py`: polygons, relations, simplification
 - `modules/vision/outlines.py`: GrabCut / SAM outliners, the on-demand pass
 - `video_ai_editor/composition_engine.py`: `relation`, `min_overlap`,
-  `max_gap`, `outline` on rules; `outliner` at the top; `contours` read from the cache
+  `max_gap`, `outline`, `compete_with` on rules; `outliner` at the top; `contours` read from the cache
 - `modules/rules/compose_events.py`, `modules/report/analysis_ondemand.py`:
   the pass wired into both places rules run
 - `modules/rules/rules_file.py`, `main.py`, `sidecar/server.py`: saving keeps fields
