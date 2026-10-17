@@ -163,7 +163,7 @@ went from 24% to 67%. Outlines added at most 0.02 to the same separation.
 
 | piece | effort | notes |
 |---|---|---|
-| ~~SAM measured on real footage, licence confirmed~~ | done | SlimSAM-77 card: Apache-2.0. Measured 2026-10-16: outlines did not make decisions more accurate on compact, adjacent parts; see [OUTLINES.md](../OUTLINES.md). Packaging (OpenVINO export, so `transformers` is not imported: that import alone takes ~20 s) is still open |
+| ~~SAM measured on real footage, licence confirmed~~ | done | SlimSAM-77 card: Apache-2.0. Measured 2026-10-16: outlines did not make decisions more accurate on compact, adjacent parts; see [OUTLINES.md](../OUTLINES.md). Packaged 2026-10-17: exported for OpenVINO (`tools/export_sam.py`, ~20 MB) and bundled with every build, so `transformers` is not imported at all (its import alone took ~22 s); first outline in ~3 s |
 | ~~Draw outlines in the timeline overlay~~ | done | a traced shape is drawn solid, its box dashed behind it |
 | ~~`Relation` and `Outline` columns in the Advanced tab~~ | done | `min_overlap` / `max_gap` are still YAML-only (kept on save) |
 | ~~Body-part sources from pose~~ | done | `source: person.hand` (or any COCO-17 keypoint, or the groups hand / foot / head / knee / elbow / shoulder / hip). Pose runs on demand only where the person's box meets the region's, and is cached as `keypoints` |

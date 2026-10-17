@@ -49,9 +49,10 @@ def relative_to_box(outline: Sequence, box: Sequence) -> list:
 
 
 def default_outliner():
-    """SAM on the best device there is; the caller falls back if it fails."""
-    from modules.vision.outlines import SamOutliner
-    return SamOutliner()
+    """The best SAM there is (OpenVINO export, else transformers); the caller
+    falls back to GrabCut if neither loads."""
+    from modules.vision.outlines import sam_outliner
+    return sam_outliner()
 
 
 def fallback_outliner():
@@ -190,8 +191,9 @@ class OutlineFeed(QObject):
 
     def warm_up(self):
         """Load the outliner now, in the background, rather than on the first
-        job: loading SAM the first time in a session takes tens of seconds
-        (most of it importing ``transformers``)."""
+        job: a second or two from the OpenVINO export, but tens of seconds
+        through ``transformers`` (most of it the import) when the export is
+        not installed."""
         self._warm_wanted = True
         self._wake.set()
 

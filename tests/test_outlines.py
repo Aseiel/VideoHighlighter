@@ -363,3 +363,158 @@ def test_the_comparison_tool_draws_both_outliners_and_measures_them(cv2, tmp_pat
         renderer=lambda tiles, caps, cols, path, header="": drawn.update(caps=caps))
     assert result["frames"] == 3 and len(drawn["caps"]) == 3
     assert result["mean_agreement"] == pytest.approx(0.6, abs=0.05)   # 3/5 overlap
+
+
+# --- SAM through OpenVINO ------------------------------------------------------------------
+
+@needs_cv2
+def test_a_frame_is_prepared_as_sams_processor_does(cv2):
+    frame = np.full((300, 600, 3), 255, np.uint8)            # wide: width is the long side
+    pixels, resized = outlines.sam_preprocess(frame)
+    assert pixels.shape == (1, 3, 1024, 1024) and pixels.dtype == np.float32
+    assert resized == (512, 1024)
+    white = (1.0 - outlines.SAM_MEAN) / outlines.SAM_STD
+    assert pixels[0, :, 10, 10] == pytest.approx(white, abs=1e-5)
+    assert np.all(pixels[0, :, 600:, :] == 0)               # padding below the picture
+    boxes = outlines.sam_boxes([(60, 30, 300, 150)], (300, 600), resized)
+    assert boxes.tolist() == [pytest.approx([102.4, 51.2, 512.0, 256.0])]
+
+
+@needs_cv2
+def test_a_low_resolution_mask_comes_back_at_frame_size_without_the_padding(cv2):
+    logits = np.full((256, 256), -5.0, np.float32)
+    logits[0:64, 0:128] = 5.0                  # a quarter of the height, half the width, of 256
+    mask = outlines.sam_mask(logits, (512, 1024), (300, 600))
+    assert mask.shape == (300, 600)
+    # 64/256 of the 1024 input is 256 rows of the 512 the picture has: half its height.
+    ys, xs = np.nonzero(mask)
+    assert ys.max() == pytest.approx(149, abs=2) and xs.max() == pytest.approx(299, abs=2)
+
+
+class _Net:
+    """A compiled OpenVINO model stand-in: calls ``fn`` on its inputs."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, inputs):
+        return self.fn(inputs)
+
+
+def _box_decoder(inputs):
+    """A decoder that answers each box with exactly that box, in mask space."""
+    _, boxes = inputs
+    masks = np.full((len(boxes), 256, 256), -5.0, np.float32)
+    for k, (x1, y1, x2, y2) in enumerate(boxes / 4.0):
+        masks[k, int(y1):int(y2), int(x1):int(x2)] = 5.0
+    return [masks, np.ones(len(boxes), np.float32)]
+
+
+def _export(tmp_path, probe_outline):
+    folder = tmp_path / "slimsam"
+    folder.mkdir()
+    for name in (outlines.SAM_ENCODER_FILE, outlines.SAM_DECODER_FILE):
+        (folder / name).write_bytes(b"")
+    (folder / outlines.SAM_META_FILE).write_text(
+        '{"id": "%s", "format": 1, "probe_outline": %s}' % (outlines.SAM_EXPORT_ID, probe_outline),
+        encoding="utf-8")
+    return str(folder)
+
+
+def _fake_compile(bad_devices=()):
+    compiled = []
+
+    def compile_(path, device):
+        compiled.append((os.path.basename(path), device))
+        if path.endswith(outlines.SAM_DECODER_FILE):
+            return _Net(_box_decoder)
+        if device in bad_devices:                            # a GPU computing garbage
+            return _Net(lambda inputs: [np.full((1, 256, 64, 64), np.nan, np.float32)])
+        return _Net(lambda inputs: [np.zeros((1, 256, 64, 64), np.float32)])
+    return compile_, compiled
+
+
+@needs_cv2
+def test_openvino_sam_outlines_each_box_and_checks_its_probe(cv2, tmp_path, monkeypatch):
+    frame, box = outlines.sam_probe()
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = box
+    probe = [[x1 / w, y1 / h], [x2 / w, y1 / h], [x2 / w, y2 / h], [x1 / w, y2 / h]]
+    compile_, compiled = _fake_compile()
+    monkeypatch.setattr(outlines.OpenVinoSamOutliner, "_compile", staticmethod(compile_))
+    sam = outlines.OpenVinoSamOutliner(folder=_export(tmp_path, probe), device="CPU")
+    sam._load()
+    assert sam.device == "OpenVINO CPU"
+    (decoder, dev), = [c for c in compiled if c[0] == outlines.SAM_DECODER_FILE]
+    assert dev == "CPU"                                       # the decoder never goes to the GPU
+    image = np.zeros((360, 640, 3), np.uint8)
+    got = sam.outline(image, [(64, 36, 320, 180), (500, 300, 501, 301)])
+    xs, ys = [p[0] for p in got[0]], [p[1] for p in got[0]]
+    assert (min(xs), max(xs)) == (pytest.approx(0.1, abs=0.01), pytest.approx(0.5, abs=0.01))
+    assert (min(ys), max(ys)) == (pytest.approx(0.1, abs=0.01), pytest.approx(0.5, abs=0.01))
+    assert got[1] is None                                     # nothing usable in a 1-pixel box
+
+
+@needs_cv2
+def test_a_gpu_that_fails_the_probe_is_dropped_for_the_cpu(cv2, tmp_path, monkeypatch):
+    frame, box = outlines.sam_probe()
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = box
+    probe = [[x1 / w, y1 / h], [x2 / w, y1 / h], [x2 / w, y2 / h], [x1 / w, y2 / h]]
+
+    def nan_decoder_for_nan_embeddings(compile_):
+        def wrapped(path, device):
+            net = compile_(path, device)
+            if path.endswith(outlines.SAM_DECODER_FILE):
+                return _Net(lambda inputs: _box_decoder(inputs) if np.isfinite(inputs[0]).all()
+                            else [np.full((len(inputs[1]), 256, 256), np.nan, np.float32),
+                                  np.zeros(len(inputs[1]), np.float32)])
+            return net
+        return wrapped
+
+    compile_, compiled = _fake_compile(bad_devices={"GPU"})
+    monkeypatch.setattr(outlines.OpenVinoSamOutliner, "_compile",
+                        staticmethod(nan_decoder_for_nan_embeddings(compile_)))
+    sam = outlines.OpenVinoSamOutliner(folder=_export(tmp_path, probe), device="GPU")
+    sam._load()
+    assert sam.device == "OpenVINO CPU"
+    assert [d for name, d in compiled if name == outlines.SAM_ENCODER_FILE] == ["GPU", "CPU"]
+
+
+def test_sam_outliner_falls_back_to_transformers(tmp_path, monkeypatch):
+    monkeypatch.setattr(outlines, "find_sam_dir", lambda: None)
+    assert isinstance(outlines.sam_outliner(), outlines.SamOutliner)
+
+    def broken(self):
+        raise RuntimeError("no device")
+
+    monkeypatch.setattr(outlines, "find_sam_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(outlines.OpenVinoSamOutliner, "_load", broken)
+    assert isinstance(outlines.sam_outliner(), outlines.SamOutliner)
+    assert isinstance(outlines.make_outliner("sam"), outlines.SamOutliner)
+
+
+def test_the_export_is_found_by_override_and_its_meta_is_checked(tmp_path, monkeypatch):
+    folder = _export(tmp_path, "[[0, 0], [1, 0], [1, 1]]")
+    monkeypatch.setenv(outlines.SAM_DIR_ENV, folder)
+    assert outlines.find_sam_dir() == folder
+    assert outlines.read_sam_meta(folder)["id"] == outlines.SAM_EXPORT_ID
+    meta = os.path.join(folder, outlines.SAM_META_FILE)
+    with open(meta, "w", encoding="utf-8") as fh:
+        fh.write('{"id": "another-model", "format": 1, "probe_outline": [[0, 0], [1, 0], [1, 1]]}')
+    with pytest.raises(ValueError, match="another-model"):
+        outlines.read_sam_meta(folder)
+    with open(meta, "w", encoding="utf-8") as fh:
+        fh.write('{"id": "%s", "format": 99, "probe_outline": [[0, 0], [1, 0], [1, 1]]}'
+                 % outlines.SAM_EXPORT_ID)
+    with pytest.raises(ValueError, match="newer"):
+        outlines.read_sam_meta(folder)
+
+
+@needs_cv2
+def test_outline_iou(cv2):
+    square = [[0.1, 0.1], [0.5, 0.1], [0.5, 0.5], [0.1, 0.5]]
+    half = [[0.1, 0.1], [0.3, 0.1], [0.3, 0.5], [0.1, 0.5]]
+    assert outlines.outline_iou(square, square) == pytest.approx(1.0)
+    assert outlines.outline_iou(square, half) == pytest.approx(0.5, abs=0.03)
+    assert outlines.outline_iou(square, []) == 0.0

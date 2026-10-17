@@ -159,6 +159,12 @@ jobs:
         # the packaged app has no object detector, and a frozen build never
         # downloads one itself. Bundled via --add-data "models;models".
         run: python tools/get_yolox_model.py
+      - name: Export the SAM outliner (SlimSAM-77, Apache-2.0)
+        # The overlay's Outlines switch and `outline: true` rules. Run by
+        # OpenVINO, so a first outline no longer waits ~20 s for transformers
+        # to import. ~20 MB, bundled with models/ like YOLOX. Pinned revision;
+        # the export checks itself on this runner (CPU) and again at load.
+        run: python -m tools.export_sam
       - name: Build EXE
         shell: pwsh
         run: |
@@ -485,6 +491,12 @@ jobs:
         # the packaged app has no object detector, and a frozen build never
         # downloads one itself. Bundled via --add-data "models;models".
         run: python tools/get_yolox_model.py
+      - name: Export the SAM outliner (SlimSAM-77, Apache-2.0)
+        # The overlay's Outlines switch and `outline: true` rules. Run by
+        # OpenVINO, so a first outline no longer waits ~20 s for transformers
+        # to import. ~20 MB, bundled with models/ like YOLOX. Pinned revision;
+        # the export checks itself on this runner (CPU) and again at load.
+        run: python -m tools.export_sam
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
       - name: Build the sidecar
@@ -569,6 +581,12 @@ jobs:
         # the packaged app has no object detector, and a frozen build never
         # downloads one itself. Bundled via --add-data "models;models".
         run: python tools/get_yolox_model.py
+      - name: Export the SAM outliner (SlimSAM-77, Apache-2.0)
+        # The overlay's Outlines switch and `outline: true` rules. Run by
+        # OpenVINO, so a first outline no longer waits ~20 s for transformers
+        # to import. ~20 MB, bundled with models/ like YOLOX. Pinned revision;
+        # the export checks itself on this runner (CPU) and again at load.
+        run: python -m tools.export_sam
       - name: Pre-convert CLIP to OpenVINO IR
         run: python -m tools.export_clip_ov
       - name: Export the action model (SigLIP2, Apache-2.0)

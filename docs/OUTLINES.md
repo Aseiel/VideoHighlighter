@@ -27,9 +27,12 @@ the two disagree, the box is what the detector said.
 - They are written into the analysis cache next to the boxes (`contours`), so
   a composition rule with `outline: true` reuses them instead of tracing again
   (see [the outlines plan](plans/2026-09-26-composition-outlines.md)).
-- The first time in a session, loading the model takes tens of seconds; the
-  label next to the switch says so. After that, one frame takes about 0.25 s
-  on an Intel Arc GPU, and about 1.4 s on a CPU.
+- SAM ships with the app, exported for OpenVINO (`tools/export_sam.py`,
+  ~20 MB), so the first outline arrives about 3 s after switching (it took
+  over 30 s while the model came through `transformers`). After that, a frame
+  takes about 0.2 s on an Intel Arc GPU and about 0.9 s on a CPU. Before it
+  is used, each device must outline a test picture the way PyTorch did at
+  export; one that does not (fp16 on an Arc gave nothing but NaN) is skipped.
 - If SAM cannot be loaded (no weights yet and no network), outlines fall back
   to GrabCut, which needs no model but often finds nothing.
 - The choice is remembered.
@@ -87,9 +90,17 @@ decisions, and outlines for **seeing** what a model found.
 | | per frame |
 |---|---|
 | detector (YOLO-size, CPU) | 33 ms |
-| SlimSAM, Intel Arc | 219 ms |
-| SAM ViT-base, Intel Arc | 282 ms |
-| SlimSAM, CPU | 1,356 ms |
+| SlimSAM, OpenVINO, Intel Arc (as shipped) | ~210 ms |
+| SlimSAM, OpenVINO, CPU (as shipped) | ~880 ms |
+| SlimSAM, transformers, Intel Arc | 219 ms |
+| SAM ViT-base, transformers, Intel Arc | 282 ms |
+| SlimSAM, transformers, CPU | 1,356 ms |
+
+The OpenVINO export outlines the same shapes as `transformers` does: on 1,929
+detections across 600 real frames, median IoU 0.964 between the two, 98.8% of
+them at 0.75 or better, and both found the same set of shapes. The difference
+is resizing (OpenCV against `transformers`' own). Loading it takes about 2 s;
+`transformers` took about 22 s just to import.
 | GrabCut, CPU | 82 ms |
 
 Requested by Neva; the idea of outlines in place of boxes came from Szymek.

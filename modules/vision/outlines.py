@@ -27,6 +27,17 @@ Two outliners, one interface (``outline(frame_bgr, boxes_px) -> [contour]``):
                      tens of MB). One image encoding per frame serves every box
                      in it. Much better on hard footage; needs the weights
                      fetched once, and a GPU to be quick.
+``OpenVinoSamOutliner`` the same SlimSAM, exported by ``tools/export_sam.py``
+                     and run by OpenVINO, so nothing imports ``transformers``:
+                     that import alone took ~22 s, which every first outline
+                     in a session waited for. Loads in a second or two; the
+                     image encoder runs on an Intel GPU when there is one
+                     (~75 ms a frame on an Arc, ~620 ms on a CPU) and the box
+                     decoder on the CPU (~20 ms a box; OpenVINO's GPU plugin
+                     crashes on it).
+
+``sam_outliner()`` picks the best SAM there is: OpenVINO when the export is
+installed and reproduces its probe, else ``transformers``.
 """
 from __future__ import annotations
 
@@ -45,6 +56,24 @@ SIMPLIFY_TOLERANCE = 0.002
 MIN_FILL = 0.05
 
 DEFAULT_SAM_MODEL = "Zigeng/SlimSAM-uniform-77"
+# The OpenVINO export (tools/export_sam.py): pinned, so a rebuild gives the
+# same model, and checked at load against a probe it was exported with.
+SAM_EXPORT_ID = "slimsam-uniform-77"
+SAM_SOURCE_REVISION = "79c09c1ce6b4ae51f00634ed171d9b8e888f6911"
+SAM_DIRNAME = SAM_EXPORT_ID
+SAM_ENCODER_FILE = "encoder.onnx"
+SAM_DECODER_FILE = "decoder.onnx"
+SAM_META_FILE = "outliner.json"
+SAM_FORMAT = 1
+SAM_DIR_ENV = "VH_SAM_DIR"
+# SAM's own preprocessing (SamProcessor): longest side to 1024, ImageNet
+# normalisation, padded to a square; masks come back at a quarter of that.
+SAM_INPUT = 1024
+SAM_MASK = 256
+SAM_MEAN = np.array([0.485, 0.456, 0.406], np.float32)
+SAM_STD = np.array([0.229, 0.224, 0.225], np.float32)
+# A route must trace the probe this close to how PyTorch traced it at export.
+SAM_PROBE_MIN_IOU = 0.95
 # What the SAM processor returns for post-processing only: moved, never cast.
 _SIZE_KEYS = ("original_sizes", "reshaped_input_sizes")
 
@@ -199,11 +228,220 @@ def to_device(inputs, device) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# SAM through OpenVINO (no transformers at run time)
+# ---------------------------------------------------------------------------
+
+def sam_preprocess(frame_bgr: np.ndarray) -> tuple:
+    """A frame as SAM's encoder takes it: RGB, longest side to ``SAM_INPUT``,
+    normalised, padded at the bottom and right. Returns ``(pixels [1,3,S,S],
+    (resized_h, resized_w))``."""
+    import cv2
+
+    h, w = frame_bgr.shape[:2]
+    scale = SAM_INPUT / max(h, w)
+    nh, nw = int(round(h * scale)), int(round(w * scale))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    rgb = cv2.cvtColor(cv2.resize(frame_bgr, (nw, nh), interpolation=interp), cv2.COLOR_BGR2RGB)
+    norm = (rgb.astype(np.float32) / 255.0 - SAM_MEAN) / SAM_STD
+    pixels = np.zeros((SAM_INPUT, SAM_INPUT, 3), np.float32)
+    pixels[:nh, :nw] = norm
+    return pixels.transpose(2, 0, 1)[None], (nh, nw)
+
+
+def sam_boxes(boxes_px: Sequence, frame_size: tuple, resized: tuple) -> np.ndarray:
+    """Pixel boxes ``(x1, y1, x2, y2)`` in the frame -> in the resized frame."""
+    (h, w), (nh, nw) = frame_size, resized
+    scale = np.array([nw / w, nh / h, nw / w, nh / h], np.float32)
+    return np.asarray(boxes_px, np.float32).reshape(-1, 4) * scale
+
+
+def sam_mask(logits: np.ndarray, resized: tuple, frame_size: tuple) -> np.ndarray:
+    """One low-resolution mask's logits -> a binary mask the size of the frame,
+    as SamProcessor post-processes: up to the padded input, crop the padding,
+    then to the frame."""
+    import cv2
+
+    (nh, nw), (h, w) = resized, frame_size
+    full = cv2.resize(logits.astype(np.float32), (SAM_INPUT, SAM_INPUT),
+                      interpolation=cv2.INTER_LINEAR)[:nh, :nw]
+    return (cv2.resize(full, (w, h), interpolation=cv2.INTER_LINEAR) > 0.0).astype(np.uint8)
+
+
+def sam_probe() -> tuple:
+    """The image and box every route must outline the same way: a dark disc
+    with a lighter bar across it, on seeded noise. ``(frame_bgr, box_px)``."""
+    import cv2
+
+    rng = np.random.default_rng(1234)
+    frame = rng.integers(90, 170, (360, 480, 3), dtype=np.uint8)
+    cv2.circle(frame, (200, 180), 90, (40, 60, 160), -1)
+    cv2.rectangle(frame, (150, 160), (330, 200), (220, 200, 60), -1)
+    return frame, (100.0, 80.0, 340.0, 280.0)
+
+
+def outline_iou(a: Sequence, b: Sequence, size: int = 256) -> float:
+    """IoU of two normalised outlines, drawn on a grid."""
+    import cv2
+
+    if not a or not b:
+        return 0.0
+    ma, mb = np.zeros((size, size), np.uint8), np.zeros((size, size), np.uint8)
+    cv2.fillPoly(ma, [np.array([[x * size, y * size] for x, y in a], np.int32)], 1)
+    cv2.fillPoly(mb, [np.array([[x * size, y * size] for x, y in b], np.int32)], 1)
+    union = int((ma | mb).sum())
+    return float((ma & mb).sum()) / union if union else 0.0
+
+
+def sam_dir_candidates() -> list:
+    """Where the export may be, most specific first: the override, then the
+    frame encoder's places (beside the exe, per user, the bundle, the source
+    checkout), each with this model's folder name."""
+    import os
+
+    from modules.vision import frame_encoder as fe
+
+    out = []
+    override = os.environ.get(SAM_DIR_ENV, "").strip()
+    if override:
+        out.append(override)
+    fe_override = os.environ.get(fe.DIR_ENV, "").strip()
+    for folder in fe.model_dir_candidates():
+        if fe_override and folder == fe_override:
+            continue
+        out.append(os.path.join(os.path.dirname(folder), SAM_DIRNAME))
+    return out
+
+
+def find_sam_dir() -> Optional[str]:
+    import os
+
+    for folder in sam_dir_candidates():
+        if all(os.path.isfile(os.path.join(folder, f))
+               for f in (SAM_ENCODER_FILE, SAM_DECODER_FILE, SAM_META_FILE)):
+            return folder
+    return None
+
+
+def read_sam_meta(folder: str) -> dict:
+    """outliner.json, checked against what this app was built for."""
+    import json
+    import os
+
+    with open(os.path.join(folder, SAM_META_FILE), encoding="utf-8") as fh:
+        meta = json.load(fh)
+    if meta.get("id") != SAM_EXPORT_ID:
+        raise ValueError(f"{SAM_META_FILE} is for {meta.get('id')!r}, this app uses {SAM_EXPORT_ID!r}")
+    if int(meta.get("format", 0)) > SAM_FORMAT:
+        raise ValueError(f"{SAM_META_FILE} format {meta.get('format')} is newer than this app")
+    if len(meta.get("probe_outline") or []) < 3:
+        raise ValueError(f"{SAM_META_FILE} has no probe outline")
+    return meta
+
+
+class OpenVinoSamOutliner:
+    """SlimSAM run by OpenVINO from the ``tools/export_sam.py`` export.
+
+    Same interface and the same masks as ``SamOutliner`` (checked at load
+    against the outline PyTorch drew for ``sam_probe()``), without importing
+    ``transformers`` or ``torch``. The image encoder goes to an Intel GPU when
+    OpenVINO sees one, else the CPU; the box decoder always runs on the CPU.
+    A GPU that traces the probe wrongly is dropped for the CPU.
+    """
+
+    name = "sam"
+
+    def __init__(self, folder: Optional[str] = None, device: str = "auto"):
+        self.folder, self.device = folder, device
+        self._encoder = self._decoder = None
+
+    @staticmethod
+    def _compile(path: str, device: str):
+        import openvino as ov
+
+        from modules.vision import frame_encoder as fe
+
+        core = ov.Core()
+        cache = fe._compile_cache_dir() if device.startswith("GPU") else None
+        if cache:
+            core.set_property({"CACHE_DIR": cache})
+        # fp32 on every device. The GPU's default fp16 overflows in SAM's image
+        # encoder: every embedding came back NaN (measured on an Arc), and the
+        # probe check below caught it. fp32 there costs ~95 ms a frame.
+        return core.compile_model(path, device, {"INFERENCE_PRECISION_HINT": "f32"})
+
+    def _load(self):
+        if self._encoder is not None:
+            return
+        import os
+
+        from modules.vision import frame_encoder as fe
+
+        folder = self.folder or find_sam_dir()
+        if not folder:
+            raise FileNotFoundError(f"the SAM export (models/{SAM_DIRNAME}) is not installed")
+        meta = read_sam_meta(folder)
+        self._decoder = self._compile(os.path.join(folder, SAM_DECODER_FILE), "CPU")
+        wanted = self.device
+        if wanted == "auto":
+            wanted = fe._openvino_gpu()[0] or "CPU"
+        devices = [wanted] + (["CPU"] if wanted != "CPU" else [])
+        last = None
+        for device in devices:
+            try:
+                self._encoder = self._compile(os.path.join(folder, SAM_ENCODER_FILE), device)
+                frame, box = sam_probe()
+                got = self.outline(frame, [box])[0]
+                iou = outline_iou(got, meta["probe_outline"])
+                if iou < SAM_PROBE_MIN_IOU:
+                    raise ValueError(f"traces the probe at IoU {iou:.3f} against PyTorch's")
+                self.device, self.folder = f"OpenVINO {device}", folder
+                return
+            except Exception as exc:          # noqa: BLE001 - try the next device
+                print(f"[outlines] SAM encoder on OpenVINO {device} unusable: {exc}")
+                self._encoder, last = None, exc
+        raise RuntimeError(f"no OpenVINO device could run the SAM export ({last})")
+
+    def outline(self, frame_bgr, boxes_px: Sequence) -> list:
+        if not len(boxes_px):
+            return []
+        if self._encoder is None:
+            self._load()
+        h, w = frame_bgr.shape[:2]
+        pixels, resized = sam_preprocess(frame_bgr)
+        embeddings = np.asarray(self._encoder(pixels)[0], np.float32)
+        out = self._decoder([embeddings, sam_boxes(boxes_px, (h, w), resized)])
+        logits = np.asarray(out[0], np.float32)          # [boxes, 256, 256]
+        result = []
+        for box, low in zip(boxes_px, logits):
+            mask = sam_mask(low, resized, (h, w))
+            x1, y1, x2, y2 = box
+            if mask.sum() < MIN_FILL * max(1.0, (x2 - x1) * (y2 - y1)):
+                result.append(None)
+                continue
+            result.append(mask_to_contour(mask, frame_size=(w, h)))
+        return result
+
+
+def sam_outliner(device: str = "auto"):
+    """The best SAM there is: the OpenVINO export when it is installed and
+    traces its probe right (loads in seconds), else ``transformers`` (whose
+    import alone takes ~20 s)."""
+    if find_sam_dir():
+        try:
+            outliner = OpenVinoSamOutliner(device=device)
+            outliner._load()
+            return outliner
+        except Exception as exc:               # noqa: BLE001 - fall back to transformers
+            print(f"[outlines] OpenVINO SAM unusable ({exc}); using transformers")
+    return SamOutliner()
+
+
 def make_outliner(name: str = "grabcut"):
     if name == "grabcut":
         return GrabCutOutliner()
     if name == "sam":
-        return SamOutliner()
+        return sam_outliner()
     raise ValueError(f"outliner must be 'grabcut' or 'sam', not {name!r}")
 
 

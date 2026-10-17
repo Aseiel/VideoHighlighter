@@ -39,6 +39,8 @@ models/clip-vit-base-patch32-ov/
 # tools/export_frame_encoder.py; a download or part of the build), and the
 # GPU kernels OpenVINO compiles for it. Generated, never committed.
 models/siglip2-base-patch16-256/
+# The SAM outliner (SlimSAM-77, ~20 MB, written by tools/export_sam.py).
+models/slimsam-uniform-77/
 ov-cache/
 
 # RTMPose keypoint IRs + ONNX/zip cache (installed via tools/get_rtmpose_model.py)
