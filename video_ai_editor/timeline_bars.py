@@ -11,7 +11,7 @@ from PySide6.QtGui import QDrag
 class TimelineBar:
     """Represents a single signal bar on the timeline"""
     def __init__(self, start_time, end_time, y_position, height, color, label, 
-                 confidence=None, metadata=None):
+                 confidence=None, metadata=None, alpha=None):
         self.start_time = start_time
         self.end_time = end_time
         self.y_position = y_position
@@ -20,10 +20,16 @@ class TimelineBar:
         self.label = label
         self.confidence = confidence  # Store confidence value (0-10 scale or 0-1 scale)
         self.metadata = metadata or {}
+        # Fixed opacity, for bars shaded by something other than a confidence
+        # (motion bars by peak strength) so the tooltip keeps saying what the
+        # confidence actually was.
+        self.alpha = alpha
         self.scene = None  # Will be set when drawn
     
     def get_alpha(self):
         """Get transparency based on confidence"""
+        if self.alpha is not None:
+            return int(max(0, min(255, self.alpha)))
         if self.confidence is not None:
             # Normalize confidence to 0-10 scale if needed
             if self.confidence <= 1.0:  # Assuming 0-1 scale

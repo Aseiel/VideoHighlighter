@@ -9,6 +9,12 @@ import traceback
 
 from modules.media.video_regions import crop_frame_for_analysis, normalize_analysis_region
 
+# Grey levels of frame-to-frame change treated as noise in the motion curve's
+# energy. Encoders shimmer a few levels on a perfectly still shot; real
+# movement changes pixels by tens.
+MOTION_NOISE_FLOOR = 8.0
+
+
 class FrameReadError(Exception):
     """The frame reader stopped on an error before the end of the video.
 
@@ -33,13 +39,20 @@ def detect_scenes_motion_optimized(video_path,
                                prefetch_frames=16,
                                cancel_flag=None,
                                progress_callback=None,
-                               analysis_region=None):  # Added cancellation support
+                               analysis_region=None,
+                               details=None):  # Added cancellation support
     """
     Hybrid approach combining speed optimizations with accurate motion detection:
     - Fast GPU batching for initial processing
     - Contour-based min_area filtering for accurate motion detection
     - Optimized memory management
     - Cancellation support
+
+    `details`, when a dict, receives `motion_curve` — how much changed between
+    sampled frames before any threshold, scene cuts left out, binned (see
+    modules/segments/motion_curve.py).
+    An out-parameter rather than a fourth return value because every caller
+    unpacks exactly three.
     """
     
     # Check for cancellation at start
@@ -90,6 +103,13 @@ def detect_scenes_motion_optimized(video_path,
     prev_gray_scene = None
     scene_start_sec = 0
     all_motion_data = []
+    # (frame index, motion energy) for the timeline's motion curve: how much
+    # changed, *before* any threshold. The thresholded area above reads every
+    # ordinary movement as zero, which drew the curve as isolated spikes.
+    motion_energy = []
+    # Sampled frames whose difference is a scene cut, not movement. Filled once
+    # the cuts are decided, and left out of the curve.
+    cut_frames = set()
     current_scene_id = 0
     freeze_frames = int(freeze_seconds * fps / frame_skip)
     
@@ -257,6 +277,12 @@ def detect_scenes_motion_optimized(video_path,
             blur_batch = F.avg_pool2d(gray_diff_batch, kernel_size=5, stride=1, padding=2)
             blur_batch = blur_batch.squeeze(1)
             
+            # Unthresholded energy, for the curve only: mean change per pixel
+            # beyond a small noise floor, so compression shimmer on a still
+            # shot reads as stillness and not as a little motion everywhere.
+            energy_batch = torch.clamp(blur_batch - MOTION_NOISE_FLOOR, min=0).mean(
+                dim=(1, 2)).detach().cpu().numpy()
+
             # Threshold
             motion_mask = blur_batch > motion_threshold
             
@@ -279,7 +305,8 @@ def detect_scenes_motion_optimized(video_path,
                                       if cv2.contourArea(c) > min_area)
                 
                 frame_idx = batch_pairs[mask_idx + 1][0]
-                motion_results.append((frame_idx, total_motion_area))
+                motion_results.append((frame_idx, total_motion_area,
+                                       float(energy_batch[mask_idx])))
             
             # Cleanup GPU memory
             del prev_batch, curr_batch, gray_diff_batch, blur_batch, motion_mask
@@ -345,10 +372,11 @@ def detect_scenes_motion_optimized(video_path,
                     if len(processed_frames) >= 2:
                         motion_results = motion_detection_hybrid(processed_frames[-batch_size-1:])
                         
-                        for frame_idx, motion_level in motion_results:
+                        for frame_idx, motion_level, energy in motion_results:
                             if cancel_flag and cancel_flag.is_set():
                                 break
                             all_motion_data.append((frame_idx, motion_level, current_scene_id))
+                            motion_energy.append((frame_idx, energy))
                             if motion_level > 0:
                                 motion_events.append(frame_idx / fps)
                     
@@ -400,10 +428,11 @@ def detect_scenes_motion_optimized(video_path,
             # Motion detection for remaining
             if len(processed_frames) >= 2 and not (cancel_flag and cancel_flag.is_set()):
                 motion_results = motion_detection_hybrid(processed_frames[-len(batch_results)*2:])
-                for frame_idx, motion_level in motion_results:
+                for frame_idx, motion_level, energy in motion_results:
                     if cancel_flag and cancel_flag.is_set():
                         break
                     all_motion_data.append((frame_idx, motion_level, current_scene_id))
+                    motion_energy.append((frame_idx, energy))
                     if motion_level > 0:
                         motion_events.append(frame_idx / fps)
             
@@ -436,6 +465,7 @@ def detect_scenes_motion_optimized(video_path,
             picked, used_threshold, recalibrated = resolve(
                 diffs, minutes, scene_threshold, min_gap=min_gap)
             cut_times = [scene_diffs[i][0] / fps for i in picked]
+            cut_frames = {scene_diffs[i][0] for i in picked}
             scenes = scenes_from_cuts(cut_times, video_duration)
 
             if debug or recalibrated:
@@ -497,6 +527,11 @@ def detect_scenes_motion_optimized(video_path,
                                 
                                 timestamp = scene_motion[spike_idx][0] / fps
                                 motion_peaks.append(timestamp)
+
+        if details is not None and not (cancel_flag and cancel_flag.is_set()):
+            from modules.segments.motion_curve import build_curve
+            details["motion_curve"] = build_curve(motion_energy, fps, video_duration,
+                                                  exclude_frames=cut_frames)
 
         if debug and not (cancel_flag and cancel_flag.is_set()):
             print(f"Scenes: {len(scenes)}, Motion events: {len(motion_events)}, Peaks: {len(motion_peaks)}")

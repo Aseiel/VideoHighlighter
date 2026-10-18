@@ -2,6 +2,7 @@ from .timeline_bars import TimelineBar, DraggableTimelineBar
 from collections import defaultdict
 import json
 
+from modules.segments import motion_curve
 from modules.system import repaint_trace
 from .filmstrip_lane import LANE_HEIGHT as FILMSTRIP_LANE_HEIGHT
 from .filmstrip_lane import FilmstripLane
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QFont, QLinearGradient,
-    QFontMetrics, QCursor, QPainter, QDrag, QPixmap, QPolygonF
+    QFontMetrics, QCursor, QPainter, QDrag, QPixmap, QPolygonF, QPainterPath
 )
 
 class SignalTimelineScene(QGraphicsScene):
@@ -30,6 +31,16 @@ class SignalTimelineScene(QGraphicsScene):
     # the labels still clear the last lane once the view scales the scene down).
     TOP_MARGIN = 40
     RULER_BAND = 34
+
+    # How many of the strongest motion peaks get a star and a rank number.
+    TOP_MOTION_PEAKS = 5
+    # Opacity range motion bars are shaded across, weakest to strongest. The
+    # floor keeps the weakest bar visible as something to grab.
+    MOTION_ALPHA_RANGE = (90, 255)
+    # Seconds before a motion peak that count towards its strength. The
+    # detector stamps a peak on the last spike before the picture goes still,
+    # so the burst that made it is just behind the timestamp, not on it.
+    MOTION_PEAK_LOOKBACK = 2.0
 
     time_clicked = Signal(float)
     time_dragged = Signal(float)
@@ -1555,21 +1566,34 @@ class SignalTimelineScene(QGraphicsScene):
         # Merge nearby intervals
         merged = self._merge_intervals(intervals)
 
-        for start, end, meta in merged:
+        curve = self._motion_curve()
+        self.draw_motion_envelope(y_pos, self.layer_height,
+                                  self.colors['motion_events'], curve)
+        strengths = [motion_curve.strength(curve, s, e) for s, e, _m in merged]
+        alphas = self._motion_alphas(strengths)
+
+        for (start, end, meta), strength, alpha in zip(merged, strengths, alphas):
             count = meta.get('merged_count', 1)
-            if count > 1:
+            if strength is not None:
+                bar_label = (f"Motion x{count} {strength:.1f}×" if count > 1
+                             else f"Motion {strength:.1f}×")
+            elif count > 1:
                 avg_conf = meta.get('avg_confidence', 0)
                 bar_label = f"Motion x{count} ({avg_conf:.0%})"
             else:
                 conf = meta.get('confidence', 0)
                 bar_label = f"Motion ({conf:.0%})" if conf else "Motion"
 
+            bar_meta = {'timestamp': start, 'merged_count': count}
+            if strength is not None:
+                bar_meta['strength'] = f"{strength:.1f}× video average"
             bar = TimelineBar(
                 start, end,
                 y_pos, self.layer_height,
-                self.colors['motion_events'], bar_label,
+                QColor(self.colors['motion_events']), bar_label,
                 confidence=7,
-                metadata={'timestamp': start, 'merged_count': count}
+                metadata=bar_meta,
+                alpha=alpha,
             )
             self.draw_bar(bar)
             self.bars.append(bar)
@@ -1586,27 +1610,163 @@ class SignalTimelineScene(QGraphicsScene):
 
         merged = self._merge_intervals(intervals)
 
-        for start, end, meta in merged:
+        curve = self._motion_curve()
+        self.draw_motion_envelope(y_pos, self.layer_height,
+                                  self.colors['motion_peaks'], curve)
+        back = self.MOTION_PEAK_LOOKBACK
+        strengths = [motion_curve.strength(curve, max(0.0, s - back), e)
+                     for s, e, _m in merged]
+        alphas = self._motion_alphas(strengths)
+        ranked = motion_curve.ranks(strengths, self.TOP_MOTION_PEAKS)
+
+        for i, ((start, end, meta), strength, alpha) in enumerate(
+                zip(merged, strengths, alphas)):
             count = meta.get('merged_count', 1)
-            if count > 1:
+            rank = ranked.get(i)
+            if strength is not None:
+                # No rank here: the label travels with the bar into the edit
+                # timeline, where "the 2nd strongest in that video" means
+                # nothing. The rank is drawn on the curve instead.
+                bar_label = (f"Peak x{count} {strength:.1f}×" if count > 1
+                             else f"Peak {strength:.1f}×")
+            elif count > 1:
                 avg_conf = meta.get('avg_confidence', 0)
                 bar_label = f"Peak x{count} ({avg_conf:.0%})" if avg_conf else f"Peak x{count}"
             else:
                 bar_label = "Peak"
 
+            bar_meta = {'timestamp': start, 'merged_count': count,
+                        'avg_confidence': meta.get('avg_confidence'),
+                        'max_confidence': meta.get('max_confidence')}
+            if strength is not None:
+                bar_meta['strength'] = f"{strength:.1f}× video average"
+            if rank:
+                bar_meta['rank'] = f"{rank} of {len(merged)}"
+                self._draw_rank_marker(curve, max(0.0, start - back), end, y_pos,
+                                       self.layer_height, rank, strength)
             bar = TimelineBar(
                 start, end,
                 y_pos, self.layer_height,
-                self.colors['motion_peaks'], bar_label,
+                QColor(self.colors['motion_peaks']), bar_label,
                 confidence=9,
-                metadata={'timestamp': start, 'merged_count': count,
-                        'avg_confidence': meta.get('avg_confidence'),
-                        'max_confidence': meta.get('max_confidence')}
+                metadata=bar_meta,
+                alpha=alpha,
             )
             self.draw_bar(bar)
             self.bars.append(bar)
 
         return y_pos + self.layer_height + self.layer_spacing
+
+    def _motion_curve(self):
+        """The cache's binned motion levels, or None for a cache written before
+        the motion pass kept them (those rows draw exactly as they used to)."""
+        curve = (self.cache_data or {}).get('motion_curve')
+        if isinstance(curve, dict) and curve.get('values'):
+            return curve
+        return None
+
+    def _motion_alphas(self, strengths):
+        """Bar opacity per strength, weakest to strongest across the row's own
+        range. None where there is no strength, so get_alpha falls back to the
+        bar's confidence and an old cache looks as it always did."""
+        known = [s for s in strengths if s is not None]
+        if not known:
+            return [None] * len(strengths)
+        lo, hi = min(known), max(known)
+        a_lo, a_hi = self.MOTION_ALPHA_RANGE
+        span = hi - lo
+        return [None if s is None
+                else int(a_hi if span <= 0 else a_lo + (s - lo) / span * (a_hi - a_lo))
+                for s in strengths]
+
+    def draw_motion_envelope(self, y_pos, height, color, curve):
+        """How much motion there is, as a filled shape behind a row's bars.
+
+        The fill sits below the bars (z=-4, above the lane bands and
+        filmstrip). The outline is drawn again *above* them (z=5): a peak bar
+        sits exactly where the curve is highest, so with the outline behind
+        it the bar hid the one part worth seeing. Both take no mouse buttons,
+        and the view finds bars beneath them (see _bar_at), so presses and
+        drags still reach the bar.
+
+        Reduced to about one point per pixel with the report's max-bucket
+        downsample, which keeps the spikes that a mean would smooth away. The
+        dashed line is the video's average -- the 1x every bar's label is
+        measured against.
+        """
+        if not curve or self.video_duration <= 0:
+            return
+        from modules.report.highlight_report import downsample
+
+        values = curve['values']
+        step = float(curve.get('step') or motion_curve.STEP)
+        span_s = min(self.video_duration, len(values) * step)
+        width_px = span_s * self.pixels_per_second
+        if width_px <= 1:
+            return
+        pts = downsample(values[:int(round(span_s / step)) or 1],
+                         points=max(2, int(width_px)))
+        top = max(pts) or 1.0
+        usable = height * 0.9
+        bottom = y_pos + height
+        dx = width_px / len(pts)
+
+        points = [QPointF((i + 0.5) * dx, bottom - (v / top) * usable)
+                  for i, v in enumerate(pts)]
+
+        area = QPainterPath(QPointF(0, bottom))
+        for pt in points:
+            area.lineTo(pt)
+        area.lineTo(QPointF(width_px, bottom))
+        area.closeSubpath()
+        fill = QColor(color)
+        fill.setAlpha(55)
+        item = self.addPath(area, QPen(Qt.PenStyle.NoPen), QBrush(fill))
+        item.setZValue(-4)
+        item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+        outline = QPainterPath(points[0])
+        for pt in points[1:]:
+            outline.lineTo(pt)
+        edge = QColor(color).lighter(125)
+        edge.setAlpha(230)
+        line_item = self.addPath(outline, QPen(edge, 1.5), QBrush(Qt.BrushStyle.NoBrush))
+        line_item.setZValue(5)
+        line_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+        avg = motion_curve.mean_level(curve)
+        if avg > 0:
+            y_avg = bottom - (avg / top) * usable
+            pen = QPen(QColor(255, 255, 255, 60), 1, Qt.PenStyle.DashLine)
+            line = self.addLine(0, y_avg, width_px, y_avg, pen)
+            line.setZValue(-4)
+            line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+    def _draw_rank_marker(self, curve, start, end, y_pos, height, rank, strength):
+        """Where a top-ranked peak tops out: a dot on the curve at its highest
+        moment, a dashed line down through its bar, and "★1 9.9×" beside the
+        dot. Drawn over the bar and taking no clicks, like the outline."""
+        at = motion_curve.peak_time(curve, start, end)
+        level = motion_curve.level_at(curve, at)
+        top = max(curve['values']) or 1.0
+        x = at * self.pixels_per_second
+        bottom = y_pos + height
+        y = bottom - (level / top) * height * 0.9
+
+        accent = QColor(255, 214, 90)
+        items = [
+            self.addLine(x, y, x, bottom,
+                         QPen(QColor(255, 214, 90, 170), 1, Qt.PenStyle.DashLine)),
+            self.addEllipse(x - 3.5, y - 3.5, 7, 7,
+                            QPen(QColor(18, 18, 18), 1), QBrush(accent)),
+        ]
+        text = self.addText(f"★{rank} {strength:.1f}×", QFont("Arial", 7))
+        text.setDefaultTextColor(accent)
+        text.setPos(x + 4, max(y_pos - 4, y - 14))
+        items.append(text)
+        for item in items:
+            item.setZValue(6)
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
     def draw_audio_peaks_layer(self, y_pos):
         """Draw audio peaks, with optional merging"""
@@ -1803,7 +1963,12 @@ class SignalTimelineScene(QGraphicsScene):
                 
                 # Create and position text if we have something to show
                 if label_text:
-                    text = QGraphicsTextItem(label_text, draggable_item)
+                    # Parented with setParentItem, not the constructor: on
+                    # PySide 6.10 a parent passed to the constructor does not
+                    # take ownership, so the label was deleted with its Python
+                    # wrapper when this method returned and no bar had one.
+                    text = QGraphicsTextItem(label_text)
+                    text.setParentItem(draggable_item)
                     text.setFont(font)
                     
                     # Choose text color based on bar brightness
@@ -2688,12 +2853,7 @@ class SignalTimelineView(QGraphicsView):
     
     def _item_is_bar(self, pos) -> bool:
         """True if a DraggableTimelineBar is under pos (walks parent chain)."""
-        item = self.itemAt(pos)
-        while item is not None:
-            if isinstance(item, DraggableTimelineBar):
-                return True
-            item = item.parentItem()
-        return False
+        return self._bar_at(pos) is not None
 
     def _pos_in_selection(self, pos) -> bool:
         """True if view pos is inside the active selection rect."""
@@ -2704,12 +2864,20 @@ class SignalTimelineView(QGraphicsView):
         return scene.selection_rect_contains(scene_pos)
 
     def _bar_at(self, pos):
-        """The DraggableTimelineBar under view pos (walking parent chain), or None."""
-        item = self.itemAt(pos)
-        while item is not None:
-            if isinstance(item, DraggableTimelineBar):
-                return item
-            item = item.parentItem()
+        """The DraggableTimelineBar under view pos (walking parent chain), or None.
+
+        Looks through items that take no mouse buttons -- the motion curve's
+        outline and peak markers are drawn over the bars -- the same way the
+        scene does when it delivers the press, so the two never disagree about
+        which bar was hit."""
+        for item in self.items(pos):
+            if item.acceptedMouseButtons() == Qt.MouseButton.NoButton:
+                continue
+            while item is not None:
+                if isinstance(item, DraggableTimelineBar):
+                    return item
+                item = item.parentItem()
+            return None
         return None
 
     # ── bar context menu ───────────────────────────────────────────────

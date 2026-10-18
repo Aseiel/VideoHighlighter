@@ -437,7 +437,7 @@ def run_objects_patch(video_path: str, objects: list, *,
 def run_motion(video_path: str, *, frame_skip: Optional[int] = None,
                progress: ProgressFn = None, cancel=None, log=print) -> dict:
     """Run scene-cut + motion detection and return a cache-shaped patch with
-    `scenes`, `motion_events` and `motion_peaks`.
+    `scenes`, `motion_events`, `motion_peaks` and `motion_curve`.
 
     One detector pass produces all three signals — which is why the three
     scoring rows share a single button. Runs on CPU (the universally-available
@@ -447,9 +447,10 @@ def run_motion(video_path: str, *, frame_skip: Optional[int] = None,
     d = analysis_defaults()
     fs = frame_skip if frame_skip is not None else d["frame_skip"]
 
+    details = {}
     result = detect_scenes_motion_optimized(
         video_path, frame_skip=int(fs), device="cpu",
-        cancel_flag=cancel, progress_callback=progress,
+        cancel_flag=cancel, progress_callback=progress, details=details,
     )
     if cancel is not None and cancel.is_set():
         raise _Cancelled()
@@ -458,6 +459,7 @@ def run_motion(video_path: str, *, frame_skip: Optional[int] = None,
         "scenes": [{"start": float(s), "end": float(e)} for s, e in scenes],
         "motion_events": [float(t) for t in motion_events],
         "motion_peaks": [float(t) for t in motion_peaks],
+        "motion_curve": details.get("motion_curve"),
     }
 
 

@@ -3174,6 +3174,7 @@ class SignalTimelineWindow(QMainWindow):
             self.cache_data["scenes"] = result.get("scenes", [])
             self.cache_data["motion_events"] = result.get("motion_events", [])
             self.cache_data["motion_peaks"] = result.get("motion_peaks", [])
+            self.cache_data["motion_curve"] = result.get("motion_curve")
             self._merge_into_cache_file(result)
             for layer in ("scenes", "motion_events", "motion_peaks"):
                 self._enable_layer_and_reload(layer)

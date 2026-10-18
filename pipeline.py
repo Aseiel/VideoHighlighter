@@ -159,7 +159,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                          search_keywords=None, keyword_matches=None, action_bboxes=None,
                          object_bboxes=None, action_detections_all=None,
                          composed_event_names=None, loudness_bursts=None,
-                         loudness_levels=None):
+                         loudness_levels=None, motion_curve=None):
     """
     Collect all analysis results into a structured dictionary for caching.
 
@@ -225,6 +225,9 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
         ],
         "motion_events": motion_events_clean,
         "motion_peaks": motion_peaks_clean,
+        # How much motion, every half second — what lets the timeline show which
+        # peak was the big one. See modules/segments/motion_curve.py.
+        "motion_curve": motion_curve,
         "pipeline_version": "1.0",
         "cache_flags": {
             "keyword_segments_only": keyword_segments_only,
@@ -666,6 +669,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         scenes = []
         motion_events = []
         motion_peaks = []
+        motion_curve = None  # For timeline viewer; absent from older caches
         audio_peaks = []
         waveform_data = None  # For timeline viewer
         using_cache = False
@@ -722,6 +726,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             scenes_raw = cached_data.get("scenes", [])
                             motion_events = cached_data.get("motion_events", [])
                             motion_peaks = cached_data.get("motion_peaks", [])
+                            motion_curve = cached_data.get("motion_curve")
                             keyword_matches = cached_data.get("keyword_matches", [])
 
 
@@ -914,11 +919,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             if not motion_wanted:
                 log("ℹ️ Skipping motion detection (all scene/motion points set to 0)")
                 scenes, motion_events, motion_peaks = [], [], []
+                motion_curve = None
                 progress.update_progress(25, 100, "Pipeline", "Motion detection skipped - no motion scoring enabled")
             else:
                 log("🔹 Step 1+2: Detecting scenes, motion events, and motion peaks (this may take time)...")
 
                 scenes, motion_events, motion_peaks = [], [], []
+                motion_details = {}
 
                 try:
                     check_cancellation(cancel_flag, log, "motion detection")
@@ -938,8 +945,10 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         freeze_seconds=4,
                         freeze_factor=0.8,
                         device=motion_device,
-                        cancel_flag=cancel_flag
+                        cancel_flag=cancel_flag,
+                        details=motion_details,
                     )
+                    motion_curve = motion_details.get("motion_curve")
                     
                     # Unpack the results
                     if result and len(result) == 3:
@@ -1135,6 +1144,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                                              for s, e in scenes]
                     cached_data["motion_events"] = [float(t) for t in motion_events]
                     cached_data["motion_peaks"] = [float(t) for t in motion_peaks]
+                    cached_data["motion_curve"] = motion_curve
                 if audio_backfill:
                     audio_block = cached_data.get("audio")
                     if isinstance(audio_block, dict):
@@ -1612,6 +1622,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     composed_event_names=composed_event_names,
                     loudness_bursts=loudness_bursts,
                     loudness_levels=loudness_levels,
+                    motion_curve=motion_curve,
                 )
                 
                 # Add analysis parameters for future validation
@@ -2823,7 +2834,8 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         source_lang=SOURCE_LANG,
                         waveform_data=waveform_data,
                         loudness_bursts=loudness_bursts,
-                        loudness_levels=loudness_levels
+                        loudness_levels=loudness_levels,
+                        motion_curve=motion_curve,
                     )
 
                 # Hand the edit timeline EXACTLY what we cut (post-subtract,
