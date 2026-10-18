@@ -1,3 +1,3 @@
-__version__ = "0.13.3"
+__version__ = "0.14.0"
 __edition__ = "Free"
-__build_date__ = "2026-10-13"
+__build_date__ = "2026-10-18"
