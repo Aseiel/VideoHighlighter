@@ -2599,10 +2599,12 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_scene.clip_double_clicked.connect(self.on_clip_double_clicked)
         self.edit_scene.clip_added.connect(self.on_clip_added)
         self.edit_scene.clip_removed.connect(self.on_clip_removed)
-        self.edit_scene.time_clicked.connect(self.on_edit_time_clicked)
+        self.edit_scene.clip_clicked.connect(self.on_edit_clip_clicked)
         self.edit_scene.clip_cut.connect(self.on_clip_cut)
         self.edit_scene.clip_trimmed.connect(self.on_clip_trimmed)
         self.edit_scene.clip_reordered.connect(self.on_clip_reordered)
+        self.edit_scene.overlaps_found.connect(self._on_overlaps_found)
+        self.edit_scene.clips_changed.connect(self._on_edit_clips_changed)
 
         # Re-prioritise thumbnail extraction toward whatever scrolls into view,
         # so the visible filmstrip fills first instead of waiting on off-screen clips.
@@ -2613,6 +2615,12 @@ class SignalTimelineWindow(QMainWindow):
 
         edit_layout.addWidget(self.edit_view)
         
+        # Asks what to do when clips just added share footage with others.
+        # A bar rather than a dialog: drag and drop is the fast path, and a
+        # modal on every drop would stop it dead.
+        self.overlap_notice = self._build_overlap_notice()
+        edit_layout.addWidget(self.overlap_notice)
+
         # Add edit controls
         edit_controls = self.create_edit_controls()
         edit_layout.addWidget(edit_controls)
@@ -4347,9 +4355,75 @@ class SignalTimelineWindow(QMainWindow):
         plural = "s" if added != 1 else ""
         self.statusBar().showMessage(f"Added {added} clip{plural} to edit timeline", 2500)
 
-    @Slot(float)
-    def on_edit_time_clicked(self, time):
-        """Handle click on edit timeline — seek to source time"""
+    def _build_overlap_notice(self):
+        bar = QFrame()
+        bar.setObjectName("overlapNotice")
+        bar.setStyleSheet(f"""
+            QFrame#overlapNotice {{
+                background-color: {THEME.surface};
+                border: 1px solid {THEME.warning};
+                border-radius: {THEME.radius}px;
+            }}
+            QFrame#overlapNotice QLabel {{ color: {THEME.warning}; border: none; }}
+        """)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 4, 6, 4)
+        row.setSpacing(6)
+        self._overlap_label = QLabel()
+        row.addWidget(self._overlap_label, 1)
+        self._overlap_merge_btn = QPushButton("Merge")
+        self._overlap_merge_btn.setToolTip(
+            "Make each run of overlapping clips one clip covering all of it")
+        self._overlap_merge_btn.clicked.connect(lambda: self.edit_scene.merge_new_overlaps())
+        self._overlap_trim_btn = QPushButton("Trim new clip")
+        self._overlap_trim_btn.setToolTip(
+            "Cut the new clip down to footage no other clip already has")
+        self._overlap_trim_btn.clicked.connect(lambda: self.edit_scene.trim_new_overlaps())
+        keep_btn = QPushButton("Keep both")
+        keep_btn.setToolTip("Leave them as they are, e.g. for a replay")
+        keep_btn.clicked.connect(lambda: self.edit_scene.keep_new_overlaps())
+        for b in (self._overlap_merge_btn, self._overlap_trim_btn, keep_btn):
+            row.addWidget(b)
+        bar.hide()
+        return bar
+
+    @Slot(list)
+    def _on_overlaps_found(self, pairs):
+        """Show or hide the overlap notice for clips that were just added."""
+        if not pairs:
+            self.overlap_notice.hide()
+            return
+        total = sum(s for _i, _j, s in pairs)
+        if len(pairs) == 1:
+            i, j, s = pairs[0]
+            text = (f"Clip {j + 1} overlaps Clip {i + 1} by {s:.1f}s "
+                    f"— that footage plays twice.")
+            self._overlap_merge_btn.setText("Merge")
+            self._overlap_trim_btn.setText("Trim new clip")
+        else:
+            text = (f"{len(pairs)} overlaps — {total:.1f}s of footage "
+                    f"plays twice.")
+            self._overlap_merge_btn.setText("Merge all")
+            self._overlap_trim_btn.setText("Trim new clips")
+        self._overlap_label.setText(text)
+        self.overlap_notice.show()
+
+    @Slot(str)
+    def _on_edit_clips_changed(self, message):
+        self.update_edit_duration()
+        self.statusBar().showMessage(message, 3000)
+
+    @Slot(int, float)
+    def on_edit_clip_clicked(self, clip_index, time):
+        """A clip on the edit timeline was clicked at source time `time`."""
+        self.on_edit_time_clicked(time, clip_index)
+
+    def on_edit_time_clicked(self, time, clip_index=None):
+        """Handle click on edit timeline — seek to source time.
+
+        `clip_index` is the clip that was clicked. Without it the clip is
+        looked up by time, which is ambiguous when clips overlap in the
+        source: the first match wins, not the one under the cursor."""
         self.current_time = max(0, min(self.video_duration, time))
 
         # Update signal timeline playhead
@@ -4366,12 +4440,16 @@ class SignalTimelineWindow(QMainWindow):
         edit_active = getattr(self, '_edit_playback_active', False)
         is_playing  = edit_active and not getattr(self, '_edit_paused', False)
 
-        # Find the clip containing the clicked time
+        # The clicked clip, else the first clip containing the clicked time
         found = -1
-        for i, (start, end) in enumerate(self.edit_scene.clips):
-            if start <= self.current_time <= end:
-                found = i
-                break
+        clips = self.edit_scene.clips
+        if clip_index is not None and 0 <= clip_index < len(clips):
+            found = clip_index
+        else:
+            for i, (start, end) in enumerate(clips):
+                if start <= self.current_time <= end:
+                    found = i
+                    break
 
         if found >= 0:
             start, end = self.edit_scene.clips[found]
@@ -5112,6 +5190,10 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_scene.clear_active_clip()
         self._edit_playlist_index = 0
         self._edit_paused = False
+        # Stopped is not playing. Leaving the sentinel set made a later click
+        # on an edit clip "reroute the live playback" -- start playing it.
+        self._edit_playback_active = False
+        self._single_clip_playing = False
         self._edit_resume_pos = None   # Stop resets edit playback to the start
         self.play_edit_btn.setText("▶ Play Edit")
         self._active_player.pause()

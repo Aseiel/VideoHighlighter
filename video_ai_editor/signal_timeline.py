@@ -583,9 +583,20 @@ class SignalTimelineScene(QGraphicsScene):
         return ts
 
     def _nav_timestamps_motion_events(self):
-        return [float(e.get('time', e.get('timestamp', 0)))
-                for e in self.cache_data.get('motion_events', [])
-                if e.get('time') is not None or e.get('timestamp') is not None]
+        """Starts of the bars the MOTION EVENTS row draws.
+
+        The cache holds one float per sampled frame that moved -- thousands,
+        several a second -- so stepping through those would crawl through each
+        bar a sixth of a second at a time. This used to call .get() on those
+        floats, which raised, and the label column swallows a failing track:
+        the row simply had no arrows."""
+        times = []
+        for e in self.cache_data.get('motion_events', []):
+            t = e.get('time', e.get('timestamp')) if isinstance(e, dict) else e
+            if t is not None:
+                times.append(float(t))
+        merged = self._merge_intervals([(t, t + 0.5) for t in times])
+        return [start for start, _end, _meta in merged]
 
     def _nav_timestamps_motion_peaks(self):
         return [float(p) if not isinstance(p, dict) else float(p.get('time', 0))

@@ -18,6 +18,7 @@ from .timeline_bars import TimelineBar
 from .thumbnail_cache import ThumbnailCache, PRIORITY_HOVER
 from .hover_preview import HoverPreview
 from .filmstrip_painter import DEFAULT_ASPECT, paint_filmstrip
+from . import clip_overlaps
 
 
 # Hover preview pulls a larger thumb than the filmstrip slots. Which also means
@@ -160,7 +161,19 @@ class EditClipItem(QGraphicsRectItem):
                 painter.setPen(Qt.NoPen)
                 painter.drawRoundedRect(backdrop, 5, 5)
 
-        # 4. Border — yellow when selected (matches old behavior), pen otherwise
+        # 4. Overlap band -- this clip shares footage with another
+        if scene is not None and self._get_current_index() in getattr(scene, 'overlap_map', {}):
+            # On a dark edge, so it still reads on an amber clip or a bright
+            # thumbnail.
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 0, 0, 200)))
+            painter.drawRect(QRectF(rect.left() + 1, rect.top() + 1,
+                                    rect.width() - 2, 7))
+            painter.setBrush(QBrush(QColor(255, 150, 30)))
+            painter.drawRect(QRectF(rect.left() + 1, rect.top() + 2,
+                                    rect.width() - 2, 4))
+
+        # 5. Border — yellow when selected (matches old behavior), pen otherwise
         if option is not None and (option.state & QStyle.State_Selected):
             painter.setPen(QPen(Qt.yellow, 2))
         else:
@@ -229,8 +242,8 @@ class EditClipItem(QGraphicsRectItem):
             if width > 0:
                 progress = max(0.0, min(1.0, local_x / width))
                 source_time = self.start_time + progress * (self.end_time - self.start_time)
-                if scene and hasattr(scene, 'time_clicked'):
-                    scene.time_clicked.emit(source_time)
+                if scene and hasattr(scene, 'clip_clicked'):
+                    scene.clip_clicked.emit(my_index, source_time)
 
             event.accept()  # Accept the event to ensure we get move events
             return
@@ -377,10 +390,15 @@ class EditClipItem(QGraphicsRectItem):
         idx = self._get_current_index()
         clip_num = idx + 1 if idx >= 0 else "?"
         
+        overlap_lines = ""
+        scene = self.scene()
+        for other, secs in (getattr(scene, 'overlap_map', {}) or {}).get(idx, []):
+            overlap_lines += f"Overlaps Clip {other + 1} by {secs:.1f}s (plays twice)\n"
         self.setToolTip(
             f"Clip {clip_num}\n"
             f"{self.start_time:.1f}s - {self.end_time:.1f}s\n"
             f"Duration: {duration:.1f}s\n"
+            f"{overlap_lines}"
             f"Drag to reorder · Double-click to play · Right-click for menu"
         )
 
@@ -465,12 +483,23 @@ class EditClipItem(QGraphicsRectItem):
         trim_start_action.setEnabled(click_time > self.start_time + 0.2)
         trim_end_action.setEnabled(click_time < self.end_time - 0.2)
 
+        merge_action = None
+        overlapping = getattr(scene, 'overlap_map', {}).get(current_index, [])
+        if overlapping:
+            menu.addSeparator()
+            merge_action = menu.addAction(
+                "⧉   Merge with overlapping clip"
+                + ("s" if len(overlapping) > 1 else ""))
+
         menu.addSeparator()
         delete_action = menu.addAction("🗑️   Delete clip")
 
         chosen = menu.exec(event.screenPos())
 
-        if chosen == cut_action:
+        if chosen is not None and chosen == merge_action:
+            scene.merge_overlaps_of(current_index)
+
+        elif chosen == cut_action:
             scene.cut_clip_at(click_time)
 
         elif chosen == trim_start_action:
@@ -571,10 +600,20 @@ class EditTimelineScene(QGraphicsScene):
     clip_double_clicked = Signal(float, float)  # start, end
     clip_added = Signal(float, float)           # start, end
     clip_removed = Signal(int)                  # index
-    time_clicked = Signal(float)                # source video time
+    # Which clip was clicked, and the source time under the cursor. The index
+    # is what places the playhead: two clips can cover the same source time
+    # (a moment used twice, or overlapping ranges), and finding "the clip
+    # containing this time" picked the first of them, so a click on the right
+    # of one clip put the playhead in another.
+    clip_clicked = Signal(int, float)           # clip index, source video time
     clip_cut = Signal(float)                    # cut time after a successful cut
     clip_trimmed = Signal(int)                  # clip index after a trim
     clip_reordered = Signal(int, int)           # from_index, to_index
+    # Clips just added that share source footage with others, as
+    # [(i, j, seconds), ...]; [] once that has been resolved or gone away.
+    overlaps_found = Signal(list)
+    # The clip list changed in bulk (a merge or a trim); the text says how.
+    clips_changed = Signal(str)
 
     def __init__(self, video_path, video_duration, parent=None, cache=None, cache_data=None):
         super().__init__(parent)
@@ -584,6 +623,15 @@ class EditTimelineScene(QGraphicsScene):
         self.cache_data = cache_data or {}
         self.clips = []
         self.clip_items = []
+        # Overlaps (see clip_overlaps.py). overlap_map is rebuilt with the
+        # clips; kept_overlaps holds pairs the user chose to keep, by their
+        # ranges so a reorder doesn't forget them.
+        self.overlap_map = {}
+        self.kept_overlaps = set()
+        self._recent_adds = []
+        self._overlap_check_pending = False
+        self._notice_pairs = []
+        self._notice_adds = set()
         self.pixels_per_second = 50
         self.clip_height = 60
         self.clip_spacing = 5
@@ -614,6 +662,9 @@ class EditTimelineScene(QGraphicsScene):
 
         # Load initial highlights if available
         self.load_initial_clips()
+        # Connected after the load: an edit that already had overlaps shows
+        # them on its clips, but only clips added from here on ask about it.
+        self.clip_added.connect(self._note_added)
         # Snapshot of what was loaded, so we can tell on close whether the user
         # actually edited the timeline (and thus whether to auto-save it).
         self._saved_clips_snapshot = list(self.clips)
@@ -713,12 +764,13 @@ class EditTimelineScene(QGraphicsScene):
             pass
 
     def mousePressEvent(self, event):
-        """Handle mouse clicks - emit time signal"""
-        if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.scenePos()
-            time = pos.x() / self.pixels_per_second
-            self.time_clicked.emit(time)
+        """Mouse clicks go to the clip under the cursor, which emits
+        clip_clicked with its index and the *source* time it shows.
 
+        No emit here: this used to send the click's x as a time too, but x on
+        the edit timeline is a position in the cut, not in the source video,
+        so every click first seeked the source somewhere unrelated -- and a
+        click on empty space did nothing else."""
         # NOTE: no add_to_edit_requested here — that signal belongs to the
         # SIGNAL timeline (SignalTimelineScene). Emitting it on the EDIT timeline
         # was copy-paste leftover that raised AttributeError on Ctrl+click of the
@@ -958,6 +1010,12 @@ class EditTimelineScene(QGraphicsScene):
         print("build_timeline() called")
         self.clear()
         self.clip_items = []
+        self.overlap_map = clip_overlaps.by_clip(self.clips)
+        if self._notice_pairs and not self._open_notice_pairs():
+            # Resolved some other way (deleted, trimmed, cut by hand).
+            self._notice_pairs = []
+            self._notice_adds = set()
+            self.overlaps_found.emit([])
 
         # ── Calculate total width FIRST ──
         current_x = 20
@@ -1178,6 +1236,81 @@ class EditTimelineScene(QGraphicsScene):
         """Get list of all clip time ranges"""
         return self.clips.copy()
 
+    # ── OVERLAPS ───────────────────────────────────────────────────────
+    def _note_added(self, start_time, end_time):
+        """Remember a clip that was just added, and look for overlaps once the
+        current burst of adds is over -- "add every bar in this row" is many
+        adds, and it should ask once, not once per clip."""
+        self._recent_adds.append((start_time, end_time))
+        if not self._overlap_check_pending:
+            self._overlap_check_pending = True
+            QTimer.singleShot(0, self._check_new_overlaps)
+
+    @staticmethod
+    def _pair_key(a, b):
+        return frozenset((tuple(a), tuple(b)))
+
+    def _open_notice_pairs(self):
+        """Overlaps involving a recently added clip that the user has not
+        chosen to keep, against the clips as they are now."""
+        recent = self._notice_adds
+        return [(i, j, s) for i, j, s in clip_overlaps.pairs(self.clips)
+                if (self.clips[i] in recent or self.clips[j] in recent)
+                and self._pair_key(self.clips[i], self.clips[j]) not in self.kept_overlaps]
+
+    def _check_new_overlaps(self):
+        self._overlap_check_pending = False
+        self._notice_adds |= set(self._recent_adds)
+        self._recent_adds = []
+        self._notice_pairs = self._open_notice_pairs()
+        if not self._notice_pairs:
+            self._notice_adds = set()
+            return
+        self.overlaps_found.emit(list(self._notice_pairs))
+
+    def _close_notice(self, message):
+        self._notice_pairs = []
+        self._notice_adds = set()
+        self.build_timeline()
+        self.overlaps_found.emit([])
+        self.clips_changed.emit(message)
+
+    def merge_new_overlaps(self):
+        """The notice's Merge: each run of overlapping clips becomes one."""
+        found = clip_overlaps.groups(self.clips, self._open_notice_pairs())
+        before = len(self.clips)
+        self.clips = clip_overlaps.merge(self.clips, found)
+        n = before - len(self.clips)
+        self._close_notice(f"Merged {n} overlapping clip{'s' if n != 1 else ''}")
+
+    def merge_overlaps_of(self, index):
+        """Right-click Merge: the clip and everything it overlaps, transitively."""
+        found = [g for g in clip_overlaps.groups(self.clips, clip_overlaps.pairs(self.clips))
+                 if index in g]
+        if not found:
+            return
+        self.clips = clip_overlaps.merge(self.clips, found)
+        self._close_notice(f"Merged {len(found[0])} clips into one")
+
+    def trim_new_overlaps(self):
+        """The notice's Trim: cut each new clip down to footage no other clip
+        already has. A new clip wholly inside another goes away."""
+        pairs = self._open_notice_pairs()
+        new = sorted({k for i, j, _s in pairs for k in (i, j)
+                      if self.clips[k] in self._notice_adds})
+        before = sum(e - s for s, e in self.clips)
+        self.clips = clip_overlaps.trim(self.clips, new)
+        removed = before - sum(e - s for s, e in self.clips)
+        self._close_notice(f"Trimmed {removed:.1f}s that played twice")
+
+    def keep_new_overlaps(self):
+        """The notice's Keep both: leave them, and don't ask about these again."""
+        for i, j, _s in self._open_notice_pairs():
+            self.kept_overlaps.add(self._pair_key(self.clips[i], self.clips[j]))
+        self._notice_pairs = []
+        self._notice_adds = set()
+        self.overlaps_found.emit([])
+
     # ── DRAG AND DROP ──────────────────────────────────────────────────
     def clear_drop_indicators(self):
         """Safely remove drop indicators"""
@@ -1289,10 +1422,10 @@ class EditTimelineScene(QGraphicsScene):
 
     def hide_drop_indicator(self):
         """Remove drop indicator - SAFE version"""
+        # clear_drop_indicators() already removed the marker and set it to
+        # None. Removing it a second time handed Qt a null item, and every
+        # clip release logged "removeItem: cannot remove 0-item".
         self.clear_drop_indicators()
-
-        if hasattr(self, 'drop_indicator_marker'):
-            self.removeItem(self.drop_indicator_marker)
 
     def get_insert_index(self, x_pos):
         """
