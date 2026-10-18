@@ -31,7 +31,7 @@ def test_main_keeps_the_full_ui_and_adds_the_stack():
     text = Path("main.py").read_text(encoding="utf-8")
     assert "SimpleStartPage" in text
     assert "set_simple_start" in text
-    assert 'QPushButton("Run Highlighter")' in text
+    assert 'QPushButton(i18n.t("Run Highlighter"))' in text
     assert "view_stack" in text
 
 
