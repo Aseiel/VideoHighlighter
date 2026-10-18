@@ -221,6 +221,7 @@ class TestUndo:
         assert scene.undo() is False
 
     def test_window_leaves_edit_playback_before_stepping(self):
+        pytest.importorskip("PySide6")    # CI runs without Qt
         import signal_timeline_viewer as stv
 
         calls = []
