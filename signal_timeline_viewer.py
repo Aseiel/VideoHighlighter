@@ -2792,6 +2792,22 @@ class SignalTimelineWindow(QMainWindow):
                     self.cut_mode_btn.setChecked(False)
                     return True
 
+            if (event.key() in (Qt.Key_Z, Qt.Key_Y)
+                    and event.modifiers() & Qt.ControlModifier
+                    and self.isActiveWindow()):
+                # Text boxes (the assistant's input, any line edit) keep their
+                # own undo; everywhere else in this window it's the edit's.
+                from PySide6.QtWidgets import (QLineEdit, QTextEdit,
+                                               QPlainTextEdit, QAbstractSpinBox)
+                focused = QApplication.focusWidget()
+                if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit,
+                                        QAbstractSpinBox)):
+                    return False
+                redo = (event.key() == Qt.Key_Y
+                        or bool(event.modifiers() & Qt.ShiftModifier))
+                self.redo_edit() if redo else self.undo_edit()
+                return True
+
             if event.key() == Qt.Key_Space:
                 # Don't steal Space from text inputs
                 from PySide6.QtWidgets import QLineEdit, QTextEdit, QPlainTextEdit
@@ -4407,6 +4423,22 @@ class SignalTimelineWindow(QMainWindow):
             self._overlap_trim_btn.setText("Trim new clips")
         self._overlap_label.setText(text)
         self.overlap_notice.show()
+
+    def undo_edit(self):
+        """Ctrl+Z: put the edit timeline back as it was before the last change."""
+        self._step_edit_history(self.edit_scene.undo, "Nothing to undo")
+
+    def redo_edit(self):
+        """Ctrl+Shift+Z / Ctrl+Y."""
+        self._step_edit_history(self.edit_scene.redo, "Nothing to redo")
+
+    def _step_edit_history(self, step, nothing):
+        # Edit playback holds clip indices; after the list changes under it
+        # they point at other clips. Leave it, as clicking the source does.
+        if getattr(self, '_edit_playback_active', False):
+            self._leave_edit_playback()
+        if not step():
+            self.statusBar().showMessage(nothing, 2000)
 
     @Slot(str)
     def _on_edit_clips_changed(self, message):

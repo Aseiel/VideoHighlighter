@@ -163,3 +163,121 @@ class TestScene:
         assert found == []
         assert set(s.overlap_map) == {0, 1}
         s.cleanup()
+
+
+class TestUndo:
+    """Ctrl+Z on the edit timeline. Recorded where every edit ends
+    (build_timeline), so each kind of edit is covered without its own code."""
+
+    def test_undo_a_merge(self, scene):
+        scene.add_clip(*CLIP_2)
+        scene.add_clip(*CLIP_3)
+        settle()
+        scene.merge_new_overlaps()
+        settle()
+        assert scene.clips == [CLIP_3]
+        assert scene.undo()
+        assert scene.clips == [CLIP_2, CLIP_3]
+        assert set(scene.overlap_map) == {0, 1}
+
+    def test_a_burst_of_adds_is_one_step(self, scene):
+        scene.add_clip(0, 10)
+        settle()
+        for clip in [(20, 30), (40, 50), (60, 70)]:
+            scene.add_clip(*clip)
+        settle()
+        scene.undo()
+        assert scene.clips == [(0, 10)]
+
+    def test_redo_and_a_new_edit_clears_it(self, scene):
+        scene.add_clip(0, 10)
+        settle()
+        scene.add_clip(20, 30)
+        settle()
+        scene.undo()
+        assert scene.redo()
+        assert scene.clips == [(0, 10), (20, 30)]
+        scene.undo()
+        scene.add_clip(40, 50)
+        settle()
+        assert not scene.can_redo()
+
+    def test_each_kind_of_edit_is_undoable(self, scene):
+        scene.add_clip(0, 10)
+        scene.add_clip(20, 30)
+        settle()
+        for change in (lambda: scene.cut_clip_at(5.0),
+                       lambda: scene.trim_clip_end(0, 4.0),
+                       lambda: scene.reorder_clip(0, 10_000)):
+            before = list(scene.clips)
+            change()
+            settle()
+            assert scene.clips != before
+            scene.undo()
+            assert scene.clips == before
+
+    def test_nothing_to_undo_after_load(self, scene):
+        assert not scene.can_undo()
+        assert scene.undo() is False
+
+    def test_window_leaves_edit_playback_before_stepping(self):
+        import signal_timeline_viewer as stv
+
+        calls = []
+
+        class Win:
+            _edit_playback_active = True
+
+            def _leave_edit_playback(self):
+                calls.append("leave")
+
+            def statusBar(self):
+                class Bar:
+                    def showMessage(self, *a):
+                        calls.append("msg")
+                return Bar()
+
+        stv.SignalTimelineWindow._step_edit_history(Win(), lambda: True, "x")
+        assert calls == ["leave"]
+        Win._edit_playback_active = False
+        stv.SignalTimelineWindow._step_edit_history(Win(), lambda: False, "x")
+        assert calls == ["leave", "msg"]
+
+
+class TestReorder:
+    """Dragging a clip: its left edge past a neighbour's centre moves it past
+    that neighbour, measured on the layout as it is while dragging."""
+
+    def lefts(self, scene):
+        return [item.pos().x() for item in scene.clip_items]
+
+    def test_one_place_right(self, scene):
+        for clip in [(0, 4), (10, 14), (20, 24)]:      # 4 s = 200 px wide each
+            scene.add_clip(*clip)
+        settle()
+        b_left = self.lefts(scene)[1]
+        scene.reorder_clip(0, b_left + 120)            # past B's centre (+100)
+        assert scene.clips == [(10, 14), (0, 4), (20, 24)]
+
+    def test_to_the_end(self, scene):
+        for clip in [(0, 4), (10, 14), (20, 24)]:
+            scene.add_clip(*clip)
+        settle()
+        scene.reorder_clip(0, 10_000)
+        assert scene.clips == [(10, 14), (20, 24), (0, 4)]
+
+    def test_short_of_the_centre_stays(self, scene):
+        for clip in [(0, 4), (10, 14), (20, 24)]:
+            scene.add_clip(*clip)
+        settle()
+        b_left = self.lefts(scene)[1]
+        scene.reorder_clip(0, b_left + 60)             # not yet past B's centre
+        assert scene.clips == [(0, 4), (10, 14), (20, 24)]
+
+    def test_one_place_left(self, scene):
+        for clip in [(0, 4), (10, 14), (20, 24)]:
+            scene.add_clip(*clip)
+        settle()
+        b_left = self.lefts(scene)[1]
+        scene.reorder_clip(2, b_left + 80)             # left of B's centre
+        assert scene.clips == [(0, 4), (20, 24), (10, 14)]

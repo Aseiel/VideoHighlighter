@@ -632,6 +632,14 @@ class EditTimelineScene(QGraphicsScene):
         self._overlap_check_pending = False
         self._notice_pairs = []
         self._notice_adds = set()
+        # Undo: earlier clip lists, recorded by build_timeline (see
+        # _record_undo). None until the initial load is done, so loading
+        # isn't something to undo.
+        self._undo_stack = []
+        self._redo_stack = []
+        self._undo_baseline = None
+        self._undo_group_open = False
+        self._restoring = False
         self.pixels_per_second = 50
         self.clip_height = 60
         self.clip_spacing = 5
@@ -684,6 +692,7 @@ class EditTimelineScene(QGraphicsScene):
 
         self.setSceneRect(0, 0, 1000, self.clip_height + 40)
         self.build_timeline()
+        self._undo_baseline = list(self.clips)
 
     @property
     def thumb_aspect(self) -> float:
@@ -1008,6 +1017,7 @@ class EditTimelineScene(QGraphicsScene):
     def build_timeline(self):
         """Build the edit timeline visualization"""
         print("build_timeline() called")
+        self._record_undo()
         self.clear()
         self.clip_items = []
         self.overlap_map = clip_overlaps.by_clip(self.clips)
@@ -1236,6 +1246,72 @@ class EditTimelineScene(QGraphicsScene):
         """Get list of all clip time ranges"""
         return self.clips.copy()
 
+    # ── UNDO ───────────────────────────────────────────────────────────
+    UNDO_LIMIT = 100
+
+    def _record_undo(self):
+        """Remember the clip list as it was before a change.
+
+        Called from build_timeline, which every edit ends in -- add, drop,
+        delete, cut, trim, reorder, merge, loading a version -- so no edit can
+        forget to record itself. Changes in one burst (a whole "add all in
+        this row", a merge) are one step: the first change of an event-loop
+        turn records, the rest of that turn join it."""
+        if self._undo_baseline is None or self._restoring:
+            return
+        now = list(self.clips)
+        if now == self._undo_baseline:
+            return
+        if not self._undo_group_open:
+            self._undo_stack.append(self._undo_baseline)
+            del self._undo_stack[:-self.UNDO_LIMIT]
+            self._redo_stack.clear()
+            self._undo_group_open = True
+            QTimer.singleShot(0, self._close_undo_group)
+        self._undo_baseline = now
+
+    def _close_undo_group(self):
+        self._undo_group_open = False
+
+    def can_undo(self):
+        return bool(self._undo_stack)
+
+    def can_redo(self):
+        return bool(self._redo_stack)
+
+    def undo(self):
+        """Put the clip list back as it was before the last edit."""
+        if not self._undo_stack:
+            return False
+        self._redo_stack.append(list(self.clips))
+        self._restore(self._undo_stack.pop(), "Undone")
+        return True
+
+    def redo(self):
+        if not self._redo_stack:
+            return False
+        self._undo_stack.append(list(self.clips))
+        self._restore(self._redo_stack.pop(), "Redone")
+        return True
+
+    def _restore(self, clips, verb):
+        before = len(self.clips)
+        self._restoring = True
+        try:
+            self.clips = list(clips)
+            self._undo_baseline = list(clips)
+            self._undo_group_open = False
+            # A notice about clips that no longer exist means nothing.
+            self._recent_adds = []
+            self._notice_pairs = []
+            self._notice_adds = set()
+            self.clear_active_clip()
+            self.build_timeline()
+        finally:
+            self._restoring = False
+        self.overlaps_found.emit([])
+        self.clips_changed.emit(f"{verb} \u2014 {before} \u2192 {len(self.clips)} clips")
+
     # ── OVERLAPS ───────────────────────────────────────────────────────
     def _note_added(self, start_time, end_time):
         """Remember a clip that was just added, and look for overlaps once the
@@ -1281,7 +1357,8 @@ class EditTimelineScene(QGraphicsScene):
         before = len(self.clips)
         self.clips = clip_overlaps.merge(self.clips, found)
         n = before - len(self.clips)
-        self._close_notice(f"Merged {n} overlapping clip{'s' if n != 1 else ''}")
+        self._close_notice(f"Merged {n} overlapping clip{'s' if n != 1 else ''}"
+                           f" \u2014 Ctrl+Z to undo")
 
     def merge_overlaps_of(self, index):
         """Right-click Merge: the clip and everything it overlaps, transitively."""
@@ -1290,7 +1367,7 @@ class EditTimelineScene(QGraphicsScene):
         if not found:
             return
         self.clips = clip_overlaps.merge(self.clips, found)
-        self._close_notice(f"Merged {len(found[0])} clips into one")
+        self._close_notice(f"Merged {len(found[0])} clips into one \u2014 Ctrl+Z to undo")
 
     def trim_new_overlaps(self):
         """The notice's Trim: cut each new clip down to footage no other clip
@@ -1301,7 +1378,8 @@ class EditTimelineScene(QGraphicsScene):
         before = sum(e - s for s, e in self.clips)
         self.clips = clip_overlaps.trim(self.clips, new)
         removed = before - sum(e - s for s, e in self.clips)
-        self._close_notice(f"Trimmed {removed:.1f}s that played twice")
+        self._close_notice(f"Trimmed {removed:.1f}s that played twice"
+                           f" \u2014 Ctrl+Z to undo")
 
     def keep_new_overlaps(self):
         """The notice's Keep both: leave them, and don't ask about these again."""
@@ -1447,6 +1525,21 @@ class EditTimelineScene(QGraphicsScene):
         
         return len(self.clips)
 
+    def _insert_index_skipping(self, x_pos, skip):
+        """Where a clip whose left edge is at `x_pos` goes, among the other
+        clips laid out as they are now; an index into the list without the
+        clip at `skip`."""
+        current_x = 20
+        n = 0
+        for i, (start, end) in enumerate(self.clips):
+            width = max(60, (end - start) * self.pixels_per_second)
+            if i != skip:
+                if x_pos < current_x + width / 2:
+                    return n
+                n += 1
+            current_x += width + self.clip_spacing
+        return n
+
     def calculate_insert_x(self, index):
         """Calculate x position for insertion at given index"""
         current_x = 20
@@ -1569,13 +1662,14 @@ class EditTimelineScene(QGraphicsScene):
     def reorder_clip(self, clip_index, new_left_x):
         """Reorder clip based on its left edge position, not center"""
         if 0 <= clip_index < len(self.clips):
+            # Measured against the layout the user is looking at while
+            # dragging -- every clip where it is now, the dragged one skipped.
+            # This popped first, found the slot in the list without the clip,
+            # and then took one off again for a forward move, so a clip
+            # dragged right landed a slot short and one dragged a single
+            # place right didn't move.
+            insert_index = self._insert_index_skipping(new_left_x, clip_index)
             clip = self.clips.pop(clip_index)
-            insert_index = self.get_insert_index(new_left_x)
-            
-            # Adjust insert_index if we're moving forward
-            if insert_index > clip_index:
-                insert_index -= 1
-            
             self.clips.insert(insert_index, clip)
             self.build_timeline()  # This recreates all clip items with new indices
             
