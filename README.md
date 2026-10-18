@@ -23,6 +23,11 @@ needs no API key.
 Free and open source (AGPL-3.0). Windows, macOS, Linux. Intel, AMD and NVIDIA
 GPUs.
 
+**App interface languages** (About → Interface language): English, 简体中文,
+Español, Português (Brasil), Français, 日本語, Deutsch, 한국어, Bahasa
+Indonesia, Türkçe, Italiano, Polski, Tiếng Việt, Nederlands. This README is
+still English-first; translated copies above cover 中文 / 日本語 / Español.
+
 > **It's free.** To make sure you see new releases in future, please click the
 > motivation button: the ⭐ at the top of the page. It's the cheapest payment we
 > accept.
