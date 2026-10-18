@@ -1697,7 +1697,9 @@ class VideoHighlighterGUI(QWidget):
         groups = (
             ("Movement && scenes", (
                 ("Scene points:", self._points_row_with_button(
-                    self.spin_scene_points, "motion", "Motion & scenes",
+                    # "&&": on a button a single & marks a shortcut key and
+                    # drew as "Motion _scenes".
+                    self.spin_scene_points, "motion", "Motion && scenes",
                     "Detect scene cuts and motion across every video in the list "
                     "and cache them (covers scene, motion event and motion peak "
                     "— one pass). No highlights are cut.")),

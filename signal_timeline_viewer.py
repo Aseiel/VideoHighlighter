@@ -41,6 +41,7 @@ from datetime import datetime, timedelta
 
 
 # modules
+from modules import i18n
 from modules.ui.collapsible import CollapsibleSection
 from modules.ui import fit
 from modules.ui.fit import fit_icon_button, fit_width
@@ -277,13 +278,15 @@ class SignalLabelPanel(QWidget):
                 p.setFont(font_lbl)
                 p.setPen(QColor(THEME.text))
                 avail = self.width() - self._ARROW_W * 2 - 6 - counter_w
-                clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
+                # Painted, so the Qt hooks never see it. Translated for display
+                # only: `name` stays the English key navigation is wired by.
+                clipped = fm_lbl.elidedText(i18n.t(name), Qt.ElideRight, avail)
                 p.drawText(self._ARROW_W + 3, mid_y, clipped)
             else:
                 p.setFont(font_lbl)
                 p.setPen(QColor(165, 165, 165))
                 avail = self.width() - 8
-                clipped = fm_lbl.elidedText(name, Qt.ElideRight, avail)
+                clipped = fm_lbl.elidedText(i18n.t(name), Qt.ElideRight, avail)
                 p.drawText(6, mid_y, clipped)
 
         p.setPen(QColor(60, 60, 60))
@@ -4767,7 +4770,9 @@ class SignalTimelineWindow(QMainWindow):
         layout.addWidget(start_combo)
 
         def _on_format_changed():
-            name = format_combo.currentText()
+            # The format's own name, not the combo's text, which is
+            # translated in other UI languages.
+            name = formats[max(0, format_combo.currentIndex())][0]
             if name.startswith("CSV"):
                 start_combo.setCurrentIndex(0)
                 start_combo.setEnabled(False)

@@ -147,3 +147,18 @@ def _no_action_model_choice_leaks():
             os.environ.pop("VH_ACTION_MODEL", None)
         else:
             os.environ["VH_ACTION_MODEL"] = before
+
+
+# The UI language is module state, and the Qt hooks that read it stay
+# installed once any test installs them. A test that switched to Turkish and
+# stopped there ran every later Qt test in Turkish: the teach window's buttons
+# were found by their English labels, and failed in the full run only.
+@pytest.fixture(autouse=True)
+def _no_ui_language_leaks():
+    yield
+    try:
+        from modules.i18n import core
+        if core.current_language() != "en":
+            core.set_language("en")
+    except Exception:
+        pass

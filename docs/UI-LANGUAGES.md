@@ -74,7 +74,7 @@ Saved 2026-10-17. Order ≈ how often users want desktop software in that langua
 
 **Phase 2 (CJK):** `zh-CN`, `ja`, `ko` — selectable in About → Interface
 
-language with the same 364-string catalog as phase 1.
+language with the same catalog as phase 1.
 
 
 
@@ -87,15 +87,33 @@ language is remembered until changed.
 
 
 **Coverage model:** `i18n.install_qt_hooks()` patches Qt widgets so labels,
-buttons, tabs, tooltips, placeholders, and common message boxes go through
-`t()`. The catalog must contain every English UI string — English fallback is
-a catalog gap to fix. Scan covers main, Simple view, Timeline Viewer, teach /
-training, LLM chat, model hub, and `video_ai_editor` dialogs (~790 keys).
-Standalone timeline also loads `ui.language` and installs hooks.
+buttons, tabs, tooltips, placeholders, common message boxes, window and dock
+titles, menus and actions, the status bar, and text drawn into a graphics
+scene go through `t()`. Text painted by hand (the timeline's row names) calls
+`i18n.t()` where it is drawn. Padding is not part of a msgid: `"  Audio"` is
+looked up as `"Audio"`. An empty catalog entry falls back to English. The
+catalog must contain every English UI string — English fallback is a catalog
+gap to fix. Standalone timeline also loads `ui.language` and installs hooks.
 
-Regenerate: `tools/_export_msgids.py` → `_rebuild_locales_from_msgids.py` →
-`_build_locale_jsons.py` → `_patch_locale_identities.py` →
-`_merge_locales_to_catalog.py`.
+Not translated yet: text built at runtime from data (`f"Loaded: {name}"`,
+durations, most status-bar messages, the assistant's log lines) and spin-box
+suffixes. Those need their call sites changed to translate a fixed template.
+
+**Finding gaps:** `python tools/i18n_misses.py zh-CN --json out.json` lists
+what a language lacks, from two passes: a scan for literals passed to hooked
+Qt calls, and a run that builds the main and timeline windows in that
+language and records every fallback. Neither alone is enough — strings that
+reach Qt through a helper or a table are only seen at runtime, and context
+menus and message boxes only by the scan.
+
+**Adding translations:** put `<lang>.json` ({msgid: translation}) and,
+optionally, `<lang>.review.json` (corrections to existing entries) in a work
+folder, then `python tools/i18n_merge.py <folder>`. It checks every entry with
+`modules/i18n/checks.py` (format fields, HTML tags, line breaks and a lone
+`&` must match the English), writes `locales/<lang>.json`, and regenerates
+`catalog.py` from them. An existing entry that fails the checks is reset to
+the English. `tests/test_i18n_coverage.py` keeps the catalog free of such
+entries and every language on the same set of strings.
 
 
 

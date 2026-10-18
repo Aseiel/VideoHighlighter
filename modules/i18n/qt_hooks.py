@@ -21,6 +21,10 @@ def _wrap_arg(args: tuple, index: int) -> tuple:
     value = args[index]
     if not isinstance(value, str) or not value.strip():
         return args
+    # Numbers, times and counters ("0%", "00:00 / 23:01") have nothing to
+    # translate.
+    if not any(ch.isalpha() for ch in value):
+        return args
     # Skip stylesheets / paths / URLs — not user-facing copy.
     if value.lstrip().startswith(("{", "<html", "http://", "https://", "/", "\\")):
         return args
@@ -70,6 +74,35 @@ def _patch_add_tab(cls) -> None:
         return original(self, *args, **kwargs)
 
     cls.addTab = wrapped  # type: ignore[method-assign]
+
+
+def _patch_text_after_icon(cls, name: str) -> None:
+    """QMenu.addAction / addMenu and QAction(): the text is arg 0, or arg 1
+    after an icon."""
+    from PySide6.QtGui import QIcon
+
+    original = getattr(cls, name)
+
+    def wrapped(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if args and isinstance(args[0], QIcon):
+            args = (args[0], *_wrap_arg(args[1:], 0))
+        else:
+            args = _wrap_arg(args, 0)
+        return original(self, *args, **kwargs)
+
+    setattr(cls, name, wrapped)
+
+
+def _patch_list_arg(cls, name: str) -> None:
+    """Header setters that take a list of labels."""
+    original = getattr(cls, name)
+
+    def wrapped(self, labels, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if isinstance(labels, (list, tuple)):
+            labels = [_wrap_arg((v,), 0)[0] for v in labels]
+        return original(self, labels, *args, **kwargs)
+
+    setattr(cls, name, wrapped)
 
 
 def install() -> None:
@@ -131,6 +164,48 @@ def install() -> None:
 
     _patch_add_item(QComboBox)
     _patch_add_tab(QTabWidget)
+    _patch_method(QTabWidget, "setTabText", 1)
+    _patch_method(QTabWidget, "setTabToolTip", 1)
+
+    # Text that isn't on a label or button: window and dock titles, menus and
+    # their actions, the status bar, and text drawn into a graphics scene.
+    # Before these, a dock's title bar or a whole menu stayed English in
+    # every language.
+    from PySide6.QtGui import QAction
+    from PySide6.QtWidgets import (
+        QDockWidget,
+        QGraphicsScene,
+        QGraphicsTextItem,
+        QListWidgetItem,
+        QMenu,
+        QStatusBar,
+        QTableWidget,
+        QTreeWidget,
+        QWidget,
+    )
+
+    _patch_method(QWidget, "setWindowTitle", 0)
+    _patch_method(QDockWidget, "__init__", 0)
+    _patch_method(QDockWidget, "setWindowTitle", 0)
+    _patch_method(QMenu, "__init__", 0)
+    _patch_method(QMenu, "setTitle", 0)
+    _patch_text_after_icon(QMenu, "addAction")
+    _patch_text_after_icon(QMenu, "addMenu")
+    _patch_method(QMenu, "addSection", 0)
+    _patch_text_after_icon(QAction, "__init__")
+    _patch_method(QAction, "setText", 0)
+    _patch_method(QAction, "setToolTip", 0)
+    _patch_method(QAction, "setStatusTip", 0)
+    _patch_method(QStatusBar, "showMessage", 0)
+    _patch_method(QGraphicsScene, "addText", 0)
+    _patch_method(QGraphicsTextItem, "__init__", 0)
+    _patch_method(QGraphicsTextItem, "setPlainText", 0)
+    _patch_method(QListWidgetItem, "__init__", 0)
+    _patch_method(QListWidgetItem, "setText", 0)
+    _patch_list_arg(QTreeWidget, "setHeaderLabels")
+    _patch_list_arg(QTableWidget, "setHorizontalHeaderLabels")
+    _patch_method(QMessageBox, "setText", 0)
+    _patch_method(QMessageBox, "setInformativeText", 0)
 
     # Form rows: addRow(label, field) when label is a str
     from PySide6.QtWidgets import QFormLayout
