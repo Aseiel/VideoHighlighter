@@ -1297,6 +1297,7 @@ class SignalTimelineWindow(QMainWindow):
         self.detection_panel.setText('<br>'.join(lines))
 
     def toggle_video_playback(self):
+        self._space_plays_edit = False
         if self._active_player.playbackState() == QMediaPlayer.PlayingState:
             self._active_player.pause()
             self.play_btn.setText("▶ Play")
@@ -2814,7 +2815,11 @@ class SignalTimelineWindow(QMainWindow):
                 focused = QApplication.focusWidget()
                 if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit)):
                     return False
-                if getattr(self, '_edit_playback_active', False):
+                # Space plays whichever timeline you were last working in.
+                # Only a *running* edit used to count, so clicking a clip in
+                # the edit timeline and pressing Space played the source video.
+                if (getattr(self, '_edit_playback_active', False)
+                        or getattr(self, '_space_plays_edit', False)):
                     self.toggle_edit_playback()
                 else:
                     self.toggle_video_playback()
@@ -4255,6 +4260,7 @@ class SignalTimelineWindow(QMainWindow):
         # the next Space plays the video from here instead of resuming the edit.
         if getattr(self, '_edit_playback_active', False):
             self._leave_edit_playback()
+        self._space_plays_edit = False
 
         self.current_time = max(0, min(self.video_duration, time))
         self.signal_scene.current_time_seconds = self.current_time
@@ -4490,7 +4496,11 @@ class SignalTimelineWindow(QMainWindow):
             # Clicking a clip in the EDIT timeline is deliberate repositioning of
             # edit playback, so remember it as the resume point (unlike signal-
             # timeline clicks, which hand control back to the source video).
+            # The index too: with overlapping clips the time alone names the
+            # first clip containing it, not the one that was clicked.
             self._edit_resume_pos = self.current_time
+            self._edit_resume_index = found
+            self._space_plays_edit = True
 
             if is_playing:
                 # Reroute the live playback so this clip plays through to its
@@ -4988,6 +4998,11 @@ class SignalTimelineWindow(QMainWindow):
         t = getattr(self, '_edit_resume_pos', None)
         if t is None:
             return 0, clips[0][0]
+        # The clip it was in, when that still holds it: overlapping clips can
+        # both contain t, and the first match is not necessarily the one.
+        i = getattr(self, '_edit_resume_index', None)
+        if i is not None and 0 <= i < len(clips) and clips[i][0] <= t < clips[i][1]:
+            return i, t
         for i, (start, end) in enumerate(clips):
             if start <= t < end:
                 return i, t
@@ -5022,6 +5037,7 @@ class SignalTimelineWindow(QMainWindow):
         """Toggle play/pause for edit timeline"""
         # Case: a single clip is mid-playback from a double-click.
         # Use the flag instead of player state (which may lag behind).
+        self._space_plays_edit = True
         if getattr(self, '_single_clip_playing', False):
             self._single_clip_playing = False
             self._active_player.pause()
@@ -5096,6 +5112,7 @@ class SignalTimelineWindow(QMainWindow):
             self._edit_playlist_index = 0
             self._edit_paused = False
             self._edit_resume_pos = None   # finished → next Play Edit starts over
+            self._edit_resume_index = None
             self.play_edit_btn.setText("▶ Play Edit")
             if hasattr(self, '_edit_progress_timer'):
                 self._edit_progress_timer.stop()
@@ -5212,6 +5229,7 @@ class SignalTimelineWindow(QMainWindow):
         # even if the main playhead was moved (e.g. by playing the source
         # timeline) in between. Independent of self.current_time by design.
         self._edit_resume_pos = current
+        self._edit_resume_index = idx
 
     def stop_edit_playback(self):
         """Stop edit timeline playback"""
@@ -5227,6 +5245,7 @@ class SignalTimelineWindow(QMainWindow):
         self._edit_playback_active = False
         self._single_clip_playing = False
         self._edit_resume_pos = None   # Stop resets edit playback to the start
+        self._edit_resume_index = None
         self.play_edit_btn.setText("▶ Play Edit")
         self._active_player.pause()
 

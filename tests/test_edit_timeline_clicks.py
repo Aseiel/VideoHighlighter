@@ -182,3 +182,51 @@ class TestMotionEventsNavigation:
                                     video_duration=60.0)
         stops = scene._nav_timestamps_motion_events()
         assert stops == [pytest.approx(10.0), pytest.approx(40.0)]
+
+
+class TestSpace:
+    """Space plays the timeline you were last working in. Only a running edit
+    used to count, so a click on an edit clip then Space played the source."""
+
+    def press_space(self, win):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QKeyEvent
+        event = QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier)
+        return stv.SignalTimelineWindow.eventFilter(win, None, event)
+
+    def window(self):
+        win = _Window([(978.4, 991.6), (963.2, 994.9)])
+        win.video_duration = 1200.0      # long enough for these clips
+        win._edit_playback_active = False
+        win.played = []
+        win.toggle_edit_playback = lambda: win.played.append("edit")
+        win.toggle_video_playback = lambda: win.played.append("video")
+        win.isActiveWindow = lambda: True
+        return win
+
+    def test_after_clicking_an_edit_clip_space_plays_the_edit(self, app):
+        win = self.window()
+        stv.SignalTimelineWindow.on_edit_clip_clicked(win, 1, 987.0)
+        assert self.press_space(win) is True
+        assert win.played == ["edit"]
+
+    def test_the_main_play_button_hands_space_back(self, app):
+        win = self.window()
+        stv.SignalTimelineWindow.on_edit_clip_clicked(win, 1, 987.0)
+        player = win._active_player
+        player.playbackState = lambda: None
+        win.play_btn = _Recorder()
+        stv.SignalTimelineWindow.toggle_video_playback(win)
+        self.press_space(win)
+        assert win.played == ["video"]
+
+    def test_nothing_clicked_space_plays_the_video(self, app):
+        win = self.window()
+        self.press_space(win)
+        assert win.played == ["video"]
+
+    def test_play_edit_resumes_in_the_clicked_overlapping_clip(self, app):
+        win = self.window()
+        stv.SignalTimelineWindow.on_edit_clip_clicked(win, 1, 987.0)
+        clips = win.edit_scene.clips
+        assert stv.SignalTimelineWindow._edit_resume_target(win, clips) == (1, 987.0)
