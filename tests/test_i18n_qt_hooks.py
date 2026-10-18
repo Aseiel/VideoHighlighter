@@ -1,5 +1,9 @@
 """Qt boundary hooks route widget text through i18n.t()."""
 
+import pytest
+
+pytest.importorskip("PySide6")
+
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
 from modules import i18n
