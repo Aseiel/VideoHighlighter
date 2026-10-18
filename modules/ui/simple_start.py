@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
+from modules import i18n
 from modules.system.app_paths import resource_path
 from modules.segments.simple_run import SIMPLE_LENGTHS, idle_status_text, is_video_path
 from modules.ui.collapsible import CollapsibleSection
@@ -95,12 +96,12 @@ class DropZone(QFrame):
         lay = QVBoxLayout(self)
         lay.setAlignment(Qt.AlignCenter)
         p = DARK
-        self._title = QLabel("Drop a video here")
+        self._title = QLabel(i18n.t("Drop a video here"))
         self._title.setStyleSheet(f"color: {p.text}; font-size: 16pt; font-weight: 600;"
                                   "background: transparent; border: none;")
         self._title.setAlignment(Qt.AlignCenter)
         self._title.setWordWrap(True)
-        self._hint = QLabel("or click to choose a file  ·  mp4, mov, mkv, avi")
+        self._hint = QLabel(i18n.t("or click to choose a file  ·  mp4, mov, mkv, avi"))
         self._hint.setStyleSheet(f"color: {p.text_dim}; background: transparent; border: none;")
         self._hint.setAlignment(Qt.AlignCenter)
         self._hint.setWordWrap(True)
@@ -135,8 +136,8 @@ class DropZone(QFrame):
         """
         names = [os.path.basename(p) for p in paths if p]
         if not names:
-            self._title.setText("Drop a video here")
-            self._hint.setText("or click to choose a file  ·  mp4, mov, mkv, avi")
+            self._title.setText(i18n.t("Drop a video here"))
+            self._hint.setText(i18n.t("or click to choose a file  ·  mp4, mov, mkv, avi"))
             self._set_chrome(loaded=False)
             return
         if len(names) == 1:
@@ -247,7 +248,7 @@ class SimpleStartPage(QWidget):
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(gui.cancel_pipeline)
-        self.analyze_btn = QPushButton("Analyze")
+        self.analyze_btn = QPushButton(i18n.t("Analyze"))
         self.analyze_btn.setMinimumHeight(48)
         self.analyze_btn.setMinimumWidth(180)
         self.analyze_btn.setStyleSheet(
@@ -303,7 +304,7 @@ class SimpleStartPage(QWidget):
             "QTextEdit { font-family: 'Courier New', monospace; font-size: 9pt; }")
         root.addWidget(self.log)
 
-        detailed = QPushButton("Detailed settings…")
+        detailed = QPushButton(i18n.t("Detailed settings…"))
         detailed.setFlat(True)
         detailed.setCursor(Qt.PointingHandCursor)
         detailed.setStyleSheet(f"QPushButton {{ color: {p.text_dim}; text-align: left; }}"
@@ -407,7 +408,7 @@ class SimpleStartPage(QWidget):
         self.analyze_btn.setEnabled(gui.run_btn.isEnabled())
         text = gui.run_btn.text()
         if text == "Run Highlighter":
-            self.analyze_btn.setText("Analyze")
+            self.analyze_btn.setText(i18n.t("Analyze"))
         else:
             self.analyze_btn.setText(text)
         self.cancel_btn.setEnabled(gui.cancel_btn.isEnabled())

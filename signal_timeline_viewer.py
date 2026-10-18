@@ -5469,7 +5469,24 @@ def show_timeline_viewer(video_path, cache_data=None):
             debug_log(f"  ⚠️ Theme apply failed: {e}")
     else:
         debug_log("  - Using existing QApplication")
-    
+
+    # UI language: when opened from main.py hooks are already installed and the
+    # language is set. Standalone still needs both, or the timeline stays English.
+    try:
+        from modules import i18n
+        from modules.system.app_paths import config_path
+        import yaml
+
+        cfg_path = config_path("config.yaml")
+        cfg = {}
+        if os.path.exists(cfg_path):
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        i18n.load_from_config(cfg)
+        i18n.install_qt_hooks()
+    except Exception as e:
+        debug_log(f"  ⚠️ UI language apply failed: {e}")
+
     debug_log("  🔵 ABOUT TO CREATE SignalTimelineWindow...")
     try:
         window = SignalTimelineWindow(video_path, cache_data)
