@@ -142,3 +142,37 @@ def test_lost_track_is_reanchored_by_identity_not_duplicated():
     assert b["identity_id"] == "p1"
     assert b["track_id"] == 0                    # the same track, not a second one
     assert len(tr._tracks) == 1
+
+
+def test_a_detection_never_corrects_a_track_of_another_class():
+    """Objects: an overlapping box of a different class starts its own track
+    rather than re-anchoring (and renaming) the one already there."""
+    bg, subj = _scene(6)
+    tr = LiveBoxTracker(identity_key="track_id", same_key="class_name")
+    tr.step(_frame(bg, subj, 100, 100), 0.0)
+    tr.correct([(_box(100, 100), {"class_name": "person", "track_id": 3})], 0.0)
+    tr.step(_frame(bg, subj, 100, 100), 1 / FPS)
+    tr.correct([(_box(102, 101), {"class_name": "dog", "track_id": 4})], 1 / FPS)
+    tr.step(_frame(bg, subj, 100, 100), 2 / FPS)
+    assert sorted(b["class_name"] for b in tr.boxes()) == ["dog", "person"]
+
+
+def test_a_detectors_own_track_id_is_kept():
+    """Live objects are named by the detector's track id; the tracker must
+    hand that id back, not one of its own."""
+    bg, subj = _scene(7)
+    tr = LiveBoxTracker(identity_key="track_id", same_key="class_name")
+    tr.step(_frame(bg, subj, 100, 100), 0.0)
+    tr.correct([(_box(100, 100), {"class_name": "person", "track_id": 41})], 0.0)
+    tr.step(_frame(bg, subj, 104, 101), 1 / FPS)
+    (b,) = tr.boxes()
+    assert b["track_id"] == 41
+
+
+def test_without_a_detector_id_the_trackers_own_is_given():
+    bg, subj = _scene(8)
+    tr = LiveBoxTracker()
+    tr.step(_frame(bg, subj, 100, 100), 0.0)
+    tr.correct([(_box(100, 100), {})], 0.0)
+    (b,) = tr.boxes()
+    assert b["track_id"] == 0

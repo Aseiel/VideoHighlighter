@@ -79,11 +79,18 @@ class LiveTrackFeed(QObject):
     _boxes = Signal(list, int, int)      # tracker thread -> UI thread
 
     # Keys of a detector result copied onto the track it starts or corrects.
+    # The defaults are the live face worker's; see __init__ for other detectors.
     PAYLOAD_KEYS = ("identity_id", "name", "sim", "det_score")
 
-    def __init__(self, video_sink, parent: Optional[QObject] = None):
+    def __init__(self, video_sink, parent: Optional[QObject] = None, *,
+                 payload_keys=PAYLOAD_KEYS, identity_key: Optional[str] = "identity_id",
+                 same_key: Optional[str] = None):
+        """``payload_keys`` are copied from each detection onto its track;
+        ``identity_key`` / ``same_key`` are LiveBoxTracker's (faces match by
+        identity; objects by their detector's track id, within one class)."""
         super().__init__(parent)
-        self._tracker = LiveBoxTracker(identity_key="identity_id")
+        self._payload_keys = tuple(payload_keys)
+        self._tracker = LiveBoxTracker(identity_key=identity_key, same_key=same_key)
         self._enabled = False
         self._span = (0.0, 1.0)
         self._cond = threading.Condition()
@@ -165,7 +172,7 @@ class LiveTrackFeed(QObject):
             for r in results:
                 x1, y1, x2, y2 = r["bbox"]
                 dets.append(((x1 * sx, y1 * sy, x2 * sx, y2 * sy),
-                             {k: r.get(k) for k in self.PAYLOAD_KEYS}))
+                             {k: r.get(k) for k in self._payload_keys}))
             self._tracker.correct(dets, t)
         self._boxes.emit(self._tracker.boxes(), gw, gh)
 

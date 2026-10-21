@@ -252,12 +252,18 @@ class LiveBoxTracker:
     _FREEZE_HIDDEN = True  # zero a hidden track's velocity (see step)
     _MATCH_SAME_ID = 2.5   # an identity match is believed up to this many box sizes away
 
-    def __init__(self, identity_key: Optional[str] = None):
+    def __init__(self, identity_key: Optional[str] = None,
+                 same_key: Optional[str] = None):
         """``identity_key``: payload key naming who a detection is (faces carry
         one from the identity bank). A detection matches the track with the same
         identity first, by overlap only otherwise — so a track that drifted off
-        its subject is corrected rather than duplicated."""
+        its subject is corrected rather than duplicated.
+
+        ``same_key``: payload key a detection and a track must agree on to
+        match at all (the class, for objects), so a box of one class never
+        corrects a track of another however much they overlap."""
         self._identity_key = identity_key
+        self._same_key = same_key
         self._tracks: list[_Track] = []
         self._next_id = 0
         self._gray: Optional[np.ndarray] = None
@@ -320,6 +326,8 @@ class LiveBoxTracker:
             then = (hx - tr.w / 2, hy - tr.h / 2, hx + tr.w / 2, hy + tr.h / 2)
             tid = tr.payload.get(key) if key else None
             for di, (box, p) in enumerate(detections):
+                if self._same_key and p.get(self._same_key) != tr.payload.get(self._same_key):
+                    continue
                 iou = _iou(then, box)
                 if tid is not None and p.get(key) == tid:
                     dist = np.hypot((box[0] + box[2]) / 2 - hx, (box[1] + box[3]) / 2 - hy)
@@ -361,13 +369,16 @@ class LiveBoxTracker:
                 self._next_id += 1
 
     def boxes(self) -> list[dict]:
-        """Boxes to draw now: [{"bbox", "state", "psr", "track_id", **payload}]."""
+        """Boxes to draw now: [{"bbox", "state", "psr", "track_id", **payload}].
+        A ``track_id`` in the payload (a detector's own) is kept; otherwise it
+        is this tracker's."""
         out = []
         for tr in self._tracks:
             if tr.state == LOST and tr.lost_since is not None \
                     and self._t - tr.lost_since > self._COAST:
                 continue
-            d = {k: v for k, v in tr.payload.items() if not k.startswith("_")}
-            d.update(bbox=tr.box(), state=tr.state, psr=tr.psr, track_id=tr.id)
+            d = {"track_id": tr.id}
+            d.update((k, v) for k, v in tr.payload.items() if not k.startswith("_"))
+            d.update(bbox=tr.box(), state=tr.state, psr=tr.psr)
             out.append(d)
         return out
