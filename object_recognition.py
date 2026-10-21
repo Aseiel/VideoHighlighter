@@ -1,5 +1,6 @@
 import cv2
 import os
+import sys
 import csv
 from tqdm import tqdm
 from multiprocessing import Process, Manager
@@ -9,7 +10,11 @@ import numpy as np
 from modules.system.device_utils import resolve_device
 
 # ---------------- CONFIG ----------------
-NUM_WORKERS = 4
+# Worker processes, each with its own detector. Two on a Mac: every worker
+# shares the one Apple GPU through Core ML, and the mac bench (M1 runner) found
+# 1, 2 and 4 workers equally fast while each one held ~400 MB, 3.0 GB at 4
+# against 2.2 GB at 2. The second keeps decoding in parallel on long videos.
+NUM_WORKERS = 2 if sys.platform == "darwin" else 4
 FRAME_SKIP = 5
 openvino_model_folder = None  # legacy setting, unused: the detector is YOLOX IR
 highlight_objects = []  # Add your objects of interest here, e.g., ["person", "car"]
