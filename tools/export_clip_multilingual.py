@@ -100,6 +100,12 @@ def main() -> int:
     # builder for it (masking_utils) does not trace to ONNX, and a prepared
     # mask is passed through untouched. Checked against transformers' own
     # 2D-mask path below.
+    #
+    # What "prepared" means depends on the transformers release: 5.x takes a
+    # 4D mask as additive (0 / -inf), 4.x as 0/1 and converts it itself, so an
+    # additive one is inverted twice (cosine 0.84 on the mac runner, which
+    # resolves transformers 4.57 beside torch 2.7.1). The check below picks the
+    # form this installation reads correctly.
     bert = AutoModel.from_pretrained(src, torch_dtype=torch.float32,
                                      attn_implementation="eager").eval()
     dense = torch.nn.Linear(dense_cfg["in_features"], dense_cfg["out_features"],
@@ -112,11 +118,13 @@ def main() -> int:
         def __init__(self):
             super().__init__()
             self.bert, self.dense = bert, dense
+            self.additive = True
 
         def forward(self, input_ids, attention_mask):
             keep = attention_mask[:, None, None, :].to(torch.float32)
-            additive = (1.0 - keep) * torch.finfo(torch.float32).min
-            hidden = self.bert(input_ids=input_ids, attention_mask=additive).last_hidden_state
+            if self.additive:
+                keep = (1.0 - keep) * torch.finfo(torch.float32).min
+            hidden = self.bert(input_ids=input_ids, attention_mask=keep).last_hidden_state
             m = attention_mask.unsqueeze(-1).to(hidden.dtype)
             pooled = (hidden * m).sum(1) / m.sum(1).clamp(min=1e-9)
             return self.dense(pooled)
@@ -135,15 +143,23 @@ def main() -> int:
         return 1
 
     with torch.no_grad():
-        reference = text(torch.from_numpy(ids), torch.from_numpy(mask)).numpy()
         hidden = bert(input_ids=torch.from_numpy(ids),
                       attention_mask=torch.from_numpy(mask)).last_hidden_state
         m = torch.from_numpy(mask).unsqueeze(-1).float()
         stock = dense((hidden * m).sum(1) / m.sum(1).clamp(min=1e-9)).numpy()
-    same = float(min((_unit(reference) * _unit(stock)).sum(1)))
+        tried = []
+        for additive in (True, False):
+            text.additive = additive
+            reference = text(torch.from_numpy(ids), torch.from_numpy(mask)).numpy()
+            same = float(min((_unit(reference) * _unit(stock)).sum(1)))
+            tried.append(f"{'additive' if additive else '0/1'} {same:.6f}")
+            if same >= 0.99999:
+                break
     if same < 0.99999:
-        print(f"[export_clip_multilingual] the 4D mask changes the answer (cosine {same:.6f})")
+        print(f"[export_clip_multilingual] the 4D mask changes the answer "
+              f"(cosine: {', '.join(tried)})")
         return 1
+    print(f"[export_clip_multilingual] 4D mask: {'additive' if text.additive else '0/1'}")
 
     # 2. The ONNX graph.
     os.makedirs(args.out, exist_ok=True)
