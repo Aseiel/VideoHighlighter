@@ -36,7 +36,8 @@ def enabled() -> bool:
         return False
     try:
         from modules.system import compute_backend as cb
-        return cb.configured() in (cb.AUTO, cb.APPLE)
+        # None: nothing chosen, which is the automatic order.
+        return cb.configured() in (None, cb.AUTO, cb.APPLE)
     except Exception:  # noqa: BLE001 - no setting is the automatic one
         return True
 

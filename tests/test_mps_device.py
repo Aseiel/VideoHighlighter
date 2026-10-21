@@ -44,6 +44,11 @@ class TestWhoMayUseMetal:
         monkeypatch.setattr(compute_backend, "configured", lambda: compute_backend.CPU)
         assert mps_device.device() is None
 
+    def test_no_backend_chosen_is_automatic(self, mac, monkeypatch):
+        # The first mac bench: compute.backend unset, and Metal never used.
+        monkeypatch.setattr(compute_backend, "configured", lambda: None)
+        assert mps_device.device() == "mps"
+
     def test_the_apple_backend_allows_it(self, mac, monkeypatch):
         monkeypatch.setattr(compute_backend, "configured", lambda: compute_backend.APPLE)
         assert mps_device.device() == "mps"
