@@ -146,13 +146,50 @@ def _mps_fp16() -> bool:
     return os.environ.get("VH_WHISPER_MPS_FP16", "").strip() in ("1", "true", "on")
 
 
+# Metal must reproduce the processor's encoder output and first-token logits
+# this closely before Whisper transcribes there.
+METAL_MIN_COSINE = 0.99
+
+
+def _metal_probe(model, device):
+    """Encoder output and first-step logits for a fixed input, on ``device``,
+    as numpy arrays."""
+    import whisper.tokenizer as wt
+    mel = torch.randn(1, model.dims.n_mels, 3000, generator=torch.Generator().manual_seed(0))
+    sot = wt.get_tokenizer(model.is_multilingual, num_languages=model.num_languages).sot_sequence
+    tokens = torch.tensor([list(sot)])
+    with torch.inference_mode():
+        features = model.encoder(mel.to(device))
+        logits = model.logits(tokens.to(device), features)
+    return features.float().cpu().numpy(), logits.float().cpu().numpy()
+
+
+def _check_metal(model, reference, device):
+    """Raise unless ``model`` on ``device`` answers ``reference`` (the
+    processor's answer) closely enough. The first mac bench found Whisper on a
+    Metal GPU returning "ööööö" for a clear sentence, with no error at all."""
+    import numpy as np
+    got = _metal_probe(model, device)
+    worst = 1.0
+    for a, b in zip(reference, got):
+        a, b = np.asarray(a, np.float64).ravel(), np.asarray(b, np.float64).ravel()
+        den = np.linalg.norm(a) * np.linalg.norm(b)
+        cos = float(a @ b / den) if den > 0 else 0.0
+        worst = min(worst, cos if np.isfinite(cos) else -1.0)
+    if not worst >= METAL_MIN_COSINE:
+        raise RuntimeError(f"the Apple GPU answers differently from the processor "
+                           f"(cosine {worst:.4f})")
+    return worst
+
+
 def load_whisper(model_name, device, log_fn=print):
     """whisper.load_model on ``device``, by way of the processor for Metal.
 
     Whisper keeps ``alignment_heads`` as a sparse tensor and Metal has no
     sparse tensors, so moving the model there whole fails. That buffer is only
     read on the processor (word timings index it), so it stays there and the
-    rest moves. Any failure costs the GPU, not the transcript.
+    rest moves. It is used there only once it has answered a fixed input as
+    the processor did. Any failure costs the GPU, not the transcript.
 
     Returns ``(model, device)``: the device it ended up on.
     """
@@ -161,10 +198,13 @@ def load_whisper(model_name, device, log_fn=print):
         return whisper.load_model(model_name, device=device), device
     try:
         model = whisper.load_model(model_name, device="cpu")
+        reference = _metal_probe(model, "cpu")
         heads = model._buffers.pop("alignment_heads", None)
         model = model.to(device)
         if heads is not None:
             model._buffers["alignment_heads"] = heads
+        cos = _check_metal(model, reference, device)
+        log_fn(f"✅ Whisper on the Apple GPU matches the processor (cosine {cos:.5f})")
         return model, device
     except Exception as e:  # noqa: BLE001
         log_fn(f"⚠️ Whisper could not use the Apple GPU ({type(e).__name__}: {e}); "

@@ -109,8 +109,23 @@ class _Model:
         return self
 
 
+@pytest.fixture()
+def whisper_checks(monkeypatch):
+    """The Metal check, answered without a model: it passes unless told not to."""
+    from modules.audio import transcript as tr
+    verdict = {"ok": True}
+    monkeypatch.setattr(tr, "_metal_probe", lambda model, device: "reference")
+
+    def check(model, reference, device):
+        if not verdict["ok"]:
+            raise RuntimeError("the Apple GPU answers differently from the processor")
+        return 1.0
+    monkeypatch.setattr(tr, "_check_metal", check)
+    return verdict
+
+
 class TestWhisper:
-    def test_metal_keeps_the_sparse_buffer_on_the_processor(self, monkeypatch):
+    def test_metal_keeps_the_sparse_buffer_on_the_processor(self, monkeypatch, whisper_checks):
         from modules.audio import transcript as tr
         monkeypatch.setattr(mps_device, "is_mps", lambda d: d == "mps")
         loads = []
@@ -121,7 +136,17 @@ class TestWhisper:
         assert model.buffers_moved == {}          # moved without it...
         assert model._buffers["alignment_heads"] == "sparse-on-cpu"   # ...then put back
 
-    def test_a_failed_move_is_the_processor_not_an_error(self, monkeypatch):
+    def test_metal_that_answers_wrongly_is_not_used(self, monkeypatch, whisper_checks):
+        # The second mac bench: "ööööö" for a clear sentence, and no error.
+        from modules.audio import transcript as tr
+        whisper_checks["ok"] = False
+        lines = []
+        monkeypatch.setattr(tr.whisper, "load_model", lambda name, device: _Model())
+        model, device = tr.load_whisper("base", "mps", lines.append)
+        assert device == "cpu"
+        assert "answers differently" in lines[0]
+
+    def test_a_failed_move_is_the_processor_not_an_error(self, monkeypatch, whisper_checks):
         from modules.audio import transcript as tr
         lines = []
         monkeypatch.setattr(tr.whisper, "load_model",
@@ -144,3 +169,64 @@ class TestWhisper:
         assert tr._mps_fp16() is False
         monkeypatch.setenv("VH_WHISPER_MPS_FP16", "1")
         assert tr._mps_fp16() is True
+
+
+class TestClipOnMetal:
+    """CLIP moves to Metal only after answering a fixed input as the processor
+    does; the second mac bench had it fail on its first frame."""
+
+    class _Model:
+        device = "cpu"
+
+        @classmethod
+        def from_pretrained(cls, weights, torch_dtype=None):
+            return cls()
+
+        def eval(self):
+            return self
+
+        def to(self, device, dtype=None):
+            self.device = device
+            return self
+
+    def _probe(self, monkeypatch, wrong_on_gpu):
+        import numpy as np
+        from llm import clip_prefilter as cp
+        image = np.arange(16, dtype=np.float32).reshape(2, 8) + 1
+        text = np.ones((1, 8), np.float32)
+        monkeypatch.setattr(cp, "_probe_embeds", lambda model, device, dtype: (
+            -image if wrong_on_gpu and device != "cpu" else image, text))
+
+    def test_a_gpu_that_agrees_is_used(self, monkeypatch):
+        from llm import clip_prefilter as cp
+        self._probe(monkeypatch, wrong_on_gpu=False)
+        assert cp._metal_checked(self._Model, "w", "mps", None).device == "mps"
+
+    def test_a_gpu_that_disagrees_is_refused(self, monkeypatch):
+        from llm import clip_prefilter as cp
+        self._probe(monkeypatch, wrong_on_gpu=True)
+        with pytest.raises(RuntimeError, match="answers differently"):
+            cp._metal_checked(self._Model, "w", "mps", None)
+
+    def test_nan_counts_as_wrong(self):
+        import numpy as np
+        from llm import clip_prefilter as cp
+        a = np.ones((1, 4))
+        assert cp._worst_cosine([a], [np.full((1, 4), np.nan)]) < cp.METAL_MIN_COSINE
+
+
+class TestWhisperCheck:
+    def test_wrong_logits_fail_the_check(self, monkeypatch):
+        import numpy as np
+        from modules.audio import transcript as tr
+        ref = (np.ones((1, 4, 2)), np.arange(6.0).reshape(1, 2, 3))
+        monkeypatch.setattr(tr, "_metal_probe", lambda m, d: (ref[0], -ref[1]))
+        with pytest.raises(RuntimeError, match="answers differently"):
+            tr._check_metal(None, ref, "mps")
+
+    def test_matching_answers_pass(self, monkeypatch):
+        import numpy as np
+        from modules.audio import transcript as tr
+        ref = (np.ones((1, 4, 2)), np.arange(6.0).reshape(1, 2, 3))
+        monkeypatch.setattr(tr, "_metal_probe", lambda m, d: ref)
+        assert tr._check_metal(None, ref, "mps") > 0.999

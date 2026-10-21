@@ -193,6 +193,62 @@ def mps_device() -> Optional[str]:
         return None
 
 
+# Metal must reproduce the processor's embeddings this closely before CLIP
+# runs there. fp16 against fp32 measures 0.9999+; a broken kernel lands far
+# below, or raises.
+METAL_MIN_COSINE = 0.99
+
+
+def _worst_cosine(reference, got) -> float:
+    """The lowest cosine between matching rows of each pair of arrays."""
+    import numpy as np
+    worst = 1.0
+    for a, b in zip(reference, got):
+        a = np.asarray(a, np.float64).reshape(len(a), -1)
+        b = np.asarray(b, np.float64).reshape(len(b), -1)
+        den = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+        cos = np.where(den > 0, (a * b).sum(axis=1) / np.where(den > 0, den, 1), 0.0)
+        worst = min(worst, float(np.nan_to_num(cos, nan=-1.0).min()))
+    return worst
+
+
+def _probe_embeds(model, device, dtype):
+    """Image and text embeddings of a fixed input, computed on ``device``,
+    as numpy arrays."""
+    import torch
+    pixels = torch.rand(2, 3, 224, 224, generator=torch.Generator().manual_seed(0))
+    # <start> "a photo of a dog" <end>, in CLIP's vocabulary.
+    ids = torch.tensor([[49406, 320, 1125, 539, 320, 1929, 49407]])
+    with torch.inference_mode():
+        out = model(input_ids=ids.to(device), pixel_values=pixels.to(device, dtype=dtype))
+    return (out.image_embeds.float().cpu().numpy(),
+            out.text_embeds.float().cpu().numpy())
+
+
+def _metal_checked(model_cls, weights, device, dtype):
+    """CLIP on the Apple GPU, once it has answered a fixed input as the
+    processor does; raises otherwise.
+
+    The first mac bench found Metal that loads the model and then fails to
+    compile a kernel on the first frame, and Whisper on the same GPU returning
+    "ööööö" without an error. A search that dies on its first frame, or ranks
+    on wrong numbers, is worse than a slower one, so the GPU has to show it is
+    right before it is used. The reference is the same weights in fp32 on the
+    processor, computed before they move.
+    """
+    import torch
+    model = model_cls.from_pretrained(weights, torch_dtype=torch.float32).eval()
+    ref = _probe_embeds(model, "cpu", torch.float32)
+    model = model.to(device, dtype=dtype)
+    got = _probe_embeds(model, device, dtype)
+    worst = _worst_cosine(ref, got)
+    if not worst >= METAL_MIN_COSINE:
+        raise RuntimeError(f"the Apple GPU answers differently from the processor "
+                           f"(cosine {worst:.4f})")
+    print(f"✅ CLIP on the Apple GPU matches the processor (cosine {worst:.5f})")
+    return model
+
+
 def _is_directml(device: str) -> bool:
     try:
         from modules.system import directml_device as dml
@@ -434,15 +490,18 @@ class ClipFramePrefilter:
                 if not dml.prefer_float16():
                     dtype = torch.float32
 
-            model = CLIPModel.from_pretrained(weights, torch_dtype=dtype)
-            self._model = model.to(device).eval()
+            if str(device).startswith("mps"):
+                self._model = _metal_checked(CLIPModel, weights, device, dtype)
+            else:
+                model = CLIPModel.from_pretrained(weights, torch_dtype=dtype)
+                self._model = model.to(device).eval()
             # Both bundled dirs carry the processor files, so prefer them and
             # keep the tokenizer/image config off the network.
             self._processor = CLIPProcessor.from_pretrained(
                 _bundled_ov_dir() or _bundled_torch_dir() or self.model_id)
         except Exception as e:  # noqa: BLE001 — OOM, no driver, no network, bad build
             print(f"⚠️  CLIP load on {device} failed ({type(e).__name__}: {e}); "
-                  f"trying OpenVINO.")
+                  f"falling back.")
             self._model = self._processor = None
             return False
 
