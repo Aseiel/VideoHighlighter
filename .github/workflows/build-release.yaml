@@ -19,6 +19,10 @@ on:
         description: 'Oldest version that may update to this one in place (blank = any). Set it when the install layout changes'
         required: false
         default: ''
+      mac_only:
+        description: 'Build and check only the mac app, publish nothing (for trying a mac change without the Windows builds)'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -105,6 +109,7 @@ jobs:
   # the update host (tools/publish_release.py has the whole release flow).
   build-windows:
     needs: version
+    if: ${{ !inputs.mac_only }}
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -451,7 +456,7 @@ jobs:
   build-web-windows:
     # Opt-in: the sidecar still bundles CUDA PyTorch itself, which is the
     # expensive part this workflow no longer does for the desktop app.
-    if: ${{ inputs.web_ui }}
+    if: ${{ inputs.web_ui && !inputs.mac_only }}
     needs: version
     runs-on: windows-latest
     steps:
@@ -587,8 +592,12 @@ jobs:
         # to import. ~20 MB, bundled with models/ like YOLOX. Pinned revision;
         # the export checks itself on this runner (CPU) and again at load.
         run: python -m tools.export_sam
-      - name: Pre-convert CLIP to OpenVINO IR
-        run: python -m tools.export_clip_ov
+      - name: Save CLIP as torch weights
+        # Not the OpenVINO IR the Windows build ships: on a Mac CLIP runs
+        # through torch, which reaches the Apple GPU through Metal (OpenVINO
+        # has no GPU plugin on macOS). Same size, fp16. Its processor route is
+        # torch's too, so optimum is left out of this bundle.
+        run: python -m tools.export_clip_torch
       - name: Export the action model (SigLIP2, Apache-2.0)
         # Action recognition's only model since 0.13.1. A Mac build has no
         # pack downloads, so it is bundled with models/, as CLIP is.
@@ -697,10 +706,11 @@ jobs:
             --collect-binaries imageio_ffmpeg \
             --hidden-import llm.clip_prefilter \
             --hidden-import modules.system.smoke_test \
+            --hidden-import modules.system.smoke_bench \
             --hidden-import psutil \
             --additional-hooks-dir packaging/pyinstaller-hooks \
             --exclude-module nncf \
-            --collect-submodules optimum \
+            --exclude-module optimum \
             --collect-submodules transformers \
             --collect-data transformers \
             --copy-metadata transformers \
@@ -709,6 +719,12 @@ jobs:
             --copy-metadata safetensors \
             --copy-metadata regex \
             main.py
+      - name: Strip what the app never loads
+        # The Windows build's step, which the mac build never had: Qt WebEngine
+        # (Chromium) and OpenVINO's readers for formats the app never opens.
+        # Before signing, since removing files breaks a signature. The report
+        # lists where the rest of the size is.
+        run: python tools/strip_bundle.py dist/VideoHighlighter.app --report 4
       # TODO(mac): ad-hoc is not shippable. `--sign -` produces no Developer ID,
       # so Gatekeeper quarantines the download and the first launch fails with
       # "VideoHighlighter is damaged and can't be opened" — the README currently
@@ -754,6 +770,25 @@ jobs:
             echo "::endgroup::"
           done
           exit $status
+      - name: Measure models on the GPU and look for leaks
+        # Nobody on the project has a Mac, and this runner (an M1 VM) reaches
+        # Metal: each model's speed on every route, whether its answers match
+        # the processor's, and whether memory grows when the same work repeats.
+        # Spoken audio comes from `say`, so Whisper has words to find. A report,
+        # not a gate: a slow route is a finding, not a broken release.
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          # Whisper's models are downloaded on first use, not bundled; fetched
+          # here so the timings are of transcribing, not of downloading.
+          python -c "import os, whisper; [whisper._download(whisper._MODELS[m], os.path.expanduser('~/.cache/whisper'), False) for m in ('base', 'small')]"
+          say -o speech.aiff "The quick brown fox jumps over the lazy dog. This clip checks that speech is transcribed the same way on the graphics card and on the processor."
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i testsrc2=size=1280x720:rate=30 -i speech.aiff \
+            -t 12 -shortest -c:v libx264 -pix_fmt yuv420p -c:a aac smoke-speech.mp4
+          "dist/VideoHighlighter.app/Contents/MacOS/VideoHighlighter" \
+            --smoke-bench "$PWD/smoke-speech.mp4" \
+            --smoke-report "$PWD/smoke-report-bench.json"
       - name: Upload smoke-test report
         if: always()
         uses: actions/upload-artifact@v4
@@ -765,8 +800,11 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
       - name: Create DMG
+        # ULMO (LZMA) rather than create-dmg's default UDZO (zlib): smaller, and
+        # opens on macOS 10.15 and later, which every Apple-silicon Mac runs.
         run: |
           create-dmg \
+            --format ULMO \
             --volname "VideoHighlighter" \
             --window-size 600 400 \
             --icon "VideoHighlighter.app" 150 200 \
@@ -782,6 +820,7 @@ jobs:
 
   bootstrap:
     needs: version
+    if: ${{ !inputs.mac_only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -811,7 +850,8 @@ jobs:
     # build-web-windows is opt-in: a skipped web build must not skip the
     # release, a failed one must stop it.
     needs: [version, build-windows, build-web-windows, build-mac, bootstrap]
-    if: ${{ !inputs.dry_run && !cancelled() && !contains(needs.*.result, 'failure') }}
+    # mac_only skips the Windows jobs, and a skipped job is not a failed one.
+    if: ${{ !inputs.dry_run && !inputs.mac_only && !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     steps:
       # Before the download: checkout cleans the workspace, artifacts included.

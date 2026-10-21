@@ -7282,6 +7282,13 @@ if __name__ == "__main__":
         # Not _hard_exit: on Windows it kills the process with SIGTERM, and
         # the exit code is the whole answer the workflow reads.
         os._exit(_smoke_code)
+    # `--smoke-bench <video>`: every model on every route, timed, compared
+    # with the processor and repeated for leaks (modules/system/smoke_bench.py).
+    if "--smoke-bench" in sys.argv:
+        from modules.system import smoke_bench
+        _smoke_code = smoke_bench.main(sys.argv)
+        sys.stdout.flush()
+        os._exit(_smoke_code)
 
     # Disable D3D11VA hardware acceleration in Qt multimedia's FFmpeg backend.
     # On some Windows systems D3D11VA initialisation fails for H.264, causing
