@@ -339,10 +339,15 @@ class _OpenVINORunner:
 class _OnnxRunner:
     def __init__(self, model_path: str, gpu: bool):
         from modules.system import ort_directml
+        # Core ML compiles this model only with its batch size fixed (see
+        # ort_coreml.coreml_ready_model); every call is then padded to it.
+        self._fixed = None
         if gpu:
             if not ort_directml.available():
                 raise RuntimeError(ort_directml.unavailable_reason() or "no GPU provider")
-            self._session = ort_directml.session(model_path)
+            if ort_directml.gpu_provider() == ort_directml.COREML_PROVIDER:
+                self._fixed = GPU_BATCH
+            self._session = ort_directml.session(model_path, coreml_batch=self._fixed)
             got = ort_directml.session_backend(self._session)
             if not ort_directml.is_gpu_provider(got):
                 raise RuntimeError(f"ONNX Runtime put the model on {got}")
@@ -352,7 +357,19 @@ class _OnnxRunner:
         self._input = self._session.get_inputs()[0].name
 
     def run(self, pixels: np.ndarray) -> np.ndarray:
-        return np.asarray(self._session.run(None, {self._input: pixels})[0], dtype=np.float32)
+        if not self._fixed:
+            return np.asarray(self._session.run(None, {self._input: pixels})[0],
+                              dtype=np.float32)
+        out = []
+        for i in range(0, len(pixels), self._fixed):
+            part = pixels[i:i + self._fixed]
+            n = len(part)
+            if n < self._fixed:
+                part = np.concatenate([part, np.zeros((self._fixed - n,) + part.shape[1:],
+                                                      part.dtype)])
+            out.append(np.asarray(self._session.run(None, {self._input: part})[0][:n],
+                                  dtype=np.float32))
+        return np.concatenate(out)
 
 
 def _open_route(route: str, model_path: str, intel_device: Optional[str]):

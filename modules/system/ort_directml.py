@@ -326,18 +326,28 @@ def providers() -> Sequence:
     return [(PROVIDER, {"device_id": device_id()}), CPU_PROVIDER]
 
 
-def session(model_path, *, providers_override=None):
+def session(model_path, *, providers_override=None, coreml_batch=None):
     """An ``InferenceSession`` for ``model_path`` on the best provider here.
 
     Raises whatever ONNX Runtime raises: a model that will not load is a real
     error, and the caller (which knows what it was loading) is better placed to
     decide whether to fall back than a swallowed exception here.
+
+    ``coreml_batch``: on Core ML, fix the model's batch size to this (the
+    caller pads to it); see ``ort_coreml.coreml_ready_model``.
     """
     ort = _import_onnxruntime()
     chosen = list(providers_override if providers_override is not None else providers())
     model = str(model_path)
     if any((p[0] if isinstance(p, tuple) else p) == COREML_PROVIDER for p in chosen):
-        model = _coreml.coreml_ready_model(model_path)
+        model = _coreml.coreml_ready_model(model_path, batch=coreml_batch)
+        cache = _coreml.cache_dir() if isinstance(model, bytes) else None
+        if cache:
+            # Only rewritten models: they carry a hash of themselves as the
+            # cache key, so a changed model can never hit an old compile.
+            chosen = [(p[0], {**p[1], "ModelCacheDirectory": cache})
+                      if isinstance(p, tuple) and p[0] == COREML_PROVIDER else p
+                      for p in chosen]
     return ort.InferenceSession(model, providers=chosen)
 
 

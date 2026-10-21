@@ -28,12 +28,15 @@ Switches, both read on every call so a worker process decides for itself:
   older format, converted by different code: the way out if a model will not
   compile as an ML Program.
 
-No model cache directory is set, deliberately. Core ML compiles a model when a
-session opens, and ONNX Runtime can keep the compiled result — but it keys that
-cache by the model's *path*, and the R3D export is rewritten in place when the
-weights behind it change. A stale compiled model would run the old weights
-without a word. Compiling each time costs a few seconds per session; wrong
-answers cost more.
+Core ML compiles a model when a session opens, and ONNX Runtime can keep the
+compiled result — but by default it keys that cache by the model's *path*, and
+a model rewritten in place (a retrained custom detector) would then run its old
+weights without a word. So a model opened from its file is never cached; YOLOX
+compiles in under a second anyway. A model this module rewrites
+(:func:`coreml_ready_model`) is different: it is handed over as bytes carrying
+``COREML_CACHE_KEY``, a hash of those bytes, so a changed model can only miss
+the cache. That is what makes the frame encoder usable here: its first compile
+took 130 s on the M1 runner.
 """
 
 from __future__ import annotations
@@ -61,6 +64,8 @@ UNITS = {
     "cpu": "CPUOnly",
 }
 DEFAULT_UNITS = "ALL"
+
+CACHE_KEY = "COREML_CACHE_KEY"     # ONNX Runtime reads it from the model's metadata
 
 
 def enabled() -> bool:
@@ -99,9 +104,26 @@ def provider_options() -> dict:
     }
 
 
-def coreml_ready_model(model_path):
+def cache_dir():
+    """Where compiled Core ML models are kept, or None when there is nowhere."""
+    try:
+        from modules.system import app_paths
+        path = os.path.join(app_paths.user_data_dir(), "coreml-cache")
+        os.makedirs(path, exist_ok=True)
+        return path
+    except Exception:  # noqa: BLE001 - no cache only costs time
+        return None
+
+
+def coreml_ready_model(model_path, batch=None):
     """``model_path`` as Core ML can compile it: the path itself when nothing
-    needs changing, else the model's bytes with the change made.
+    needs changing, else the model's bytes with the change made, carrying a
+    hash of themselves as their cache key.
+
+    ``batch`` fixes a symbolic batch dimension to that size. With it left
+    free, Core ML compiled the frame encoder's ML Program to nothing ("Failed
+    to build the model execution plan", -14); fixed at 32 it compiled and ran
+    at half the processor's time per frame. The caller then pads its batches.
 
     ONNX Runtime turns a Conv's ``auto_pad="VALID"`` into a "custom" padding
     with no pad values, and Core ML then refuses the whole model ("Required
@@ -129,10 +151,24 @@ def coreml_ready_model(model_path):
         node.attribute.remove(pad)
         node.attribute.append(onnx.helper.make_attribute("pads", [0] * (2 * len(kernel.ints))))
         changed += 1
-    if not changed:
+    if changed:
+        print(f"ℹ️ Core ML: {changed} Conv padding(s) written out in "
+              f"{os.path.basename(str(model_path))}")
+    fixed = 0
+    if batch:
+        for value in list(model.graph.input) + list(model.graph.output):
+            dims = value.type.tensor_type.shape.dim
+            if dims and not dims[0].HasField("dim_value"):
+                dims[0].ClearField("dim_param")
+                dims[0].dim_value = int(batch)
+                fixed += 1
+    if not changed and not fixed:
         return model_path
-    print(f"ℹ️ Core ML: {changed} Conv padding(s) written out in "
-          f"{os.path.basename(str(model_path))}")
+    import hashlib
+    for prop in [p for p in model.metadata_props if p.key == CACHE_KEY]:
+        model.metadata_props.remove(prop)
+    key = hashlib.sha256(model.SerializeToString()).hexdigest()[:32]
+    model.metadata_props.add(key=CACHE_KEY, value=key)
     return model.SerializeToString()
 
 

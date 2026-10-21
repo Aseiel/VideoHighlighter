@@ -192,8 +192,10 @@ def _frame_encoder(frames) -> dict:
     pixels = fe.preprocess(frames)
     out, ref = {}, None
 
-    routes = [("openvino-cpu", fe.OPENVINO_CPU, "")]
-    routes += [(name, fe.ONNX_GPU, units) for name, units in _COREML_UNITS]
+    # The NeuralNetwork format ran it at 9.5 s a frame on the M1 runner, so
+    # only the ML Program ones; the second "all" load shows the compile cache.
+    routes = [("openvino-cpu", fe.OPENVINO_CPU, ""), ("coreml-all", fe.ONNX_GPU, "all"),
+              ("coreml-all-again", fe.ONNX_GPU, "all"), ("coreml-gpu", fe.ONNX_GPU, "gpu")]
     for name, route, units in routes:
         before = _settle()
         try:
@@ -221,18 +223,6 @@ def _frame_encoder(frames) -> dict:
         finally:
             _with_units("")
 
-    # Core ML and a batch size fixed in the model: a dynamic one is a common
-    # reason Core ML cannot build an execution plan.
-    for units in ("gpu", "all"):
-        name = f"coreml-{units}-static{fe.GPU_BATCH}"
-        try:
-            _with_units(units)
-            out[name] = _static_coreml(path, pixels, fe.GPU_BATCH, ref)
-        except Exception as e:  # noqa: BLE001
-            out[name] = {"error": f"{type(e).__name__}: {e}"}
-        finally:
-            _with_units("")
-
     enc = fe.load(log=print)
     if enc is not None:
         out["app_picks"] = enc.label
@@ -241,34 +231,6 @@ def _frame_encoder(frames) -> dict:
         some = frames if enc.on_gpu else frames[:8]
         out["leak"] = _leak(lambda: enc.encode_bgr(some))
     return out
-
-
-def _static_coreml(path, pixels, batch, ref) -> dict:
-    import numpy as np
-    import onnx
-    import onnxruntime as ort
-    from modules.system import ort_coreml, ort_directml
-    ready = ort_coreml.coreml_ready_model(path)
-    model = onnx.load_from_string(ready) if isinstance(ready, bytes) else onnx.load(path)
-    dim = model.graph.input[0].type.tensor_type.shape.dim[0]
-    dim.ClearField("dim_param")
-    dim.dim_value = batch
-    t = time.perf_counter()
-    sess = ort.InferenceSession(model.SerializeToString(), providers=ort_directml.providers())
-    load_s = time.perf_counter() - t
-    name = sess.get_inputs()[0].name
-    n = len(pixels)
-    padded = np.concatenate([pixels, np.zeros((max(batch - n, 0),) + pixels.shape[1:],
-                                              pixels.dtype)])[:batch]
-
-    def run():
-        return sess.run(None, {name: padded})[0][:n]
-    vecs = run()
-    row = {"load_s": round(load_s, 2), "provider": ort_directml.session_backend(sess),
-           **_timed(run, n)}
-    if ref is not None:
-        row["cosine_vs_cpu"] = round(_row_cosines(vecs, ref), 5)
-    return row
 
 
 def _yolox(frames) -> dict:

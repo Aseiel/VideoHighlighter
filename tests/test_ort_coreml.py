@@ -336,3 +336,62 @@ class TestModelsCoreMLCannotCompile:
         assert ort_coreml.provider_options()["ModelFormat"] == "MLProgram"
         monkeypatch.setenv(ort_coreml.FORMAT_ENV, "neuralnetwork")
         assert ort_coreml.provider_options()["ModelFormat"] == "NeuralNetwork"
+
+
+def _dynamic_batch_model(path, weight=1.0):
+    """A Conv with a free batch size, like the frame encoder's input."""
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper
+    w = numpy_helper.from_array(np.full((2, 3, 4, 4), weight, np.float32), "w")
+    node = helper.make_node("Conv", ["x", "w"], ["y"], kernel_shape=[4, 4],
+                            strides=[4, 4], pads=[0, 0, 0, 0])
+    graph = helper.make_graph(
+        [node], "g",
+        [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, ["n", 3, 8, 8])],
+        [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, ["n", 2, 2, 2])],
+        [w])
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)]),
+              str(path))
+    return str(path)
+
+
+class TestFixedBatchAndItsCache:
+    """The fourth mac bench: the frame encoder compiled on Core ML only with its
+    batch size fixed, and the compile took 130 s, so it is kept, by content."""
+
+    def test_the_batch_is_fixed_and_the_model_says_what_it_is(self, tmp_path):
+        onnx = pytest.importorskip("onnx")
+        out = ort_coreml.coreml_ready_model(_dynamic_batch_model(tmp_path / "m.onnx"), batch=32)
+        model = onnx.load_from_string(out)
+        assert model.graph.input[0].type.tensor_type.shape.dim[0].dim_value == 32
+        assert model.graph.output[0].type.tensor_type.shape.dim[0].dim_value == 32
+        keys = {p.key: p.value for p in model.metadata_props}
+        assert len(keys[ort_coreml.CACHE_KEY]) == 32
+
+    def test_the_cache_key_follows_the_content_not_the_path(self, tmp_path):
+        onnx = pytest.importorskip("onnx")
+
+        def key(path):
+            model = onnx.load_from_string(ort_coreml.coreml_ready_model(path, batch=8))
+            return {p.key: p.value for p in model.metadata_props}[ort_coreml.CACHE_KEY]
+        a = key(_dynamic_batch_model(tmp_path / "a.onnx"))
+        same = key(_dynamic_batch_model(tmp_path / "b.onnx"))
+        # Retrained in place: same path, other weights.
+        changed = key(_dynamic_batch_model(tmp_path / "a.onnx", weight=2.0))
+        assert a == same
+        assert a != changed
+
+    def test_only_rewritten_models_are_cached(self, monkeypatch, tmp_path):
+        pytest.importorskip("onnx")
+        _mac(monkeypatch)
+        monkeypatch.setattr(ort_coreml, "cache_dir", lambda: str(tmp_path / "cache"))
+
+        def coreml_options(sess):
+            return next(p[1] for p in sess.providers if isinstance(p, tuple))
+        path = _dynamic_batch_model(tmp_path / "m.onnx")
+        fixed = ort_directml.session(path, coreml_batch=32)
+        as_is = ort_directml.session(path)
+        assert coreml_options(fixed)["ModelCacheDirectory"] == str(tmp_path / "cache")
+        assert "ModelCacheDirectory" not in coreml_options(as_is)
+        assert as_is.path == path
