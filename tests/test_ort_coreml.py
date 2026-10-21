@@ -180,8 +180,9 @@ class TestTheDeviceProbeOnAMac:
         assert info.gpu_available is True
         assert info.onnx_dml_yolo is True
         assert info.onnx_dml_torch is True
-        # torch has no consumer taught "mps" yet, and OpenVINO has no GPU
-        # plugin on macOS.
+        # CLIP and Whisper ask modules.system.mps_device for Metal themselves,
+        # the other torch consumers stay here; OpenVINO has no GPU plugin on
+        # macOS.
         assert info.pytorch_device == "cpu"
         assert info.openvino_device == "CPU"
         assert info.dml_device is None

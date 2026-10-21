@@ -226,10 +226,9 @@ def _apple_info(log_fn=print):
     hands out Core ML instead of DirectML (`modules/system/ort_coreml.py`).
     The flag names predate the Mac; read them as "ONNX Runtime has the GPU".
 
-    `pytorch_device` stays "cpu". torch on a Mac can reach the GPU too, through
-    Metal (MPS), and it is named in the log when it can — but no torch consumer
-    here is taught "mps" yet, and saying the device is there while every model
-    runs on the processor is exactly what this line would otherwise be.
+    `pytorch_device` stays "cpu": the torch models that can use Metal (MPS),
+    CLIP and Whisper, ask `modules.system.mps_device` for it themselves, and the
+    rest of the torch consumers (training, motion) are not taught "mps".
 
     OpenVINO stays on "CPU": macOS has no OpenVINO GPU plugin.
     """
@@ -247,8 +246,13 @@ def _apple_info(log_fn=print):
     log_fn(f"   object detection and action recognition on the "
            f"{ort_coreml.describe_units()} (experimental; {ort_coreml.MODE_ENV}=off "
            f"turns it off); other models stay on the CPU")
-    if _mps_available():
-        log_fn("   torch also sees the GPU through Metal (MPS); nothing uses it yet")
+    from modules.system import mps_device
+    if mps_device.device():
+        log_fn("   CLIP and Whisper on the GPU through Metal (torch MPS; "
+               f"{mps_device.MODE_ENV}=off turns it off)")
+    elif _mps_available():
+        log_fn(f"   torch sees the GPU through Metal but may not use it: "
+               f"{mps_device.unavailable_reason()}")
     return DeviceInfo(
         yolo_pt_device="cpu",
         yolo_ov_device="cpu",

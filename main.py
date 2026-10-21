@@ -29,6 +29,11 @@ if __name__ == "__main__":
 from modules.system.app_paths import use_writable_cwd
 print(f"📂 Working directory: {use_writable_cwd()}")
 
+# Before torch is imported: an operator Metal lacks then runs on the processor
+# instead of failing the model that needed it. A no-op off macOS.
+from modules.system import mps_device
+mps_device.enable_cpu_fallback()
+
 # Interface size, if the user set one. Qt reads QT_SCALE_FACTOR when the
 # QApplication is constructed and never again, so this has to happen before the
 # Qt imports below — on a 55" 4K panel the OS scale is right for a television

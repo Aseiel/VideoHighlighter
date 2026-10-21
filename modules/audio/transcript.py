@@ -130,6 +130,48 @@ def is_valid_speech(text):
 _SLOW_ON_CPU = ("medium", "large")
 
 
+def whisper_device():
+    """Where Whisper runs: an NVIDIA card, else the Apple GPU through Metal,
+    else the processor."""
+    if cuda_usable(torch):
+        return "cuda"
+    from modules.system import mps_device
+    return mps_device.device() or "cpu"
+
+
+def _mps_fp16() -> bool:
+    """Half precision on Metal only when asked (VH_WHISPER_MPS_FP16=1): fp32 on
+    the Apple GPU is still the GPU, and half has produced repeated or empty
+    text on Metal in some torch releases."""
+    return os.environ.get("VH_WHISPER_MPS_FP16", "").strip() in ("1", "true", "on")
+
+
+def load_whisper(model_name, device, log_fn=print):
+    """whisper.load_model on ``device``, by way of the processor for Metal.
+
+    Whisper keeps ``alignment_heads`` as a sparse tensor and Metal has no
+    sparse tensors, so moving the model there whole fails. That buffer is only
+    read on the processor (word timings index it), so it stays there and the
+    rest moves. Any failure costs the GPU, not the transcript.
+
+    Returns ``(model, device)``: the device it ended up on.
+    """
+    from modules.system import mps_device
+    if not mps_device.is_mps(device):
+        return whisper.load_model(model_name, device=device), device
+    try:
+        model = whisper.load_model(model_name, device="cpu")
+        heads = model._buffers.pop("alignment_heads", None)
+        model = model.to(device)
+        if heads is not None:
+            model._buffers["alignment_heads"] = heads
+        return model, device
+    except Exception as e:  # noqa: BLE001
+        log_fn(f"⚠️ Whisper could not use the Apple GPU ({type(e).__name__}: {e}); "
+               f"using the processor")
+        return whisper.load_model(model_name, device="cpu"), "cpu"
+
+
 def cpu_model_warning(model_name, device):
     """A line for the run log when this Whisper model will crawl here, else None."""
     name = str(model_name or "")
@@ -219,7 +261,7 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
     - should_cancel: optional predicate, polled throughout. Raises
       TranscriptionCancelled promptly rather than at the end of the run.
     """
-    device = "cuda" if cuda_usable(torch) else "cpu"
+    device = whisper_device()
     log_fn(f"Using device for Whisper: {device}")
     slow = cpu_model_warning(model_name, device)
     if slow:
@@ -247,7 +289,7 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
     if progress_fn:
         progress_fn(1, 100, "Transcription", f"Loading Whisper '{model_name}'...")
 
-    model = whisper.load_model(model_name, device=device)
+    model, device = load_whisper(model_name, device, log_fn)
     log_fn("Splitting video into chunks...")
     abort_if_cancelled()
 
@@ -305,14 +347,28 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
             # Add language if not auto-detect
             if language != "auto":
                 transcribe_params["language"] = language
+            if device == "mps":
+                transcribe_params["fp16"] = _mps_fp16()
 
             # Whisper walks the chunk 30 seconds at a time; that inner walk is the
             # only signal there is while a chunk (up to 10 minutes of audio) decodes.
             # It skips its own progress update on windows it judges to be silence,
             # so a quiet stretch still shows as a pause — the closing report below
             # makes sure the chunk ends where it should regardless.
-            with _whisper_progress(lambda f, _i=idx: tick(f, _i)):
-                result = model.transcribe(chunk, **transcribe_params)
+            try:
+                with _whisper_progress(lambda f, _i=idx: tick(f, _i)):
+                    result = model.transcribe(chunk, **transcribe_params)
+            except (RuntimeError, NotImplementedError) as e:
+                if device != "mps":
+                    raise
+                # Metal lacks something this model needs: finish on the
+                # processor rather than lose the transcript.
+                log_fn(f"⚠️ Whisper failed on the Apple GPU ({type(e).__name__}: {e}); "
+                       f"continuing on the processor")
+                model, device = whisper.load_model(model_name, device="cpu"), "cpu"
+                transcribe_params.pop("fp16", None)
+                with _whisper_progress(lambda f, _i=idx: tick(f, _i)):
+                    result = model.transcribe(chunk, **transcribe_params)
 
             report(idx, 1.0)
 
