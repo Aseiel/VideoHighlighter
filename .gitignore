@@ -45,6 +45,7 @@ models/siglip2-base-patch16-256/
 # The SAM outliner (SlimSAM-77, ~20 MB, written by tools/export_sam.py).
 models/slimsam-uniform-77/
 ov-cache/
+coreml-cache/
 
 # RTMPose keypoint IRs + ONNX/zip cache (installed via tools/get_rtmpose_model.py)
 models/rtmpose/

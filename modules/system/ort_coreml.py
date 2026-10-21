@@ -115,6 +115,24 @@ def cache_dir():
         return None
 
 
+def save_ready_model(model_bytes: bytes, folder: str):
+    """Write a model from :func:`coreml_ready_model` into ``folder`` under a
+    hash of its bytes and return the path, or None when it cannot be written.
+    A file already there under that name is the same model, so it is reused."""
+    try:
+        import hashlib
+        path = os.path.join(folder, f"{hashlib.sha256(model_bytes).hexdigest()[:32]}.onnx")
+        if not os.path.isfile(path):
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(model_bytes)
+            os.replace(tmp, path)
+        return path
+    except Exception as e:  # noqa: BLE001 - no cache only costs time
+        print(f"ℹ️ Core ML: compiled models will not be kept ({type(e).__name__}: {e})")
+        return None
+
+
 def coreml_ready_model(model_path, batch=None):
     """``model_path`` as Core ML can compile it: the path itself when nothing
     needs changing, else the model's bytes with the change made, carrying a

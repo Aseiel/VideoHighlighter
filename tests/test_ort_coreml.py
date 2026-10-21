@@ -16,6 +16,7 @@ module in `sys.modules` is exactly what the probe reads.
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 
@@ -328,6 +329,7 @@ class TestModelsCoreMLCannotCompile:
         pytest.importorskip("onnx")
         path = _conv_model(tmp_path / "m.onnx", auto_pad="VALID")
         _mac(monkeypatch)
+        monkeypatch.setattr(ort_coreml, "cache_dir", lambda: None)
         assert isinstance(ort_directml.session(path).path, bytes)
         cpu = ort_directml.session(path, providers_override=[CPU])
         assert cpu.path == path
@@ -392,6 +394,14 @@ class TestFixedBatchAndItsCache:
         path = _dynamic_batch_model(tmp_path / "m.onnx")
         fixed = ort_directml.session(path, coreml_batch=32)
         as_is = ort_directml.session(path)
+        os.makedirs(tmp_path / "cache")
+        fixed = ort_directml.session(path, coreml_batch=32)
         assert coreml_options(fixed)["ModelCacheDirectory"] == str(tmp_path / "cache")
         assert "ModelCacheDirectory" not in coreml_options(as_is)
         assert as_is.path == path
+        # Core ML caches only a model on disk: the rewritten one is saved
+        # under the hash of its bytes, once, and opened from there.
+        assert os.path.dirname(fixed.path) == str(tmp_path / "cache")
+        again = ort_directml.session(path, coreml_batch=32)
+        assert again.path == fixed.path
+        assert len(os.listdir(tmp_path / "cache")) == 1

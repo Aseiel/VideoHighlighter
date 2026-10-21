@@ -345,9 +345,15 @@ def session(model_path, *, providers_override=None, coreml_batch=None):
         if cache:
             # Only rewritten models: they carry a hash of themselves as the
             # cache key, so a changed model can never hit an old compile.
-            chosen = [(p[0], {**p[1], "ModelCacheDirectory": cache})
-                      if isinstance(p, tuple) and p[0] == COREML_PROVIDER else p
-                      for p in chosen]
+            # Saved under that hash, because Core ML caches only a model it
+            # can find on disk ("Failed to create model URL from path" when
+            # handed bytes).
+            saved = _coreml.save_ready_model(model, cache)
+            if saved:
+                model = saved
+                chosen = [(p[0], {**p[1], "ModelCacheDirectory": cache})
+                          if isinstance(p, tuple) and p[0] == COREML_PROVIDER else p
+                          for p in chosen]
     return ort.InferenceSession(model, providers=chosen)
 
 
