@@ -137,11 +137,21 @@ class ClipEmbedder(ClipFramePrefilter):
         return img
 
     def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
-        """Unit-norm embeddings for prompts -> [n, dim] float32."""
+        """Unit-norm embeddings for prompts -> [n, dim] float32.
+
+        Text in another language than English (or typed while the interface is
+        in one) goes to the multilingual model, whose vectors land in this
+        CLIP's own space (llm/clip_multilingual.py); CLIP's English-only text
+        tower otherwise, and whenever that model is not installed."""
         from PIL import Image
+
+        from llm import clip_multilingual
 
         if self._model is None:
             raise RuntimeError("Call load() first.")
+        multi = clip_multilingual.encode_if_wanted(list(texts))
+        if multi is not None:
+            return multi
         dummy = Image.fromarray(
             np.zeros((_DUMMY_IMAGE_SIZE, _DUMMY_IMAGE_SIZE, 3), dtype=np.uint8)
         )

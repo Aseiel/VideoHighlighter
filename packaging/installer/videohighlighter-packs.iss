@@ -1,4 +1,4 @@
-; VideoHighlighter setup with PyTorch as a pack (Inno Setup 6.1+).
+﻿; VideoHighlighter setup with PyTorch as a pack (Inno Setup 6.1+).
 ;
 ; A real installer: Inno compresses and installs the files itself, so there is
 ; no .7z inside and nothing to download before the app works. What it carries:
@@ -16,8 +16,19 @@
 ;     default. Model weights barely compress, so carrying it would put its
 ;     whole size into every download, including for people who never search.
 ;     It lands in {app}\models\, the first place llm/clip_prefilter.py looks.
+;   * the multilingual search text model (llm/clip_multilingual.py) - ticked
+;     when the language chosen below is not English. Only offered when this
+;     Setup was built against packs that have it (MlPackAsset).
 ;
-; Either one failing or being declined still leaves an app that runs.
+; Any of them failing or being declined still leaves an app that runs.
+;
+; THE LANGUAGE. A page after the folder asks which language the app should
+; use, preselecting Windows' display language, and leaves the answer in
+; {app}\install_language.txt. The app reads it at its first start
+; (modules/i18n/content_language.py) - its menus, and the language it listens
+; for in transcripts, writes subtitles and narration in, and understands in
+; search. Setup's own pages stay in English. Skipped when Setup runs over an
+; install that already has a config: the app holds that choice already.
 ;
 ; Built in CI:
 ;   ISCC.exe /DAppVersion= /DDistDir= /DCpuPackDir= /DPackBase= \
@@ -78,6 +89,18 @@
 #ifndef ClipInstalledMB
   #define ClipInstalledMB 0
 #endif
+#ifndef MlPackAsset
+  #define MlPackAsset ""
+#endif
+#ifndef MlPackSha256
+  #define MlPackSha256 ""
+#endif
+#ifndef MlPackMB
+  #define MlPackMB 0
+#endif
+#ifndef MlInstalledMB
+  #define MlInstalledMB 0
+#endif
 #ifndef InstalledMB
   #define InstalledMB 0
 #endif
@@ -91,6 +114,7 @@
 #define AppMutex AppName + " is running"
 #define CudaPackName "torch-cu128"
 #define ClipDirName "clip-vit-base-patch32-ov"
+#define MlDirName "clip-vit-b32-multilingual"
 
 [Setup]
 AppId={{#AppId}
@@ -121,6 +145,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 [Tasks]
 Name: "nvidia"; Description: "NVIDIA GPU acceleration (downloads about {#CudaPackMB} MB)"; Flags: unchecked
 Name: "clip"; Description: "Visual search model, CLIP (downloads about {#ClipPackMB} MB)"
+#if MlPackAsset != ""
+Name: "multilingual"; Description: "Search in your language, not only English (downloads about {#MlPackMB} MB)"; Flags: unchecked
+#endif
 Name: "desktopicon"; Description: "Create a &desktop shortcut"
 
 ; The bundle folder is replaced whole on every install. A build from before
@@ -159,6 +186,80 @@ var
   NvidiaDefaultApplied: Boolean;
   CudaPackDownloaded: Boolean;
   ClipPackDownloaded: Boolean;
+  MlPackDownloaded: Boolean;
+  LanguagePage: TInputOptionWizardPage;
+  MlDefaultApplied: Boolean;
+
+// The app's interface languages, in the order its own picker lists them
+// (modules/i18n/languages.py), with the Windows primary language id of each.
+const
+  LanguageCount = 14;
+
+function LanguageCode(I: Integer): String;
+begin
+  case I of
+    0: Result := 'en';     1: Result := 'zh-CN';  2: Result := 'es';
+    3: Result := 'pt-BR';  4: Result := 'fr';     5: Result := 'ja';
+    6: Result := 'de';     7: Result := 'ko';     8: Result := 'id';
+    9: Result := 'tr';     10: Result := 'it';    11: Result := 'pl';
+    12: Result := 'vi';    13: Result := 'nl';
+  else
+    Result := 'en';
+  end;
+end;
+
+function LanguageLabel(I: Integer): String;
+begin
+  case I of
+    0: Result := 'English';
+    1: Result := '简体中文 - Chinese (Simplified)';
+    2: Result := 'Español - Spanish';
+    3: Result := 'Português (Brasil) - Portuguese (Brazil)';
+    4: Result := 'Français - French';
+    5: Result := '日本語 - Japanese';
+    6: Result := 'Deutsch - German';
+    7: Result := '한국어 - Korean';
+    8: Result := 'Bahasa Indonesia - Indonesian';
+    9: Result := 'Türkçe - Turkish';
+    10: Result := 'Italiano - Italian';
+    11: Result := 'Polski - Polish';
+    12: Result := 'Tiếng Việt - Vietnamese';
+    13: Result := 'Nederlands - Dutch';
+  else
+    Result := 'English';
+  end;
+end;
+
+// Windows' display language -> the index above; English when it is none of them.
+function SystemLanguageIndex: Integer;
+begin
+  case GetUILanguage and $3FF of
+    $04: Result := 1;   $0A: Result := 2;   $16: Result := 3;   $0C: Result := 4;
+    $11: Result := 5;   $07: Result := 6;   $12: Result := 7;   $21: Result := 8;
+    $1F: Result := 9;   $10: Result := 10;  $15: Result := 11;  $2A: Result := 12;
+    $13: Result := 13;
+  else
+    Result := 0;
+  end;
+end;
+
+function ChosenLanguage: String;
+var
+  I: Integer;
+begin
+  Result := 'en';
+  for I := 0 to LanguageCount - 1 do
+    if LanguagePage.Values[I] then
+      Result := LanguageCode(I);
+end;
+
+// An install that already has a config: the app holds the language already,
+// beside the exe or, for a read-only install, in the per-user folder.
+function HasConfig: Boolean;
+begin
+  Result := FileExists(ExpandConstant('{app}\config.yaml'))
+    or FileExists(ExpandConstant('{localappdata}\{#AppName}\config.yaml'));
+end;
 
 // True when Windows reports an NVIDIA display adapter. Any failure (WMI
 // disabled, a locked-down machine) is "not found": the checkbox then simply
@@ -205,7 +306,19 @@ begin
 end;
 
 procedure InitializeWizard;
+var
+  I: Integer;
 begin
+  LanguagePage := CreateInputOptionPage(wpSelectDir,
+    'Language', 'Which language should VideoHighlighter use?',
+    'Its menus, and the language it listens for in transcripts, writes '
+    + 'subtitles and narration in, and understands in search, all follow this. '
+    + 'You can change it later under About.',
+    True, True);
+  for I := 0 to LanguageCount - 1 do
+    LanguagePage.Add(LanguageLabel(I));
+  LanguagePage.Values[SystemLanguageIndex] := True;
+
   NvidiaFound := HasNvidiaGpu;
   DownloadPage := CreateDownloadPage(
     'Downloading NVIDIA GPU acceleration',
@@ -243,6 +356,31 @@ begin
       WizardSelectTasks('nvidia');
     NvidiaDefaultApplied := True;
   end;
+#if MlPackAsset != ""
+  // Ticked for any language but English, the first time the tasks page shows;
+  // the user's own choice stands after that.
+  if (CurPageID = wpSelectTasks) and not MlDefaultApplied then
+  begin
+    if (not HasConfig) and (ChosenLanguage <> 'en') then
+      WizardSelectTasks('multilingual');
+    MlDefaultApplied := True;
+  end;
+#endif
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = LanguagePage.ID) and HasConfig;
+end;
+
+// Whether the multilingual task exists in this build and is ticked.
+function MlSelected: Boolean;
+begin
+#if MlPackAsset != ""
+  Result := WizardIsTaskSelected('multilingual');
+#else
+  Result := False;
+#endif
 end;
 
 function FreeSpaceMB(const Path: String): Int64;
@@ -269,6 +407,8 @@ begin
     Need := Need + {#CudaPackMB} + {#CudaInstalledMB};
   if WizardIsTaskSelected('clip') then
     Need := Need + {#ClipPackMB} + {#ClipInstalledMB};
+  if MlSelected then
+    Need := Need + {#MlPackMB} + {#MlInstalledMB};
   if Need <= 0 then
     Exit;
   AppDir := ExpandConstant('{app}');
@@ -324,7 +464,8 @@ begin
 
   CudaPackDownloaded := False;
   ClipPackDownloaded := False;
-  if not (WizardIsTaskSelected('nvidia') or WizardIsTaskSelected('clip')) then
+  MlPackDownloaded := False;
+  if not (WizardIsTaskSelected('nvidia') or WizardIsTaskSelected('clip') or MlSelected) then
     Exit;
   if '{#PackBase}' = '' then
   begin
@@ -345,6 +486,13 @@ begin
         'The visual search model',
         'Everything else works; visual search, chapters and taught categories '
         + 'need it, and running Setup again adds it.', Stay);
+#if MlPackAsset != ""
+    if (not Stay) and MlSelected then
+      MlPackDownloaded := FetchComponent('{#MlPackAsset}', '{#MlPackSha256}',
+        'The multilingual search model',
+        'Search then understands English queries only; the app offers it '
+        + 'again, and running Setup again adds it.', Stay);
+#endif
   finally
     DownloadPage.Hide;
   end;
@@ -396,29 +544,29 @@ begin
     mbError, MB_OK);
 end;
 
-// The archive holds models\{#ClipDirName}\...: unpack it to a staging folder
+// A model archive holds models\<DirName>\...: unpack it to a staging folder
 // and move that one directory into {app}\models.
-procedure InstallClipPack;
+procedure InstallModelPack(const Asset, DirName, What: String);
 var
   Staging, Target: String;
 begin
-  Staging := ExpandConstant('{app}\models\.clip.partial');
-  Target := ExpandConstant('{app}\models\{#ClipDirName}');
-  WizardForm.StatusLabel.Caption := 'Unpacking the visual search model...';
+  Staging := ExpandConstant('{app}\models\.') + DirName + '.partial';
+  Target := ExpandConstant('{app}\models\') + DirName;
+  WizardForm.StatusLabel.Caption := 'Unpacking ' + What + '...';
   WizardForm.Refresh;
 
   ForceDirectories(ExpandConstant('{app}\models'));
-  if Unpack('{#ClipPackAsset}', Staging) then
+  if Unpack(Asset, Staging) then
   begin
     DelTree(Target, True, True, True);
-    if RenameFile(Staging + '\models\{#ClipDirName}', Target) then
+    if RenameFile(Staging + '\models\' + DirName, Target) then
     begin
       DelTree(Staging, True, True, True);
       Exit;
     end;
     DelTree(Staging, True, True, True);
   end;
-  MsgBox('Could not install the visual search model. Everything else works; '
+  MsgBox('Could not install ' + What + '. Everything else works; '
     + 'run Setup again to add it.', mbError, MB_OK);
 end;
 
@@ -429,5 +577,12 @@ begin
   if CudaPackDownloaded then
     InstallCudaPack;
   if ClipPackDownloaded then
-    InstallClipPack;
+    InstallModelPack('{#ClipPackAsset}', '{#ClipDirName}', 'the visual search model');
+#if MlPackAsset != ""
+  if MlPackDownloaded then
+    InstallModelPack('{#MlPackAsset}', '{#MlDirName}', 'the multilingual search model');
+#endif
+  // Read by the app at its first start; ignored once its config has a language.
+  if not HasConfig then
+    SaveStringToFile(ExpandConstant('{app}\install_language.txt'), ChosenLanguage, False);
 end;

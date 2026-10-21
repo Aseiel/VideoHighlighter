@@ -73,6 +73,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QMetaObject, Q_ARG, Slot, QStringListModel
 from modules import i18n
+from modules.i18n import content_language
 # Translate QLabel/QPushButton/… text at the Qt boundary so the chosen UI
 # language covers the whole surface, not only hand-wrapped call sites.
 i18n.install_qt_hooks()
@@ -108,6 +109,11 @@ REPO_URL = "https://github.com/Aseiel/VideoHighlighter"
 # User-editable config: lives next to the exe when frozen (so saves persist),
 # seeded from the bundled default; just the project-root file when run from source.
 CONFIG_FILE = config_path("config.yaml")
+
+# Whisper codes the transcript and subtitle language boxes offer: every
+# interface language's (modules/i18n/content_language.WHISPER) and a few more.
+TRANSCRIPT_LANGUAGES = ["auto", "en", "zh", "es", "pt", "fr", "ja", "de", "ko", "id",
+                        "tr", "it", "pl", "vi", "nl", "ru"]
 
 YOLO_OBJECTS_LABELS_FILE = _resource_path("yolo_objects_labels.json")
 # Suggestions for the action field. SigLIP2 scores any action by name; this
@@ -1075,8 +1081,17 @@ class VideoHighlighterGUI(QWidget):
         self.worker = None
 
         self.config_data = self.load_config()
+        # First start: nobody has chosen a language yet. The Windows installer
+        # asks; elsewhere this does (modules/i18n/content_language.py).
+        self._choose_first_language()
         # UI language before any widget text is built (msgid catalogs in modules/i18n).
         i18n.load_from_config(self.config_data)
+        # Transcript and subtitle languages follow the interface language; once,
+        # for a config saved before they did.
+        moved = content_language.migrate(self.config_data)
+        if moved:
+            print(f"🌐 Content language follows the interface ({i18n.current_language()}): "
+                  + ", ".join(f"{s}.{k}" for s, k in moved))
 
         # Publish the saved DirectML choice into the environment before anything
         # probes a device, so worker processes — which inherit the environment
@@ -1972,8 +1987,9 @@ class VideoHighlighterGUI(QWidget):
 
         # Source language for transcription
         self.transcript_source_lang = QComboBox()
-        self.transcript_source_lang.addItems(["auto","en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
-        self.transcript_source_lang.setCurrentText(transcript_cfg.get("source_lang", "en"))
+        self.transcript_source_lang.addItems(TRANSCRIPT_LANGUAGES)
+        self._set_lang_combo(self.transcript_source_lang, str(
+            transcript_cfg.get("source_lang") or content_language.whisper_code(i18n.current_language())))
         self.transcript_source_lang.setEnabled(transcript_cfg.get("enabled", False))
         transcript_form.addRow(i18n.t("Source language:"), self.transcript_source_lang)
 
@@ -2004,8 +2020,9 @@ class VideoHighlighterGUI(QWidget):
         # it just mislabelled the translation and named the file wrong. When a
         # cached transcript is reused, its own recorded language is used.
         self.subtitle_target_lang = QComboBox()
-        self.subtitle_target_lang.addItems(["en","pl","es","fr","de","it","pt","ru","ja","ko","zh"])
-        self.subtitle_target_lang.setCurrentText(subtitles_cfg.get("target_lang", "pl"))
+        self.subtitle_target_lang.addItems([c for c in TRANSCRIPT_LANGUAGES if c != "auto"])
+        self._set_lang_combo(self.subtitle_target_lang, str(
+            subtitles_cfg.get("target_lang") or content_language.whisper_code(i18n.current_language())))
         self.subtitle_target_lang.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
         subtitle_form.addRow(i18n.t("Target language:"), self.subtitle_target_lang)
         _sub_run = self._make_analyze_button(
@@ -3764,13 +3781,82 @@ class VideoHighlighterGUI(QWidget):
         layout.addStretch()
         return outer
 
+    def _choose_first_language(self) -> None:
+        """Give a config without an interface language one: the installer's
+        answer when there is one, else ask (the system's language preselected).
+        Saved straight to the file, since no widget exists yet to save from."""
+        if content_language.chosen(self.config_data):
+            return
+        # Nobody to ask in a test or a headless run, and a guess must not be
+        # saved as somebody's choice: the window runs in English, the file
+        # stays as it was.
+        app = QApplication.instance()
+        if app is None or app.platformName() in ("offscreen", "minimal"):
+            return
+        exe_dir = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+                   else os.path.dirname(os.path.abspath(__file__)))
+        code = content_language.installer_choice(exe_dir)
+        if code is None:
+            try:
+                from modules.ui.language_dialog import ask_language
+                code = ask_language()
+            except Exception as e:  # noqa: BLE001 - a missing answer is English
+                print(f"⚠️ Language question failed: {e}")
+                code = "en"
+        ui = self.config_data.setdefault("ui", {})
+        ui["language"] = code
+        # A first start has no old defaults to move: they follow from here.
+        content_language.follow(self.config_data, "en", code, also_shipped=True)
+        ui[content_language.MIGRATED_KEY] = True
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                yaml.dump(self.config_data, f, sort_keys=False, allow_unicode=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ Could not save the chosen language: {e}")
+        print(f"🌐 Interface language chosen at first start: {code}")
+        if code != "en":
+            # Once the window is up: search needs its multilingual model.
+            QTimer.singleShot(1500, self._offer_multilingual_search)
+
+    def _offer_multilingual_search(self) -> None:
+        """Offer the multilingual search model when the interface is not in
+        English and it is missing. Says nothing where no pack can be had
+        (from source, or a build whose packs do not list it)."""
+        from llm import clip_multilingual
+        if i18n.current_language() == "en" or clip_multilingual.is_installed():
+            return
+        try:
+            from modules.packs import pack_ui
+            pack_ui.ensure_pack(self, pack_ui.MULTILINGUAL_PACK, why=i18n.t(
+                "Visual search understands queries in English only. This model "
+                "lets it understand them in your language too."))
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ Multilingual search offer failed: {e}")
+
+    @staticmethod
+    def _set_lang_combo(combo, code: str) -> None:
+        """Select ``code``, adding it first if a saved config names one the box
+        does not list."""
+        if code and combo.findText(code) < 0:
+            combo.addItem(code)
+        combo.setCurrentText(code)
+
     def _on_ui_language_changed(self, _index: int = 0) -> None:
         """Persist interface language; full UI rebuild needs a restart."""
         code = self.ui_language_combo.currentData()
         if not code or code == i18n.current_language():
             return
+        previous = i18n.current_language()
         i18n.set_language(code)
         self.config_data.setdefault("ui", {})["language"] = code
+        # The transcript and subtitle languages move along, unless one was
+        # set to something other than what the old language gave it.
+        langs = {"transcript": {"source_lang": self.transcript_source_lang.currentText()},
+                 "subtitles": {"source_lang": self.transcript_source_lang.currentText(),
+                               "target_lang": self.subtitle_target_lang.currentText()}}
+        content_language.follow(langs, previous, code)
+        self._set_lang_combo(self.transcript_source_lang, langs["transcript"]["source_lang"])
+        self._set_lang_combo(self.subtitle_target_lang, langs["subtitles"]["target_lang"])
         try:
             self.save_config()
         except Exception as e:  # noqa: BLE001
@@ -3784,6 +3870,7 @@ class VideoHighlighterGUI(QWidget):
                 "VideoHighlighter."
             ),
         )
+        self._offer_multilingual_search()
 
     # --- Avoid methods ---
     def _get_face_bank(self):
@@ -4701,12 +4788,12 @@ class VideoHighlighterGUI(QWidget):
         if "model" in transcript:
             self.transcript_model_combo.setCurrentText(str(transcript["model"]))
         if "source_lang" in transcript:
-            self.transcript_source_lang.setCurrentText(str(transcript["source_lang"]))
+            self._set_lang_combo(self.transcript_source_lang, str(transcript["source_lang"]))
         sub = data.get("subtitles") or {}
         if "enabled" in sub:
             self.subtitles_checkbox.setChecked(bool(sub["enabled"]))
         if "target_lang" in sub:
-            self.subtitle_target_lang.setCurrentText(str(sub["target_lang"]))
+            self._set_lang_combo(self.subtitle_target_lang, str(sub["target_lang"]))
 
         adv = data.get("advanced") or {}
         if "frame_skip" in adv:
@@ -4906,6 +4993,10 @@ class VideoHighlighterGUI(QWidget):
                 "write_highlight_report": self.why_report_chk.isChecked(),
                 **self._report_config(),
                 "draw_action_labels": self.bbox_actions_chk.isChecked(),
+                # Set by hand only (no widget): narration otherwise follows the
+                # interface language.
+                **({"narration_language": self.config_data["visualization"]["narration_language"]}
+                   if (self.config_data.get("visualization") or {}).get("narration_language") else {}),
             },
             "avoid": {
                 "face_recognition_enabled": self.avoid_face_recognition_chk.isChecked(),
@@ -4913,6 +5004,7 @@ class VideoHighlighterGUI(QWidget):
             "ui": {
                 "suppress_no_cache_warning": self.config_data.get("ui", {}).get("suppress_no_cache_warning", False),
                 "language": i18n.current_language(),
+                content_language.MIGRATED_KEY: True,
             },
         }
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:

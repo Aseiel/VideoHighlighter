@@ -100,8 +100,14 @@ def system_prompt_for(model_name: Optional[str]) -> str:
     """The brief this model can actually receive."""
     from modules.narration.llm_models import is_captioner
 
-    return CAPTIONER_SYSTEM_PROMPT if is_captioner(model_name) \
-        else STORY_SYSTEM_PROMPT
+    if is_captioner(model_name):
+        return CAPTIONER_SYSTEM_PROMPT
+    # In the user's language (the interface language unless
+    # visualization.narration_language says otherwise). Not for a captioner:
+    # it takes no instructions, and English is what it was trained to write.
+    from modules.i18n.content_language import narration_instruction
+    language = narration_instruction()
+    return f"{STORY_SYSTEM_PROMPT}\n\n{language}" if language else STORY_SYSTEM_PROMPT
 
 # A paragraph, not an essay. Each chapter's block already carries its
 # measurements and quotes; the prose is there to connect them, and at four

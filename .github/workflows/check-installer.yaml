@@ -40,3 +40,21 @@ jobs:
             packaging/installer/videohighlighter-packs.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
           Get-ChildItem stub -Filter *.exe | ForEach-Object { Write-Host "compiled: $($_.Name)" }
+      - name: Compile it again with the multilingual search pack
+        # The multilingual task and its download are compiled in only when
+        # the packs list it (MlPackAsset), so that branch needs its own run.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force stub-ml | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q `
+            "/DDistDir=$((Resolve-Path stub/dist).Path)" `
+            "/DCpuPackDir=$((Resolve-Path stub/pack).Path)" `
+            "/DPackBase=https://example.invalid/packs" `
+            "/DCudaPackSha256=0000000000000000000000000000000000000000000000000000000000000000" `
+            "/DCudaPackMB=1769" "/DCudaInstalledMB=4800" "/DInstalledMB=2100" `
+            "/DMlPackAsset=component-models-clip-multilingual.7z" `
+            "/DMlPackSha256=0000000000000000000000000000000000000000000000000000000000000000" `
+            "/DMlPackMB=160" "/DMlInstalledMB=171" `
+            "/O$((Resolve-Path stub-ml).Path)" `
+            packaging/installer/videohighlighter-packs.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with the multilingual pack ($LASTEXITCODE)" }

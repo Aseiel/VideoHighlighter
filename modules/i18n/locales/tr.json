@@ -1059,5 +1059,8 @@
   "🚫  Avoid this range in highlights": "🚫  Bu aralıktan öne çıkanlarda kaçın",
   "🟢 Live (real-time) — recognising faces on the current frame": "🟢 Canlı (gerçek zamanlı) — geçerli karede yüzler tanınıyor",
   "🥽 Side-by-side VR — showing the left eye. Untick “VR Half-Frame” for the whole frame.": "🥽 Yan yana VR — sol göz gösteriliyor. Karenin tamamı için \"VR yarım kare\" işaretini kaldırın.",
-  "🧠  Teach a model to find this — draw a box…": "🧠  Bir modele bunu bulmayı öğret — bir kutu çizin…"
+  "🧠  Teach a model to find this — draw a box…": "🧠  Bir modele bunu bulmayı öğret — bir kutu çizin…",
+  "Choose your language": "Dilinizi seçin",
+  "VideoHighlighter's menus, and the language it listens for in transcripts, writes subtitles and narration in, and understands in search, all follow this. You can change it later under About.": "VideoHighlighter'ın menüleri, dökümlerde dinlediği dil, altyazı ve anlatımı yazdığı dil ve aramada anladığı dil bu seçimi izler. Bunu daha sonra Hakkında bölümünden değiştirebilirsiniz.",
+  "Visual search understands queries in English only. This model lets it understand them in your language too.": "Görsel arama yalnızca İngilizce sorguları anlar. Bu model, sorguları sizin dilinizde de anlamasını sağlar."
 }

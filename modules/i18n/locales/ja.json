@@ -338,7 +338,7 @@
   "Keep temp clips: OFF": "臨時雇用者クリップを保って下さい: オフ",
   "Keep temp clips: ON": "臨時雇用者クリップを保って下さい: オン",
   "Labels…": "ラベル...",
-  "Language": "用語集",
+  "Language": "言語",
   "Language changes apply after you restart the app.": "アプリを再起動した後に言語変更が適用されます。",
   "Language:": "言語:",
   "Last 10min": "最後の10分",
@@ -544,7 +544,7 @@
   "Report a problem": "問題報告",
   "Report Only": "レポートのみ",
   "Repository name": "リポジトリ名",
-  "Restart required": "必要な再起動",
+  "Restart required": "再起動が必要です",
   "Rewrite as one commentary": "1つのコメントとして書き換える",
   "Rounds of learning:": "学習のラウンド:",
   "Run action detection with bounding boxes (uses your existing pipeline)": "境界ボックスでアクション検出を実行(既存のパイプラインを使用する)",
@@ -1059,5 +1059,8 @@
   "🚫  Avoid this range in highlights": "🚫  この範囲をハイライトから除外",
   "🟢 Live (real-time) — recognising faces on the current frame": "🟢 ライブ（リアルタイム）— 現在のフレームで顔を認識中",
   "🥽 Side-by-side VR — showing the left eye. Untick “VR Half-Frame” for the whole frame.": "🥽 サイドバイサイド VR — 左目の映像を表示中。フレーム全体を表示するには「VR ハーフフレーム」のチェックを外してください。",
-  "🧠  Teach a model to find this — draw a box…": "🧠  これを見つけるようモデルに教える — 枠を描いてください…"
+  "🧠  Teach a model to find this — draw a box…": "🧠  これを見つけるようモデルに教える — 枠を描いてください…",
+  "Choose your language": "言語を選択してください",
+  "VideoHighlighter's menus, and the language it listens for in transcripts, writes subtitles and narration in, and understands in search, all follow this. You can change it later under About.": "VideoHighlighter のメニュー、文字起こしで聞き取る言語、字幕とナレーションを書く言語、検索で理解する言語は、すべてこの設定に従います。あとで「バージョン情報」から変更できます。",
+  "Visual search understands queries in English only. This model lets it understand them in your language too.": "ビジュアル検索は英語のクエリしか理解できません。このモデルを使うと、あなたの言語でも理解できるようになります。"
 }

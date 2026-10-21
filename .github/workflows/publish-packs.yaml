@@ -1,8 +1,9 @@
 name: Publish packs
 
 # Puts the packs — PyTorch for NVIDIA (torch-cu128), PyTorch for everyone
-# else (torch-cpu), the CLIP model (models-clip) and the frame encoder
-# (models-frame-encoder) — on a release of this public repo, where the
+# else (torch-cpu), the CLIP model (models-clip), the frame encoder
+# (models-frame-encoder) and the multilingual search text model
+# (models-clip-multilingual) — on a release of this public repo, where the
 # installers and the app download them from. They hold nothing
 # edition-specific, and each is under GitHub's 2 GB asset cap.
 #
@@ -55,7 +56,8 @@ jobs:
           python3 - <<'EOF'
           import hashlib, json, os, sys
           packs = json.load(open("in/packs.json", encoding="utf-8-sig"))["packs"]
-          names = ("torch-cu128", "torch-cpu", "models-clip", "models-frame-encoder")
+          names = ("torch-cu128", "torch-cpu", "models-clip", "models-frame-encoder",
+                   "models-clip-multilingual")
           keep = [p for p in packs if p["name"] in names]
           if sorted(p["name"] for p in keep) != sorted(names):
               sys.exit(f"expected {', '.join(names)}, found {[p['name'] for p in keep]}")
@@ -104,7 +106,7 @@ jobs:
             # release must never be what it gets.
             gh release create "$TAG" --prerelease --latest=false --target "$GITHUB_SHA" \
               --title "Packs: PyTorch $TAG, CLIP, frame encoder" \
-              --notes "Components the VideoHighlighter installers and app download: PyTorch for NVIDIA GPUs (torch-cu128), PyTorch for CPU (torch-cpu), the CLIP visual search model (models-clip) and the SigLIP2 frame encoder for taught action models (models-frame-encoder, Apache-2.0). Not an app release - install VideoHighlighter from the latest release. Checksums are in packs.json."
+              --notes "Components the VideoHighlighter installers and app download: PyTorch for NVIDIA GPUs (torch-cu128), PyTorch for CPU (torch-cpu), the CLIP visual search model (models-clip), the SigLIP2 frame encoder for taught action models (models-frame-encoder, Apache-2.0) and the multilingual search text model (models-clip-multilingual, Apache-2.0). Not an app release - install VideoHighlighter from the latest release. Checksums are in packs.json."
           fi
           gh release upload "$TAG" $assets out/packs.json
           echo "published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"

@@ -1059,5 +1059,8 @@
   "🚫  Avoid this range in highlights": "🚫  Pomijaj ten zakres w skrócie",
   "🟢 Live (real-time) — recognising faces on the current frame": "🟢 Na żywo (w czasie rzeczywistym) — rozpoznawanie twarzy w bieżącej klatce",
   "🥽 Side-by-side VR — showing the left eye. Untick “VR Half-Frame” for the whole frame.": "🥽 VR side-by-side — widok lewego oka. Odznacz „Pół klatki VR”, aby zobaczyć całą klatkę.",
-  "🧠  Teach a model to find this — draw a box…": "🧠  Naucz model to znajdować — narysuj ramkę…"
+  "🧠  Teach a model to find this — draw a box…": "🧠  Naucz model to znajdować — narysuj ramkę…",
+  "Choose your language": "Wybierz język",
+  "VideoHighlighter's menus, and the language it listens for in transcripts, writes subtitles and narration in, and understands in search, all follow this. You can change it later under About.": "Menu VideoHighlighter, a także język, którego słucha w transkrypcjach, w którym pisze napisy i narrację oraz który rozumie w wyszukiwaniu, podążają za tym wyborem. Możesz to później zmienić w zakładce O programie.",
+  "Visual search understands queries in English only. This model lets it understand them in your language too.": "Wyszukiwanie wizualne rozumie tylko zapytania po angielsku. Ten model pozwala mu rozumieć je także w Twoim języku."
 }

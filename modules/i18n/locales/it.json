@@ -1059,5 +1059,8 @@
   "🚫  Avoid this range in highlights": "🚫  Evita questo intervallo nei momenti salienti",
   "🟢 Live (real-time) — recognising faces on the current frame": "🟢 Dal vivo (tempo reale) — riconoscimento dei volti nel fotogramma corrente",
   "🥽 Side-by-side VR — showing the left eye. Untick “VR Half-Frame” for the whole frame.": "🥽 VR affiancato — mostra l'occhio sinistro. Deseleziona \"Mezzo fotogramma VR\" per il fotogramma intero.",
-  "🧠  Teach a model to find this — draw a box…": "🧠  Insegna a un modello a trovarlo — disegna un riquadro…"
+  "🧠  Teach a model to find this — draw a box…": "🧠  Insegna a un modello a trovarlo — disegna un riquadro…",
+  "Choose your language": "Scegli la tua lingua",
+  "VideoHighlighter's menus, and the language it listens for in transcripts, writes subtitles and narration in, and understands in search, all follow this. You can change it later under About.": "I menu di VideoHighlighter, e la lingua che ascolta nelle trascrizioni, in cui scrive sottotitoli e narrazione e che capisce nella ricerca, seguono questa scelta. Puoi cambiarla più tardi in Informazioni.",
+  "Visual search understands queries in English only. This model lets it understand them in your language too.": "La ricerca visiva capisce solo le richieste in inglese. Questo modello le permette di capirle anche nella tua lingua."
 }

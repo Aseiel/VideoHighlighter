@@ -123,6 +123,22 @@ jobs:
           [ordered]@{ name = "models-frame-encoder"; dep = "models-frame-encoder";
                       version = "siglip2-base-patch16-256-onnx-text"; bytes_installed = $bytes } |
             ConvertTo-Json | Set-Content build-packs/models-frame-encoder/pack.json -Encoding utf8
+      - name: Export the multilingual search model into its own pack
+        # sentence-transformers/clip-ViT-B-32-multilingual-v1 (Apache-2.0): a
+        # text model whose vectors land in CLIP ViT-B/32's space, so search
+        # understands queries in the user's language (llm/clip_multilingual.py).
+        # ~170 MB. Offered by the installer, ticked when the chosen language is
+        # not English. Pinned to one revision; the export checks itself.
+        if: matrix.variant == 'packs' && inputs.rebuild_packs
+        shell: pwsh
+        run: |
+          $dest = "build-packs/models-clip-multilingual/models"
+          python -m tools.export_clip_multilingual --out "$dest/clip-vit-b32-multilingual"
+          if ($LASTEXITCODE -ne 0) { throw "multilingual search model export failed" }
+          $bytes = (Get-ChildItem $dest -Recurse -File | Measure-Object Length -Sum).Sum
+          [ordered]@{ name = "models-clip-multilingual"; dep = "models-clip-multilingual";
+                      version = "clip-vit-b32-multilingual-onnx"; bytes_installed = $bytes } |
+            ConvertTo-Json | Set-Content build-packs/models-clip-multilingual/pack.json -Encoding utf8
       - name: Fetch YOLOX detector models (Apache-2.0)
         run: python tools/get_yolox_model.py
       - name: Build EXE (${{ matrix.variant }})
@@ -308,6 +324,15 @@ jobs:
           $packs = (Get-Content out/packs.json | ConvertFrom-Json).packs
           $cuda = $packs | Where-Object { $_.name -eq "torch-cu128" }
           $clip = $packs | Where-Object { $_.name -eq "models-clip" }
+          # The multilingual search model, once the packs have it: Setup then
+          # offers it (ticked when the chosen language is not English).
+          $ml = $packs | Where-Object { $_.name -eq "models-clip-multilingual" }
+          $mlArgs = @()
+          if ($ml) {
+            $mlArgs = @("/DMlPackAsset=$($ml.asset)", "/DMlPackSha256=$($ml.sha256)",
+                        "/DMlPackMB=$([int][math]::Ceiling($ml.bytes / 1MB))",
+                        "/DMlInstalledMB=$([int][math]::Ceiling($ml.bytes_installed / 1MB))")
+          }
           $installedMB = [int][math]::Ceiling(((Get-ChildItem dist/VideoHighlighter, build-packs/torch-cpu -Recurse -File | Measure-Object Length -Sum).Sum) / 1MB)
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q `
             "/DAppVersion=packs-experiment" `
@@ -323,6 +348,7 @@ jobs:
             "/DClipPackSha256=$($clip.sha256)" `
             "/DClipPackMB=$([int][math]::Ceiling($clip.bytes / 1MB))" `
             "/DClipInstalledMB=$([int][math]::Ceiling($clip.bytes_installed / 1MB))" `
+            @mlArgs `
             "/DInstalledMB=$installedMB" `
             "/O$((Resolve-Path out).Path)" `
             packaging/installer/videohighlighter-packs.iss
