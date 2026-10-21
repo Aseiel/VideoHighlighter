@@ -34,6 +34,9 @@ models/actions/
 # it before packaging). Without it the app re-converts the model from PyTorch on
 # every launch — slow, but never something to commit.
 models/clip-vit-base-patch32-ov/
+# Multilingual search text model, made by tools/export_clip_multilingual.py
+# (delivered as a pack; bundled only in the mac build).
+models/clip-vit-b32-multilingual/
 
 # The frame encoder (SigLIP2 image tower, ~186 MB, written by
 # tools/export_frame_encoder.py; a download or part of the build), and the

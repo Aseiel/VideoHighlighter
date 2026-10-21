@@ -1059,5 +1059,8 @@
   "🚫  Avoid this range in highlights": "🚫  Tránh khoảng này trong điểm nổi bật",
   "🟢 Live (real-time) — recognising faces on the current frame": "🟢 Trực tiếp (thời gian thực) — đang nhận diện khuôn mặt trên khung hình hiện tại",
   "🥽 Side-by-side VR — showing the left eye. Untick “VR Half-Frame” for the whole frame.": "🥽 VR song song — đang hiện mắt trái. Bỏ chọn \"Nửa khung hình VR\" để xem cả khung hình.",
-  "🧠  Teach a model to find this — draw a box…": "🧠  Dạy mô hình tìm thứ này — vẽ một khung…"
+  "🧠  Teach a model to find this — draw a box…": "🧠  Dạy mô hình tìm thứ này — vẽ một khung…",
+  "Choose your language": "Chọn ngôn ngữ của bạn",
+  "VideoHighlighter's menus, and the language it listens for in transcripts, writes subtitles and narration in, and understands in search, all follow this. You can change it later under About.": "Menu của VideoHighlighter, cùng với ngôn ngữ nó nghe trong bản chép lời, ngôn ngữ nó viết phụ đề và lời dẫn, và ngôn ngữ nó hiểu khi tìm kiếm, đều theo lựa chọn này. Bạn có thể đổi sau trong Giới thiệu.",
+  "Visual search understands queries in English only. This model lets it understand them in your language too.": "Tìm kiếm hình ảnh chỉ hiểu truy vấn bằng tiếng Anh. Mô hình này giúp nó hiểu cả truy vấn bằng ngôn ngữ của bạn."
 }

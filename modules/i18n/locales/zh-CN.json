@@ -1059,5 +1059,8 @@
   "🚫  Avoid this range in highlights": "🚫  在高光中排除此区间",
   "🟢 Live (real-time) — recognising faces on the current frame": "🟢 实时 — 正在识别当前帧中的人脸",
   "🥽 Side-by-side VR — showing the left eye. Untick “VR Half-Frame” for the whole frame.": "🥽 左右并排 VR — 正在显示左眼画面。取消勾选“VR 半画面”可显示完整画面。",
-  "🧠  Teach a model to find this — draw a box…": "🧠  教模型识别这个 — 画一个框…"
+  "🧠  Teach a model to find this — draw a box…": "🧠  教模型识别这个 — 画一个框…",
+  "Choose your language": "选择您的语言",
+  "VideoHighlighter's menus, and the language it listens for in transcripts, writes subtitles and narration in, and understands in search, all follow this. You can change it later under About.": "VideoHighlighter 的菜单，以及它在转录中识别的语言、撰写字幕和旁白所用的语言、在搜索中理解的语言，都会跟随此设置。之后可以在“关于”中更改。",
+  "Visual search understands queries in English only. This model lets it understand them in your language too.": "视觉搜索只能理解英文查询。此模型让它也能理解您的语言。"
 }

@@ -1059,5 +1059,8 @@
   "🚫  Avoid this range in highlights": "🚫  Hindari rentang ini dalam sorotan",
   "🟢 Live (real-time) — recognising faces on the current frame": "🟢 Langsung (real-time) — mengenali wajah pada frame saat ini",
   "🥽 Side-by-side VR — showing the left eye. Untick “VR Half-Frame” for the whole frame.": "🥽 VR berdampingan — menampilkan mata kiri. Hapus centang \"Setengah frame VR\" untuk frame utuh.",
-  "🧠  Teach a model to find this — draw a box…": "🧠  Latih model untuk menemukan ini — gambar kotak…"
+  "🧠  Teach a model to find this — draw a box…": "🧠  Latih model untuk menemukan ini — gambar kotak…",
+  "Choose your language": "Pilih bahasa Anda",
+  "VideoHighlighter's menus, and the language it listens for in transcripts, writes subtitles and narration in, and understands in search, all follow this. You can change it later under About.": "Menu VideoHighlighter, serta bahasa yang didengarkannya dalam transkrip, yang dipakainya untuk menulis subtitel dan narasi, dan yang dipahaminya dalam pencarian, semuanya mengikuti pilihan ini. Anda dapat mengubahnya nanti di Tentang.",
+  "Visual search understands queries in English only. This model lets it understand them in your language too.": "Pencarian visual hanya memahami kueri dalam bahasa Inggris. Model ini membuatnya juga memahami kueri dalam bahasa Anda."
 }

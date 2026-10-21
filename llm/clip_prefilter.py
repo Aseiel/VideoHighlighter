@@ -47,6 +47,9 @@ from typing import Optional
 # clip-vit-base-patch32 is general-purpose: fast and proven on the Arc GPU.
 # Swap for a domain-tuned CLIP later if ranking recall is insufficient.
 MODEL_ID = "openai/clip-vit-base-patch32"
+# Its trained logit scale (exp(logit_scale) = 100.0), for scoring vectors that
+# did not come out of its own forward pass.
+CLIP_LOGIT_SCALE = 100.0
 
 # Directory name of the pre-converted OpenVINO IR (model + processor) shipped
 # under models/. Converting the HF PyTorch model at runtime (export=True) traces
@@ -600,6 +603,19 @@ class ClipFramePrefilter:
 
         images = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
                   for f in frames_bgr]
+        # A query in another language than English: its labels come from the
+        # multilingual model (same space as CLIP's), scored the way CLIP's own
+        # zero-shot head scores them.
+        from llm import clip_multilingual
+        labels = clip_multilingual.encode_if_wanted(self._labels)
+        if labels is not None:
+            import numpy as np
+            img = to_numpy(self.infer(["a photo"], images).image_embeds).astype(np.float32)
+            img /= np.clip(np.linalg.norm(img, axis=1, keepdims=True), 1e-12, None)
+            logits = CLIP_LOGIT_SCALE * img @ labels.T
+            logits -= logits.max(axis=1, keepdims=True)
+            probs = np.exp(logits)
+            return [float(p) for p in probs[:, 0] / probs.sum(axis=1)]
         outputs = self.infer(self._labels, images)
         # logits_per_image: [n_images, n_labels]; softmax → prob over labels.
         # .float() first: CLIP scales logits by ~100, and fp16 has ~3 decimal

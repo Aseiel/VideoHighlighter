@@ -88,5 +88,6 @@ avoid:
   face_recognition_enabled: false
 ui:
   suppress_no_cache_warning: true
-  # Interface language (menus/tabs/labels). See docs/UI-LANGUAGES.md.
-  language: en
+  # Interface language (menus/tabs/labels; see docs/UI-LANGUAGES.md) is left
+  # out on purpose: the first start asks for it (or reads the installer's
+  # answer), and the transcript and subtitle languages follow it.
