@@ -567,6 +567,10 @@ jobs:
         run: brew install ffmpeg create-dmg hwloc
       - name: Install dependencies
         run: |
+          # The torch the Windows packs carry, rather than whatever is newest:
+          # torch 2.14 on this runner's GPU failed to compile its Metal matmul
+          # for CLIP and gave Whisper "ööööö" (the second mac bench).
+          pip install torch==2.7.1 torchvision==0.22.1
           pip install -r requirements.txt
           # YOLOX (Apache-2.0) for training detectors in the app. --no-deps:
           # its declared requirements would let pip replace the torch above.
@@ -791,6 +795,9 @@ jobs:
             --smoke-report "$PWD/smoke-report-bench.json"
       - name: Upload smoke-test report
         if: always()
+        # A report: losing it to a network error must not fail the build (the
+        # bench also prints every section whole into the log).
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: mac-smoke-test
