@@ -48,7 +48,7 @@ class _FakeOrt(types.ModuleType):
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    for env in (ort_coreml.MODE_ENV, ort_coreml.UNITS_ENV,
+    for env in (ort_coreml.MODE_ENV, ort_coreml.UNITS_ENV, ort_coreml.FORMAT_ENV,
                 directml_device.MODE_ENV, "VH_BACKEND"):
         monkeypatch.delenv(env, raising=False)
     directml_device.set_mode(None)
@@ -285,3 +285,54 @@ class TestTheDeviceProbeOnAMac:
         listed = device_utils.describe_devices()
 
         assert listed == ["Apple M2 GPU - Core ML (ONNX Runtime)"]
+
+
+def _conv_model(path, **attrs):
+    """One Conv, written to ``path`` — enough to stand for SigLIP2's patch
+    embedding (auto_pad="VALID") or YOLOX's (explicit pads)."""
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper
+    w = numpy_helper.from_array(np.ones((2, 3, 4, 4), np.float32), "w")
+    node = helper.make_node("Conv", ["x", "w"], ["y"], kernel_shape=[4, 4],
+                            strides=[4, 4], **attrs)
+    graph = helper.make_graph(
+        [node], "g",
+        [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1, 3, 8, 8])],
+        [helper.make_tensor_value_info("y", onnx.TensorProto.FLOAT, [1, 2, 2, 2])],
+        [w])
+    onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)]),
+              str(path))
+    return str(path)
+
+
+class TestModelsCoreMLCannotCompile:
+    """The first mac bench: the frame encoder failed to compile on Core ML
+    ("Required param 'pad' is missing") and every action ran on the processor."""
+
+    def test_a_valid_padding_is_written_out(self, tmp_path):
+        onnx = pytest.importorskip("onnx")
+        out = ort_coreml.coreml_ready_model(_conv_model(tmp_path / "m.onnx", auto_pad="VALID"))
+        assert isinstance(out, bytes)
+        node = onnx.load_from_string(out).graph.node[0]
+        attrs = {a.name: onnx.helper.get_attribute_value(a) for a in node.attribute}
+        assert "auto_pad" not in attrs
+        assert attrs["pads"] == [0, 0, 0, 0]
+
+    def test_explicit_padding_is_left_as_it_is(self, tmp_path):
+        pytest.importorskip("onnx")
+        path = _conv_model(tmp_path / "m.onnx", pads=[0, 0, 0, 0])
+        assert ort_coreml.coreml_ready_model(path) == path
+
+    def test_only_core_ml_sessions_get_the_rewrite(self, monkeypatch, tmp_path):
+        pytest.importorskip("onnx")
+        path = _conv_model(tmp_path / "m.onnx", auto_pad="VALID")
+        _mac(monkeypatch)
+        assert isinstance(ort_directml.session(path).path, bytes)
+        cpu = ort_directml.session(path, providers_override=[CPU])
+        assert cpu.path == path
+
+    def test_the_older_model_format_can_be_asked_for(self, monkeypatch):
+        assert ort_coreml.provider_options()["ModelFormat"] == "MLProgram"
+        monkeypatch.setenv(ort_coreml.FORMAT_ENV, "neuralnetwork")
+        assert ort_coreml.provider_options()["ModelFormat"] == "NeuralNetwork"

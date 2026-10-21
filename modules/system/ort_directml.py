@@ -334,10 +334,11 @@ def session(model_path, *, providers_override=None):
     decide whether to fall back than a swallowed exception here.
     """
     ort = _import_onnxruntime()
-    return ort.InferenceSession(
-        str(model_path),
-        providers=list(providers_override if providers_override is not None
-                       else providers()))
+    chosen = list(providers_override if providers_override is not None else providers())
+    model = str(model_path)
+    if any((p[0] if isinstance(p, tuple) else p) == COREML_PROVIDER for p in chosen):
+        model = _coreml.coreml_ready_model(model_path)
+    return ort.InferenceSession(model, providers=chosen)
 
 
 def session_backend(sess) -> str:

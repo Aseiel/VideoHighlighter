@@ -37,7 +37,7 @@ import sys
 import time
 
 FRAMES = 32               # frames per timing round
-ROUNDS = 6                # rounds of the same work, for the leak check
+ROUNDS = 10               # rounds of the same work, for the leak check
 LEAK_MB_PER_ROUND = 8.0   # growth past the first round that counts as a leak
 WHISPER_MODELS = ("base", "small")
 
@@ -166,15 +166,19 @@ def _environment() -> dict:
 
 
 def _with_units(units: str):
-    """Set Core ML's compute units for sessions opened from now on."""
+    """Set Core ML's compute units (and, after a "/", its model format) for
+    sessions opened from now on; "" restores the defaults."""
     from modules.system import ort_coreml
-    if units:
-        os.environ[ort_coreml.UNITS_ENV] = units
-    else:
-        os.environ.pop(ort_coreml.UNITS_ENV, None)
+    units, _, fmt = (units or "").partition("/")
+    for env, value in ((ort_coreml.UNITS_ENV, units), (ort_coreml.FORMAT_ENV, fmt)):
+        if value:
+            os.environ[env] = value
+        else:
+            os.environ.pop(env, None)
 
 
-_COREML_UNITS = (("coreml-all", "all"), ("coreml-gpu", "gpu"))
+_COREML_UNITS = (("coreml-all", "all"), ("coreml-gpu", "gpu"),
+                 ("coreml-nn-all", "all/neuralnetwork"))
 
 
 def _frame_encoder(frames) -> dict:

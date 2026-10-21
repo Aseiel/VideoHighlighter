@@ -24,6 +24,9 @@ Switches, both read on every call so a worker process decides for itself:
 * ``VH_COREML_UNITS`` — which silicon Core ML may use: ``all`` (the default:
   Core ML picks between GPU, Neural Engine and CPU per layer), ``gpu`` (GPU and
   CPU only, i.e. Metal), ``ane`` (Neural Engine and CPU), ``cpu``.
+* ``VH_COREML_FORMAT`` — ``mlprogram`` (the default) or ``neuralnetwork``, the
+  older format, converted by different code: the way out if a model will not
+  compile as an ML Program.
 
 No model cache directory is set, deliberately. Core ML compiles a model when a
 session opens, and ONNX Runtime can keep the compiled result — but it keys that
@@ -42,6 +45,7 @@ PROVIDER = "CoreMLExecutionProvider"
 
 MODE_ENV = "VH_COREML"
 UNITS_ENV = "VH_COREML_UNITS"
+FORMAT_ENV = "VH_COREML_FORMAT"
 
 _OFF = {"off", "0", "false", "no", "disable", "disabled"}
 
@@ -88,10 +92,48 @@ def provider_options() -> dict:
     format Core ML's GPU path is built around. It needs macOS 12, which every
     Apple-silicon Mac can run.
     """
+    fmt = str(os.environ.get(FORMAT_ENV, "")).strip().lower()
     return {
-        "ModelFormat": "MLProgram",
+        "ModelFormat": "NeuralNetwork" if fmt in ("neuralnetwork", "nn") else "MLProgram",
         "MLComputeUnits": compute_units(),
     }
+
+
+def coreml_ready_model(model_path):
+    """``model_path`` as Core ML can compile it: the path itself when nothing
+    needs changing, else the model's bytes with the change made.
+
+    ONNX Runtime turns a Conv's ``auto_pad="VALID"`` into a "custom" padding
+    with no pad values, and Core ML then refuses the whole model ("Required
+    param 'pad' is missing"). SigLIP2's patch embedding, and so the frame
+    encoder and every action model built on it, is exactly such a Conv, which
+    kept them on the processor on every Mac. VALID means no padding, so the
+    explicit ``pads=0`` is the same layer. Fixed here rather than only in the
+    export because models people already made carry the old attribute.
+    """
+    try:
+        import onnx
+        model = onnx.load(str(model_path))
+    except Exception:  # noqa: BLE001 - unreadable here; let the session say why
+        return model_path
+    changed = 0
+    for node in model.graph.node:
+        if node.op_type != "Conv":
+            continue
+        pad = next((a for a in node.attribute if a.name == "auto_pad"), None)
+        if pad is None or pad.s not in (b"VALID",):
+            continue
+        kernel = next((a for a in node.attribute if a.name == "kernel_shape"), None)
+        if kernel is None or any(a.name == "pads" for a in node.attribute):
+            continue
+        node.attribute.remove(pad)
+        node.attribute.append(onnx.helper.make_attribute("pads", [0] * (2 * len(kernel.ints))))
+        changed += 1
+    if not changed:
+        return model_path
+    print(f"ℹ️ Core ML: {changed} Conv padding(s) written out in "
+          f"{os.path.basename(str(model_path))}")
+    return model.SerializeToString()
 
 
 def describe_units(units: str | None = None) -> str:
