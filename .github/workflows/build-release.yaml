@@ -907,6 +907,7 @@ jobs:
           SLUG: ${{ needs.version.outputs.slug }}
           REPO: ${{ github.repository }}
           WEB: ${{ inputs.web_ui }}
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
         run: |
           # What changed since the last release, drafted from the commits
           # (tools/release_notes.py), then the downloads. The release is a
@@ -924,6 +925,14 @@ jobs:
             echo ""
             echo "### [Install VideoHighlighter for Windows]($dl/00-VideoHighlighter-Windows-Setup.exe)"
             echo ""
+            # The download mirror (mirror-release.yaml copies this release
+            # there when it is published), for people GitHub's downloads are
+            # slow or cut off for. "Ladder" (梯子) is what a VPN is called there.
+            if [ -n "$UPDATE_BASE_URL" ]; then
+              mirror="${UPDATE_BASE_URL%/}/downloads"
+              echo "**中国大陆用户：无需梯子，直接用这个链接下载 →** [00-VideoHighlighter-Windows-Setup.exe]($mirror/$SLUG/00-VideoHighlighter-Windows-Setup.exe)（[全部文件]($mirror/latest/index.html)）"
+              echo ""
+            fi
             echo "One file. Run it, click through, done. It installs the app with"
             echo "PyTorch for the processor, and downloads NVIDIA GPU acceleration"
             echo "(ticked when an NVIDIA card is found) and the visual search model"
