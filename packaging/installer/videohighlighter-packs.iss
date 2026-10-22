@@ -352,8 +352,9 @@ end;
 function OnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
 begin
   if ProgressMax > 0 then
-    DownloadPage.SetText(FileName, FmtMessage(CustomMessage('DownloadedOf'),
-      [IntToStr(Progress div 1048576), IntToStr(ProgressMax div 1048576)]));
+    // No line of [Code] may start with "[": Inno reads it as a section.
+    DownloadPage.SetText(FileName, FmtMessage(CustomMessage('DownloadedOf'), [
+      IntToStr(Progress div 1048576), IntToStr(ProgressMax div 1048576)]));
   Result := True;
 end;
 
@@ -461,8 +462,8 @@ begin
   Free := FreeSpaceMB(AppDir);
   if (Free >= 0) and (Free < Need) then
   begin
-    MsgBox(FmtMessage(CustomMessage('LowSpace'),
-      [ExtractFileDrive(AppDir), IntToStr(Need), IntToStr(Free)]), mbError, MB_OK);
+    MsgBox(FmtMessage(CustomMessage('LowSpace'), [
+      ExtractFileDrive(AppDir), IntToStr(Need), IntToStr(Free)]), mbError, MB_OK);
     Result := False;
   end;
 end;
