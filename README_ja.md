@@ -6,105 +6,142 @@
   <a href="https://discord.gg/cUPJqPAMmm"><img src="https://img.shields.io/discord/1471915944652832788?logo=discord&logoColor=white&label=Discord&color=brightgreen" alt="Discord"></a>
 </p>
 
+# VideoHighlighter
+
 <!-- hy-mt2-i18n:start -->
 [English](./README.md) | [中文](./README_zh-CN.md) | **日本語** | [Español](./README_es.md)
 <!-- hy-mt2-i18n:end -->
 
-VideoHighlighter（フリーウェア）
+**アップロードしたくない映像から大事な瞬間を見つけ、その理由を示し、手元のマシンで切り出します。**
 
-シーン検出、動き検出、オーディオピーク、物体検出、アクション認識、字幕解析を活用して、ビデオから自動的にハイライトクリップを生成するPythonツールです。
+ローカルで動くデスクトップアプリです。撮ったままの動画を入れると、シーン・動き・音声・物体・動作・
+文字起こしから見どころを採点し、各瞬間が*なぜ*選ばれたのかをシグナルタイムラインとレポートで示したうえで、
+ハイライト動画と個別のクリップを書き出します。解析のために何かがアップロードされることはなく、
+基本機能に API キーは不要です。
 
-> **無料です。** 今後の新しいリリースを見逃さないよう、ページ上部の「モチベーションボタン」⭐ を押してください。
-> 受け付けている支払いの中で一番安い方法です。
+無料のオープンソース（AGPL-3.0）。Windows・macOS・Linux 対応。Intel・AMD・NVIDIA の GPU に対応。
 
+**アプリの表示言語**（About → Interface language）：English、简体中文、Español、
+Português (Brasil)、Français、日本語、Deutsch、한국어、Bahasa Indonesia、Türkçe、Italiano、
+Polski、Tiếng Việt、Nederlands。この README は英語版が基準で、上の翻訳版は
+中文 / 日本語 / Español に対応しています。
 
-機能
+> **無料です。** 今後の新しいリリースを見逃さないよう、ページ上部の「やる気ボタン」⭐ を押してください。
+> 私たちが受け取る中で一番安い支払い方法です。
 
-検出機能：
-- OpenCVを使用したシーンの検出。
-- 動きのピークおよびシーンの切り替わりの検出。
-- オブジェクトの検出。
-- アクションの検出。
-- 音声のピークの検出。
+## どんな用途に使われているか
 
-OpenAI Whisperを利用して字幕付きのテキストを生成します。
-スコアが高いセグメントを切り出し、結合してハイライト動画を作成します。
-フレームのスキップやハイライトの持続時間、キーワードなど、すべてを自由に設定可能です。
-簡単に操作できるオプションのGUIも用意されています。
+- **4 時間の Twitch や YouTube のアーカイブ → 数分のハイライト。** 観客の歓声、自分のリアクション、
+  シーンの切り替わりがすべて点数になるので、盛り上がった部分がシークバーを動かさなくても浮かび上がります。
+- **一晩分の防犯カメラやトレイルカメラの映像 → 何かが動いた数分間。** 何も起きない何時間分もの映像に対して、
+  物体検出と動き検出をローカルで行います。映っているのが自分の家なら、これは大事なことです。
+- **GoPro やドローンの SD カード → 完成した作品。** **Auto** タブがカードを見つけ、素材をコピーし、
+  ハイライトを切り出し、まとめた動画を作ってビートに合わせて音楽を乗せます。全体が中断・再開できる
+  ひとつのジョブです。
+- **試合 → ゴールシーン。** 「ボールがネットの中」というルールを書けば、行動モデルが見た目で判別してくれるのを
+  期待するのではなく、物の位置関係からそのイベントを採点します。
+- **長いインタビュー、講義、ポッドキャスト → チャプターと字幕。** ローカルの Whisper による文字起こし、
+  チャプター分けした動画、任意でローカル翻訳。
+- **ドラレコやボディカメラの確認 → 人に渡せる記録。** レポートは、測定したこと、言われただけのこと、
+  判断できなかったことを分けて書きます。
 
-どの検出機能を使えばいいかわからない？  
-[docs/DETECTION-GUIDE.md](docs/DETECTION-GUIDE.md) をご覧ください。そこにはオブジェクト認識、アクション認識、CLIP検索、およびコンポジションエンジンがそれぞれ何に長けているか、またどの点で課題があるかが記載されています。
+どの検出器が自分の映像に合うかわからないときは、
+[docs/DETECTION-GUIDE.md](docs/DETECTION-GUIDE.md) にそれぞれの得意なことと苦手なことをまとめてあります。
 
-> **リアルタイム検出が必要ですか？** 上記の機能はすべて事後的にオフラインで処理されます。
-> [VideoHighlighter Pro](#pro-edition) では、再生中にリアルタイムの物体やアクションのオーバーレイ表示、例を使ったカテゴリ学習、オープンボキャブラリ検出、およびカウンタ検出が追加されます。[違いを確認する →](#pro-edition)
+## ほかと何が違うか
 
+**[毎回の実行が自分で説明します。](docs/REPORTS.md)** レポートは、残った各瞬間の裏にある計算そのものです。
+シグナルごとの得点の内訳、何が反応したか、点数は高かったのに選ばれなかったもの。文字起こしから来ていて
+一度も測定されていない主張は、そのまま採点せずに、そうだと明記します。
+**[実際のレポートを開く →](https://aseiel.github.io/VideoHighlighter-site/example-report.html)**
+
+**[組み合わせルール。](docs/DETECTION-GUIDE.md#4-the-composition-engine)** 検出結果の*組み合わせ*が
+自分の映像で何を意味するかを指定できます。あるクラスが別のクラスの中にある、数を数える、一定時間続く、
+といった条件が、自分で名前を付けたイベントになります。ルールはすでにある検出結果を読み直すだけなので、
+編集して再実行してもかかるのは数ミリ秒です。
 
 ## プレビュー
 
 ![VideoHighlighter](assets/Highlighter.png)
 
-## タイムラインビューア
-![Timeline Viewer](assets/TimelineViewer.png)
+**タイムラインビューアー**
 
-## アクション認識
-![Action Recognition](assets/power_rangers_actions_annotated.gif)
+![タイムラインビューアー](assets/TimelineViewer.png)
 
-## ワークフローステージ
-![Workflow Stages](assets/workflow_stages.png)
+**デモ**
 
-## Pro版
-
-このエディションには、リアルタイムの顔検出、VRの並列再生とレンダリング、オフライン分析、CLIP検索、コンポジションエンジン、およびトレーニングスクリプトが既に搭載されています。
-
-[VideoHighlighter Pro](https://aseiel.github.io/VideoHighlighter-site/)には以下の機能が追加されます：
-
-- **ライブオブジェクトおよびアクションのオーバーレイ** — サイドバイサイドのVR映像を含む再生中にリアルタイムで検出します。  
-- **指差しによるカテゴリー教示** — 任意の対象物に枠を描いて名前を付けるだけで、即座にスコアリングが行われます。データセットや学習処理は不要です。  
-- **類似コンテンツの検索** — 1フレーム内の特定領域を選択することで、動画全体からその対象を検索できます。  
-- **オープンボキャビュラリ検出** — 特定の単語を入力するだけで、事前に学習済みのモデルなしでもその対象を見つけ出せます。  
-- **カウンター／スコアボード検出** — 映像に画面上のカウンターがある場合、1回のカウントが1つのイベントとして扱われるため、Pro版では検出エンジンが見逃した実際の瞬間を表示できます。
-
-このバージョンも引き続き無料で、AGPL-3.0ライセンスのもとで提供されます。
+https://github.com/user-attachments/assets/5c85af94-9228-4537-926a-1ed7a91fa5ee
 
 ## インストール
 
-### Windows（推奨）
-[Releases](https://github.com/Aseiel/VideoHighlighter/releases) から最新の `.exe` ファイルをダウンロードしてください。Pythonやその他の依存関係は不要です。
+[Releases](https://github.com/Aseiel/VideoHighlighter/releases) からビルドを入手してください：
 
-### Linux / ソースからのビルド
-1. **Python**
-   `pip install -r requirements.txt` を実行してください。FFmpegは（`imageio-ffmpeg`経由で）一緒にインストールされるため、別途インストールする必要はありません。PATH上に既にFFmpegがある場合はそちらが使われます。
+- **Windows** —
+  [`00-VideoHighlighter-Windows-Setup.exe`](https://github.com/Aseiel/VideoHighlighter/releases/latest/download/00-VideoHighlighter-Windows-Setup.exe)
+  を実行します。ユーザー単位のインストールで、管理者権限は不要です。まだコード署名されていないため、
+  *詳細情報 → 実行* をクリックしてください。
+- **macOS** — `.dmg` をアプリケーションフォルダにドラッグし、隔離フラグを一度だけ外します：
+  `xattr -dr com.apple.quarantine /Applications/VideoHighlighter.app`
+  （[理由](docs/INSTALL.md#macos)）。
+- **Linux / ソースから** — `pip install -r requirements.txt && python main.py`。FFmpeg も一緒に入ります。
 
-## 使用方法
-Linux: python main.py  
-Windows: Videohighlighter.exeを実行  
-Mac: 現在は動作していないようですが、いつか修正します。DMGファイルは引き続き生成されます
+ポータブル版、GPU の設定、書き込み先、大きすぎる UI の直し方：
+**[docs/INSTALL.md](docs/INSTALL.md)**。
 
-## Discord
-VideoHighlighterは時々、ユーザーの動画に対して「意見」を述べることがあります。そのような時は：
-[Discordに参加して](https://discord.gg/cUPJqPAMmm)、#supportチャンネルで声を上げてください。私はたいていそこにいます。
+## ドキュメント
 
+| | |
+| --- | --- |
+| [検出器の選び方](docs/DETECTION-GUIDE.md) | 物体、動作、CLIP 検索、組み合わせルール――それぞれの用途 |
+| [なぜこれらの瞬間なのか](docs/REPORTS.md) | レポートの中身と、そう作られている理由 |
+| [Auto パイプライン](docs/AUTO-PIPELINE.md) | カード → 取り込み → 台本 → 音楽 → ハイライト動画、中断・再開可能 |
+| [インストール](docs/INSTALL.md) | 全プラットフォーム、GPU バックエンド、設定 |
+| [モデルの学習](docs/CUSTOM-MODEL-TRAINING.md) | 自分のクラスにラベルを付けて学習する |
+| [コミュニティモデル](docs/COMMUNITY-MODELS.md) | 他の人が学習したモデルを入れる、自分のモデルを公開する |
+| [Intel GPU](docs/INTEL-GPU.md) · [AMD GPU](docs/AMD-GPU.md) · [Apple GPU](docs/MAC-GPU.md) | メーカー別の高速化 |
+| [リモートの ollama](docs/OLLAMA-REMOTE.md) | LAN 内の別のマシンでローカル LLM を動かす |
 
-## 備考
+## Pro 版
 
-OpenAI WhisperはMITライセンスで提供されており、自由に利用できます。
+**VideoHighlighter（このリポジトリ）は AGPL-3.0 のフリーソフトウェアで、これからもそうです。**
+オフライン解析、リアルタイムの顔検出、VR のサイドバイサイド再生、CLIP 検索、組み合わせエンジン、
+モデルの学習（プレーヤー上で枠をひとつ描くだけでモデルに教えられ、その後もアプリが空いている間に
+改善し続けます）、そしてモデルハブを含みます。
 
-字幕の翻訳は [ollama](https://ollama.com) 経由のローカル LLM で実行されます。翻訳サービス、API キー、アカウントは一切不要で、テキストがマシンの外に出ることはありません。ollama がない場合、字幕は話された言語のまま書き出されます。
+**[VideoHighlighter Pro](https://aseiel.github.io/VideoHighlighter-site/)** は別の有料版で、
+その上にリアルタイムの機能を加えます：再生中の物体・動作のライブ表示、再生しながらのライブカテゴリの学習、
+「似たものをもっと探す」検索、オープンボキャブラリ検出、カウンター／スコアボードの検出。
 
-このプロジェクトには有料のAPIキーは含まれていません。公式サービスを利用する場合、ユーザー自身でキーを用意する必要があります。
+説明の機能はそこには含まれません。レポート、所見、アドバイザーはどちらの版でもまったく同じです。
+クラウドのツールが渡すのはボタンと、問いただせない結果です。「なぜ」にローカルで答えること、
+それがこのアプリの役割です。
 
+## コミュニティ
+
+VideoHighlighter は、ときどき映像について思うところがあります。そんなときは
+[Discord に参加して](https://discord.gg/cUPJqPAMmm) #support で声をかけてください。たいていいます。
+バグやアイデアは [Issues](https://github.com/Aseiel/VideoHighlighter/issues) へどうぞ。
+
+**よくある質問。** [FAQ を読む](docs/FAQ/faq.md)：
+- 検出器の選び方と採点の調整
+- CPU / GPU でのパフォーマンスのヒント
+- よくある問題の解決
 
 ## ライセンス
 
-Copyright (C) 2026 Przemysław Kreft, Meric Donmezer.
+Copyright (C) 2026 Przemysław Kreft and Meric Donmezer.
 
-このリポジトリはGNU Affero General Public License v3.0（AGPLv3）の下で公開されています。コードを自由に利用、修正、配布することができますが、ネットワーク経由で提供されるものを含むすべての修正版については、同じライセンスの下でその完全なソースコードを公開しなければなりません。
+GNU Affero General Public License v3.0 で公開しています。自由に使用・改変・再配布できますが、
+改変版（ネットワーク越しに提供するものを含む）は、同じライセンスで完全なソースコードを公開する
+必要があります。全文は [LICENSE](LICENSE)、著作権表示は [COPYRIGHT](COPYRIGHT) にあります。
 
+貢献者は自分の作品の著作権を保持します。[CONTRIBUTING.md](CONTRIBUTING.md) と [CLA.md](CLA.md)
+を参照してください。VideoHighlighter は、著作権者による別の商用ライセンスでも提供されています。
 
-## プロジェクトの背景
+## コントリビュート
 
-このプロジェクトは、7歳の幼い息子のために動画の字幕を自動生成する個人的なツールとして始まりました。時が経つにつれて、映画やスポーツ、個人の動画用のハイライト生成ツールへと進化していきました。
+コードの品質、テスト、良いコントリビューションとは何かについては
+[CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。バグ報告、小さな修正、機能の提案を歓迎します。
+最初の PR の前に CLA を確認してください。
 
-このプロジェクトの主な目的は引き続き実用的なもので、つまりビデオの分析を高速化し、ハイライトを生成し、アクセスしやすい字幕を自動的に作成することです。
-
-![Stars History](assets/star-history-2026630.png)
+![スター履歴](assets/star-history-2026630.png)
