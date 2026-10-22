@@ -793,6 +793,7 @@ class SignalRunWorker(QThread):
             result = aod.run_subtitles(video_path, language=p.get("language"),
                                        source_lang=p.get("source_lang"),
                                        target_lang=p.get("target_lang"),
+                                       reuse_cached=p.get("reuse_cached", True),
                                        progress=progress, cancel=c, log=self.log.emit)
             return {"transcript": result}
         raise ValueError(f"unknown signal kind: {self.kind}")
@@ -6143,6 +6144,9 @@ class VideoHighlighterGUI(QWidget):
             # cached one is labelled with its own language rather than this.
             params["language"] = self.transcript_source_lang.currentText()
             params["target_lang"] = self.subtitle_target_lang.currentText()
+            # "Force reprocess (ignore cache)" means a fresh transcript here too;
+            # otherwise the one in the cache is reused and only the .srt is new.
+            params["reuse_cached"] = not self.force_reprocess_checkbox.isChecked()
 
         # UI state — reuse the pipeline's progress row.
         self.log_output.clear()

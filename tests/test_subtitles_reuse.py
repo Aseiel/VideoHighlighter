@@ -276,3 +276,28 @@ class TestCachedTranscriptHelper:
                             lambda *a, **k: called.append(1) or SEGMENTS)
         aod.run_transcript("movie.mp4", language="en", log=lambda *a: None)
         assert called == [1]
+
+
+class TestForceReprocessReachesTheRunner:
+    """"Force reprocess (ignore cache)" used to stop at the full pipeline run:
+    Make subtitles never passed it on, so it always reused the cached
+    transcript and the box looked broken."""
+
+    @pytest.mark.parametrize("params, expected", [
+        ({"reuse_cached": False}, False),
+        ({"reuse_cached": True}, True),
+        ({}, True),                       # a caller that predates the switch
+    ])
+    def test_the_main_window_worker_passes_it_on(self, params, expected):
+        import main
+
+        seen = {}
+
+        class FakeOnDemand:
+            def run_subtitles(self, video_path, **kwargs):
+                seen.update(kwargs)
+                return {"segments": SEGMENTS}
+
+        worker = main.SignalRunWorker("subtitles", [], dict(params, language="en"))
+        worker._run_one(FakeOnDemand(), "movie.mp4", None)
+        assert seen["reuse_cached"] is expected
