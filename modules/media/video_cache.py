@@ -222,6 +222,12 @@ class CachedAnalysisData:
         self.resolution = self.video_metadata.get("resolution", "unknown")
 
         self.transcript = cache_data.get("transcript", {"segments": []})
+        # Transcripts cached before the loop cleanup carry Whisper's repetition
+        # loops; cleaning is idempotent, so a clean one comes back unchanged.
+        if isinstance(self.transcript, dict) and self.transcript.get("segments"):
+            from modules.audio.transcript_cleanup import clean_segments
+            self.transcript = dict(self.transcript,
+                                   segments=clean_segments(self.transcript["segments"]))
         self.objects = cache_data.get("objects", [])
         self.actions = cache_data.get("actions", [])
         self.scenes = cache_data.get("scenes", [])

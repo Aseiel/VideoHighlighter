@@ -46,6 +46,9 @@ class ProgressTracker:
             except:
                 pass  # Ignore callback errors
 
+# Pure Python, so not optional: a cached transcript is cleaned without Whisper.
+from modules.audio.transcript_cleanup import clean_segments
+
 # Transcript modules (optional)
 try:
     from modules.audio.transcript import get_transcript_segments, search_transcript_for_keywords
@@ -720,7 +723,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             log(f"✅ Loaded from cache ({load_time:.2f}s) [signature match]")
                             
                             # Extract data from cache - Ensure all data is loaded
-                            transcript_segments = cached_data.get("transcript", {}).get("segments", [])
+                            # Cleaned here too: a transcript cached before the
+                            # loop cleanup still holds Whisper's loops, and they
+                            # would score as speech (modules/audio/transcript_cleanup.py).
+                            transcript_segments = clean_segments(
+                                cached_data.get("transcript", {}).get("segments", []))
                             object_detections_raw = cached_data.get("objects", [])
                             action_detections_raw = cached_data.get("actions", [])
                             scenes_raw = cached_data.get("scenes", [])

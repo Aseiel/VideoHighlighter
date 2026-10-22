@@ -4,6 +4,8 @@ import whisper
 import cv2
 from typing import List, Dict, Optional
 
+from modules.audio.transcript_cleanup import clean_segments
+
 # --------------------------
 # VIDEO & TIMESTAMP UTILITIES
 # --------------------------
@@ -267,6 +269,7 @@ def create_srt_content(segments, max_chars=80, min_duration=0.8, chars_per_secon
     return "\n".join(srt_lines)
 
 def create_enhanced_transcript(segments: List[Dict], pause_threshold=2.0) -> str:
+    segments = clean_segments(segments)
     transcript_parts = []
     last_end = 0
     last_timestamp = 0
@@ -547,6 +550,8 @@ def translate_segments(segments, source_lang="en", target_lang="pl",
 def create_srt_file(segments, output_path, source_lang="en", target_lang=None,
                     show_speakers=False, progress_fn=None):
     """Create SRT subtitle file from transcript segments with optional translation"""
+    # Before translating: a loop costs translation batches too.
+    segments = clean_segments(segments)
     if target_lang and target_lang != source_lang:
         print(f"Translating subtitles from {source_lang} to {target_lang}...")
         segments = translate_segments(segments, source_lang, target_lang,
@@ -563,6 +568,9 @@ def create_highlight_subtitles(original_segments: List[Dict], highlight_segments
                                output_path: str, source_lang="en", target_lang=None,
                                progress_fn=None):
     """Create SRT subtitles for highlight video from original transcript segments"""
+    # A loop cut into a highlight is the same loop; and a cached transcript
+    # may predate the cleanup (modules/audio/transcript_cleanup.py).
+    original_segments = clean_segments(original_segments)
     highlight_subtitle_segments = []
     current_time_offset = 0.0
     for h_start, h_end in highlight_segments:

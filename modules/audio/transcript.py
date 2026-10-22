@@ -8,6 +8,8 @@ import subprocess
 import time
 
 from modules.system.cuda_check import cuda_usable
+from modules.audio.transcript_cleanup import clean_segments
+from modules.audio.segment_timing import is_stretched, retime, whisper_aligner
 
 
 class TranscriptionCancelled(RuntimeError):
@@ -419,9 +421,26 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
                 log_fn(f"⚠️ WARNING: Expected '{language}' but Whisper detected '{detected_lang}'")
                 log_fn(f"   This may indicate unclear audio or incorrect language setting")
 
-            # Offset for proper timestamps
+            # A line after a quiet stretch comes back starting where the last
+            # one ended; those few get the times their words were said
+            # (modules/audio/segment_timing.py).
+            segments = result.get("segments", [])
+            if any(is_stretched(s) for s in segments):
+                abort_if_cancelled()
+                try:
+                    align = whisper_aligner(
+                        model, whisper.load_audio(chunk),
+                        detected_lang if detected_lang != "unknown" else language)
+                except Exception as e:  # noqa: BLE001 - keep Whisper's times
+                    print(f"segment_timing: no aligner for {chunk}: {type(e).__name__}: {e}")
+                else:
+                    segments = retime(segments, align, log_fn)
+
+            # Offset for proper timestamps. Loops come out next, while
+            # Whisper's own no-speech numbers are still on each segment
+            # (modules/audio/transcript_cleanup.py).
             offset = idx * chunk_length
-            for seg in result.get("segments", []):
+            for seg in clean_segments(segments):
                 text = seg["text"].strip()
 
                 if len(text) >= 3 and is_valid_speech(text):
@@ -440,6 +459,10 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
                     os.remove(f)
                 except OSError:
                     pass
+
+    # Again across the whole video: a run of one repeated line can straddle
+    # the boundary between two chunks.
+    all_segments = clean_segments(all_segments)
 
     if progress_fn:
         progress_fn(95, 100, "Transcription", "Complete")
