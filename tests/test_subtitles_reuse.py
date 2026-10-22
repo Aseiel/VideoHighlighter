@@ -289,6 +289,7 @@ class TestForceReprocessReachesTheRunner:
         ({}, True),                       # a caller that predates the switch
     ])
     def test_the_main_window_worker_passes_it_on(self, params, expected):
+        pytest.importorskip("PySide6")    # CI runs without Qt
         import main
 
         seen = {}
