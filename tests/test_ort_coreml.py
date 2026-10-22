@@ -405,3 +405,20 @@ class TestFixedBatchAndItsCache:
         again = ort_directml.session(path, coreml_batch=32)
         assert again.path == fixed.path
         assert len(os.listdir(tmp_path / "cache")) == 1
+
+
+class TestWhereTheCacheLives:
+    def test_a_mac_keeps_it_in_its_caches_folder(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path / "home")))
+        assert os.path.normpath(ort_coreml.cache_dir()) == os.path.join(
+            str(tmp_path / "home"), "Library", "Caches", "VideoHighlighter", "coreml")
+
+    def test_a_path_with_a_space_gets_no_cache(self, monkeypatch, tmp_path):
+        # The sixth mac bench: "Application Support" made Core ML refuse the
+        # cached model ("Failed to create model URL from path").
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: p.replace("~", str(tmp_path / "my home")))
+        assert ort_coreml.cache_dir() is None

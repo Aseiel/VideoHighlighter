@@ -42,6 +42,7 @@ took 130 s on the M1 runner.
 from __future__ import annotations
 
 import os
+import sys
 
 # ORT's name for the provider, as get_available_providers() reports it.
 PROVIDER = "CoreMLExecutionProvider"
@@ -105,10 +106,23 @@ def provider_options() -> dict:
 
 
 def cache_dir():
-    """Where compiled Core ML models are kept, or None when there is nowhere."""
+    """Where compiled Core ML models are kept, or None when there is nowhere.
+
+    macOS's own cache folder (~/Library/Caches), not the app's data folder:
+    that one is under "Application Support", and ONNX Runtime turns the cached
+    model's path into a URL without escaping the space ("Failed to create model
+    URL from path", the sixth mac bench). A path that still has a space, say a
+    home folder with one, gets no cache rather than no Core ML.
+    """
     try:
-        from modules.system import app_paths
-        path = os.path.join(app_paths.user_data_dir(), "coreml-cache")
+        if sys.platform == "darwin":
+            path = os.path.join(os.path.expanduser("~/Library/Caches"),
+                                "VideoHighlighter", "coreml")
+        else:
+            from modules.system import app_paths
+            path = os.path.join(app_paths.user_data_dir(), "coreml-cache")
+        if " " in path:
+            return None
         os.makedirs(path, exist_ok=True)
         return path
     except Exception:  # noqa: BLE001 - no cache only costs time
