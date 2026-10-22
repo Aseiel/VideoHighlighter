@@ -14,6 +14,7 @@ here, so a member is imported as ``modules.system.<name>``.
     display_info
     encoder_select
     hf_mirror
+    hidden_subprocess
     https_certs
     ort_directml
     repaint_trace

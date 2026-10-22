@@ -9,6 +9,11 @@ import sys
 from modules.system import debug_console
 debug_console.install()
 
+# The packaged app has no console, so every ffmpeg, ffprobe or yt-dlp it starts
+# would flash up a console window of its own. Before anything starts one.
+from modules.system import hidden_subprocess
+hidden_subprocess.install()
+
 # A frozen build starts every multiprocessing child — the object-detection
 # workers, their Manager, the thumbnail decoder — by re-running this exe, and
 # the child becomes a child only when it reaches freeze_support(). Left at the
