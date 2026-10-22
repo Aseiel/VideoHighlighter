@@ -8,6 +8,11 @@ name: Prune update host
 # its blobs minutes before its manifest). tools/publish_release.py `gc` does
 # the choosing and is tested; this only lists, downloads and deletes.
 #
+# It also clears the download mirror (mirror-release.yaml): every
+# downloads/<tag>/ but the newest `keep` app releases and what
+# downloads/latest/ names. Packs releases are always kept; builds fetch them
+# for as long as they are installed. tools/mirror_release.py `prune` chooses.
+#
 # Runs as a dry run unless `dry_run` is unticked: the summary lists what would
 # go, and how much space it frees.
 
@@ -81,3 +86,34 @@ jobs:
               --delete "file://$batch" > /dev/null
           done
           echo "Deleted." >> "$GITHUB_STEP_SUMMARY"
+      - name: Clear old releases off the download mirror
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          KEEP: ${{ inputs.keep }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          ep="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3api list-objects-v2 --endpoint-url "$ep" --bucket "$R2_BUCKET" --prefix downloads/ \
+            --delimiter / --query 'CommonPrefixes[].Prefix' --output json > tags.json
+          mkdir -p latest
+          aws s3 sync "s3://$R2_BUCKET/downloads/latest" latest --endpoint-url "$ep" \
+            --exclude '*' --include '*.json' --only-show-errors
+          python tools/mirror_release.py prune --tags tags.json --latest latest --keep "$KEEP" \
+            > doomed.txt 2> prune.txt
+          {
+            echo "### Download mirror (keep $KEEP)"
+            echo '```'
+            cat prune.txt
+            sed 's/^/  delete downloads\//' doomed.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DRY_RUN" = "true" ]; then
+            exit 0
+          fi
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            aws s3 rm "s3://$R2_BUCKET/downloads/$tag/" --recursive --endpoint-url "$ep" --only-show-errors
+          done < doomed.txt

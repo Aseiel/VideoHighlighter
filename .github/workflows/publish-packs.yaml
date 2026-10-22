@@ -34,7 +34,9 @@ on:
 
 permissions:
   contents: write
-  actions: read
+  # actions: write starts mirror-release.yaml, which a release published with
+  # this workflow's token does not start by itself.
+  actions: write
 
 jobs:
   publish:
@@ -110,3 +112,6 @@ jobs:
           fi
           gh release upload "$TAG" $assets out/packs.json
           echo "published: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
+          # Copy it to the download mirror (tools/mirror_release.py). It skips
+          # itself when the update host is not configured.
+          gh workflow run mirror-release.yaml --ref "$GITHUB_REF_NAME" -f tag="$TAG"

@@ -18,6 +18,13 @@ Usage::
     python tools/build_bootstrap_zip.py --edition free
     python tools/build_bootstrap_zip.py --edition pro --tag 0.9.0-Pro
     python tools/build_bootstrap_zip.py --edition free --write-config
+    python tools/build_bootstrap_zip.py --edition free --mirror-host https://<update host>
+
+With ``--mirror-host`` (CI passes the ``UPDATE_BASE_URL`` variable) the Free
+config names the download mirror (tools/mirror_release.py): the script asks it
+for the latest release when the GitHub API cannot be reached, and downloads
+each volume from it before trying GitHub. Pro never gets one: the mirror is
+public, and Pro's assets are not.
 """
 from __future__ import annotations
 
@@ -77,10 +84,11 @@ def _windows_assets(tag: str, *, pro: bool) -> tuple[str, ...]:
     )
 
 
-def make_config(*, edition: str, tag: str) -> dict:
+def make_config(*, edition: str, tag: str, mirror_host: str = "") -> dict:
     pro = edition.lower() == "pro"
     repo = PRO_REPO if pro else FREE_REPO
     assets = list(_windows_assets(tag, pro=pro))
+    host = "" if pro else (mirror_host or "").strip().rstrip("/")
     return {
         "product_name": "VideoHighlighter",
         "edition": "Pro" if pro else "Free",
@@ -90,6 +98,8 @@ def make_config(*, edition: str, tag: str) -> dict:
         "tag": tag,
         "assets": assets,
         "base_url": f"https://github.com/{repo}/releases/download/{tag}",
+        # <mirror>/<tag>/<asset> and <mirror>/latest/free.json.
+        "mirror": f"{host}/downloads" if host else "",
         "notes": (
             "Pro: private repo — anonymous download URLs need auth; "
             "customers install from Lemon Squeezy my-orders (single .7z). "
@@ -124,7 +134,7 @@ def write_config(*, edition: str, tag: str) -> Path:
     return path
 
 
-def build_zip(*, edition: str, tag: str, out: Path) -> Path:
+def build_zip(*, edition: str, tag: str, out: Path, mirror_host: str = "") -> Path:
     if not BOOTSTRAP.is_dir():
         raise SystemExit(f"bootstrap folder missing: {BOOTSTRAP}")
 
@@ -132,7 +142,7 @@ def build_zip(*, edition: str, tag: str, out: Path) -> Path:
     if missing:
         raise SystemExit(f"missing bootstrap files: {', '.join(missing)}")
 
-    config = make_config(edition=edition, tag=tag)
+    config = make_config(edition=edition, tag=tag, mirror_host=mirror_host)
     staging = out.parent / f".bootstrap-staging-{out.stem}"
     staging.mkdir(parents=True, exist_ok=True)
     try:
@@ -155,7 +165,8 @@ def build_zip(*, edition: str, tag: str, out: Path) -> Path:
 
     size_kb = out.stat().st_size / 1024
     print(f"OK {out} ({size_kb:.1f} KB)")
-    print(f"   edition={edition} tag={tag} repo={config['repo']}")
+    print(f"   edition={edition} tag={tag} repo={config['repo']} "
+          f"mirror={config['mirror'] or 'none'}")
     return out
 
 
@@ -171,6 +182,11 @@ def main(argv: list[str] | None = None) -> int:
         "--tag",
         default=None,
         help="Release tag, e.g. 0.9.0 or 0.9.0-Pro. Defaults to version.py.",
+    )
+    parser.add_argument(
+        "--mirror-host",
+        default="",
+        help="The update host serving the download mirror (Free only); blank for none.",
     )
     parser.add_argument(
         "--write-config",
@@ -189,7 +205,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.write_config:
         write_config(edition=args.edition, tag=tag)
     else:
-        build_zip(edition=args.edition, tag=tag, out=args.out.resolve())
+        build_zip(edition=args.edition, tag=tag, out=args.out.resolve(),
+                  mirror_host=args.mirror_host)
     return 0
 
 

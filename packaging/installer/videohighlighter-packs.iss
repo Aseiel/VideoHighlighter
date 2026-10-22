@@ -65,6 +65,11 @@
 #ifndef PackBase
   #define PackBase ""
 #endif
+; The download mirror's copy of the same packs tag (tools/mirror_release.py),
+; tried before PackBase. Same files, checked against the same SHA-256.
+#ifndef PackMirror
+  #define PackMirror ""
+#endif
 #ifndef CudaPackAsset
   #define CudaPackAsset "component-torch-cu128.7z"
 #endif
@@ -424,28 +429,52 @@ begin
   end;
 end;
 
-// Fetch one optional component into {tmp}. True when it arrived and matched
-// its SHA-256. On failure the user decides: Yes installs without it, No sets
-// Stay, which keeps the wizard on the Ready page so Next retries.
-function FetchComponent(const Asset, Sha256, What, Without: String; var Stay: Boolean): Boolean;
+// One attempt at one host. Aborted is set when the user pressed Cancel, and
+// Error to what went wrong otherwise.
+function DownloadFrom(const Url, Asset, Sha256: String; var Aborted: Boolean; var Error: String): Boolean;
 begin
   Result := False;
   DownloadPage.Clear;
-  DownloadPage.Add('{#PackBase}/' + Asset, Asset, Sha256);
+  DownloadPage.Add(Url, Asset, Sha256);
   try
     DownloadPage.Download;
     Result := True;
   except
-    if DownloadPage.AbortedByUser then
-      Log(What + ': download cancelled by the user.')
-    else
-      Log(What + ': download failed: ' + GetExceptionMessage);
-    Stay := SuppressibleMsgBox(
-      What + ' could not be downloaded:' + #13#10
-      + AddPeriod(GetExceptionMessage) + #13#10#13#10
-      + 'Install without it? ' + Without,
-      mbConfirmation, MB_YESNO, IDYES) <> IDYES;
+    Aborted := DownloadPage.AbortedByUser;
+    Error := GetExceptionMessage;
   end;
+end;
+
+// Fetch one optional component into {tmp}: from the mirror when this Setup
+// has one, then from PackBase. True when it arrived and matched its SHA-256.
+// On failure the user decides: Yes installs without it, No sets Stay, which
+// keeps the wizard on the Ready page so Next retries.
+function FetchComponent(const Asset, Sha256, What, Without: String; var Stay: Boolean): Boolean;
+var
+  Aborted: Boolean;
+  Error: String;
+begin
+  Aborted := False;
+  Error := '';
+  Result := False;
+#if PackMirror != ""
+  Result := DownloadFrom('{#PackMirror}/' + Asset, Asset, Sha256, Aborted, Error);
+  if not Result and not Aborted then
+    Log(What + ': the mirror failed (' + Error + '); trying {#PackBase}');
+#endif
+  if not Result and not Aborted then
+    Result := DownloadFrom('{#PackBase}/' + Asset, Asset, Sha256, Aborted, Error);
+  if Result then
+    Exit;
+  if Aborted then
+    Log(What + ': download cancelled by the user.')
+  else
+    Log(What + ': download failed: ' + Error);
+  Stay := SuppressibleMsgBox(
+    What + ' could not be downloaded:' + #13#10
+    + AddPeriod(Error) + #13#10#13#10
+    + 'Install without it? ' + Without,
+    mbConfirmation, MB_YESNO, IDYES) <> IDYES;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;

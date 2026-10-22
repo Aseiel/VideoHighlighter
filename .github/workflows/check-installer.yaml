@@ -40,9 +40,10 @@ jobs:
             packaging/installer/videohighlighter-packs.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
           Get-ChildItem stub -Filter *.exe | ForEach-Object { Write-Host "compiled: $($_.Name)" }
-      - name: Compile it again with the multilingual search pack
+      - name: Compile it again with the multilingual search pack and a mirror
         # The multilingual task and its download are compiled in only when
-        # the packs list it (MlPackAsset), so that branch needs its own run.
+        # the packs list it (MlPackAsset), and the mirror attempt only with
+        # PackMirror, so those branches need their own run.
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force stub-ml | Out-Null
@@ -55,6 +56,7 @@ jobs:
             "/DMlPackAsset=component-models-clip-multilingual.7z" `
             "/DMlPackSha256=0000000000000000000000000000000000000000000000000000000000000000" `
             "/DMlPackMB=160" "/DMlInstalledMB=171" `
+            "/DPackMirror=https://mirror.invalid/downloads/packs" `
             "/O$((Resolve-Path stub-ml).Path)" `
             packaging/installer/videohighlighter-packs.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with the multilingual pack ($LASTEXITCODE)" }

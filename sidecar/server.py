@@ -37,6 +37,11 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# Before anything imports huggingface_hub, which reads HF_ENDPOINT only then.
+from modules.system import hf_mirror  # noqa: E402
+
+hf_mirror.apply()
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect

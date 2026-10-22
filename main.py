@@ -41,6 +41,11 @@ mps_device.enable_cpu_fallback()
 from modules.system import ui_scale
 ui_scale.apply()
 
+# A Hugging Face mirror, if the user set one. huggingface_hub reads
+# HF_ENDPOINT once, when it is first imported, and transformers below imports it.
+from modules.system import hf_mirror
+hf_mirror.apply()
+
 # Progress reporting for the launch itself. Imported here, before the heavy
 # imports below, because in a frozen build *they* are the slow part — several
 # seconds of decompressing and initialising cv2/OpenVINO/transformers before

@@ -80,6 +80,29 @@ function Get-FileWithProgress {
     }
 }
 
+# The same file from each of $Uris in turn (the mirror, then GitHub), until one
+# works. A failed attempt's partial file is removed, or the next run would take
+# it for a finished download.
+function Get-FileFromAny {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Uris,
+        [Parameter(Mandatory = $true)][string]$OutFile
+    )
+    $last = $null
+    foreach ($uri in $Uris) {
+        try {
+            Get-FileWithProgress -Uri $uri -OutFile $OutFile
+            return
+        }
+        catch {
+            $last = $_
+            Write-Warning "  failed: $uri ($($_.Exception.Message))"
+            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    throw $last
+}
+
 # --- main ---
 Write-Host "VideoHighlighter bootstrap installer (isolated)"
 Write-Host "Config: $ConfigPath"
@@ -95,12 +118,22 @@ $extractDir = Join-Path $Root "out\$($config.product_name)"
 $tag = $config.tag
 $base = $config.base_url.TrimEnd("/")
 $assets = @($config.assets)
+$pattern = $config.asset_pattern
+# The download mirror (tools/mirror_release.py): <mirror>/<tag>/<asset>, and
+# <mirror>/latest/<edition>.json naming the newest release. Empty when the
+# build had none; older configs lack the field.
+$mirror = ""
+if ($config.PSObject.Properties["mirror"] -and $config.mirror) {
+    $mirror = ([string]$config.mirror).TrimEnd("/")
+}
 
 # A pinned tag goes stale the moment a release ships, and the installer then
 # hands out an old build for as long as nobody edits this file. Ask the API
-# which release is current and take the volumes from it; the pinned values in
-# config.json stay as the offline fallback.
+# which release is current and take the volumes from it, or the mirror when
+# the API cannot be reached; the pinned values in config.json stay as the
+# offline fallback.
 if ($config.use_latest) {
+    $resolved = $false
     try {
         Write-Step "Resolving latest release of $($config.repo)"
         $api = "https://api.github.com/repos/$($config.repo)/releases/latest"
@@ -108,30 +141,54 @@ if ($config.use_latest) {
             "User-Agent" = "VideoHighlighter-bootstrap"
             "Accept"     = "application/vnd.github+json"
         }
-        $pattern = $config.asset_pattern
         $found = @($rel.assets | Where-Object { $_.name -match $pattern } |
             Sort-Object name)
         if ($found.Count -gt 0) {
             $tag = $rel.tag_name
             $assets = $found | ForEach-Object { $_.name }
             $base = ($found[0].browser_download_url -replace '/[^/]+$', '')
+            $resolved = $true
             Write-Host "  latest is $tag ($($assets.Count) matching parts)"
         }
         else {
-            Write-Warning "No asset matched '$pattern' in $($rel.tag_name); using pinned $tag"
+            Write-Warning "No asset matched '$pattern' in $($rel.tag_name)"
         }
     }
     catch {
-        Write-Warning "Could not reach the GitHub API ($($_.Exception.Message)); using pinned $tag"
+        Write-Warning "Could not reach the GitHub API ($($_.Exception.Message))"
+    }
+    if (-not $resolved -and $mirror) {
+        try {
+            Write-Step "Asking the download mirror for the latest release"
+            $index = Invoke-RestMethod -UseBasicParsing `
+                -Uri "$mirror/latest/$(([string]$config.edition).ToLower()).json"
+            $found = @($index.assets | Where-Object { $_.name -match $pattern } |
+                Sort-Object name)
+            if ($found.Count -gt 0) {
+                $tag = $index.tag
+                $assets = $found | ForEach-Object { $_.name }
+                $base = "https://github.com/$($config.repo)/releases/download/$tag"
+                $resolved = $true
+                Write-Host "  latest is $tag ($($assets.Count) matching parts)"
+            }
+        }
+        catch {
+            Write-Warning "Could not reach the download mirror either ($($_.Exception.Message))"
+        }
+    }
+    if (-not $resolved) {
+        Write-Warning "Using the pinned $tag"
     }
 }
 
 Write-Step "Downloading $($config.edition) $tag ($($assets.Count) parts)"
 $localParts = @()
 foreach ($name in $assets) {
-    $uri = "$base/$name"
+    $sources = @()
+    if ($mirror) { $sources += "$mirror/$tag/$name" }
+    $sources += "$base/$name"
     $dest = Join-Path $downloadDir $name
-    Get-FileWithProgress -Uri $uri -OutFile $dest
+    Get-FileFromAny -Uris $sources -OutFile $dest
     $localParts += $dest
 }
 

@@ -98,6 +98,20 @@ variable) to a multiplier applied on top of the system's own: `0.75` on a 200%
 display gives you 150%. It is read once at startup, so restart the app after
 changing it.
 
+## GitHub or Hugging Face slow or blocked?
+
+Releases are mirrored outside GitHub. Setup, the script installer and the app
+fetch from the mirror first and fall back to GitHub, and check every file
+against its SHA-256 whichever host served it. That covers the app, NVIDIA
+acceleration and the search models.
+
+A model shared on Hugging Face, or weights the app fetches by name, comes from
+huggingface.co, which is out of reach in some places. Set `hf_endpoint` in
+`config.yaml` to a Hugging Face mirror you trust, for example
+`hf_endpoint: https://hf-mirror.com` (or use the `VH_HF_ENDPOINT` environment
+variable). Restart the app after changing it. An `HF_ENDPOINT` already set in
+the environment takes precedence.
+
 ## Optional pieces
 
 - **Transcripts** run on OpenAI Whisper, locally. Whisper is MIT licensed.

@@ -29,6 +29,12 @@ release and takes every asset matching `asset_pattern`, so a new Free release
 needs no edit here. `tag` / `assets` / `base_url` are the fallback used when
 the API cannot be reached.
 
+`mirror` is the download mirror (`tools/mirror_release.py`), set when CI builds
+the zip with the update host configured and empty in the committed config. With
+one, the script asks `<mirror>/latest/free.json` for the current release when
+the GitHub API cannot be reached, and downloads each volume from
+`<mirror>/<tag>/` before trying GitHub. Pro never has one.
+
 Pro assets live on a private repo that an anonymous API call cannot see, so
 `config.pro.example.json` keeps `use_latest` off and pins the tag.
 
@@ -57,7 +63,8 @@ python tools/build_bootstrap_zip.py --edition free --write-config
 ## Requirements on the machine
 
 - Windows + PowerShell 5+
-- Network access to `github.com`
+- Network access to `github.com`, or to the download mirror when the config
+  names one
 - **7-Zip** on PATH (`7z`), *or* the script will offer to download the
   official `7zr.exe` into `out\tools\` (no system install required)
 

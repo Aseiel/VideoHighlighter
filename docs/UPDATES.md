@@ -119,3 +119,54 @@ The packs are rebuilt only when torch or CLIP changes:
 
 Packs live in `packs/` beside the app and are not in the update manifest, so
 updates never touch them.
+
+## The download mirror
+
+GitHub's release downloads are slow or cut off in some places, mainland China
+above all, where the same bucket on a custom domain usually is reachable. So
+the bucket doubles as a mirror of every published free release, app and packs
+(`tools/mirror_release.py` has the layout):
+
+```
+downloads/<tag>/<asset>          every asset, as GitHub has it
+downloads/<tag>/index.json       names, sizes, SHA-256
+downloads/latest/index.html      a page linking the newest app release's files
+downloads/latest/00-VideoHighlighter-Windows-Setup.exe   a link that never moves
+downloads/latest/free.json       that release's index
+```
+
+**Mirror release** (`mirror-release.yaml`) copies a release when you press
+Publish on it, and **Publish packs** starts it for a new packs tag. Run it by
+hand with a tag for a release published before this existed: once for the
+current app release and once for the packs tag in `PACKS_BASE`. It needs only
+the R2 secrets and variables above, not the release key.
+
+For the newest app release it also writes `channels/free.json`, announcing it
+for download with the mirror's page as the link, unless the channel already
+names it or something newer. **Publish update** later adds the signed manifest
+for the same version and keeps that link.
+
+What tries the mirror first and GitHub second, in builds made with
+`UPDATE_BASE_URL` set:
+
+| | Where the mirror is recorded |
+|---|---|
+| Setup's NVIDIA and model downloads | `/DPackMirror`, compiled into Setup |
+| The app's pack downloads | `mirrors` in `packs.lock.json` (`tools/write_packs_lock.py`) |
+| The script installer (`Setup.zip`) | `mirror` in its `config.json`; it also asks `downloads/latest/free.json` when the GitHub API cannot be reached |
+| Update checks | `channels/free.json`, already the first place they look |
+
+Nothing is trusted for coming from the mirror: packs and Setup's components
+are pinned by SHA-256 at build time. Only the free edition is mirrored, because
+everything on the bucket is public.
+
+A domain on Cloudflare is usually reachable from mainland China, but it is
+served from outside the country, so speed varies. Use a custom domain:
+`*.r2.dev` is rate-limited and not reliably reachable there. Before announcing
+the mirror, check it from mainland test nodes (for example
+[ITDOG](https://www.itdog.cn/http/) or [boce.com](https://www.boce.com/)).
+
+Each app release adds roughly its assets' size (several GB). **Prune update
+host** also deletes every `downloads/<tag>/` but the newest `keep` app releases
+and what `downloads/latest/` names. Packs tags are kept: every build whose lock
+names one fetches from it for as long as that build is installed.

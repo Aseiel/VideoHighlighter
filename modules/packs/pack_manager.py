@@ -18,6 +18,14 @@ new packs is a new app build with a new lock.
 download, a proxy's error page served as 200, a swapped asset: all fail the
 same check, and nothing reaches ``packs/`` or ``models/`` before it passes.
 
+**The download mirror comes first, GitHub second.** A lock built with the
+update host configured names its copy of the packs tag (``mirrors``,
+tools/mirror_release.py), for people GitHub's downloads are slow or cut off
+for. A host that does not have the file (a 404) is dropped at once, and a
+network error moves the next attempt to the other host. The bytes are the
+same on both, so a download resumes across them, and the hash check above
+does not care which one served it.
+
 **Interrupted downloads resume.** The NVIDIA pack is ~2 GB, and a portable
 user is exactly the person on a flaky connection. Bytes on disk are kept in
 ``<asset>.part`` across a cancel, a network error or a restart of the app, and
@@ -130,6 +138,12 @@ class Pack:
     sha256: str
     bytes_installed: int
     url: str
+    mirrors: tuple = ()                  # the same asset elsewhere, tried first
+
+    @property
+    def sources(self) -> tuple:
+        """Every URL the asset can come from, in the order to try them."""
+        return tuple(self.mirrors) + (self.url,)
 
     @property
     def is_model(self) -> bool:
@@ -219,6 +233,8 @@ def load_lock(path: Optional[str] = None) -> dict:
         print(f"[packs] unreadable {path}: {exc}")
         return {}
     base = str(data.get("base") or "").rstrip("/")
+    mirrors = [str(m).rstrip("/") for m in data.get("mirrors") or []
+               if str(m).startswith("https://")]
     out = {}
     for row in data.get("packs") or []:
         try:
@@ -231,7 +247,8 @@ def load_lock(path: Optional[str] = None) -> dict:
                 asset=str(row["asset"]), bytes=int(row["bytes"]),
                 sha256=str(row["sha256"]).lower(),
                 bytes_installed=int(float(row.get("bytes_installed") or 0)),
-                url=url)
+                url=url,
+                mirrors=tuple(f"{m}/{row['asset']}" for m in mirrors))
         except (KeyError, TypeError, ValueError) as exc:
             print(f"[packs] skipping a malformed lock entry ({exc}): {row!r}")
             continue
@@ -420,13 +437,13 @@ def _http_code(exc) -> Optional[int]:
     return code if isinstance(code, int) else None
 
 
-def _fetch_into(fetch, pack: Pack, part: str, progress: Optional[ProgressFn],
+def _fetch_into(fetch, url: str, pack: Pack, part: str, progress: Optional[ProgressFn],
                 should_cancel: Optional[Callable[[], bool]]) -> bool:
-    """Append the rest of ``pack`` to ``part``. False when cancelled."""
+    """Append the rest of ``pack``, from ``url``, to ``part``. False when cancelled."""
     offset = _size(part)
     headers = {"Range": f"bytes={offset}-"} if offset else {}
     try:
-        response = fetch(pack.url, headers)
+        response = fetch(url, headers)
     except Exception as exc:
         if offset and _http_code(exc) == 416:
             raise _Restart() from exc     # the host does not accept our offset
@@ -474,8 +491,9 @@ def download_pack(
 
     Returns the verified file's path, or None when cancelled; the bytes so far
     stay in ``<asset>.part`` for the next attempt. Raises PackError when it
-    cannot be done: after RETRIES network failures in a row, at once for a
-    404 (a lock pointing at a tag that does not exist), or on a hash mismatch.
+    cannot be done: after RETRIES network failures in a row, at once when no
+    host has the file (a 404: a lock pointing at a tag that does not exist),
+    or on a hash mismatch. Hosts are tried in ``pack.sources`` order.
     """
     os.makedirs(dest_dir, exist_ok=True)
     final = os.path.join(dest_dir, pack.asset)
@@ -487,6 +505,7 @@ def download_pack(
             return final
         _remove(final)
 
+    sources = list(pack.sources)
     failures = 0
     while True:
         if should_cancel and should_cancel():
@@ -497,8 +516,9 @@ def download_pack(
             have = 0
         if have == pack.bytes:
             break
+        url = sources[0]
         try:
-            if not _fetch_into(fetch, pack, part, progress, should_cancel):
+            if not _fetch_into(fetch, url, pack, part, progress, should_cancel):
                 return None
             if _size(part) == pack.bytes:
                 break
@@ -510,14 +530,24 @@ def download_pack(
         except (OSError, http.client.HTTPException) as exc:
             code = _http_code(exc)
             if code is not None and 400 <= code < 500 and code not in (408, 416, 429):
-                raise PackError(f"{pack.asset} could not be downloaded "
-                                f"(HTTP {code} from {pack.url}).") from exc
+                # This host does not have it; another may (a mirror that has
+                # not copied the tag yet, or GitHub after it).
+                sources.pop(0)
+                if not sources:
+                    raise PackError(f"{pack.asset} could not be downloaded "
+                                    f"(HTTP {code} from {url}).") from exc
+                print(f"[packs] {pack.asset}: HTTP {code} from {url}; trying {sources[0]}")
+                continue
             failures += 1
             if failures > RETRIES:
                 raise PackError(f"{pack.asset} could not be downloaded: {exc}. "
                                 f"What arrived is kept; trying again continues "
                                 f"from there.") from exc
-            print(f"[packs] {pack.asset}: {exc}; retrying ({failures}/{RETRIES})")
+            # The next attempt goes to the next host: a host that is slow or
+            # cut off for this user is often the only thing wrong.
+            sources.append(sources.pop(0))
+            print(f"[packs] {pack.asset}: {exc}; retrying from {sources[0]} "
+                  f"({failures}/{RETRIES})")
         if failures > RETRIES:
             raise PackError(f"{pack.asset}: the server kept sending a different file.")
         sleep(min(2 ** failures, 30))

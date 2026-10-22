@@ -1,13 +1,17 @@
 """Write packs.lock.json into a build: the packs this app build may download.
 
     python tools/write_packs_lock.py --base "$PACKS_BASE" \
-        --out dist/VideoHighlighter/packs.lock.json
+        --mirror-host "$UPDATE_BASE_URL" --out dist/VideoHighlighter/packs.lock.json
 
 Reads ``<base>/packs.json`` (or ``--packs-json`` for a local copy), checks every
 row has what the app needs to verify a download, and writes it back with the
 base URL added. modules/packs/pack_manager.py reads it at runtime; nothing about
 packs is looked up online after the build, so a build always installs exactly
 the packs it was tested against.
+
+With ``--mirror-host`` the lock also names the download mirror's copy of the
+tag (``<host>/downloads/<tag>``, tools/mirror_release.py), which the app tries
+before GitHub. The SHA-256 it checks is the same either way.
 """
 from __future__ import annotations
 
@@ -25,6 +29,8 @@ def main(argv=None) -> int:
                     help="release download URL of the packs tag, e.g. "
                          "https://github.com/<owner>/<repo>/releases/download/packs-torch-2.7.1")
     ap.add_argument("--packs-json", help="local packs.json (default: <base>/packs.json)")
+    ap.add_argument("--mirror-host", default="",
+                    help="the update host serving the download mirror; blank for none")
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
@@ -49,11 +55,17 @@ def main(argv=None) -> int:
             print(f"{row['name']}: sha256 is not a SHA-256", file=sys.stderr)
             return 1
 
-    lock = {"base": base, "tag": data.get("tag") or base.rsplit("/", 1)[-1], "packs": packs}
+    tag = data.get("tag") or base.rsplit("/", 1)[-1]
+    lock = {"base": base, "tag": tag, "packs": packs}
+    host = args.mirror_host.strip().rstrip("/")
+    if host:
+        # mirror_release.mirror_base, spelled out: this runs as a bare script.
+        lock["mirrors"] = [f"{host}/downloads/{tag}"]
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(lock, fh, indent=2)
         fh.write("\n")
-    print(f"{args.out}: {', '.join(p['name'] for p in packs)} from {lock['tag']}")
+    print(f"{args.out}: {', '.join(p['name'] for p in packs)} from {tag}"
+          + (f", mirrored at {lock['mirrors'][0]}" if host else ""))
     return 0
 
 

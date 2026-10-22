@@ -284,9 +284,14 @@ def build_channel(manifest: dict, manifest_url: str, *, previous: dict = None,
 
     manifests = {}
     previous = previous if isinstance(previous, dict) else {}
-    if str(previous.get("version")) == version and isinstance(previous.get("manifests"), dict):
+    same = str(previous.get("version")) == version
+    if same and isinstance(previous.get("manifests"), dict):
         manifests.update(previous["manifests"])
     manifests[platform] = manifest_url
+    # mirror-release.yaml announced this release for download first, with the
+    # mirror's page as the link; signing it must not send people back to GitHub.
+    if not download_url and same:
+        download_url = str(previous.get("download_url") or "")
 
     return {
         "version": version,

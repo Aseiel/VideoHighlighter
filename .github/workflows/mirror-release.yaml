@@ -1,0 +1,159 @@
+name: Mirror release
+
+# Copies a published release to the update host, for people GitHub's
+# downloads are slow or cut off for (mainland China above all). Runs by itself
+# when a release is published; run it by hand for one published before this
+# existed, or to repair a copy. tools/mirror_release.py has the layout and
+# decides what is written.
+#
+# Every asset goes to downloads/<tag>/, with an index of names, sizes and
+# SHA-256. For the newest app release, downloads/latest/ also gets a page
+# linking its files, a copy of the fixed-name installers, and the index; and
+# channels/<edition>.json announces it for download, unless the channel names
+# it already (a signed update, publish-update.yaml) or something newer.
+#
+# Setup, the bootstrap zip and the app try the mirror first and GitHub second,
+# and check what they fetch against SHA-256 pinned at build time, so a copy
+# here is never trusted for being here.
+#
+# A packs release is published by publish-packs.yaml with the workflow token,
+# which starts no other workflow by publishing; it runs this one explicitly.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published release to mirror, e.g. 0.14.0 or packs-torch-2.7.1-r1'
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  R2_BUCKET: vh-updates
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+
+concurrency:
+  # Writes channels/<edition>.json, like publish-update.yaml.
+  group: publish-update
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Copy the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${R2_ACCOUNT_ID:-}" ] || [ -z "${UPDATE_BASE_URL:-}" ]; then
+            echo "::warning::R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY secrets or R2_ACCOUNT_ID / UPDATE_BASE_URL variables are not set; nothing was mirrored. docs/UPDATES.md has the setup."
+            exit 0
+          fi
+          if [ -z "$TAG" ]; then echo "::error::no tag"; exit 1; fi
+          edition=$(python -c "import version; print(version.__edition__)")
+          channel=$(python -c "from tools.publish_release import channel_name; print(channel_name('$edition'))")
+          if [ "$channel" != "free" ]; then
+            echo "::error::only the free edition is mirrored: the mirror is public, and so is everything on it"
+            exit 1
+          fi
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft) || {
+            echo "::error::no GitHub release $TAG"; exit 1; }
+          if [ "$draft" != "false" ]; then
+            echo "::error::release $TAG is a draft; publish it first"
+            exit 1
+          fi
+          base="${UPDATE_BASE_URL%/}"
+          ep="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          s3() { aws "$@" --endpoint-url "$ep"; }
+
+          # One asset at a time: the app release is several GB in all, more
+          # than a runner's disk wants to hold at once.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | [.name, (.size | tostring)] | @tsv' > assets.tsv
+          : > hashed.tsv
+          mkdir -p dl
+          while IFS=$'\t' read -r name size; do
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir dl --clobber
+            got=$(stat -c %s "dl/$name")
+            if [ "$got" != "$size" ]; then
+              echo "::error::$name: downloaded $got bytes, GitHub lists $size"; exit 1
+            fi
+            sha=$(sha256sum "dl/$name" | cut -d' ' -f1)
+            printf '%s\t%s\t%s\n' "$name" "$size" "$sha" >> hashed.tsv
+            key="downloads/$TAG/$name"
+            have=$(s3 s3api head-object --bucket "$R2_BUCKET" --key "$key" \
+                     --query ContentLength --output text 2>/dev/null || true)
+            if [ "$have" = "$size" ]; then
+              echo "already there: $key"
+            else
+              s3 s3 cp "dl/$name" "s3://$R2_BUCKET/$key" --only-show-errors \
+                --cache-control "public, max-age=86400"
+              echo "copied: $key ($((size / 1048576)) MB)"
+            fi
+            rm -f "dl/$name"
+          done < assets.tsv
+
+          python tools/mirror_release.py index --tag "$TAG" --hashed hashed.tsv --out index.json | tee index.txt
+          s3 s3 cp index.json "s3://$R2_BUCKET/downloads/$TAG/index.json" --only-show-errors \
+            --content-type application/json --cache-control "no-cache"
+          # What a client will do: plain HTTPS to the public host.
+          curl -fsS -o /dev/null "$base/downloads/$TAG/index.json" || {
+            echo "::error::$base/downloads/$TAG/index.json is not publicly reachable. Is public access on for the bucket, and is UPDATE_BASE_URL its public URL?"
+            exit 1; }
+
+          {
+            echo "### $TAG is mirrored"
+            echo ""
+            echo "$base/downloads/$TAG/index.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$TAG" in packs-*) exit 0 ;; esac
+          latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+          if [ "$latest" != "$TAG" ]; then
+            echo "$TAG is not the latest release ($latest), so downloads/latest/ and the channel are left as they are." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          sed -n 's/^fixed://p' index.txt | while read -r name; do
+            s3 s3 cp "s3://$R2_BUCKET/downloads/$TAG/$name" "s3://$R2_BUCKET/downloads/latest/$name" \
+              --only-show-errors --metadata-directive REPLACE \
+              --content-type application/octet-stream --cache-control "no-cache"
+          done
+          notes_url="https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          python tools/mirror_release.py page --index index.json --notes-url "$notes_url" --out index.html
+          s3 s3 cp index.html "s3://$R2_BUCKET/downloads/latest/index.html" --only-show-errors \
+            --content-type "text/html; charset=utf-8" --cache-control "no-cache"
+          s3 s3 cp index.json "s3://$R2_BUCKET/downloads/latest/$channel.json" --only-show-errors \
+            --content-type application/json --cache-control "no-cache"
+
+          s3 s3 cp "s3://$R2_BUCKET/channels/$channel.json" previous.json --only-show-errors 2>/dev/null || echo '{}' > previous.json
+          python tools/mirror_release.py channel --index index.json --previous previous.json \
+            --notes-url "$notes_url" --download-url "$base/downloads/latest/index.html" --out channel.json
+          if [ -f channel.json ]; then
+            s3 s3 cp channel.json "s3://$R2_BUCKET/channels/$channel.json" --only-show-errors \
+              --content-type application/json --cache-control "no-cache, max-age=0"
+          fi
+          {
+            echo ""
+            echo "Latest: $base/downloads/latest/index.html"
+            if [ -f channel.json ]; then
+              echo ""
+              echo "Announced for download on channels/$channel.json."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

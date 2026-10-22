@@ -363,3 +363,72 @@ def test_workers_do_no_maintenance(rthook, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["VideoHighlighter.exe", "--multiprocessing-fork",
                                       "parent_pid=1", "pipe_handle=2"])
     assert hook._is_worker()
+
+
+# --- the download mirror ----------------------------------------------------
+
+def _mirrored(data=DATA):
+    import dataclasses
+    return dataclasses.replace(_pack(data=data),
+                               mirrors=("https://mirror/packs-x/component-torch-cu128.7z",))
+
+
+class ByHost:
+    """One Server per host; records which host each request went to."""
+
+    def __init__(self, **servers):
+        self.servers = servers
+        self.hosts = []
+
+    def __call__(self, url, headers):
+        host = url.split("/")[2]
+        self.hosts.append(host)
+        return self.servers[host](url, headers)
+
+
+def test_load_lock_names_the_mirror_first(tmp_path):
+    lock = tmp_path / "packs.lock.json"
+    lock.write_text(json.dumps({"base": "https://h/packs-x", "mirrors": [
+        "https://mirror/downloads/packs-x/", "http://plain/no"], "packs": [
+        {"name": "torch-cpu", "asset": "a.7z", "bytes": 5, "sha256": "ab" * 32}]}),
+        encoding="utf-8")
+    pack = pm.load_lock(str(lock))["torch-cpu"]
+    # Plain http is not a mirror worth trusting with the order; the hash would
+    # still catch it, but there is no reason to ask.
+    assert pack.sources == ("https://mirror/downloads/packs-x/a.7z", "https://h/packs-x/a.7z")
+
+
+def test_the_mirror_is_asked_first(tmp_path):
+    opener = ByHost(mirror=Server(DATA), host=Server(b"never"))
+    path = pm.download_pack(_mirrored(), str(tmp_path), opener=opener, sleep=_no_sleep)
+    assert open(path, "rb").read() == DATA
+    assert set(opener.hosts) == {"mirror"}
+
+
+def test_a_mirror_without_the_file_falls_back_at_once(tmp_path):
+    pack = _mirrored()
+    err = urllib.error.HTTPError(pack.mirrors[0], 404, "Not Found", {}, None)
+    opener = ByHost(mirror=Server(DATA, fail=[err]), host=Server(DATA))
+    path = pm.download_pack(pack, str(tmp_path), opener=opener, sleep=_no_sleep)
+    assert open(path, "rb").read() == DATA
+    assert opener.hosts == ["mirror", "host"]
+
+
+def test_404_everywhere_is_an_error(tmp_path):
+    pack = _mirrored()
+    gone = lambda url: urllib.error.HTTPError(url, 404, "Not Found", {}, None)  # noqa: E731
+    opener = ByHost(mirror=Server(DATA, fail=[gone(pack.mirrors[0])]),
+                    host=Server(DATA, fail=[gone(pack.url)]))
+    with pytest.raises(pm.PackError, match="404 from https://host"):
+        pm.download_pack(pack, str(tmp_path), opener=opener, sleep=_no_sleep)
+
+
+def test_a_cut_off_download_resumes_from_the_other_host(tmp_path):
+    pack = _mirrored()
+    mirror = Server(DATA, cut_after=1024 * 1024)
+    opener = ByHost(mirror=mirror, host=Server(DATA))
+    path = pm.download_pack(pack, str(tmp_path), opener=opener, sleep=_no_sleep)
+    assert open(path, "rb").read() == DATA
+    assert opener.hosts == ["mirror", "host"]
+    # GitHub was asked only for what the mirror had not sent.
+    assert opener.servers["host"].calls == [{"Range": f"bytes={1024 * 1024}-"}]

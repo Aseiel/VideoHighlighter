@@ -137,3 +137,26 @@ class TestWriteConfigKeepsWhatIsNotDerived:
         monkeypatch.setitem(mod.CONFIG_PATHS, "pro", tmp_path / "nope.json")
         with pytest.raises(SystemExit):
             mod.write_config(edition="pro", tag="9.9.9")
+
+
+class TestTheMirror:
+    def test_free_names_the_mirror_it_was_built_with(self, mod):
+        config = mod.make_config(edition="free", tag="0.14.0",
+                                 mirror_host="https://dl.example/")
+        assert config["mirror"] == "https://dl.example/downloads"
+
+    def test_without_a_host_there_is_none(self, mod):
+        assert mod.make_config(edition="free", tag="0.14.0")["mirror"] == ""
+
+    def test_pro_never_gets_one(self, mod):
+        # The mirror is public; Pro's assets are not.
+        config = mod.make_config(edition="pro", tag="0.14.0-Pro",
+                                 mirror_host="https://dl.example")
+        assert config["mirror"] == ""
+
+    def test_the_zip_carries_it(self, mod, tmp_path: Path):
+        out = tmp_path / "setup.zip"
+        mod.build_zip(edition="free", tag="0.14.0", out=out, mirror_host="https://dl.example")
+        with zipfile.ZipFile(out) as zf:
+            config = json.loads(zf.read("config.json"))
+        assert config["mirror"] == "https://dl.example/downloads"
