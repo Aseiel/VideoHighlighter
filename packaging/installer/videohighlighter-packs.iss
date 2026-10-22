@@ -17,23 +17,33 @@
 ;     whole size into every download, including for people who never search.
 ;     It lands in {app}\models\, the first place llm/clip_prefilter.py looks.
 ;   * the multilingual search text model (llm/clip_multilingual.py) - ticked
-;     when the language chosen below is not English. Only offered when this
-;     Setup was built against packs that have it (MlPackAsset).
+;     when the language chosen is not English. Only offered when this Setup
+;     was built against packs that have it (MlPackAsset).
 ;
 ; Any of them failing or being declined still leaves an app that runs.
 ;
-; THE LANGUAGE. A page after the folder asks which language the app should
-; use, preselecting Windows' display language, and leaves the answer in
-; {app}\install_language.txt. The app reads it at its first start
+; ALREADY INSTALLED. Run over an existing install, Setup finds the packs it
+; already has (here, or where the app put them in the per-user folder) and
+; leaves them unticked, marked "already installed", instead of downloading
+; them again. The NVIDIA pack counts only when it is the version this Setup
+; was built against (CudaPackVersion).
+;
+; THE LANGUAGE. Setup opens by asking its own language, preselecting Windows'
+; display language, and every page after that is in it: Inno Setup's standard
+; texts from its translations (official ones from the compiler,
+; ChineseSimplified, Indonesian and Vietnamese vendored in languages/ from
+; jrsoftware/issrc at is-6_7_1, the compiler CI pins), this Setup's own from
+; setup-messages.iss. The same choice is the app's language: Setup leaves it
+; in {app}\install_language.txt, which the app reads at its first start
 ; (modules/i18n/content_language.py) - its menus, and the language it listens
 ; for in transcripts, writes subtitles and narration in, and understands in
-; search. Setup's own pages stay in English. Skipped when Setup runs over an
-; install that already has a config: the app holds that choice already.
+; search. Not written over an install that already has a config: the app
+; holds that choice already.
 ;
 ; Built in CI:
 ;   ISCC.exe /DAppVersion= /DDistDir= /DCpuPackDir= /DPackBase= \
-;            /DCudaPackAsset= /DCudaPackSha256= /DCudaPackMB= /DCudaInstalledMB= \
-;            /DInstalledMB= packaging\installer\videohighlighter-packs.iss
+;            /DCudaPackAsset= /DCudaPackSha256= /DCudaPackVersion= /DCudaPackMB= \
+;            /DCudaInstalledMB= /DInstalledMB= packaging\installer\videohighlighter-packs.iss
 ;
 ; FOR ME ONLY, OR FOR ALL USERS. Setup asks. "For me only" installs under
 ; %LOCALAPPDATA%\Programs with no admin prompt, and is the one the in-app
@@ -75,6 +85,11 @@
 #endif
 #ifndef CudaPackSha256
   #define CudaPackSha256 ""
+#endif
+; The NVIDIA pack's version (its pack.json), to tell an installed copy of this
+; pack from an older one. Empty: any installed NVIDIA pack counts.
+#ifndef CudaPackVersion
+  #define CudaPackVersion ""
 #endif
 #ifndef CudaPackMB
   #define CudaPackMB 0
@@ -146,14 +161,37 @@ LZMAUseSeparateProcess=yes
 LZMANumBlockThreads=4
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; Asked first, preselecting Windows' display language; also the app's language.
+ShowLanguageDialog=yes
 
+; The app's interface languages (modules/i18n/languages.py). The names are
+; what ChosenLanguage turns back into the app's codes.
+[Languages]
+Name: "en"; MessagesFile: "compiler:Default.isl"
+Name: "zhCN"; MessagesFile: "languages\ChineseSimplified.isl"
+Name: "es"; MessagesFile: "compiler:Languages\Spanish.isl"
+Name: "ptBR"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
+Name: "fr"; MessagesFile: "compiler:Languages\French.isl"
+Name: "ja"; MessagesFile: "compiler:Languages\Japanese.isl"
+Name: "de"; MessagesFile: "compiler:Languages\German.isl"
+Name: "ko"; MessagesFile: "compiler:Languages\Korean.isl"
+Name: "id"; MessagesFile: "languages\Indonesian.isl"
+Name: "tr"; MessagesFile: "compiler:Languages\Turkish.isl"
+Name: "it"; MessagesFile: "compiler:Languages\Italian.isl"
+Name: "pl"; MessagesFile: "compiler:Languages\Polish.isl"
+Name: "vi"; MessagesFile: "languages\Vietnamese.isl"
+Name: "nl"; MessagesFile: "compiler:Languages\Dutch.isl"
+
+#include "setup-messages.iss"
+
+; Their order is the tasks list's: DescribeTasks addresses them by index.
 [Tasks]
-Name: "nvidia"; Description: "NVIDIA GPU acceleration (downloads about {#CudaPackMB} MB)"; Flags: unchecked
-Name: "clip"; Description: "Visual search model, CLIP (downloads about {#ClipPackMB} MB)"
+Name: "nvidia"; Description: "{cm:NvidiaTask,{#CudaPackMB}}"; Flags: unchecked
+Name: "clip"; Description: "{cm:ClipTask,{#ClipPackMB}}"
 #if MlPackAsset != ""
-Name: "multilingual"; Description: "Search in your language, not only English (downloads about {#MlPackMB} MB)"; Flags: unchecked
+Name: "multilingual"; Description: "{cm:MlTask,{#MlPackMB}}"; Flags: unchecked
 #endif
-Name: "desktopicon"; Description: "Create a &desktop shortcut"
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"
 
 ; The bundle folder is replaced whole on every install. A build from before
 ; packs carried torch inside _internal, and _internal is on the frozen app's
@@ -171,11 +209,11 @@ Source: "{#CpuPackDir}\*"; DestDir: "{app}\packs\torch-cpu"; Flags: ignoreversio
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
-Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
+Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 ; Packs unpacked by 7-Zip and everything the app wrote at runtime are not
 ; tracked by the installer, so the folder is removed whole — the same full
@@ -192,70 +230,18 @@ var
   CudaPackDownloaded: Boolean;
   ClipPackDownloaded: Boolean;
   MlPackDownloaded: Boolean;
-  LanguagePage: TInputOptionWizardPage;
   MlDefaultApplied: Boolean;
+  ClipDefaultApplied: Boolean;
 
-// The app's interface languages, in the order its own picker lists them
-// (modules/i18n/languages.py), with the Windows primary language id of each.
-const
-  LanguageCount = 14;
-
-function LanguageCode(I: Integer): String;
-begin
-  case I of
-    0: Result := 'en';     1: Result := 'zh-CN';  2: Result := 'es';
-    3: Result := 'pt-BR';  4: Result := 'fr';     5: Result := 'ja';
-    6: Result := 'de';     7: Result := 'ko';     8: Result := 'id';
-    9: Result := 'tr';     10: Result := 'it';    11: Result := 'pl';
-    12: Result := 'vi';    13: Result := 'nl';
-  else
-    Result := 'en';
-  end;
-end;
-
-function LanguageLabel(I: Integer): String;
-begin
-  case I of
-    0: Result := 'English';
-    1: Result := '简体中文 - Chinese (Simplified)';
-    2: Result := 'Español - Spanish';
-    3: Result := 'Português (Brasil) - Portuguese (Brazil)';
-    4: Result := 'Français - French';
-    5: Result := '日本語 - Japanese';
-    6: Result := 'Deutsch - German';
-    7: Result := '한국어 - Korean';
-    8: Result := 'Bahasa Indonesia - Indonesian';
-    9: Result := 'Türkçe - Turkish';
-    10: Result := 'Italiano - Italian';
-    11: Result := 'Polski - Polish';
-    12: Result := 'Tiếng Việt - Vietnamese';
-    13: Result := 'Nederlands - Dutch';
-  else
-    Result := 'English';
-  end;
-end;
-
-// Windows' display language -> the index above; English when it is none of them.
-function SystemLanguageIndex: Integer;
-begin
-  case GetUILanguage and $3FF of
-    $04: Result := 1;   $0A: Result := 2;   $16: Result := 3;   $0C: Result := 4;
-    $11: Result := 5;   $07: Result := 6;   $12: Result := 7;   $21: Result := 8;
-    $1F: Result := 9;   $10: Result := 10;  $15: Result := 11;  $2A: Result := 12;
-    $13: Result := 13;
-  else
-    Result := 0;
-  end;
-end;
-
+// The language Setup runs in, as the app's code for it: the [Languages] names
+// are the app's codes without their hyphen.
 function ChosenLanguage: String;
-var
-  I: Integer;
 begin
-  Result := 'en';
-  for I := 0 to LanguageCount - 1 do
-    if LanguagePage.Values[I] then
-      Result := LanguageCode(I);
+  Result := ActiveLanguage;
+  if Result = 'zhCN' then
+    Result := 'zh-CN'
+  else if Result = 'ptBR' then
+    Result := 'pt-BR';
 end;
 
 // An install that already has a config: the app holds the language already,
@@ -302,80 +288,135 @@ begin
   Result := not DirExists(ExpandConstant('{app}\packs\{#CudaPackName}'));
 end;
 
-function OnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
+// ---------------------------------------------------------------------------
+// What an earlier install already has. The app downloads a pack beside itself
+// when it can write there, else into the per-user folder
+// (modules/packs/pack_manager.target_root), so both are looked in.
+// ---------------------------------------------------------------------------
+
+function PackRoots(I: Integer): String;
 begin
-  if ProgressMax > 0 then
-    DownloadPage.SetText(FileName,
-      IntToStr(Progress div 1048576) + ' of ' + IntToStr(ProgressMax div 1048576) + ' MB');
-  Result := True;
+  if I = 0 then
+    Result := ExpandConstant('{app}')
+  else
+    Result := ExpandConstant('{localappdata}\{#AppName}');
 end;
 
-procedure InitializeWizard;
+// This Setup's NVIDIA pack, unpacked. An older version of it (another torch)
+// does not count: Setup should offer the new one.
+function CudaInstalled: Boolean;
 var
   I: Integer;
+  Dir: String;
+  Info: AnsiString;
 begin
-  LanguagePage := CreateInputOptionPage(wpSelectDir,
-    'Language', 'Which language should VideoHighlighter use?',
-    'Its menus, and the language it listens for in transcripts, writes '
-    + 'subtitles and narration in, and understands in search, all follow this. '
-    + 'You can change it later under About.',
-    True, True);
-  for I := 0 to LanguageCount - 1 do
-    LanguagePage.Add(LanguageLabel(I));
-  LanguagePage.Values[SystemLanguageIndex] := True;
-
-  NvidiaFound := HasNvidiaGpu;
-  DownloadPage := CreateDownloadPage(
-    'Downloading NVIDIA GPU acceleration',
-    'PyTorch for NVIDIA cards is fetched once; app updates do not download it again.',
-    @OnDownloadProgress);
-end;
-
-// Say what the detection found, so the checkbox explains itself (and a
-// tester can tell detection from a wrong default at a glance).
-procedure DescribeNvidiaTask;
-var
-  I: Integer;
-begin
-  for I := 0 to WizardForm.TasksList.Items.Count - 1 do
-    if Pos('NVIDIA GPU acceleration', WizardForm.TasksList.ItemCaption[I]) = 1 then
+  Result := False;
+  for I := 0 to 1 do
+  begin
+    Dir := PackRoots(I) + '\packs\{#CudaPackName}';
+    if DirExists(Dir + '\site-packages')
+       and LoadStringFromFile(Dir + '\pack.json', Info)
+       and (('{#CudaPackVersion}' = '') or (Pos('{#CudaPackVersion}', String(Info)) > 0)) then
     begin
-      if NvidiaFound then
-        WizardForm.TasksList.ItemCaption[I] := WizardForm.TasksList.ItemCaption[I]
-          + ' - recommended for your ' + NvidiaName
-      else
-        WizardForm.TasksList.ItemCaption[I] := WizardForm.TasksList.ItemCaption[I]
-          + ' - no NVIDIA card found';
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+// A model pack's folder under models\, with the file that proves it is there
+// (pack_manager.MODEL_DIRS has the same pairs).
+function ModelInstalled(const DirName, Probe: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 0 to 1 do
+    if FileExists(PackRoots(I) + '\models\' + DirName + '\' + Probe) then
+    begin
+      Result := True;
       Exit;
     end;
 end;
 
-// Tick the NVIDIA box once, the first time the page is shown, when a card was
-// found - after that the user's own choice stands, including on Back/Next.
+function ClipInstalled: Boolean;
+begin
+  Result := ModelInstalled('{#ClipDirName}', 'openvino_model.xml');
+end;
+
+function MlInstalled: Boolean;
+begin
+  Result := ModelInstalled('{#MlDirName}', 'text.onnx');
+end;
+
+function OnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
+begin
+  if ProgressMax > 0 then
+    DownloadPage.SetText(FileName, FmtMessage(CustomMessage('DownloadedOf'),
+      [IntToStr(Progress div 1048576), IntToStr(ProgressMax div 1048576)]));
+  Result := True;
+end;
+
+procedure InitializeWizard;
+begin
+  NvidiaFound := HasNvidiaGpu;
+  DownloadPage := CreateDownloadPage(CustomMessage('DownloadingTitle'),
+    CustomMessage('DownloadingDescription'), @OnDownloadProgress);
+end;
+
+procedure AppendToTask(Index: Integer; const Note: String);
+begin
+  if Index < WizardForm.TasksList.Items.Count then
+    WizardForm.TasksList.ItemCaption[Index] :=
+      WizardForm.TasksList.ItemCaption[Index] + ' - ' + Note;
+end;
+
+// Say what was found, so each checkbox explains itself (and a tester can tell
+// detection from a wrong default at a glance). By index, in [Tasks] order,
+// because the captions are in whatever language Setup runs in.
+procedure DescribeTasks;
+begin
+  if CudaInstalled then
+    AppendToTask(0, CustomMessage('AlreadyInstalled'))
+  else if NvidiaFound then
+    AppendToTask(0, FmtMessage(CustomMessage('NvidiaRecommended'), [NvidiaName]))
+  else
+    AppendToTask(0, CustomMessage('NvidiaNotFound'));
+  if ClipInstalled then
+    AppendToTask(1, CustomMessage('AlreadyInstalled'));
+#if MlPackAsset != ""
+  if MlInstalled then
+    AppendToTask(2, CustomMessage('AlreadyInstalled'));
+#endif
+end;
+
+// The defaults, set once, the first time the tasks page shows - after that
+// the user's own choice stands, including on Back/Next. A pack already
+// installed starts unticked; ticking it again downloads it again.
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID = wpSelectTasks) and not NvidiaDefaultApplied then
   begin
-    DescribeNvidiaTask;
-    if NvidiaFound then
+    DescribeTasks;
+    if NvidiaFound and not CudaInstalled then
       WizardSelectTasks('nvidia');
     NvidiaDefaultApplied := True;
   end;
+  if (CurPageID = wpSelectTasks) and not ClipDefaultApplied then
+  begin
+    if ClipInstalled then
+      WizardSelectTasks('!clip');
+    ClipDefaultApplied := True;
+  end;
 #if MlPackAsset != ""
-  // Ticked for any language but English, the first time the tasks page shows;
-  // the user's own choice stands after that.
+  // Ticked for any language but English when it is not there yet.
   if (CurPageID = wpSelectTasks) and not MlDefaultApplied then
   begin
-    if (not HasConfig) and (ChosenLanguage <> 'en') then
+    if (not HasConfig) and (ChosenLanguage <> 'en') and not MlInstalled then
       WizardSelectTasks('multilingual');
     MlDefaultApplied := True;
   end;
 #endif
-end;
-
-function ShouldSkipPage(PageID: Integer): Boolean;
-begin
-  Result := (PageID = LanguagePage.ID) and HasConfig;
 end;
 
 // Whether the multilingual task exists in this build and is ticked.
@@ -420,11 +461,8 @@ begin
   Free := FreeSpaceMB(AppDir);
   if (Free >= 0) and (Free < Need) then
   begin
-    MsgBox('Not enough free space on ' + ExtractFileDrive(AppDir) + '.' + #13#10#13#10
-      + 'Needed: about ' + IntToStr(Need) + ' MB' + #13#10
-      + 'Available: ' + IntToStr(Free) + ' MB' + #13#10#13#10
-      + 'Free up space, choose a folder on another drive, or untick NVIDIA GPU acceleration.',
-      mbError, MB_OK);
+    MsgBox(FmtMessage(CustomMessage('LowSpace'),
+      [ExtractFileDrive(AppDir), IntToStr(Need), IntToStr(Free)]), mbError, MB_OK);
     Result := False;
   end;
 end;
@@ -471,9 +509,7 @@ begin
   else
     Log(What + ': download failed: ' + Error);
   Stay := SuppressibleMsgBox(
-    What + ' could not be downloaded:' + #13#10
-    + AddPeriod(Error) + #13#10#13#10
-    + 'Install without it? ' + Without,
+    FmtMessage(CustomMessage('CouldNotDownload'), [What, AddPeriod(Error), Without]),
     mbConfirmation, MB_YESNO, IDYES) <> IDYES;
 end;
 
@@ -507,20 +543,14 @@ begin
   try
     if WizardIsTaskSelected('nvidia') then
       CudaPackDownloaded := FetchComponent('{#CudaPackAsset}', '{#CudaPackSha256}',
-        'NVIDIA GPU acceleration',
-        'VideoHighlighter will run on the processor, and you can add GPU '
-        + 'acceleration later by running Setup again.', Stay);
+        CustomMessage('NvidiaName'), CustomMessage('NvidiaWithout'), Stay);
     if (not Stay) and WizardIsTaskSelected('clip') then
       ClipPackDownloaded := FetchComponent('{#ClipPackAsset}', '{#ClipPackSha256}',
-        'The visual search model',
-        'Everything else works; visual search, chapters and taught categories '
-        + 'need it, and running Setup again adds it.', Stay);
+        CustomMessage('ClipName'), CustomMessage('ClipWithout'), Stay);
 #if MlPackAsset != ""
     if (not Stay) and MlSelected then
       MlPackDownloaded := FetchComponent('{#MlPackAsset}', '{#MlPackSha256}',
-        'The multilingual search model',
-        'Search then understands English queries only; the app offers it '
-        + 'again, and running Setup again adds it.', Stay);
+        CustomMessage('MlName'), CustomMessage('MlWithout'), Stay);
 #endif
   finally
     DownloadPage.Hide;
@@ -555,7 +585,7 @@ var
 begin
   Target := ExpandConstant('{app}\packs\{#CudaPackName}');
   Staging := Target + '.partial';
-  WizardForm.StatusLabel.Caption := 'Unpacking NVIDIA GPU acceleration (this takes a few minutes)...';
+  WizardForm.StatusLabel.Caption := CustomMessage('UnpackingNvidia');
   WizardForm.Refresh;
 
   if Unpack('{#CudaPackAsset}', Staging) then
@@ -568,20 +598,19 @@ begin
     end;
     DelTree(Staging, True, True, True);
   end;
-  MsgBox('Could not install NVIDIA GPU acceleration. VideoHighlighter is '
-    + 'installed and will run on the processor; run Setup again to retry.',
-    mbError, MB_OK);
+  MsgBox(CustomMessage('NvidiaFailed'), mbError, MB_OK);
 end;
 
 // A model archive holds models\<DirName>\...: unpack it to a staging folder
-// and move that one directory into {app}\models.
-procedure InstallModelPack(const Asset, DirName, What: String);
+// and move that one directory into {app}\models. Unpacking and Failed are
+// what the user sees meanwhile and if it fails.
+procedure InstallModelPack(const Asset, DirName, Unpacking, Failed: String);
 var
   Staging, Target: String;
 begin
   Staging := ExpandConstant('{app}\models\.') + DirName + '.partial';
   Target := ExpandConstant('{app}\models\') + DirName;
-  WizardForm.StatusLabel.Caption := 'Unpacking ' + What + '...';
+  WizardForm.StatusLabel.Caption := Unpacking;
   WizardForm.Refresh;
 
   ForceDirectories(ExpandConstant('{app}\models'));
@@ -595,8 +624,7 @@ begin
     end;
     DelTree(Staging, True, True, True);
   end;
-  MsgBox('Could not install ' + What + '. Everything else works; '
-    + 'run Setup again to add it.', mbError, MB_OK);
+  MsgBox(Failed, mbError, MB_OK);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -606,10 +634,12 @@ begin
   if CudaPackDownloaded then
     InstallCudaPack;
   if ClipPackDownloaded then
-    InstallModelPack('{#ClipPackAsset}', '{#ClipDirName}', 'the visual search model');
+    InstallModelPack('{#ClipPackAsset}', '{#ClipDirName}',
+      CustomMessage('UnpackingClip'), CustomMessage('ClipFailed'));
 #if MlPackAsset != ""
   if MlPackDownloaded then
-    InstallModelPack('{#MlPackAsset}', '{#MlDirName}', 'the multilingual search model');
+    InstallModelPack('{#MlPackAsset}', '{#MlDirName}',
+      CustomMessage('UnpackingMl'), CustomMessage('MlFailed'));
 #endif
   // Read by the app at its first start; ignored once its config has a language.
   if not HasConfig then

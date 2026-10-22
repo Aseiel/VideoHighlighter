@@ -22,7 +22,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
+        # The version build-release.yaml pins: packaging/installer/languages/ matches it.
+        run: choco install innosetup --version=6.7.1 -y --no-progress
       - name: Compile videohighlighter-packs.iss
         shell: pwsh
         run: |
@@ -35,6 +36,7 @@ jobs:
             "/DCpuPackDir=$((Resolve-Path stub/pack).Path)" `
             "/DPackBase=https://example.invalid/packs" `
             "/DCudaPackSha256=0000000000000000000000000000000000000000000000000000000000000000" `
+            "/DCudaPackVersion=2.7.1+cu128" `
             "/DCudaPackMB=1769" "/DCudaInstalledMB=4800" "/DInstalledMB=2100" `
             "/O$((Resolve-Path stub).Path)" `
             packaging/installer/videohighlighter-packs.iss

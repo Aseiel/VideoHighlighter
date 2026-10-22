@@ -321,7 +321,8 @@ jobs:
         env:
           UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
         run: |
-          choco install innosetup -y --no-progress | Out-Null
+          # Pinned: packaging/installer/languages/ holds this version's translations.
+          choco install innosetup --version=6.7.1 -y --no-progress | Out-Null
           $mirrorArgs = @()
           if ($env:UPDATE_BASE_URL) {
             # tools/mirror_release.py: <host>/downloads/<tag>.
@@ -350,6 +351,7 @@ jobs:
             @mirrorArgs `
             "/DCudaPackAsset=$($cuda.asset)" `
             "/DCudaPackSha256=$($cuda.sha256)" `
+            "/DCudaPackVersion=$($cuda.version)" `
             "/DCudaPackMB=$([int][math]::Ceiling($cuda.bytes / 1MB))" `
             "/DCudaInstalledMB=$([int][math]::Ceiling($cuda.bytes_installed / 1MB))" `
             "/DClipPackAsset=$($clip.asset)" `

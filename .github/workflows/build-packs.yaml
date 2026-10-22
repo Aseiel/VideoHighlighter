@@ -320,7 +320,8 @@ jobs:
           Copy-Item packaging/installer/7zr.exe dist/VideoHighlighter/7zr.exe
           python tools/write_packs_lock.py --base "$env:PACKS_BASE" --packs-json out/packs.json `
             --out dist/VideoHighlighter/packs.lock.json
-          choco install innosetup -y --no-progress | Out-Null
+          # Pinned: packaging/installer/languages/ holds this version's translations.
+          choco install innosetup --version=6.7.1 -y --no-progress | Out-Null
           $packs = (Get-Content out/packs.json | ConvertFrom-Json).packs
           $cuda = $packs | Where-Object { $_.name -eq "torch-cu128" }
           $clip = $packs | Where-Object { $_.name -eq "models-clip" }
@@ -342,6 +343,7 @@ jobs:
             "/DPackBase=$env:PACKS_BASE" `
             "/DCudaPackAsset=$($cuda.asset)" `
             "/DCudaPackSha256=$($cuda.sha256)" `
+            "/DCudaPackVersion=$($cuda.version)" `
             "/DCudaPackMB=$([int][math]::Ceiling($cuda.bytes / 1MB))" `
             "/DCudaInstalledMB=$([int][math]::Ceiling($cuda.bytes_installed / 1MB))" `
             "/DClipPackAsset=$($clip.asset)" `
