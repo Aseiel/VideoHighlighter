@@ -232,6 +232,8 @@ def run_subtitles(video_path: str, *, model: Optional[str] = None,
     TRANSCRIBE_TO = 60
 
     tr = cached_transcript(video_path, language=language, log=log) if reuse_cached else None
+    if not reuse_cached:
+        log("ℹ️ Force reprocess is on: transcribing again instead of using the cache")
     if tr is not None:
         n = len(tr.get("segments") or [])
         log(f"✅ Using the transcript already in this video's cache ({n} segments) "
