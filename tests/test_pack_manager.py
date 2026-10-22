@@ -432,3 +432,36 @@ def test_a_cut_off_download_resumes_from_the_other_host(tmp_path):
     assert opener.hosts == ["mirror", "host"]
     # GitHub was asked only for what the mirror had not sent.
     assert opener.servers["host"].calls == [{"Range": f"bytes={1024 * 1024}-"}]
+
+
+# --- the macOS bundle ---------------------------------------------------------
+
+def test_the_lock_beside_the_exe_comes_first(tmp_path, monkeypatch, _isolated_roots):
+    exe, _ = _isolated_roots
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (exe / pm.LOCK_NAME).write_text("{}")
+    (bundle / pm.LOCK_NAME).write_text("{}")
+    monkeypatch.delenv(pm.LOCK_ENV, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+    assert pm.lock_path() == str(exe / pm.LOCK_NAME)
+
+
+def test_a_mac_app_finds_its_lock_inside_the_bundle(tmp_path, monkeypatch, _isolated_roots):
+    # Contents/MacOS may hold only code, so the Mac build bundles the lock as data.
+    exe, _ = _isolated_roots
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / pm.LOCK_NAME).write_text("{}")
+    monkeypatch.delenv(pm.LOCK_ENV, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+    assert pm.lock_path() == str(bundle / pm.LOCK_NAME)
+
+
+def test_7zz_is_found_in_the_mac_bundle(tmp_path, monkeypatch, _isolated_roots):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "7zz").write_text("")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle), raising=False)
+    assert pm.find_7z() == str(bundle / "7zz")

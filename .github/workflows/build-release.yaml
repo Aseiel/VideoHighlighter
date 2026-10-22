@@ -626,14 +626,44 @@ jobs:
         # has no GPU plugin on macOS). Same size, fp16. Its processor route is
         # torch's too, so optimum is left out of this bundle.
         run: python -m tools.export_clip_torch
-      - name: Export the action model (SigLIP2, Apache-2.0)
-        # Action recognition's only model since 0.13.1. A Mac build has no
-        # pack downloads, so it is bundled with models/, as CLIP is.
-        run: python -m tools.export_frame_encoder
-      - name: Export the multilingual search model (Apache-2.0)
-        # Search in the user's language (llm/clip_multilingual.py). ~170 MB,
-        # bundled with models/ for the same reason as the encoder above.
-        run: python -m tools.export_clip_multilingual
+      - name: Bundle only the models the packs do not offer
+        # The action encoder (SigLIP2, Apache-2.0, 563 MB) and the multilingual
+        # search model (Apache-2.0, 172 MB) are packs on Windows, downloaded the
+        # first time a feature needs them (modules/packs). The Mac build had no
+        # pack downloads and carried both. It has them now: the pinned lock and
+        # 7-Zip's own macOS build go into the bundle, and the app asks before
+        # it downloads, as on Windows. A model whose pack is not published at
+        # PACKS_BASE yet is still exported and bundled, so no build loses a
+        # feature while the packs catch up; it leaves the bundle by itself once
+        # PACKS_BASE moves to packs that have it.
+        env:
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+        run: |
+          curl -fsSL "$PACKS_BASE/packs.json" -o packs.json
+          published() { python -c "import json, sys; sys.exit(0 if any(p['name'] == '$1' for p in json.load(open('packs.json'))['packs']) else 1)"; }
+          names=""
+          if published models-frame-encoder; then
+            names="models-frame-encoder"; echo "action encoder: downloaded on first use"
+          else
+            python -m tools.export_frame_encoder; echo "action encoder: bundled"
+          fi
+          if published models-clip-multilingual; then
+            names="$names,models-clip-multilingual"; echo "multilingual search: downloaded on first use"
+          else
+            python -m tools.export_clip_multilingual; echo "multilingual search: bundled"
+          fi
+          # The model packs only: the PyTorch packs are Windows builds.
+          if [ -n "$names" ]; then
+            python tools/write_packs_lock.py --base "$PACKS_BASE" --packs-json packs.json \
+              --names "${names#,}" --mirror-host "$UPDATE_BASE_URL" --out packs.lock.json
+          else
+            echo '{"packs": []}' > packs.lock.json
+          fi
+          # 7-Zip's macOS build (LGPL, like the 7zr.exe the Windows build ships),
+          # which the packs are unpacked with (pack_manager.find_7z).
+          curl -fsSL https://www.7-zip.org/a/7z2501-mac.tar.xz -o 7z-mac.tar.xz
+          mkdir -p 7z-mac && tar -xJf 7z-mac.tar.xz -C 7z-mac
+          ./7z-mac/7zz | head -3
       - name: Give OpenVINO a libtbb that codesign accepts
         # libtbb.12.dylib was deleted from the bundle in March because it could
         # not be ad-hoc signed. OpenVINO links against it, so `_pyopenvino` then
@@ -709,6 +739,9 @@ jobs:
             --add-data "models:models" \
             --add-data "video_ai_editor/VRVideoOutput.qml:video_ai_editor" \
             --add-data "video_ai_editor/models:video_ai_editor/models" \
+            --add-data "packs.lock.json:." \
+            --add-binary "7z-mac/7zz:." \
+            --add-data "7z-mac/License.txt:7-Zip" \
             --hidden-import convert_pth_to_openvino \
             --hidden-import crop_actions \
             --hidden-import downloader \
@@ -802,6 +835,37 @@ jobs:
             echo "::endgroup::"
           done
           exit $status
+      - name: Install the model packs the way the app does
+        # The path a Mac user takes the first time a feature needs a model:
+        # the lock and 7zz from inside the signed bundle, the download
+        # (mirror, then GitHub), the SHA-256 check, unpacking, placing. Into a
+        # scratch root rather than the user folder. The bench below then reads
+        # the models from there, so it also checks what the packs hold.
+        run: |
+          python - <<'EOF'
+          import glob, os, sys
+          from modules.packs import pack_manager as pm
+          def bundled(name):
+              hits = glob.glob(f"dist/VideoHighlighter.app/Contents/**/{name}", recursive=True)
+              if not hits:
+                  sys.exit(f"{name} is not in the bundle")
+              return hits[0]
+          lock = pm.load_lock(bundled(pm.LOCK_NAME))
+          seven = bundled("7zz")
+          root = os.path.abspath("pack-root")
+          print(f"lock: {', '.join(lock) or 'no packs'}; 7-Zip: {seven}")
+          for name in sorted(lock):
+              result = pm.install_pack(name, lock=lock, root=root,
+                                       extractor=lambda a, d: pm.extract(a, d, seven_zip=seven))
+              print(f"{name}: {result.message}")
+              if not result.ok:
+                  sys.exit(1)
+          EOF
+          for dir in siglip2-base-patch16-256:VH_FRAME_ENCODER_DIR clip-vit-b32-multilingual:VH_CLIP_MULTILINGUAL_DIR; do
+            if [ -d "pack-root/models/${dir%%:*}" ]; then
+              echo "${dir##*:}=$PWD/pack-root/models/${dir%%:*}" >> "$GITHUB_ENV"
+            fi
+          done
       - name: Measure models on the GPU and look for leaks
         # Nobody on the project has a Mac, and this runner (an M1 VM) reaches
         # Metal: each model's speed on every route, whether its answers match

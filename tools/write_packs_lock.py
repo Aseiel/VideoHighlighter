@@ -29,6 +29,9 @@ def main(argv=None) -> int:
                     help="release download URL of the packs tag, e.g. "
                          "https://github.com/<owner>/<repo>/releases/download/packs-torch-2.7.1")
     ap.add_argument("--packs-json", help="local packs.json (default: <base>/packs.json)")
+    ap.add_argument("--names", default="",
+                    help="comma-separated packs to keep (default: all); the Mac build "
+                         "keeps only the model packs, the PyTorch ones being Windows builds")
     ap.add_argument("--mirror-host", default="",
                     help="the update host serving the download mirror; blank for none")
     ap.add_argument("--out", required=True)
@@ -43,6 +46,9 @@ def main(argv=None) -> int:
             data = json.loads(resp.read().decode("utf-8-sig"))
 
     packs = data.get("packs") or []
+    keep = {n.strip() for n in args.names.split(",") if n.strip()}
+    if keep:
+        packs = [p for p in packs if p.get("name") in keep]
     if not packs:
         print("packs.json lists no packs", file=sys.stderr)
         return 1

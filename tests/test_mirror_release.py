@@ -151,3 +151,18 @@ class TestPrune:
         tags.write_text("null")
         assert mr.main(["prune", "--tags", str(tags), "--keep", "3"]) == 0
         assert capsys.readouterr().out == ""
+
+
+def test_the_mac_lock_keeps_only_the_packs_it_names(tmp_path):
+    # The PyTorch packs are Windows builds; a Mac must never be offered them.
+    from tools import write_packs_lock
+
+    packs = tmp_path / "packs.json"
+    packs.write_text(json.dumps({"tag": "packs-x", "packs": [
+        {"name": n, "asset": f"{n}.7z", "bytes": 5, "sha256": SHA}
+        for n in ("torch-cpu", "torch-cu128", "models-frame-encoder", "models-clip")]}),
+        encoding="utf-8")
+    out = tmp_path / "lock.json"
+    assert write_packs_lock.main(["--base", "https://h/packs-x", "--packs-json", str(packs),
+                                  "--names", "models-frame-encoder", "--out", str(out)]) == 0
+    assert [p["name"] for p in json.loads(out.read_text())["packs"]] == ["models-frame-encoder"]

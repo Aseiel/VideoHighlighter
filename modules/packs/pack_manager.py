@@ -2,8 +2,10 @@
 
 The installer (packaging/installer/videohighlighter-packs.iss) offers the
 NVIDIA PyTorch pack and the CLIP model as checkboxes during setup. The portable
-download has no setup step, so the app itself fetches a pack the first time a
-feature needs it: the user picks the NVIDIA backend, or opens visual search.
+download has no setup step, and neither has the Mac app (its lock lists only the
+model packs, and ships inside the bundle with 7-Zip's macOS build, 7zz), so the
+app itself fetches a pack the first time a feature needs it: the user picks the
+NVIDIA backend, runs action recognition, or opens visual search.
 This module does that for both kinds of install, and holds no Qt, so it is
 testable without a window or a network (``pack_ui`` is the Qt layer).
 
@@ -217,7 +219,18 @@ def target_root() -> str:
 # ---------------------------------------------------------------------------
 
 def lock_path() -> str:
-    return os.environ.get(LOCK_ENV) or os.path.join(exe_dir(), LOCK_NAME)
+    """Beside the exe (Windows), else inside the bundle: a macOS app cannot
+    keep anything but code in Contents/MacOS, so its lock is bundled data."""
+    override = os.environ.get(LOCK_ENV)
+    if override:
+        return override
+    beside = os.path.join(exe_dir(), LOCK_NAME)
+    meipass = getattr(sys, "_MEIPASS", None)
+    if not os.path.isfile(beside) and meipass:
+        bundled = os.path.join(meipass, LOCK_NAME)
+        if os.path.isfile(bundled):
+            return bundled
+    return beside
 
 
 def load_lock(path: Optional[str] = None) -> dict:
@@ -569,8 +582,10 @@ def download_pack(
 # ---------------------------------------------------------------------------
 
 def find_7z() -> Optional[str]:
-    """7-Zip to unpack with: the 7zr.exe shipped beside the app, else one on PATH."""
-    names = ("7zr.exe", "7za.exe", "7z.exe") if sys.platform == "win32" else ("7zr", "7za", "7z")
+    """7-Zip to unpack with: the one shipped with the app (7zr.exe on Windows,
+    7-Zip's own macOS build, 7zz, in the Mac bundle), else one on PATH."""
+    names = (("7zr.exe", "7za.exe", "7z.exe") if sys.platform == "win32"
+             else ("7zz", "7zr", "7za", "7z"))
     dirs = [exe_dir()]
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
