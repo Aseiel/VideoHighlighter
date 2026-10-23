@@ -221,4 +221,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Its check prints the phrases it tried, in Chinese, Japanese and more; a
+    # Windows runner's console is cp1252 and failed the export on them.
+    from modules.system.debug_console import force_utf8_stdio
+    force_utf8_stdio()
     sys.exit(main())
