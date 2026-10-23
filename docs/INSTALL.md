@@ -100,10 +100,12 @@ changing it.
 
 ## GitHub or Hugging Face slow or blocked?
 
-Setup, the script installer and the app can fetch from a download mirror
-outside GitHub and fall back to GitHub, checking every file against its
-SHA-256 whichever host served it. The mirror is not live yet; until it is,
-everything comes from GitHub.
+Every release is mirrored outside GitHub, at
+**[dl.videohighlighter.com](https://dl.videohighlighter.com/downloads/latest/index.html)**,
+which works from mainland China without a VPN. From 0.14.2, Setup, the script
+installer and the app fetch from the mirror first and fall back to GitHub,
+checking every file against its SHA-256 whichever host served it; that covers
+the app, NVIDIA acceleration and the search models.
 
 A model shared on Hugging Face, or weights the app fetches by name, comes from
 huggingface.co, which is out of reach in some places. Set `hf_endpoint` in

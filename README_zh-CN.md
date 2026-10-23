@@ -77,6 +77,8 @@ https://github.com/user-attachments/assets/5c85af94-9228-4537-926a-1ed7a91fa5ee
 - **Windows** — 运行
   [`00-VideoHighlighter-Windows-Setup.exe`](https://github.com/Aseiel/VideoHighlighter/releases/latest/download/00-VideoHighlighter-Windows-Setup.exe)。
   按用户安装，无需管理员权限。安装程序尚未进行代码签名，所以请点击*更多信息 → 仍要运行*。
+- **中国大陆用户：无需梯子，** 直接从镜像下载同样的文件：
+  [dl.videohighlighter.com](https://dl.videohighlighter.com/downloads/latest/index.html)。
 - **macOS** — 把 `.dmg` 拖入“应用程序”，然后清除一次隔离标记：
   `xattr -dr com.apple.quarantine /Applications/VideoHighlighter.app`
   （[原因](docs/INSTALL.md#macos)）。

@@ -89,6 +89,8 @@ Grab a build from [Releases](https://github.com/Aseiel/VideoHighlighter/releases
   [`00-VideoHighlighter-Windows-Setup.exe`](https://github.com/Aseiel/VideoHighlighter/releases/latest/download/00-VideoHighlighter-Windows-Setup.exe).
   Per-user, no admin. It is not code-signed yet, so click through *More info →
   Run anyway*.
+- **GitHub slow or blocked where you are?** The same files are mirrored at
+  [dl.videohighlighter.com](https://dl.videohighlighter.com/downloads/latest/index.html).
 - **macOS** — drag the `.dmg` into Applications, then clear the quarantine flag
   once: `xattr -dr com.apple.quarantine /Applications/VideoHighlighter.app`
   ([why](docs/INSTALL.md#macos)).

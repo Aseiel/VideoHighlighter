@@ -116,8 +116,11 @@ code {{ font-size: 12px; word-break: break-all; }}
 <body>
 <h1>VideoHighlighter {tag}</h1>
 <p>A mirror of the release on GitHub. Windows: run
-<strong>00-VideoHighlighter-Windows-Setup.exe</strong>. It downloads GPU
-acceleration and the search models from this mirror too.</p>
+<strong>00-VideoHighlighter-Windows-Setup.exe</strong>. From 0.14.2 on, Setup
+and the app download GPU acceleration and the search models from this mirror
+too.</p>
+<p lang="zh-CN">中国大陆用户：无需梯子，直接从这里下载。Windows 请运行
+<strong>00-VideoHighlighter-Windows-Setup.exe</strong>。</p>
 {notes}<table>
 {chr(10).join(rows)}
 </table>

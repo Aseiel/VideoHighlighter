@@ -80,6 +80,8 @@ https://github.com/user-attachments/assets/5c85af94-9228-4537-926a-1ed7a91fa5ee
   [`00-VideoHighlighter-Windows-Setup.exe`](https://github.com/Aseiel/VideoHighlighter/releases/latest/download/00-VideoHighlighter-Windows-Setup.exe)
   を実行します。ユーザー単位のインストールで、管理者権限は不要です。まだコード署名されていないため、
   *詳細情報 → 実行* をクリックしてください。
+- **GitHub が遅い、またはつながらない場合**は、同じファイルを
+  [dl.videohighlighter.com](https://dl.videohighlighter.com/downloads/latest/index.html) からも入手できます。
 - **macOS** — `.dmg` をアプリケーションフォルダにドラッグし、隔離フラグを一度だけ外します：
   `xattr -dr com.apple.quarantine /Applications/VideoHighlighter.app`
   （[理由](docs/INSTALL.md#macos)）。
