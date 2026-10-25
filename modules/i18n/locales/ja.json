@@ -1062,5 +1062,17 @@
   "🧠  Teach a model to find this — draw a box…": "🧠  これを見つけるようモデルに教える — 枠を描いてください…",
   "Choose your language": "言語を選択してください",
   "VideoHighlighter's menus, and the language it listens for in transcripts, writes subtitles and narration in, and understands in search, all follow this. You can change it later under About.": "VideoHighlighter のメニュー、文字起こしで聞き取る言語、字幕とナレーションを書く言語、検索で理解する言語は、すべてこの設定に従います。あとで「バージョン情報」から変更できます。",
-  "Visual search understands queries in English only. This model lets it understand them in your language too.": "ビジュアル検索は英語のクエリしか理解できません。このモデルを使うと、あなたの言語でも理解できるようになります。"
+  "Visual search understands queries in English only. This model lets it understand them in your language too.": "ビジュアル検索は英語のクエリしか理解できません。このモデルを使うと、あなたの言語でも理解できるようになります。",
+  "<b>VideoHighlighter Pro</b> adds ways to measure them that this edition doesn't have: {ways}.": "<b>VideoHighlighter Pro</b> には、この版にはない測定方法があります: {ways}。",
+  "<b>{video}</b> has a low-resolution preview from the camera beside it ({preview}). <b>VideoHighlighter Pro</b> can analyse that preview instead, which is quicker on long high-resolution recordings, and still cut from the full-quality original.": "<b>{video}</b> の横に、カメラが作成した低解像度のプレビュー ({preview}) があります。<b>VideoHighlighter Pro</b> はこのプレビューを代わりに解析でき、長い高解像度の録画ではより速く、切り出しは元のフル画質ファイルから行います。",
+  "Free edition · <a href=\"{url}\">What's in Pro?</a>": "無料版 · <a href=\"{url}\">Pro でできること</a>",
+  "If what you asked about isn't one of this video's classes, no rule can add it — a rule only arranges what the detector found. You can teach a model to find it: right-click it in the player, then <i>Teach a model</i>. <b>VideoHighlighter Pro</b> can also look for it by name straight away, with no training.": "お尋ねのものがこの動画のクラスに含まれていない場合、ルールでは追加できません。ルールは検出器が見つけたものを並べるだけです。モデルに教えて見つけさせることはできます。プレーヤーでそれを右クリックし、<i>モデルに教える</i>を選んでください。<b>VideoHighlighter Pro</b> なら、学習なしで名前からすぐに探すこともできます。",
+  "Marks side-by-side VR/3D footage. This edition analyses the whole frame either way; the Timeline Viewer's “VR Half-Frame” shows one eye.": "サイドバイサイドの VR/3D 映像であることを示します。この版はどちらの場合もフレーム全体を解析します。Timeline Viewer の「VR ハーフフレーム」は片目を表示します。",
+  "Pro has a free {days}-day trial.": "Pro は {days} 日間無料で試せます。",
+  "The selected detector has no class called <b>{names}</b>, so a run will not find it. If it is not a typo, you can teach a model to find it: right-click it in the player, then <i>Teach a model</i>. <b>VideoHighlighter Pro</b> can also look for it by name straight away, with no training.": "選択中の検出器には <b>{names}</b> というクラスがないため、実行しても見つかりません。入力ミスでなければ、モデルに教えて見つけさせることができます。プレーヤーでそれを右クリックし、<i>モデルに教える</i>を選んでください。<b>VideoHighlighter Pro</b> なら、学習なしで名前からすぐに探すこともできます。",
+  "These five expressions are what this edition reads on a face. <b>VideoHighlighter Pro</b> learns face categories of your own from a few example faces you pick, for anything the five do not cover.": "この版が顔から読み取るのは、この 5 つの表情です。<b>VideoHighlighter Pro</b> は、選んだ数枚の顔の例から独自の顔カテゴリを学習し、5 つでは表せないものにも対応します。",
+  "This edition analyses the whole frame of side-by-side footage. <b>VideoHighlighter Pro</b> analyses just one eye, or the left, right or centre of the frame, and can pick which on its own.": "この版はサイドバイサイド映像のフレーム全体を解析します。<b>VideoHighlighter Pro</b> は片目だけ、またはフレームの左・右・中央だけを解析し、どれにするかを自動で選ぶこともできます。",
+  "This report lists 1 thing that was said but not measured.": "このレポートには、話されたが測定されていない事柄が 1 件あります。",
+  "This report lists {n} things that were said but not measured.": "このレポートには、話されたが測定されていない事柄が {n} 件あります。",
+  "Your own face categories… (Pro)": "独自の顔カテゴリ… (Pro)"
 }

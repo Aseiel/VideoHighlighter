@@ -1682,6 +1682,12 @@ class VideoHighlighterGUI(QWidget):
             act.setChecked(_label in chosen)
             act.toggled.connect(self._update_face_labels_button)
             self._face_label_actions[_label] = act
+        from modules.ui import pro_offer as _pro_offer
+        if _pro_offer.is_free_build() and _pro_offer.is_enabled():
+            face_menu.addSeparator()
+            pro_act = face_menu.addAction("Your own face categories… (Pro)")
+            pro_act.triggered.connect(
+                lambda: self._show_pro_offer(_pro_offer.for_face_category()))
         self.btn_face_labels.setMenu(face_menu)
         self._update_face_labels_button()
 
@@ -1923,6 +1929,7 @@ class VideoHighlighterGUI(QWidget):
         self.load_objects_btn.setToolTip("Load labels from yolo_objects_labels.json")
         self.load_objects_btn.clicked.connect(self.open_object_label_selector)
         obj_layout.addWidget(self.load_objects_btn)
+        self.objects_input.editingFinished.connect(self._check_typed_objects)
         basic_layout.addLayout(obj_layout, 1, 0, 1, 2)
 
         # Action keywords
@@ -2071,8 +2078,11 @@ class VideoHighlighterGUI(QWidget):
         self.vr_mode_chk = QCheckBox("VR side-by-side optimization")
         self.vr_mode_chk.setChecked(bool(advanced_cfg.get("vr_mode", False)))
         self.vr_mode_chk.setToolTip(
-            "Run visual analysis on the left half only for side-by-side VR/3D videos."
+            "Marks side-by-side VR/3D footage. This edition analyses the whole "
+            "frame either way; the Timeline Viewer's “VR Half-Frame” shows one eye."
         )
+        # clicked, not toggled: loading saved settings must not count as asking.
+        self.vr_mode_chk.clicked.connect(self._on_vr_mode_clicked)
         motion_layout.addRow("", self.vr_mode_chk)
         motion_box.setLayout(motion_layout)
         advanced_layout.addWidget(motion_box, 1, 0)
@@ -3225,7 +3235,20 @@ class VideoHighlighterGUI(QWidget):
         log_widget = QWidget()
         log_layout = QVBoxLayout(log_widget)
         log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.addWidget(QLabel(i18n.t("Log Output:")))
+        # The log's header row has the width to spare, so the one always-there
+        # mention of Pro sits at its right end: no row of its own, nothing that
+        # moves or pops up. Hidden in Pro and once suggestions are switched off.
+        log_header = QHBoxLayout()
+        log_header.setContentsMargins(0, 0, 0, 0)
+        log_header.addWidget(QLabel(i18n.t("Log Output:")))
+        log_header.addStretch()
+        self.pro_footer = QLabel()
+        self.pro_footer.setOpenExternalLinks(True)
+        self.pro_footer.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.pro_footer.setStyleSheet("color: #888; font-size: 9pt;")
+        log_header.addWidget(self.pro_footer)
+        self._sync_pro_footer()
+        log_layout.addLayout(log_header)
         log_layout.addWidget(self.log_output)
         content_splitter.addWidget(log_widget)
         content_splitter.setStretchFactor(0, 3)
@@ -3493,6 +3516,77 @@ class VideoHighlighterGUI(QWidget):
             chk.blockSignals(True)
             chk.setChecked(False)
             chk.blockSignals(False)
+        self._sync_pro_footer()
+
+    def _set_pro_offer_enabled(self, enabled):
+        """The About tab's switch: the banners and the footer link together."""
+        from modules.ui import pro_offer
+
+        pro_offer.set_enabled(enabled)
+        self._sync_pro_footer()
+
+    def _sync_pro_footer(self):
+        footer = getattr(self, "pro_footer", None)
+        if footer is None:
+            return
+        from modules.ui import pro_offer
+
+        show = pro_offer.is_free_build() and pro_offer.is_enabled()
+        if show:
+            footer.setText(pro_offer.footer_text())
+        footer.setVisible(show)
+
+    def _known_object_labels(self):
+        """Every object class the selected detector can report; empty when
+        that cannot be told (no labels file, unreadable model)."""
+        yolo_type = self.object_detector_choice()[0]
+        labels = []
+        if "custom" in yolo_type:
+            labels = list(self.custom_object_class_names())
+        if yolo_type != "custom" and os.path.exists(YOLO_OBJECTS_LABELS_FILE):
+            labels += self.load_labels_from_json(YOLO_OBJECTS_LABELS_FILE)
+        return labels
+
+    def _check_typed_objects(self):
+        """Say when a typed object can never be found by the selected detector.
+
+        True in either edition, so the log line is always written; the Pro
+        banner after it is the pro_offer module's decision. Said once per set
+        of unknown names, not on every focus change.
+        """
+        from modules.ui import pro_offer
+
+        known = self._known_object_labels()
+        if not known:
+            return
+        typed = [s.strip() for s in self.objects_input.text().split(",")]
+        unknown = pro_offer.unknown_objects(typed, known)
+        if unknown == getattr(self, "_last_unknown_objects", []):
+            return
+        self._last_unknown_objects = unknown
+        if not unknown:
+            return
+        self.append_log(
+            f"⚠️ The selected detector has no class called: {', '.join(unknown)}. "
+            "A run will not find it. Load Labels lists the ones it has.")
+        self._show_pro_offer(pro_offer.for_unknown_objects(unknown))
+
+    def _on_vr_mode_clicked(self, checked):
+        if checked:
+            from modules.ui import pro_offer
+            self._show_pro_offer(pro_offer.for_vr())
+
+    def _offer_pro_for_videos(self, paths):
+        """After videos are added: mention Pro if a camera preview sits beside one."""
+        from modules.ui import pro_offer
+
+        if not pro_offer.may_offer("lrv_proxy"):
+            return
+        for path in paths or []:
+            preview = pro_offer.lrv_companion(path)
+            if preview:
+                self._show_pro_offer(pro_offer.for_lrv(path, preview))
+                return
 
     def _start_update_check(self, force=False):
         """Kick off the manifest check in the background.
@@ -3740,7 +3834,7 @@ class VideoHighlighterGUI(QWidget):
         self.pro_offer_chk.setToolTip(
             "A one-line banner after, for example, a rule that can't be built "
             "from this video's classes. Never at startup, never in a report.")
-        self.pro_offer_chk.toggled.connect(_pro_offer.set_enabled)
+        self.pro_offer_chk.toggled.connect(self._set_pro_offer_enabled)
         pro_layout.addWidget(self.pro_offer_chk)
         layout.addWidget(pro_group)
 
@@ -4583,6 +4677,7 @@ class VideoHighlighterGUI(QWidget):
         for path in file_paths:
             if path not in existing:
                 self.file_list.addItem(path)
+        self._offer_pro_for_videos(file_paths)
         
         # Auto-set output filename based on first video if output is empty or default
         if file_paths and (not self.output_input.text().strip() or 

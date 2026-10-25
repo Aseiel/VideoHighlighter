@@ -1062,5 +1062,17 @@
   "🧠  Teach a model to find this — draw a box…": "🧠  教模型识别这个 — 画一个框…",
   "Choose your language": "选择您的语言",
   "VideoHighlighter's menus, and the language it listens for in transcripts, writes subtitles and narration in, and understands in search, all follow this. You can change it later under About.": "VideoHighlighter 的菜单，以及它在转录中识别的语言、撰写字幕和旁白所用的语言、在搜索中理解的语言，都会跟随此设置。之后可以在“关于”中更改。",
-  "Visual search understands queries in English only. This model lets it understand them in your language too.": "视觉搜索只能理解英文查询。此模型让它也能理解您的语言。"
+  "Visual search understands queries in English only. This model lets it understand them in your language too.": "视觉搜索只能理解英文查询。此模型让它也能理解您的语言。",
+  "<b>VideoHighlighter Pro</b> adds ways to measure them that this edition doesn't have: {ways}.": "<b>VideoHighlighter Pro</b> 提供了此版本没有的测量方式：{ways}。",
+  "<b>{video}</b> has a low-resolution preview from the camera beside it ({preview}). <b>VideoHighlighter Pro</b> can analyse that preview instead, which is quicker on long high-resolution recordings, and still cut from the full-quality original.": "<b>{video}</b> 旁边有相机生成的低分辨率预览（{preview}）。<b>VideoHighlighter Pro</b> 可以改为分析该预览，处理长时间的高分辨率录像更快，剪辑仍取自全画质原片。",
+  "Free edition · <a href=\"{url}\">What's in Pro?</a>": "免费版 · <a href=\"{url}\">Pro 有什么？</a>",
+  "If what you asked about isn't one of this video's classes, no rule can add it — a rule only arranges what the detector found. You can teach a model to find it: right-click it in the player, then <i>Teach a model</i>. <b>VideoHighlighter Pro</b> can also look for it by name straight away, with no training.": "如果你问的内容不是本视频的类别之一，任何规则都无法添加它——规则只会编排检测器找到的内容。你可以教模型去找到它：在播放器中右键点击它，然后选择<i>教模型识别</i>。<b>VideoHighlighter Pro</b> 还能直接按名称查找，无需训练。",
+  "Marks side-by-side VR/3D footage. This edition analyses the whole frame either way; the Timeline Viewer's “VR Half-Frame” shows one eye.": "标记并排的 VR/3D 画面。此版本无论如何都会分析整帧；Timeline Viewer 中的“VR 半画面”只显示单眼。",
+  "Pro has a free {days}-day trial.": "Pro 可免费试用 {days} 天。",
+  "The selected detector has no class called <b>{names}</b>, so a run will not find it. If it is not a typo, you can teach a model to find it: right-click it in the player, then <i>Teach a model</i>. <b>VideoHighlighter Pro</b> can also look for it by name straight away, with no training.": "所选检测器没有名为 <b>{names}</b> 的类别，因此运行时找不到它。如果不是拼写错误，你可以教模型去找到它：在播放器中右键点击它，然后选择<i>教模型识别</i>。<b>VideoHighlighter Pro</b> 还能直接按名称查找，无需训练。",
+  "These five expressions are what this edition reads on a face. <b>VideoHighlighter Pro</b> learns face categories of your own from a few example faces you pick, for anything the five do not cover.": "此版本从人脸上识别的就是这五种表情。<b>VideoHighlighter Pro</b> 能从你挑选的几张示例人脸中学习你自己的人脸类别，覆盖这五种之外的任何内容。",
+  "This edition analyses the whole frame of side-by-side footage. <b>VideoHighlighter Pro</b> analyses just one eye, or the left, right or centre of the frame, and can pick which on its own.": "此版本会分析并排画面的整帧。<b>VideoHighlighter Pro</b> 只分析单眼，或画面的左、右、中部，并能自动选择分析哪一部分。",
+  "This report lists 1 thing that was said but not measured.": "本报告列出 1 项被提到但未被测量的内容。",
+  "This report lists {n} things that were said but not measured.": "本报告列出 {n} 项被提到但未被测量的内容。",
+  "Your own face categories… (Pro)": "你自己的人脸类别…（Pro）"
 }

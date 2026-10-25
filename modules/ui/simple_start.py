@@ -384,6 +384,9 @@ class SimpleStartPage(QWidget):
             if path not in existing:
                 self._gui.file_list.addItem(path)
                 existing.add(path)
+        offer = getattr(self._gui, "_offer_pro_for_videos", None)
+        if offer is not None:
+            offer(paths)
         if paths:
             from os.path import basename, exists, splitext
             first = paths[0]

@@ -85,6 +85,81 @@ class TestUnbuildableRule:
         assert f"{pro_offer.TRIAL_DAYS}-day trial" in offer.text
 
 
+class TestAsked:
+    """The Pro entry in the expression picker answers a click, so it is not
+    held back the way an interruption is."""
+
+    def test_a_click_is_answered_inside_the_cooldowns(self):
+        pro_offer.mark_shown("face_category", NOW)
+        assert pro_offer.for_face_category(NOW) is not None
+
+    def test_a_click_is_answered_when_switched_off(self):
+        pro_offer.set_enabled(False)
+        assert pro_offer.for_face_category(NOW) is not None
+
+    def test_but_not_in_a_pro_build(self, monkeypatch):
+        monkeypatch.setattr(pro_offer, "__edition__", "Pro")
+        assert pro_offer.for_face_category(NOW) is None
+
+    def test_offered_moments_still_wait(self):
+        pro_offer.mark_shown("vr_region", NOW)
+        assert pro_offer.for_vr(NOW) is None
+
+
+class TestUnknownObjects:
+    KNOWN = ["bench_vice", "lathe", "person"]
+
+    def test_names_only_what_the_detector_lacks(self):
+        assert pro_offer.unknown_objects(
+            ["lathe", " drill_press ", "", "drill_press"], self.KNOWN) == ["drill_press"]
+
+    def test_the_match_is_exact_like_the_run(self):
+        assert pro_offer.unknown_objects(["Lathe"], self.KNOWN) == ["Lathe"]
+
+    def test_the_offer_names_them_and_escapes_them(self):
+        offer = pro_offer.for_unknown_objects(["drill<b>"], NOW)
+        assert offer.moment == "object_unknown"
+        assert "drill&lt;b&gt;" in offer.text
+        assert "Teach a model" in offer.text
+
+    def test_nothing_unknown_says_nothing(self):
+        assert pro_offer.for_unknown_objects([], NOW) is None
+
+
+class TestLrv:
+    def _touch(self, folder, *names):
+        for name in names:
+            (folder / name).write_bytes(b"")
+
+    def test_gopro_preview_beside_the_master(self, tmp_path):
+        self._touch(tmp_path, "GX010527.MP4", "GL010527.LRV", "GL010528.LRV")
+        assert pro_offer.lrv_companion(str(tmp_path / "GX010527.MP4")) == "GL010527.LRV"
+
+    def test_insta360_preview_beside_the_master(self, tmp_path):
+        self._touch(tmp_path, "VID_20260901_101500_00_042.mp4",
+                    "LRV_20260901_101500_11_042.lrv")
+        assert (pro_offer.lrv_companion(str(tmp_path / "VID_20260901_101500_00_042.mp4"))
+                == "LRV_20260901_101500_11_042.lrv")
+
+    def test_no_preview_no_offer(self, tmp_path):
+        self._touch(tmp_path, "GX010527.MP4", "holiday.mp4")
+        assert pro_offer.lrv_companion(str(tmp_path / "GX010527.MP4")) is None
+        assert pro_offer.lrv_companion(str(tmp_path / "holiday.mp4")) is None
+        assert pro_offer.for_lrv(str(tmp_path / "GX010527.MP4"), None, NOW) is None
+
+    def test_an_lrv_added_on_its_own_is_its_own_preview(self, tmp_path):
+        assert pro_offer.lrv_companion(str(tmp_path / "GL010527.LRV")) == "GL010527.LRV"
+
+    def test_the_offer_names_both_files(self, tmp_path):
+        offer = pro_offer.for_lrv(str(tmp_path / "GX010527.MP4"), "GL010527.LRV", NOW)
+        assert "GX010527.MP4" in offer.text and "GL010527.LRV" in offer.text
+
+
+class TestFooter:
+    def test_links_to_the_pro_page(self):
+        assert f'href="{pro_offer.PRO_URL}"' in pro_offer.footer_text()
+
+
 class TestReport:
     def test_speaks_when_only_a_missing_engine_could_measure_it(self):
         offer = pro_offer.for_report(_report(),
