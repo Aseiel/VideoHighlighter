@@ -996,7 +996,7 @@ jobs:
             # slow or cut off for. "Ladder" (梯子) is what a VPN is called there.
             if [ -n "$UPDATE_BASE_URL" ]; then
               mirror="${UPDATE_BASE_URL%/}/downloads"
-              echo "**中国大陆用户：无需梯子，直接用这个链接下载 →** [00-VideoHighlighter-Windows-Setup.exe]($mirror/$SLUG/00-VideoHighlighter-Windows-Setup.exe)（[全部文件]($mirror/latest/index.html)）"
+              echo "**中国大陆用户：无需梯子，直接用这个链接下载 →** Windows：[00-VideoHighlighter-Windows-Setup.exe]($mirror/$SLUG/00-VideoHighlighter-Windows-Setup.exe)　macOS：[VideoHighlighter-$SLUG.dmg]($mirror/$SLUG/VideoHighlighter-$SLUG.dmg)（[全部文件]($mirror/latest/index.html)）"
               echo ""
             fi
             echo "One file. Run it, click through, done. It installs the app with"
