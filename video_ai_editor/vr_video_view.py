@@ -25,12 +25,28 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, QObject, QSize, QUrl
+from PySide6.QtCore import Qt, QObject, QPoint, QSize, QUrl, Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout
+
+
+def shown_to_frame_roi(roi, vr_mode: bool) -> tuple:
+    """A box as fractions of the picture on screen -> fractions of the whole
+    frame. They differ only in VR mode, where the screen shows the left eye,
+    i.e. the left half of the frame."""
+    x, y, w, h = (float(v) for v in roi)
+    if vr_mode:
+        x, w = x / 2.0, w / 2.0
+    return x, y, w, h
 
 
 class VRVideoView(QWidget):
     """QML VideoOutput cropped to the left eye of a side-by-side frame."""
+
+    # Right-click and draw-a-box on the plain surface (see VRVideoOutput.qml),
+    # so the Off and Precomp modes offer what the Live overlay's right-click
+    # does. Not available in the QVideoWidget fallback.
+    context_requested = Signal(object)    # global QPoint
+    region_drawn = Signal(object)         # (x, y, w, h) fractions of the whole frame
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -40,6 +56,7 @@ class VRVideoView(QWidget):
         self._quick = None
         self._video_widget = None
         self._fallback = False
+        self._vr_mode = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -74,6 +91,9 @@ class VRVideoView(QWidget):
                 return False
             self._quick = quick
             layout.addWidget(quick)
+            root = quick.rootObject()
+            root.contextRequested.connect(self._on_qml_context)
+            root.regionDrawn.connect(self._on_qml_region)
             return True
         except Exception as e:  # noqa: BLE001 — any QtQuick/QML problem -> fall back
             print(f"⚠️ VRVideoView: QML unavailable ({e}); falling back to a plain "
@@ -120,11 +140,32 @@ class VRVideoView(QWidget):
         its OSD exactly once regardless of how often VR is toggled.
 
         No-op in the QVideoWidget fallback (that path can't GPU-crop)."""
+        self._vr_mode = bool(enabled)
         if self._fallback or self._quick is None:
             return
         root = self._quick.rootObject()
         if root is not None:
             root.setProperty("vrMode", bool(enabled))
+
+    def can_draw_region(self) -> bool:
+        """Whether right-click and draw-a-box work here (the QML surface)."""
+        return not self._fallback and self._quick is not None
+
+    def begin_region_draw(self) -> None:
+        """Arm the box: the next left-drag draws it and emits `region_drawn`.
+        Esc or a right-click cancels."""
+        if not self.can_draw_region():
+            return
+        root = self._quick.rootObject()
+        if root is not None:
+            root.setProperty("drawing", True)
+            self._quick.setFocus()
+
+    def _on_qml_context(self, x, y):
+        self.context_requested.emit(self._quick.mapToGlobal(QPoint(int(x), int(y))))
+
+    def _on_qml_region(self, x, y, w, h):
+        self.region_drawn.emit(shown_to_frame_roi((x, y, w, h), self._vr_mode))
 
     def _refresh_resolution(self) -> None:
         if self._player is None:

@@ -209,13 +209,16 @@ def test_a_box_drawn_in_the_player_becomes_a_seed(app, tmp_path, monkeypatch):
 
     from modules.teach import project as project_mod
     from video_ai_editor import realtime_overlay as ro
+    from video_ai_editor import teach_from_box
 
     monkeypatch.setattr(project_mod, "projects_root", lambda: str(tmp_path))
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"video")
     shown = []
-    monkeypatch.setattr(ro.QMessageBox, "information", lambda *a: shown.append(a[2]))
-    monkeypatch.setattr(ro.QMessageBox, "warning", lambda *a: shown.append("warn: " + a[2]))
+    monkeypatch.setattr(teach_from_box.QMessageBox, "information",
+                        lambda *a: shown.append(a[2]))
+    monkeypatch.setattr(teach_from_box.QMessageBox, "warning",
+                        lambda *a: shown.append("warn: " + a[2]))
     player = SimpleNamespace(
         _scene=SimpleNamespace(sceneRect=lambda: QRectF(0, 0, 200, 100)),
         _player=SimpleNamespace(position=lambda: 12500), video_path=str(video))

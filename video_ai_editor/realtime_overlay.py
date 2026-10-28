@@ -54,7 +54,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
     QGraphicsRectItem, QGraphicsTextItem, QGraphicsEllipseItem, QGraphicsPolygonItem,
     QCheckBox, QLabel, QGroupBox, QComboBox, QSlider, QGraphicsItem, QMenu, QInputDialog,
-    QToolButton, QMessageBox,
+    QToolButton,
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -1686,17 +1686,17 @@ class RealtimeOverlayPreview(QWidget):
         """Right-click on nothing detected — offers to teach a model to find
         what is there (modules/teach/from_player.py): one box, a name, and the
         rest happens in the background while the app is idle."""
+        from video_ai_editor import teach_from_box
+
         menu = QMenu(self)
-        a_model = menu.addAction("🧠  Teach a model to find this — draw a box…")
+        a_model = menu.addAction(teach_from_box.MENU_TEXT)
         chosen = menu.exec(global_pos)
         if chosen is not a_model:
             return
-        name, ok = QInputDialog.getText(
-            self, "Teach a model",
-            "What is it? (a name; the same name again adds another view)")
-        if not (ok and name.strip()):
+        name = teach_from_box.ask_model_name(self)
+        if name is None:
             return
-        self._pending_model_name = name.strip()
+        self._pending_model_name = name
         self._view.begin_teach_draw()
 
     def _normalized_region(self, scene_rect):
@@ -1722,17 +1722,10 @@ class RealtimeOverlayPreview(QWidget):
     def _teach_model(self, name: str, scene_rect):
         """Seed a background-taught model from the drawn box (from_player)."""
         region = self._normalized_region(scene_rect)
-        if region is None or not self.video_path:
+        if region is None:
             return
-        from modules.teach.from_player import message, teach
-        try:
-            result = teach(self.video_path, region[1], region[0], name)
-        except (ValueError, OSError) as exc:
-            QMessageBox.warning(self, "Teach a model", str(exc))
-            return
-        print(f"teach: seeded {result['class']!r} in {result['root']} "
-              f"({result['seeds']} seeds)")
-        QMessageBox.information(self, "Teach a model", message(result))
+        from video_ai_editor import teach_from_box
+        teach_from_box.teach(self, self.video_path, region[0], region[1], name)
 
     def _on_teach_region(self, scene_rect):
         """A box was drawn after "Teach a model…"."""

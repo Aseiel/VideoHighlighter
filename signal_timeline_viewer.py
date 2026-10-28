@@ -830,6 +830,11 @@ class SignalTimelineWindow(QMainWindow):
         self.video_player.setAudioOutput(self.audio_output)
         self.video_player.setVideoOutput(self.video_view.video_output)
         self.video_view.attach_player(self.video_player)  # crop tracks real resolution
+        # Right-click on the plain video: what the Live overlay's right-click
+        # offers, without switching the overlay on.
+        self._pending_box_name = None
+        self.video_view.context_requested.connect(self._on_plain_video_context)
+        self.video_view.region_drawn.connect(self._on_plain_video_region)
         self.video_player.setSource(QUrl.fromLocalFile(self.video_path))
         self.audio_output.setVolume(0.8)
 
@@ -979,6 +984,37 @@ class SignalTimelineWindow(QMainWindow):
 
         dock.setWidget(preview_widget)
         return dock
+
+    def _on_plain_video_context(self, global_pos):
+        """Right-click on the plain video (Off / Precomp): teach a model from a
+        box drawn on the paused frame (video_ai_editor.teach_from_box)."""
+        from PySide6.QtWidgets import QMenu
+
+        from video_ai_editor import teach_from_box
+
+        if not getattr(self, "video_path", ""):
+            return
+        menu = QMenu(self)
+        a_model = menu.addAction(teach_from_box.MENU_TEXT)
+        if menu.exec(global_pos) is not a_model:
+            return
+        name = teach_from_box.ask_model_name(self)
+        if name is None:
+            return
+        self._pending_box_name = name
+        # The box is taken from the frame on screen, so hold that frame still.
+        self.video_player.pause()
+        self.video_view.begin_region_draw()
+
+    def _on_plain_video_region(self, roi):
+        """A box was drawn on the plain video after "Teach a model…"."""
+        from video_ai_editor import teach_from_box
+
+        name, self._pending_box_name = self._pending_box_name, None
+        if not name:
+            return
+        seconds = self.video_player.position() / 1000.0
+        teach_from_box.teach(self, self.video_path, roi, seconds, name)
 
     def _on_overlay_mode_changed(self, text):
         """Switch between Off / Live / Precomp overlay modes."""
