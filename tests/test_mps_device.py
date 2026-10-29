@@ -94,6 +94,14 @@ class TestClip:
         assert cp.ClipFramePrefilter.import_error("CPU") is None
 
 
+def _load_model(monkeypatch, tr, load):
+    """Swap the whole whisper module, not its attribute: where whisper is a
+    MagicMock (conftest, no whisper installed), pytest 9.2 undoes an
+    attribute patch by deleting it, and a deleted mock attribute stays gone
+    for every later test."""
+    monkeypatch.setattr(tr, "whisper", types.SimpleNamespace(load_model=load))
+
+
 class _Model:
     def __init__(self, fail_to=None):
         self._buffers = {"alignment_heads": "sparse-on-cpu"}
@@ -129,8 +137,8 @@ class TestWhisper:
         from modules.audio import transcript as tr
         monkeypatch.setattr(mps_device, "is_mps", lambda d: d == "mps")
         loads = []
-        monkeypatch.setattr(tr.whisper, "load_model",
-                            lambda name, device: loads.append(device) or _Model())
+        _load_model(monkeypatch, tr,
+                    lambda name, device: loads.append(device) or _Model())
         model, device = tr.load_whisper("base", "mps")
         assert (device, model.device, loads) == ("mps", "mps", ["cpu"])
         assert model.buffers_moved == {}          # moved without it...
@@ -141,7 +149,7 @@ class TestWhisper:
         from modules.audio import transcript as tr
         whisper_checks["ok"] = False
         lines = []
-        monkeypatch.setattr(tr.whisper, "load_model", lambda name, device: _Model())
+        _load_model(monkeypatch, tr, lambda name, device: _Model())
         model, device = tr.load_whisper("base", "mps", lines.append)
         assert device == "cpu"
         assert "answers differently" in lines[0]
@@ -149,8 +157,8 @@ class TestWhisper:
     def test_a_failed_move_is_the_processor_not_an_error(self, monkeypatch, whisper_checks):
         from modules.audio import transcript as tr
         lines = []
-        monkeypatch.setattr(tr.whisper, "load_model",
-                            lambda name, device: _Model(fail_to="mps"))
+        _load_model(monkeypatch, tr,
+                    lambda name, device: _Model(fail_to="mps"))
         model, device = tr.load_whisper("base", "mps", lines.append)
         assert device == "cpu"
         assert "Apple GPU" in lines[0]
@@ -158,8 +166,8 @@ class TestWhisper:
     def test_other_devices_load_as_before(self, monkeypatch):
         from modules.audio import transcript as tr
         loads = []
-        monkeypatch.setattr(tr.whisper, "load_model",
-                            lambda name, device: loads.append(device) or _Model())
+        _load_model(monkeypatch, tr,
+                    lambda name, device: loads.append(device) or _Model())
         assert tr.load_whisper("base", "cuda")[1] == "cuda"
         assert loads == ["cuda"]
 
