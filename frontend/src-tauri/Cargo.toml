@@ -1,6 +1,6 @@
 [package]
 name = "video-highlighter"
-version = "0.14.2"
+version = "0.14.3"
 description = "Video Highlighter"
 authors = ["thewbuk"]
 edition = "2021"
