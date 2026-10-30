@@ -1074,5 +1074,14 @@
   "This edition analyses the whole frame of side-by-side footage. <b>VideoHighlighter Pro</b> analyses just one eye, or the left, right or centre of the frame, and can pick which on its own.": "이 버전은 사이드 바이 사이드 영상의 전체 프레임을 분석합니다. <b>VideoHighlighter Pro</b>는 한쪽 눈만, 또는 프레임의 왼쪽·오른쪽·가운데만 분석하며 어느 쪽인지 스스로 고를 수도 있습니다.",
   "This report lists 1 thing that was said but not measured.": "이 보고서에는 언급되었지만 측정되지 않은 항목이 1개 있습니다.",
   "This report lists {n} things that were said but not measured.": "이 보고서에는 언급되었지만 측정되지 않은 항목이 {n}개 있습니다.",
-  "Your own face categories… (Pro)": "나만의 얼굴 카테고리… (Pro)"
+  "Your own face categories… (Pro)": "나만의 얼굴 카테고리… (Pro)",
+  "About VideoHighlighter": "VideoHighlighter 정보",
+  "Check for updates": "업데이트 확인",
+  "Help": "도움말",
+  "How to use": "사용 방법",
+  "Open debug log file": "디버그 로그 파일 열기",
+  "View": "보기",
+  "CapCut / Jianying project": "CapCut / Jianying 프로젝트",
+  "Export clips": "클립 내보내기",
+  "Score only (no video)": "점수만 매기기(동영상 없음)"
 }

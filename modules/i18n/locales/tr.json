@@ -1074,5 +1074,14 @@
   "This edition analyses the whole frame of side-by-side footage. <b>VideoHighlighter Pro</b> analyses just one eye, or the left, right or centre of the frame, and can pick which on its own.": "Bu sürüm yan yana çekimlerde karenin tamamını analiz eder. <b>VideoHighlighter Pro</b> yalnızca bir gözü ya da karenin sol, sağ veya orta kısmını analiz eder ve hangisi olacağını kendisi seçebilir.",
   "This report lists 1 thing that was said but not measured.": "Bu rapor, söylenen ama ölçülmeyen 1 şeyi listeliyor.",
   "This report lists {n} things that were said but not measured.": "Bu rapor, söylenen ama ölçülmeyen {n} şeyi listeliyor.",
-  "Your own face categories… (Pro)": "Kendi yüz kategorileriniz… (Pro)"
+  "Your own face categories… (Pro)": "Kendi yüz kategorileriniz… (Pro)",
+  "About VideoHighlighter": "VideoHighlighter hakkında",
+  "Check for updates": "Güncellemeleri denetle",
+  "Help": "Yardım",
+  "How to use": "Nasıl kullanılır",
+  "Open debug log file": "Hata ayıklama günlüğünü aç",
+  "View": "Görünüm",
+  "CapCut / Jianying project": "CapCut / Jianying projesi",
+  "Export clips": "Klipleri dışa aktar",
+  "Score only (no video)": "Yalnızca puanla (video yok)"
 }
