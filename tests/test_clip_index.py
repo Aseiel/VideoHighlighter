@@ -177,3 +177,59 @@ class TestPersistence:
         assert index.matches(str(video), "m")               # memo: interval unchecked
         video.write_bytes(b"x" * 200)                       # re-encoded
         assert not index.matches(str(video), "m", 1.0)
+
+
+class TestMemoPerModel:
+    """A second encoder (the SigLIP2 search experiment) keeps its own memo, so
+    searching with it never throws away the CLIP index chapters also read."""
+
+    def test_clip_keeps_its_path_and_other_models_get_their_own(self, tmp_path):
+        from llm.clip_index import cache_path_for
+        from llm.clip_prefilter import MODEL_ID
+
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"x" * 100)
+        plain = cache_path_for(str(video), str(tmp_path))
+        assert cache_path_for(str(video), str(tmp_path), MODEL_ID) == plain
+        other = cache_path_for(str(video), str(tmp_path), "other-encoder")
+        assert other != plain and other.endswith("_other-encoder.npz")
+
+    def test_memo_grows_at_the_encoders_width(self, tmp_path):
+        from llm.clip_index import open_memo
+
+        video = tmp_path / "v.mp4"
+        video.write_bytes(b"x" * 100)
+        memo, path = open_memo(str(video), "other-encoder", cache_dir=str(tmp_path), dims=768)
+        assert memo.embeddings.shape == (0, 768)
+        memo.extend([0.0, 1.0], np.ones((2, 768), np.float32))
+        memo.save(path)
+        again, _ = open_memo(str(video), "other-encoder", cache_dir=str(tmp_path), dims=768)
+        assert len(again) == 2
+
+
+class TestRankingPastSaturation:
+    """At SigLIP2's logit scale (~113) every clear match rounds to P = 1.0, so
+    the best frames tied; log-odds keeps them apart in the same order."""
+
+    def _labels(self):
+        from llm.clip_index import l2_normalize
+        return l2_normalize(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                                     dtype=np.float32))
+
+    def test_saturated_matches_still_rank(self):
+        from llm.clip_index import l2_normalize, log_odds, score_embeddings
+
+        frames = l2_normalize(np.array([[0.9, 0.1, 0.0], [0.7, 0.3, 0.0]], np.float32))
+        probs = score_embeddings(frames, self._labels(), 112.9)
+        assert probs[0] == probs[1] == 1.0            # what made the order arbitrary
+        margins = log_odds(frames, self._labels(), 112.9)
+        assert margins[0] > margins[1] > 0
+
+    def test_same_order_as_the_probability_where_it_can_tell(self):
+        from llm.clip_index import l2_normalize, log_odds, score_embeddings
+
+        rng = np.random.default_rng(0)
+        frames = l2_normalize(rng.normal(size=(40, 3)).astype(np.float32))
+        probs = score_embeddings(frames, self._labels(), 10.0)
+        margins = log_odds(frames, self._labels(), 10.0)
+        assert list(np.argsort(-probs)) == list(np.argsort(-margins))

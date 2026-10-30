@@ -34,7 +34,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from llm.clip_prefilter import ClipFramePrefilter, to_numpy
+from llm.clip_prefilter import MODEL_ID as CLIP_MODEL_ID, ClipFramePrefilter, to_numpy
 
 # Bump when the .npz layout changes in a way old caches can't satisfy.
 # v2: v1 memos were written by a scan whose grid was offset by start_time, so
@@ -68,15 +68,36 @@ def score_embeddings(embeddings: np.ndarray, labels: np.ndarray,
     return exp[:, 0] / exp.sum(axis=1)
 
 
-def cache_path_for(video_path: str, cache_dir: str = "./cache") -> str:
+def log_odds(embeddings: np.ndarray, labels: np.ndarray,
+             logit_scale: float = 100.0) -> np.ndarray:
+    """log P(label 0) / P(not label 0) for each embedding -> [n], unbounded.
+
+    The same order as `score_embeddings` wherever that one can tell frames
+    apart, and it still can once the probability has rounded to 1.0: at
+    SigLIP2's logit scale (~113) every clear match does, so ranking by the
+    probability alone left the best frames in an arbitrary order.
+    """
+    logits = logit_scale * (np.asarray(embeddings, dtype=np.float64) @ labels.T)
+    rest = logits[:, 1:]
+    top = rest.max(axis=1)
+    lse = top + np.log(np.exp(rest - top[:, None]).sum(axis=1))
+    return logits[:, 0] - lse
+
+
+def cache_path_for(video_path: str, cache_dir: str = "./cache",
+                   model_id: Optional[str] = None) -> str:
     """Where this video's index lives. Mirrors VideoAnalysisCache's key
-    (abspath + size + mtime) so a re-encode gets a different file."""
+    (abspath + size + mtime) so a re-encode gets a different file.
+
+    `model_id` other than CLIP's gets its own file, so searching with another
+    encoder never discards the CLIP index (chapters read that one too)."""
     import hashlib
 
     st = os.stat(video_path)
     key = f"{os.path.abspath(video_path)}_{st.st_size}_{st.st_mtime}"
     digest = hashlib.sha256(key.encode()).hexdigest()
-    return os.path.join(cache_dir, "clip", f"{digest}.npz")
+    suffix = "" if model_id in (None, CLIP_MODEL_ID) else f"_{model_id}"
+    return os.path.join(cache_dir, "clip", f"{digest}{suffix}.npz")
 
 
 class ClipEmbedder(ClipFramePrefilter):
@@ -328,13 +349,13 @@ def _video_fingerprint(video_path: str, model_id: str,
 
 
 def open_memo(video_path: str, model_id: str, cache_path: Optional[str] = None,
-              cache_dir: str = "./cache") -> tuple[ClipFrameIndex, str]:
+              cache_dir: str = "./cache", dims: int = 512) -> tuple[ClipFrameIndex, str]:
     """The embedding memo for a video: whatever was cached, or an empty one.
 
     Never raises on a bad cache — a corrupt or foreign file just means starting
     over, which costs time, not correctness.
     """
-    path = cache_path or cache_path_for(video_path, cache_dir)
+    path = cache_path or cache_path_for(video_path, cache_dir, model_id)
     if os.path.exists(path):
         try:
             memo = ClipFrameIndex.load(path)
@@ -346,7 +367,7 @@ def open_memo(video_path: str, model_id: str, cache_path: Optional[str] = None,
             print(f"⚠️  CLIP memo: unreadable cache ({e}); starting fresh")
     meta = _video_fingerprint(video_path, model_id)
     return ClipFrameIndex(np.zeros(0, dtype=np.float32),
-                          np.zeros((0, 512), dtype=np.float32), meta), path
+                          np.zeros((0, dims), dtype=np.float32), meta), path
 
 
 def build_index(video_path: str, interval: float = 1.0, batch: int = 16,

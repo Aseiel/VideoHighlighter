@@ -148,8 +148,9 @@ class _VisualSearchWorker(QObject):
         self.max_seeks = max_seeks
         self.stop_on_first_match = stop_on_first_match
         self.start_time = start_time
-        # Engine: "llm" (VLM brute force), "clip" (fast GPU ranker only), or
-        # "clip_llm" (CLIP ranks all frames on the GPU, VLM confirms top_k).
+        # Engine: "llm" (VLM brute force), "clip" (fast GPU ranker only),
+        # "clip_llm" (CLIP ranks all frames on the GPU, VLM confirms top_k), or
+        # "siglip" (experiment: "clip" with SigLIP2 in CLIP's place).
         self.mode = mode
         self.top_k = top_k
         self.clip_device = clip_device
@@ -174,7 +175,7 @@ class _VisualSearchWorker(QObject):
     def run(self):
         """Dispatch to the selected engine. Each path emits finished/error."""
         try:
-            if self.mode == "clip":
+            if self.mode in ("clip", "siglip"):
                 self._run_clip()
             elif self.mode == "clip_llm":
                 self._run_clip_llm()
@@ -332,25 +333,33 @@ class _VisualSearchWorker(QObject):
         self._print_summary(stage_totals, n_skipped)
         self.finished.emit(results)
 
+    @property
+    def _engine_name(self) -> str:
+        return "SigLIP2" if self.mode == "siglip" else "CLIP"
+
     def _clip_scan(self):
-        """Score every interval frame with CLIP on the GPU. Returns a list of
-        (timestamp, score) sorted by score desc, or None if CLIP is unavailable."""
+        """Score every interval frame with CLIP (or SigLIP2) on the GPU. Returns
+        a list of (timestamp, score) sorted by score desc, or None if the
+        engine is unavailable."""
         import time
+        name = self._engine_name
         try:
-            from .clip_prefilter import ClipFramePrefilter
-            from .clip_index import ClipEmbedder
+            if self.mode == "siglip":
+                from .siglip_search import SiglipEmbedder as Embedder
+            else:
+                from .clip_index import ClipEmbedder as Embedder
         except Exception as e:
-            self.error.emit(f"CLIP prefilter import failed: {e}")
+            self.error.emit(f"{name} import failed: {e}")
             return None
-        reason = ClipFramePrefilter.import_error(self.clip_device)
+        reason = Embedder.import_error(self.clip_device)
         if reason is not None:
-            self.error.emit(f"CLIP unavailable — {reason}")
+            self.error.emit(f"{name} unavailable — {reason}")
             return None
 
         if self._clip is None:
             self.progress.emit(0, 1, self.start_time,
-                               "Loading CLIP on GPU (first run downloads the model)...")
-            self._clip = ClipEmbedder(device=self.clip_device)
+                               f"Loading {name} on GPU (first run downloads the model)...")
+            self._clip = Embedder(device=self.clip_device)
             self._clip.load()
         self._clip.set_query(self.target)
 
@@ -358,6 +367,9 @@ class _VisualSearchWorker(QObject):
         # The frames themselves are memoised across scans (see _clip_memo), so a
         # reworded search re-encodes nothing it has already seen.
         self._clip_labels = self._clip.embed_query_labels()
+        # Tie-break for the sort: frames whose probability rounded to 1.0 are
+        # still told apart by how far the prompt beat the negatives.
+        self._clip_margins = {}
         self._open_clip_memo()
 
         timestamps = self._clip_timestamps()
@@ -387,15 +399,16 @@ class _VisualSearchWorker(QObject):
                 if ts in batch:
                     scored.append((ts, batch[ts]))
             self.progress.emit(min(c + BATCH, len(timestamps)), len(timestamps),
-                               chunk[-1], f"CLIP scan {chunk[-1]:.0f}s")
+                               chunk[-1], f"{name} scan {chunk[-1]:.0f}s")
 
         elapsed = time.perf_counter() - t0
         encoded = self._clip_memo_added
-        print(f"\nCLIP scan: {len(scored)} frames in {elapsed:.1f}s "
+        print(f"\n{name} scan: {len(scored)} frames in {elapsed:.1f}s "
               f"({elapsed/max(1,len(scored))*1000:.1f} ms/frame) on {self._clip.device} "
               f"— {len(scored) - encoded} from memo, {encoded} newly encoded")
         self._save_clip_memo()
-        scored.sort(key=lambda x: -x[1])
+        margins = getattr(self, "_clip_margins", {})
+        scored.sort(key=lambda x: (-x[1], -margins.get(x[0], 0.0)))
         return scored
 
     # -- embedding memo ---------------------------------------------------
@@ -441,6 +454,7 @@ class _VisualSearchWorker(QObject):
         try:
             self._clip_memo, self._clip_memo_path = open_memo(
                 self.analyzer.video_path, self._clip.model_id,
+                dims=getattr(self._clip, "dims", 512),
             )
         except Exception as e:
             # A memo is an optimisation; never let it break search.
@@ -466,7 +480,15 @@ class _VisualSearchWorker(QObject):
         decode, or None if its extraction path is unusable. Returns
         (scores_by_ts, grab_failed).
         """
-        from .clip_index import score_embeddings
+        from .clip_index import log_odds, score_embeddings
+
+        margins = getattr(self, "_clip_margins", None)
+
+        def _keep_margins(ts_list, embs):
+            if margins is not None:
+                for ts, m in zip(ts_list, log_odds(embs, self._clip_labels,
+                                                   self._clip.logit_scale)):
+                    margins[ts] = float(m)
 
         memo = self._clip_memo
         if memo is None:      # memo unavailable: encode everything, cache nothing
@@ -477,6 +499,7 @@ class _VisualSearchWorker(QObject):
                 return {}, False
             embs = self._clip.embed_frames_bgr([f for _, f in pairs])
             scores = score_embeddings(embs, self._clip_labels, self._clip.logit_scale)
+            _keep_margins([ts for ts, _ in pairs], embs)
             return {ts: float(s) for (ts, _), s in zip(pairs, scores)}, False
 
         _, _, missing = memo.lookup(timestamps)
@@ -493,20 +516,23 @@ class _VisualSearchWorker(QObject):
             return {}, False
         scores = score_embeddings(memo.embeddings[rows], self._clip_labels,
                                   self._clip.logit_scale)
+        _keep_margins([timestamps[p] for p in positions], memo.embeddings[rows])
         return {timestamps[p]: float(s) for p, s in zip(positions, scores)}, False
 
     def _run_clip(self):
-        """CLIP-only: return the top_k frames ranked by similarity (no VLM)."""
+        """CLIP-only (or SigLIP2-only): return the top_k frames ranked by
+        similarity (no VLM)."""
         scored = self._clip_scan()
         if scored is None:
             return
+        name = self._engine_name
         top = scored[:self.top_k]
-        print(f"CLIP: top {len(top)} of {len(scored)} frames "
-              f"(scores {top[0][1]:.2f}..{top[-1][1]:.2f})" if top else "CLIP: no frames")
+        print(f"{name}: top {len(top)} of {len(scored)} frames "
+              f"(scores {top[0][1]:.2f}..{top[-1][1]:.2f})" if top else f"{name}: no frames")
         results = []
         for ts, score in sorted(top, key=lambda x: x[0]):  # chronological for playback
             tstr = f"{int(ts)//60}:{int(ts)%60:02d}"
-            analysis = f"CLIP match (similarity {score:.2f})"
+            analysis = f"{name} match (similarity {score:.2f})"
             results.append({"timestamp": ts, "timestamp_str": tstr,
                             "analysis": analysis, "contains_target": True,
                             "clip_score": score})
@@ -856,10 +882,13 @@ class LLMChatWidget(QWidget):
         self.search_engine_combo.addItem("CLIP + LLM", "clip_llm")
         self.search_engine_combo.addItem("CLIP only", "clip")
         self.search_engine_combo.addItem("LLM only", "llm")
+        self.search_engine_combo.addItem("SigLIP2 only (experiment)", "siglip")
         self.search_engine_combo.setToolTip(
             "CLIP only  : fast GPU similarity ranking; best for broad concepts.\n"
             "LLM only   : the vision model checks every frame (slow, reasons, uncensored).\n"
-            "CLIP + LLM : CLIP ranks all frames on the GPU, the LLM confirms the top-K."
+            "CLIP + LLM : CLIP ranks all frames on the GPU, the LLM confirms the top-K.\n"
+            "SigLIP2 only: CLIP only with the action encoder (SigLIP2) in CLIP's place,\n"
+            "              same prompt and scoring, to compare the two on one video."
         )
         self.search_engine_combo.currentIndexChanged.connect(self._on_search_engine_changed)
         search_layout.addWidget(self.search_engine_combo)
@@ -1178,7 +1207,7 @@ class LLMChatWidget(QWidget):
     def _on_search_engine_changed(self):
         """Top-K only applies to the CLIP-based engines; hide it for LLM-only."""
         engine = self.search_engine_combo.currentData()
-        is_clip = engine in ("clip", "clip_llm")
+        is_clip = engine in ("clip", "clip_llm", "siglip")
         self.search_topk_label.setVisible(is_clip)
         self.search_topk.setVisible(is_clip)
         self._save_search_prefs()
@@ -1238,13 +1267,13 @@ class LLMChatWidget(QWidget):
         top_k = self.search_topk.value()
 
         if not self._analyzer:
-            if not self._init_analyzer(require_llm=(engine != "clip")):
+            if not self._init_analyzer(require_llm=(engine not in ("clip", "siglip"))):
                 self._append_system("❌ Cannot start search: No video loaded or analyzer not ready")
                 return
 
         # Engines that use the VLM need a live model. The analyzer may have been
         # created earlier by a CLIP-only run (with no LLM), so sync the current one.
-        if engine != "clip":
+        if engine not in ("clip", "siglip"):
             if not self._llm or not self._llm.is_loaded():
                 self._append_system("⚠️ This engine needs a connected vision model. Connect one, or use CLIP only.")
                 return
@@ -1289,8 +1318,9 @@ class LLMChatWidget(QWidget):
             if hasattr(scene, 'clear_visual_findings'):
                 scene.clear_visual_findings(query=target)
 
-        engine_label = {"clip_llm": "CLIP+LLM", "clip": "CLIP", "llm": "LLM"}.get(engine, engine)
-        extra = f", top-{top_k}" if engine in ("clip", "clip_llm") else ""
+        engine_label = {"clip_llm": "CLIP+LLM", "clip": "CLIP", "llm": "LLM",
+                        "siglip": "SigLIP2"}.get(engine, engine)
+        extra = f", top-{top_k}" if engine in ("clip", "clip_llm", "siglip") else ""
         self._append_system(
             f"🔍 [{engine_label}{extra}] searching for '{target}' from {start_str} "
             f"every {interval}s ({mode_str})..."
