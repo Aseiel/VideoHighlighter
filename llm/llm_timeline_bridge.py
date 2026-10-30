@@ -220,7 +220,7 @@ Available commands:
   [CMD:zoom level=NUMBER]                       — Set zoom (10-200, default ~50)
   [CMD:list_clips]                              — List current edit timeline clips
   [CMD:save]                                    — Save edit timeline to cache
-  [CMD:export format=edl]                       — Export the edit timeline (edl, fcpxml, or xml). Optional start=00:00:00:00 or start=01:00:00:00
+  [CMD:export format=edl]                       — Export the edit timeline (edl, fcpxml, xml, or capcut). Optional start=00:00:00:00 or start=01:00:00:00
   [CMD:visual_scan interval=SECONDS target=DESCRIPTION] — Scan video frames looking for something
   [CMD:get_visual_findings]                     — List all visual search findings on the timeline
   [CMD:get_visual_findings query=NAME]          — List findings for one query only
@@ -448,6 +448,8 @@ Example:
         ``format=xml`` is FCPXML. ``start`` is ``00:00:00:00`` unless the
         command says ``01:00:00:00``. Any other start is an error and writes
         nothing. The path is always ``{stem}_edit.edl`` or ``.fcpxml``.
+        ``format=capcut`` writes a project into CapCut's or Jianying's own
+        project list instead.
         """
         from video_ai_editor.timeline_export import (
             RECORD_START_ZERO,
@@ -465,12 +467,21 @@ Example:
         if not clips:
             return "⚠️ No clips to export"
 
+        if fmt in ('capcut', 'jianying'):
+            # A project folder in the installed app's own project list.
+            try:
+                result = TimelineExporter.to_capcut(clips, self._window.video_path)
+                return (f"✅ CapCut / Jianying project exported: {result}"
+                        f"{skipped_note(result.skipped)}")
+            except Exception as exc:
+                return f"❌ Export failed: {exc}"
+
         if fmt == 'edl':
             pattern, label, writer = '*.edl', 'EDL', TimelineExporter.to_edl
         elif fmt in ('xml', 'fcpxml'):
             pattern, label, writer = '*.fcpxml', 'FCPXML', TimelineExporter.to_fcp_xml
         else:
-            return f"⚠️ Unknown format: {fmt}. Use 'edl', 'fcpxml', or 'xml'"
+            return f"⚠️ Unknown format: {fmt}. Use 'edl', 'fcpxml', 'xml', or 'capcut'"
 
         start = p.get('start', RECORD_START_ZERO)
         try:

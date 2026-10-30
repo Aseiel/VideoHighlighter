@@ -56,11 +56,13 @@ from modules.media.audio_device import follow_system_default
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
 from video_ai_editor.timeline_export import (
+    CAPCUT_FORMAT,
     RECORD_START_HOUR,
     RECORD_START_ZERO,
     ExportError,
     TimelineExporter,
     default_export_path,
+    has_record_start,
     prepare_export,
     record_start_for_format,
     skipped_note,
@@ -4809,11 +4811,11 @@ class SignalTimelineWindow(QMainWindow):
             # The format's own name, not the combo's text, which is
             # translated in other UI languages.
             name = formats[max(0, format_combo.currentIndex())][0]
-            if name.startswith("CSV"):
+            if has_record_start(name):
+                start_combo.setEnabled(True)
+            else:
                 start_combo.setCurrentIndex(0)
                 start_combo.setEnabled(False)
-            else:
-                start_combo.setEnabled(True)
 
         format_combo.currentIndexChanged.connect(lambda _index: _on_format_changed())
         _on_format_changed()
@@ -4832,6 +4834,9 @@ class SignalTimelineWindow(QMainWindow):
             return
 
         format_name, format_pattern = formats[format_combo.currentIndex()]
+        if format_name == CAPCUT_FORMAT:
+            self._export_capcut_project(source)
+            return
         try:
             default_path, filter_str = default_export_path(
                 self.video_path, format_pattern)
@@ -4890,7 +4895,53 @@ class SignalTimelineWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export Failed",
                                  f"Failed to export timeline:\n{str(e)}")
-    
+
+    def _export_capcut_project(self, source):
+        """Write the edit timeline as a project straight into CapCut's or
+        Jianying's own project list. No app installed: ask for a folder."""
+        from PySide6.QtWidgets import QFileDialog, QInputDialog
+        from video_ai_editor.capcut_draft import CAPCUT, app_label, installed_drafts_roots
+
+        installed = installed_drafts_roots()
+        if len(installed) > 1:
+            labels = [app_label(app) for app, _root in installed]
+            choice, ok = QInputDialog.getItem(
+                self, "Export Timeline", "Open the project in:", labels, 0, False)
+            if not ok:
+                return
+            app, root = installed[labels.index(choice)]
+        elif installed:
+            app, root = installed[0]
+        else:
+            app = CAPCUT
+            root = QFileDialog.getExistingDirectory(
+                self, "Choose a folder for the CapCut project",
+                os.path.dirname(os.path.abspath(self.video_path)))
+            if not root:
+                return
+
+        try:
+            result = TimelineExporter.to_capcut(
+                self.edit_scene.clips, self.video_path, root,
+                source=source, app=app)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed",
+                                 f"Failed to export timeline:\n{str(e)}")
+            return
+
+        name = os.path.basename(result.path)
+        if installed:
+            label = app_label(app)
+            msg = (f"Project “{name}” is in {label}'s project list.\n"
+                   f"Open {label} to keep editing.")
+        else:
+            msg = (f"Project folder written: {result.path}\n"
+                   f"CapCut was not found. Copy this folder into its projects folder.")
+        QMessageBox.information(
+            self, "Export Successful",
+            f"✅ Timeline exported successfully!\n\n{msg}"
+            f"{skipped_note(result.skipped)}")
+
     def update_edit_duration(self):
         """Update edit duration display"""
         total_duration = self.edit_scene.get_total_duration()

@@ -22,6 +22,10 @@ RECORD_START_ZERO = "00:00:00:00"
 RECORD_START_HOUR = "01:00:00:00"
 RECORD_STARTS = (RECORD_START_ZERO, RECORD_START_HOUR)
 
+# A project folder for CapCut or Jianying, not a file: no save dialog.
+CAPCUT_FORMAT = "CapCut / Jianying project"
+CAPCUT_PATTERN = "capcut-draft"
+
 _SPAN_KINDS = ("speech", "detection", "face")
 
 # Same gap SignalTimelineScene uses to join sampled hits into one run.
@@ -1029,9 +1033,15 @@ def export_summary(clip_count: int, duration: float, timebase: Timebase,
     return text
 
 
+def has_record_start(format_name: str) -> bool:
+    """Whether the format has a sequence clock. CSV and CapCut do not."""
+    return not (str(format_name).startswith("CSV")
+                or str(format_name) == CAPCUT_FORMAT)
+
+
 def record_start_for_format(format_name: str, chosen: str) -> str:
-    """Sequence start for this format. CSV has no sequence clock."""
-    if str(format_name).startswith("CSV"):
+    """Sequence start for this format. CSV and CapCut have no sequence clock."""
+    if not has_record_start(format_name):
         return RECORD_START_ZERO
     if chosen not in RECORD_STARTS:
         raise ExportError(
@@ -1131,12 +1141,38 @@ class TimelineExporter:
         return write_csv(sequence, output_path)
 
     @staticmethod
+    def to_capcut(clips, video_path, drafts_root=None, fps=30, *,
+                  source: MediaSource | None = None,
+                  record_start: str = RECORD_START_ZERO,
+                  spans: tuple = (),
+                  app: str = "capcut"):
+        """Write a CapCut / Jianying project folder for ``clips``.
+
+        ``drafts_root`` is the app's projects folder; without it the first
+        installed app's is used, or the source video's folder when neither
+        is installed. ``record_start`` and ``spans`` are accepted and
+        ignored: the project has no sequence clock and no markers yet.
+        """
+        del fps, record_start, spans
+        from video_ai_editor.capcut_draft import installed_drafts_roots, write_draft
+        if drafts_root is None:
+            installed = installed_drafts_roots()
+            if installed:
+                app, drafts_root = installed[0]
+            else:
+                drafts_root = os.path.dirname(os.path.abspath(str(video_path)))
+        sequence = _export_sequence(
+            clips, video_path, source, RECORD_START_ZERO, ())
+        return write_draft(sequence, drafts_root, app)
+
+    @staticmethod
     def get_export_formats():
-        """The three formats the export dialog offers."""
+        """The formats the export dialog offers. A CapCut project is a folder."""
         return [
             ("EDL (CMX 3600)", "*.edl"),
             ("FCPXML", "*.fcpxml"),
             ("CSV", "*.csv"),
+            (CAPCUT_FORMAT, CAPCUT_PATTERN),
         ]
 
     @staticmethod
@@ -1149,5 +1185,7 @@ class TimelineExporter:
             return TimelineExporter.to_fcp_xml(clips, video_path)
         if key == "csv":
             return TimelineExporter.to_csv(clips, video_path)
+        if key in ("capcut", "jianying"):
+            return TimelineExporter.to_capcut(clips, video_path)
         raise ExportError(
-            f"unknown export format {format!r}; choose edl, fcpxml, or csv")
+            f"unknown export format {format!r}; choose edl, fcpxml, csv, or capcut")

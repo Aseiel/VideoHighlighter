@@ -649,13 +649,14 @@ def test_a_failed_fcpxml_replace_leaves_no_partial_file(tmp_path, monkeypatch):
 # CSV
 # ---------------------------------------------------------------------------
 
-def test_export_formats_are_edl_fcpxml_and_csv():
+def test_export_formats_are_edl_fcpxml_csv_and_a_capcut_project():
     from video_ai_editor.timeline_export import TimelineExporter
     formats = TimelineExporter.get_export_formats()
     assert formats == [
         ("EDL (CMX 3600)", "*.edl"),
         ("FCPXML", "*.fcpxml"),
         ("CSV", "*.csv"),
+        ("CapCut / Jianying project", "capcut-draft"),
     ]
 
 
