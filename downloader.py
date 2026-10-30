@@ -24,7 +24,14 @@ import time
 from collections import Counter
 import math
 import hashlib
-
+from modules.media.process_progress import (
+    STALL_SECONDS,
+    YTDLP_PROGRESS_ARGS,
+    _flag_is_cancelled,
+    _report_stop,
+    _run_ffmpeg_with_progress,
+    _run_ytdlp_with_progress,
+)
 
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException
@@ -1316,7 +1323,8 @@ def get_duration_with_playwright_automation(
 
         with sync_playwright() as p:
             # Launch with more lenient settings
-            browser = p.chromium.launch(
+            browser = _launch_chromium(
+                p, log_fn,
                 headless=True,
                 args=[
                     "--no-sandbox",
@@ -1894,7 +1902,7 @@ def get_duration_with_playwright_automation(
                 return None
 
     except ImportError:
-        log_fn("    ⚠ Playwright not installed → pip install playwright && playwright install")
+        log_fn(f"    ⚠ {_playwright_missing()}")
         return None
     except Exception as e:
         log_fn(f"    ✗ Playwright crashed: {type(e).__name__}: {str(e)[:120]}")
@@ -1922,101 +1930,40 @@ def get_downloaded_videos(directory: str) -> List[str]:
             files.append(os.path.join(directory, fn))
     return sorted(files)
 
-def _flag_is_cancelled(flag) -> bool:
-    """True if a cancel flag has been tripped. Accepts either a threading.Event
-    (`is_set()`) or a worker object exposing `is_cancelled()`. None => never."""
-    if flag is None:
-        return False
+def _playwright_missing() -> str:
+    """What to say when the browser fallbacks cannot run. pip advice only
+    helps someone running from source; the installed app cannot pip."""
+    import sys
+    if getattr(sys, "frozen", False):
+        return ("Browser-based extraction is not included in this build, "
+                "so pages yt-dlp cannot read are skipped.")
+    return ("Playwright not installed → pip install playwright && "
+            "playwright install chromium")
+
+
+# Browsers already on the machine, tried when Playwright has none of its own.
+# The installed app ships Playwright without a browser download: every
+# Windows 10/11 has Edge, and Chrome covers most Macs.
+_SYSTEM_BROWSER_CHANNELS = ("msedge", "chrome")
+
+
+def _launch_chromium(p, log_fn: Callable = print, **kwargs):
+    """Launch Chromium through Playwright: its own build if one was installed
+    (`playwright install chromium`), else the system Edge, else Chrome."""
     try:
-        if hasattr(flag, "is_cancelled") and flag.is_cancelled():
-            return True
-        if hasattr(flag, "is_set") and flag.is_set():
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _terminate_tree(proc) -> None:
-    """Kill a subprocess *and its children*. yt-dlp spawns ffmpeg (for
-    --download-sections, HLS, and muxing); ffmpeg inherits our stdout pipe, so
-    killing only yt-dlp leaves the pipe open and hangs the progress reader. On
-    Windows we use `taskkill /T` to take down the whole tree."""
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True, check=False,
-            )
-        else:
-            proc.kill()
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-
-def _run_ytdlp_with_progress(cmd, timeout, log_fn: Callable = print, cancel_flag=None):
-    """Run yt-dlp via Popen and stream its progress (speed / ETA / size) to log_fn
-    live, throttled to ~1/sec. Returns a CompletedProcess-like result (stdout holds
-    the captured output minus our machine-readable progress lines) so the existing
-    downstream parsing keeps working. Expects --newline + --progress-template
-    "DLP|..." to be in cmd.
-
-    If cancel_flag is provided, a watcher thread kills yt-dlp as soon as the flag
-    trips (works even if the download stalls and stops emitting lines). The result
-    carries a `.cancelled` attribute so the caller can skip fallback stages.
-    """
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, encoding="utf-8", errors="replace",
-    )
-    killer = threading.Timer(timeout, lambda: _terminate_tree(proc)) if timeout else None
-    if killer:
-        killer.start()
-
-    cancelled = threading.Event()
-    watcher = None
-    if cancel_flag is not None:
-        def _watch():
-            while proc.poll() is None:
-                if _flag_is_cancelled(cancel_flag):
-                    cancelled.set()
-                    _terminate_tree(proc)
-                    return
-                time.sleep(0.3)
-        watcher = threading.Thread(target=_watch, daemon=True)
-        watcher.start()
-
-    lines = []
-    last_emit = 0.0
-    try:
-        for line in proc.stdout:
-            s = line.strip()
-            if s.startswith("DLP|"):
-                parts = [p.strip() for p in s.split("|")]
-                if len(parts) >= 4:
-                    pct, speed, eta = parts[1], parts[2], parts[3]
-                    size = parts[4] if len(parts) >= 5 else ""
-                    now = time.time()
-                    if now - last_emit >= 1.0:
-                        last_emit = now
-                        tail = f"  •  {size}" if size and size not in ("NA", "") else ""
-                        log_fn(f"⬇️ {pct}  •  {speed}  •  ETA {eta}{tail}")
-                continue  # don't keep template lines in captured output
-            lines.append(line)
-    finally:
-        proc.wait()
-        if killer:
-            killer.cancel()
-        if watcher:
-            watcher.join(timeout=1)
-    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout="".join(lines), stderr="")
-    result.cancelled = cancelled.is_set()
-    return result
+        return p.chromium.launch(**kwargs)
+    except Exception as first:
+        if "Executable doesn't exist" not in str(first):
+            raise
+        for channel in _SYSTEM_BROWSER_CHANNELS:
+            try:
+                browser = p.chromium.launch(channel=channel, **kwargs)
+                print(f"🌐 Playwright is using the installed {channel}")
+                return browser
+            except Exception:
+                continue
+        log_fn("⚠ No browser for page extraction: install Microsoft Edge or Google Chrome")
+        raise first
 
 
 def download_video(
@@ -2223,11 +2170,7 @@ def download_video(
             "--retries", "10",
             "--fragment-retries", "10",
             "--concurrent-fragments", "4",
-            # Live progress: one machine-readable line per update (speed / ETA / size)
-            "--newline",
-            "--progress-template",
-            "DLP|%(progress._percent_str)s|%(progress._speed_str)s|"
-            "%(progress._eta_str)s|%(progress._total_bytes_str)s",
+            *YTDLP_PROGRESS_ARGS,
         ]
         
         if skip_existing:
@@ -2254,8 +2197,10 @@ def download_video(
         
         # 6. Execute download (streaming so we can show live speed / ETA)
         t0 = time.time()
-        result = _run_ytdlp_with_progress(cmd, timeout=300, log_fn=log_fn, cancel_flag=cancel_flag)
+        result = _run_ytdlp_with_progress(cmd, log_fn=log_fn, cancel_flag=cancel_flag)
         metadata["download_time"] = time.time() - t0
+        if getattr(result, "stalled", False):
+            _report_stop(result, log_fn, "yt-dlp")
 
         # User cancelled mid-download: don't fall through to fallback stages.
         if getattr(result, "cancelled", False) or _flag_is_cancelled(cancel_flag):
@@ -2315,11 +2260,14 @@ def download_video(
                 "--no-playlist",
                 "--format", "best[height<=720]/best",
                 "--force-ipv4",
+                *YTDLP_PROGRESS_ARGS,
                 url,
             ]
             if skip_existing:
                 fallback_cmd.extend(["--no-overwrites", "--ignore-errors"])
-            fr = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=300, check=False)
+            fr = _run_ytdlp_with_progress(fallback_cmd, log_fn=log_fn, cancel_flag=cancel_flag)
+            if getattr(fr, "stalled", False):
+                _report_stop(fr, log_fn, "Fallback 1")
 
             if fr.returncode == 0:
                 log_fn("✅ Fallback 1 succeeded!")
@@ -2348,7 +2296,14 @@ def download_video(
                     time_range=time_range,
                     download_full=download_full,
                     http_headers=extracted_headers,
+                    cancel_flag=cancel_flag,
+                    expected_seconds=metadata.get("duration"),
                 )
+                if _flag_is_cancelled(cancel_flag):
+                    metadata["cancelled"] = True
+                    return False, None, metadata
+                if success_fb and not _check_video_file(filename_fb, log_fn):
+                    success_fb = False
                 if not success_fb or not filename_fb or not os.path.exists(filename_fb):
                     # yt-dlp cannot pass a Cloudflare TLS-fingerprint check even
                     # with the right cookie, so retry from inside the browser.
@@ -3014,7 +2969,8 @@ def extract_video_source_via_browser(
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            browser = _launch_chromium(
+                p, log_fn,
                 headless=True,
                 args=[
                     "--no-sandbox",
@@ -3367,7 +3323,7 @@ def extract_video_source_via_browser(
             return None
 
     except ImportError:
-        log_fn("  ⚠ Playwright not installed. Run: pip install playwright && playwright install")
+        log_fn(f"  ⚠ {_playwright_missing()}")
         return None
     except Exception as e:
         log_fn(f"  ✗ Playwright extraction failed: {str(e)[:120]}")
@@ -3439,6 +3395,152 @@ def _capture_yandex_network_media(driver, log_fn):
     log_fn(f"    ✓ Best media URL: {best[:140]}...")
     return best
 
+def _check_video_file(path: Optional[str], log_fn: Callable = print) -> bool:
+    """True if ``path`` holds a video ffprobe can read. Otherwise the file is
+    removed, so a playlist, an error page or an empty file saved as .mp4 is
+    never passed on to analysis as a download that worked."""
+    if not path or not os.path.exists(path):
+        return False
+    size = os.path.getsize(path)
+    seconds = get_duration_from_ffprobe(path, log_fn=lambda *_a: None) if size else None
+    if size >= 64 * 1024 and seconds:
+        return True
+    log_fn(f"  ✗ Not a playable video ({size / 1024:.0f} KB"
+           f"{'' if seconds else ', no duration'}) — discarded")
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return False
+
+
+def _session_get(context, url: str, referer: str, timeout_ms: int = 60000, tries: int = 3):
+    """GET through the browser session, retried; the response, or None."""
+    for attempt in range(tries):
+        try:
+            r = context.request.get(url, headers={"Referer": referer}, timeout=timeout_ms)
+            if r.status < 400 or r.status in (401, 403, 404, 410):
+                return r                    # a refusal will not change on a retry
+        except Exception:
+            if attempt == tries - 1:
+                raise
+        time.sleep(1.5 * (attempt + 1))
+    return None
+
+
+def _session_hls(context, url: str, referer: str, out_path: str,
+                 log_fn: Callable, cancel_flag=None) -> bool:
+    """Fetch an HLS stream segment by segment through the browser session,
+    then remux the joined segments into ``out_path`` without re-encoding."""
+    from modules.media.hls_playlist import best_variant, media_playlist
+    from modules.media.process_progress import _clock, _throttled
+
+    r = _session_get(context, url, referer, timeout_ms=30000)
+    if r is None or r.status >= 400:
+        log_fn(f"  ✗ Playlist refused: HTTP {getattr(r, 'status', '?')}")
+        return False
+    text = r.text()
+    variant = best_variant(text, url)
+    if variant:
+        url = variant
+        r = _session_get(context, url, referer, timeout_ms=30000)
+        if r is None or r.status >= 400:
+            log_fn(f"  ✗ Stream playlist refused: HTTP {getattr(r, 'status', '?')}")
+            return False
+        text = r.text()
+    playlist = media_playlist(text, url)
+    if playlist.encrypted:
+        log_fn("  ✗ The stream is encrypted (AES) — not supported in-session")
+        return False
+    if not playlist.segments:
+        log_fn("  ✗ The playlist lists no segments")
+        return False
+
+    count = len(playlist.segments)
+    log_fn(f"  • {count} segments, {_clock(playlist.seconds)}")
+    joined = out_path + (".part.mp4" if playlist.init else ".part.ts")
+    pieces = ([playlist.init] if playlist.init else []) + playlist.segments
+    emit = _throttled(log_fn)
+    written = 0
+    try:
+        with open(joined, "wb") as f:
+            for i, seg in enumerate(pieces, 1):
+                if _flag_is_cancelled(cancel_flag):
+                    log_fn("⏹️ Cancelled during in-session download")
+                    return False
+                rr = _session_get(context, seg, referer)
+                if rr is None or rr.status >= 400:
+                    log_fn(f"  ✗ Segment {i}: HTTP {getattr(rr, 'status', '?')} — stopping")
+                    return False
+                body = rr.body()
+                f.write(body)
+                written += len(body)
+                done = i - (1 if playlist.init else 0)
+                emit(f"  ⬇️ {done}/{count} segments  •  {written / 1048576:.1f} MB "
+                     f"({done * 100 // count}%)")
+        log_fn(f"  • Joining {written / 1048576:.1f} MB into {os.path.basename(out_path)}...")
+        result = _run_ffmpeg_with_progress(
+            ["ffmpeg", "-y", "-i", joined, "-c", "copy", out_path], lambda *_a: None)
+        if result.returncode == 0 and os.path.exists(out_path):
+            return True
+        log_fn("  ⚠ Remux failed — keeping the joined stream as it is")
+        os.replace(joined, out_path)
+        return True
+    finally:
+        if os.path.exists(joined):
+            try:
+                os.remove(joined)
+            except OSError:
+                pass
+
+
+def _session_ranged(context, url: str, referer: str, out_path: str,
+                    log_fn: Callable, cancel_flag=None) -> int:
+    """Fetch one progressive file through the session in ranged chunks.
+    Returns the bytes written."""
+    from modules.media.process_progress import _throttled
+
+    chunk = 8 * 1024 * 1024
+    written = 0
+    total: Optional[int] = None
+    emit = _throttled(log_fn)
+    with open(out_path, "wb") as f:
+        while True:
+            if _flag_is_cancelled(cancel_flag):
+                log_fn("⏹️ Cancelled during in-session download")
+                break
+            r = context.request.get(
+                url,
+                headers={"Range": f"bytes={written}-{written + chunk - 1}",
+                         "Referer": referer},
+                timeout=120000,
+            )
+            if r.status not in (200, 206):
+                if written == 0:
+                    log_fn(f"  ✗ Session fetch refused: HTTP {r.status}")
+                break
+            body = r.body()
+            if not body:
+                break
+            f.write(body)
+            written += len(body)
+            cr = (r.headers or {}).get("content-range", "")
+            if total is None and "/" in cr:
+                tail = cr.rsplit("/", 1)[1]
+                if tail.isdigit():
+                    total = int(tail)
+            if total:
+                emit(f"  ⬇️ {written / 1048576:.1f} / {total / 1048576:.1f} MB "
+                     f"({min(100, written * 100 // total)}%)")
+                if written >= total:
+                    break
+            else:
+                emit(f"  ⬇️ {written / 1048576:.1f} MB")
+                if r.status == 200:
+                    break      # server ignored Range and sent it all
+    return written
+
+
 def download_via_browser_session(
     media_url: str,
     page_url: str,
@@ -3446,7 +3548,7 @@ def download_via_browser_session(
     log_fn: Callable = print,
     cancel_flag=None,
 ) -> Optional[str]:
-    """Fetch media through a real browser session, byte-ranged to disk.
+    """Fetch media through a real browser session.
 
     Some CDNs sit behind Cloudflare, whose `cf_clearance` cookie is bound to the
     TLS fingerprint of the browser that solved the challenge — not just to the
@@ -3456,16 +3558,19 @@ def download_via_browser_session(
 
     Playwright's APIRequestContext issues requests from the browser's own stack
     and cookie jar, so it is the only path that gets served. We load the watch
-    page first (that is what mints the clearance cookie), then pull the media in
-    ranged chunks so a multi-GB file never has to fit in memory.
+    page first (that is what mints the clearance cookie), then pull the media:
+    an HLS stream segment by segment, a file in ranged chunks, so a multi-GB
+    download never has to fit in memory.
 
-    Returns the saved path, or None.
+    Returns the saved path, or None. A result that is not a playable video is
+    discarded rather than returned.
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        log_fn("⚠️ Playwright not installed — cannot download in-session")
+        log_fn(f"⚠️ {_playwright_missing()} Cannot download in-session.")
         return None
+    from modules.media.hls_playlist import is_playlist
 
     out_path = re.sub(r"\.%\(ext\)s$", ".mp4", output_template)
     if out_path == output_template:
@@ -3474,65 +3579,34 @@ def download_via_browser_session(
 
     ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    chunk = 8 * 1024 * 1024
-    written = 0
 
     log_fn("🌐 Retrying inside the browser session (Cloudflare-safe)...")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            browser = _launch_chromium(
+                p, log_fn,
                 headless=True,
                 args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                       "--disable-features=IsolateOrigins,site-per-process"],
             )
             context = browser.new_context(user_agent=ua, ignore_https_errors=True,
                                           viewport={"width": 1366, "height": 768})
-            # Close advert popups so they cannot steal the session or stall us.
-            context.on("page", lambda pg: pg.close() if pg else None)
             page = context.new_page()
+            # Close advert popups so they cannot steal the session or stall us.
+            # Registered after our own page exists and never closing it: the
+            # "page" event fires for new_page() too, which closed our own page.
+            context.on("page", lambda pg: pg.close() if pg is not page else None)
             try:
                 page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_timeout(4000)      # let the clearance cookie land
             except Exception as e:
                 log_fn(f"  ⚠ Page load: {str(e)[:100]}")
 
-            total: Optional[int] = None
             try:
-                with open(out_path, "wb") as f:
-                    while True:
-                        if _flag_is_cancelled(cancel_flag):
-                            log_fn("⏹️ Cancelled during in-session download")
-                            break
-                        r = context.request.get(
-                            media_url,
-                            headers={"Range": f"bytes={written}-{written + chunk - 1}",
-                                     "Referer": page_url},
-                            timeout=120000,
-                        )
-                        if r.status not in (200, 206):
-                            if written == 0:
-                                log_fn(f"  ✗ Session fetch refused: HTTP {r.status}")
-                            break
-                        body = r.body()
-                        if not body:
-                            break
-                        f.write(body)
-                        written += len(body)
-                        cr = (r.headers or {}).get("content-range", "")
-                        if total is None and "/" in cr:
-                            tail = cr.rsplit("/", 1)[1]
-                            if tail.isdigit():
-                                total = int(tail)
-                        if total:
-                            log_fn(f"  ⬇️ {written / 1048576:.1f} / "
-                                   f"{total / 1048576:.1f} MB "
-                                   f"({written * 100 // total}%)")
-                            if written >= total:
-                                break
-                        else:
-                            log_fn(f"  ⬇️ {written / 1048576:.1f} MB")
-                            if r.status == 200:
-                                break      # server ignored Range and sent it all
+                if is_playlist(media_url):
+                    _session_hls(context, media_url, page_url, out_path, log_fn, cancel_flag)
+                else:
+                    _session_ranged(context, media_url, page_url, out_path, log_fn, cancel_flag)
             finally:
                 try:
                     context.close()
@@ -3542,14 +3616,17 @@ def download_via_browser_session(
     except Exception as e:
         log_fn(f"  ✗ In-session download failed: {type(e).__name__}: {str(e)[:110]}")
 
-    if written > 0 and os.path.exists(out_path):
-        log_fn(f"✅ In-session download complete: {written / 1048576:.1f} MB")
+    if _flag_is_cancelled(cancel_flag):
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        return None
+    if _check_video_file(out_path, log_fn):
+        log_fn(f"✅ In-session download complete: "
+               f"{os.path.getsize(out_path) / 1048576:.1f} MB")
         return out_path
-    try:
-        if os.path.exists(out_path) and os.path.getsize(out_path) == 0:
-            os.remove(out_path)
-    except OSError:
-        pass
     return None
 
 
@@ -3560,7 +3637,14 @@ def download_from_extracted_source(
     time_range: Optional[Tuple[float, float]] = None,
     download_full: bool = True,
     http_headers: Optional[Dict[str, str]] = None,
+    cancel_flag=None,
+    expected_seconds: Optional[float] = None,
 ) -> Tuple[bool, Optional[str]]:
+    """Download a media URL the browser found, replaying its headers.
+
+    yt-dlp first, then ffmpeg for HLS. Both log progress live and are stopped
+    only by a cancel or by STALL_SECONDS without progress, never for length.
+    """
     log_fn(f"📥 Downloading extracted source: {source_url[:100]}...")
 
     http_headers = http_headers or {}
@@ -3610,6 +3694,9 @@ def download_from_extracted_source(
         "--force-ipv4",
         "--socket-timeout", "30",
         "--retries", "3",
+        "--fragment-retries", "10",
+        "--concurrent-fragments", "4",
+        *YTDLP_PROGRESS_ARGS,
     ]
 
     # Replay the browser's request headers so hotlink-protected CDNs don't 403.
@@ -3634,20 +3721,28 @@ def download_from_extracted_source(
     cmd.append(source_url)
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=400, check=True)
+        result = _run_ytdlp_with_progress(cmd, log_fn=log_fn, cancel_flag=cancel_flag)
+        _report_stop(result, log_fn, "yt-dlp direct")
+        if result.cancelled:
+            return False, None
         filename = None
         for line in result.stdout.splitlines():
             if "Destination:" in line:
                 filename = line.split("Destination:")[1].strip()
-                break
-        if filename and os.path.exists(filename):
+            elif "has already been downloaded" in line:
+                filename = line.split("[download]", 1)[-1].split(" has already")[0].strip()
+        if result.returncode == 0 and filename and os.path.exists(filename):
             log_fn(f"✅ Direct download success: {filename}")
             return True, filename
+        if result.returncode != 0 and not result.stalled:
+            tail = [l for l in result.stdout.splitlines() if "ERROR" in l][-1:]
+            log_fn(f"⚠ yt-dlp direct failed (exit {result.returncode})"
+                   + (f": {tail[0][:160]}" if tail else ""))
     except Exception as e:
         log_fn(f"⚠ yt-dlp direct failed: {e}")
 
     # ffmpeg fallback for HLS
-    if ".m3u8" in source_url.lower():
+    if ".m3u8" in source_url.lower() and not _flag_is_cancelled(cancel_flag):
         final_path = (
             output_template.replace(".%(ext)s", ".mp4")
             if ".%(ext)s" in output_template
@@ -3677,11 +3772,21 @@ def download_from_extracted_source(
         else:
             cmd.extend(["-i", source_url])
         cmd.extend(["-c", "copy", final_path])
+        total = None
+        if time_range and not download_full and time_range[1] > time_range[0]:
+            total = time_range[1] - time_range[0]
+        elif expected_seconds:
+            total = float(expected_seconds)
+        log_fn("🔄 Trying ffmpeg for the HLS stream...")
         try:
-            subprocess.run(cmd, check=True, timeout=400)
-            if os.path.exists(final_path):
+            result = _run_ffmpeg_with_progress(cmd, log_fn, cancel_flag, total_seconds=total)
+            _report_stop(result, log_fn, "ffmpeg")
+            if result.returncode == 0 and os.path.exists(final_path):
                 log_fn(f"✅ ffmpeg success: {final_path}")
                 return True, final_path
+            if not (result.cancelled or result.stalled):
+                tail = result.stdout.strip().splitlines()[-1:] or [""]
+                log_fn(f"⚠ ffmpeg failed (exit {result.returncode}) {tail[0][:160]}")
         except Exception as e:
             log_fn(f"⚠ ffmpeg failed: {e}")
 

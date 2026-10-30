@@ -69,6 +69,8 @@ onnxscript  # torch.onnx.export needs it; without it the DirectML R3D export fai
             # and action recognition quietly stays on the CPU (modules/vision/r3d_onnx.py)
 ffmpeg-python
 selenium
+playwright  # Apache-2.0; page extraction for downloads. The app ships no browser of its
+            # own and drives the installed Edge or Chrome (downloader._launch_chromium)
 trio
 trio-websocket
 webdriver-manager

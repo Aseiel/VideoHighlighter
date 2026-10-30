@@ -213,6 +213,7 @@ jobs:
             --copy-metadata keyring `
             --collect-all openvino `
             --collect-all onnxruntime `
+            --collect-all playwright `
             --collect-data whisper `
             --collect-binaries imageio_ffmpeg `
             --hidden-import llm.clip_prefilter `
@@ -769,6 +770,7 @@ jobs:
             --copy-metadata keyring \
             --collect-all openvino \
             --collect-all onnxruntime \
+            --collect-all playwright \
             --collect-data whisper \
             --collect-binaries imageio_ffmpeg \
             --hidden-import llm.clip_prefilter \
