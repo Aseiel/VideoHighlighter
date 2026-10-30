@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VideoHighlighter 使用说明</title>
+<style>
+:root { --bg: #ffffff; --text: #1f1f1f; --muted: #5f5f5f; --line: #e2e2e2; --accent: #2f81f7; --card: #f6f6f6; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161616; --text: #e8e8e8; --muted: #a0a0a0; --line: #333333; --accent: #5aa0ff; --card: #1f1f1f; }
+}
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.75 "Microsoft YaHei", "PingFang SC", "Segoe UI", system-ui, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; }
+h1 { font-size: 28px; margin: 0 0 4px; }
+h2 { font-size: 20px; margin: 40px 0 8px; padding-top: 16px; border-top: 1px solid var(--line); }
+h3 { font-size: 16px; margin: 20px 0 4px; }
+p.lead { color: var(--muted); margin: 0 0 24px; }
+nav { background: var(--card); border-radius: 8px; padding: 12px 16px; }
+nav a { color: var(--accent); text-decoration: none; margin-right: 16px; white-space: nowrap; }
+b.ui { font-weight: 600; }
+ol, ul { padding-left: 22px; }
+li { margin: 4px 0; }
+.note { background: var(--card); border-left: 3px solid var(--accent); padding: 10px 14px; margin: 16px 0; }
+</style>
+</head>
+<body>
+<main>
+<h1>VideoHighlighter 使用说明</h1>
+<p class="lead">交给它一段长视频，它会找出最精彩的高光片段；之后可以在这里完成剪辑，也可以交给你常用的剪辑软件。所有处理都在你的电脑上进行，不会上传任何内容。</p>
+
+<nav>
+<a href="#quick">快速生成高光</a>
+<a href="#detailed">详细设置</a>
+<a href="#timeline">编辑时间线</a>
+<a href="#report">为什么选这一段</a>
+<a href="#teach">教它认识新东西</a>
+<a href="#faq">常见问题</a>
+</nav>
+
+<h2 id="quick">1. 快速生成高光</h2>
+<p>启动界面（<b class="ui">简洁视图</b>）只用一个按钮就能完成整个流程。</p>
+<ol>
+<li>把视频拖到 <b class="ui">把视频放这儿</b>区域，或点击它选择文件。</li>
+<li>选择 <b class="ui">高光时长</b>：短（约 1–2 分钟）、中（约 4 分钟）或长（约 7 分钟）。</li>
+<li>点击 <b class="ui">分析</b>。同一个视频第一次分析最慢，之后会复用已经找到的结果。</li>
+<li>完成后，<b class="ui">打开时间轴</b>显示选中的片段，<b class="ui">打开报告</b>解释每一段。</li>
+</ol>
+<p>生成的高光视频保存在原视频旁边。</p>
+
+<h2 id="detailed">2. 详细设置</h2>
+<p>在启动界面点击 <b class="ui">详细设置…</b>可以看到全部选项。<b class="ui">视图 → 简洁视图</b> 可以回到启动界面。</p>
+<ul>
+<li><b class="ui">添加视频</b>把视频加入顶部的列表，可以一次处理多个视频。</li>
+<li><b class="ui">基本设置</b>：高光时长，以及要找什么。</li>
+<li><b class="ui">转录和字幕</b>：开启语音转文字，让说的话也参与评分，并生成字幕。</li>
+<li><b class="ui">高级</b>：检测器、评分规则和高光报告。</li>
+<li><b class="ui">预设</b>：把当前设置存成一个名字，以后再载入。</li>
+</ul>
+<p>窗口底部：</p>
+<ul>
+<li><b class="ui">运行高光提取</b>分析视频并生成高光视频。</li>
+<li>它旁边的箭头里有 <b class="ui">仅评分（不生成视频）</b>：用当前设置重新评分并写出报告，但不生成视频。已经分析过的视频很快就能完成，适合试调设置。</li>
+<li>勾选 <b class="ui">导出片段</b>，会另外把每个选中的片段单独保存为文件，放在高光视频旁边的 <code>_clips</code> 文件夹里。</li>
+</ul>
+
+<h2 id="timeline">3. 编辑时间线</h2>
+<p><b class="ui">时间线查看器</b>显示整段视频以及找到的所有内容：语音、人脸、物体、运动和镜头切换。下方是编辑时间线，里面是选中的片段。</p>
+<ul>
+<li>可以播放、修剪、删除片段，也可以用 <b class="ui">添加片段</b>加入自己的片段。</li>
+<li><b class="ui">渲染高光视频</b>把编辑好的结果输出为视频。</li>
+<li><b class="ui">导出</b>把剪辑交给其他软件：EDL 或 FCPXML（DaVinci Resolve、Premiere、Final Cut）、CSV，或者 <b class="ui">剪映 / CapCut 项目</b>——导出后会直接出现在剪映或 CapCut 的项目列表里。</li>
+</ul>
+
+<h2 id="report">4. 为什么选这一段</h2>
+<p><b class="ui">高光报告</b>打开一个页面，解释每个选中的片段：哪些信号给它加了分、检测到了什么、说了什么，以及差一点入选的好片段。</p>
+<p><b class="ui">AI 总结</b>在报告里加几句通俗的话：是什么决定了这次的剪辑，以及最可能让结果更好的一处修改。它使用本地 AI 模型，所以需要一点时间。旁边的齿轮按钮还有更多选项：讲述片段里发生了什么、提问，或选择模型。</p>
+<div class="note">AI 总结需要本地模型，可以在 <b class="ui">LLM 聊天</b>标签页里设置。</div>
+
+<h2 id="teach">5. 教它认识新东西</h2>
+<p>VideoHighlighter 找的是你教给它的东西。如果它还不认识你关心的内容，就教它：</p>
+<ol>
+<li>打开 <b class="ui">训练</b>标签页。</li>
+<li>给它几段包含这个内容的视频，并检查它整理出的样本。</li>
+<li>开始训练。下一次运行就会使用新模型。</li>
+</ol>
+<p><b class="ui">高级</b>标签页里的 <b class="ui">社区模型…</b> 列出其他用户制作并分享的模型。</p>
+
+<h2 id="faq">6. 常见问题</h2>
+<h3>处理很慢。</h3>
+<p>同一个视频第一次运行会做检测，之后会复用结果。显卡能大幅加速：NVIDIA、AMD 和 Intel 显卡都支持。</p>
+<h3>界面语言不对。</h3>
+<p><b class="ui">视图 → 语言</b>。重启程序后生效。</p>
+<h3>出错了。</h3>
+<p><b class="ui">帮助 → 打开调试日志文件</b> 会打开完整日志。提问时请把它一起发来。</p>
+<h3>去哪里提问？</h3>
+<p>Discord（<code>discord.gg/cUPJqPAMmm</code>，#support 频道）或 GitHub Issues（<code>github.com/Aseiel/VideoHighlighter/issues</code>）。</p>
+</main>
+</body>
+</html>

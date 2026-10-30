@@ -151,6 +151,12 @@ def build_qss(p: Palette = DARK) -> str:
     QPushButton:pressed {{ background-color: {p.bg}; }}
     QPushButton:disabled {{ color: {p.text_mute}; border-color: {p.border}; background-color: {p.surface}; }}
 
+    /* Two buttons drawn as one (main.py _joined_buttons): an action and its
+       options, split by a line. A property, not an inline style, so a button
+       that recolours itself while it runs keeps the shared edge. */
+    QPushButton[joined="main"] {{ border-top-right-radius: 0; border-bottom-right-radius: 0; border-right: none; }}
+    QPushButton[joined="side"] {{ border-top-left-radius: 0; border-bottom-left-radius: 0; }}
+
     /* Text-ish inputs. Spin boxes are left to Fusion + palette (see the note by
        the combo rules) so their native arrows survive. */
     QLineEdit, QPlainTextEdit, QTextEdit, QComboBox {{

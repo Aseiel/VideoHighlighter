@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to use VideoHighlighter</title>
+<style>
+:root { --bg: #ffffff; --text: #1f1f1f; --muted: #5f5f5f; --line: #e2e2e2; --accent: #2f81f7; --card: #f6f6f6; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #161616; --text: #e8e8e8; --muted: #a0a0a0; --line: #333333; --accent: #5aa0ff; --card: #1f1f1f; }
+}
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.65 "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; }
+h1 { font-size: 28px; margin: 0 0 4px; }
+h2 { font-size: 20px; margin: 40px 0 8px; padding-top: 16px; border-top: 1px solid var(--line); }
+h3 { font-size: 16px; margin: 20px 0 4px; }
+p.lead { color: var(--muted); margin: 0 0 24px; }
+nav { background: var(--card); border-radius: 8px; padding: 12px 16px; }
+nav a { color: var(--accent); text-decoration: none; margin-right: 16px; white-space: nowrap; }
+b.ui { font-weight: 600; }
+ol, ul { padding-left: 22px; }
+li { margin: 4px 0; }
+.note { background: var(--card); border-left: 3px solid var(--accent); padding: 10px 14px; margin: 16px 0; }
+</style>
+</head>
+<body>
+<main>
+<h1>How to use VideoHighlighter</h1>
+<p class="lead">Give it a long video, get back the moments that matter, then finish the edit here or in your own editor. Everything runs on your computer. Nothing is uploaded.</p>
+
+<nav>
+<a href="#quick">Quick highlight</a>
+<a href="#detailed">Detailed settings</a>
+<a href="#timeline">Edit the timeline</a>
+<a href="#report">Why a moment was picked</a>
+<a href="#teach">Teach it something new</a>
+<a href="#faq">Questions</a>
+</nav>
+
+<h2 id="quick">1. Quick highlight</h2>
+<p>The start screen (<b class="ui">Simple view</b>) does a whole run with one button.</p>
+<ol>
+<li>Drop a video onto <b class="ui">Drop a video here</b>, or click it to choose a file.</li>
+<li>Choose a <b class="ui">Highlight length</b>: Short (about 1–2 minutes), Medium (about 4) or Longer (about 7).</li>
+<li>Press <b class="ui">Analyze</b>. The first run on a video takes longest; later runs reuse what was already found.</li>
+<li>When it finishes, <b class="ui">Open timeline</b> shows the picked moments, and <b class="ui">Open report</b> explains each one.</li>
+</ol>
+<p>The finished highlight video is saved next to the original.</p>
+
+<h2 id="detailed">2. Detailed settings</h2>
+<p>Press <b class="ui">Detailed settings…</b> on the start screen for every option. <b class="ui">View → Simple view</b> takes you back.</p>
+<ul>
+<li><b class="ui">Add Videos</b> fills the list at the top. Several videos can run in one go.</li>
+<li><b class="ui">Basic Settings</b>: how long the highlight is and what to look for.</li>
+<li><b class="ui">Transcript &amp; Subtitles</b>: turn on speech-to-text, so what is said can count, and write subtitles.</li>
+<li><b class="ui">Advanced</b>: detectors, scoring and the highlight report.</li>
+<li><b class="ui">Presets</b>: save your settings under a name and load them later.</li>
+</ul>
+<p>Then, at the bottom:</p>
+<ul>
+<li><b class="ui">Run Highlighter</b> analyses the videos and renders the highlight.</li>
+<li>The arrow next to it has <b class="ui">Score only (no video)</b>: it re-scores with the current settings and writes the report, without rendering a video. It is fast on a video already analysed, so it is the quick way to try a setting.</li>
+<li>Tick <b class="ui">Export clips</b> to also save every picked moment as its own file, in a <code>_clips</code> folder next to the highlight.</li>
+</ul>
+
+<h2 id="timeline">3. Edit the timeline</h2>
+<p><b class="ui">Timeline Viewer</b> shows the whole video with everything that was found: speech, faces, objects, motion and scene cuts. Below it is the edit timeline with the picked clips.</p>
+<ul>
+<li>Play, trim and delete clips, or add your own with <b class="ui">Add Clip</b>.</li>
+<li><b class="ui">Render Highlight Video</b> writes the edited cut as a video.</li>
+<li><b class="ui">Export</b> hands the cut to another editor: EDL or FCPXML (DaVinci Resolve, Premiere, Final Cut), CSV, or a <b class="ui">CapCut / Jianying project</b> that appears straight in CapCut's project list.</li>
+</ul>
+
+<h2 id="report">4. Why a moment was picked</h2>
+<p><b class="ui">Highlight Report</b> opens a page that explains every picked moment: what scored it, what was detected, what was said, and the good moments that just missed the cut.</p>
+<p><b class="ui">AI Summary</b> adds a few plain sentences to that report: what shaped this cut and the one change most likely to improve it. It uses a local AI model, so it takes a moment. The button next to it (the wheel) has more: read what happens in the cut, ask a question, or choose the model.</p>
+<div class="note">AI Summary needs a local model. The <b class="ui">LLM Chat</b> tab sets one up.</div>
+
+<h2 id="teach">5. Teach it something new</h2>
+<p>VideoHighlighter finds what you show it. If it does not know the thing you care about, teach it:</p>
+<ol>
+<li>Open the <b class="ui">Train</b> tab.</li>
+<li>Give it a few videos with examples of the thing, and check the samples it sorts.</li>
+<li>Train. The new model is used on the next run.</li>
+</ol>
+<p><b class="ui">Community models…</b> on the <b class="ui">Advanced</b> tab lists models other people have made and shared.</p>
+
+<h2 id="faq">6. Questions</h2>
+<h3>It is slow.</h3>
+<p>The first run on a video does the detection; later runs reuse it. A graphics card helps a lot: NVIDIA, AMD and Intel are all supported.</p>
+<h3>The language is wrong.</h3>
+<p><b class="ui">View → Language</b>. It changes after you restart the app.</p>
+<h3>Something went wrong.</h3>
+<p><b class="ui">Help → Open debug log file</b> opens the full log. Send it with your question.</p>
+<h3>Where do I ask?</h3>
+<p>On Discord (<code>discord.gg/cUPJqPAMmm</code>, channel #support) or on GitHub Issues (<code>github.com/Aseiel/VideoHighlighter/issues</code>).</p>
+</main>
+</body>
+</html>

@@ -93,6 +93,7 @@ from llm.llm_chat_widget import LLMChatWidget
 from modules.media.video_cache import VideoAnalysisCache, CachedAnalysisData, build_analysis_cache_params
 from modules.report import analysis_stats
 from modules.ui import icons as _ui_icons, theme as _ui_theme
+from modules.ui.main_menu import build_menu_bar
 from modules.segments.simple_run import apply_simple_run
 from modules.ui.simple_start import (
     SimpleStartPage, persist_simple_start, simple_start_enabled,
@@ -660,13 +661,16 @@ class Worker(QThread):
             self._is_running = False
 
     def cancel(self):
+        """Non-blocking: trip the flag and return. run() stops at the pipeline's
+        next check and emits cancelled/finished, which clean up the UI.
+
+        Never terminate(). Whisper on the processor checks the flag once per
+        30 s window, which can take longer than any grace period; killing the
+        thread inside PyTorch left the model and its threads in memory, and the
+        next run then exhausted memory and crashed the process in ntdll."""
         if self._is_running:
             self.log.emit("⏹️ Cancellation requested - stopping pipeline...")
             self._cancel_flag.set()
-            if not self.wait(5000):
-                self.log.emit("⚠️ Force terminating thread...")
-                self.terminate()
-                self.wait()
 
     def is_cancelled(self):
         return self._cancel_flag.is_set()
@@ -3123,19 +3127,14 @@ class VideoHighlighterGUI(QWidget):
 
         # --- Run / Cancel Controls ---
         ctrl_layout = QHBoxLayout()
-        self.keep_temp_chk = QPushButton(i18n.t("Keep temp clips: ON") if highlights_cfg.get("keep_temp", False) else i18n.t("Keep temp clips: OFF"))
-        self.keep_temp_chk.setCheckable(True)
-        self.keep_temp_chk.setChecked(highlights_cfg.get("keep_temp", False))
-        self.keep_temp_chk.clicked.connect(lambda: self.keep_temp_chk.setText(
-            i18n.t("Keep temp clips: ON") if self.keep_temp_chk.isChecked() else i18n.t("Keep temp clips: OFF")))
+        # Keeping the working files (each cut under a temp name, and the concat
+        # list) is a debugging aid with no control of its own any more: Export
+        # clips keeps the same cuts under readable names. config.yaml and
+        # presets still set it, and it is written back as it was read.
+        self.keep_temp = bool(highlights_cfg.get("keep_temp", False))
 
-        _export_on = bool(highlights_cfg.get("export_separate_clips", False))
-        self.export_clips_chk = QPushButton(
-            i18n.t("Export clips: ON") if _export_on else i18n.t("Export clips: OFF"))
-        self.export_clips_chk.setCheckable(True)
-        self.export_clips_chk.setChecked(_export_on)
-        self.export_clips_chk.clicked.connect(lambda: self.export_clips_chk.setText(
-            i18n.t("Export clips: ON") if self.export_clips_chk.isChecked() else i18n.t("Export clips: OFF")))
+        self.export_clips_chk = QCheckBox(i18n.t("Export clips"))
+        self.export_clips_chk.setChecked(bool(highlights_cfg.get("export_separate_clips", False)))
         self.export_clips_chk.setToolTip(
             "Also write each scored segment as its own file under\n"
             "<video>_clips/ next to the concatenated highlight reel.")
@@ -3182,37 +3181,26 @@ class VideoHighlighterGUI(QWidget):
         self.cancel_btn.setStyleSheet("QPushButton:enabled { background-color: #ff4444; color: white; font-weight: bold; }")
         self.cancel_btn.clicked.connect(self.cancel_pipeline)
 
-        # Scores and reports without encoding. Detection is cached, so this is
-        # seconds once a video has been analysed — cheap enough to use as the
-        # normal way of trying a setting.
-        self.report_only_btn = QPushButton("Report Only")
-        self.report_only_btn.setToolTip(
-            "Re-score with the current settings and write the Highlight Report,\n"
-            "without rendering a video. Fast on a video already analysed.")
-        self.report_only_btn.clicked.connect(lambda: self.run_pipeline(report_only=True))
-
         self.run_btn = QPushButton(i18n.t("Run Highlighter"))
         self.run_btn.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px; }")
         self.run_btn.clicked.connect(self.toggle_run)
 
+        # Other ways to run. Scoring without a video is a run, not a report,
+        # so it sits with Run rather than beside Highlight Report.
+        self.run_opts_btn = QPushButton()
+        self.run_opts_btn.setIcon(_ui_icons.chevron())
+        self.run_opts_btn.setFixedWidth(28)
+        self.run_opts_btn.setToolTip("Other ways to run")
+        self.run_opts_btn.clicked.connect(self.show_run_menu)
+
         ctrl_layout.addWidget(self.simple_start_btn)
         ctrl_layout.addWidget(self.cancel_btn)
-        ctrl_layout.addWidget(self.keep_temp_chk)
         ctrl_layout.addWidget(self.export_clips_chk)
         ctrl_layout.addWidget(self.timeline_btn)
         ctrl_layout.addWidget(self.why_report_btn)
-        ctrl_layout.addWidget(self.ai_summary_btn)
-        ctrl_layout.addWidget(self.ai_summary_opts_btn)
-        self.debug_console_chk = QCheckBox("Debug log")
-        self.debug_console_chk.setChecked(debug_console.is_console_visible())
-        self.debug_console_chk.setToolTip(
-            "Open a live window mirroring all app output\n"
-            "(recent output is replayed, so it works after an error too).\n"
-            f"Everything is always saved to:\n{debug_console.log_file_path()}"
-        )
-        self.debug_console_chk.toggled.connect(debug_console.set_console_visible)
-        debug_console.register_checkbox(self.debug_console_chk)
-        ctrl_layout.addWidget(self.debug_console_chk)
+        ctrl_layout.addWidget(self._joined_buttons(
+            self.ai_summary_btn, self.ai_summary_opts_btn))
+        # The debug log is switched from View > Debug log (modules/ui/main_menu.py).
         self.session_analyzed_count = 0
         self.analyzed_counter_label = QLabel()
         self.analyzed_counter_label.setStyleSheet("color: #2196F3; font-weight: bold;")
@@ -3223,8 +3211,7 @@ class VideoHighlighterGUI(QWidget):
         self.update_analyzed_counter()
         ctrl_layout.addWidget(self.analyzed_counter_label)
         ctrl_layout.addStretch()
-        ctrl_layout.addWidget(self.report_only_btn)
-        ctrl_layout.addWidget(self.run_btn)
+        ctrl_layout.addWidget(self._joined_buttons(self.run_btn, self.run_opts_btn))
         layout.addLayout(ctrl_layout)
 
         # --- Log view (inside splitter) ---
@@ -3270,6 +3257,7 @@ class VideoHighlighterGUI(QWidget):
         self.set_simple_start(simple_start_enabled(default=True), persist=False)
 
         self.setLayout(root)
+        root.setMenuBar(build_menu_bar(self))
 
         self.setup_label_completers()
         self.status_timer = QTimer()
@@ -3346,6 +3334,28 @@ class VideoHighlighterGUI(QWidget):
         area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         area.setWidget(page)
         return area
+
+    @staticmethod
+    def _joined_buttons(main, side):
+        """Two buttons drawn as one, split by a line: ``main`` does the thing,
+        ``side`` holds its options. Apart, the options wheel read as a control
+        of its own."""
+        group = QWidget()
+        row = QHBoxLayout(group)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        # The shared edge is a theme rule on this property (modules/ui/theme.py),
+        # so a button that restyles itself mid-run keeps it. The side button's
+        # left border is the line.
+        main.setProperty("joined", "main")
+        side.setProperty("joined", "side")
+        # The same height whatever padding the main button sets for itself:
+        # the group is as tall as its taller button, and the side one fills it.
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        side.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        row.addWidget(main)
+        row.addWidget(side)
+        return group
 
     def set_simple_start(self, on: bool, persist: bool = True):
         """Simple view vs Detailed settings. Neither one is a wizard step;
@@ -4454,7 +4464,7 @@ class VideoHighlighterGUI(QWidget):
             "exact_duration": exact_duration,
             "multi_signal_boost": 1.2,
             "min_signals_for_boost": 2,
-            "keep_temp": self.keep_temp_chk.isChecked(),
+            "keep_temp": self.keep_temp,
             "export_separate_clips": self.export_clips_chk.isChecked(),
             "render_mode": self.render_mode_combo.currentData(),
             "highlight_objects": highlight_objects,
@@ -4829,13 +4839,9 @@ class VideoHighlighterGUI(QWidget):
         if has("highlights", "coverage"):
             self.slider_coverage.setValue(int(round(float(get("highlights", "coverage") or 0) * 100)))
         if has("highlights", "keep_temp"):
-            self.keep_temp_chk.setChecked(bool(get("highlights", "keep_temp")))
-            self.keep_temp_chk.setText(
-                i18n.t("Keep temp clips: ON") if self.keep_temp_chk.isChecked() else i18n.t("Keep temp clips: OFF"))
+            self.keep_temp = bool(get("highlights", "keep_temp"))
         if has("highlights", "export_separate_clips"):
             self.export_clips_chk.setChecked(bool(get("highlights", "export_separate_clips")))
-            self.export_clips_chk.setText(
-                i18n.t("Export clips: ON") if self.export_clips_chk.isChecked() else i18n.t("Export clips: OFF"))
         self._set_combo_data(self.render_mode_combo, get("highlights", "render_mode") if has("highlights", "render_mode") else None)
         if has("highlights", "use_time_range"):
             self.use_time_range_chk.setChecked(bool(get("highlights", "use_time_range")))
@@ -5022,7 +5028,7 @@ class VideoHighlighterGUI(QWidget):
                 "output": self.output_input.text().strip(),
                 "max_duration": int(self.spin_max_duration.value()),
                 "exact_duration": int(self.spin_exact_duration.value()),
-                "keep_temp": self.keep_temp_chk.isChecked(),
+                "keep_temp": self.keep_temp,
                 "export_separate_clips": self.export_clips_chk.isChecked(),
                 "render_mode": self.render_mode_combo.currentData(),
                 "auto_min_clip": int(self.spin_auto_min_clip.value()),
@@ -5792,9 +5798,13 @@ class VideoHighlighterGUI(QWidget):
             return
 
         if self.worker and self.worker.isRunning():
-            self.append_log("⚠️ Pipeline already running!")
+            if self.worker.is_cancelled():
+                self.append_log("⏳ The cancelled run is still stopping — "
+                                "start again once it has finished.")
+            else:
+                self.append_log("⚠️ Pipeline already running!")
             return
-        
+
         # --- Validate scoring points ---
         scene_points = int(self.spin_scene_points.value())
         motion_event_points = int(self.spin_motion_event_points.value())
@@ -5903,7 +5913,7 @@ class VideoHighlighterGUI(QWidget):
             "exact_duration": exact_duration,
             "multi_signal_boost": 1.2,
             "min_signals_for_boost": 2,
-            "keep_temp": self.keep_temp_chk.isChecked(),
+            "keep_temp": self.keep_temp,
             "export_separate_clips": self.export_clips_chk.isChecked(),
             "render_mode": self.render_mode_combo.currentData(),
             "output_file": output_file,
@@ -6364,19 +6374,22 @@ class VideoHighlighterGUI(QWidget):
         if worker is not getattr(self, 'download_worker', None):
             return
         if worker and worker.isRunning():
-            self.append_log("⚠️ Forcing download termination...")
-            worker.terminate()
-            worker.wait(3000)
+            # Not terminate(): the download tools run as child processes, and the
+            # cancel already killed their whole tree (modules/media/
+            # process_progress.py); the thread returns once they are gone.
+            self.append_log("⏳ Download still stopping...")
+            QTimer.singleShot(5000, lambda: self.force_download_cleanup(worker))
+            return
         self.download_cleanup()
 
     def force_worker_cleanup(self):
-        """Force cleanup if worker doesn't stop gracefully"""
+        """Fires after a cancel: says so if the run is still stopping, and looks
+        again later. It never kills the thread (see Worker.cancel); the run's
+        own cancelled/finished signals bring the controls back."""
         if self.worker and self.worker.isRunning():
-            self.append_log("⚠️ Forcing pipeline termination...")
-            self.worker.terminate()
-            self.worker.wait(3000)  # Wait up to 3 seconds
-            self.pipeline_cleanup()
-            self._show_progress(False)
+            self.append_log("⏳ Still stopping: the current step finishes first "
+                            "(a transcript stops at the end of its 30-second window)")
+            QTimer.singleShot(10000, self.force_worker_cleanup)
 
     def update_analyzed_counter(self):
         """Refresh the analyzed-videos counter label (lifetime + this session)."""
@@ -7036,6 +7049,22 @@ class VideoHighlighterGUI(QWidget):
                 if text and (text in wanted or wanted in text):
                     return float(line.get("start") or 0.0)
         return None
+
+    def show_run_menu(self):
+        """The chevron beside Run Highlighter: other ways to run."""
+        menu = QMenu(self)
+        # Scores and reports without encoding. Detection is cached, so this is
+        # seconds once a video has been analysed — cheap enough to use as the
+        # normal way of trying a setting.
+        score_only = menu.addAction(i18n.t("Score only (no video)"))
+        score_only.setToolTip(
+            "Re-score with the current settings and write the Highlight Report,\n"
+            "without rendering a video. Fast on a video already analysed.")
+        menu.setToolTipsVisible(True)
+        chosen = menu.exec(self.run_opts_btn.mapToGlobal(
+            self.run_opts_btn.rect().bottomLeft()))
+        if chosen is score_only:
+            self.run_pipeline(report_only=True)
 
     def show_ai_summary_menu(self):
         from PySide6.QtWidgets import QMenu

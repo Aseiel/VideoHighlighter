@@ -162,6 +162,11 @@ def _paint_gear(p: QPainter) -> None:
         )
 
 
+def _paint_chevron(p: QPainter) -> None:
+    """A small downward chevron: more choices behind this button."""
+    p.drawPolyline(QPolygonF([QPointF(4.5, 6.2), QPointF(8.0, 9.8), QPointF(11.5, 6.2)]))
+
+
 def _paint_tally(p: QPainter) -> None:
     """Four tally strokes and the crossing fifth — counting."""
     for x in (3.6, 6.0, 8.4, 10.8):
@@ -242,6 +247,11 @@ def render(palette: Palette = DARK, color: str | None = None) -> QIcon:
 def gear(palette: Palette = DARK, color: str | None = None) -> QIcon:
     """Settings. Defaults to `on_accent` (sits on the render CTA's ⚙ half)."""
     return _icon(_paint_gear, color or palette.on_accent, width=1.3)
+
+
+def chevron(palette: Palette = DARK, color: str | None = None) -> QIcon:
+    """More options. Defaults to `text`: sits on a quiet secondary button."""
+    return _icon(_paint_chevron, color or palette.text, width=1.6)
 
 
 def tally(palette: Palette = DARK, color: str | None = None) -> QIcon:
