@@ -1083,5 +1083,9 @@
   "View": "Görünüm",
   "CapCut / Jianying project": "CapCut / Jianying projesi",
   "Export clips": "Klipleri dışa aktar",
-  "Score only (no video)": "Yalnızca puanla (video yok)"
+  "Score only (no video)": "Yalnızca puanla (video yok)",
+  "LM Studio (local server)": "LM Studio (yerel sunucu)",
+  "LM Studio host:": "LM Studio sunucusu:",
+  "Looking for Ollama and LM Studio…": "Ollama ve LM Studio aranıyor…",
+  "Where LM Studio's server is running. Blank means http://localhost:1234.\nAny OpenAI-compatible server works here too: llama.cpp's\nllama-server, Jan, vLLM. For another PC, turn on\n\"Serve on Local Network\" in LM Studio's Developer tab there.\nThe whole app follows this: chat, report, narration and advisor.": "LM Studio sunucusunun çalıştığı yer. Boş bırakılırsa http://localhost:1234.\nOpenAI uyumlu her sunucu da çalışır: llama.cpp'nin\nllama-server'ı, Jan, vLLM. Başka bir bilgisayar için oradaki\nLM Studio'nun Developer sekmesinde \"Serve on Local Network\" seçeneğini açın.\nTüm uygulama bunu izler: sohbet, rapor, anlatım ve danışman."
 }

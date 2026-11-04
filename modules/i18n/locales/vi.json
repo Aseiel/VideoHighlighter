@@ -1083,5 +1083,9 @@
   "View": "Xem",
   "CapCut / Jianying project": "Dự án CapCut / Jianying",
   "Export clips": "Xuất các đoạn",
-  "Score only (no video)": "Chỉ chấm điểm (không xuất video)"
+  "Score only (no video)": "Chỉ chấm điểm (không xuất video)",
+  "LM Studio (local server)": "LM Studio (máy chủ cục bộ)",
+  "LM Studio host:": "Máy chủ LM Studio:",
+  "Looking for Ollama and LM Studio…": "Đang tìm Ollama và LM Studio…",
+  "Where LM Studio's server is running. Blank means http://localhost:1234.\nAny OpenAI-compatible server works here too: llama.cpp's\nllama-server, Jan, vLLM. For another PC, turn on\n\"Serve on Local Network\" in LM Studio's Developer tab there.\nThe whole app follows this: chat, report, narration and advisor.": "Nơi máy chủ LM Studio đang chạy. Để trống nghĩa là http://localhost:1234.\nMọi máy chủ tương thích OpenAI cũng dùng được: llama-server\ncủa llama.cpp, Jan, vLLM. Với một máy tính khác, hãy bật\n\"Serve on Local Network\" trong thẻ Developer của LM Studio trên máy đó.\nToàn bộ ứng dụng dùng thiết lập này: trò chuyện, báo cáo, tường thuật và cố vấn."
 }

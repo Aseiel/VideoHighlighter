@@ -1083,5 +1083,9 @@
   "View": "Exibir",
   "CapCut / Jianying project": "Projeto do CapCut / Jianying",
   "Export clips": "Exportar clipes",
-  "Score only (no video)": "Só pontuar (sem vídeo)"
+  "Score only (no video)": "Só pontuar (sem vídeo)",
+  "LM Studio (local server)": "LM Studio (servidor local)",
+  "LM Studio host:": "Host do LM Studio:",
+  "Looking for Ollama and LM Studio…": "Procurando Ollama e LM Studio…",
+  "Where LM Studio's server is running. Blank means http://localhost:1234.\nAny OpenAI-compatible server works here too: llama.cpp's\nllama-server, Jan, vLLM. For another PC, turn on\n\"Serve on Local Network\" in LM Studio's Developer tab there.\nThe whole app follows this: chat, report, narration and advisor.": "Onde o servidor do LM Studio está rodando. Vazio significa http://localhost:1234.\nQualquer servidor compatível com OpenAI também funciona: o\nllama-server do llama.cpp, Jan, vLLM. Para outro PC, ative\n\"Serve on Local Network\" na aba Developer do LM Studio nele.\nO app inteiro segue esta configuração: chat, relatório, narração e consultor."
 }

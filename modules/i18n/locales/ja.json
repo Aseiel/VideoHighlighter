@@ -1083,5 +1083,9 @@
   "View": "表示",
   "CapCut / Jianying project": "CapCut / 剪映 プロジェクト",
   "Export clips": "クリップを書き出す",
-  "Score only (no video)": "採点のみ（動画なし）"
+  "Score only (no video)": "採点のみ（動画なし）",
+  "LM Studio (local server)": "LM Studio（ローカルサーバー）",
+  "LM Studio host:": "LM Studio のホスト:",
+  "Looking for Ollama and LM Studio…": "Ollama と LM Studio を探しています…",
+  "Where LM Studio's server is running. Blank means http://localhost:1234.\nAny OpenAI-compatible server works here too: llama.cpp's\nllama-server, Jan, vLLM. For another PC, turn on\n\"Serve on Local Network\" in LM Studio's Developer tab there.\nThe whole app follows this: chat, report, narration and advisor.": "LM Studio のサーバーが動いている場所。空欄なら http://localhost:1234 です。\nOpenAI 互換のサーバーならどれでも使えます: llama.cpp の\nllama-server、Jan、vLLM。別の PC の場合は、その PC の LM Studio で\nDeveloper タブの「Serve on Local Network」をオンにしてください。\nアプリ全体がこの設定に従います: チャット、レポート、ナレーション、アドバイザー。"
 }

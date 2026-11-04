@@ -29,7 +29,8 @@ export function LlmChatTab({
   onModelChange,
 }: Props) {
   const [backends, setBackends] = useState<string[]>([])
-  const [models, setModels] = useState<string[]>([])
+  const [modelsByBackend, setModelsByBackend] = useState<Record<string, string[]>>({})
+  const models = modelsByBackend[backend] ?? []
   const setBackend = onBackendChange
   const setModel = onModelChange
   const [msgs, setMsgs] = useState<Msg[]>([])
@@ -46,10 +47,19 @@ export function LlmChatTab({
     }
     setError(null)
     setBackends(res.backends)
-    setModels(res.ollama_models)
-    if (res.backends.length && !backend) setBackend(res.backends[0])
-    if (res.ollama_models.length && !model) setModel(res.ollama_models[0])
+    const byBackend = res.models ?? { ollama: res.ollama_models }
+    setModelsByBackend(byBackend)
+    const chosen = backend || res.backends[0] || ""
+    if (!backend && chosen) setBackend(chosen)
+    const list = byBackend[chosen] ?? []
+    if (list.length && !list.includes(model)) setModel(list[0])
   }
+
+  // A model name belongs to one server; switching servers picks one of its own.
+  useEffect(() => {
+    if (models.length && !models.includes(model)) setModel(models[0])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backend])
 
   useEffect(() => {
     void refresh()
@@ -99,8 +109,8 @@ export function LlmChatTab({
           <p className="text-xs text-destructive">{error}</p>
         ) : backends.length === 0 ? (
           <p className="text-xs text-muted-foreground">
-            No local LLM backend found. Install Ollama (or llama-cpp-python) and
-            hit Refresh.
+            No local LLM backend found. Install Ollama or LM Studio (or
+            llama-cpp-python) and hit Refresh.
           </p>
         ) : (
           <div className="grid gap-2">

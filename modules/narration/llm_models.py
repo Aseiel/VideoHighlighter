@@ -24,7 +24,7 @@ from typing import Mapping, Optional, Sequence
 # The backends `llm.llm_module` knows how to build. A stored entry naming
 # anything else is dropped on load: it cannot be constructed, and offering it in
 # a menu only moves the failure to the point where the user has waited for it.
-BACKENDS = ("ollama", "llama-cpp")
+BACKENDS = ("ollama", "llama-cpp", "lmstudio")
 
 # Models that caption a picture rather than follow an instruction. The
 # distinction is not a nicety: handed a numbered rulebook, a captioner

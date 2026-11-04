@@ -1671,16 +1671,28 @@ _llm_cache: dict[str, Any] = {"key": None, "module": None}
 @app.get("/llm/backends")
 async def llm_backends() -> dict:
     try:
-        from llm.llm_module import get_available_backends, get_ollama_models
+        from llm.llm_module import get_available_backends
+        from modules.narration.llm_discovery import (
+            SERVER_BACKENDS, preferred_server, running_servers)
 
         backends = get_available_backends()
+        found = running_servers()
+        models = {name: found.get(name) or [] for name in SERVER_BACKENDS
+                  if name in backends}
+        # The server that is actually running goes first, so a client that
+        # takes the first entry gets one it can use.
+        first = preferred_server(found)
+        if first in backends:
+            backends = [first] + [b for b in backends if b != first]
         return {
             "ok": True,
             "backends": backends,
-            "ollama_models": get_ollama_models() if "ollama" in backends else [],
+            "models": models,
+            "ollama_models": models.get("ollama", []),
         }
     except Exception as exc:  # noqa: BLE001 — LLM stack is optional
-        return {"ok": False, "error": str(exc), "backends": [], "ollama_models": []}
+        return {"ok": False, "error": str(exc), "backends": [], "models": {},
+                "ollama_models": []}
 
 
 @app.get("/llm/clip-status")

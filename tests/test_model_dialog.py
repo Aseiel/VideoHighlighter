@@ -21,6 +21,7 @@ pytest.importorskip("PySide6")
 
 INSTALLED = ["llama3.2:latest", "qwen2.5:7b"]
 USED_BEFORE = ["D:/models/one.gguf", "D:/models/two.gguf"]
+LMSTUDIO = ["google/gemma-4-e4b"]
 
 
 @pytest.fixture(scope="module")
@@ -48,7 +49,8 @@ def make(app, remembered):
             chosen=chosen if chosen is not None else "llama3",
             list_models=lambda refresh=False: list(installed),
             list_recent=lambda: list(recent),
-            remember=remembered.append)
+            remember=remembered.append,
+            list_lmstudio=lambda refresh=False: list(LMSTUDIO))
     return build
 
 
@@ -230,3 +232,18 @@ class TestTheGgufShortlist:
         dialog = make(recent=[])
         assert not dialog.recent.isEnabled()
         assert "Browse" in dialog.recent.itemText(0)
+
+
+def test_lm_studio_lists_its_own_models(dialog):
+    dialog.backend.setCurrentIndex(dialog.backend.findData("lmstudio"))
+    offered = [dialog.tag.itemText(i) for i in range(dialog.tag.count())]
+    assert offered == LMSTUDIO
+    assert "LM Studio" in dialog.status.text()
+    assert not dialog.tag_row.isHidden() and dialog.gguf_row.isHidden()
+    dialog.tag.setCurrentText("google/gemma-4-e4b")
+    dialog._add()
+    assert {"backend": "lmstudio", "model": "google/gemma-4-e4b"} in dialog.models
+
+    dialog.backend.setCurrentIndex(dialog.backend.findData("ollama"))
+    offered = [dialog.tag.itemText(i) for i in range(dialog.tag.count())]
+    assert offered == INSTALLED

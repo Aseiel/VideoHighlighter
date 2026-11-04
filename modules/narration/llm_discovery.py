@@ -89,6 +89,98 @@ def ollama_models(base_url: Optional[str] = None,
 def forget_ollama_models() -> None:
     """Drop the cache. For the Refresh button's sake, and for tests."""
     _cache.clear()
+    _lmstudio_cache.clear()
+
+
+# Kept apart from `_cache` because both are keyed by URL, and a user can point
+# both servers at the same machine on different ports without either list
+# replaying the other's.
+_lmstudio_cache: dict = {}
+
+
+def lmstudio_models(base_url: Optional[str] = None,
+                    refresh: bool = False) -> list:
+    """The chat models the configured LM Studio server offers, or ``[]``.
+
+    Same contract as :func:`ollama_models`: cached per URL for the process,
+    ``refresh=True`` asks again, and nothing here raises.
+    """
+    from llm import lmstudio
+    base_url = lmstudio.resolve(base_url)
+    if not refresh and base_url in _lmstudio_cache:
+        return list(_lmstudio_cache[base_url])
+    found = lmstudio.list_models(base_url)
+    _lmstudio_cache[base_url] = found
+    return list(found)
+
+
+def models_for(backend: str, refresh: bool = False) -> list:
+    """The model list for a server backend; ``[]`` for anything else."""
+    if backend == "ollama":
+        return ollama_models(refresh=refresh)
+    if backend == "lmstudio":
+        return lmstudio_models(refresh=refresh)
+    return []
+
+
+# The servers worth looking for, in the order a menu offers them.
+SERVER_BACKENDS = ("ollama", "lmstudio")
+
+
+def _probe(backend: str, timeout: float):
+    """The server's model list, or ``None`` when nothing answered."""
+    import requests
+    try:
+        if backend == "ollama":
+            resp = requests.get(f"{resolve_ollama_host()}/api/tags",
+                                timeout=timeout)
+            resp.raise_for_status()
+            return [str(m["name"]) for m in resp.json().get("models", [])]
+        from llm import lmstudio
+        return [str(m["id"]) for m in
+                lmstudio.server_models(timeout=timeout)]
+    except Exception:
+        return None
+
+
+def running_servers(timeout: float = 1.0) -> dict:
+    """``{backend: [models] or None}`` for each server, asked at once.
+
+    ``None`` is "nothing answered"; ``[]`` is "running, but no models", which
+    is a different thing to tell the user. The probes run in parallel so the
+    whole answer costs one timeout, not one per server, and the lists are
+    stored in the caches above so the menu that asked does not ask again.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(SERVER_BACKENDS)) as pool:
+        futures = {name: pool.submit(_probe, name, timeout)
+                   for name in SERVER_BACKENDS}
+        found = {name: future.result() for name, future in futures.items()}
+    if found.get("ollama") is not None:
+        _cache[resolve_ollama_host()] = list(found["ollama"])
+    if found.get("lmstudio") is not None:
+        from llm import lmstudio
+        _lmstudio_cache[lmstudio.resolve()] = list(found["lmstudio"])
+    return found
+
+
+def preferred_server(found: dict, current: Optional[str] = None) -> Optional[str]:
+    """Which server to select: ``current`` if it answered, else the first that did.
+
+    A server that answered with models beats one that answered empty, so a
+    stopped-but-installed LM Studio does not win over an Ollama that can run.
+    """
+    if current in found and found[current]:
+        return current
+    for name in SERVER_BACKENDS:
+        if found.get(name):
+            return name
+    if current in found and found[current] is not None:
+        return current
+    for name in SERVER_BACKENDS:
+        if found.get(name) is not None:
+            return name
+    return None
 
 
 def _settings():

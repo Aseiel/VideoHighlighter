@@ -1083,5 +1083,9 @@
   "View": "视图",
   "CapCut / Jianying project": "剪映 / CapCut 项目",
   "Export clips": "导出片段",
-  "Score only (no video)": "仅评分（不生成视频）"
+  "Score only (no video)": "仅评分（不生成视频）",
+  "LM Studio (local server)": "LM Studio（本地服务器）",
+  "LM Studio host:": "LM Studio 主机：",
+  "Looking for Ollama and LM Studio…": "正在查找 Ollama 和 LM Studio…",
+  "Where LM Studio's server is running. Blank means http://localhost:1234.\nAny OpenAI-compatible server works here too: llama.cpp's\nllama-server, Jan, vLLM. For another PC, turn on\n\"Serve on Local Network\" in LM Studio's Developer tab there.\nThe whole app follows this: chat, report, narration and advisor.": "LM Studio 服务器运行的位置。留空表示 http://localhost:1234。\n任何兼容 OpenAI 的服务器也可以：llama.cpp 的\nllama-server、Jan、vLLM。若是另一台电脑，请在那台电脑的 LM Studio\n“Developer”标签页中打开“Serve on Local Network”。\n整个应用都遵循此设置：聊天、报告、旁白和顾问。"
 }

@@ -384,10 +384,12 @@ export async function getActionLabels(): Promise<string[]> {
   }
 }
 
-/** Local LLM backends (Ollama / llama-cpp) and any Ollama models found. */
+/** Local LLM backends (Ollama / LM Studio / llama-cpp) and each server's models. */
 export async function getLlmBackends(): Promise<{
   ok: boolean
   backends: string[]
+  /** Per server backend; a server that did not answer has an empty list. */
+  models?: Record<string, string[]>
   ollama_models: string[]
   error?: string
 }> {

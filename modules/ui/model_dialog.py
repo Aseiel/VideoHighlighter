@@ -40,6 +40,16 @@ from modules.narration.llm_models import BACKENDS, label_for
 
 GGUF_FILTER = "GGUF models (*.gguf);;All files (*)"
 
+# What each backend is called in the menu, and what its server is called in a
+# sentence. A backend missing from SERVERS takes a file, not a name.
+BACKEND_LABELS = {
+    "ollama": "Ollama (local server)",
+    "lmstudio": "LM Studio (local server)",
+    "llama-cpp": "llama-cpp (GGUF file)",
+}
+SERVERS = {"ollama": "Ollama", "lmstudio": "LM Studio"}
+PLACEHOLDERS = {"ollama": "llama3.2", "lmstudio": "google/gemma-4-e4b"}
+
 
 class ModelDialog(QDialog):
     """The report's models: what is configured, and how to add another.
@@ -60,10 +70,14 @@ class ModelDialog(QDialog):
                  list_models: Optional[Callable] = None,
                  list_recent: Optional[Callable] = None,
                  remember: Optional[Callable] = None,
-                 host: Optional[Callable] = None):
+                 host: Optional[Callable] = None,
+                 list_lmstudio: Optional[Callable] = None,
+                 lmstudio_host: Optional[Callable] = None):
         super().__init__(parent)
         self._list_models = list_models or self._default_models
         self._host = host or self._default_host
+        self._list_lmstudio = list_lmstudio or self._default_lmstudio
+        self._lmstudio_host = lmstudio_host or self._default_lmstudio_host
         self._list_recent = list_recent or self._default_recent
         self._remember_fn = remember or self._default_remember
         self.setWindowTitle("Models for the report")
@@ -91,9 +105,7 @@ class ModelDialog(QDialog):
 
         self.backend = QComboBox()
         for name in BACKENDS:
-            self.backend.addItem(
-                "Ollama (local server)" if name == "ollama"
-                else "llama-cpp (GGUF file)", name)
+            self.backend.addItem(BACKEND_LABELS.get(name, name), name)
         self.backend.currentIndexChanged.connect(self._backend_changed)
         form.addRow("Backend:", self.backend)
 
@@ -188,6 +200,21 @@ class ModelDialog(QDialog):
             return ""
 
     @staticmethod
+    def _default_lmstudio(refresh: bool = False) -> list:
+        from modules.narration.llm_discovery import lmstudio_models
+        return lmstudio_models(refresh=refresh)
+
+    @staticmethod
+    def _default_lmstudio_host() -> str:
+        """As :meth:`_default_host`, for LM Studio."""
+        try:
+            from llm.lmstudio import DEFAULT_BASE_URL, resolve
+            url = resolve()
+            return "" if url == DEFAULT_BASE_URL else url
+        except Exception:                          # pragma: no cover - defensive
+            return ""
+
+    @staticmethod
     def _default_recent() -> list:
         from modules.narration.llm_discovery import recent_gguf
         return recent_gguf()
@@ -198,10 +225,15 @@ class ModelDialog(QDialog):
         remember_gguf(path)
 
     def _fill_tags(self, refresh: bool = False):
-        """Offer what the server holds, keeping whatever is half-typed."""
+        """Offer what the selected server holds, keeping whatever is half-typed."""
+        backend = self.backend.currentData()
+        if backend not in SERVERS:
+            return
+        lmstudio = backend == "lmstudio"
         typed = self.tag.currentText().strip()
         try:
-            found = list(self._list_models(refresh=refresh) or [])
+            listing = self._list_lmstudio if lmstudio else self._list_models
+            found = list(listing(refresh=refresh) or [])
         except Exception as exc:                   # pragma: no cover - defensive
             print(f"⚠️ Could not list models: {exc}")
             found = []
@@ -209,13 +241,14 @@ class ModelDialog(QDialog):
         self.tag.addItems(found)
         self.tag.setCurrentText(typed)
         try:
-            asked = self._host()
+            asked = (self._lmstudio_host if lmstudio else self._host)()
         except Exception:                          # pragma: no cover - defensive
             asked = ""
         where = f" at {asked}" if asked else ""
+        server = SERVERS[backend]
         self.status.setText(
-            f"{len(found)} model(s) on the Ollama server{where}." if found else
-            f"No Ollama server answered{where} — type a name, or start it and "
+            f"{len(found)} model(s) on the {server} server{where}." if found else
+            f"No {server} server answered{where} — type a name, or start it and "
             "press Refresh.")
 
     def _refresh_tags(self):
@@ -269,12 +302,19 @@ class ModelDialog(QDialog):
 
     def _backend_changed(self, *_args):
         """Only the fields that mean something for this backend."""
-        is_gguf = self.backend.currentData() == "llama-cpp"
+        backend = self.backend.currentData()
+        is_gguf = backend == "llama-cpp"
         self.tag_row.setVisible(not is_gguf)
         self.status_row.setVisible(not is_gguf)
         self.gguf_row.setVisible(is_gguf)
         self.recent_row.setVisible(is_gguf)
         self.mmproj_row.setVisible(is_gguf)
+        if backend in SERVERS:
+            self.tag.lineEdit().setPlaceholderText(PLACEHOLDERS.get(backend, ""))
+            # __init__ calls this with no arguments after filling the list
+            # itself; only a change of backend needs the other server asked.
+            if _args:
+                self._fill_tags()
 
     def _refill(self):
         self.list.clear()

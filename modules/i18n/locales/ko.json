@@ -1083,5 +1083,9 @@
   "View": "보기",
   "CapCut / Jianying project": "CapCut / Jianying 프로젝트",
   "Export clips": "클립 내보내기",
-  "Score only (no video)": "점수만 매기기(동영상 없음)"
+  "Score only (no video)": "점수만 매기기(동영상 없음)",
+  "LM Studio (local server)": "LM Studio (로컬 서버)",
+  "LM Studio host:": "LM Studio 호스트:",
+  "Looking for Ollama and LM Studio…": "Ollama와 LM Studio를 찾는 중…",
+  "Where LM Studio's server is running. Blank means http://localhost:1234.\nAny OpenAI-compatible server works here too: llama.cpp's\nllama-server, Jan, vLLM. For another PC, turn on\n\"Serve on Local Network\" in LM Studio's Developer tab there.\nThe whole app follows this: chat, report, narration and advisor.": "LM Studio 서버가 실행 중인 곳. 비워 두면 http://localhost:1234입니다.\nOpenAI 호환 서버라면 무엇이든 됩니다: llama.cpp의\nllama-server, Jan, vLLM. 다른 PC라면 그 PC의 LM Studio에서\nDeveloper 탭의 \"Serve on Local Network\"를 켜세요.\n앱 전체가 이 설정을 따릅니다: 채팅, 보고서, 내레이션, 어드바이저."
 }

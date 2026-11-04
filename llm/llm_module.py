@@ -1,9 +1,11 @@
 """
 llm_module.py — Local LLM interface for VideoHighlighter.
 
-Supports two backends:
+Supports these backends:
   1. ollama   — requires `ollama` running locally (easiest setup)
-  2. llama-cpp — requires `llama-cpp-python` + a GGUF model file
+  2. lmstudio — LM Studio, or any OpenAI-compatible server (llm/lmstudio.py)
+  3. llama-cpp — requires `llama-cpp-python` + a GGUF model file
+  4. openvino — a converted model on an Intel GPU, in-process
 
 The module builds rich context from your video analysis cache so the LLM
 can reason about detected objects, actions, transcript, scores, etc.
@@ -1252,6 +1254,12 @@ class LLMModule:
 
         if backend == "ollama":
             self._backend = _OllamaBackend(model=model, base_url=base_url)
+        elif backend == "lmstudio":
+            try:
+                from llm.lmstudio import LMStudioBackend
+            except ImportError:  # pragma: no cover - standalone/dev fallback
+                from lmstudio import LMStudioBackend
+            self._backend = LMStudioBackend(model=model, base_url=base_url)
         elif backend == "llama-cpp":
             self._backend = _LlamaCppBackend(
                 model_path=model_path,
@@ -1264,7 +1272,8 @@ class LLMModule:
             # `device` is an OpenVINO device string rather than a layer count.
             self._backend = _OpenVINOBackend(model_path=model_path, device=device)
         else:
-            raise ValueError(f"Unknown backend: {backend}. Use 'ollama' or 'llama-cpp'.")
+            raise ValueError(f"Unknown backend: {backend}. Use 'ollama', "
+                             f"'lmstudio', 'llama-cpp' or 'openvino'.")
 
     def load(self):
         """Load/verify the model. Raises RuntimeError on failure."""
@@ -1462,6 +1471,8 @@ def get_available_backends() -> list[str]:
     backends = []
     if _OllamaBackend.available():
         backends.append("ollama")
+        # Same requirement (requests), different server.
+        backends.append("lmstudio")
     if _LlamaCppBackend.available():
         backends.append("llama-cpp")
     return backends

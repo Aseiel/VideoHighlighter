@@ -122,6 +122,14 @@ the environment takes precedence.
   involved, and the text never leaves the machine. Without ollama, subtitles are
   written in the language that was spoken. Running ollama on another box on your
   LAN: [OLLAMA-REMOTE.md](OLLAMA-REMOTE.md).
+- **Chat, report narration and the advisor** run on a local LLM through ollama
+  or [LM Studio](https://lmstudio.ai) — or any OpenAI-compatible server, such
+  as llama.cpp's `llama-server`, Jan or vLLM, pointed at with the LM Studio
+  host field. The chat panel looks for both servers when it opens and selects
+  the one that is running; the report's model list takes either. For LM Studio,
+  start the server in its Developer tab (or run `lms server start`). With
+  just-in-time loading on, which is the default, a downloaded model loads on
+  first use. Subtitle translation still needs ollama.
 
 This project ships no paid API keys. Bring your own if you want to use a hosted
 service.

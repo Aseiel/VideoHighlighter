@@ -620,7 +620,7 @@ def _main(argv=None) -> int:
         description="Describe each kept clip of a report from its own frames.")
     parser.add_argument("report", help="the *_why.json written beside a cut")
     parser.add_argument("--backend", default="ollama",
-                        choices=("ollama", "llama-cpp"))
+                        choices=("ollama", "lmstudio", "llama-cpp"))
     # Was llava-llama3, which is a generation behind and fails this job rather
     # than merely doing it worse. Measured over one 14-clip report against the
     # same frames and prompt: it opened paragraphs "This image captures...",

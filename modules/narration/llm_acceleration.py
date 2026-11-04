@@ -174,6 +174,12 @@ def decide(config: Mapping, entry: Mapping | None = None) -> dict:
         return {"backend": chosen, "model": tag, "accelerated": False,
                 "reason": "llama-cpp with the GGUF that was chosen."}
 
+    # A server the user picked over Ollama, with its own GPU settings. Its ids
+    # are not Ollama tags, so matching them to a converted model would guess.
+    if chosen == "lmstudio":
+        return {"backend": chosen, "model": tag, "accelerated": False,
+                "reason": "LM Studio, with the model that was chosen."}
+
     if chosen == "openvino":
         path = entry.get("model_path") or tag or ""
         if not _is_ir_dir(path):

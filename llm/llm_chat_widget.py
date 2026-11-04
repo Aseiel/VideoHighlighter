@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import json
+import threading
 import time as _time
 from pathlib import Path
 from typing import Optional
@@ -34,7 +35,7 @@ from modules.ui.theme import DARK as THEME
 from modules.ui import icons as ui_icons
 
 from .llm_module import (
-    LLMModule, VideoContextBuilder, get_available_backends, get_ollama_models,
+    LLMModule, VideoContextBuilder, get_available_backends,
     VideoSeekAnalyzer, CancellationToken, GenerationCancelled,
 )
 from .llm_reasoning import ReasoningLLMIntegration
@@ -42,6 +43,13 @@ from .ollama_host import (
     DEFAULT_BASE_URL as OLLAMA_DEFAULT_URL, is_remote as ollama_is_remote,
     remember as remember_ollama_host, resolve as resolve_ollama_host,
 )
+from .lmstudio import (
+    DEFAULT_BASE_URL as LMSTUDIO_DEFAULT_URL, is_remote as lmstudio_is_remote,
+    remember as remember_lmstudio_host, resolve as resolve_lmstudio_host,
+)
+
+# The backends that are a server to look for, and what to call each one.
+SERVER_NAMES = {"ollama": "Ollama", "lmstudio": "LM Studio"}
 
 # timeline bridge (only available when timeline viewer is present)
 try:
@@ -653,6 +661,8 @@ class LLMChatWidget(QWidget):
     SETTINGS_KEY = "VideoHighlighter/LLMChat"
 
     llm_replied = Signal(str)
+    # From the server probe's thread back to this one.
+    _servers_found = Signal(dict)
 
     def __init__(self, parent: Optional[QWidget] = None, compact: bool = False,
                  cache_dir: str = "./cache", video_path: str = ""):
@@ -701,6 +711,7 @@ class LLMChatWidget(QWidget):
         row1.addWidget(QLabel("Backend:"))
         self.backend_combo = QComboBox()
         self.backend_combo.addItem("Ollama (local server)", "ollama")
+        self.backend_combo.addItem("LM Studio (local server)", "lmstudio")
         self.backend_combo.addItem("llama-cpp (GGUF file)", "llama-cpp")
         self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
         row1.addWidget(self.backend_combo)
@@ -713,7 +724,7 @@ class LLMChatWidget(QWidget):
 
         self.refresh_btn = QPushButton("Refresh")
         fit_width(self.refresh_btn)
-        self.refresh_btn.clicked.connect(self._refresh_models)
+        self.refresh_btn.clicked.connect(lambda: self._refresh_models(refresh=True))
         row1.addWidget(self.refresh_btn)
 
         # Connect + status share this row (was a separate row) to save vertical space
@@ -762,6 +773,29 @@ class LLMChatWidget(QWidget):
         self.ollama_row_widget.setLayout(ollama_inner)
         settings_layout.addWidget(self.ollama_row_widget)
 
+        # Row 1c: which LM Studio server. Its own row rather than the Ollama
+        # one relabelled, because the two hosts are stored separately and a
+        # user with both running switches between them with the Backend menu.
+        self.lmstudio_row_widget = QWidget()
+        lmstudio_inner = QHBoxLayout()
+        lmstudio_inner.setContentsMargins(0, 0, 0, 0)
+        lmstudio_inner.addWidget(QLabel("LM Studio host:"))
+        self.lmstudio_host_input = QLineEdit()
+        self.lmstudio_host_input.setPlaceholderText(LMSTUDIO_DEFAULT_URL)
+        self.lmstudio_host_input.setToolTip(
+            "Where LM Studio's server is running. Blank means "
+            + LMSTUDIO_DEFAULT_URL + ".\n"
+            "Any OpenAI-compatible server works here too: llama.cpp's\n"
+            "llama-server, Jan, vLLM. For another PC, turn on\n"
+            "\"Serve on Local Network\" in LM Studio's Developer tab there.\n"
+            "The whole app follows this: chat, report, narration and advisor."
+        )
+        self.lmstudio_host_input.editingFinished.connect(self._on_lmstudio_host_edited)
+        lmstudio_inner.addWidget(self.lmstudio_host_input)
+        self.lmstudio_row_widget.setLayout(lmstudio_inner)
+        self.lmstudio_row_widget.setVisible(False)
+        settings_layout.addWidget(self.lmstudio_row_widget)
+
         # Row 2: GGUF path (hidden by default)
         self.gguf_row_widget = QWidget()
         gguf_inner = QHBoxLayout()
@@ -799,6 +833,7 @@ class LLMChatWidget(QWidget):
         # from OLLAMA_HOST in the environment - a field that reads "localhost"
         # while the run goes somewhere else is worse than no field.
         self.ollama_host_input.setText(resolve_ollama_host())
+        self.lmstudio_host_input.setText(resolve_lmstudio_host())
 
 
         # Row 4: context indicator + reasoning controls + Load Cache + Show Context.
@@ -1037,7 +1072,22 @@ class LLMChatWidget(QWidget):
 
         root.addLayout(input_layout)
         self.setLayout(root)
-        self._refresh_models()
+
+        # The backend used last time, then a look at which servers are running.
+        # The look is on a thread: a port nothing listens on still costs about
+        # a second on Windows, and this runs while the window is opening.
+        self._servers_found.connect(self._on_servers_found)
+        last = QSettings(self.SETTINGS_KEY, "LLMChat").value("last_backend", "")
+        index = self.backend_combo.findData(last)
+        if index >= 0:
+            self.backend_combo.blockSignals(True)
+            self.backend_combo.setCurrentIndex(index)
+            self.backend_combo.blockSignals(False)
+        self._show_backend_rows()
+        if self.backend_combo.currentData() == "llama-cpp":
+            self._populate_recent_gguf()
+        else:
+            self._detect_servers()
 
     # --------------------------------------------------------- Public API
 
@@ -1838,19 +1888,72 @@ class LLMChatWidget(QWidget):
 
     # ------------------------------------------------ Handlers
 
-    def _on_backend_changed(self, _index):
+    def _show_backend_rows(self):
+        """Only the rows that mean something for the selected backend."""
         backend = self.backend_combo.currentData()
         is_gguf = backend == "llama-cpp"
-        self.ollama_row_widget.setVisible(not is_gguf)
+        self.ollama_row_widget.setVisible(backend == "ollama")
+        self.lmstudio_row_widget.setVisible(backend == "lmstudio")
         self.gguf_row_widget.setVisible(is_gguf)
         self.mmproj_row_widget.setVisible(is_gguf)
         self.refresh_btn.setVisible(not is_gguf)
         self.model_combo.setEnabled(not is_gguf)
 
-        if is_gguf:
+    def _on_backend_changed(self, _index):
+        backend = self.backend_combo.currentData()
+        self._show_backend_rows()
+        # A choice the user made, so it is the one to start with next time.
+        # The probe's own switch blocks this signal and is not remembered.
+        QSettings(self.SETTINGS_KEY, "LLMChat").setValue("last_backend", backend)
+
+        if backend == "llama-cpp":
             self._populate_recent_gguf()
         else:
             self._refresh_models()
+
+    def _detect_servers(self):
+        """Ask Ollama and LM Studio at once, off this thread."""
+        self.status_label.setText("Looking for Ollama and LM Studio…")
+        self.status_label.setStyleSheet("color:#999;font-style:italic;")
+
+        def _run():
+            try:
+                from modules.narration.llm_discovery import running_servers
+                found = running_servers()
+            except Exception as exc:                # pragma: no cover - defensive
+                print(f"⚠️ Could not look for LLM servers: {exc}")
+                found = {}
+            try:
+                self._servers_found.emit(found)
+            except RuntimeError:                    # the panel closed meanwhile
+                pass
+
+        threading.Thread(target=_run, daemon=True, name="llm-server-probe").start()
+
+    def _on_servers_found(self, found: dict):
+        """Select a server that answered, if the selected one did not.
+
+        Only ever moves between servers: a GGUF file chosen while the probe was
+        out is a decision, and the probe has nothing to say about it.
+        """
+        current = self.backend_combo.currentData()
+        if current not in SERVER_NAMES:
+            return
+        from modules.narration.llm_discovery import preferred_server
+        chosen = preferred_server(found, current) or current
+        print("[llm] servers: " + ", ".join(
+            f"{SERVER_NAMES[k]}={'off' if v is None else len(v)}"
+            for k, v in found.items() if k in SERVER_NAMES)
+            + f" -> {SERVER_NAMES.get(chosen, chosen)}")
+        if chosen != current:
+            index = self.backend_combo.findData(chosen)
+            if index >= 0:
+                self.backend_combo.blockSignals(True)
+                self.backend_combo.setCurrentIndex(index)
+                self.backend_combo.blockSignals(False)
+                self._show_backend_rows()
+        # The probe filled the cache, so this does not ask again.
+        self._refresh_models(refresh=False)
 
     def _on_ollama_host_edited(self):
         """Store the new server and ask *it* what models it has.
@@ -1868,6 +1971,13 @@ class LLMChatWidget(QWidget):
         except Exception:                       # pragma: no cover - defensive
             pass
         if self.backend_combo.currentData() == "ollama":
+            self._refresh_models()
+
+    def _on_lmstudio_host_edited(self):
+        """Store the new LM Studio server and list *its* models."""
+        url = remember_lmstudio_host(self.lmstudio_host_input.text())
+        self.lmstudio_host_input.setText(url or resolve_lmstudio_host())
+        if self.backend_combo.currentData() == "lmstudio":
             self._refresh_models()
 
     def _show_ollama_setup(self):
@@ -1904,48 +2014,62 @@ class LLMChatWidget(QWidget):
         if path and os.path.exists(path):
             self.gguf_path_input.setText(path)
 
-    def _refresh_models(self):
+    def _refresh_models(self, refresh: bool = True):
         backend = self.backend_combo.currentData()
         # Whatever was typed survives a refresh — the combo is editable, and a
         # name typed while the server was down is still the one the user wants.
-        typed = self.model_combo.currentText().strip() if backend == "ollama" else ""
+        typed = (self.model_combo.currentText().strip()
+                 if backend in SERVER_NAMES else "")
         self.model_combo.clear()
 
         if backend == "llama-cpp":
             self.model_combo.addItem("(select GGUF file below)")
             return
+        if backend not in SERVER_NAMES:
+            return
 
+        from modules.narration.llm_discovery import models_for
+        name = SERVER_NAMES[backend]
         if backend == "ollama":
             host = resolve_ollama_host()
             remote = ollama_is_remote(host)
-            # Named only when it is not the default: on localhost the URL is
-            # noise, and on another machine it is the whole answer.
-            where = f" at {host}" if remote else ""
-            models = get_ollama_models(host)
-            if models:
-                for m in models:
-                    self.model_combo.addItem(m)
-                if typed in models:
-                    self.model_combo.setCurrentText(typed)
-                self.status_label.setToolTip("")
-                self.status_label.setText(
-                    f"Found {len(models)} Ollama models{where}")
-                self.status_label.setStyleSheet("color:#4CAF50;font-style:italic;")
-            else:
-                # No list rather than a made-up one: tags the server never
-                # offered read as "these are available", which is the opposite
-                # of what just happened.
-                self.model_combo.setCurrentText(typed)
-                self.status_label.setText(
-                    f"No Ollama answered{where or ' on this machine'}")
-                self.status_label.setToolTip(
-                    "Ollama on another PC only answers itself until it is set "
+            hint = ("Ollama on another PC only answers itself until it is set "
                     "up.\n\"Other PC setup…\" has the commands to run there. "
                     "You can still type a model name."
                     if remote else
                     "Start Ollama, then press Refresh. You can still type a "
                     "model name.")
-                self.status_label.setStyleSheet("color:#f44336;font-style:italic;")
+        else:
+            host = resolve_lmstudio_host()
+            remote = lmstudio_is_remote(host)
+            hint = ("LM Studio on another PC answers only itself until \"Serve "
+                    "on Local Network\" is on in its Developer tab.\nYou can "
+                    "still type a model name."
+                    if remote else
+                    "Start the server in LM Studio's Developer tab (or run: lms "
+                    "server start), then press Refresh. You can still type a "
+                    "model name.")
+        # Named only when it is not the default: on localhost the URL is
+        # noise, and on another machine it is the whole answer.
+        where = f" at {host}" if remote else ""
+        models = models_for(backend, refresh=refresh)
+        if models:
+            for m in models:
+                self.model_combo.addItem(m)
+            if typed in models:
+                self.model_combo.setCurrentText(typed)
+            self.status_label.setToolTip("")
+            self.status_label.setText(f"Found {len(models)} {name} models{where}")
+            self.status_label.setStyleSheet("color:#4CAF50;font-style:italic;")
+        else:
+            # No list rather than a made-up one: tags the server never
+            # offered read as "these are available", which is the opposite
+            # of what just happened.
+            self.model_combo.setCurrentText(typed)
+            self.status_label.setText(
+                f"No {name} answered{where or ' on this machine'}")
+            self.status_label.setToolTip(hint)
+            self.status_label.setStyleSheet("color:#f44336;font-style:italic;")
 
     def _browse_gguf(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1978,6 +2102,10 @@ class LLMChatWidget(QWidget):
                 self._llm = LLMModule(backend="ollama", model=model,
                                       base_url=resolve_ollama_host(),
                                       log_fn=self._log)
+            elif backend == "lmstudio":
+                self._llm = LLMModule(backend="lmstudio", model=model,
+                                      base_url=resolve_lmstudio_host(),
+                                      log_fn=self._log)
             elif backend == "llama-cpp":
                 gguf_path = self.gguf_path_input.text().strip()
                 if not gguf_path:
@@ -2002,6 +2130,7 @@ class LLMChatWidget(QWidget):
 
             self._save_gguf_to_recent(gguf_path)
             settings = QSettings(self.SETTINGS_KEY, "LLMChat")
+            settings.setValue("last_backend", backend)
             settings.setValue("last_gguf_path", gguf_path)
             if mmproj_path:
                 settings.setValue("last_mmproj_path", mmproj_path)
@@ -2033,12 +2162,12 @@ class LLMChatWidget(QWidget):
                 n_obj = len(self._analysis_data.get("objects", []))
                 n_act = len(self._analysis_data.get("actions", []))
                 self._append_system(
-                    f"Connected to {model if backend=='ollama' else os.path.basename(gguf_path)}. "
+                    f"Connected to {os.path.basename(gguf_path) if backend == 'llama-cpp' else model}. "
                     f"Context ready: {n_obj} object entries, {n_act} actions."
                 )
             else:
                 self._append_system(
-                    f"Connected to {model if backend=='ollama' else os.path.basename(gguf_path)}. "
+                    f"Connected to {os.path.basename(gguf_path) if backend == 'llama-cpp' else model}. "
                     f"WARNING: No video context! Use 'Load Cache' first."
                 )
 

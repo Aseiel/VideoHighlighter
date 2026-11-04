@@ -89,6 +89,8 @@ def preflight(config: Mapping) -> list:
             return [f"Narration is on but its model file is missing, so it will "
                     f"be skipped: {name}. Pick a model, {off}."]
         return []
+    if backend == "lmstudio":
+        return _lmstudio_preflight(name, do_clips, off)
     if backend != "ollama":
         return []
 
@@ -113,6 +115,36 @@ def preflight(config: Mapping) -> list:
     # narrates chapters and skips every clip. A different fix, so said now.
     if do_clips and not _looks_like_vision(name):
         return [f"Clip descriptions are on, but '{name}' has no vision half, "
+                "so clips cannot be described from their frames; only chapters "
+                "will be written. Choose a vision model to describe clips."]
+    return []
+
+
+def _lmstudio_preflight(name: str, do_clips: bool, off: str) -> list:
+    """The LM Studio half of :func:`preflight`.
+
+    LM Studio says outright which models see images, so the name guess below is
+    only the fallback for other OpenAI-compatible servers.
+    """
+    try:
+        from llm import lmstudio
+        models = lmstudio.server_models(timeout=3)
+    except ImportError:
+        return []
+    except Exception:
+        return ["Narration is on, but LM Studio's server is not running, so it "
+                "will be skipped and the report will have no written chapters "
+                f"or clip descriptions. Start it in LM Studio first, {off}."]
+    ids = [str(m["id"]) for m in models]
+    found = lmstudio.match_model(name, ids)
+    if not found:
+        return [f"Narration is on, but LM Studio has no model '{name}', so it "
+                f"will be skipped. Download it in LM Studio or pick another "
+                f"({off})."]
+    kind = next((m.get("type") for m in models if m.get("id") == found), None)
+    sees = kind == "vlm" if kind else _looks_like_vision(found)
+    if do_clips and not sees:
+        return [f"Clip descriptions are on, but '{found}' has no vision half, "
                 "so clips cannot be described from their frames; only chapters "
                 "will be written. Choose a vision model to describe clips."]
     return []

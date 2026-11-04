@@ -1083,5 +1083,9 @@
   "View": "Tampilan",
   "CapCut / Jianying project": "Proyek CapCut / Jianying",
   "Export clips": "Ekspor klip",
-  "Score only (no video)": "Hanya beri skor (tanpa video)"
+  "Score only (no video)": "Hanya beri skor (tanpa video)",
+  "LM Studio (local server)": "LM Studio (server lokal)",
+  "LM Studio host:": "Host LM Studio:",
+  "Looking for Ollama and LM Studio…": "Mencari Ollama dan LM Studio…",
+  "Where LM Studio's server is running. Blank means http://localhost:1234.\nAny OpenAI-compatible server works here too: llama.cpp's\nllama-server, Jan, vLLM. For another PC, turn on\n\"Serve on Local Network\" in LM Studio's Developer tab there.\nThe whole app follows this: chat, report, narration and advisor.": "Tempat server LM Studio berjalan. Kosong berarti http://localhost:1234.\nServer apa pun yang kompatibel dengan OpenAI juga bisa: llama-server\ndari llama.cpp, Jan, vLLM. Untuk PC lain, aktifkan\n\"Serve on Local Network\" di tab Developer LM Studio di PC itu.\nSeluruh aplikasi mengikuti ini: obrolan, laporan, narasi, dan penasihat."
 }
