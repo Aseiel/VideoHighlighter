@@ -137,13 +137,6 @@ class TestPrompt:
         assert "Nothing was transcribed as speech" in prompt
         assert "frames are all there is to go on" in prompt
 
-    def test_the_previous_clip_is_carried_forward_but_capped(self):
-        rep = _report()
-        prompt = clip_story.clip_prompt(rep, rep["segments"][1],
-                                        previous="X" * 5000)
-        assert "What the previous clip was" in prompt
-        assert "X" * (clip_story.CARRY_CHARS + 1) not in prompt
-
     def test_detector_labels_are_named_by_the_source_that_produced_them(self):
         rep = _report()
         entry = dict(rep["segments"][0])
@@ -274,13 +267,14 @@ class TestTell:
                                frames_fn=_frames)
         assert all(e["story"] for e in read)
 
-    def test_clips_are_read_in_order_and_handed_the_previous_one(self):
+    def test_clips_are_read_in_order_and_never_shown_each_other(self):
+        # A model shown its neighbour's paragraph reused it: on a 42-clip
+        # report, 13 clips came back as word-for-word copies of the one before.
         rep = _report()
         llm = _FakeLLM()
         clip_story.tell(rep, llm=llm, log_fn=lambda _m: None, frames_fn=_frames)
         assert len(llm.calls) == 2
-        assert "What the previous clip was" not in llm.calls[0]["prompt"]
-        assert "(1)" in llm.calls[1]["prompt"]
+        assert "Two people at a bench" not in llm.calls[1]["prompt"]
 
     def test_frames_are_sampled_across_the_clip_not_at_its_peak(self):
         # The thumbnail on the card is already the peak second. Sampling the
@@ -325,14 +319,6 @@ class TestTell:
         assert "story" not in read[0]
         assert read[1]["story"]
         assert len(llm.calls) == 1
-
-    def test_a_skipped_clip_is_not_passed_off_as_the_predecessor(self):
-        rep = _report()
-        llm = _FakeLLM(empty_after=0)
-        read = clip_story.tell(rep, llm=llm, log_fn=lambda _m: None,
-                               frames_fn=_frames)
-        assert not any(e.get("story") for e in read)
-        assert "What the previous clip was" not in llm.calls[1]["prompt"]
 
     def test_a_looping_clip_keeps_what_came_before_the_loop(self):
         rep = _report()
@@ -503,3 +489,41 @@ class TestReportFile:
         clip_story.tell_report_file(str(json_path), llm=_FakeLLM(),
                                     frames_fn=_frames, log_fn=lambda _m: None)
         assert "<video" in html_path.read_text(encoding="utf-8")
+
+
+class TestSameVideo:
+    """Every clip is from one video, and the brief says so, without quoting.
+
+    Each clip used to be a separate call that started from nothing: on a
+    42-clip report, 26 to 36 paragraphs opened by re-describing the same person
+    in the same room. Showing a clip other paragraphs to fix that, its
+    neighbour's or its chapter's, made the model copy their words. The brief
+    alone stopped the re-introductions with nothing to copy.
+    """
+
+    def test_a_clip_is_never_shown_its_chapter_paragraph(self):
+        rep = _report()
+        rep["chapters"] = [{"number": 1, "start": 0.0, "end": 600.0,
+                            "story": "A carpenter works at a bench in a garage."}]
+        for entry in rep["segments"]:
+            entry["chapter"] = 1
+        prompt = clip_story.clip_prompt(rep, rep["segments"][0])
+        assert "A carpenter works at a bench" not in prompt
+
+    def test_the_brief_forbids_referring_to_other_clips(self):
+        assert "'continues'" in clip_story.CLIP_SYSTEM_PROMPT
+        assert "'continues'" in clip_story.CAPTIONER_SYSTEM_PROMPT
+
+    @pytest.mark.parametrize("brief", [clip_story.CLIP_SYSTEM_PROMPT,
+                                       clip_story.CAPTIONER_SYSTEM_PROMPT])
+    def test_both_briefs_say_who_and_where_are_already_known(self, brief):
+        assert "same video" in brief
+        assert "already" in brief and "who is in it and where" in brief
+        assert "do not describe" in brief.lower()
+
+    @pytest.mark.parametrize("brief", [clip_story.CLIP_SYSTEM_PROMPT,
+                                       clip_story.CAPTIONER_SYSTEM_PROMPT])
+    def test_the_flag_sentence_goes_last(self, brief):
+        # Neighbouring clips share a label, so a paragraph opening on the flag
+        # opened like its neighbour.
+        assert "last" in brief

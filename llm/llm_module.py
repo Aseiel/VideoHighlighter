@@ -1303,24 +1303,34 @@ class LLMModule:
         temperature: float = 0.3,
         stream_callback: Optional[Callable[[str], None]] = None,
         cancellation_token: Optional[CancellationToken] = None,
+        frames: list[str] | None = None,
     ) -> str:
         """
         Send a query to the LLM with optional video analysis context.
-        
+
         Args:
+            frames: Several base64 images, sent together in one call. Takes
+                precedence over ``frame_base64``. The report's narration
+                passes a clip's or a chapter's sampled frames here. With only
+                ``frame_base64`` it saw one picture per span, and a chapter
+                saw none.
             cancellation_token: Optional CancellationToken that, when cancelled,
                 will interrupt generation even mid-token for GGUF vision models.
         """
         if not self._backend.is_loaded():
             raise RuntimeError("LLM not loaded. Call load() first.")
-        
+
+        images = [f for f in (frames or []) if f]
+        if not images and frame_base64:
+            images = [frame_base64]
+
         print(f"🔍 query() called:")
-        print(f"   frame_base64: {'YES (' + str(len(frame_base64)) + ' chars)' if frame_base64 else 'NONE'}")
+        print(f"   images: {len(images)} ({sum(len(i) for i in images)} chars)" if images else "   images: NONE")
         print(f"   timeline_context: {'YES' if timeline_context else 'NONE'}")
         print(f"   analysis_data: {'YES' if analysis_data else 'NONE'}")
 
         # ===== VISION MODE =====
-        if frame_base64:
+        if images:
             prompt_parts = []
             
             if timeline_context:
@@ -1349,7 +1359,7 @@ class LLMModule:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream_callback=stream_callback,
-                images=[frame_base64],
+                images=images,
                 cancellation_token=cancellation_token,
             )
         

@@ -286,3 +286,48 @@ class TestOnDisk:
         # The report is routinely opened away from its footage. That must cost
         # the frames and nothing else.
         assert chapter_story.frames_from_video("nowhere/at/all.mp4") is None
+
+
+class _QueryOnlyLLM:
+    """Shaped like the real LLMModule: query(), no generate()."""
+
+    def __init__(self):
+        self.calls = []
+
+    def query(self, user_message, system_prompt=None, free_chat_mode=False,
+              frame_base64=None, max_tokens=1024, temperature=0.3,
+              frames=None):
+        self.calls.append({"frames": frames, "frame_base64": frame_base64})
+        return "A paragraph."
+
+
+class TestFramesReachAQueryOnlyModel:
+    def test_every_frame_is_sent(self):
+        # LLMModule has no generate(). Calling it and catching the error
+        # dropped every chapter to text alone, so no chapter was ever seen.
+        llm = _QueryOnlyLLM()
+        text = chapter_story._tell_one(llm, "prompt", ["a", "b", "c"])
+        assert text == "A paragraph."
+        assert llm.calls == [{"frames": ["a", "b", "c"], "frame_base64": None}]
+
+    def test_no_frames_is_a_text_call(self):
+        llm = _QueryOnlyLLM()
+        chapter_story._tell_one(llm, "prompt", [])
+        assert llm.calls == [{"frames": None, "frame_base64": None}]
+
+
+class TestTheChapterIntroducesWhoAndWhere:
+    """The clip pass no longer says who is there or where (see
+    ``clip_story``), so the chapter paragraph above its clips is the one
+    place the reader is told: once, when nothing came before."""
+
+    @pytest.mark.parametrize("brief", [chapter_story.STORY_SYSTEM_PROMPT,
+                                       chapter_story.CAPTIONER_SYSTEM_PROMPT])
+    def test_the_first_stretch_introduces_the_people_and_the_place(self, brief):
+        assert "hair and clothing" in brief
+        assert "where they are" in brief
+
+    @pytest.mark.parametrize("brief", [chapter_story.STORY_SYSTEM_PROMPT,
+                                       chapter_story.CAPTIONER_SYSTEM_PROMPT])
+    def test_later_stretches_introduce_only_what_is_new(self, brief):
+        assert "new" in brief

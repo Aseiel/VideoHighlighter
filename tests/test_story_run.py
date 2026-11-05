@@ -172,3 +172,79 @@ class TestNarrationNeverCostsTheRun:
         assert story_run.narrate_report_file(
             "nowhere.json", config={}, log_fn=lambda _m: None,
             cancel_fn=lambda: True) == {"chapters": 0, "clips": 0}
+
+
+class TestTheEngineIsChosenBeforeTheModelIsBuilt:
+    """`llm_acceleration.decide` is asked first, in the load and the pre-flight.
+
+    The picker stores an Ollama tag. Without this, the free edition narrated
+    through Ollama on an Intel GPU even with openvino-genai and a converted
+    build of the same model on disk. Stubbed here, so the answer is the test's
+    and not the machine's.
+    """
+
+    TAG = {"backend": "ollama", "model": "qwen3-vl:8b"}
+
+    @staticmethod
+    def _decide(monkeypatch, result):
+        monkeypatch.setattr("modules.narration.llm_acceleration.decide",
+                            lambda config, entry: result)
+
+    def test_openvino_is_built_when_decide_picks_it(self, monkeypatch):
+        self._decide(monkeypatch, {"backend": "openvino",
+                                   "model": "D:/ov/Qwen3-VL-8B-Instruct-int4-ov",
+                                   "accelerated": True, "reason": "fast"})
+        built = []
+        monkeypatch.setattr("modules.report.advisor.load_llm",
+                            lambda backend, name, **_kw: built.append(
+                                (backend, name)) or None)
+        said = []
+        story_run.narrate_report_file(
+            "r.json", config={"narration_model": self.TAG}, log_fn=said.append)
+        assert built == [("openvino", "D:/ov/Qwen3-VL-8B-Instruct-int4-ov")]
+        assert "⚡ fast" in said
+
+    def test_ollama_stays_when_decide_keeps_it(self, monkeypatch):
+        self._decide(monkeypatch, {**self.TAG, "accelerated": False,
+                                   "reason": "No Intel GPU, so Ollama it is."})
+        built = []
+        monkeypatch.setattr("modules.report.advisor.load_llm",
+                            lambda backend, name, **_kw: built.append(
+                                (backend, name)) or None)
+        story_run.narrate_report_file(
+            "r.json", config={"narration_model": self.TAG},
+            log_fn=lambda _m: None)
+        assert built == [("ollama", "qwen3-vl:8b")]
+
+    def test_a_decide_that_raises_narrates_on_what_was_chosen(self, monkeypatch):
+        def _boom(config, entry):
+            raise RuntimeError("probe failed")
+        monkeypatch.setattr("modules.narration.llm_acceleration.decide", _boom)
+        built = []
+        monkeypatch.setattr("modules.report.advisor.load_llm",
+                            lambda backend, name, **_kw: built.append(
+                                (backend, name)) or None)
+        story_run.narrate_report_file(
+            "r.json", config={"narration_model": self.TAG},
+            log_fn=lambda _m: None)
+        assert built == [("ollama", "qwen3-vl:8b")]
+
+    def test_preflight_does_not_ask_ollama_when_openvino_will_narrate(
+            self, monkeypatch, tmp_path):
+        from modules.narration import llm_acceleration
+        (tmp_path / llm_acceleration.IR_MARKER).write_text("<net/>",
+                                                           encoding="utf-8")
+        self._decide(monkeypatch, {"backend": "openvino", "model": str(tmp_path),
+                                   "accelerated": True, "reason": "fast"})
+        monkeypatch.setattr(
+            "modules.narration.llm_discovery.ollama_models",
+            lambda *a, **k: pytest.fail("asked Ollama for an OpenVINO run"))
+        assert story_run.preflight({"narration_model": self.TAG}) == []
+
+    def test_preflight_names_a_folder_that_is_not_a_converted_model(
+            self, monkeypatch, tmp_path):
+        self._decide(monkeypatch, {"backend": "openvino", "model": str(tmp_path),
+                                   "accelerated": True,
+                                   "reason": "not a converted model"})
+        assert story_run.preflight({"narration_model": self.TAG}) == [
+            "not a converted model"]

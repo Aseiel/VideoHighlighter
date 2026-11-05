@@ -50,6 +50,21 @@ def _entry(config: Mapping) -> dict:
     return dict(entry)
 
 
+def _accelerated(config: Mapping, entry: Mapping) -> Optional[dict]:
+    """``llm_acceleration.decide`` for this entry, or ``None`` if it failed.
+
+    Never raises, like everything this module runs at the tail of a pipeline.
+    A failed probe means "narrate on what was chosen", which is what happened
+    before this was asked at all.
+    """
+    try:
+        from modules.narration import llm_acceleration
+        return llm_acceleration.decide(config, entry)
+    except Exception as exc:
+        print(f"⚠️ Could not check for OpenVINO narration: {exc}")
+        return None
+
+
 def wanted(config: Mapping) -> tuple:
     """Which passes this run should make: ``(chapters, clips)``."""
     return (bool(config.get("narrate_chapters", DEFAULTS["narrate_chapters"])),
@@ -83,6 +98,13 @@ def preflight(config: Mapping) -> list:
     name = entry.get("model") or "llama3"
     off = ("or untick the narration boxes under Highlight Report to stop "
            "this warning")
+
+    # Asked first, as the load below does: when the run will narrate on
+    # OpenVINO, whether Ollama is up is beside the point.
+    picked = _accelerated(config, entry)
+    if picked is not None and picked["backend"] == "openvino":
+        from modules.narration.llm_acceleration import _is_ir_dir
+        return [] if _is_ir_dir(picked["model"]) else [picked["reason"]]
 
     if backend == "llama-cpp":
         if not os.path.exists(name):
@@ -189,6 +211,21 @@ def narrate_report_file(json_path: str,
     backend = entry.get("backend") or "ollama"
     name = entry.get("model") or "llama3"
     label = label_for(entry) if entry else f"{backend}/{name}"
+
+    # Which engine this machine should narrate on, said in the log either way.
+    # The picker stores an Ollama tag. On an Intel GPU with openvino-genai and a
+    # converted build of that model, OpenVINO runs the same model several
+    # times faster, image encoding included. Ollama leaves that on the CPU.
+    picked = _accelerated(config, entry)
+    if picked is not None:
+        line = ("⚡ " if picked["accelerated"] else "ℹ️ ") + picked["reason"]
+        if picked.get("actionable", True) or picked["accelerated"]:
+            log_fn(line)
+        else:
+            print(line)
+        if picked["backend"] == "openvino":
+            backend, name = "openvino", picked["model"]
+            label = f"openvino/{os.path.basename(name)}"
 
     try:
         llm = advisor.load_llm(backend, name, mmproj=entry.get("mmproj"),

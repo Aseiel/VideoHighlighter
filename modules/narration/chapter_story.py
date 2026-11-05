@@ -52,7 +52,12 @@ STORY_SYSTEM_PROMPT = (
     "2. Never state a number, a percentage or a timestamp. They are printed "
     "beside your paragraph already.\n"
     "3. Describe what is happening -- who is present, what they are doing, what "
-    "is being said and how it changes. That is what is being asked for.\n"
+    "is being said and how it changes. That is what is being asked for. When "
+    "no previous stretch is given, open by introducing who is present -- what "
+    "they look like, such as hair and clothing -- and where they are. This is "
+    "the only place the reader is told: the clip descriptions under this "
+    "paragraph do not say it again. When a previous stretch is given, "
+    "introduce only someone or somewhere new.\n"
     "4. Stay with what the material shows. Where you are inferring rather than "
     "reading something off, say so plainly ('appears to', 'seems to be'). Do "
     "not invent events, names or places that nothing mentions.\n"
@@ -77,6 +82,10 @@ CAPTIONER_SYSTEM_PROMPT = (
     "watch it. You are given measurements another tool made, everything that "
     "was said, and sometimes frames.\n"
     "Say who is present, what they are doing, and how it changes.\n"
+    "When you are not shown what came before, start by saying what the people "
+    "look like, such as hair and clothing, and where they are. Nothing else "
+    "on the page says it. When you are shown what came before, mention only "
+    "someone or somewhere new.\n"
     "Write two to four plain sentences in the past tense. No headings, no "
     "lists, no preamble.\n"
     "Never write a number, a percentage or a time. They are printed beside "
@@ -479,19 +488,38 @@ def _tell_one(llm, prompt: str, images: Optional[Sequence[str]],
               system: Optional[str] = None) -> str:
     """One call, with pictures when the model takes them.
 
-    Falls back to text on any image-related failure rather than losing the
+    Falls back to text on an image-related failure rather than losing the
     paragraph: a model that cannot see still has the transcript, which is most
     of what the answer rests on anyway.
+
+    The pictures go through whichever interface the object offers, as in
+    :func:`modules.narration.clip_story._read_one`. Calling ``generate`` and
+    catching the error is wrong for an ``LLMModule``, which has only
+    ``query``. It always took the fallback, so every chapter was told from
+    the measurements alone, with no sign of it on the page.
     """
     from modules.report.advisor import _generate
+    from modules.narration.clip_story import _takes_a_list
 
     system = system or STORY_SYSTEM_PROMPT
-    if images:
+    frames = [i for i in (images or []) if i]
+    if frames:
         try:
-            return llm.generate(prompt, system=system,
-                                max_tokens=STORY_TOKENS,
-                                temperature=STORY_TEMPERATURE,
-                                images=list(images))
+            if hasattr(llm, "generate"):
+                return llm.generate(prompt, system=system,
+                                    max_tokens=STORY_TOKENS,
+                                    temperature=STORY_TEMPERATURE,
+                                    images=frames)
+            if hasattr(llm, "query"):
+                if _takes_a_list(llm.query):
+                    return llm.query(prompt, system_prompt=system,
+                                     frames=frames, free_chat_mode=True,
+                                     max_tokens=STORY_TOKENS,
+                                     temperature=STORY_TEMPERATURE)
+                return llm.query(prompt, system_prompt=system,
+                                 frame_base64=frames[len(frames) // 2],
+                                 free_chat_mode=True, max_tokens=STORY_TOKENS,
+                                 temperature=STORY_TEMPERATURE)
         except Exception as exc:
             print(f"⚠️ Chapter frames not used ({exc}); telling from text alone")
     return _generate(llm, prompt, system, STORY_TOKENS, STORY_TEMPERATURE)

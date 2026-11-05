@@ -36,8 +36,11 @@ Where it differs from the chapter pass
 A chapter is minutes long and is told in order, each one handed what came
 before, because a run of chapters should read continuously. A clip is thirty
 seconds and its neighbour is often twenty minutes away, so there is nothing to
-continue *from* — the carry exists here only to stop fourteen cards opening with
-the same sentence, and it is the one thing the previous clip is used for.
+continue *from*. No clip is shown another clip's paragraph or its chapter's: a
+model shown other paragraphs reuses their words (measured, beside
+``MAX_CLIP_CHARS``). The brief says instead that every clip is from the same
+video and the reader already knows who is in it and where, which stops the
+cards re-introducing the same person in the same room.
 
 The other difference is what the frames are for. A chapter's frames are a
 sanity check on a paragraph the transcript could mostly have written; here they
@@ -75,9 +78,13 @@ CLIP_SYSTEM_PROMPT = (
     "headings, no bullet points, no preamble, no restating the question.\n"
     "2. Never state a number, a percentage or a timestamp. They are printed "
     "beside your paragraph already.\n"
-    "3. Say what is in the frames: who is present, where they are, what they "
-    "are doing. This is what the rest of the page cannot say, so it is what is "
-    "being asked for.\n"
+    "3. Say what is in the frames, above all what is being done. This is what "
+    "the rest of the page cannot say, so it is what is being asked for. Every "
+    "clip comes from the same video, and the reader has already been told who "
+    "is in it and where, so do not describe the people or the place again: "
+    "refer to them briefly ('she', "
+    "'the two of them') and open on the action. Describe someone or somewhere "
+    "only when they are new here or something about them has changed.\n"
     "4. Where you are given more than one frame they are in order, a few "
     "seconds apart. Say what changes between them — that is what the clip was "
     "picked for, and what a single still cannot show.\n"
@@ -88,8 +95,9 @@ CLIP_SYSTEM_PROMPT = (
     "in one sentence instead of filling the space.\n"
     "7. Expression labels come from a five-class classifier that cannot tell a "
     "performed expression from a felt one. Do not treat them as feelings.\n"
-    "8. When a previous clip is given, do not recap it and do not open the same "
-    "way; say what is different here.\n"
+    "8. Do not refer to other clips ('continues', 'as before', 'the previous "
+    "clip'): each is read beside its own player, and two clips can be minutes "
+    "apart. Describe these frames as they are.\n"
     "9. When the run has flagged something here -- a detected label or a "
     "composition rule -- neither ignore it nor repeat it as fact. Say whether "
     "what you can see supports it, and attribute it to the run: 'the run "
@@ -98,7 +106,9 @@ CLIP_SYSTEM_PROMPT = (
     "fired, which is not the same as having seen it, so it is never your own "
     "observation. This one sentence is worth more than another describing the "
     "frames, because it is the only part of the page that can disagree with "
-    "the detector."
+    "the detector. Put it last, after the frames: neighbouring clips are "
+    "often flagged the same way, so a paragraph that opens on the flag opens "
+    "like its neighbour."
 )
 
 # The captioner's copy of the same brief — see
@@ -110,8 +120,12 @@ CAPTIONER_SYSTEM_PROMPT = (
     "Describe one short clip from a video, for someone who cannot watch it. "
     "You are given a few frames taken across it, measurements another tool "
     "made, and whatever was said.\n"
-    "Say what is in the frames: who is present, where they are, what they are "
-    "doing. That is what the rest of the page cannot say.\n"
+    "Say what is in the frames, above all what is being done. That is what the "
+    "rest of the page cannot say.\n"
+    "Every clip is from the same video, and the reader already knows who is in "
+    "it and where. Do not describe them again. Say 'she' or 'they' and start "
+    "with the action. Describe someone or somewhere only when they are new or "
+    "have changed.\n"
     "The frames are in order, a few seconds apart. Say what changes between "
     "them.\n"
     "Write two to four plain sentences in the present tense. No headings, no "
@@ -123,13 +137,13 @@ CAPTIONER_SYSTEM_PROMPT = (
     "mention.\n"
     "Treat any expression label you are given as a guess by another tool, not "
     "as what someone felt.\n"
-    "When you are shown the clip before this one, do not recap it and do not "
-    "open the same way. Say what is different here.\n"
+    "Do not refer to other clips ('continues', 'as before'). Describe these "
+    "frames as they are.\n"
     "When you are told the run flagged something here, you were told it fired "
     "— you did not see it fire. Say whether the frames support it and say who "
     "claimed it: 'the run flagged X, and the frames show / do not show Y'. If "
     "the frames neither support nor contradict it, say exactly that. Never "
-    "repeat it as your own observation.\n"
+    "repeat it as your own observation. Say it last, after the frames.\n"
     "If the frames are too dark, too close or too few to make out, say only: "
     "Too little to see here."
 )
@@ -149,11 +163,21 @@ CLIP_TEMPERATURE = 0.8
 # of the payload.
 MAX_CLIP_CHARS = 5000
 
-# How much of the previous clip is carried. Half a chapter's, because this is
-# only here to break the opening-sentence lock — a clip has no continuity with
-# its neighbour worth preserving, and more context is more chance of an error
-# from one card being restated as fact on the next.
-CARRY_CHARS = 200
+# No clip is shown text another pass wrote: not the previous clip's paragraph,
+# which this pass used to carry so that cards would not all open the same way,
+# and not its chapter's. Measured 2026-11-05 on a 42-clip report with
+# Qwen3-VL-8B Instruct (int4, OpenVINO):
+#
+#   prompt                          re-describe  copy the     copy 8+ words
+#                                   her hair     neighbour    of the chapter
+#   previous 200 chars (old)            26        11 near          0
+#   chapter + previous paragraph         0        21 near          -
+#   chapter, nothing carried             1         0              12
+#   nothing carried, brief only (now)    0         0               0
+#
+# A model shown other paragraphs reuses their words, whatever the brief says,
+# and a reused paragraph was not written from this clip's frames. Rule 3 says
+# who and where are already known. That stops the re-introductions on its own.
 
 # Spread across the clip, not clustered at the peak. Four rather than the
 # chapter pass's three: a thirty-second span sampled four times is roughly every
@@ -280,7 +304,6 @@ def _speech_here(entry: Mapping) -> list:
 
 
 def clip_prompt(report: Mapping, entry: Mapping,
-                previous: Optional[str] = None,
                 max_chars: int = MAX_CLIP_CHARS,
                 frame_count: int = 0) -> str:
     """Everything the model is told about one clip.
@@ -338,10 +361,6 @@ def clip_prompt(report: Mapping, entry: Mapping,
                   "and where they disagree with what is in front of you, go "
                   "with the frames.",
                   *(f"- {n}" for n in notes), ""]
-
-    if previous:
-        parts += ["## What the previous clip was",
-                  previous.strip()[:CARRY_CHARS], ""]
 
     # Last, and given whatever budget is left. On the footage this pass exists
     # for the section is empty and says so — which is itself worth telling the
@@ -477,7 +496,6 @@ def tell(report: Mapping,
 
     system = system_prompt_for(model_name)
 
-    previous = None
     for position, entry in enumerate(segments, start=1):
         if cancel_fn is not None and cancel_fn():
             log_fn(f"⏹️ Stopped after {position - 1} of {len(segments)} clips.")
@@ -497,8 +515,7 @@ def tell(report: Mapping,
             continue
         try:
             text = (_read_one(llm,
-                              clip_prompt(report, entry, previous,
-                                          frame_count=seen),
+                              clip_prompt(report, entry, frame_count=seen),
                               images, system) or "").strip()
         except Exception as exc:
             log_fn(f"⚠️ Clip {position} could not be read: {exc}")
@@ -510,7 +527,6 @@ def tell(report: Mapping,
             log_fn(f"✂️ Clip {position} repeated itself; kept what came before.")
             text = trimmed
         entry["story"] = text
-        previous = text
     return segments
 
 
