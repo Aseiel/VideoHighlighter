@@ -17,6 +17,7 @@ absent, and the only way forward is to run the whole thing again.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -111,6 +112,19 @@ class TestHighlightSaveDoesNotEatTheAnalysis:
         # highlights are still there for the reader that wants them.
         assert cache.get_highlight_history(str(video), analysis_params=PARAMS)
         assert cache.load(str(video), params=PARAMS) is None
+
+    def test_a_highlights_only_entry_takes_later_versions_too(self, cache, video):
+        # The entry the case above seeds is exactly what `load` refuses, so a
+        # second save used to see "exists but unreadable" and give up: on a
+        # video never analysed, a highlight could be saved once and never again.
+        for n, clip in enumerate([(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)]):
+            assert cache.save_highlight_segments(
+                str(video), {"version": n}, [clip], [{}], {},
+                analysis_params=PARAMS) is True
+            time.sleep(0.01)          # distinct created_at stamps
+        history = cache.get_highlight_history(str(video), analysis_params=PARAMS)
+        assert [tuple(h["segments"][0]) for h in history] == [
+            (5.0, 6.0), (3.0, 4.0), (1.0, 2.0)]
 
 
 class TestStubsDoNotStandInForARun:

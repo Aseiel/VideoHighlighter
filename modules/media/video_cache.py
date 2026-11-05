@@ -547,6 +547,26 @@ class VideoAnalysisCache:
 
 # modules/media/video_cache.py
 
+    def _highlights_only_entry(self, video_path, params=None) -> Optional[Dict[str, Any]]:
+        """The cached entry, if it is this video's and holds no analysis --
+        only highlights a previous save wrote. ``None`` for anything else:
+        unreadable, another file's, or real analysis that ``load`` refused."""
+        if params is not None:
+            path = self._get_analysis_cache_path_for_signature(
+                video_path, self._make_signature(params))
+        else:
+            path = self._get_cache_path(video_path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if data.get("video_hash") not in (None, self._get_video_hash(video_path)):
+            return None
+        return None if holds_analysis(data) else data
+
     def save_highlight_segments(self, video_path, parameters, segments, segments_metadata, score_info, analysis_params=None):
         """Save highlight segments with metadata for history
         
@@ -592,10 +612,18 @@ class VideoAnalysisCache:
                 # valid. Refuse instead: a highlight run that fails to record
                 # itself is cheap next to the run it would have eaten.
                 if self.exists(video_path, params=analysis_params):
-                    print("  ⚠️ An analysis cache exists but could not be read; "
-                          "refusing to overwrite it with a highlights-only entry")
-                    return False
-                cache_data = {}
+                    # One case is safe to update: an entry for this same video
+                    # that holds no analysis at all, only highlights -- the
+                    # stub a previous call here wrote for a video that was
+                    # never analysed. Refusing it meant a highlight could be
+                    # saved for such a video once and never again.
+                    cache_data = self._highlights_only_entry(video_path, analysis_params)
+                    if cache_data is None:
+                        print("  ⚠️ An analysis cache exists but could not be read; "
+                              "refusing to overwrite it with a highlights-only entry")
+                        return False
+                else:
+                    cache_data = {}
             print(f"  ✓ Loaded cache_data with keys: {cache_data.keys() if cache_data else 'empty dict'}")
             
             # Initialize or update highlight history
