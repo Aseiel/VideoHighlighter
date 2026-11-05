@@ -206,10 +206,25 @@ def extract_local_imports(
 _SCOPE_TRANSPARENT = (ast.Try, ast.If, ast.While, ast.For, ast.AsyncFor, ast.With, ast.AsyncWith)
 
 
+def _target_names(target: ast.expr) -> set[str]:
+    """Names an assignment target binds: ``x``, and each name in an unpacking
+    such as ``a, b = ...``, ``[a, b] = ...`` or ``a, *rest = ...``."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        out: set[str] = set()
+        for elt in target.elts:
+            out |= _target_names(elt)
+        return out
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    return set()                      # attribute or subscript: binds no name
+
+
 def _collect_top_level_names(stmts: list[ast.stmt]) -> set[str]:
-    """Names bound at module level: def/class names, plain assignment
-    targets, and names bound by import statements. Recurses into
-    module-level control flow (try/if/while/for/with) since those don't
+    """Names bound at module level: def/class names, assignment targets
+    (unpacked ones included), and names bound by import statements. Recurses
+    into module-level control flow (try/if/while/for/with) since those don't
     introduce a new scope in Python, but never into a function/class body."""
     names: set[str] = set()
     for node in stmts:
@@ -217,8 +232,7 @@ def _collect_top_level_names(stmts: list[ast.stmt]) -> set[str]:
             names.add(node.name)
         elif isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name):
-                    names.add(target.id)
+                names |= _target_names(target)
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name):
                 names.add(node.target.id)

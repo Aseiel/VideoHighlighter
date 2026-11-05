@@ -487,3 +487,11 @@ def test_cli_exits_one_with_clear_message_outside_a_git_repo(tmp_path):
     assert result.returncode == 1
     assert "check_local_imports:" in result.stdout
     assert "not a git repository" in result.stdout.lower()
+
+
+def test_unpacked_module_level_assignments_bind_every_name():
+    # `RESCORE, ANALYSE = "rescore", "analyse"` defines both names, and a
+    # test importing them was reported as importing names that do not exist.
+    from tools.check_local_imports import _collect_top_level_names
+    tree = ast.parse("A, B = 1, 2\n[C, D] = 3, 4\nE, *F = 5, 6, 7\nG = 8\nobj.attr = 9\n")
+    assert _collect_top_level_names(tree.body) == {"A", "B", "C", "D", "E", "F", "G"}
