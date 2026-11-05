@@ -16,6 +16,15 @@ cannot invent a finding cannot invent a recommendation.
 
 Each finding carries the evidence that produced it. An advisor the user cannot
 check is one they stop trusting the first time it is wrong.
+
+Where a remedy is one concrete change to a setting, the finding also carries it
+as an ``action``: ``{"label": ..., "settings": {key: value}}``, keyed exactly as
+the pipeline reads its run settings. That is what lets a window offer the
+remedy as a checkbox instead of a sentence to act on by hand. Remedies that need
+a judgement only the user can make (which expressions matter, whether a label
+holds up on screen, what a rule should say) carry no action, deliberately: a
+button would have to guess. ``modules.report.advice_actions`` merges the chosen
+actions into one re-run.
 """
 from __future__ import annotations
 
@@ -54,6 +63,14 @@ CONCENTRATED_SPAN = 0.35
 # A tag in at least this share of the kept clips makes the highlight repetitive.
 DOMINANT_TAG_SHARE = 0.8
 
+# The weight an action gives a signal that is switched off: "3 to 5 points is
+# usually enough to break ties without taking over" (see _rule_unused_detector).
+SUGGESTED_WEIGHT = 4
+
+# Where an action moves the Best moments <-> Full story slider. Above the 0.5
+# the concentration rule stops at, with room to go further by hand.
+SUGGESTED_COVERAGE = 0.6
+
 
 @dataclass
 class Finding:
@@ -65,6 +82,7 @@ class Finding:
     remedy: str                       # what to change
     topic: str                        # page in docs/advisor that explains it
     evidence: dict = field(default_factory=dict)
+    action: dict = field(default_factory=dict)  # {"label", "settings"} or empty
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -106,6 +124,51 @@ def _scoring_signals(report: Mapping) -> dict:
             if k in SIGNAL_WEIGHTS and v}
 
 
+def settings_of(report: Mapping) -> dict:
+    return dict(report.get("settings") or {})
+
+
+def _weightable(key: str, settings: Mapping) -> bool:
+    """Can a weight on this signal score anything without another choice first?
+    Expressions need a class picked, and that choice is the user's."""
+    return key != "face" or bool(settings.get("face_expression_labels"))
+
+
+def _weight_action(key: str, weight: float) -> dict:
+    return {"label": f"Give {SIGNAL_NAMES[key]} {weight:g} points",
+            "settings": {SIGNAL_WEIGHTS[key]: weight}}
+
+
+def _raised(weight) -> float:
+    """A weight raised far enough to change outcomes, not just nudge them."""
+    weight = float(weight or 0)
+    return float(SUGGESTED_WEIGHT if weight <= 0
+                 else max(weight + 2, round(weight * 1.5)))
+
+
+def _raise_action(keys: Sequence[str], settings: Mapping) -> dict:
+    """Raise each named signal's weight, in one action."""
+    keys = [k for k in keys if _weightable(k, settings)]
+    if not keys:
+        return {}
+    change = {SIGNAL_WEIGHTS[k]: _raised(settings.get(SIGNAL_WEIGHTS[k]))
+              for k in keys}
+    names = ", ".join(SIGNAL_NAMES[k] for k in keys)
+    return {"label": f"Raise the weight of {names}", "settings": change}
+
+
+def _coverage_action(settings: Mapping) -> dict:
+    """Spread the cut: the slider to SUGGESTED_COVERAGE, or further if it is
+    already there. Nothing when it is at the end of its travel."""
+    current = float(settings.get("coverage") or 0.0)
+    if current >= 1.0:
+        return {}
+    target = (SUGGESTED_COVERAGE if current < SUGGESTED_COVERAGE
+              else min(1.0, round(current + 0.3, 2)))
+    return {"label": f"Spread the cut across the video (coverage {target:g})",
+            "settings": {"coverage": target}}
+
+
 # --------------------------------------------------------------------------- #
 # Rules
 # --------------------------------------------------------------------------- #
@@ -118,6 +181,10 @@ def _rule_single_signal(report) -> Optional[Finding]:
     settings = report.get("settings") or {}
     off = [SIGNAL_NAMES[k] for k, w in SIGNAL_WEIGHTS.items()
            if k != key and not settings.get(w)]
+    activity = settings.get("detector_activity") or {}
+    busiest = max(((int(activity.get(k) or 0), k) for k, w in SIGNAL_WEIGHTS.items()
+                   if k != key and not settings.get(w) and _weightable(k, settings)),
+                  default=(0, ""))
     return Finding(
         id="single_signal",
         severity="high",
@@ -132,6 +199,8 @@ def _rule_single_signal(report) -> Optional[Finding]:
                 "where only one fired."),
         topic="weights",
         evidence={"signal": key, "points": total, "disabled": off},
+        action=(_weight_action(busiest[1], SUGGESTED_WEIGHT)
+                if busiest[0] > 0 else {}),
     )
 
 
@@ -210,6 +279,7 @@ def _rule_concentrated(report) -> Optional[Finding]:
         topic="coverage",
         evidence={"span_seconds": span, "fraction": fraction,
                   "coverage_setting": coverage},
+        action=_coverage_action(settings_of(report)),
     )
 
 
@@ -235,6 +305,11 @@ def _rule_boost_never_fired(report) -> Optional[Finding]:
         topic="weights",
         evidence={"multiplier": multiplier, "required": minimum,
                   "best_seen": best},
+        # Lowering the bar means something only while it still asks for
+        # agreement; at one signal it would boost every moment alike.
+        action=({"label": f"Boost moments where {best} signals agree",
+                 "settings": {"min_signals_for_boost": best}}
+                if 2 <= best < minimum else {}),
     )
 
 
@@ -264,6 +339,7 @@ def _rule_near_miss_gap(report) -> Optional[Finding]:
                 "check first."),
         topic="weights",
         evidence={"signals": only_missed, "near_misses": len(misses)},
+        action=_raise_action(only_missed, settings_of(report)),
     )
 
 
@@ -294,6 +370,7 @@ def _rule_dominant_tag(report) -> Optional[Finding]:
                 "for the alternatives that lost to them."),
         topic="variety",
         evidence={"tag": tag, "clips_with_tag": count, "clips": len(kept)},
+        action=_coverage_action(settings_of(report)),
     )
 
 
@@ -456,6 +533,8 @@ def _rule_unused_detector(report, concern=None) -> list:
                     "a re-analysis."),
             topic="weights",
             evidence={"signal": key, "detected": found, "clips": kept},
+            action=(_weight_action(key, SUGGESTED_WEIGHT)
+                    if _weightable(key, settings) else {}),
         ))
     # Most events first: the detector with the most to say is the best bet.
     out.sort(key=lambda f: -f.evidence["detected"])
@@ -484,6 +563,7 @@ def _rule_concern_repetitive(report, concern=None) -> Optional[Finding]:
                 "interesting in more than one way to win."),
         topic="variety",
         evidence={"signal": key},
+        action=_coverage_action(settings_of(report)),
     )
 
 
