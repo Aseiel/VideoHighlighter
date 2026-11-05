@@ -1087,5 +1087,8 @@
   "LM Studio (local server)": "LM Studio（本地服务器）",
   "LM Studio host:": "LM Studio 主机：",
   "Looking for Ollama and LM Studio…": "正在查找 Ollama 和 LM Studio…",
-  "Where LM Studio's server is running. Blank means http://localhost:1234.\nAny OpenAI-compatible server works here too: llama.cpp's\nllama-server, Jan, vLLM. For another PC, turn on\n\"Serve on Local Network\" in LM Studio's Developer tab there.\nThe whole app follows this: chat, report, narration and advisor.": "LM Studio 服务器运行的位置。留空表示 http://localhost:1234。\n任何兼容 OpenAI 的服务器也可以：llama.cpp 的\nllama-server、Jan、vLLM。若是另一台电脑，请在那台电脑的 LM Studio\n“Developer”标签页中打开“Serve on Local Network”。\n整个应用都遵循此设置：聊天、报告、旁白和顾问。"
+  "Where LM Studio's server is running. Blank means http://localhost:1234.\nAny OpenAI-compatible server works here too: llama.cpp's\nllama-server, Jan, vLLM. For another PC, turn on\n\"Serve on Local Network\" in LM Studio's Developer tab there.\nThe whole app follows this: chat, report, narration and advisor.": "LM Studio 服务器运行的位置。留空表示 http://localhost:1234。\n任何兼容 OpenAI 的服务器也可以：llama.cpp 的\nllama-server、Jan、vLLM。若是另一台电脑，请在那台电脑的 LM Studio\n“Developer”标签页中打开“Serve on Local Network”。\n整个应用都遵循此设置：聊天、报告、旁白和顾问。",
+  "Auto (CPU for VR, GPU otherwise)": "自动（VR 用 CPU，其他用 GPU）",
+  "How the highlight video is encoded:\nAuto — CPU x265 for VR footage (side-by-side, or wider than 4096 px),\n   the hardware encoder for everything else.\nCPU x265 — re-encode on the CPU with libx265 (HEVC), matching how VR\n   sources are authored. VR-safe, but slow at 6K.\nGPU — re-encode with the hardware encoder. Fast, but the HEVC output\n   may not play in VR players like HereSphere.": "精彩视频的编码方式：\n自动 — VR 视频（左右并排，或宽度超过 4096 像素）用 CPU x265，\n   其他视频用硬件编码器。\nCPU x265 — 在 CPU 上用 libx265 (HEVC) 重新编码，与 VR 片源的\n   制作方式一致。VR 安全，但 6K 时较慢。\nGPU — 用硬件编码器重新编码。速度快，但输出的 HEVC\n   可能无法在 HereSphere 等 VR 播放器中播放。",
+  "Video: Auto (CPU for VR, GPU otherwise)": "视频：自动（VR 用 CPU，其他用 GPU）"
 }

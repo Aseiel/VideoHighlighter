@@ -35,7 +35,55 @@ _UNSET = object()
 _vendor_cache = _UNSET
 _encoders_cache = None
 _size_cache = {}
+_fps_cache = {}
 _chain_cache = {}
+_vr_cache = {}
+
+RENDER_MODES = ("auto", "cpu", "gpu")
+
+# HEVC levels (ITU-T H.265 table A.8): (level, max luma picture size, max luma
+# samples per second). The level is written as the encoder's own number for it
+# (6.1 -> 61), which is what hevc_qsv takes.
+_HEVC_LEVELS = (
+    (40, 2_228_224, 66_846_720),
+    (41, 2_228_224, 133_693_440),
+    (50, 8_912_896, 267_386_880),
+    (51, 8_912_896, 534_773_760),
+    (52, 8_912_896, 1_069_547_520),
+    (60, 35_651_584, 1_069_547_520),
+    (61, 35_651_584, 2_139_095_040),
+    (62, 35_651_584, 4_278_190_080),
+)
+
+
+def hevc_level(width, height, fps):
+    """The lowest HEVC level whose limits hold a `width`x`height` picture at
+    `fps`, as the encoder's number (6.1 -> 61). 62 when nothing fits, 52 when
+    the size is unknown.
+
+    hevc_qsv needs it because its tier option only takes effect alongside an
+    explicit level (see _hevc_qsv_args)."""
+    if not (width and height):
+        return 52
+    luma = int(width) * int(height)
+    rate = luma * float(fps or 60.0)
+    side = max(int(width), int(height))
+    for level, max_ps, max_sr in _HEVC_LEVELS:
+        # A.4.1: neither side may exceed sqrt(8 * MaxLumaPs).
+        if luma <= max_ps and rate <= max_sr and side * side <= 8 * max_ps:
+            return level
+    return 62
+
+
+def _hevc_qsv_args(level):
+    # Main tier, stated explicitly. ffmpeg's hevc_qsv defaults to High tier,
+    # which neither the VR sources nor libx265 use; it is the one difference in
+    # the stream's profile/tier/level header between QSV output and the files
+    # headset players (HereSphere) accept, and a decoder that supports only
+    # Main tier refuses a High-tier stream outright. QSV ignores -tier unless
+    # -level is set too.
+    return ["-c:v", "hevc_qsv", "-preset", "faster", "-global_quality", "22",
+            "-tier", "main", "-level", str(level), "-tag:v", "hvc1"]
 
 
 def _vendor_from_name(name):
@@ -152,21 +200,74 @@ def probe_video_size(video_path, ffmpeg=None):
     return (w, h)
 
 
+def probe_video_fps(video_path):
+    """Frame rate from the container, cached per path; 0.0 if unreadable."""
+    if video_path in _fps_cache:
+        return _fps_cache[video_path]
+    fps = 0.0
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        cap.release()
+    except Exception:
+        pass
+    if not (0 < fps < 1000):
+        fps = 0.0
+    _fps_cache[video_path] = fps
+    return fps
+
+
+def is_vr(video_path):
+    """True when `video_path` looks like VR footage: wider than 4096 px (where
+    the HEVC path, and the headset players, start) or side-by-side stereo as
+    modules.media.vr_detect sees it. Cached per path."""
+    if video_path in _vr_cache:
+        return _vr_cache[video_path]
+    w, h = probe_video_size(video_path)
+    vr, why = False, ""
+    if max(w, h) > 4096:
+        vr, why = True, f"{w}x{h} is wider than 4096 px"
+    else:
+        try:
+            from modules.media import vr_detect
+            layout = vr_detect.probe(video_path)
+            vr, why = bool(layout.side_by_side), layout.reason
+        except Exception as e:
+            why = f"layout probe failed: {e}"
+    print(f"[encoder_select] {os.path.basename(video_path)}: "
+          f"{'VR' if vr else 'not VR'} ({why})")
+    _vr_cache[video_path] = vr
+    return vr
+
+
+def resolve_mode(video_path, mode):
+    """'cpu' or 'gpu' for one video. 'auto' is CPU for VR footage, which has
+    to play in a headset, and the hardware encoder for everything else.
+    Anything unknown is treated as 'auto'."""
+    if mode in ("cpu", "gpu"):
+        return mode
+    return "cpu" if is_vr(video_path) else "gpu"
+
+
 def encoder_chain(video_path, ffmpeg=None, mode="gpu"):
     """Ordered list of (name, [ffmpeg video args]) to try, hardware first,
     always ending with a CPU fallback. Cached per (video path, mode).
 
     `mode`:
       - "gpu" (default): hardware first (nvenc/qsv/amf), CPU libx264 fallback.
-        Fast, but the hardware HEVC bitstreams are rejected by some VR players.
+        Fast. Hardware HEVC is forced to Main tier, which is what VR players
+        were rejecting in QSV's default output.
       - "cpu": CPU only — libx265 for high-res/VR (matches how VR sources are
         authored, so VR players accept it), libx264 otherwise. Slow but safe.
+      - "auto": "cpu" for VR footage, "gpu" otherwise (see resolve_mode).
 
     HEVC is used for high-res/VR sources (>4096px, what VR players expect);
     H.264 otherwise. When the GPU vendor is known only that vendor's encoder
     is kept (+ libx264); when unknown (CPU-only, or an AMD box with no
     DirectML installed to name the card) the full candidate list is kept so
     h264_amf/hevc_amf still gets a chance."""
+    mode = resolve_mode(video_path, mode)
     cache_key = (video_path, mode)
     if cache_key in _chain_cache:
         return _chain_cache[cache_key]
@@ -183,11 +284,13 @@ def encoder_chain(video_path, ffmpeg=None, mode="gpu"):
     if hi_res:
         candidates = [
             ("hevc_nvenc", ["-c:v", "hevc_nvenc", "-preset", "p5", "-rc",
-                            "vbr", "-cq", "22", "-b:v", "0", "-tag:v", "hvc1"]),
-            ("hevc_qsv", ["-c:v", "hevc_qsv", "-preset", "faster",
-                          "-global_quality", "22", "-tag:v", "hvc1"]),
+                            "vbr", "-cq", "22", "-b:v", "0", "-tier", "main",
+                            "-tag:v", "hvc1"]),
+            ("hevc_qsv", _hevc_qsv_args(
+                hevc_level(w, h, probe_video_fps(video_path)))),
             ("hevc_amf", ["-c:v", "hevc_amf", "-quality", "balanced", "-rc",
-                          "cqp", "-qp_i", "22", "-qp_p", "22", "-tag:v", "hvc1"]),
+                          "cqp", "-qp_i", "22", "-qp_p", "22",
+                          "-profile_tier", "main", "-tag:v", "hvc1"]),
         ]
     else:
         candidates = [

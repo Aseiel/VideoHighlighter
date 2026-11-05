@@ -3468,11 +3468,15 @@ class SignalTimelineWindow(QMainWindow):
         
         # Video output mode (CPU/GPU), shared with the main GUI via config.
         # Hardware HEVC is rejected by some VR players; CPU libx265 is VR-safe.
+        # Auto picks CPU for VR footage and the GPU otherwise.
         self.render_mode_combo = QComboBox()
+        self.render_mode_combo.addItem("Video: Auto (CPU for VR, GPU otherwise)", "auto")
         self.render_mode_combo.addItem("Video: CPU x265 (VR-safe, slow)", "cpu")
         self.render_mode_combo.addItem("Video: GPU (fast, may break VR)", "gpu")
         self.render_mode_combo.setToolTip(
             "How the highlight video is encoded:\n"
+            "Auto — CPU x265 for VR footage (side-by-side, or wider than 4096 px),\n"
+            "   the hardware encoder for everything else.\n"
             "CPU x265 — re-encode on the CPU with libx265 (HEVC), matching how VR\n"
             "   sources are authored. VR-safe, but slow at 6K.\n"
             "GPU — re-encode with the hardware encoder. Fast, but the HEVC output\n"
@@ -5401,7 +5405,7 @@ class SignalTimelineWindow(QMainWindow):
         # thread must not touch Qt widgets.
         self._render_output_path = output_path
         self._render_clips = clips
-        self._render_mode = self.render_mode_combo.currentData() or "cpu"
+        self._render_mode = self.render_mode_combo.currentData() or "auto"
 
         import threading
 
@@ -5490,21 +5494,21 @@ class SignalTimelineWindow(QMainWindow):
     def _load_render_mode_default(self):
         """Default video-output mode, read from the shared config.yaml
         (highlights.render_mode) so the timeline viewer agrees with the main
-        GUI's Advanced-tab setting. Falls back to 'cpu' (VR-safe)."""
+        GUI's Advanced-tab setting. Falls back to 'auto' (CPU for VR)."""
         try:
             import yaml
             from modules.system.app_paths import config_path
             with open(config_path("config.yaml"), "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
-            mode = (cfg.get("highlights", {}) or {}).get("render_mode", "cpu")
-            return mode if mode in ("cpu", "gpu") else "cpu"
+            mode = (cfg.get("highlights", {}) or {}).get("render_mode", "auto")
+            return mode if mode in ("auto", "cpu", "gpu") else "auto"
         except Exception:
-            return "cpu"
+            return "auto"
 
     def _save_render_mode(self, mode):
         """Persist the chosen video-output mode back to config.yaml so it
         sticks and stays in sync with the main GUI. Best-effort."""
-        if mode not in ("cpu", "gpu"):
+        if mode not in ("auto", "cpu", "gpu"):
             return
         try:
             import yaml
@@ -5527,10 +5531,10 @@ class SignalTimelineWindow(QMainWindow):
         decision — GPU vendor via device_utils, HEVC-for-VR by resolution,
         libx264 fallback — lives in one place. Cached per (window, mode).
 
-        Uses the mode chosen via the Video output combo ('cpu'/'gpu'), captured
+        Uses the mode chosen via the Video output combo ('auto'/'cpu'/'gpu'), captured
         on the main thread into self._render_mode before the worker starts."""
         mode = getattr(self, "_render_mode", None) or (
-            self.render_mode_combo.currentData() if hasattr(self, "render_mode_combo") else "cpu")
+            self.render_mode_combo.currentData() if hasattr(self, "render_mode_combo") else "auto")
         if getattr(self, "_enc_chain_mode", None) == mode and hasattr(self, "_enc_chain"):
             return self._enc_chain
         from modules.system.encoder_select import encoder_chain

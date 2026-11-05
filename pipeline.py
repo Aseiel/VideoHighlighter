@@ -463,12 +463,12 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         EXPORT_CLIPS = bool(gui_config.get(
             "export_separate_clips",
             config.get("highlights", {}).get("export_separate_clips", False)))
-        # How the final clips are cut/encoded: "cpu" (libx265/libx264 re-encode,
-        # VR-safe, slow) or "gpu" (hardware re-encode, fast, may not play in some
-        # VR players).
-        RENDER_MODE = gui_config.get("render_mode", config.get("highlights", {}).get("render_mode", "cpu"))
-        if RENDER_MODE not in ("cpu", "gpu"):
-            RENDER_MODE = "cpu"
+        # How the final clips are cut/encoded: "auto" (CPU for VR footage, GPU
+        # otherwise), "cpu" (libx265/libx264 re-encode, VR-safe, slow) or "gpu"
+        # (hardware re-encode, fast). Resolved per video at Step 7.
+        RENDER_MODE = gui_config.get("render_mode", config.get("highlights", {}).get("render_mode", "auto"))
+        if RENDER_MODE not in ("auto", "cpu", "gpu"):
+            RENDER_MODE = "auto"
 
         # Transcript settings
         USE_TRANSCRIPT = gui_config.get("use_transcript", False) and TRANSCRIPT_AVAILABLE
@@ -2583,8 +2583,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
 
         # Cut and concatenate
         progress.update_progress(90, 100, "Pipeline", "Creating highlight video...")
+        from modules.system.encoder_select import resolve_mode
+        _resolved_mode = resolve_mode(processed_video_path, RENDER_MODE)
         _render_mode_label = {"cpu": "CPU re-encode (libx265/264)",
-                              "gpu": "GPU re-encode"}[RENDER_MODE]
+                              "gpu": "GPU re-encode"}[_resolved_mode]
+        if RENDER_MODE == "auto":
+            _render_mode_label += (", auto: VR footage" if _resolved_mode == "cpu"
+                                   else ", auto")
         log(f"🔹 Step 7: Cutting video segments... [{_render_mode_label}]")
         try:
             from modules.media.clip_export import (

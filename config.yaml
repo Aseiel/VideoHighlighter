@@ -18,7 +18,7 @@ highlights:
   exact_duration: 0
   keep_temp: false
   export_separate_clips: false
-  render_mode: cpu
+  render_mode: auto
   auto_min_clip: 2
   auto_max_clip: 30
   auto_merge_gap: 2

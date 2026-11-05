@@ -2922,21 +2922,25 @@ class VideoHighlighterGUI(QWidget):
 
         # ── Group: Video Output ──
         # How the final highlight is re-encoded. CPU (libx265) is VR-safe but slow;
-        # GPU is fast but its HEVC may not play in some VR players. Placed at the top
+        # Auto picks CPU x265 for VR footage and the GPU otherwise; GPU is fast but
+        # its HEVC may not play in some VR players. Placed at the top
         # of Advanced so it's easy to find when a VR player rejects a render.
         output_box = QGroupBox("Video Output")
         output_layout = QFormLayout()
         self.render_mode_combo = QComboBox()
+        self.render_mode_combo.addItem("Auto (CPU for VR, GPU otherwise)", "auto")
         self.render_mode_combo.addItem("CPU x265 (VR-safe, slow)", "cpu")
         self.render_mode_combo.addItem("GPU (fast, may break VR)", "gpu")
         self.render_mode_combo.setToolTip(
             "How the highlight video is encoded:\n"
+            "Auto — CPU x265 for VR footage (side-by-side, or wider than 4096 px),\n"
+            "   the hardware encoder for everything else.\n"
             "CPU x265 — re-encode on the CPU with libx265 (HEVC), matching how VR\n"
             "   sources are authored. VR-safe, but slow at 6K.\n"
             "GPU — re-encode with the hardware encoder. Fast, but the HEVC output\n"
             "   may not play in VR players like HereSphere."
         )
-        _saved_render_mode = highlights_cfg.get("render_mode", "cpu")
+        _saved_render_mode = highlights_cfg.get("render_mode", "auto")
         _rm_idx = self.render_mode_combo.findData(_saved_render_mode)
         if _rm_idx >= 0:
             self.render_mode_combo.setCurrentIndex(_rm_idx)
