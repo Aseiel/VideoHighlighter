@@ -82,6 +82,18 @@ datas += ov_datas
 binaries += ov_binaries
 hiddenimports += ov_hidden
 
+# Whisper on an Intel GPU (modules/audio/whisper_openvino.py): the GenAI
+# pipeline and the tokenizer extension it loads as a native library. Absent
+# where the wheels are (macOS), and a build there just keeps Whisper as it was.
+for _pkg in ("openvino_genai", "openvino_tokenizers"):
+    try:
+        _d, _b, _h = collect_all(_pkg)
+    except Exception:
+        continue
+    datas += _d
+    binaries += _b
+    hiddenimports += _h
+
 # ONNX Runtime, for the DirectML detection path (modules/vision/onnx_detector.py). It
 # is imported inside a function rather than at module scope, and its providers
 # are native libraries, so collect it explicitly rather than trusting the graph.

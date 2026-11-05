@@ -29,6 +29,10 @@ openai-whisper
 # breaks on Python 3.13 and conflicts with the ML stack.
 httpx>=0.24
 openvino==2026.4.0
+# Whisper on an Intel GPU (modules/audio/whisper_openvino.py). Apache-2.0, and
+# pinned to the openvino above: genai's release must match the runtime's.
+# No Intel GPU plugin exists on macOS, so it is not installed there.
+openvino-genai==2026.4.0.0; sys_platform != "darwin"
 # Object detection is YOLOX (Apache-2.0): the runtime is OpenVINO above, and the
 # stock models download on first use. Training a detector in the app also needs
 # the yolox package itself, installed separately and WITHOUT its deps, because

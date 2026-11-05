@@ -304,10 +304,25 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
       TranscriptionCancelled promptly rather than at the end of the run.
     """
     device = whisper_device()
-    log_fn(f"Using device for Whisper: {device}")
-    slow = cpu_model_warning(model_name, device)
-    if slow:
-        log_fn(slow)
+    # An Intel GPU, through OpenVINO, when the run's accelerator choice points
+    # there (modules/audio/whisper_openvino.py). None keeps openai-whisper.
+    ov_model = None
+    if device != "mps":
+        try:
+            from modules.audio import whisper_openvino
+            from modules.system import compute_backend
+            ov_model = whisper_openvino.load(model_name, compute_backend.configured(),
+                                             cuda=(device == "cuda"), log_fn=log_fn)
+        except Exception as e:  # noqa: BLE001 - the GPU route is optional
+            log_fn(f"⚠️ Intel GPU route for Whisper unavailable ({type(e).__name__}: {e})")
+            ov_model = None
+    if ov_model is not None:
+        log_fn(f"Using device for Whisper: Intel GPU ({ov_model.device}, OpenVINO)")
+    else:
+        log_fn(f"Using device for Whisper: {device}")
+        slow = cpu_model_warning(model_name, device)
+        if slow:
+            log_fn(slow)
 
     log_fn(f"🔤 Language parameter received: {language}")
 
@@ -331,7 +346,20 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
     if progress_fn:
         progress_fn(1, 100, "Transcription", f"Loading Whisper '{model_name}'...")
 
-    model, device = load_whisper(model_name, device, log_fn)
+    if ov_model is None:
+        model, device = load_whisper(model_name, device, log_fn)
+    else:
+        # openai-whisper is still needed now and then on this route: for
+        # aligning a stretched line's words, and to finish the run if the GPU
+        # fails mid-way. Loaded on the processor the first time either happens.
+        model = None
+
+    def cpu_model():
+        nonlocal model, device
+        if model is None:
+            model, device = whisper.load_model(model_name, device="cpu"), "cpu"
+        return model
+
     log_fn("Splitting video into chunks...")
     abort_if_cancelled()
 
@@ -397,9 +425,23 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
             # It skips its own progress update on windows it judges to be silence,
             # so a quiet stretch still shows as a pause — the closing report below
             # makes sure the chunk ends where it should regardless.
+            result = None
+            if ov_model is not None:
+                try:
+                    result = ov_model.transcribe(
+                        whisper.load_audio(chunk), language=language,
+                        on_frac=lambda f, _i=idx: tick(f, _i))
+                except TranscriptionCancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 - finish on the processor
+                    log_fn(f"⚠️ Whisper failed on the Intel GPU ({type(e).__name__}: {e}); "
+                           f"continuing on the processor")
+                    ov_model = None
+                    cpu_model()
             try:
-                with _whisper_progress(lambda f, _i=idx: tick(f, _i)):
-                    result = model.transcribe(chunk, **transcribe_params)
+                if result is None:
+                    with _whisper_progress(lambda f, _i=idx: tick(f, _i)):
+                        result = model.transcribe(chunk, **transcribe_params)
             except (RuntimeError, NotImplementedError) as e:
                 if device != "mps":
                     raise
@@ -429,7 +471,7 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
                 abort_if_cancelled()
                 try:
                     align = whisper_aligner(
-                        model, whisper.load_audio(chunk),
+                        cpu_model(), whisper.load_audio(chunk),
                         detected_lang if detected_lang != "unknown" else language)
                 except Exception as e:  # noqa: BLE001 - keep Whisper's times
                     print(f"segment_timing: no aligner for {chunk}: {type(e).__name__}: {e}")

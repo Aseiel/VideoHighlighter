@@ -212,6 +212,8 @@ jobs:
             --collect-submodules keyring `
             --copy-metadata keyring `
             --collect-all openvino `
+            --collect-all openvino_genai `
+            --collect-all openvino_tokenizers `
             --collect-all onnxruntime `
             --collect-all playwright `
             --collect-data whisper `

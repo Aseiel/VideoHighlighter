@@ -149,6 +149,23 @@ def _no_action_model_choice_leaks():
             os.environ["VH_ACTION_MODEL"] = before
 
 
+# Whisper on an Intel GPU (modules/audio/whisper_openvino.py) is taken on its
+# own when openvino-genai is installed and an Arc is present. On such a
+# machine every transcript test would load the real pipeline and download a
+# model. Off by default here; the tests of that route turn it back on.
+@pytest.fixture(autouse=True)
+def _no_whisper_on_the_intel_gpu():
+    before = os.environ.get("VH_WHISPER_OPENVINO")
+    os.environ["VH_WHISPER_OPENVINO"] = "0"
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("VH_WHISPER_OPENVINO", None)
+        else:
+            os.environ["VH_WHISPER_OPENVINO"] = before
+
+
 # The UI language is module state, and the Qt hooks that read it stay
 # installed once any test installs them. A test that switched to Turkish and
 # stopped there ran every later Qt test in Turkish: the teach window's buttons

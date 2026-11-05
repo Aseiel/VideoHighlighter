@@ -69,8 +69,40 @@ the table above shows.
 | Object detection | yes, via OpenVINO IR | The heaviest per-frame stage, so the largest part of the win. Exported on first use — see below. |
 | Action recognition (SigLIP2) | yes | The frame encoder runs on OpenVINO GPU, checked against a reference vector before use. |
 | Visual search (CLIP prefilter) | yes | Pre-converted to IR at build time by `tools/export_clip_ov.py`. |
+| Transcription (Whisper) | yes, via OpenVINO GenAI | About 5× the processor. The model downloads on first use; see below. |
 | Video encoding (QSV) | yes, indirectly | `modules/system/encoder_select.py` reads the vendor and prefers `h264_qsv` / `hevc_qsv`. Nothing to do with machine learning. |
 | Face, motion | no | OpenVINO on the processor. |
+
+### Transcription
+
+openai-whisper, which transcribes on NVIDIA and Apple GPUs, has no Intel GPU
+path that pays: through torch's XPU build it ran slower than the processor. So
+on an Intel card Whisper runs through OpenVINO GenAI's `WhisperPipeline`
+instead (`modules/audio/whisper_openvino.py`), with the OpenVINO project's own
+exports of the same weights (`OpenVINO/whisper-<size>-fp16-ov` on Hugging Face),
+downloaded once into `models/whisper-ov/`.
+
+It is used when the compute backend is *Automatic* and no NVIDIA card is
+present, or when it is *Intel (OpenVINO)*. `VH_WHISPER_OPENVINO=0` keeps
+Whisper on the processor whatever the backend. Anything missing (the
+`openvino-genai` package, the card, the download) leaves Whisper where it was,
+and a failure part-way through finishes the run on the processor.
+
+**2026-11-05**, Whisper `small`, the app's settings, three 10-minute clips on
+the A750:
+
+| clip | processor | Arc, OpenVINO | words, processor / Arc |
+|---|---|---|---|
+| clean speech | 73.8 s | 13.1 s | 1011 / 1011, timestamps identical |
+| noisy speech | 71.9 s | 13.5 s | 440 / 426 |
+| cartoon dialogue | 104.3 s | 20.4 s | 1214 / 1250 |
+
+On clean speech the two agree word for word. On noisy audio they differ, and
+neither is clearly better: both lock into repetition loops there (the
+processor's raw output had 123 looping segments on that clip), and the
+transcript cleanup removes them from either. What the pipeline lacks is
+openai-whisper's retry at a higher temperature when a window's text repeats,
+so on noisy footage its raw output loops a little more before cleanup.
 
 **Detection reaches the GPU through OpenVINO's `AUTO` device, not through the
 app's own device choice.** The detector is YOLOX IR under `models/yolox/`,
@@ -126,5 +158,7 @@ The ratios are large enough to act on and not precise enough to extrapolate.
 - `modules/system/compute_backend.py` — the backend setting, including the `intel`
   choice that covers both probes.
 - `modules/system/encoder_select.py` — vendor detection for the QSV video encoders.
+- `modules/audio/whisper_openvino.py` — Whisper on the Intel GPU: when it is
+  used, the model download, and the shape it hands back to `transcript.py`.
 - `tools/export_clip_ov.py` — the build-time CLIP conversion to OpenVINO IR.
 - `docs/AMD-GPU.md` — the DirectML path, and why it is opt-in everywhere.

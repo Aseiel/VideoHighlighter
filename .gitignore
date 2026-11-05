@@ -50,6 +50,10 @@ coreml-cache/
 # RTMPose keypoint IRs + ONNX/zip cache (installed via tools/get_rtmpose_model.py)
 models/rtmpose/
 
+# Whisper for the Intel GPU (OpenVINO exports, downloaded on first use by
+# modules/audio/whisper_openvino.py).
+models/whisper-ov/
+
 # YOLOX detector IRs + ONNX cache (installed via tools/get_yolox_model.py,
 # and by the app on first run). Downloaded, never authored here.
 models/yolox/
