@@ -19,3 +19,4 @@ pyyaml        # real parser for the composition-rules tests (not shimmed): a
               # mocked safe_load returns a MagicMock, so rules parse to nothing
               # and the tests pass against an empty rule set
 cryptography  # real Ed25519 for tests/test_update_manifest.py (not shimmed)
+mcp>=1.2,<2   # tests/test_mcp_server.py drives the real FastMCP tool layer

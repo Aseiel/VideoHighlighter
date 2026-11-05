@@ -585,8 +585,16 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
                                 log: LogFn = print, window_s: float = WINDOW_S,
                                 stride_s: float = STRIDE_S, preview_fn=None,
                                 annotated_output: Optional[str] = None,
-                                frames_per_window: Optional[int] = None):
+                                frames_per_window: Optional[int] = None,
+                                window_scores_out: Optional[list] = None):
     """Timed action detections for ``video_path`` (see the module docstring).
+
+    ``window_scores_out``: when a list, it also receives every window of the
+    head's own classes as ``{"start", "end", "centre", "scores": {class:
+    score}}`` (seconds), trusted or not and above the bar or not. Detections
+    are what crossed a class's bar; a caller that already knows *where* an
+    event is (a counter, a user's mark) needs the best window there even when
+    nothing crossed it.
 
     ``preview_fn(frame_bgr, boxes, sec)`` gets a few of the frames read, for
     the live preview window, with the people found on them.
@@ -825,6 +833,12 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             scores, where = window_scores[p][w]
             hits = scorer.detected(scores[None, :])[0]
             seconds = window_seconds(windows, w, fps, last_second)
+            if p == 0 and window_scores_out is not None:
+                window_scores_out.append({
+                    "start": windows[w][0] / fps, "end": windows[w][-1] / fps,
+                    "centre": (windows[w][0] + windows[w][-1]) / 2 / fps,
+                    "scores": {c: float(s) for c, s in zip(scorer.classes, scores)},
+                })
             for i in np.flatnonzero(hits):
                 name = scorer.classes[i]
                 if p == 0 and wanted_names is not None and name.lower() not in wanted_names:

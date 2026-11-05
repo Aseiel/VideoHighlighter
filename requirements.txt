@@ -83,6 +83,11 @@ webdriver-manager
 # on Intel GPU / CPU. pillow is above.
 transformers
 optimum-intel  # OpenVINO backend only — the CUDA path does not import it
+# MCP server (mcp_server/): Claude Desktop / Claude Code drive the app as tools.
+# MIT; its dependency tree is MIT/BSD/Apache, plus certifi (MPL-2.0) via httpx,
+# which is above already. <2: server.py runs FastMCP's lowlevel server on a
+# stdout of its own, through an attribute 1.x keeps.
+mcp>=1.2,<2
 cryptography  # Ed25519 verification of release manifests (modules/update/update_manifest.py).
               # The updater replaces executables, so an unverified manifest is
               # not installed at all — without this the update check still
