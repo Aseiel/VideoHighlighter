@@ -156,4 +156,12 @@ Consulta [CONTRIBUTING.md](CONTRIBUTING.md) para ver las pautas sobre calidad de
 qué hace buena una contribución. El proyecto agradece los informes de errores, las correcciones
 pequeñas y las propuestas de funciones; revisa el CLA antes de tu primer PR.
 
-![Historial de estrellas](assets/star-history-2026630.png)
+## Historial de estrellas
+
+<a href="https://www.star-history.com/?repos=aseiel%2Fvideohighlighter&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=aseiel/videohighlighter&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=aseiel/videohighlighter&type=date&legend=top-left" />
+   <img alt="Historial de estrellas" src="https://api.star-history.com/chart?repos=aseiel/videohighlighter&type=date&legend=top-left" />
+ </picture>
+</a>

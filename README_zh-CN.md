@@ -140,4 +140,12 @@ VideoHighlighter 偶尔会对你的视频有自己的“想法”。遇到这种
 关于代码质量、测试以及怎样才算一个好的贡献，请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
 欢迎提交错误报告、小修复和功能建议——第一次提交 PR 之前请先阅读 CLA。
 
-![星标历史](assets/star-history-2026630.png)
+## 星标历史
+
+<a href="https://www.star-history.com/?repos=aseiel%2Fvideohighlighter&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=aseiel/videohighlighter&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=aseiel/videohighlighter&type=date&legend=top-left" />
+   <img alt="星标历史" src="https://api.star-history.com/chart?repos=aseiel/videohighlighter&type=date&legend=top-left" />
+ </picture>
+</a>

@@ -146,4 +146,12 @@ GNU Affero General Public License v3.0 で公開しています。自由に使�
 [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。バグ報告、小さな修正、機能の提案を歓迎します。
 最初の PR の前に CLA を確認してください。
 
-![スター履歴](assets/star-history-2026630.png)
+## スター履歴
+
+<a href="https://www.star-history.com/?repos=aseiel%2Fvideohighlighter&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=aseiel/videohighlighter&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=aseiel/videohighlighter&type=date&legend=top-left" />
+   <img alt="スター履歴" src="https://api.star-history.com/chart?repos=aseiel/videohighlighter&type=date&legend=top-left" />
+ </picture>
+</a>
