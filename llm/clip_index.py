@@ -372,19 +372,27 @@ def open_memo(video_path: str, model_id: str, cache_path: Optional[str] = None,
 
 def build_index(video_path: str, interval: float = 1.0, batch: int = 16,
                 device: str = "AUTO", embedder: Optional[ClipEmbedder] = None,
-                progress=None) -> ClipFrameIndex:
+                progress=None, decode: Optional[str] = None) -> ClipFrameIndex:
     """Sample `video_path` every `interval` seconds and embed each frame once.
 
     `progress(done, total)` is called as batches complete, for a GUI bar.
+
+    Every frame has to be decoded - that is how video codecs work - but only
+    the sampled ones are converted to pictures; the rest are `grab()`-ed and
+    skipped. `decode` picks the decoder, ``"gpu"`` or ``"cpu"``; by default the
+    `compute.video_decode` setting (see modules/media/video_decode.py, which
+    also says what the card's decoder changes and why it is only used here).
     """
     import cv2
+
+    from modules.media import video_decode
 
     pf = embedder
     if pf is None:
         pf = ClipEmbedder(device=device)
         pf.load()
 
-    cap = cv2.VideoCapture(video_path)
+    cap, decoder = video_decode.open_sparse(video_path, decode)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -410,26 +418,38 @@ def build_index(video_path: str, interval: float = 1.0, batch: int = 16,
     try:
         i = 0
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
             if i % step == 0:
+                ok, frame = cap.read()
+                if not ok:
+                    break
                 buf_frames.append(frame)
                 buf_ts.append(i / fps)
                 if len(buf_frames) >= batch:
                     flush()
+            elif not cap.grab():          # decoded, never converted: much cheaper
+                break
             i += 1
         flush()
     finally:
         cap.release()
 
+    if decoder == video_decode.GPU and total_frames and i < total_frames * 0.97:
+        # A hardware decoder that gives up part-way would leave an index that
+        # silently ends early. Do it again on the processor instead.
+        print(f"⚠️  CLIP index: the GPU decoder stopped at frame {i} of ~{total_frames}; "
+              f"redoing it on the CPU")
+        return build_index(video_path, interval=interval, batch=batch, device=device,
+                           embedder=pf, progress=progress, decode=video_decode.CPU)
+
     embeddings = (np.vstack(chunks) if chunks
                   else np.zeros((0, 512), dtype=np.float32))
     meta = _video_fingerprint(video_path, pf.model_id, interval)
     meta["logit_scale"] = pf.logit_scale
+    meta["decoder"] = decoder             # not part of the fingerprint: either is valid
     elapsed = time.perf_counter() - t0
     per = (elapsed / len(timestamps) * 1000) if timestamps else 0.0
-    print(f"🧠 CLIP index: {len(timestamps)} frames in {elapsed:.1f}s ({per:.1f} ms/frame)")
+    print(f"🧠 CLIP index: {len(timestamps)} frames in {elapsed:.1f}s ({per:.1f} ms/frame), "
+          f"decoded on {decoder}")
     return ClipFrameIndex(np.array(timestamps, dtype=np.float32), embeddings, meta)
 
 
@@ -467,10 +487,13 @@ def main():
                     help="AUTO/GPU (NVIDIA if present, else Intel GPU, else CPU), "
                          "CUDA, cuda:N, CPU, or any OpenVINO device string")
     ap.add_argument("--cache", default=None, help="path to .npz index cache")
+    ap.add_argument("--decode", choices=["gpu", "cpu"], default=None,
+                    help="video decoder (default: the compute.video_decode setting, gpu)")
     args = ap.parse_args()
 
     cache = args.cache or os.path.splitext(args.video)[0] + ".clipindex.npz"
-    idx = load_or_build(args.video, cache, interval=args.interval, device=args.device)
+    idx = load_or_build(args.video, cache, interval=args.interval, device=args.device,
+                        decode=args.decode)
 
     pf = ClipEmbedder(device=args.device)
     pf.load()

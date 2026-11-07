@@ -62,6 +62,7 @@ hf_mirror.apply()
 # order below, which matters on Windows.
 from modules.system import startup_splash
 from modules.system import compute_backend
+from modules.media import video_decode
 startup_splash.stage("Loading the video engine…")
 
 import cv2
@@ -1112,6 +1113,8 @@ class VideoHighlighterGUI(QWidget):
         # probes a device, so worker processes — which inherit the environment
         # and nothing else — make the same choice the GUI shows.
         compute_backend.apply(self.config_data)
+        # And which decoder the CLIP index reads video with (compute.video_decode).
+        video_decode.apply(self.config_data)
         # The same for the trained action model a run uses (Advanced > Action
         # Recognition), so a run in this process sees the saved choice.
         try:
@@ -5103,6 +5106,8 @@ class VideoHighlighterGUI(QWidget):
             },
             "compute": {
                 "backend": self.backend_combo.currentData(),
+                # No control for this one yet: keep what the file says.
+                "video_decode": video_decode.from_config(self.config_data) or video_decode.DEFAULT,
             },
             "visualization": {
                 "draw_object_boxes": self.bbox_objects_chk.isChecked(),
