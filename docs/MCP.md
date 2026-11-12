@@ -68,6 +68,10 @@ Leave out `--scope user` to register it for the current project only. Run
 | `set_timeline_clips` | Put a list of clips on the app's edit timeline for a video, to adjust and export there |
 | `start_counter_check` | Read an on-screen counter: when each value appears, and which of a run's clips cover them (job). Pro |
 | `start_counter_guided_run` | One clip per counter value, placed where the action model scores the chosen classes highest near it (job). Pro |
+| `dataset_health` | A hand-sorted training dataset: what would skew it, and which classes need more videos |
+| `plan_reviewed_video` / `add_reviewed_video` | Add a reviewed video's crops to a dataset: thin classes only, capped, as one source video. The plan changes nothing |
+| `start_dataset_comparison` | Did the added video help on the dataset's other videos, and which part did not (job) |
+| `drop_reviewed_folders` / `undo_reviewed_video` | Take out what measured worse, or everything that video added |
 | `get_job` / `list_jobs` / `cancel_job` | Follow, list or stop jobs |
 
 Analysis and searches are jobs. A `start_*` tool returns a `job_id` at once,
@@ -79,6 +83,53 @@ kills the job's thread. A running job stops at the engine's next check.
 The first search on a video builds its frame index. That takes about as long
 as a Visual Search scan in the app, and later searches on the same video reuse
 it.
+
+## Improving a dataset
+
+Ask Claude to add a reviewed video to your dataset and keep only what helps.
+It plans the addition, adds it, measures it against the dataset's other
+videos, and takes out the parts that measured worse. The measurement decides,
+not an opinion: an addition is kept only when it did not score worse, and
+everything added is recorded in `<dataset>/.intake/`, so it can be undone.
+
+Your class names stay on this computer by default. Tool results name classes
+by code (`C01`, `C02`, ...), and `<dataset>/.intake/names/class_codes.json`
+says which is which. To send the real names, set `mcp_class_names: true` in
+`config.yaml`.
+
+## Without Claude: a model in LM Studio
+
+The same loop works with a model served on this computer, with no account and
+nothing leaving the machine. Two ways:
+
+**In the app's chat.** Connect a model from LM Studio in the chat and
+tick "Let the model use the app". Besides reading reports and re-running, it
+can then check a dataset, add a reviewed video, and train the action model:
+
+| Tool | What it does |
+|---|---|
+| `dataset_health` | What would skew the dataset, and which classes need more videos |
+| `plan_reviewed_video` | What adding a reviewed video would do; changes nothing |
+| `improve_dataset` | Adds the video, measures it, takes out the folders that measured worse, and takes out everything if it is still worse |
+| `measure_dataset` | Measures what was already added; changes nothing |
+| `undo_reviewed_video` | Takes out everything a video added |
+| `train_action_model` | Trains on the dataset and replaces the installed model only when the new one is not worse on videos it did not train on. The replaced model is kept |
+
+These are built for a small model. There is no job to follow: a tool waits
+and returns the result, and progress shows in the chat. The keep-or-take-out
+rule is inside `improve_dataset`, so the outcome is decided by the
+measurement, not by how well the model follows a plan. A measurement that is
+stopped or fails takes the addition out again. A model on this computer is
+shown your real class names; a server on another machine gets what
+`mcp_class_names` allows.
+
+Pick a model that supports tool use (LM Studio marks them), and give it a
+context of 8k tokens or more: the tool list alone is about 2k.
+
+**In LM Studio itself.** LM Studio 0.3.17 and newer is an MCP client. Add the
+server to its `mcp.json` (Program tab → Install → Edit mcp.json) with the same
+block as for Claude Desktop above. The model then gets the full tool list of
+this page, jobs included, so it needs to be a capable one.
 
 ## Seeing the result in the app
 

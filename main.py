@@ -3031,6 +3031,9 @@ class VideoHighlighterGUI(QWidget):
         llm_tab = QWidget()
         self.llm_tab_layout = QVBoxLayout()
         self.llm_chat = LLMChatWidget(parent=self)
+        # With a model from LM Studio connected, the chat may act in this
+        # window (llm/assistant_agent.py).
+        self.llm_chat.set_assistant_host(self)
         self.llm_tab_layout.addWidget(self.llm_chat)
         # Kept so the tab can reclaim the panel after the Simple view has
         # borrowed it (see set_simple_start).
@@ -5775,7 +5778,8 @@ class VideoHighlighterGUI(QWidget):
         except Exception as e:
             print(f"⚠️ preview draw error: {e}")
 
-    def run_pipeline(self, report_only: bool = False, simple: bool = False):
+    def run_pipeline(self, report_only: bool = False, simple: bool = False,
+                     overrides: dict = None, video_paths: list = None):
         from pipeline import run_highlighter
         """Start the pipeline processing (UPDATED for multi-file).
 
@@ -5786,13 +5790,17 @@ class VideoHighlighterGUI(QWidget):
 
         ``simple`` is the one-button workspace: built-in defaults for that run
         only. It does not rewrite the Detailed settings knobs.
+
+        ``overrides`` go over everything else for this run only, and
+        ``video_paths`` replaces the file list: the chat assistant re-runs one
+        video with a suggested change (llm/assistant_agent.py).
         """
         self._report_only = bool(report_only)
         self._simple_run = bool(simple)
         # What runs now is what config.yaml says from now on, so a timeline
         # opened on this result analyses on demand with the same detector.
         self.save_config()
-        video_paths = self.get_file_list()
+        video_paths = list(video_paths) if video_paths else self.get_file_list()
         
         if not video_paths:
             self.append_log("⚠️ No videos selected!")
@@ -5849,7 +5857,7 @@ class VideoHighlighterGUI(QWidget):
                        beginning_points + ending_points + object_points + action_points
                        + face_points)
         
-        if total_points == 0 and not self._simple_run:
+        if total_points == 0 and not self._simple_run and not overrides:
             self.append_log("❌ ERROR: All scoring points are set to 0!")
             self.append_log("")
             self.append_log("Please configure at least one scoring point:")
@@ -5966,6 +5974,8 @@ class VideoHighlighterGUI(QWidget):
             if page is not None:
                 length = page.length_key()
             apply_simple_run(config, length)
+        if overrides:
+            config.update(overrides)
 
         # Remove None values
         config = {k: v for k,v in config.items() if v is not None}

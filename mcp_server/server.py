@@ -15,7 +15,17 @@ Paths are local file paths. Analysis and searches run as background jobs, one
 at a time: a start_* tool returns a job_id at once; call get_job with it until
 status is done, failed or cancelled. A first search on a video builds a frame
 index and can take minutes; later searches on the same video reuse it.
-Results are paths, timestamps (seconds) and scores, never images."""
+Results are paths, timestamps (seconds) and scores, never images.
+
+It also keeps a hand-sorted training dataset healthy (folders
+<dataset>/train/<class>/*.mp4). The loop: dataset_health says what is thin;
+plan_reviewed_video then add_reviewed_video add a reviewed video's crops,
+thin classes only and capped; start_dataset_comparison measures, on the
+dataset's other videos, whether that helped and which part did not;
+drop_reviewed_folders or undo_reviewed_video take out what measured worse.
+Decide by the comparison's numbers: an addition is kept only when it did
+not measure worse. Classes are shown as codes (C01, ...) unless the user has
+turned real names on; the user has the table."""
 
 
 def build_server(jobs=None):
@@ -24,7 +34,7 @@ def build_server(jobs=None):
     from mcp.server.fastmcp import FastMCP
     from mcp.types import ToolAnnotations
 
-    from mcp_server import tools
+    from mcp_server import dataset_tools, tools
     from mcp_server.jobs import JobManager
 
     jobs = jobs if jobs is not None else JobManager()
@@ -184,6 +194,90 @@ def build_server(jobs=None):
         them, ready to adjust and export there. Use it to hand the user a
         selection, or to correct one a run made. A later run replaces them."""
         return tools.set_timeline_clips(video_path, clips, note=note)
+
+    @mcp.tool(annotations=read_only)
+    def dataset_health(dataset: str, aliases: Optional[str] = None) -> dict:
+        """Is a hand-sorted training dataset healthy? dataset is the folder
+        holding train/, val/ and test/. Reads file names only (seconds).
+        Returns findings (each with a level, what is wrong and the fix):
+        classes from fewer than 3 source videos, one video flooding a class or
+        the dataset, clips whose name gives no source video, val/ or test/
+        sharing videos with train/, the same file twice. `wanted` lists the
+        classes more videos would help most, thinnest first: what to look for
+        next. aliases: optional JSON file renaming or leaving out folders."""
+        return dataset_tools.dataset_health(dataset, aliases=aliases)
+
+    @mcp.tool(annotations=read_only)
+    def plan_reviewed_video(dataset: str, review: str, video: str,
+                            thin_under: int = 200, cap: int = 50,
+                            exclude: Optional[list[str]] = None,
+                            aliases: Optional[str] = None) -> dict:
+        """What adding a reviewed video to a dataset would do; changes nothing.
+        review is a folder with one sub-folder per class holding that video's
+        checked crops; video is the name it gets in the dataset (one source
+        video, so held-out tests keep it on one side). A folder is taken only
+        when one of its classes has fewer than thin_under clips in the dataset,
+        and at most cap crops of it, spread over the video. exclude: folders to
+        leave out. Returns per folder what was found, what would be taken and
+        why not, the share of the training clips this video would become, and
+        warnings."""
+        return dataset_tools.plan_reviewed_video(
+            dataset, review, video, thin_under=thin_under, cap=cap,
+            exclude=exclude or (), aliases=aliases)
+
+    @mcp.tool(annotations=starts)
+    def add_reviewed_video(dataset: str, review: str, video: str,
+                           thin_under: int = 200, cap: int = 50,
+                           exclude: Optional[list[str]] = None,
+                           aliases: Optional[str] = None) -> dict:
+        """Add a reviewed video's crops to the dataset's train/ folders, as
+        plan_reviewed_video described (same arguments). The crops are linked,
+        not moved, and exactly what was added is recorded in the dataset, so it
+        can be taken out again. Safe to repeat. Follow it with
+        start_dataset_comparison: adding is not known to help until measured."""
+        return dataset_tools.add_reviewed_video(
+            dataset, review, video, thin_under=thin_under, cap=cap,
+            exclude=exclude or (), aliases=aliases)
+
+    @mcp.tool(annotations=starts)
+    def start_dataset_comparison(dataset: str, added: Optional[list[str]] = None,
+                                 seeds: int = 5, parts: Optional[str] = "kinds",
+                                 aliases: Optional[str] = None) -> dict:
+        """Did the added videos make the model better on the dataset's OTHER
+        videos? Trains small heads with and without the added clips on the same
+        folds and scores both on the same held-out clips; the added videos are
+        never scored. Returns a job_id; poll get_job. Takes about 5-20 minutes.
+        added: video names (default: those add_reviewed_video recorded).
+        parts: "kinds" also scores, each on its own, the clips of classes the
+        dataset already has and the clips of classes only the added video has;
+        "folders" scores every class folder on its own (slow); null skips it.
+        The result has verdict (better, worse, no clear change), keep (false
+        when it measured worse), top-1 with and without, per-class recall
+        changes, and drop_folders: the folders that measured worse on their
+        own and should be taken out with drop_reviewed_folders. A change counts
+        only when every seed agrees and it is clear of the seeds' spread, so
+        use 5 seeds or more for a decision."""
+        return dataset_tools.start_dataset_comparison(
+            jobs, dataset, added=added, seeds=seeds, parts=parts, aliases=aliases)
+
+    removes = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                              idempotentHint=True, openWorldHint=False)
+
+    @mcp.tool(annotations=removes)
+    def drop_reviewed_folders(dataset: str, video: str, folders: list[str],
+                              aliases: Optional[str] = None) -> dict:
+        """Take out of the dataset the crops add_reviewed_video put into these
+        class folders for this video, and keep the rest. Only files that tool
+        added are removed; the review folder and the dataset's own clips are
+        never touched. Use it with a comparison's drop_folders."""
+        return dataset_tools.drop_reviewed_folders(dataset, video, folders,
+                                                   aliases=aliases)
+
+    @mcp.tool(annotations=removes)
+    def undo_reviewed_video(dataset: str, video: str) -> dict:
+        """Take out everything add_reviewed_video added for this video: those
+        files and only those. The review folder is never touched."""
+        return dataset_tools.undo_reviewed_video(dataset, video)
 
     @mcp.tool(annotations=read_only)
     def get_job(job_id: str, log_lines: int = 20) -> dict:

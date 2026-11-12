@@ -672,6 +672,9 @@ class LLMChatWidget(QWidget):
         self._analysis_data: Optional[dict] = None
         self._video_path: str = video_path
         self._chat_history: list[dict] = []
+        # The main window, when the chat may act in it (set_assistant_host).
+        self._assistant_host = None
+        self._invoker = None
         self._worker: Optional[_LLMWorker] = None
         self._worker_thread: Optional[QThread] = None
         self._search_worker: Optional[_VisualSearchWorker] = None
@@ -1070,6 +1073,18 @@ class LLMChatWidget(QWidget):
         )
         input_layout.addWidget(self.free_chat_chk)
 
+        # Shown once a window lends the chat its tools (set_assistant_host).
+        self.act_chk = QCheckBox("Let the model use the app")
+        self.act_chk.setToolTip(
+            "With a model in LM Studio connected, the assistant can read the "
+            "run's report, re-run with other settings and put clips on the edit "
+            "timeline itself. It can also check a training dataset, add a "
+            "reviewed video and keep only what measured better, and train the "
+            "action model.\nIt never sees the video: only paths, times, scores "
+            "and the report.")
+        self.act_chk.setVisible(False)
+        input_layout.addWidget(self.act_chk)
+
         root.addLayout(input_layout)
         self.setLayout(root)
 
@@ -1288,6 +1303,49 @@ class LLMChatWidget(QWidget):
             self._search_worker_thread = None
             self._search_worker = None
             return False
+
+    def set_assistant_host(self, window) -> None:
+        """Let the chat act in ``window`` (the main window): shows the "Let
+        the model use the app" option. See llm/assistant_agent.py."""
+        try:
+            from llm.assistant_agent import GuiInvoker
+        except ImportError:
+            return                                   # a build without it
+        self._assistant_host = window
+        self._invoker = GuiInvoker(self)
+        self.act_chk.setVisible(True)
+
+    def _begin_turn(self, message: str) -> None:
+        """Show the user's message and put the panel into its answering state."""
+        self._append_user(message)
+        self.input_field.clear()
+        self._chat_history.append({"role": "user", "content": message})
+        self.input_field.setEnabled(False)
+        self.send_btn.setEnabled(False)
+        self.send_btn.setText("...")
+        self.stop_btn.setEnabled(True)
+        self._append_html(
+            '<div style="color:#8BC34A;margin-top:8px;"><b>Assistant:</b></div>'
+        )
+
+    def _start_agent_turn(self, message: str, history: list) -> None:
+        from llm.assistant_agent import AgentWorker, compose_prompt, converse_for
+
+        prompt = compose_prompt(message, history, self._analysis_data,
+                                self._video_path or "")
+        self._worker_thread = QThread(self)
+        self._worker = AgentWorker(converse_for(self._llm), prompt,
+                                   self._assistant_host, self._invoker)
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.error.connect(self._worker_thread.quit)
+        self._worker_thread.finished.connect(self._worker_thread.deleteLater)
+        self._worker.token_received.connect(self._on_token)
+        self._worker.finished.connect(self._on_response_done)
+        self._worker.error.connect(self._on_response_error)
+        self._worker_thread.start()
 
     def _llm_thread_running(self) -> bool:
         """Whether the LLM chat worker thread is alive and running.
@@ -2209,7 +2267,22 @@ class LLMChatWidget(QWidget):
         if self._llm_thread_running():
             self._append_system("Still generating... please wait.")
             return
-        
+
+        # The model acting in the app (llm/assistant_agent.py). It decides what
+        # a message asks for, so the parsers below do not claim it first.
+        if (self._assistant_host is not None and self.act_chk.isChecked()
+                and not self.free_chat_chk.isChecked()):
+            from llm.assistant_agent import can_act
+            if not can_act(self._llm):
+                self._append_system("Only a model served by LM Studio can use "
+                                    "the app. Connect one, or untick "
+                                    "'Let the model use the app'.")
+                return
+            history = list(self._chat_history)
+            self._begin_turn(text)
+            self._start_agent_turn(text, history)
+            return
+
         # Special handling for reasoning questions
         if (hasattr(self, 'reasoning_engine') and self.reasoning_engine and 
             text.lower().startswith(('why ', 'how do you know', 'explain '))):

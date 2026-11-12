@@ -446,6 +446,50 @@ def cmd_import(args, root):
     return benchmark.report(data, args.dataset, args.min_train)
 
 
+def cmd_add_reviewed(args, root):
+    """A reviewed video into a hand-sorted dataset, thin classes only and
+    capped. Says what it would do; ``--apply`` does it."""
+    from modules.teach import benchmark, intake
+
+    if args.undo:
+        return intake.undo(args.dataset, args.video)
+    if args.drop:
+        return intake.drop(args.dataset, args.video, args.drop)
+    if not args.review:
+        raise ValueError("give the folder of reviewed crops (or --undo)")
+    planned = intake.plan(args.dataset, args.review, args.video,
+                          thin_under=0 if args.everything else args.thin_under,
+                          cap=0 if args.everything else args.cap,
+                          aliases=benchmark.load_aliases(args.aliases),
+                          exclude=args.exclude or ())
+    result = intake.summary(planned, paths=args.paths)
+    if args.apply:
+        result["applied"] = intake.apply(planned)
+        result["then"] = "compare-added: did it help on the dataset's other videos?"
+    else:
+        result["then"] = "nothing was changed; repeat with --apply to add these"
+    return result
+
+
+def cmd_compare_added(args, root):
+    """Did the added videos make the model better on the dataset's others?"""
+    from model_training.action_head import compare
+
+    def say(message):
+        print(message, file=sys.stderr)
+
+    return compare.compare(args.dataset, args.added or None, seeds=args.seeds,
+                           folds=args.folds, steps=args.steps, aliases=args.aliases,
+                           cache=args.cache, parts=args.parts, log=say)
+
+
+def cmd_dataset_health(args, root):
+    """Is a hand-sorted dataset healthy, and which classes need more videos?"""
+    from modules.teach import benchmark, dataset_health
+
+    return dataset_health.check(args.dataset, benchmark.load_aliases(args.aliases), args.group)
+
+
 def cmd_evaluate(args, root):
     """How the loop and a model do on a hand-sorted dataset; saved under root."""
     import time
@@ -871,6 +915,42 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--min-train", type=int, default=project_mod.MIN_TO_TRAIN,
                    dest="min_train")
 
+    s = sub.add_parser("add-reviewed", help="add a reviewed video to a hand-sorted "
+                                            "dataset: thin classes only, capped")
+    s.add_argument("dataset", help="folder holding train/, val/ and test/")
+    s.add_argument("review", nargs="?", help="folder of reviewed crops, one folder per class")
+    s.add_argument("--video", required=True, help="the name this video gets in the dataset")
+    s.add_argument("--thin-under", type=int, default=200, dest="thin_under",
+                   help="add a folder only when a class of it has fewer clips than this")
+    s.add_argument("--cap", type=int, default=50, help="most crops taken from one folder")
+    s.add_argument("--everything", action="store_true",
+                   help="no limits (measured worse; for comparing)")
+    s.add_argument("--aliases", help="JSON {name: name or \"\"} to rename or leave out")
+    s.add_argument("--apply", action="store_true", help="add them (default: only say what would be)")
+    s.add_argument("--undo", action="store_true", help="take this video's added crops out again")
+    s.add_argument("--exclude", nargs="*", help="review folders to leave out")
+    s.add_argument("--paths", action="store_true", help="list each folder's chosen crops")
+    s.add_argument("--drop", nargs="*", help="take out what was added to these class folders")
+
+    s = sub.add_parser("dataset-health", help="a hand-sorted dataset: what would skew it, "
+                                              "and which classes need more videos")
+    s.add_argument("dataset", help="folder holding train/, val/ and test/")
+    s.add_argument("--aliases", help="JSON {name: name or \"\"} to rename or leave out")
+    s.add_argument("--group", default=DEFAULT_GROUP,
+                   help="regex for the video a clip came from, in its file name")
+
+    s = sub.add_parser("compare-added", help="did the added videos help on the dataset's "
+                                             "other videos? (trains heads; minutes)")
+    s.add_argument("dataset", help="folder holding train/, val/ and test/")
+    s.add_argument("--added", nargs="*", help="video names (default: those add-reviewed recorded)")
+    s.add_argument("--seeds", type=int, default=3)
+    s.add_argument("--folds", type=int, default=5)
+    s.add_argument("--steps", type=int, default=1500)
+    s.add_argument("--aliases", help="JSON {name: name or \"\"} to rename or leave out")
+    s.add_argument("--cache", help="feature cache file (.npz)")
+    s.add_argument("--parts", choices=("kinds", "folders"),
+                   help="also score parts of the added clips on their own, to say which to drop")
+
     s = sub.add_parser("evaluate", help="measure the loop (and a model) against a "
                                         "hand-sorted dataset")
     s.add_argument("dataset", help="folder holding train/, val/ and test/")
@@ -987,6 +1067,12 @@ def run(argv=None) -> tuple:
                 result = cmd_import(args, root)
             elif args.command == "evaluate":
                 result = cmd_evaluate(args, root)
+            elif args.command == "add-reviewed":
+                result = cmd_add_reviewed(args, root)
+            elif args.command == "compare-added":
+                result = cmd_compare_added(args, root)
+            elif args.command == "dataset-health":
+                result = cmd_dataset_health(args, root)
             elif args.command == "from-dataset":
                 result = cmd_from_dataset(args, root)
             elif args.command == "quick":

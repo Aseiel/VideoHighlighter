@@ -365,6 +365,10 @@ class ListPage(QWidget):
         self.open_btn.clicked.connect(self.open_selected)
         self.folder_btn = QPushButton("Show folder")
         self.folder_btn.clicked.connect(self.show_folder)
+        self.reviewed_btn = QPushButton("Add a reviewed video…")
+        self.reviewed_btn.setToolTip("Add a video you sorted and checked to a dataset that "
+                                     "already exists as folders, and measure whether it helped")
+        self.reviewed_btn.clicked.connect(self.add_reviewed)
         self.delete_btn = QPushButton("Delete…")
         self.delete_btn.setToolTip("Move the selected dataset to the Recycle Bin (Del)")
         self.delete_btn.clicked.connect(self.delete_selected)
@@ -374,7 +378,7 @@ class ListPage(QWidget):
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh)
         buttons = QHBoxLayout()
-        for b in (self.new_btn, self.open_btn, self.folder_btn):
+        for b in (self.new_btn, self.open_btn, self.folder_btn, self.reviewed_btn):
             buttons.addWidget(b)
         buttons.addStretch(1)
         buttons.addWidget(self.delete_btn)
@@ -387,6 +391,11 @@ class ListPage(QWidget):
 
     def refresh(self):
         self.runner.run(["projects"])
+
+    def add_reviewed(self):
+        from modules.teach.reviewed_dialog import ReviewedVideoDialog
+        self.reviewed = ReviewedVideoDialog(self.window())
+        self.reviewed.show()
 
     def show_projects(self, result: dict):
         self.projects = [p for p in result.get("projects") or [] if not p.get("error")]

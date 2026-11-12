@@ -47,6 +47,16 @@ After a new video has been sorted and checked by hand
    overall held-out line. The new video is a held-out fold of its own and
    drags that average down even when nothing got worse.
 
+Two commands do this (`python -m modules.teach --project <any> …`):
+
+- `add-reviewed <dataset> <review folder> --video <name>` applies rules 1-4.
+  It only says what it would add, folder by folder, with the reason for
+  everything left out; `--apply` links the crops into `train/` and records
+  them in `<dataset>/.intake/<name>.json`; `--undo` takes exactly those out.
+- `compare-added <dataset>` applies rule 5: the same folds over the
+  dataset's other videos, heads trained with and without the added clips,
+  3 seeds, class by class. A change counts only when every seed agrees.
+
 ## Sorting new footage automatically
 
 1. **Sort only what is trusted.** A crop goes into a class folder only when
