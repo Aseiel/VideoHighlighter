@@ -737,6 +737,7 @@ class SignalRunWorker(QThread):
                 self.cancelled.emit()
                 self.finished.emit("")
             else:
+                self.done = done
                 self.finished.emit(f"{self.kind.title()}: {done}/{n} done")
         except Exception as e:
             import traceback
@@ -1181,7 +1182,12 @@ class VideoHighlighterGUI(QWidget):
 
         # File list — compact; it scrolls when there are more files. The tall
         # white box was the biggest chunk of empty space up top.
-        self.file_list = QListWidget()
+        # Takes dropped files, and says so while it is empty — an empty list
+        # was an unlabelled dark strip. The page around it takes drops too
+        # (below), because 46px is a small target to hit from Explorer.
+        from modules.ui.video_drop import VideoList, accept_video_drops
+        self.file_list = VideoList(self.add_video_paths)
+        accept_video_drops(self.full_page, self.add_video_paths)
         self.file_list.setMaximumHeight(46)
         file_layout.addWidget(self.file_list)
 
@@ -1598,8 +1604,18 @@ class VideoHighlighterGUI(QWidget):
         # runs that one signal over every video in the list and folds the result
         # into each cache — no highlights are cut. Registered here so a full
         # pipeline run (or another on-demand run) can grey them out.
-        self._analyze_buttons = {}
+        from modules.ui.scan_controls import ScanControls
+        self.scan_controls = ScanControls(
+            self, list_paths=self.get_file_list,
+            on_start=self.start_signal_run, on_stop=self.cancel_pipeline)
         self._signal_worker = None
+        # The statuses beside the buttons are about the videos in the list, so
+        # they follow it. `file_list` is built before the tabs.
+        _files_model = self.file_list.model()
+        for _sig in (_files_model.rowsInserted, _files_model.rowsRemoved,
+                     _files_model.modelReset):
+            _sig.connect(lambda *_a: self.scan_controls.refresh())
+        self.scan_controls.refresh()
 
         # ── Group 1: Scoring Points ──
         points_box = QGroupBox(i18n.t("Scoring Points"))
@@ -1741,9 +1757,7 @@ class VideoHighlighterGUI(QWidget):
         groups = (
             ("Movement && scenes", (
                 ("Scene points:", self._points_row_with_button(
-                    # "&&": on a button a single & marks a shortcut key and
-                    # drew as "Motion _scenes".
-                    self.spin_scene_points, "motion", "Motion && scenes",
+                    self.spin_scene_points, "motion", "Scan motion",
                     "Detect scene cuts and motion across every video in the list "
                     "and cache them (covers scene, motion event and motion peak "
                     "— one pass). No highlights are cut.")),
@@ -1752,7 +1766,7 @@ class VideoHighlighterGUI(QWidget):
             )),
             ("Audio", (
                 ("Audio peak points:", self._points_row_with_button(
-                    self.spin_audio_peak, "audio", "Audio",
+                    self.spin_audio_peak, "audio", "Scan audio",
                     "Detect audio peaks across every video in the list and cache "
                     "them. No highlights are cut.")),
                 ("Loudness burst points (vs local level):",
@@ -1778,12 +1792,12 @@ class VideoHighlighterGUI(QWidget):
             )),
             ("Objects && actions", (
                 ("Object points:", self._points_row_with_button(
-                    self.spin_object, "objects", "Objects",
+                    self.spin_object, "objects", "Scan objects",
                     "Detect the classes from the 'Object detection' field below, "
                     "across every video in the list, and cache them. No "
                     "highlights are cut.")),
                 ("Action points:", self._points_row_with_button(
-                    self.spin_action, "actions", "Actions",
+                    self.spin_action, "actions", "Scan actions",
                     "Detect the actions from the 'Action keywords' field below "
                     "(blank = all actions), across every video in the list, and "
                     "cache them. No highlights are cut.")),
@@ -1796,8 +1810,28 @@ class VideoHighlighterGUI(QWidget):
                 ("Outro (window, points):", outro_widget),
             )),
         )
+        # Said once, above the rows, because it is the one thing the page
+        # cannot show: the numbers and the buttons do different jobs. Points
+        # only matter on a full run; a scan button works now and cuts nothing.
+        points_hint = QLabel(
+            "Points decide what a full run cuts. A scan button runs that one "
+            "detector on the listed videos now and saves the result for the "
+            "Timeline Viewer and later runs — nothing is cut.")
+        points_hint.setWordWrap(True)
+        points_hint.setStyleSheet(
+            f"color: {_ui_theme.DARK.text_dim}; font-size: 9pt; font-weight: normal;")
+        points_layout.addWidget(points_hint)
+
+        self._points_labels = []
         for title, rows in groups:
             points_layout.addWidget(self._points_group(title, rows))
+        # One label column for all the boxes. Each box is its own form, so each
+        # sized its labels to its own longest one and the fields — and the scan
+        # buttons after them — started at a different x in every box.
+        if self._points_labels:
+            _w = max(lab.sizeHint().width() for lab in self._points_labels)
+            for lab in self._points_labels:
+                lab.setMinimumWidth(_w)
         points_layout.addStretch(1)
 
         points_box.setLayout(points_layout)
@@ -1989,8 +2023,10 @@ class VideoHighlighterGUI(QWidget):
         basic_layout.addWidget(self.auto_combine_chk, 5, 0, 1, 2)
 
         # Equal-width columns; trailing stretch row keeps groups packed at the top.
-        basic_layout.setColumnStretch(0, 1)
-        basic_layout.setColumnStretch(1, 1)
+        # Scoring gets the larger share: its rows end in a scan button and a
+        # status, and at half the width the status had room for three words.
+        basic_layout.setColumnStretch(0, 3)
+        basic_layout.setColumnStretch(1, 2)
         basic_layout.setRowStretch(6, 1)
 
         basic_tab.setLayout(basic_layout)
@@ -2390,12 +2426,12 @@ class VideoHighlighterGUI(QWidget):
         comp_save_btn.setToolTip("Save composition rules to composition_rules.yaml")
         comp_btn_row.addWidget(comp_add_btn)
         comp_btn_row.addWidget(comp_add_signal_btn)
-        comp_btn_row.addStretch()
+        comp_btn_row.addSpacing(16)
         # Run lives here, beside the editor, because this is where rules are
         # changed. Applying them is seconds against what is already cached; the
         # alternative was a full pipeline run just to see a rule edit.
         comp_btn_row.addWidget(self._make_analyze_button(
-            "composition", "Run Rules",
+            "composition", "Run rules",
             "Run the ticked rules over every video in the list.\n\n"
             "Fetches whatever they read that is missing: a rule naming an\n"
             "object class the cache does not have starts a detection pass for\n"
@@ -2404,7 +2440,7 @@ class VideoHighlighterGUI(QWidget):
             "there is reused, so a re-run after a threshold edit is seconds.\n\n"
             "Save your rules first. Unticked rules are skipped and cost\n"
             "nothing. Safe to run repeatedly: previous results for these rules\n"
-            "are replaced, not stacked."))
+            "are replaced, not stacked."), 1)
         comp_btn_row.addWidget(comp_save_btn)
         comp_outer.addLayout(comp_btn_row)
 
@@ -4693,6 +4729,15 @@ class VideoHighlighterGUI(QWidget):
         file_paths, _ = QFileDialog.getOpenFileNames(
             self, "Select Video(s)", "", "Videos (*.mp4 *.mov *.avi *.mkv)"
         )
+        self.add_video_paths(file_paths)
+
+    def add_video_paths(self, file_paths):
+        """Add videos to the list — from the file dialog or dropped on the window."""
+        if not self.file_list.isEnabled():
+            # The list is locked while a run works through it; a drop on the
+            # page would otherwise slip past the disabled list.
+            self.append_log("⚠️ Wait for the current run to finish before adding videos.")
+            return
         existing = self.get_file_list()
         for path in file_paths:
             if path not in existing:
@@ -5482,7 +5527,7 @@ class VideoHighlighterGUI(QWidget):
         counter = f"{max(0, min(current, total))}/{total}  " if total > 1 else ""
         self.batch_label.setText(f"📦 {counter}{details}")
         self.batch_label.setVisible(True)
-        QApplication.processEvents()
+        self._pump_events()
 
     def hide_batch_progress(self):
         self.batch_label.setVisible(False)
@@ -5508,7 +5553,7 @@ class VideoHighlighterGUI(QWidget):
             self.task_label.setText(f"⬇️ {task_name} - {details}")
 
         self._sync_simple_start()
-        QApplication.processEvents()
+        self._pump_events()
 
     @Slot(int, int, str, str)
     def update_process_progress(self, current: int, total: int, task_name: str, details: str = ""):
@@ -5525,7 +5570,30 @@ class VideoHighlighterGUI(QWidget):
 
         self._sync_simple_start()
         # Keep UI responsive
-        QApplication.processEvents()
+        self._pump_events()
+
+    def _pump_events(self):
+        """Let the window repaint from inside a progress handler — once.
+
+        Progress reaches these handlers as queued events. Pumping the loop from
+        inside one delivers the *next* report, whose handler pumps again, and
+        so on: each report waiting in the queue is handled one stack frame
+        deeper than the last. That is harmless while the window keeps up, and
+        unbounded when it does not — a fast pass reports hundreds of times a
+        second, and a large or heavily scaled window paints slower than that.
+        The stack then overflows below Python, so the process ends with no
+        traceback and nothing in the log.
+
+        One level is all the repaint needs. A report that arrives while this is
+        already pumping is handled by that same pump, not by a new one.
+        """
+        if getattr(self, "_pumping_events", False):
+            return
+        self._pumping_events = True
+        try:
+            QApplication.processEvents()
+        finally:
+            self._pumping_events = False
 
     def format_time(self, seconds):
         """Format seconds as MM:SS or HH:MM:SS"""
@@ -6094,16 +6162,11 @@ class VideoHighlighterGUI(QWidget):
         """A small 'run this one signal on demand' button, registered so the
         pipeline can grey it out while a full run (or another on-demand run) is
         active."""
-        btn = QPushButton(label)
-        btn.setToolTip(tooltip)
-        btn.clicked.connect(lambda _=False, k=kind: self.start_signal_run(k))
-        # A list, not one button per kind. Composition has two Run buttons — one
-        # beside the rules editor where rules are changed, one in the signals
-        # list beside every other on-demand run — and keying by kind alone let
-        # the second registration drop the first, leaving a live button during a
-        # run that is meant to disable them all.
-        self._analyze_buttons.setdefault(kind, []).append(btn)
-        return btn
+        # The button, its status and its Stop are one widget, kept in step
+        # with every other scan button by `self.scan_controls` — which holds a
+        # list per kind, because composition has two (one beside the rules
+        # editor, one in the signals list).
+        return self.scan_controls.control(kind, label, tooltip)
 
     def _points_group(self, title, rows):
         """One signal's scoring rows, in their own titled box.
@@ -6117,9 +6180,11 @@ class VideoHighlighterGUI(QWidget):
         form.setSpacing(4)
         for label, field in rows:
             tip = field.toolTip() if hasattr(field, "toolTip") else ""
-            if isinstance(label, str) and tip:
+            if isinstance(label, str):
                 lab = QLabel(label)
-                lab.setToolTip(tip)
+                if tip:
+                    lab.setToolTip(tip)
+                getattr(self, "_points_labels", []).append(lab)
                 form.addRow(lab, field)
             else:
                 form.addRow(label, field)
@@ -6158,6 +6223,8 @@ class VideoHighlighterGUI(QWidget):
         h.setSpacing(6)
         h.addWidget(self._make_analyze_button(
             "composition", "Apply rules", chr(10).join([
+                "Edit the rules in Advanced → Composition Rules.",
+                "",
                 "Run the saved composition rules over every video in the",
                 "list and cache the events.",
                 "",
@@ -6168,11 +6235,7 @@ class VideoHighlighterGUI(QWidget):
                 "",
                 "Safe to run repeatedly: previous results for these rules",
                 "are replaced, not stacked.",
-            ])))
-        note = QLabel("edit them in Advanced → Composition Rules")
-        note.setStyleSheet("color: #888; font-size: 9pt;")
-        h.addWidget(note)
-        h.addStretch(1)
+            ])), 1)
         return w
 
     def _points_row_with_button(self, spin, kind, label, tooltip):
@@ -6182,15 +6245,23 @@ class VideoHighlighterGUI(QWidget):
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(6)
+        # One width for every field that is followed by a button. Left to
+        # size themselves they differ by their ranges (0-100 vs 0-1000), and
+        # the buttons after them stepped sideways by a few pixels per row.
+        # A minimum plus a Fixed policy, not setFixedWidth: the theme's
+        # `max-width` rule replaces the maximum half of a fixed width, so the
+        # widest field (0-1000) kept its own size anyway.
+        spin.setMinimumWidth(74)
+        spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         h.addWidget(spin)
-        h.addWidget(self._make_analyze_button(kind, label, tooltip))
-        h.addStretch(1)
+        # Stretch 1: the control carries its own status, which takes the slack.
+        h.addWidget(self._make_analyze_button(kind, label, tooltip), 1)
         return w
 
     def _set_analyze_buttons_enabled(self, enabled):
-        for btn in [b for group in getattr(self, "_analyze_buttons", {}).values()
-                    for b in group]:
-            btn.setEnabled(enabled)
+        controls = getattr(self, "scan_controls", None)
+        if controls is not None:
+            controls.set_blocked(not enabled)
 
     def start_signal_run(self, kind):
         """Run one analysis signal (objects / actions / transcript / subtitles /
@@ -6221,6 +6292,11 @@ class VideoHighlighterGUI(QWidget):
             objs = [s.strip() for s in self.objects_input.text().split(",") if s.strip()]
             if not objs:
                 self.append_log("⚠️ Type at least one object class first (e.g. person, car).")
+                # Beside the button too, and put the cursor where the answer
+                # goes: the field is further down the page than the button.
+                self.scan_controls.note(
+                    "objects", "fill in “Object detection” below first")
+                self.objects_input.setFocus()
                 return
             params["objects"] = objs
         elif kind == "composition":
@@ -6238,6 +6314,8 @@ class VideoHighlighterGUI(QWidget):
             if not rules_path:
                 self.append_log("⚠️ No composition rules saved yet — add rules "
                                 "above and press Save Rules first.")
+                self.scan_controls.note(
+                    "composition", "no rules yet — add some in Advanced")
                 return
             try:
                 from video_ai_editor.composition_engine import CompositionEngine
@@ -6250,6 +6328,8 @@ class VideoHighlighterGUI(QWidget):
             if not names:
                 self.append_log("⚠️ No events defined in the rules file — add a "
                                 "rule above and press Save Rules first.")
+                self.scan_controls.note(
+                    "composition", "no rules yet — add some in Advanced")
                 return
 
             # Said up front: these two turn a seconds-long run into a long one.
@@ -6286,7 +6366,7 @@ class VideoHighlighterGUI(QWidget):
         self.download_progress_bar.setVisible(False)
         self.hide_batch_progress()
         self.task_label.setText(f"🚀 {kind.title()} (on demand)…")
-        self._set_analyze_buttons_enabled(False)
+        self.scan_controls.set_running(kind)   # its button becomes Stop
         self.run_btn.setEnabled(False)   # no full run while an on-demand run goes
         self.cancel_btn.setEnabled(True)
 
@@ -6296,15 +6376,45 @@ class VideoHighlighterGUI(QWidget):
         self._signal_worker.preview_enabled = self._preview_enabled
         self._signal_worker.log.connect(self.append_log)
         self._signal_worker.progress.connect(self.update_pipeline_progress)
+        # The same progress, beside the button that started it: the progress
+        # row is at the top of the window and the button may be scrolled away
+        # from it. A method, not a lambda: a lambda has no thread of its own,
+        # so Qt would call it on the worker's thread and it would touch widgets
+        # from there.
+        self._signal_worker.progress.connect(self._on_signal_progress)
         self._signal_worker.finished.connect(self._signal_run_finished)
         self._signal_worker.preview.connect(self.on_preview_frame)
         self._signal_worker.start()
+
+    @Slot(int, int, str, str)
+    def _on_signal_progress(self, current, total, _task, details):
+        worker = self._signal_worker
+        if worker is None:
+            return
+        # "<file>: <stage>" — with one video the name is no news, and the stage
+        # is what there is room for beside a button.
+        if len(worker.video_paths) == 1:
+            details = details.split(": ", 1)[-1]
+        self.scan_controls.set_progress(
+            worker.kind, int(100 * current / total) if total else 0, details)
 
     @Slot(str)
     def _signal_run_finished(self, summary):
         if summary:
             self.append_log(f"✅ {summary}")
-        self._set_analyze_buttons_enabled(True)
+        worker = self._signal_worker
+        kind = getattr(worker, "kind", None)
+        done = getattr(worker, "done", None)
+        total = len(getattr(worker, "video_paths", []) or [])
+        if kind and not summary:
+            stopped = worker is not None and worker.is_cancelled()
+            self.scan_controls.note(
+                kind, "stopped" if stopped else "failed — see the log below",
+                "mute" if stopped else "warn")
+        elif kind and done is not None and done < total:
+            self.scan_controls.note(
+                kind, f"{total - done} of {total} failed — see the log below")
+        self.scan_controls.set_running(None)   # back to idle; re-reads the cache
         self.run_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setText("Cancel")
