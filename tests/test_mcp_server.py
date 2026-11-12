@@ -38,6 +38,7 @@ HAS_EXAMPLE_SEARCH = tools.has_example_search()
 EXPECTED_TOOLS = {
     "get_info", "probe_video", "scan_folder", "get_config",
     "start_highlight_run", "start_visual_search", "set_timeline_clips",
+    "start_expression_scan",
     "get_job", "list_jobs", "cancel_job",
 } | ({"start_example_search"} if HAS_EXAMPLE_SEARCH else set())   | ({"start_counter_check"} if tools.has_counter_check() else set())   | ({"start_counter_guided_run"} if tools.has_counter_guided() else set())
 
@@ -300,6 +301,72 @@ def test_visual_search_ranks_frames_and_returns_numbers_only(server, jobs, video
     for m in result["matches"]:
         assert set(m) == {"timestamp", "score", "margin"}
         assert 0.0 <= m["score"] <= 1.0
+
+
+def _fake_face_scan(monkeypatch, seconds, seen=None):
+    from modules.vision import face_emotions, face_scan
+    import modules.media.video_probe as vp
+
+    monkeypatch.setattr(face_emotions.EmotionClassifier, "available",
+                        lambda self: True)
+    monkeypatch.setattr(vp, "probe_video", lambda p: {"duration": 60.0})
+
+    def scan_video(path, **kw):
+        if seen is not None:
+            seen.update(path=path, use_cache=kw.get("use_cache"))
+        return seconds
+
+    monkeypatch.setattr(face_scan, "scan_video", scan_video)
+
+
+def test_expression_scan_returns_counts_and_ranges(server, jobs, video,
+                                                   monkeypatch):
+    seconds = {
+        3: {"label": "happy", "confidence": 0.9, "faces": 1},
+        4: {"label": "happy", "confidence": 0.8, "faces": 1},
+        5: {"label": "neutral", "confidence": 0.7, "faces": 1},
+        30: {"label": "happy", "confidence": 0.6, "faces": 2},
+        40: {"label": "surprise", "confidence": 0.95, "faces": 1},
+    }
+    seen = {}
+    _fake_face_scan(monkeypatch, seconds, seen)
+
+    started = call(server, "start_expression_scan", video_path=video)
+    finish(jobs, started["job_id"])
+    snap = call(server, "get_job", job_id=started["job_id"])
+    assert snap["status"] == "done", snap.get("error")
+    result = snap["result"]
+    assert seen == {"path": video, "use_cache": True}
+    assert result["seconds_with_a_readable_face"] == 5
+    assert result["seconds_by_expression"]["happy"] == 3
+    # Neutral is counted, and left out of the ranges unless asked for.
+    assert set(result["ranges"]) == {"happy", "surprise"}
+    assert result["ranges"]["happy"] == [{"start": 2.5, "end": 5.5},
+                                         {"start": 29.5, "end": 31.5}]
+
+    # A confidence floor and a chosen label narrow the ranges, not the counts.
+    started = call(server, "start_expression_scan", video_path=video,
+                   labels=["Happy"], min_confidence=0.7, rescan=True)
+    finish(jobs, started["job_id"])
+    result = call(server, "get_job", job_id=started["job_id"])["result"]
+    assert seen["use_cache"] is False
+    assert result["ranges"] == {"happy": [{"start": 2.5, "end": 5.5}]}
+    assert result["seconds_by_expression"]["happy"] == 3
+
+
+def test_expression_scan_refuses_a_class_the_model_does_not_have(server, video):
+    with pytest.raises(ToolError, match="Unknown expression"):
+        call(server, "start_expression_scan", video_path=video, labels=["bored"])
+
+
+def test_expression_scan_fails_plainly_without_the_model(server, jobs, video,
+                                                         monkeypatch):
+    from modules.vision import face_emotions
+    monkeypatch.setattr(face_emotions.EmotionClassifier, "available",
+                        lambda self: False)
+    started = call(server, "start_expression_scan", video_path=video)
+    job = finish(jobs, started["job_id"])
+    assert job.status == "failed" and "not installed" in job.error
 
 
 @needs_example_search

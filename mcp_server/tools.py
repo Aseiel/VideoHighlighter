@@ -229,6 +229,61 @@ def start_visual_search(jobs: JobManager, video_path: str, query: str,
     return {"job_id": job.id, "status": job.status}
 
 
+def start_expression_scan(jobs: JobManager, video_path: str,
+                          labels: Optional[Sequence[str]] = None,
+                          min_confidence: float = 0.0,
+                          rescan: bool = False) -> dict:
+    """The face scan (./cache/<video>_faces.json) as time ranges per class."""
+    from modules.vision.face_emotions import EMOTION_LABELS
+
+    path = _existing_file(video_path)
+    wanted = [str(l).strip().lower() for l in (labels or ()) if str(l).strip()]
+    unknown = sorted(set(wanted) - set(EMOTION_LABELS))
+    if unknown:
+        raise ValueError(f"Unknown expression(s): {', '.join(unknown)}. "
+                         f"Known: {', '.join(EMOTION_LABELS)}")
+    min_confidence = max(0.0, min(float(min_confidence), 1.0))
+
+    def run(job: Job) -> dict:
+        from modules.media.video_probe import probe_video as _probe
+        from modules.vision import face_scan
+        from modules.vision.face_emotions import EmotionClassifier
+
+        if not EmotionClassifier().available():
+            raise RuntimeError("The expression model is not installed "
+                               "(emotions-recognition-retail-0003).")
+        seconds = face_scan.scan_video(
+            path, use_cache=not rescan, cancel_fn=job.cancel_flag.is_set,
+            progress_fn=lambda sec, total: job.set_progress(
+                int(sec), int(total), "Reading faces"),
+            log_fn=job.log)
+        job.check_cancel()
+        duration = float(dict(_probe(path)).get("duration") or 0.0) or None
+        counts = face_scan.label_counts(seconds)
+        return {
+            "video_path": path,
+            "scan_file": os.path.abspath(face_scan.cache_path_for(path)),
+            "duration": duration,
+            "seconds_with_a_readable_face": len(seconds),
+            "seconds_by_expression": counts,
+            "ranges": {
+                label: [
+                    {"start": round(start, 2), "end": round(end, 2)}
+                    for start, end in face_scan.segments_for(
+                        seconds, label, min_confidence=min_confidence,
+                        duration=duration)]
+                for label in (wanted or [l for l in EMOTION_LABELS
+                                         if l != "neutral" and counts.get(l)])
+            },
+        }
+
+    job = jobs.submit("expression_scan", {
+        "video_path": path, "labels": wanted, "min_confidence": min_confidence,
+        "rescan": bool(rescan),
+    }, run)
+    return {"job_id": job.id, "status": job.status}
+
+
 def _roi(roi: Sequence[float]) -> tuple:
     vals = tuple(float(v) for v in (roi or ()))
     if len(vals) != 4:

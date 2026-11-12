@@ -83,6 +83,26 @@ def build_server(jobs=None):
         a score in 0..1 and the margin it won by."""
         return tools.start_visual_search(jobs, video_path, query, top_k=top_k)
 
+    @mcp.tool(annotations=starts)
+    def start_expression_scan(video_path: str,
+                              labels: Optional[list[str]] = None,
+                              min_confidence: float = 0.0,
+                              rescan: bool = False) -> dict:
+        """Where faces in a video show an expression: neutral, happy, sad,
+        surprise or anger, read on the clearest face once a second. Returns a
+        job_id; poll get_job. The first scan of a video takes minutes; it is
+        saved and later calls return at once (rescan=true to redo it). The
+        result has how many seconds each expression accounts for and, per
+        expression, the time ranges (s) it holds. labels: which expressions to
+        list ranges for (default: all found except neutral). min_confidence
+        (0..1) drops weak readings. A second with no readable face is absent,
+        not neutral; profile and covered faces read poorly. The app's timeline
+        viewer shows the same scan as its EXPRESSIONS row. Pass ranges to
+        set_timeline_clips to put them on the edit timeline."""
+        return tools.start_expression_scan(
+            jobs, video_path, labels=labels, min_confidence=min_confidence,
+            rescan=rescan)
+
     def start_example_search(video_path: str, roi: list[float], name: str,
                              example_timestamps: Optional[list[float]] = None,
                              interval: float = 1.5,

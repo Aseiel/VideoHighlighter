@@ -135,6 +135,15 @@ class SignalTimelineScene(QGraphicsScene):
         self.visual_merge_gap = 2.0  # seconds — merge frame hits within this gap
         self._extract_visual_findings()  # populate from cache_data
 
+        # ── Expressions — the face scan's per-second reading, one row per
+        #    built-in class. It lives in its own file beside the cache
+        #    (`<video>_faces.json`), not in cache_data, so it is read here and
+        #    kept apart: reload_cache_data must not drop it.
+        self.expressions: dict = {}
+        self.expression_merge_gap = 2.0  # seconds — one sample a second, so
+        #                                  a single unread frame is not a cut
+        self._load_expressions()
+
         # Define logical groups (order matters). Events lead, because that is
         # where they are drawn — directly beneath the waveform, see
         # build_timeline. A panel that lists rows in a different order than the
@@ -146,6 +155,7 @@ class SignalTimelineScene(QGraphicsScene):
             ('actions', [f"Action: {a}" for a in self.action_types]),
             ('objects', [f"Object: {o}" for o in self.object_classes]),
             ('visual_search', [f"Search: {q}" for q in self.visual_queries]),
+            ('expressions', ['Expressions']),
             ('scenes', ['Scenes']),
             ('motion', ['Motion Events', 'Motion Peaks']),
             ('audio', ['Audio Peaks']),
@@ -192,6 +202,17 @@ class SignalTimelineScene(QGraphicsScene):
             'audio_peaks': QColor(150, 100, 255),
             'highlights': QColor(50, 200, 50),
             'visual_search': QColor(255, 100, 255),
+        }
+        # Fixed per class rather than hashed: there are five, they never
+        # change, and a colour that means the same thing in every video is
+        # readable without the label. Neutral is grey on purpose — it is most
+        # of any scan and the least worth looking at.
+        self.expression_colors = {
+            'neutral': QColor(130, 130, 140),
+            'happy': QColor(255, 205, 70),
+            'sad': QColor(90, 150, 255),
+            'surprise': QColor(255, 130, 220),
+            'anger': QColor(255, 90, 70),
         }
         
         # Create color palettes
@@ -662,6 +683,7 @@ class SignalTimelineScene(QGraphicsScene):
             'highlights': self._nav_timestamps_highlights,
             'transcript': self._nav_timestamps_transcript,
             'visual_search': self._nav_timestamps_visual_search,
+            'expressions': lambda: self.expressions,
             # NOT _nav_timestamps_events: that honours visible_events, so hiding
             # every event would make the layer report "no detections", get
             # switched off automatically, and be labelled as having no data. This
@@ -1004,7 +1026,11 @@ class SignalTimelineScene(QGraphicsScene):
         # Layer 3.5: Visual Search Findings (LLM scans / Visual Search panel)
         if self.visible_layers.get('visual_search', True) and self.visual_findings:
             current_y = self.draw_visual_findings_layer(current_y)
-        
+
+        # Layer 3.7: Expressions (the face scan, one row per class)
+        if self.visible_layers.get('expressions', True) and self.expressions:
+            current_y = self.draw_expressions_layer(current_y)
+
         # Layer 4: Scenes
         if self.visible_layers.get('scenes', True):
             current_y = self.draw_scenes_layer(current_y)
@@ -2642,6 +2668,90 @@ class SignalTimelineScene(QGraphicsScene):
                 self.bars.append(bar)
 
             current_y += query_height
+
+        return y_pos + self.layer_height + self.layer_spacing
+
+    # ─────────────────────────────────────────────────────────────────
+    # Expressions (face scan) rows
+    # ─────────────────────────────────────────────────────────────────
+    def _load_expressions(self):
+        """Read this video's face scan, if one has been run."""
+        if not self.video_path:
+            return
+        try:
+            from modules.vision.face_scan import cache_path_for, load
+            self.expressions = load(cache_path_for(self.video_path)) or {}
+        except Exception as e:
+            print(f"⚠️ expressions layer: face scan not loaded: {e}")
+            self.expressions = {}
+
+    def set_expressions(self, seconds, rebuild=True):
+        """Replace the scan (after an on-demand run) and redraw."""
+        self.expressions = {int(k): v for k, v in (seconds or {}).items()}
+        if rebuild:
+            self.build_timeline()
+
+    def _expression_runs(self):
+        """``{label: [(start, end, meta)]}`` in the classifier's own order.
+
+        One sample is one second, so a hit is drawn a second wide and hits
+        closer than the merge gap become one bar: an expression that holds for
+        ten seconds is one thing to look at, not ten.
+        """
+        from modules.vision.face_emotions import EMOTION_LABELS
+
+        by_label = defaultdict(list)
+        for sec, value in self.expressions.items():
+            label = str((value or {}).get('label') or '')
+            if not label:
+                continue
+            start = float(sec)
+            by_label[label].append((
+                start, min(float(self.video_duration), start + 1.0),
+                {'label': label,
+                 'confidence': float((value or {}).get('confidence') or 0.0)}))
+        order = [l for l in EMOTION_LABELS if l in by_label]
+        order += sorted(l for l in by_label if l not in EMOTION_LABELS)
+        return {label: self._merge_intervals(by_label[label],
+                                             threshold=self.expression_merge_gap)
+                for label in order}
+
+    def _nav_timestamps_expressions(self):
+        """Bar starts, neutral left out: ◀ ▶ step through the moments a face
+        shows something, and neutral is most of any scan."""
+        runs = self._expression_runs()
+        named = [label for label in runs if label != 'neutral'] or list(runs)
+        return sorted(start for label in named for start, _e, _m in runs[label])
+
+    def draw_expressions_layer(self, y_pos):
+        """One row per expression class the scan found."""
+        self.row_labels.append(("EXPRESSIONS", y_pos))
+        runs = self._expression_runs()
+        if not runs:
+            return y_pos + self.layer_height + self.layer_spacing
+
+        row_height = self.layer_height // max(1, len(runs))
+        current_y = y_pos
+        for label, merged in runs.items():
+            color = self.expression_colors.get(label) or self._query_color(label)
+            for start, end, meta in merged:
+                count = meta.get('merged_count', 1)
+                max_conf = meta.get('max_confidence', meta.get('confidence', 0))
+                bar_label = (f"{label} ×{count} ({max_conf:.0%})" if count > 1
+                             else f"{label} ({max_conf:.0%})")
+                bar = TimelineBar(
+                    start, end,
+                    current_y, row_height,
+                    color, bar_label,
+                    confidence=max_conf,
+                    # query=label so the generic row menu reads "Add all “<label>”"
+                    metadata={'type': 'expression', 'query': label,
+                              'merged_count': count,
+                              'avg_confidence': meta.get('avg_confidence', max_conf),
+                              'max_confidence': max_conf},
+                )
+                self.draw_bar(bar)   # also records it in self.bars
+            current_y += row_height
 
         return y_pos + self.layer_height + self.layer_spacing
 

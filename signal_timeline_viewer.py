@@ -101,7 +101,8 @@ class SignalLabelPanel(QWidget):
         "HIGHLIGHTS":     lambda scene: scene._nav_timestamps_highlights(),
         "TRANSCRIPT":     lambda scene: scene._nav_timestamps_transcript(),
         "VISUAL SEARCH":  lambda scene: scene._nav_timestamps_visual_search(),
-        "EVENTS":         lambda scene: scene._nav_timestamps_events(),
+        "EXPRESSIONS":    lambda scene: scene._nav_timestamps_expressions(),
+        "EVENTS":        lambda scene: scene._nav_timestamps_events(),
     }
 
     _ARROW_W = 14   # px reserved for each arrow
@@ -3033,6 +3034,11 @@ class SignalTimelineWindow(QMainWindow):
         lay.addLayout(self._make_analyze_row(
             "audio", "Audio",
             "Detect audio peaks (and the waveform) over the whole video."))
+        lay.addLayout(self._make_analyze_row(
+            "expressions", "Expressions",
+            "Read the expression on the clearest face, once a second, over the "
+            "whole video. Saved beside the cache and reused by rules and the "
+            "report."))
 
         # Actions: optional keep-list (blank = all actions).
         self.analyze_actions_field = QLineEdit(act_default)
@@ -3181,6 +3187,19 @@ class SignalTimelineWindow(QMainWindow):
                     result = run_motion(self.video_path, progress=progress, cancel=cancel)
                 elif kind == "audio":
                     result = run_audio(self.video_path, progress=progress, cancel=cancel)
+                elif kind == "expressions":
+                    from modules.report.analysis_ondemand import _Cancelled
+                    from modules.vision.face_scan import scan_video
+                    # A press of the button means "scan", so the cached file is
+                    # replaced rather than handed back unchanged.
+                    result = scan_video(
+                        self.video_path, use_cache=False,
+                        cancel_fn=cancel.is_set,
+                        progress_fn=lambda sec, total: progress(
+                            sec, total, "Expressions",
+                            f"{int(sec) // 60}:{int(sec) % 60:02d}"))
+                    if cancel.is_set():
+                        raise _Cancelled()
                 elif kind == "actions":
                     acts = [s.strip() for s in self.analyze_actions_field.text().split(",") if s.strip()]
                     result = run_actions(self.video_path, interesting_actions=acts,
@@ -3263,6 +3282,24 @@ class SignalTimelineWindow(QMainWindow):
             self._enable_layer_and_reload("audio_peaks")
             if row:
                 row["status"].setText(f"✓ {len(result.get('audio_peaks', []))} peaks")
+        elif kind == "expressions":
+            # Not folded into the cache file: the scan keeps its own, which the
+            # pipeline, the rules and the report already read.
+            if not result:
+                if row:
+                    row["status"].setText("no readable faces — or the "
+                                          "expression model is not installed")
+                return
+            self.signal_scene.set_expressions(result, rebuild=False)
+            self._enable_layer_and_reload("expressions")
+            if row:
+                from modules.vision.face_scan import label_counts
+                counts = {k: v for k, v in label_counts(result).items()
+                          if v and k != "neutral"}
+                top = ", ".join(f"{k} {v}s" for k, v in
+                                sorted(counts.items(), key=lambda kv: -kv[1])[:3])
+                row["status"].setText(f"✓ {len(result)}s read" +
+                                      (f" · {top}" if top else ""))
         elif kind == "actions":
             self.cache_data["actions"] = result
             self.cache_data["actions_all"] = result

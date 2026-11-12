@@ -283,6 +283,11 @@ def scan_video(video_path: str,
                                progress_fn=progress_fn)
     seconds = scan(frames, detect_fn=detector.detect_faces,
                    classify_fn=classifier.classify)
+    if cancel_fn is not None and cancel_fn():
+        # A stopped sweep covers the start of the video only. Saved, it would be
+        # handed back as the whole answer by every later call that finds it.
+        log_fn("ℹ Face scan stopped before the end; nothing saved")
+        return seconds
     log_fn(f"✅ Face scan: {len(seconds)} second(s) with a readable expression "
            f"in {time.time() - started:.1f}s")
     save(seconds, path, video_path=video_path, interval=interval)
