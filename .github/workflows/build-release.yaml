@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       web_ui:
-        description: 'Also build the web UI (Tauri + sidecar). It bundles its own CUDA PyTorch, about 40 more Windows minutes; untick for a quick run'
+        description: 'Also build the web UI (Tauri + sidecar), about 25 more Windows minutes; untick for a quick run'
         type: boolean
         default: true
       update_min_version:
@@ -482,9 +482,13 @@ jobs:
   # The web UI: a Tauri shell around the React frontend, with the Python engine
   # bundled as a PyInstaller sidecar. Independent of the Qt build above — both
   # ship from the same engine source.
+  #
+  # Built like the desktop core: the sidecar carries no PyTorch, the archive
+  # carries the CPU pack beside it, and the sidecar fetches the NVIDIA pack
+  # (where nvidia-smi finds a card) and CLIP itself on first start
+  # (sidecar/packs_fetch.py). It used to bundle CUDA PyTorch and a converted
+  # CLIP: ~1.7 GB of sidecar that every release rebuilt and recompressed.
   build-web-windows:
-    # Opt-in: the sidecar still bundles CUDA PyTorch itself, which is the
-    # expensive part this workflow no longer does for the desktop app.
     if: ${{ inputs.web_ui && !inputs.mac_only }}
     needs: version
     runs-on: windows-latest
@@ -506,9 +510,11 @@ jobs:
         with:
           workspaces: frontend/src-tauri
       - name: Install Python dependencies
+        # The CPU torch wheel only so PyInstaller can analyse the modules that
+        # import it; it is excluded from the bundle, as in the Qt build.
         run: |
           pip install numpy==2.2.6 mkl mkl-include
-          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+          pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
           pip install openvino==2026.4.0
           pip install -r requirements.txt
           pip install -r sidecar/requirements.txt
@@ -516,10 +522,22 @@ jobs:
           # its declared requirements would let pip replace the torch above.
           pip install yolox==0.3.0 --no-deps
           pip install pyinstaller
-      - name: Check the CUDA build covers every supported GPU generation
-        # Same guard as the Qt build: the sidecar bundles the same CUDA torch.
+      - name: Fetch the published packs
+        # The same packs, checked the same way, as the Qt build: the archive
+        # carries the CPU one; the NVIDIA one is only for the check below.
+        shell: pwsh
         run: |
-          python -c "import torch; flags = torch._C._cuda_getArchFlags().split(); print('CUDA archs:', ' '.join(flags)); missing = [a for a in ('sm_61', 'sm_75', 'sm_86', 'sm_120') if a not in flags]; assert not missing, 'torch build lacks ' + ', '.join(missing)"
+          New-Item -ItemType Directory -Force out, build-packs, packs-dl | Out-Null
+          Invoke-WebRequest "$env:PACKS_BASE/packs.json" -OutFile out/packs.json -UseBasicParsing
+          $packs = (Get-Content out/packs.json -Raw | ConvertFrom-Json).packs
+          foreach ($p in $packs | Where-Object { $_.name -in @("torch-cpu", "torch-cu128") }) {
+            $file = "packs-dl/$($p.asset)"
+            Invoke-WebRequest "$env:PACKS_BASE/$($p.asset)" -OutFile $file -UseBasicParsing
+            $sha = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            if ($sha -ne $p.sha256) { throw "$($p.asset): sha256 $sha, packs.json says $($p.sha256)" }
+            7z x -y $file "-obuild-packs/$($p.name)" | Out-Null
+            Remove-Item $file
+          }
       - name: Fetch YOLOX detector models (Apache-2.0)
         # models/yolox/ is gitignored (downloaded, not committed). Without this
         # the packaged app has no object detector, and a frozen build never
@@ -531,21 +549,59 @@ jobs:
         # to import. ~20 MB, bundled with models/ like YOLOX. Pinned revision;
         # the export checks itself on this runner (CPU) and again at load.
         run: python -m tools.export_sam
-      - name: Pre-convert CLIP to OpenVINO IR
-        run: python -m tools.export_clip_ov
       - name: Build the sidecar
         run: >
           pyinstaller packaging/vh-sidecar.spec --noconfirm
           --distpath dist-sidecar --workpath build-sidecar
+      - name: Add the packs the sidecar loads and fetches
+        # rthook_packs looks beside vh-sidecar.exe; pack_manager reads the lock
+        # and unpacks with 7zr from there too. CLIP is no longer converted
+        # and bundled here: it is the models-clip pack, fetched on first start.
+        shell: pwsh
+        env:
+          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
+        run: |
+          $side = "dist-sidecar/vh-sidecar"
+          if (Test-Path "$side/_internal/torch") {
+            throw "torch was bundled into the sidecar; it must only arrive as a pack"
+          }
+          Invoke-WebRequest -Uri https://www.7-zip.org/a/7zr.exe -OutFile "$side/7zr.exe" -UseBasicParsing
+          python tools/write_packs_lock.py --base "$env:PACKS_BASE" --packs-json out/packs.json `
+            --mirror-host "$env:UPDATE_BASE_URL" --out "$side/packs.lock.json"
+          New-Item -ItemType Directory -Force "$side/packs" | Out-Null
+          Copy-Item -Recurse build-packs/torch-cpu "$side/packs/torch-cpu"
+      - name: Check the sidecar imports the engine with each pack
+        # On a copy, with the CPU pack and then the NVIDIA one in its place
+        # (the runner has no GPU: this proves the CUDA DLLs load frozen).
+        shell: pwsh
+        env:
+          VH_NO_PACK_FETCH: '1'
+        run: |
+          $copy = "$env:RUNNER_TEMP\sidecar-check"
+          Copy-Item -Recurse dist-sidecar/vh-sidecar $copy
+          $status = 0
+          foreach ($pack in @("torch-cpu", "torch-cu128")) {
+            Remove-Item -Recurse -Force "$copy\packs" -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force "$copy\packs" | Out-Null
+            Copy-Item -Recurse "build-packs/$pack" "$copy\packs\$pack"
+            Write-Host "::group::$pack"
+            & "$copy\vh-sidecar.exe" --check-imports
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            Write-Host "$pack exit code: $code"
+            if ($code -ne 0) { $status = 1 }
+          }
+          Remove-Item -Recurse -Force $copy
+          exit $status
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
         working-directory: frontend
       - name: Build the app
         # Compiles the exe only — bundle.active is false in tauri.conf.json.
         #
-        # Neither Windows installer format can package this app: the sidecar
-        # resource is ~1.7 GB (CUDA torch + OpenVINO + the pre-converted CLIP
-        # IR), and both installer compilers are 32-bit processes that run out of
+        # Neither Windows installer format could package this app when the
+        # sidecar was ~1.7 GB (CUDA torch + OpenVINO + the pre-converted CLIP
+        # IR): both installer compilers are 32-bit processes that run out of
         # address space on it. WiX's light.exe ground for 16 minutes and died
         # with no error code; makensis failed with "error mmapping file
         # (1994782295, 33554432) is out of range" — that number is ~1.86 GB.
@@ -1038,8 +1094,9 @@ jobs:
             if [ "$WEB" = "true" ]; then
               echo ""
               echo "The web UI is the Tauri shell around the React frontend with the"
-              echo "Python engine bundled; it has no installer because no installer can"
-              echo "hold a 1.7 GB sidecar."
+              echo "Python engine bundled. It runs on the processor out of the box and"
+              echo "downloads NVIDIA acceleration (where it finds a card) and visual"
+              echo "search the first time it starts."
             fi
             echo ""
             echo "\`00-VideoHighlighter-Windows-Setup.zip\` is the older script-based"

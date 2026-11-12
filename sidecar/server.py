@@ -59,6 +59,10 @@ async def lifespan(_app: "FastAPI"):
     # Jobs run ffmpeg by name; the one pip installed has to answer to it.
     from modules.media.ffmpeg_tools import ensure_ffmpeg_on_path
     ensure_ffmpeg_on_path()
+    # The web build ships PyTorch for the processor only; NVIDIA PyTorch and
+    # CLIP come down here, in the background (sidecar/packs_fetch.py).
+    from sidecar import packs_fetch
+    packs_fetch.start_in_background()
     yield
 
 
@@ -1856,6 +1860,24 @@ async def ws_events(ws: WebSocket) -> None:
         manager.unsubscribe(q)
 
 
+def check_imports() -> int:
+    """What a run imports first: the engine, and torch from its pack.
+
+    The web build's sidecar has no torch of its own, so a frozen bundle that
+    lacks something torch reaches only shows up here, not at /health.
+    """
+    try:
+        import pipeline  # noqa: F401
+        import torch
+        print(f"[check] torch {torch.__version__} from {os.path.dirname(torch.__file__)}")
+        print(f"[check] cuda available: {torch.cuda.is_available()}")
+        print("[check] ok")
+        return 0
+    except Exception:
+        traceback.print_exc()
+        return 1
+
+
 def main() -> None:
     # The engine prints emoji; a Windows console defaults to cp1252 and the
     # first such print would raise UnicodeEncodeError. Same reason worker.py
@@ -1869,7 +1891,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="VideoHighlighter FastAPI sidecar")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8756)
+    parser.add_argument("--check-imports", action="store_true",
+                        help="import the engine and PyTorch, print where torch "
+                             "came from, and exit (a build check)")
     args = parser.parse_args()
+
+    if args.check_imports:
+        sys.exit(check_imports())
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

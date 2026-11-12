@@ -6,8 +6,13 @@
 #   * console app, not --windowed: it's a child process, never user-facing, and
 #     its stdout is piped to the Tauri log.
 #   * no PySide6/Qt: the sidecar never draws anything.
-#   * onedir, not onefile: a onefile build unpacks ~2GB of torch/openvino to a
-#     temp dir on every launch, which would add many seconds to app startup.
+#   * onedir, not onefile: a onefile build unpacks ~1GB of openvino and the
+#     rest to a temp dir on every launch, which would add seconds to startup.
+#   * PyTorch is not bundled. As in the desktop core, it is a pack
+#     (packaging/packs/rthook_packs.py) found in vh-sidecar/packs/ or the
+#     per-user folder; the web archive carries the CPU pack, and the sidecar
+#     fetches the NVIDIA one itself where it helps (sidecar/packs_fetch.py).
+#     The rules for a core without torch are tools/pack_core_args.py's.
 #
 # Build:  pyinstaller packaging/vh-sidecar.spec --noconfirm
 # Output: dist/vh-sidecar/vh-sidecar.exe
@@ -28,6 +33,12 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(SPEC)), ".."
 
 def _p(*parts):
     return os.path.join(ROOT, *parts)
+
+
+import sys
+
+sys.path.insert(0, _p("tools"))
+import pack_core_args  # noqa: E402  (the desktop core's rules, one source)
 
 
 datas = [
@@ -60,6 +71,18 @@ hiddenimports = [
     "uvicorn.protocols.websockets.auto",
     "uvicorn.lifespan.on",
 ]
+
+# A core without torch: the whole standard library (torch's import reaches
+# modules nothing else here does), and the packages torch shares with the
+# engine collected whole, so a half-bundled copy never shadows the pack's needs.
+_flags = pack_core_args._stdlib()
+for _flag, _name in zip(_flags[::2], _flags[1::2]):
+    if _flag == "--collect-submodules":
+        hiddenimports += collect_submodules(_name)
+    else:
+        hiddenimports.append(_name)
+for _name in pack_core_args.SHARED:
+    hiddenimports += collect_submodules(_name)
 
 hiddenimports += collect_submodules("whisper")
 hiddenimports += collect_submodules("yolox")
@@ -123,10 +146,10 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[_p("packaging", "pyinstaller-hooks")],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[_p("packaging", "packs", "rthook_packs.py")],
     # nncf is an optional openvino extra that drags in a lot and isn't used.
     excludes=["nncf", "PySide6", "PyQt5", "matplotlib.backends._backend_tk",
-              "tkinter"],
+              "tkinter", *pack_core_args.PACK_ONLY],
     noarchive=False,
 )
 
