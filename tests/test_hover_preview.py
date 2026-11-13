@@ -106,7 +106,7 @@ class TestDeliveryFromTheCache:
             self._ready = {int(t * 10) for t in ready}
             self.asked = []
 
-        def request(self, t, height, priority=0):
+        def request(self, t, height, priority=0, tolerance=0.0):
             self.asked.append((t, height))
             return _frame() if int(t * 10) in self._ready else None
 

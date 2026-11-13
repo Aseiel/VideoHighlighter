@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import itertools
+import re
 import os
 import subprocess
 import sys
@@ -78,6 +79,19 @@ _extraction_slots = threading.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 PREFER_SOFTWARE_DECODE = True
 
 
+# A filmstrip slot stands for a stretch of video, so any frame inside the
+# stretch pictures it. The nearest keyframe costs a seek and one decode; the
+# exact frame costs every frame from that keyframe on. Measured on a 1080p
+# film with a keyframe every 8 s: 130-145 ms a thumbnail exact, 16-17 ms from
+# the keyframe. So a request may carry a tolerance, and one that does is
+# answered from the keyframe when the keyframe is that close.
+#
+# Not worth asking when the tolerance is a small share of the distance between
+# keyframes: the answer is nearly always "too far", and asking costs a decode.
+NEAR_MIN_SHARE_OF_GAP = 0.15
+_NEAR_FILE = re.compile(r"^(\d+)_(\d+)(_[a-z_]+?)?_k(\d+)\.jpg$")
+
+
 def _memory_mb() -> float:
     """Resident size of this process, or 0.0 when it cannot be read.
 
@@ -106,6 +120,8 @@ class ThumbnailCache(QObject):
     # because the flag can be toggled while an extraction is in flight and the
     # frame belongs to the mode it was decoded for.
     _image_ready = Signal(int, int, bool, QImage)  # time_ms, height_px, vr, image
+    # The same, for a frame taken from the nearest keyframe (see request).
+    _near_ready = Signal(int, int, bool, QImage)
     # Public: main thread, carries the final QPixmap
     thumbnail_ready = Signal(float, int, QPixmap)
 
@@ -142,8 +158,19 @@ class ThumbnailCache(QObject):
         #               already queued at prefetch priority.
         #   _active   : keys a worker is extracting right now, so a repeat
         #               request doesn't queue duplicate work mid-flight.
+        #   _within   : key → how far off (s) the frame may be, for a key in
+        #               the queue; the strictest of the requests that asked.
         self._queue: "PriorityQueue[tuple]" = PriorityQueue()
         self._pending: dict = {}
+        self._within: dict = {}
+        # Thumbnails taken from the nearest keyframe rather than the exact
+        # frame: key → how far (s) that keyframe is from the key's moment. On
+        # disk they carry the distance in their name, so a later, stricter
+        # request can tell whether one will do. _mem_near marks which keys in
+        # memory currently hold such a frame.
+        self._near: dict = self._read_near_from_disk()
+        self._mem_near: set = set()
+        self._keyframe_gap = 0.0     # the longest distance to a keyframe seen
         self._active: set = set()
         self._seq = itertools.count()
         self._lock = threading.Lock()
@@ -155,6 +182,7 @@ class ThumbnailCache(QObject):
         # Worker → main thread marshaling. QueuedConnection is implicit
         # for cross-thread signal emissions, so the slot runs on the main thread.
         self._image_ready.connect(self._on_image_ready, Qt.QueuedConnection)
+        self._near_ready.connect(self._on_near_ready, Qt.QueuedConnection)
 
         self._ffmpeg = ffmpeg_exe() if ffmpeg_exe is not None else None
         # Ordered hardware-decode candidates for the ffmpeg (VR/high-res) path.
@@ -194,7 +222,8 @@ class ThumbnailCache(QObject):
     # ── Public API ────────────────────────────────────────────────────────
 
     def request(self, time_seconds: float, height_px: int,
-                priority: int = PRIORITY_VISIBLE) -> QPixmap | None:
+                priority: int = PRIORITY_VISIBLE,
+                tolerance: float = 0.0) -> QPixmap | None:
         """
         Return a cached pixmap or None.
 
@@ -205,11 +234,18 @@ class ThumbnailCache(QObject):
         mouse) beats PRIORITY_VISIBLE (the default, on-screen filmstrip), which
         beats PRIORITY_PREFETCH (bulk look-ahead). A higher-priority request for
         a key already sitting in the queue promotes it to the front.
+
+        `tolerance` is how many seconds off the frame may be. Zero (the
+        default) is the exact frame. A filmstrip passes half its slot's
+        duration, which lets the slot be answered from a keyframe inside it -
+        about eight times cheaper than the exact frame on ordinary footage.
         """
         key = self._make_key(time_seconds, height_px)
+        near = self._near.get(key)
+        near_will_do = near is not None and near <= tolerance
 
         # 1. Memory hit
-        if key in self._mem:
+        if key in self._mem and (key not in self._mem_near or near_will_do):
             self._mem.move_to_end(key)
             return self._mem[key]
 
@@ -218,18 +254,29 @@ class ThumbnailCache(QObject):
         if disk_path.exists():
             pix = QPixmap(str(disk_path))
             if not pix.isNull():
+                self._mem_near.discard(key)
                 self._add_to_mem(key, pix)
+                return pix
+        if near_will_do:
+            pix = QPixmap(str(self._near_path(key, near)))
+            if not pix.isNull():
+                self._add_to_mem(key, pix)
+                self._mem_near.add(key)
                 return pix
 
         # 3. Miss → queue extraction (or promote an already-queued one)
         with self._lock:
             if key in self._active:
-                return None  # a worker is already extracting this exact frame
+                return self._mem.get(key)  # a worker is already extracting it
             existing = self._pending.get(key)
+            self._within[key] = (tolerance if existing is None
+                                 else min(self._within.get(key, tolerance), tolerance))
             if existing is None or priority < existing:
                 self._pending[key] = priority
                 self._queue.put((priority, next(self._seq), key))
-        return None
+        # A keyframe frame that is not close enough for this request still
+        # beats an empty slot while the exact one decodes.
+        return self._mem.get(key)
 
     def frame_aspect(self) -> float | None:
         """Aspect ratio of the pixmaps this cache hands out, or None if unknown.
@@ -267,6 +314,12 @@ class ThumbnailCache(QObject):
     def stop(self):
         """Stop the worker threads. Call on app shutdown."""
         self._stopped = True
+        reader, self._reader = getattr(self, "_reader", None), None
+        if reader is not None:
+            # On its own thread: closing waits for a frame in flight, and
+            # shutdown should not.
+            threading.Thread(target=reader.close, daemon=True,
+                             name="FrameReaderClose").start()
         if self._decoder is not None:
             self._decoder = None
             try:
@@ -330,7 +383,8 @@ class ThumbnailCache(QObject):
         self._mem[key] = pixmap
         self._mem.move_to_end(key)
         while len(self._mem) > self.mem_limit:
-            self._mem.popitem(last=False)
+            gone, _ = self._mem.popitem(last=False)
+            self._mem_near.discard(gone)
 
     def _compute_video_hash(self) -> str:
         try:
@@ -422,10 +476,11 @@ class ThumbnailCache(QObject):
                     if cur is None or cur < priority:
                         continue
                     del self._pending[key]
+                    within = self._within.pop(key, 0.0)
                     self._active.add(key)
 
                 try:
-                    cap = self._extract_one(key, cap, priority)
+                    cap = self._extract_one(key, cap, priority, within)
                 except Exception as e:
                     print(f"⚠️ ThumbnailCache extract failed: {e}")
                 finally:
@@ -435,7 +490,8 @@ class ThumbnailCache(QObject):
             if cap is not None:
                 cap.release()
 
-    def _extract_one(self, key, cap=None, priority: int = PRIORITY_VISIBLE):
+    def _extract_one(self, key, cap=None, priority: int = PRIORITY_VISIBLE,
+                     within: float = 0.0):
         """Extract, persist, and emit a single thumbnail.
 
         Strategy is chosen by source resolution (see _compute_prefer_ffmpeg):
@@ -470,7 +526,7 @@ class ThumbnailCache(QObject):
         # waiting for a slot is not holding one.
         with _extraction_slots:
             try:
-                cap = self._extract_one_frame(key, out_path, cap, priority)
+                cap = self._extract_one_frame(key, out_path, cap, priority, within)
             finally:
                 if traced:
                     repaint_trace.note(
@@ -479,7 +535,7 @@ class ThumbnailCache(QObject):
         return cap
 
     def _extract_one_frame(self, key, out_path: Path, cap=None,
-                           priority: int = PRIORITY_VISIBLE):
+                           priority: int = PRIORITY_VISIBLE, within: float = 0.0):
         """The decode itself; see _extract_one for the strategy it implements."""
         time_ms, height, vr = key
 
@@ -503,7 +559,15 @@ class ThumbnailCache(QObject):
                 # this costs them the strip, and possibly the process.
                 self._report_extraction_gap(time_ms, height)
         else:
-            frame, cap = self._extract_via_opencv(time_ms, height, cap, vr)
+            near = self._extract_near_keyframe(key, within, priority)
+            if near is not None:
+                h, w = near.shape[:2]
+                rgb = cv2.cvtColor(near, cv2.COLOR_BGR2RGB)
+                qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+                self._near_ready.emit(time_ms, height, vr, qimg)
+                return cap
+            frame, cap = self._extract_via_opencv(time_ms, height, cap, vr,
+                                                  priority=priority)
             if frame is not None:
                 self._write_disk(out_path, frame)
             elif self._extract_via_ffmpeg(time_ms, height, out_path, vr):
@@ -526,9 +590,77 @@ class ThumbnailCache(QObject):
         except Exception as e:
             print(f"⚠️ ThumbnailCache disk write failed: {e}")
 
-    def _ensure_decoder(self):
+    def _frame_reader(self):
+        """The reader exact frames come from, opened on first need."""
+        reader = getattr(self, "_reader", None)
+        if reader is None:
+            from .frame_reader import FrameReader
+            reader = self._reader = FrameReader(self.video_path, opencv=cv2)
+        return reader
+
+    def _read_near_from_disk(self) -> dict:
+        """Keyframe thumbnails left by earlier sessions: key → distance (s)."""
+        found = {}
+        try:
+            names = os.listdir(self.disk_dir)
+        except OSError:
+            return found
+        for name in names:
+            m = _NEAR_FILE.match(name)
+            if not m:
+                continue
+            suffix = m.group(3) or ""
+            region = self._region_of_suffix(suffix)
+            found[(int(m.group(1)), int(m.group(2)), region)] = int(m.group(4)) / 1000.0
+        return found
+
+    @staticmethod
+    def _region_of_suffix(suffix: str):
+        """The view a thumbnail file's suffix names; _disk_path's inverse."""
+        return bool(suffix)
+
+    def _near_path(self, key: tuple, distance: float) -> Path:
+        exact = self._disk_path(key)
+        return exact.with_name(f"{exact.stem}_k{int(round(distance * 1000))}.jpg")
+
+    def _extract_near_keyframe(self, key, within: float, priority: int):
+        """The keyframe before this key's moment as a BGR frame, if it lies
+        within `within` seconds of it; else None and the caller decodes the
+        exact frame. Filed on disk under its own name, never the exact one's."""
+        if within <= 0 or within < NEAR_MIN_SHARE_OF_GAP * self._keyframe_gap:
+            return None
+        decoder = self._ensure_decoder(always=True)
+        if decoder is None:
+            return None
+        time_ms, height, vr = key
+        scratch = self.disk_dir / f".near_{threading.get_ident()}.jpg"
+        try:
+            written, offset_ms = decoder.extract_near(
+                self._seekable_seconds(time_ms) * 1000.0, height, vr, scratch,
+                within * 1000.0, priority=priority)
+        except Exception as e:      # an older decoder, or one that just died
+            print(f"⚠️ ThumbnailCache: keyframe thumbnails unavailable ({e})")
+            return None
+        if offset_ms is not None:
+            self._keyframe_gap = max(self._keyframe_gap, offset_ms / 1000.0)
+        if not written:
+            return None
+        frame = cv2.imread(str(scratch))
+        if frame is None:
+            return None
+        distance = (offset_ms or 0.0) / 1000.0
+        try:
+            os.replace(scratch, self._near_path(key, distance))
+        except OSError:
+            pass                    # shown this session, decoded again the next
+        self._near[key] = distance
+        return frame
+
+    def _ensure_decoder(self, always: bool = False):
         """The persistent decoder for this video, started on first need."""
-        if self._decoder is not None or not self._prefer_ffmpeg:
+        # `always`: ordinary footage wants it too, for filmstrip slots a
+        # keyframe can answer (see _extract_near_keyframe).
+        if self._decoder is not None or not (self._prefer_ffmpeg or always):
             return self._decoder
         with self._lock:
             if self._decoder is None:
@@ -678,23 +810,19 @@ class ThumbnailCache(QObject):
             return (False, f"{type(e).__name__}: {e}")
 
     def _extract_via_opencv(self, time_ms: int, height: int, cap=None,
-                            vr: bool = False):
-        """Full-frame decode + resize using a reusable VideoCapture.
+                            vr: bool = False,
+                            priority: int = PRIORITY_VISIBLE):
+        """Full-frame decode + resize: the exact frame at `time_ms`.
 
-        `cap` is the worker's persistent capture (or None to open one). Reusing
-        it across frames turns each thumbnail into a cheap seek+read instead of
-        paying VideoCapture open cost every time. Returns (frame_or_None, cap)
-        so the caller can keep the (possibly newly-opened) capture alive.
+        The frame comes from the cache's one FrameReader, which reads on from
+        the frame before when that is cheaper than seeking - what makes a
+        zoomed-in filmstrip, whose slots are a second or two apart, cost a
+        fraction of a seek per slot. `cap` is no longer used and is handed
+        back as it came; it stays in the signature for its callers.
+        Returns (frame_or_None, cap).
         """
-        if cap is None or not cap.isOpened():
-            cap = cv2.VideoCapture(self.video_path)
-            if not cap.isOpened():
-                return None, None
-
-        cap.set(cv2.CAP_PROP_POS_MSEC, time_ms)
-        ok, frame = cap.read()
-
-        if not ok or frame is None:
+        frame = self._frame_reader().frame_at(time_ms, priority)
+        if frame is None:
             return None, cap
 
         h, w = frame.shape[:2]
@@ -707,7 +835,7 @@ class ThumbnailCache(QObject):
         return frame, cap
 
     def prefetch_range(self, start_time: float, end_time: float,
-                    height_px: int, n_slots: int):
+                    height_px: int, n_slots: int, exact: bool = False):
         """
         Queue up all thumbs for a clip's filmstrip in one go.
         Match the slot calculation in filmstrip_painter so we request
@@ -719,7 +847,18 @@ class ThumbnailCache(QObject):
             # Bulk look-ahead: queue behind anything on screen. When one of
             # these clips scrolls into view its paint() re-requests at
             # PRIORITY_VISIBLE and promotes the frame to the front.
-            self.request(t, height_px, priority=PRIORITY_PREFETCH)
+            # A strip's slot may be answered from a keyframe inside it, as
+            # paint() allows; `exact` is for frames that will be shown as the
+            # moment itself - the hover preview's.
+            self.request(t, height_px, priority=PRIORITY_PREFETCH,
+                         tolerance=0.0 if exact else duration / n_slots / 2)
+
+    @Slot(int, int, bool, QImage)
+    def _on_near_ready(self, time_ms: int, height: int, vr: bool, qimg: QImage):
+        """A keyframe frame arrived. Runs on the main thread."""
+        self._on_image_ready(time_ms, height, vr, qimg)
+        if (time_ms, height, vr) in self._mem:
+            self._mem_near.add((time_ms, height, vr))
 
     @Slot(int, int, bool, QImage)
     def _on_image_ready(self, time_ms: int, height: int, vr: bool, qimg: QImage):
@@ -728,5 +867,6 @@ class ThumbnailCache(QObject):
         if pix.isNull():
             return
         key = (time_ms, height, vr)
+        self._mem_near.discard(key)
         self._add_to_mem(key, pix)
         self.thumbnail_ready.emit(time_ms / 1000.0, height, pix)

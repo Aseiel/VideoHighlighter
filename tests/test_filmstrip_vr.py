@@ -56,7 +56,7 @@ class FakeCache:
         self.vr_mode = enabled
         self.crops.append(enabled)
 
-    def request(self, time_seconds, height_px, priority=0):
+    def request(self, time_seconds, height_px, priority=0, tolerance=0.0):
         return None
 
 
@@ -160,6 +160,7 @@ class TestTogglingDoesNotThrowTheFramesAway:
     def _cache(self, tmp_path):
         cache = ThumbnailCache.__new__(ThumbnailCache)
         cache._mem = OrderedDict()
+        cache._near, cache._mem_near, cache._within = {}, set(), {}
         cache.mem_limit = 300
         cache._vr_mode = False
         cache._ffmpeg = None
@@ -222,7 +223,7 @@ class TestTheExpensivePathLeavesATrace:
         cache._prefer_ffmpeg = prefer_ffmpeg
         cache._src_w, cache._src_h = 8192, 4096
         cache._hwaccels = ["d3d11va"]
-        cache._extract_one_frame = lambda key, out_path, cap=None, priority=0: cap
+        cache._extract_one_frame = lambda key, out_path, cap=None, priority=0, within=0.0: cap
         cache._disk_path = lambda key: None
         return cache
 

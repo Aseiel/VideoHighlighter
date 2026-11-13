@@ -103,7 +103,7 @@ class TestEnteringAClipWarmsIt:
         def __init__(self):
             self.prefetched = []
 
-        def prefetch_range(self, start, end, height, n_slots):
+        def prefetch_range(self, start, end, height, n_slots, exact=False):
             self.prefetched.append((start, end, height, n_slots))
 
     def test_hovering_a_clip_prefetches_hover_sized_frames(self, app):

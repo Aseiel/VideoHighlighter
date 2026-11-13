@@ -38,7 +38,7 @@ class RecordingCache:
     def __init__(self):
         self.times = []
 
-    def request(self, time_seconds, height_px, priority=0):
+    def request(self, time_seconds, height_px, priority=0, tolerance=0.0):
         self.times.append(float(time_seconds))
         return None            # always a placeholder; nothing to decode
 

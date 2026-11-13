@@ -65,7 +65,9 @@ def paint_filmstrip(painter: QPainter, rect: QRectF, start_time: float,
         # Sample at slot midpoint (better than left edge — feels more
         # representative of "what's in this section of the clip").
         t = start_time + (i + 0.5) / n_slots * duration
-        pix = thumb_cache.request(t, H)
+        # Any frame inside the slot pictures it, which lets the cache answer
+        # from a keyframe when one is there (see ThumbnailCache.request).
+        pix = thumb_cache.request(t, H, tolerance=duration / n_slots / 2)
 
         if pix is None or pix.isNull():
             painter.fillRect(slot_rect, PLACEHOLDER_COLOR)

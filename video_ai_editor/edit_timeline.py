@@ -413,7 +413,7 @@ class EditClipItem(QGraphicsRectItem):
             try:
                 scene.thumb_cache.prefetch_range(
                     self.start_time, self.end_time,
-                    HOVER_PREVIEW_HEIGHT, HOVER_PREFETCH_SLOTS)
+                    HOVER_PREVIEW_HEIGHT, HOVER_PREFETCH_SLOTS, exact=True)
             except Exception as e:
                 print(f"⚠️ Hover prefetch skipped: {e}")
 

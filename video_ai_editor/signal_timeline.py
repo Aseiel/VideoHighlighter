@@ -952,6 +952,7 @@ class SignalTimelineScene(QGraphicsScene):
         # its scene() is undefined behaviour, and here it was fatal. Nothing
         # below needs the old list: clear() has taken every one of them.
         self._time_marker_items = []
+        self._ruler_drawn = None
 
         # If we have a view connected, store its current transform
         views = self.views()
@@ -1081,7 +1082,9 @@ class SignalTimelineScene(QGraphicsScene):
             r = self.addRect(0, y, width, band_h, QPen(Qt.PenStyle.NoPen), band)
             r.setZValue(-9)
 
-        # Draw time markers
+        # Draw time markers. Afresh: a scroll during the rebuild may already
+        # have drawn them, underneath everything added since.
+        self._ruler_drawn = None
         self.draw_time_markers()
         # (avoid ranges are painted in drawForeground so a repaint can't drop them)
 
@@ -2112,7 +2115,23 @@ class SignalTimelineScene(QGraphicsScene):
         """Draw the time ruler. The interval adapts to the *effective* zoom
         (scene pixels-per-second × the view's horizontal scale) so labels never
         collide when zoomed out, and the labels ignore the view transform so the
-        horizontal-only zoom can't squish the glyphs together."""
+        horizontal-only zoom can't squish the glyphs together.
+
+        Two things keep this cheap, because it runs on every wheel step and a
+        mark is a scene item. It draws only the stretch the view can reach
+        without the ruler being asked again - what is on screen and as much
+        again to either side - and it does nothing at all when what is drawn is
+        still right. It used to redraw the whole video's marks each time: on a
+        76-minute film that was 1,800 labels and 4,300 lines, 210 ms of every
+        wheel step, for a view showing two dozen of them."""
+        plan = self._ruler_plan()
+        if (plan is not None and getattr(self, "_time_marker_items", None)
+                and getattr(self, "_ruler_drawn", None) is not None):
+            drawn = self._ruler_drawn
+            if (drawn["look"] == plan["look"] and drawn["first"] <= plan["need"][0]
+                    and drawn["last"] >= plan["need"][1]):
+                return
+
         # Remove markers from a previous pass (this method is re-run on zoom).
         # build_timeline's self.clear() may have already deleted the underlying
         # C++ objects, leaving these refs dangling — hence the guard.
@@ -2123,9 +2142,53 @@ class SignalTimelineScene(QGraphicsScene):
             except RuntimeError:
                 pass  # C++ object already deleted by clear()
         self._time_marker_items = []
+        self._ruler_drawn = None
+        if plan is None:
+            return
+
+        label_iv, minor_iv = plan["label_iv"], plan["minor_iv"]
+        h, label_y = plan["h"], plan["label_y"]
+        first, last = plan["first"], plan["last"]
+
+        # Minor gridlines (skip the ones that coincide with a label line).
+        # Solid faint hairlines — the old dashes added a lot of visual noise
+        # over a dark canvas.
+        minor_pen = QPen(QColor(255, 255, 255, 14), 0, Qt.PenStyle.SolidLine)
+        minor_pen.setCosmetic(True)  # stay 1px regardless of horizontal zoom
+        second = (first // minor_iv) * minor_iv
+        while second <= last:
+            if second % label_iv != 0:
+                x = second * self.pixels_per_second
+                line = self.addLine(x, 0, x, h, minor_pen)
+                self._time_marker_items.append(line)
+            second += minor_iv
+
+        # Major gridlines + labels.
+        major_pen = QPen(QColor(255, 255, 255, 34), 0, Qt.PenStyle.SolidLine)
+        major_pen.setCosmetic(True)
+        second = (first // label_iv) * label_iv
+        while second <= last:
+            x = second * self.pixels_per_second
+            line = self.addLine(x, 0, x, h, major_pen)
+            self._time_marker_items.append(line)
+
+            text = self.addText(self._format_time_label(second), QFont("Consolas", 9))
+            text.setDefaultTextColor(QColor(150, 150, 150))
+            # Constant on-screen size + anchored at x so the zoom can't distort it.
+            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            text.setPos(x, label_y)
+            self._time_marker_items.append(text)
+            second += label_iv
+        self._ruler_drawn = plan
+
+    def _ruler_plan(self):
+        """What the ruler should be for the view as it stands, or None when
+        there is nothing to draw: its intervals and heights ("look"), the
+        seconds the view shows now ("need"), and the stretch worth drawing."""
+        import math
 
         if self.video_duration <= 0:
-            return
+            return None
 
         # Effective on-screen pixels per second = scene scale × view horizontal scale.
         views = self.views()
@@ -2133,7 +2196,7 @@ class SignalTimelineScene(QGraphicsScene):
         m22 = views[0].transform().m22() if views else 1.0
         eff_pps = self.pixels_per_second * (m11 or 1.0)
         if eff_pps <= 0:
-            return
+            return None
 
         # Aim for ~80px between labels and ~12px between minor gridlines.
         label_iv = self._nice_interval(80.0 / eff_pps)
@@ -2156,36 +2219,35 @@ class SignalTimelineScene(QGraphicsScene):
         label_offset = self.LABEL_BAND_PX / (m22 or 1.0)
         label_y = max(0.0, h - min(label_offset, h))
 
-        # Minor gridlines (skip the ones that coincide with a label line).
-        # Solid faint hairlines — the old dashes added a lot of visual noise
-        # over a dark canvas.
-        minor_pen = QPen(QColor(255, 255, 255, 14), 0, Qt.PenStyle.SolidLine)
-        minor_pen.setCosmetic(True)  # stay 1px regardless of horizontal zoom
-        second = 0
-        while second <= duration:
-            if second % label_iv != 0:
-                x = second * self.pixels_per_second
-                line = self.addLine(x, 0, x, h, minor_pen)
-                self._time_marker_items.append(line)
-            second += minor_iv
+        # The whole video where there is no view to say otherwise.
+        first, last, need = 0, duration, (0, duration)
+        shown = self._seconds_in_view(views)
+        if shown is not None:
+            reach = shown[1] - shown[0]
+            need = (max(0, int(shown[0])), min(duration, int(math.ceil(shown[1]))))
+            first = max(0, int(shown[0] - reach))
+            last = min(duration, int(math.ceil(shown[1] + reach)))
+        return {
+            "look": (label_iv, minor_iv, round(label_y, 3), round(h, 3),
+                     self.pixels_per_second, duration),
+            "label_iv": label_iv, "minor_iv": minor_iv, "h": h, "label_y": label_y,
+            "need": need, "first": first, "last": last,
+        }
 
-        # Major gridlines + labels.
-        major_pen = QPen(QColor(255, 255, 255, 34), 0, Qt.PenStyle.SolidLine)
-        major_pen.setCosmetic(True)
-        second = 0
-        while second <= duration:
-            x = second * self.pixels_per_second
-            line = self.addLine(x, 0, x, h, major_pen)
-            self._time_marker_items.append(line)
+    def _seconds_in_view(self, views):
+        """(from, to) in seconds of what the first view shows, or None."""
+        if not views or self.pixels_per_second <= 0:
+            return None
+        try:
+            view = views[0]
+            shown = view.mapToScene(view.viewport().rect()).boundingRect()
+        except RuntimeError:
+            return None
+        if shown.width() <= 0:
+            return None
+        return (shown.left() / self.pixels_per_second,
+                shown.right() / self.pixels_per_second)
 
-            text = self.addText(self._format_time_label(second), QFont("Consolas", 9))
-            text.setDefaultTextColor(QColor(150, 150, 150))
-            # Constant on-screen size + anchored at x so the zoom can't distort it.
-            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-            text.setPos(x, label_y)
-            self._time_marker_items.append(text)
-            second += label_iv
-      
     def set_zoom(self, zoom_level):
         """Change zoom level (pixels per second)"""
         self.pixels_per_second = zoom_level
@@ -2817,6 +2879,11 @@ class SignalTimelineView(QGraphicsView):
         
         # Enable mouse tracking for better drag experience
         self.setMouseTracking(True)
+
+        # The ruler is drawn for what the view can reach, so moving along the
+        # video has to ask for more. Nearly always a comparison and nothing
+        # else: it only redraws once the view has left what was drawn.
+        self.horizontalScrollBar().valueChanged.connect(self._ruler_follows_scroll)
         
         # Track mouse state for manual panning
         self.panning = False
@@ -2934,6 +3001,11 @@ class SignalTimelineView(QGraphicsView):
         center_y = self.mapToScene(vp.center()).y()
         # Offset so playhead lands at 35% from left (center = 50%, so shift by +15%)
         self.centerOn(playhead_x + width * 0.15, center_y)
+
+    def _ruler_follows_scroll(self, _value=None):
+        scene = self.scene()
+        if scene is not None and hasattr(scene, "draw_time_markers"):
+            scene.draw_time_markers()
 
     def wheelEvent(self, event):
         """Wheel = zoom (anchored at cursor); Shift+wheel = horizontal scroll.

@@ -86,10 +86,14 @@ def _serve(conn, video_path: str) -> None:
             request = conn.recv()
             if request is None:
                 break
-            time_ms, height, vr, out_path = request
+            time_ms, height, vr, out_path = request[:4]
+            # Present when the caller will only take a frame this close (ms)
+            # to the moment it asked for; see PersistentDecoder.extract_near.
+            within_ms = request[4] if len(request) > 4 else None
             try:
-                _write_thumbnail(container, stream, time_ms, height, vr, out_path)
-                conn.send(("ok", decoder))
+                offset_ms = _write_thumbnail(container, stream, time_ms, height,
+                                             vr, out_path, within_ms)
+                conn.send(_answer(decoder, offset_ms, within_ms))
             except Exception as e:
                 if decoder == "software":
                     conn.send(("error", f"{type(e).__name__}: {e}"))
@@ -107,8 +111,9 @@ def _serve(conn, video_path: str) -> None:
                     pass
                 try:
                     container, stream, decoder = _open(video_path, hardware=False)
-                    _write_thumbnail(container, stream, time_ms, height, vr, out_path)
-                    conn.send(("ok", decoder))
+                    offset_ms = _write_thumbnail(container, stream, time_ms, height,
+                                                 vr, out_path, within_ms)
+                    conn.send(_answer(decoder, offset_ms, within_ms))
                 except Exception as e2:
                     conn.send(("error", f"{type(e2).__name__}: {e2}"))
     except (EOFError, OSError):
@@ -118,6 +123,17 @@ def _serve(conn, video_path: str) -> None:
             container.close()
         except Exception:
             pass
+
+
+def _answer(decoder: str, offset_ms, within_ms):
+    """What to tell the parent about one frame. Plain requests get the reply
+    they always got; one with a limit also learns how far the keyframe was
+    from the moment asked for, and "far" when that was too far to write."""
+    if within_ms is None:
+        return ("ok", decoder)
+    if offset_ms is None or offset_ms > within_ms:
+        return ("far", decoder, offset_ms)
+    return ("ok", decoder, offset_ms)
 
 
 def _open(video_path: str, hardware: bool = True):
@@ -151,12 +167,22 @@ def _open(video_path: str, hardware: bool = True):
     return container, stream, "software"
 
 
-def _write_thumbnail(container, stream, time_ms, height, vr, out_path) -> None:
+def _write_thumbnail(container, stream, time_ms, height, vr, out_path,
+                     within_ms=None):
+    """Write the keyframe at or before `time_ms`. Returns how far (ms) that
+    keyframe is from the moment asked for, or None when the file does not
+    say. With `within_ms`, a keyframe further off than that is not written."""
     import cv2
 
     container.seek(int((time_ms / 1000.0) / stream.time_base),
                    stream=stream, any_frame=False, backward=True)
     frame = next(container.decode(video=0))
+
+    offset_ms = None
+    if frame.time is not None:
+        offset_ms = abs(float(time_ms) - frame.time * 1000.0)
+    if within_ms is not None and (offset_ms is None or offset_ms > within_ms):
+        return offset_ms
 
     width = thumb_width(frame.width, frame.height, height, vr)
     # Scale the whole frame down first and take the left half of the result:
@@ -169,6 +195,7 @@ def _write_thumbnail(container, stream, time_ms, height, vr, out_path) -> None:
         image = image[:, :width]
     if not cv2.imwrite(str(out_path), image, [cv2.IMWRITE_JPEG_QUALITY, 60]):
         raise OSError(f"could not write {out_path}")
+    return offset_ms
 
 
 # ── the parent ───────────────────────────────────────────────────────────
@@ -219,6 +246,7 @@ class PersistentDecoder:
         self._process = None
         self._conn = None
         self._closed = False
+        self._offset_ms = None       # of the last request that asked for it
         self._turnstile = _Turnstile()
         self._lock = threading.Lock()
 
@@ -240,16 +268,43 @@ class PersistentDecoder:
         finally:
             self._turnstile.release()
 
-    def _request(self, time_ms: int, height: int, vr: bool, out_path) -> bool:
+    def extract_near(self, time_ms: int, height: int, vr, out_path,
+                     within_ms: float, priority: int = 0) -> tuple:
+        """Write the keyframe before `time_ms`, but only if it lies within
+        `within_ms` of it. → (written, offset_ms).
+
+        A keyframe costs a seek and one decode; the exact frame costs every
+        frame from that keyframe on. A filmstrip slot stands for a stretch of
+        video, so a keyframe inside the stretch is as true a picture of it as
+        its midpoint is, at a fraction of the price. `offset_ms` is how far the
+        keyframe was, also when it was too far to write (None: unknown)."""
+        if not self.available or self._closed:
+            return False, None
+        self._turnstile.acquire(priority)
+        try:
+            written = self._request(time_ms, height, vr, out_path, within_ms)
+            return written, self._offset_ms
+        finally:
+            self._turnstile.release()
+
+    def _request(self, time_ms: int, height: int, vr: bool, out_path,
+                 within_ms=None) -> bool:
         with self._lock:
+            self._offset_ms = None
             if not self._start():
                 return False
             try:
-                self._conn.send((int(time_ms), int(height), bool(vr), str(out_path)))
+                message = (int(time_ms), int(height), bool(vr), str(out_path))
+                if within_ms is not None:
+                    message += (float(within_ms),)
+                self._conn.send(message)
                 if not self._conn.poll(REQUEST_TIMEOUT):
                     self._fail(f"no answer in {REQUEST_TIMEOUT:.0f}s")
                     return False
-                status, detail = self._conn.recv()
+                reply = self._conn.recv()
+                status, detail = reply[0], reply[1]
+                if len(reply) > 2:
+                    self._offset_ms = reply[2]
             except (EOFError, OSError, BrokenPipeError) as e:
                 # The isolation earning its keep: the decoder died, the app did
                 # not, and the next request gets a fresh one.
@@ -261,6 +316,8 @@ class PersistentDecoder:
                     print(f"🎞 Thumbnail decoder: {detail}")
                     _note("thumb.decoder", using=detail, video=self.video_path)
                 return True
+            if status == "far":
+                return False          # a good decoder, a keyframe too far off
             if status == "fatal":
                 self._fail(detail, permanent=True)
             else:
