@@ -37,7 +37,8 @@ HAS_EXAMPLE_SEARCH = tools.has_example_search()
 
 EXPECTED_TOOLS = {
     "get_info", "probe_video", "scan_folder", "get_config",
-    "start_highlight_run", "start_visual_search", "set_timeline_clips",
+    "start_highlight_run", "start_visual_search", "more_like_these",
+    "set_timeline_clips",
     "start_expression_scan",
     "get_job", "list_jobs", "cancel_job",
     "dataset_health", "plan_reviewed_video", "add_reviewed_video",
@@ -103,7 +104,7 @@ def test_tool_schemas_and_hints(server):
         assert set(by_name["start_example_search"].inputSchema["required"]) == {
             "video_path", "roi", "name"}
     for name in ("get_info", "probe_video", "scan_folder", "get_config",
-                 "get_job", "list_jobs"):
+                 "get_job", "list_jobs", "more_like_these"):
         assert by_name[name].annotations.readOnlyHint is True, name
     for name in EXPECTED_TOOLS & {"start_highlight_run", "start_visual_search",
                                   "start_example_search", "cancel_job"}:
@@ -271,8 +272,8 @@ class _FakeEmbedder:
         return np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=np.float32)
 
 
-def test_visual_search_ranks_frames_and_returns_numbers_only(server, jobs, video,
-                                                             monkeypatch):
+def test_visual_search_ranks_moments_and_returns_numbers_only(server, jobs, video,
+                                                              monkeypatch):
     import llm.clip_index as ci
 
     emb = _FakeEmbedder()
@@ -281,9 +282,10 @@ def test_visual_search_ranks_frames_and_returns_numbers_only(server, jobs, video
 
     def load_or_build(path, cache_path, interval=1.0, **kw):
         built.update(path=path, interval=interval, embedder=kw.get("embedder"))
-        vecs = np.array([[0, 1, 0, 0], [1, 0, 0, 0], [0.8, 0.6, 0, 0]],
-                        dtype=np.float32)
-        return ci.ClipFrameIndex(np.array([0.0, 1.0, 2.0]), vecs,
+        # 10 s and 11 s are one place; 30 s is another; 20 s matches nothing.
+        vecs = np.array([[1, 0, 0, 0], [0.9, 0.436, 0, 0], [0, 1, 0, 0],
+                         [0.8, 0.6, 0, 0]], dtype=np.float32)
+        return ci.ClipFrameIndex(np.array([10.0, 11.0, 20.0, 30.0]), vecs,
                                  {"logit_scale": 100.0})
 
     monkeypatch.setattr(ci, "load_or_build", load_or_build)
@@ -298,11 +300,59 @@ def test_visual_search_ranks_frames_and_returns_numbers_only(server, jobs, video
     assert emb.query == "a red ball"
     assert built == {"path": video, "interval": tools.INDEX_INTERVAL,
                      "embedder": emb}
-    assert result["frames_indexed"] == 3
-    assert [m["timestamp"] for m in result["matches"]] == [1.0, 2.0]
+    assert result["frames_indexed"] == 4
+    # Two places, not the two best frames (which are neighbours).
+    assert [(m["timestamp"], m["start"], m["end"]) for m in result["matches"]] == [
+        (10.0, 10.0, 11.0), (30.0, 30.0, 30.0)]
     for m in result["matches"]:
-        assert set(m) == {"timestamp", "score", "margin"}
+        assert set(m) == {"timestamp", "start", "end", "score", "margin"}
         assert 0.0 <= m["score"] <= 1.0
+
+
+def _saved_index(monkeypatch, tmp_path, video):
+    """A frame index on disk where a visual search would have left it: 60
+    frames, with 10-14 s and 40-44 s alike and unlike the rest."""
+    import llm.clip_index as ci
+
+    rng = np.random.default_rng(0)
+    common, kind = (ci.l2_normalize(rng.normal(size=16)) for _ in range(2))
+    emb = np.tile(common * 5.0, (60, 1)) + rng.normal(scale=0.05, size=(60, 16))
+    for t in list(range(10, 15)) + list(range(40, 45)):
+        emb[t] += kind
+    index = ci.ClipFrameIndex(np.arange(60, dtype=np.float32),
+                              ci.l2_normalize(emb.astype(np.float32)),
+                              ci._video_fingerprint(video, ci.CLIP_MODEL_ID))
+    cache = str(tmp_path / "index.npz")
+    index.save(cache)
+    monkeypatch.setattr(ci, "cache_path_for", lambda p, *a, **k: cache)
+
+
+def test_more_like_these_finds_the_other_occurrence(server, video, tmp_path,
+                                                    monkeypatch):
+    _saved_index(monkeypatch, tmp_path, video)
+    result = call(server, "more_like_these", video_path=video,
+                  timestamps=[12.0], top_k=2)
+    assert result["frames_indexed"] == 60
+    assert sorted((m["start"], m["end"]) for m in result["matches"]) == [
+        (10.0, 14.0), (40.0, 44.0)]
+    for m in result["matches"]:
+        assert set(m) == {"timestamp", "start", "end", "likeness", "frames"}
+        assert 0.0 <= m["likeness"] <= 1.0
+
+
+def test_more_like_these_says_what_is_missing(server, video, tmp_path, monkeypatch):
+    import llm.clip_index as ci
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    monkeypatch.setattr(ci, "cache_path_for",
+                        lambda p, *a, **k: str(tmp_path / "none.npz"))
+    with pytest.raises(ToolError, match="start_visual_search"):
+        call(server, "more_like_these", video_path=video, timestamps=[12.0])
+    _saved_index(monkeypatch, tmp_path, video)
+    with pytest.raises(ToolError, match="not in the indexed part"):
+        call(server, "more_like_these", video_path=video, timestamps=[500.0])
+    with pytest.raises(ToolError, match="empty"):
+        call(server, "more_like_these", video_path=video, timestamps=[])
 
 
 def _fake_face_scan(monkeypatch, seconds, seen=None):

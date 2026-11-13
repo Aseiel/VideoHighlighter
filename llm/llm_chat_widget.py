@@ -381,6 +381,7 @@ class _VisualSearchWorker(QObject):
         self._open_clip_memo()
 
         timestamps = self._clip_timestamps()
+        self._fill_memo_in_order(timestamps)
 
         scored = []
         BATCH = 16
@@ -420,6 +421,98 @@ class _VisualSearchWorker(QObject):
         return scored
 
     # -- embedding memo ---------------------------------------------------
+
+    # Reading in order pays off once this share of a stretch is wanted: below
+    # it, the frames between two wanted ones cost more than a seek does.
+    IN_ORDER_MIN_SHARE = 0.2
+    IN_ORDER_MIN_FRAMES = 32
+
+    def _fill_memo_in_order(self, timestamps):
+        """Before scanning, embed what the memo lacks by reading the video
+        front to back, so the scan below finds it memoised and only scores.
+
+        The scan's own way is a seek per sample, and a seek decodes from the
+        last keyframe up to the frame asked for - several times the frames the
+        sample is worth, all on the processor, with the encoder idle on the
+        card meanwhile. Measured on a 1080p film at one sample a second: 202 ms
+        a frame seeking, 32 ms reading in order. In order, a frame that is not
+        wanted is skipped without being made into a picture (`grab`), and the card's video
+        decoder is used where there is one (modules/media/video_decode.py).
+
+        Only for a stretch that is mostly wanted. A few scattered misses are
+        left to the seek, as is anything this could not read; high-resolution
+        video keeps its keyframe path."""
+        memo = self._clip_memo
+        if memo is None or len(timestamps) < self.IN_ORDER_MIN_FRAMES:
+            return
+        fast = getattr(self.analyzer, "clip_fast_available", None)
+        if callable(fast) and fast():
+            return
+        _, _, missing = memo.lookup(timestamps)
+        if len(missing) < self.IN_ORDER_MIN_FRAMES:
+            return
+        missing = sorted(missing)
+        stretch = (missing[-1] - missing[0]) / max(self.interval, 1e-6) + 1
+        if len(missing) < self.IN_ORDER_MIN_SHARE * stretch:
+            return
+
+        import cv2
+        from modules.media import video_decode
+
+        name = self._engine_name
+        crop = getattr(self.analyzer, "_apply_vr_crop", None)
+        cap = None
+        try:
+            cap, decoder = video_decode.open_sparse(self.analyzer.video_path, None)
+            if not cap.isOpened():
+                return
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            at = 0
+            if missing[0] > 1.0:                 # start where the gap starts
+                cap.set(cv2.CAP_PROP_POS_MSEC, missing[0] * 1000.0)
+                at = int(round(cap.get(cv2.CAP_PROP_POS_FRAMES)))
+            print(f"{name}: reading {len(missing)} frames in order "
+                  f"(video decoded on {decoder})")
+
+            frames, times, done = [], [], 0
+
+            def flush():
+                nonlocal done
+                if not frames:
+                    return
+                self._clip_memo_added += memo.extend(
+                    times, self._clip.embed_frames_bgr(frames))
+                done += len(frames)
+                self.progress.emit(done, len(missing), times[-1],
+                                   f"{name} reading the video {times[-1]:.0f}s")
+                frames.clear()
+                times.clear()
+
+            for ts in missing:
+                want = int(round(ts * fps))
+                if want < at:                     # the seek landed past it
+                    continue
+                while at < want:
+                    if not cap.grab():
+                        flush()
+                        return
+                    at += 1
+                ok, frame = cap.read()
+                at += 1
+                if not ok:
+                    break
+                frames.append(crop(frame) if callable(crop) else frame)
+                times.append(ts)
+                if len(frames) >= 32:
+                    if self._cancel_token.is_cancelled:
+                        break
+                    flush()
+            flush()
+        except Exception as e:  # noqa: BLE001 - the scan below still does it all
+            print(f"⚠️  {name}: could not read the video in order ({e}); seeking instead")
+        finally:
+            if cap is not None:
+                cap.release()
 
     def _clip_timestamps(self):
         """Sample on a fixed lattice: multiples of `interval` measured from zero,
@@ -533,9 +626,14 @@ class _VisualSearchWorker(QObject):
         scored = self._clip_scan()
         if scored is None:
             return
+        if getattr(self, "index_only", False):
+            # "More like this" wanted every frame embedded and saved, not a
+            # ranking against a word: the scan above did that.
+            self.finished.emit([])
+            return
         name = self._engine_name
-        top = scored[:self.top_k]
-        print(f"{name}: top {len(top)} of {len(scored)} frames "
+        top = self._best_moments(scored)
+        print(f"{name}: top {len(top)} moments of {len(scored)} frames "
               f"(scores {top[0][1]:.2f}..{top[-1][1]:.2f})" if top else f"{name}: no frames")
         results = []
         for ts, score in sorted(top, key=lambda x: x[0]):  # chronological for playback
@@ -547,6 +645,27 @@ class _VisualSearchWorker(QObject):
             self.frame_analyzed.emit(ts, tstr, analysis, True, float(score))
             self.found.emit(ts, tstr, analysis)
         self.finished.emit(results)
+
+    def _best_moments(self, scored):
+        """The top_k places in a ranking, as [(timestamp, score)] best first:
+        the best frame of each, not the top_k frames.
+
+        A match lasts seconds, so the best frames of a ranking are mostly each
+        other's neighbours - thirty frames were twelve places on real footage,
+        and a match ranked just below them was never shown. Ranked by the
+        margin where there is one, since the score itself rounds to 1.0 for
+        every clear match (see clip_index.log_odds)."""
+        from .more_like_these import MOMENT_GAP_SECONDS, moments
+
+        if not scored:
+            return []
+        margins = getattr(self, "_clip_margins", {}) or {}
+        by_ts = dict(scored)
+        rank = [margins.get(ts, score) for ts, score in scored] \
+            if all(ts in margins for ts, _ in scored) else [s for _, s in scored]
+        found = moments([ts for ts, _ in scored], rank, self.top_k,
+                        gap=max(MOMENT_GAP_SECONDS, 1.5 * self.interval))
+        return [(m.timestamp, by_ts[m.timestamp]) for m in found]
 
     def _run_clip_llm(self):
         """CLIP ranks all frames on the GPU; the VLM confirms only the top_k."""
@@ -687,6 +806,7 @@ class LLMChatWidget(QWidget):
         self.reasoning_enabled = True
         # Found visual-search matches, for ◀ ▶ navigation
         self._search_results: list[dict] = []
+        self._like_examples: list[float] = []   # moments confirmed as right, for "more like this"
         self._search_result_idx = -1
         if HAS_TIMELINE_BRIDGE:
             self._timeline_bridge = TimelineBridge()
@@ -1237,6 +1357,8 @@ class LLMChatWidget(QWidget):
 
     def set_video_path(self, video_path: str):
         """Set the video path and initialize analyzer."""
+        if video_path != self._video_path:
+            self._like_examples = []  # they were moments of the other video
         self._video_path = video_path
         if video_path and os.path.exists(video_path):
             self._init_analyzer(video_path)
@@ -1413,8 +1535,10 @@ class LLMChatWidget(QWidget):
         mode_str = "stop on first match" if stop_on_match else "scan entire video"
         start_str = f"{int(start_from)//60}:{int(start_from)%60:02d}"
 
-        # Reset match navigation for this fresh search.
+        # Reset match navigation for this fresh search, and the moments
+        # confirmed as right during the last one.
         self._reset_search_results()
+        self._like_examples = []
 
         # Generate a unique scan ID and clear any previous findings for this query
         # so the timeline shows fresh results.
@@ -1584,6 +1708,191 @@ class LLMChatWidget(QWidget):
         self.search_result_label.setText(f"{i + 1}/{n}" if n else "0/0")
         self.search_prev_btn.setEnabled(n > 0 and i > 0)
         self.search_next_btn.setEnabled(n > 0 and i < n - 1)
+
+    # ---- more like this (the video's right-click menu) ----------------------
+    def _search_frame_index(self):
+        """(index, engine name) holding this video's saved frame embeddings, or
+        (None, "") if no CLIP or SigLIP2 search has indexed it. The engine
+        picked in the panel first."""
+        from .clip_index import ClipFrameIndex, cache_path_for
+        from .clip_prefilter import MODEL_ID as clip_id
+
+        encoders = [("CLIP", clip_id)]
+        try:
+            from modules.vision.frame_encoder import ENCODER_ID
+            encoders.append(("SigLIP2", ENCODER_ID))
+        except Exception:  # noqa: BLE001 - no such encoder in this build
+            pass
+        if self.search_engine_combo.currentData() == "siglip":
+            encoders.reverse()
+        for name, model_id in encoders:
+            try:
+                path = cache_path_for(self._video_path, model_id=model_id)
+                if not os.path.exists(path):
+                    continue
+                index = ClipFrameIndex.load(path)
+                if len(index) and index.matches(self._video_path, model_id):
+                    return index, name
+            except Exception as e:  # noqa: BLE001 - try the other encoder
+                print(f"⚠️ More like this: could not read the {name} index ({e})")
+        return None, ""
+
+    def more_like_moment(self, ts: float, _scanned: bool = False) -> tuple:
+        """The moment at `ts` seconds is right: add it to the examples and
+        re-rank the video against them (llm.more_like_these). No scan and no
+        model - it is arithmetic on the embeddings the search already saved.
+        Where the video's frames are not all saved yet, it reads them first
+        (once) and ranks when that is done; `_scanned` marks that second call.
+
+        Returns (done, message). The message is also written to the chat; it
+        is handed back because the user who asked is looking at the video,
+        whose right-click menu this is reached from."""
+        from .more_like_these import example_rows, more_like
+
+        def refuse(message):
+            self._append_system(message)
+            return False, message
+
+        ts = float(ts)
+        if not _scanned and self._search_thread_running():
+            return refuse("⚠️ Wait for the search to finish first.")
+        if not self._video_path or not os.path.exists(self._video_path):
+            return refuse("⚠️ Load a video first.")
+        index, engine = self._search_frame_index()
+        if not _scanned and not self._index_covers_video(index):
+            # Not every frame is there to compare with: read them, then rank.
+            return self._index_then_more_like(ts)
+        if index is None or not example_rows(index, [ts]):
+            return refuse(
+                f"⚠️ The frame at {self._mmss(ts)} could not be read from the "
+                f"video, so there is nothing to compare the rest with.")
+        examples = self._like_examples
+        if any(abs(ts - e) < 0.5 for e in examples):
+            return refuse(f"ℹ️ {self._mmss(ts)} is already one of the examples.")
+        found = more_like(index, examples + [ts], top_k=self.search_topk.value())
+        examples.append(ts)
+
+        base = self.search_target.text().strip()
+        label = f"more like: {base}" if base else "more like these"
+        scan_id = f"like_{int(_time.time())}"
+        bridge = self._timeline_bridge
+        window = getattr(bridge, "_window", None) if bridge else None
+        if window is not None and hasattr(window, "add_visual_findings"):
+            scene = getattr(window, "signal_scene", None)
+            if scene is not None and hasattr(scene, "clear_visual_findings"):
+                scene.clear_visual_findings(query=label)
+            window.add_visual_findings([{
+                "timestamp": m.timestamp, "query": label, "confidence": m.score,
+                "model": engine, "scan_id": scan_id,
+                "analysis": f"like {len(examples)} confirmed match"
+                            f"{'es' if len(examples) != 1 else ''} "
+                            f"(likeness {m.score:.2f})",
+            } for m in found], save=True)
+
+        self._search_results = sorted(
+            ({"timestamp": m.timestamp, "timestamp_str": self._mmss(m.timestamp),
+              "analysis": f"likeness {m.score:.2f}"} for m in found),
+            key=lambda r: r["timestamp"],
+        )
+        # Stay on the match that was just confirmed, so ◀ ▶ carry on from it.
+        self._search_result_idx = next(
+            (i for i, r in enumerate(self._search_results)
+             if abs(r["timestamp"] - ts) <= 6.0), 0) if self._search_results else -1
+        self._update_search_nav()
+
+        lines = [f"   {self._mmss(m.start)}–{self._mmss(m.end)}  likeness {m.score:.2f}"
+                 if m.end > m.start else
+                 f"   {self._mmss(m.start)}  likeness {m.score:.2f}" for m in found]
+        self._append_system(
+            f"👍 {len(found)} moments most like your {len(examples)} confirmed "
+            f"match{'es' if len(examples) != 1 else ''} ({engine}), best first:\n"
+            + "\n".join(lines)
+            + "\n   ◀ ▶ steps through them in order of time. Right-click the "
+              "video on another right one to sharpen it; a new Search starts over.")
+        return True, (f"👍 {len(found)} moments like {self._mmss(ts)} are on the "
+                      f"Visual Search row ({engine}). ◀ ▶ in the search panel "
+                      f"steps through them.")
+
+    def _index_covers_video(self, index) -> bool:
+        """True when `index` holds (nearly) every frame the search samples in
+        this video, so that a ranking from it leaves no part of the video out."""
+        if index is None or not len(index):
+            return False
+        if not self._analyzer and not self._init_analyzer(require_llm=False):
+            return True              # cannot tell: rank what there is
+        step = float(self.search_interval.value())
+        duration = float(getattr(self._analyzer, "duration", 0.0) or 0.0)
+        if step <= 0 or duration <= 0:
+            return True
+        grid = [round(i * step, 3) for i in range(int(duration / step) + 1)]
+        _, _, missing = index.lookup(grid)
+        return len(missing) <= 0.02 * len(grid)   # the last frames may not decode
+
+    def _index_then_more_like(self, ts: float) -> tuple:
+        """Read the whole video's frames, then rank it against the moment at
+        `ts`. The scan is the search's own with no word to look for: it fills
+        the memo a text search fills, so it is paid once per video and only
+        for the frames not already there."""
+        if not self._analyzer and not self._init_analyzer(require_llm=False):
+            message = "⚠️ The video could not be opened to scan it."
+            self._append_system(message)
+            return False, message
+        engine = ("siglip" if self.search_engine_combo.currentData() == "siglip"
+                  else "clip")
+        interval = float(self.search_interval.value())
+        frames = int(self._analyzer.duration / interval) + 1
+
+        self._pending_like_ts = float(ts)
+        self._search_worker_thread = QThread(self)  # parent=self for Qt ownership
+        self._search_worker = _VisualSearchWorker(
+            analyzer=self._analyzer, target="", interval=interval,
+            max_seeks=frames, stop_on_first_match=False, start_time=0.0,
+            mode=engine, top_k=1)
+        self._search_worker.index_only = True
+        self._search_worker.moveToThread(self._search_worker_thread)
+        self._search_worker_thread.started.connect(self._search_worker.run)
+        self._search_worker.finished.connect(self._search_worker_thread.quit)
+        self._search_worker.finished.connect(self._search_worker.deleteLater)
+        self._search_worker.error.connect(self._search_worker_thread.quit)
+        self._search_worker_thread.finished.connect(
+            self._search_worker_thread.deleteLater)
+        self._search_worker.progress.connect(self._on_search_progress)
+        self._search_worker.error.connect(self._on_search_error)
+        self._search_worker.finished.connect(self._after_index_for_more_like)
+        self.search_btn.setEnabled(False)
+        self.stop_search_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self._search_worker_thread.start()
+
+        message = (f"🔎 Reading the whole video first (up to {frames} frames; "
+                   f"done once and saved). The moments like {self._mmss(ts)} "
+                   f"follow when it finishes.")
+        self._append_system(message)
+        return True, message
+
+    @Slot(list)
+    def _after_index_for_more_like(self, _results):
+        """The frames are in: rank the video against the moment that asked."""
+        ts = getattr(self, "_pending_like_ts", None)
+        self._pending_like_ts = None
+        self.search_progress.setText("")
+        self.search_btn.setEnabled(True)
+        self.stop_search_btn.setEnabled(False)
+        if not self._llm_thread_running():
+            self.stop_btn.setEnabled(False)
+        if ts is None:
+            return
+        _, message = self.more_like_moment(ts, _scanned=True)
+        # Asked from the video's right-click: say it where the user is looking.
+        bridge = self._timeline_bridge
+        window = getattr(bridge, "_window", None) if bridge else None
+        if window is not None and hasattr(window, "statusBar"):
+            window.statusBar().showMessage(message, 8000)
+
+    @staticmethod
+    def _mmss(seconds: float) -> str:
+        return f"{int(seconds) // 60}:{int(seconds) % 60:02d}"
+
 
     def _step_search_result(self, delta: int):
         if not self._search_results:

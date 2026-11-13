@@ -1088,6 +1088,7 @@ class RealtimeOverlayPreview(QWidget):
     # Emitted when overlay mode changes
     overlay_toggled = Signal(bool)
     avoid_person_requested = Signal(str)
+    more_like_requested = Signal(float)                   # the playback time, s
 
     def __init__(
         self,
@@ -1686,11 +1687,17 @@ class RealtimeOverlayPreview(QWidget):
         """Right-click on nothing detected — offers to teach a model to find
         what is there (modules/teach/from_player.py): one box, a name, and the
         rest happens in the background while the app is idle."""
+        from llm.more_like_these import MENU_TEXT as MORE_LIKE_MENU_TEXT
         from video_ai_editor import teach_from_box
 
         menu = QMenu(self)
         a_model = menu.addAction(teach_from_box.MENU_TEXT)
+        # The frame on screen is right: find the moments that look like it.
+        a_like = menu.addAction(MORE_LIKE_MENU_TEXT)
         chosen = menu.exec(global_pos)
+        if chosen is a_like:
+            self.more_like_requested.emit(self._playback_seconds())
+            return
         if chosen is not a_model:
             return
         name = teach_from_box.ask_model_name(self)
@@ -1718,6 +1725,16 @@ class RealtimeOverlayPreview(QWidget):
             except Exception:
                 ts = 0.0
         return roi, float(ts)
+
+    def _playback_seconds(self) -> float:
+        """Where playback is, in seconds; 0.0 before a video is shown."""
+        player = getattr(self, "_player", None)
+        if player is None:
+            return 0.0
+        try:
+            return float(player.position() / 1000.0)
+        except Exception:
+            return 0.0
 
     def _teach_model(self, name: str, scene_rect):
         """Seed a background-taught model from the drawn box (from_player)."""

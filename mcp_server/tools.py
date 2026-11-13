@@ -214,19 +214,66 @@ def start_visual_search(jobs: JobManager, video_path: str, query: str,
         # Rank by margin: at a high logit scale many good frames round to a
         # probability of 1.0, and the margin still orders them.
         margins = log_odds(idx.embeddings, labels, scale)
-        order = sorted(range(len(idx)), key=lambda i: -margins[i])[:top_k]
+        # As places, not frames: a match lasts seconds, so the best frames of
+        # a ranking are mostly each other's neighbours and a list of them
+        # shows far fewer different things than its length says.
+        from llm.more_like_these import moments
+
+        row = {round(float(t), 3): i for i, t in enumerate(idx.timestamps)}
+        found = moments(idx.timestamps, margins, top_k)
         return {
             "query": query,
             "frames_indexed": len(idx),
-            "matches": [{"timestamp": round(float(idx.timestamps[i]), 3),
-                         "score": round(float(probs[i]), 4),
-                         "margin": round(float(margins[i]), 3)} for i in order],
+            "matches": [{
+                **_moment(m),
+                "score": round(float(probs[row[round(m.timestamp, 3)]]), 4),
+                "margin": round(m.score, 3),
+            } for m in found],
         }
 
     job = jobs.submit("visual_search", {
         "video_path": path, "query": query, "top_k": top_k,
     }, run)
     return {"job_id": job.id, "status": job.status}
+
+
+def _moment(m) -> dict:
+    """A moment as numbers: where to look, and the stretch it covers."""
+    return {"timestamp": round(m.timestamp, 3),
+            "start": round(m.start, 3), "end": round(m.end, 3)}
+
+
+def more_like_these(video_path: str, timestamps: Sequence[float],
+                    top_k: int = 20) -> dict:
+    """The moments of a video most like the frames at `timestamps`, from the
+    whole-frame index a visual search saved. No model and no scan."""
+    path = _existing_file(video_path)
+    examples = [float(t) for t in (timestamps or ())]
+    if not examples:
+        raise ValueError("timestamps is empty: give at least one confirmed match")
+    top_k = max(1, min(int(top_k), 500))
+
+    from llm.clip_index import ClipFrameIndex, cache_path_for
+    from llm.clip_prefilter import MODEL_ID
+    from llm.more_like_these import example_rows, more_like
+
+    cache = cache_path_for(path)
+    index = ClipFrameIndex.load(cache) if os.path.exists(cache) else None
+    if index is None or not len(index) or not index.matches(path, MODEL_ID):
+        raise ValueError("this video has no frame index yet: run "
+                         "start_visual_search on it first")
+    outside = [t for t in examples if not example_rows(index, [t])]
+    if outside:
+        raise ValueError(f"not in the indexed part of the video: {outside} "
+                         f"(indexed {float(index.timestamps.min()):g}"
+                         f"-{float(index.timestamps.max()):g} s)")
+    found = more_like(index, examples, top_k)
+    return {
+        "examples": examples,
+        "frames_indexed": len(index),
+        "matches": [{**_moment(m), "likeness": round(m.score, 4),
+                     "frames": m.frames} for m in found],
+    }
 
 
 def start_expression_scan(jobs: JobManager, video_path: str,

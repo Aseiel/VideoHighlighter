@@ -980,6 +980,8 @@ class SignalTimelineWindow(QMainWindow):
         self.avoided_identity_ids = set()
         if self.realtime_preview is not None:
             self.realtime_preview.avoid_person_requested.connect(self._on_avoid_person)
+            self.realtime_preview.more_like_requested.connect(
+                self._on_more_like_requested)
 
         # The live preview built its own audio output before the volume controls
         # existed — line them all up with the slider now.
@@ -993,13 +995,19 @@ class SignalTimelineWindow(QMainWindow):
         box drawn on the paused frame (video_ai_editor.teach_from_box)."""
         from PySide6.QtWidgets import QMenu
 
+        from llm.more_like_these import MENU_TEXT as MORE_LIKE_MENU_TEXT
         from video_ai_editor import teach_from_box
 
         if not getattr(self, "video_path", ""):
             return
         menu = QMenu(self)
         a_model = menu.addAction(teach_from_box.MENU_TEXT)
-        if menu.exec(global_pos) is not a_model:
+        a_like = menu.addAction(MORE_LIKE_MENU_TEXT)
+        chosen = menu.exec(global_pos)
+        if chosen is a_like:
+            self._on_more_like_requested(self.video_player.position() / 1000.0)
+            return
+        if chosen is not a_model:
             return
         name = teach_from_box.ask_model_name(self)
         if name is None:
@@ -1008,6 +1016,23 @@ class SignalTimelineWindow(QMainWindow):
         # The box is taken from the frame on screen, so hold that frame still.
         self.video_player.pause()
         self.video_view.begin_region_draw()
+
+    def _on_more_like_requested(self, seconds):
+        """Right-click on the video, "More like this moment": the frame on
+        screen is right, so rank the whole video by likeness to it. The search
+        panel does it (llm.more_like_these) and owns the examples, so each
+        further moment confirmed this way adds to them until a new search."""
+        chat = getattr(self, "llm_chat", None)
+        if chat is None or not hasattr(chat, "more_like_moment"):
+            self.statusBar().showMessage(
+                "⚠️ Open the assistant panel first: it holds the search.", 5000)
+            return
+        done, message = chat.more_like_moment(float(seconds))
+        if done:
+            self.statusBar().showMessage(message, 8000)
+        else:
+            # Nobody is looking at the chat after a right-click on the video.
+            QMessageBox.information(self, "More like this", message)
 
     def _on_plain_video_region(self, roi):
         """A box was drawn on the plain video after "Teach a model…"."""

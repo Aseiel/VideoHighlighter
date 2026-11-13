@@ -64,6 +64,7 @@ Leave out `--scope user` to register it for the current project only. Run
 | `get_config` | The saved settings every run starts from |
 | `start_highlight_run` | Analyse videos and cut a reel from each (job) |
 | `start_visual_search` | Moments that match a text description (job) |
+| `more_like_these` | Moments that look like ones already confirmed as right, by their timestamps. Instant, from the index a visual search saved |
 | `start_example_search` | Find more like this: an example region at given timestamps (job). Listed only in editions that have search by example |
 | `set_timeline_clips` | Put a list of clips on the app's edit timeline for a video, to adjust and export there |
 | `start_counter_check` | Read an on-screen counter: when each value appears, and which of a run's clips cover them (job). Pro |

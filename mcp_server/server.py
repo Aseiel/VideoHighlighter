@@ -89,9 +89,26 @@ def build_server(jobs=None):
     def start_visual_search(video_path: str, query: str, top_k: int = 20) -> dict:
         """Find the moments in a video that look like a text description
         (e.g. "a dog jumping into water"). Returns a job_id; poll get_job.
-        The result lists the best `top_k` timestamps (s), best first, each with
-        a score in 0..1 and the margin it won by."""
+        The result lists the best `top_k` moments, best first: timestamp (s) is
+        the best frame, start and end the stretch it belongs to, with a score
+        in 0..1 and the margin it won by. A vague or unusual word ranks poorly:
+        scores are then all alike and right answers sit far down. Once the
+        user confirms any match as right, pass it to more_like_these."""
         return tools.start_visual_search(jobs, video_path, query, top_k=top_k)
+
+    @mcp.tool(annotations=read_only)
+    def more_like_these(video_path: str, timestamps: list[float],
+                        top_k: int = 20) -> dict:
+        """Find the moments of a video that look like moments already known to
+        be right. timestamps: seconds of confirmed matches (one is enough;
+        more sharpen it), e.g. hits from start_visual_search the user agreed
+        with. Answers at once from the index that search saved, so run
+        start_visual_search on the video first. Returns up to `top_k` moments,
+        best first: timestamp (s) is the best frame, start and end the
+        stretch, likeness in 0..1 (the examples themselves score near 1;
+        comparable within one answer only), frames how many sampled frames
+        it holds. Usually finds what the word missed."""
+        return tools.more_like_these(video_path, timestamps, top_k=top_k)
 
     @mcp.tool(annotations=starts)
     def start_expression_scan(video_path: str,
