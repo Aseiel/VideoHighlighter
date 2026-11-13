@@ -119,7 +119,7 @@ def detect_scenes_motion_optimized(video_path,
     if debug:
         print(f"=== HYBRID OPTIMIZED VIDEO PROCESSING ===")
         print(f"Device: {device}, min_area: {min_area}")
-        print(f"Motion threshold: {motion_threshold}, Scene threshold: {scene_threshold}")
+        print(f"Motion threshold: {motion_threshold}, Shot threshold: {scene_threshold}")
 
     # (frame index, exception) when the reader died on an error. Read by the
     # consumer once the queue runs dry, and raised from there.
@@ -471,12 +471,12 @@ def detect_scenes_motion_optimized(video_path,
             if debug or recalibrated:
                 rate = (len(scenes) / minutes) if minutes else 0.0
                 if recalibrated:
-                    print(f"🎬 Scene threshold {scene_threshold:.0f} found nothing "
+                    print(f"🎬 Shot threshold {scene_threshold:.0f} found nothing "
                           f"in {minutes:.0f} min; recalibrated to "
                           f"{used_threshold:.1f} from this video's own frame "
-                          f"differences -> {len(scenes)} scenes ({rate:.1f}/min)")
+                          f"differences -> {len(scenes)} shots ({rate:.1f}/min)")
                 else:
-                    print(f"🎬 Scenes: {len(scenes)} at threshold "
+                    print(f"🎬 Shots: {len(scenes)} at threshold "
                           f"{used_threshold:.0f} ({rate:.1f}/min)")
 
         pbar.close()
@@ -534,9 +534,9 @@ def detect_scenes_motion_optimized(video_path,
                                                   exclude_frames=cut_frames)
 
         if debug and not (cancel_flag and cancel_flag.is_set()):
-            print(f"Scenes: {len(scenes)}, Motion events: {len(motion_events)}, Peaks: {len(motion_peaks)}")
+            print(f"Shots: {len(scenes)}, Motion events: {len(motion_events)}, Peaks: {len(motion_peaks)}")
         elif debug and cancel_flag and cancel_flag.is_set():
-            print(f"Motion detection cancelled - partial results: Scenes: {len(scenes)}, Motion events: {len(motion_events)}, Peaks: {len(motion_peaks)}")
+            print(f"Motion detection cancelled - partial results: Shots: {len(scenes)}, Motion events: {len(motion_events)}, Peaks: {len(motion_peaks)}")
 
     except FrameReadError:
         # Not folded into the partial result below: that would be cached as a

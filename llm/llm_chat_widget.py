@@ -2092,7 +2092,7 @@ class LLMChatWidget(QWidget):
                 f"Cache loaded: {os.path.basename(filepath)}\n"
                 f"  Duration: {int(dur)}s ({int(dur)//60}m{int(dur)%60:02d}s) | "
                 f"Objects: {n_obj} | Actions: {n_act} | "
-                f"Transcript: {n_trans} segs | Scenes: {n_scenes}\n"
+                f"Transcript: {n_trans} segs | Shots: {n_scenes}\n"
                 f"  Motion: {n_motion} events, {n_peaks} peaks | Audio peaks: {n_audio}"
             )
             return True

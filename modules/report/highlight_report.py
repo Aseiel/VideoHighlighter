@@ -42,7 +42,7 @@ import numpy as np
 # Order matters: it is the order signals appear in the breakdown, chosen so the
 # cheap ambient signals read first and the semantic ones last.
 SIGNAL_LABELS = (
-    ("scene", "Scene change"),
+    ("scene", "Shot change"),
     ("motion_event", "Motion event"),
     ("motion_peak", "Motion peak"),
     ("audio", "Audio peak"),

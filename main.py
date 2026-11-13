@@ -1627,8 +1627,8 @@ class VideoHighlighterGUI(QWidget):
 
         self.spin_scene_points = QSpinBox(); self.spin_scene_points.setRange(0,100); self.spin_scene_points.setValue(scoring_cfg.get("scene_points", 0))
         self.spin_scene_points.setToolTip(
-            "Points on the second a scene cut starts (a jump in frame difference). "
-            "One hit per cut, not for the rest of the scene.")
+            "Points on the second a shot change happens (a jump in frame difference). "
+            "One hit per cut, not for the rest of the shot.")
 
         self.spin_motion_event_points = QSpinBox(); self.spin_motion_event_points.setRange(0,100); self.spin_motion_event_points.setValue(scoring_cfg.get("motion_event_points", 0))
         self.spin_motion_event_points.setToolTip(
@@ -1638,7 +1638,7 @@ class VideoHighlighterGUI(QWidget):
 
         self.spin_motion_peak = QSpinBox(); self.spin_motion_peak.setRange(0,100); self.spin_motion_peak.setValue(scoring_cfg.get("motion_peak_points", 3))
         self.spin_motion_peak.setToolTip(
-            "Points when motion inside a scene rises above that scene's average, "
+            "Points when motion inside a shot rises above that shot's average, "
             "then stays low for about 4 seconds of samples.")
 
         self.spin_audio_peak = QSpinBox(); self.spin_audio_peak.setRange(0,100); self.spin_audio_peak.setValue(scoring_cfg.get("audio_peak_points", 0))
@@ -1744,7 +1744,7 @@ class VideoHighlighterGUI(QWidget):
         # One box per signal rather than one list of eleven rows. The labels
         # only mean anything once the reader knows which detector a row belongs
         # to, and in a flat column that has to be inferred from the wording of
-        # each label — which is why the shortest ones ("Scene points") were the
+        # each label — which is why the shortest ones ("Shot change points") were the
         # hardest to place. A box answers it before the row is read.
         face_row = QWidget()
         face_h = QHBoxLayout(face_row)
@@ -1758,11 +1758,11 @@ class VideoHighlighterGUI(QWidget):
         # the button lives on the first of the three and runs all three.
         # Keyword + transcript points likewise share one transcription pass.
         groups = (
-            ("Movement && scenes", (
-                ("Scene points:", self._points_row_with_button(
+            ("Movement && shots", (
+                ("Shot change points:", self._points_row_with_button(
                     self.spin_scene_points, "motion", "Scan motion",
-                    "Detect scene cuts and motion across every video in the list "
-                    "and cache them (covers scene, motion event and motion peak "
+                    "Detect shot changes and motion across every video in the list "
+                    "and cache them (covers shot change, motion event and motion peak "
                     "— one pass). No highlights are cut.")),
                 ("Motion event points:", self.spin_motion_event_points),
                 ("Motion peak points:", self.spin_motion_peak),
@@ -1952,7 +1952,7 @@ class VideoHighlighterGUI(QWidget):
             if is_auto:
                 self.auto_seg_info_label.setText(
                     "🔧 Auto mode: the app will determine clip boundaries from signal structure "
-                    "(action durations, scene cuts, keyword timing, object clusters, audio/motion peaks)."
+                    "(action durations, shot changes, keyword timing, object clusters, audio/motion peaks)."
                 )
             else:
                 self.auto_seg_info_label.setText(
@@ -2128,7 +2128,7 @@ class VideoHighlighterGUI(QWidget):
         self.frame_skip_spin.setRange(1, 30)
         self.frame_skip_spin.setValue(advanced_cfg.get("frame_skip", 5))
         self.frame_skip_spin.setToolTip(
-            "Motion and scene detection read every Nth frame. "
+            "Motion and shot detection read every Nth frame. "
             "Higher is faster and can miss a short cut or a brief motion.")
 
         motion_layout.addRow("Frame skip:", self.frame_skip_spin)
@@ -5960,7 +5960,7 @@ class VideoHighlighterGUI(QWidget):
             self.append_log("❌ ERROR: All scoring points are set to 0!")
             self.append_log("")
             self.append_log("Please configure at least one scoring point:")
-            self.append_log("  • Scene points")
+            self.append_log("  • Shot change points")
             self.append_log("  • Motion event points")
             self.append_log("  • Motion peak points")
             self.append_log("  • Audio peak points")

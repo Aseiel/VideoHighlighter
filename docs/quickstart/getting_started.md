@@ -26,7 +26,7 @@ Drag or paste a video file onto the "Drop files" zone, or click "Browse" to open
 
 ### Step 3: Analyze
 Click **"Analyze"** and wait for scoring to complete. The app will:
-1. Detect scene cuts, motion, audio peaks, objects, actions
+1. Detect shot changes, motion, audio peaks, objects, actions
 2. Generate transcript (optional)
 3. Score moments and rank them
 4. Create the highlight reel and separate clips

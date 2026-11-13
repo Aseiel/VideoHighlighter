@@ -73,7 +73,7 @@ def build_server(jobs=None):
         """Analyse videos and cut a highlight reel from each. Returns a job_id;
         poll get_job. Takes minutes per video (longer with transcription).
 
-        preset: "simple" = the app's one-button scoring (scene changes, motion
+        preset: "simple" = the app's one-button scoring (shot changes, motion
         peaks, loudness), "saved" = the user's saved settings from config.yaml.
         length: "short" (~90 s), "medium" (~4 min) or "long" (~7 min) for
         "simple". output_name: file name for the reel, written beside each

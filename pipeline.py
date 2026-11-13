@@ -778,7 +778,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             cache_status = "full" if not cache_keyword_filtered else f"keyword-filtered ({len(cache_search_keywords or [])} keywords)"
                             log(f"✅ Loaded from cache: {len(transcript_segments)} transcript segments ({cache_status}), "
                                 f"{len(object_detections)} object seconds, {len(action_detections)} actions, "
-                                f"{len(scenes)} scenes, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks, "
+                                f"{len(scenes)} shots, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks, "
                                 f"{len(audio_peaks)} audio peaks")
                         else:
                             log(f"⚠️ Cache incompatible: cached with {'keyword-filtered' if cache_keyword_filtered else 'full'} transcript, "
@@ -921,16 +921,16 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             log(_describe_backfill("motion"))
 
         if not using_cache or motion_backfill:
-            progress.update_progress(10, 100, "Pipeline", "Detecting motion and scenes...")
+            progress.update_progress(10, 100, "Pipeline", "Detecting motion and shots...")
 
             # Skip motion detection if all motion-related points are 0
             if not motion_wanted:
-                log("ℹ️ Skipping motion detection (all scene/motion points set to 0)")
+                log("ℹ️ Skipping motion detection (all shot/motion points set to 0)")
                 scenes, motion_events, motion_peaks = [], [], []
                 motion_curve = None
                 progress.update_progress(25, 100, "Pipeline", "Motion detection skipped - no motion scoring enabled")
             else:
-                log("🔹 Step 1+2: Detecting scenes, motion events, and motion peaks (this may take time)...")
+                log("🔹 Step 1+2: Detecting shots, motion events, and motion peaks (this may take time)...")
 
                 scenes, motion_events, motion_peaks = [], [], []
                 motion_details = {}
@@ -961,7 +961,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     # Unpack the results
                     if result and len(result) == 3:
                         scenes, motion_events, motion_peaks = result
-                        log(f"✅ Motion detection results: {len(scenes)} scenes, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks")
+                        log(f"✅ Motion detection results: {len(scenes)} shots, {len(motion_events)} motion events, {len(motion_peaks)} motion peaks")
                     else:
                         log(f"⚠️ Unexpected motion detection result format: {result}")
                         
@@ -973,7 +973,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     log(f"Full error: {traceback.format_exc()}")
 
                 # Add progress update after motion detection
-                progress.update_progress(25, 100, "Pipeline", f"Motion detection complete: {len(scenes)} scenes, {len(motion_events)} events, {len(motion_peaks)} peaks")
+                progress.update_progress(25, 100, "Pipeline", f"Motion detection complete: {len(scenes)} shots, {len(motion_events)} events, {len(motion_peaks)} peaks")
         else:
             log("ℹ️ Using cached motion analysis")
             progress.update_progress(25, 100, "Pipeline", "Loaded cached motion analysis")
@@ -2503,7 +2503,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             keyword_score[idx] + object_score[idx] + action_score[idx])
             
             print(f"\nTime {timestamp} ({idx} sec): {score[idx]:.1f} total points")
-            print(f"  Scene: {scene_score[idx]:.1f}")
+            print(f"  Shot change: {scene_score[idx]:.1f}")
             print(f"  Motion events: {motion_event_score[idx]:.1f}")
             print(f"  Motion peaks: {motion_peak_score[idx]:.1f}")
             print(f"  Audio: {audio_score[idx]:.1f}")

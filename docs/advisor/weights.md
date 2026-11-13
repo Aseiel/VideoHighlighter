@@ -9,7 +9,7 @@ definition of "interesting" — there is no other taste in the system.
 
 | signal | fires when | good for |
 |---|---|---|
-| scene changes | the shot cuts | structure, chapters, montage |
+| shot changes | one shot ends and the next begins | structure, chapters, montage |
 | motion events | sustained movement starts | activity of any kind |
 | motion peaks | a spike of movement | impacts, sudden action |
 | audio peaks | loudness rises sharply | reactions, impacts, speech onset |

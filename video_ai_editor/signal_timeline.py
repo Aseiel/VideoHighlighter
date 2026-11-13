@@ -156,7 +156,7 @@ class SignalTimelineScene(QGraphicsScene):
             ('objects', [f"Object: {o}" for o in self.object_classes]),
             ('visual_search', [f"Search: {q}" for q in self.visual_queries]),
             ('expressions', ['Expressions']),
-            ('scenes', ['Scenes']),
+            ('scenes', ['Shots']),
             ('motion', ['Motion Events', 'Motion Peaks']),
             ('audio', ['Audio Peaks']),
             ('highlights', ['Final Highlights']),
@@ -1571,8 +1571,8 @@ class SignalTimelineScene(QGraphicsScene):
         return y_pos + self.layer_height + self.layer_spacing
 
     def draw_scenes_layer(self, y_pos):
-        """Draw scene changes with improved labeling"""
-        self.row_labels.append(("SCENES", y_pos))
+        """Draw the shots, one bar each."""
+        self.row_labels.append(("SHOTS", y_pos))
         
         if 'scenes' in self.cache_data:
             for i, scene in enumerate(self.cache_data['scenes']):
@@ -1586,7 +1586,7 @@ class SignalTimelineScene(QGraphicsScene):
                 
                 bar = TimelineBar(
                     start, end, y_pos, self.layer_height,
-                    scene_color, f"Scene {i+1}",
+                    scene_color, f"Shot {i+1}",
                     metadata={'scene_index': i, 'duration': end - start}
                 )
                 self.draw_bar(bar)

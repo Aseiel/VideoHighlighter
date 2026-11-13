@@ -417,7 +417,7 @@ def build_auto_segments(
     all_regions.extend(r)
 
     r = _regions_from_scenes(scenes, score)
-    log_fn(f"   Scenes   → {len(r)} regions")
+    log_fn(f"   Shots    → {len(r)} regions")
     all_regions.extend(r)
 
     r = _regions_from_keywords(keyword_matches, score)

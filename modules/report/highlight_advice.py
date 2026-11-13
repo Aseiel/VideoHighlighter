@@ -46,7 +46,7 @@ SIGNAL_WEIGHTS = {
 }
 
 SIGNAL_NAMES = {
-    "scene": "scene changes",
+    "scene": "shot changes",
     "motion_event": "motion events",
     "motion_peak": "motion peaks",
     "audio": "audio peaks",

@@ -1053,7 +1053,7 @@ class VideoContextBuilder:
         # --- Scenes ---
         scenes = analysis_data.get("scenes", [])
         if scenes:
-            parts.append(f"## Scene Changes ({len(scenes)})")
+            parts.append(f"## Shot Changes ({len(scenes)})")
             for sc in scenes[:max_items]:
                 s, e = sc.get("start", 0), sc.get("end", 0)
                 parts.append(f"  - {int(s)//60}:{int(s)%60:02d} → {int(e)//60}:{int(e)%60:02d}")

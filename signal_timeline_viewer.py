@@ -94,7 +94,7 @@ class SignalLabelPanel(QWidget):
         "AUDIO WAVEFORM": lambda scene: scene._nav_timestamps_waveform_peaks(),
         "ACTIONS":        lambda scene: scene._nav_timestamps_actions(),
         "OBJECTS":        lambda scene: scene._nav_timestamps_objects(),
-        "SCENES":         lambda scene: scene._nav_timestamps_scenes(),
+        "SHOTS":          lambda scene: scene._nav_timestamps_scenes(),
         "MOTION EVENTS":  lambda scene: scene._nav_timestamps_motion_events(),
         "MOTION PEAKS":   lambda scene: scene._nav_timestamps_motion_peaks(),
         "AUDIO PEAKS":    lambda scene: scene._nav_timestamps_audio_peaks(),
@@ -3053,8 +3053,8 @@ class SignalTimelineWindow(QMainWindow):
         # Motion & scenes / Audio: no inputs — one detector pass each, folded
         # into the cache. Motion covers scene, motion-event and motion-peak rows.
         lay.addLayout(self._make_analyze_row(
-            "motion", "Motion & scenes",
-            "Detect scene cuts and motion over the whole video (scene, motion "
+            "motion", "Motion & shots",
+            "Detect shot changes and motion over the whole video (shot change, motion "
             "event and motion peak — one pass)."))
         lay.addLayout(self._make_analyze_row(
             "audio", "Audio",
@@ -3294,7 +3294,7 @@ class SignalTimelineWindow(QMainWindow):
                 self._enable_layer_and_reload(layer)
             if row:
                 row["status"].setText(
-                    f"✓ {len(result.get('scenes', []))} scenes, "
+                    f"✓ {len(result.get('scenes', []))} shots, "
                     f"{len(result.get('motion_peaks', []))} peaks")
         elif kind == "audio":
             self.cache_data["audio_peaks"] = result.get("audio_peaks", [])

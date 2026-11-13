@@ -39,7 +39,7 @@ Edit [`config.yaml`](../config.yaml):
 
 ```yaml
 scoring:
-  scene_points: 1           # Enable scene cuts
+  scene_points: 1           # Enable shot changes
   motion_peak_points: 0     # Disable unless you want motion peaks
   loudness_burst_points: 0  # Disable unless you want audio bursts
 
@@ -54,7 +54,7 @@ objects:
 ### How do I tune the scoring?
 Each signal contributes points toward keeping a moment. Higher total scores win (up to `max_duration` seconds). Enable signals you want by giving them positive point values.
 
-Default scoring prioritizes scene cuts (`scene_points: 1`) and object detections (`object_points: 5`).
+Default scoring prioritizes shot changes (`scene_points: 1`) and object detections (`object_points: 5`).
 
 ### What does `advanced.frame_skip` do?
 Controls processing rate:
