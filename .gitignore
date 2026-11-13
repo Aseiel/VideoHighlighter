@@ -133,3 +133,6 @@ labels/
 
 # Named GUI settings (presets/*.yaml next to config.yaml). User data.
 presets/
+
+# TransNetV2 shot-boundary model (tools/export_transnetv2.py makes it)
+models/transnetv2/

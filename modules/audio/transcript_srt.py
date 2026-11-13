@@ -204,14 +204,16 @@ def adjust_subtitle_duration(start: float, end: float, text: str,
     return start, end
 
 def create_srt_content(segments, max_chars=80, min_duration=0.8, chars_per_second=15,
-                       show_speakers=False):
+                       show_speakers=False, shot_changes=None, log_fn=print):
     """
     Create SRT content with precise timestamps from original segments.
     Translation text is used, but timing is preserved.
     Each chunk gets proper duration based on reading speed.
+
+    ``shot_changes`` is ``(cut_times, fps)``: given, the cues are then timed
+    to the cuts (modules/audio/shot_snap.py).
     """
-    srt_lines = []
-    subtitle_number = 1
+    cues = []
 
     for idx, seg in enumerate(segments):
         text = clean_subtitle_text(seg['text'])
@@ -257,15 +259,22 @@ def create_srt_content(segments, max_chars=80, min_duration=0.8, chars_per_secon
                 chunk_duration = min_duration
             
             chunk_end = current_start + chunk_duration
-            
-            srt_lines.append(str(subtitle_number))
-            srt_lines.append(f"{format_timestamp_srt(current_start)} --> {format_timestamp_srt(chunk_end)}")
-            srt_lines.append(chunk)
-            srt_lines.append("")
-
-            subtitle_number += 1
+            cues.append({"start": current_start, "end": chunk_end, "text": chunk})
             current_start = chunk_end
 
+    if shot_changes and cues:
+        from modules.audio import shot_snap
+        cut_times, fps = shot_changes
+        cues, moved = shot_snap.snap(cues, cut_times, fps, min_seconds=min_duration)
+        log_fn(f"🎬 Subtitles timed to {len(cut_times)} shot changes: "
+               f"{moved['starts']} start(s) and {moved['ends']} end(s) moved onto a cut")
+
+    srt_lines = []
+    for number, cue in enumerate(cues, 1):
+        srt_lines.append(str(number))
+        srt_lines.append(f"{format_timestamp_srt(cue['start'])} --> {format_timestamp_srt(cue['end'])}")
+        srt_lines.append(cue["text"])
+        srt_lines.append("")
     return "\n".join(srt_lines)
 
 def create_enhanced_transcript(segments: List[Dict], pause_threshold=2.0) -> str:
@@ -548,8 +557,10 @@ def translate_segments(segments, source_lang="en", target_lang="pl",
 # --------------------------
 
 def create_srt_file(segments, output_path, source_lang="en", target_lang=None,
-                    show_speakers=False, progress_fn=None):
-    """Create SRT subtitle file from transcript segments with optional translation"""
+                    show_speakers=False, progress_fn=None, shot_changes=None,
+                    log_fn=print):
+    """Create SRT subtitle file from transcript segments with optional
+    translation; ``shot_changes`` as for ``create_srt_content``."""
     # Before translating: a loop costs translation batches too.
     segments = clean_segments(segments)
     if target_lang and target_lang != source_lang:
@@ -557,7 +568,8 @@ def create_srt_file(segments, output_path, source_lang="en", target_lang=None,
         segments = translate_segments(segments, source_lang, target_lang,
                                       progress_fn=progress_fn)
 
-    srt_content = create_srt_content(segments, show_speakers=show_speakers)
+    srt_content = create_srt_content(segments, show_speakers=show_speakers,
+                                     shot_changes=shot_changes, log_fn=log_fn)
 
     with open(output_path, "w", encoding="utf-8-sig") as f:
         f.write(srt_content)

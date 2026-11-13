@@ -805,6 +805,7 @@ class SignalRunWorker(QThread):
                                        source_lang=p.get("source_lang"),
                                        target_lang=p.get("target_lang"),
                                        reuse_cached=p.get("reuse_cached", True),
+                                       snap_to_shots=bool(p.get("snap_to_shots")),
                                        progress=progress, cancel=c, log=self.log.emit)
             return {"transcript": result}
         raise ValueError(f"unknown signal kind: {self.kind}")
@@ -1189,6 +1190,8 @@ class VideoHighlighterGUI(QWidget):
         self.file_list = VideoList(self.add_video_paths)
         accept_video_drops(self.full_page, self.add_video_paths)
         self.file_list.setMaximumHeight(46)
+        self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_list.customContextMenuRequested.connect(self._file_list_context_menu)
         file_layout.addWidget(self.file_list)
 
         saved_paths = self.config_data.get("video", {}).get("paths", [])
@@ -2086,6 +2089,17 @@ class VideoHighlighterGUI(QWidget):
             subtitles_cfg.get("target_lang") or content_language.whisper_code(i18n.current_language())))
         self.subtitle_target_lang.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
         subtitle_form.addRow(i18n.t("Target language:"), self.subtitle_target_lang)
+        # Off by default: it finds the shot changes first, which adds about a
+        # minute per 20 minutes of video on an Intel GPU.
+        self.subtitle_snap_checkbox = QCheckBox("Time subtitles to shot changes")
+        self.subtitle_snap_checkbox.setToolTip(
+            "Find the video's shot changes and line the subtitles up with them, "
+            "as subtitlers do: a line that starts or ends within half a second "
+            "of a cut starts on it, or ends just before it, so text and picture "
+            "change together instead of a few frames apart.")
+        self.subtitle_snap_checkbox.setChecked(bool(subtitles_cfg.get("snap_to_shots", False)))
+        self.subtitle_snap_checkbox.setEnabled(subtitles_cfg.get("enabled", False) and transcript_cfg.get("enabled", False))
+        subtitle_form.addRow("", self.subtitle_snap_checkbox)
         _sub_run = self._make_analyze_button(
             "subtitles", "Make subtitles",
             "Transcribe every video in the list and write a .srt next to each "
@@ -4521,6 +4535,7 @@ class VideoHighlighterGUI(QWidget):
             "transcript_source_lang": self.transcript_source_lang.currentText(),
             "search_keywords": search_keywords,
             "create_subtitles": self.subtitles_checkbox.isChecked() and use_transcript,
+            "snap_subtitles_to_shots": self.subtitle_snap_checkbox.isChecked(),
             # The spoken language has one home: Transcript Settings.
             "source_lang": self.transcript_source_lang.currentText(),
             "target_lang": self.subtitle_target_lang.currentText(),
@@ -4724,6 +4739,18 @@ class VideoHighlighterGUI(QWidget):
             self.download_worker = None
 
     # --- Multi-file support methods ---
+    def _file_list_context_menu(self, pos):
+        item = self.file_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        # Every cut to the frame, as an EDL and a plain list beside the video:
+        # what a subtitle editor loads to keep lines off shot changes.
+        shots = menu.addAction("Export shot list (EDL)…")
+        if menu.exec(self.file_list.mapToGlobal(pos)) is shots:
+            from modules.ui.shot_list_action import export_shot_list
+            export_shot_list(self, item.data(Qt.UserRole) or item.text())
+
     def browse_files(self):
         """Add one or more video files"""
         file_paths, _ = QFileDialog.getOpenFileNames(
@@ -4961,6 +4988,8 @@ class VideoHighlighterGUI(QWidget):
             self.subtitles_checkbox.setChecked(bool(sub["enabled"]))
         if "target_lang" in sub:
             self._set_lang_combo(self.subtitle_target_lang, str(sub["target_lang"]))
+        if "snap_to_shots" in sub:
+            self.subtitle_snap_checkbox.setChecked(bool(sub["snap_to_shots"]))
 
         adv = data.get("advanced") or {}
         if "frame_skip" in adv:
@@ -5136,6 +5165,7 @@ class VideoHighlighterGUI(QWidget):
                 # still reading subtitles.source_lang) sees one answer, not two.
                 "source_lang": self.transcript_source_lang.currentText(),
                 "target_lang": self.subtitle_target_lang.currentText(),
+                "snap_to_shots": self.subtitle_snap_checkbox.isChecked(),
             },
             # Detector knobs with no widget of their own. Carried through from
             # whatever is on disk rather than omitted, because this dict is
@@ -5219,6 +5249,7 @@ class VideoHighlighterGUI(QWidget):
         final_state = checked and transcript_enabled
         
         self.subtitle_target_lang.setEnabled(final_state)
+        self.subtitle_snap_checkbox.setEnabled(final_state)
 
     # --- Labels ---
     def load_labels_from_json(self, filepath):
@@ -6012,6 +6043,7 @@ class VideoHighlighterGUI(QWidget):
             "transcript_source_lang": self.transcript_source_lang.currentText(),
             "search_keywords": search_keywords,
             "create_subtitles": self.subtitles_checkbox.isChecked() and use_transcript,
+            "snap_subtitles_to_shots": self.subtitle_snap_checkbox.isChecked(),
             # The spoken language has one home: Transcript Settings.
             "source_lang": self.transcript_source_lang.currentText(),
             "target_lang": self.subtitle_target_lang.currentText(),
@@ -6358,6 +6390,7 @@ class VideoHighlighterGUI(QWidget):
             # cached one is labelled with its own language rather than this.
             params["language"] = self.transcript_source_lang.currentText()
             params["target_lang"] = self.subtitle_target_lang.currentText()
+            params["snap_to_shots"] = self.subtitle_snap_checkbox.isChecked()
             # "Force reprocess (ignore cache)" means a fresh transcript here too;
             # otherwise the one in the cache is reused and only the .srt is new.
             params["reuse_cached"] = not self.force_reprocess_checkbox.isChecked()

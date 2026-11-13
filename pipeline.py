@@ -476,6 +476,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         TRANSCRIPT_SOURCE_LANG = gui_config.get("transcript_source_lang", "en")
         SEARCH_KEYWORDS = gui_config.get("search_keywords", [])
         CREATE_SUBTITLES = gui_config.get("create_subtitles", False)
+        SNAP_SUBTITLES = gui_config.get("snap_subtitles_to_shots", False)
         TRANSCRIPT_ONLY = gui_config.get("transcript_only", False)
         TRANSCRIPT_POINTS = int(gui_config.get("transcript_points", 0))
         # Subtitles are written *from* the transcript, so their source language
@@ -2742,6 +2743,16 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 # Always create full subtitles
                 progress.update_progress(95, 100, "Pipeline", "Creating full-video subtitles...")
                 log("Creating subtitles for the full video...")
+                # Lined up with the shot changes when asked (modules/audio/
+                # shot_snap.py). Only the full-video file: a highlight's
+                # subtitles are re-based onto the cut, whose shots differ.
+                shot_changes = None
+                if SNAP_SUBTITLES:
+                    from modules.audio import shot_snap
+                    log("🎬 Finding shot changes to time the subtitles to…")
+                    shot_changes = shot_snap.shot_changes(
+                        video_path, log_fn=log,
+                        should_cancel=(lambda: bool(cancel_flag and cancel_flag.is_set())))
                 translated = None
                 if translate_to:
                     # Say which language it is translating out of: the default
@@ -2759,13 +2770,13 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         translate_to = None
                 if translate_to:
                     full_srt = f"{os.path.splitext(video_path)[0]}_{translate_to}.srt"
-                    create_srt_file(translated, full_srt)
+                    create_srt_file(translated, full_srt, shot_changes=shot_changes, log_fn=log)
                 else:
                     # "auto" is a request to Whisper, not a language to name a
                     # file after; untranslated, it is just the subtitles.
                     suffix = "" if SOURCE_LANG == "auto" else f"_{SOURCE_LANG}"
                     full_srt = f"{os.path.splitext(video_path)[0]}{suffix}.srt"
-                    create_srt_file(transcript_segments, full_srt)
+                    create_srt_file(transcript_segments, full_srt, shot_changes=shot_changes, log_fn=log)
                 log(f"Full-video subtitles created: {full_srt}")
 
                 # Create highlight subtitles if we have segments

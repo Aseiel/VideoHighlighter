@@ -208,6 +208,7 @@ def _band(progress: ProgressFn, lo: int, hi: int) -> ProgressFn:
 def run_subtitles(video_path: str, *, model: Optional[str] = None,
                   language: Optional[str] = None, source_lang: Optional[str] = None,
                   target_lang: Optional[str] = None, reuse_cached: bool = True,
+                  snap_to_shots: bool = False,
                   progress: ProgressFn = None, cancel=None, log=print) -> dict:
     """Write a full-video `.srt` next to the video, then return the same
     cache-shaped `transcript` dict `run_transcript` returns.
@@ -263,6 +264,20 @@ def run_subtitles(video_path: str, *, model: Optional[str] = None,
     if cancel is not None and cancel.is_set():
         raise _Cancelled()
 
+    # `snap_to_shots`: the cues are lined up with the video's shot changes
+    # (modules/audio/shot_snap.py), which have to be found first.
+    shot_changes = None
+    if snap_to_shots and segments:
+        from modules.audio import shot_snap
+        from modules.segments.shot_boundaries import ShotDetectionCancelled
+        log("🎬 Finding shot changes to time the subtitles to…")
+        try:
+            shot_changes = shot_snap.shot_changes(
+                video_path, log_fn=log,
+                should_cancel=(cancel.is_set if cancel is not None else None))
+        except ShotDetectionCancelled:
+            raise _Cancelled()
+
     if progress:
         progress(TRANSCRIBE_TO, 100, "Subtitles",
                  f"Translating {len(segments)} segments to {target_lang}..." if translating
@@ -273,7 +288,8 @@ def run_subtitles(video_path: str, *, model: Optional[str] = None,
     # run can sit for minutes, so it gets the rest of the bar.
     create_srt_file(segments, srt_path, source_lang=src,
                     target_lang=target_lang if translating else None,
-                    progress_fn=_band(progress, TRANSCRIBE_TO, 98))
+                    progress_fn=_band(progress, TRANSCRIBE_TO, 98),
+                    shot_changes=shot_changes, log_fn=log)
     log(f"✅ Subtitles saved: {srt_path}")
     return tr
 
