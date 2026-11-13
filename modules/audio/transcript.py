@@ -9,6 +9,7 @@ import time
 
 from modules.system.cuda_check import cuda_usable
 from modules.audio.transcript_cleanup import clean_segments
+from modules.audio import loop_recovery
 from modules.audio.segment_timing import is_stretched, retime, whisper_aligner
 
 
@@ -463,10 +464,39 @@ def get_transcript_segments(video_file, model_name="small", progress_fn=None, lo
                 log_fn(f"⚠️ WARNING: Expected '{language}' but Whisper detected '{detected_lang}'")
                 log_fn(f"   This may indicate unclear audio or incorrect language setting")
 
+            segments = result.get("segments", [])
+
+            # A window that opened on a sound Whisper could not make out can
+            # come back as one looped token, with the rest of the window's
+            # speech lost behind it; that stretch is decoded again from a
+            # little further in (modules/audio/loop_recovery.py).
+            if any(loop_recovery.is_loop(s) for s in segments):
+                chunk_audio = whisper.load_audio(chunk)
+
+                def redecode(start, end, _audio=chunk_audio):
+                    abort_if_cancelled()
+                    piece = _audio[int(start * 16000):int(end * 16000)]
+                    if ov_model is not None:
+                        got = ov_model.transcribe(
+                            piece, language=language,
+                            on_frac=lambda _f: abort_if_cancelled())
+                    else:
+                        got = model.transcribe(piece, **transcribe_params)
+                    return [dict(s, start=float(s["start"]) + start,
+                                 end=float(s["end"]) + start)
+                            for s in got.get("segments", [])]
+
+                try:
+                    segments = loop_recovery.recover(
+                        segments, redecode, len(chunk_audio) / 16000.0, log_fn)
+                except TranscriptionCancelled:
+                    raise
+                except Exception as e:  # noqa: BLE001 - keep what Whisper gave
+                    print(f"loop_recovery: {chunk}: {type(e).__name__}: {e}")
+
             # A line after a quiet stretch comes back starting where the last
             # one ended; those few get the times their words were said
             # (modules/audio/segment_timing.py).
-            segments = result.get("segments", [])
             if any(is_stretched(s) for s in segments):
                 abort_if_cancelled()
                 try:

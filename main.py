@@ -6274,6 +6274,11 @@ class VideoHighlighterGUI(QWidget):
         if self._signal_worker and self._signal_worker.isRunning():
             self.append_log("⚠️ An on-demand run is already going.")
             return
+        # These runs read their settings back from config.yaml (the model,
+        # the language, the detector), so what is on screen has to be in the
+        # file first: a Whisper model picked a moment ago was otherwise
+        # ignored for the one still saved from the last full run.
+        self.save_config()
 
         video_paths = self.get_file_list()
         if not video_paths:

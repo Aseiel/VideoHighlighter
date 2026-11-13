@@ -30,7 +30,9 @@ model, transcription runs where it ran before.
 """
 from __future__ import annotations
 
+import difflib
 import os
+import re
 import threading
 import time
 from typing import Callable, Dict, List, Optional
@@ -162,12 +164,23 @@ class OpenVINOWhisper:
             props["CACHE_DIR"] = cache
         self.device = device
         self.folder = folder
-        self._pipe = ov_genai.WhisperPipeline(folder, device, **props)
+        # Word timestamps are what put each line where it is said (see
+        # ``to_result``). They are a property of the compiled pipeline, so an
+        # export without alignment heads fails here and loads without them.
+        try:
+            self._pipe = ov_genai.WhisperPipeline(folder, device, word_timestamps=True, **props)
+            self._words = True
+        except Exception as e:  # noqa: BLE001 - line times are still Whisper's own
+            print(f"whisper_openvino: no word timestamps for {folder}: {type(e).__name__}: {e}")
+            self._pipe = ov_genai.WhisperPipeline(folder, device, **props)
+            self._words = False
         self._speed = _ASSUMED_SPEED
         self._lock = threading.Lock()
 
     def _generate(self, samples, language: Optional[str]):
         kwargs = dict(task="transcribe", return_timestamps=True)
+        if getattr(self, "_words", False):
+            kwargs["word_timestamps"] = True
         if language and language != "auto":
             kwargs["language"] = f"<|{language}|>"
         with self._lock:
@@ -227,9 +240,88 @@ class OpenVINOWhisper:
         return to_result(box["result"])
 
 
+_TOKEN = re.compile(r"\w+(?:'\w+)*", re.UNICODE)
+
+# A line's times from its words are used only when they stay this close to the
+# line's own: further out, the words were matched to the wrong line.
+WORD_SLACK_SECONDS = 1.0
+
+
+def _tokens(text: str) -> List[str]:
+    return [t.lower() for t in _TOKEN.findall(text or "")]
+
+
+def times_from_words(segments: List[Dict], words) -> int:
+    """Give each segment the start and end of its own words, in place.
+    Returns how many segments moved.
+
+    Over a long chunk the pipeline's line times fall on a half-second grid:
+    measured on a 10-minute chunk, almost every line started at x.44 or x.94,
+    0.1-0.5 s before the speech, while its word times matched a decode of the
+    same 30 seconds on their own (295.44 -> 295.66 for a line said at 295.7).
+    The words carry the same text as the lines, plus any loop the lines were
+    cleaned of, so they are matched to the lines token by token; a line whose
+    words do not all match, or land outside its own times by more than
+    ``WORD_SLACK_SECONDS``, keeps Whisper's times.
+    """
+    from modules.audio.segment_timing import bounds_from_words
+
+    flat = []                                   # (token, word index)
+    for i, w in enumerate(words or []):
+        for t in _tokens(getattr(w, "word", "")):
+            flat.append((t, i))
+    if not flat or not segments:
+        return 0
+    line_tokens = [(t, k) for k, seg in enumerate(segments) for t in _tokens(seg["text"])]
+    owner: Dict[int, List[int]] = {}
+    matcher = difflib.SequenceMatcher(None, [t for t, _ in line_tokens],
+                                      [t for t, _ in flat], autojunk=False)
+    for a, b, size in matcher.get_matching_blocks():
+        for n in range(size):
+            owner.setdefault(line_tokens[a + n][1], []).append(flat[b + n][1])
+    wanted = {}
+    for _t, k in line_tokens:
+        wanted[k] = wanted.get(k, 0) + 1
+    moved = 0
+    for k, seg in enumerate(segments):
+        found = owner.get(k, [])
+        if not found or len(found) != wanted.get(k):
+            continue
+        picked = [words[i] for i in sorted(set(found))]
+        bounds = bounds_from_words([(float(w.start_ts), float(w.end_ts), w.word, 1.0)
+                                    for w in picked])
+        if bounds is None:
+            continue
+        start, end = bounds
+        if (end <= start or start < seg["start"] - WORD_SLACK_SECONDS
+                or end > seg["end"] + WORD_SLACK_SECONDS):
+            continue
+        seg["start"], seg["end"] = start, end
+        moved += 1
+    if moved:
+        _no_overlaps(segments)
+    return moved
+
+
+def _no_overlaps(segments: List[Dict]) -> None:
+    """One line ends before the next begins. Moving some lines and not others
+    left a few overlapping their neighbour (by under a second, on one episode
+    10 of 386): the earlier line ends where the next starts, and a next line
+    that now starts before the earlier one (a repeated "Pikachu!" matched to the
+    other copy) starts where the earlier one ends instead."""
+    for prev, nxt in zip(segments, segments[1:]):
+        if nxt["start"] >= prev["end"]:
+            continue
+        if nxt["start"] > prev["start"]:
+            prev["end"] = nxt["start"]
+        else:
+            nxt["start"] = min(prev["end"], nxt["end"])
+
+
 def to_result(decoded) -> Dict:
     """openai-whisper's result shape from a WhisperDecodedResults: language
-    code and segments with start, end and text. No no-speech or log-prob
+    code and segments with start, end and text, timed by their words when the
+    pipeline returned them (``times_from_words``). No no-speech or log-prob
     numbers: the pipeline has none, and transcript_cleanup only judges
     segments that carry them."""
     segments: List[Dict] = []
@@ -242,6 +334,12 @@ def to_result(decoded) -> Dict:
         if end < start:          # an open-ended last chunk comes back as -1
             end = start
         segments.append({"start": start, "end": end, "text": text})
+    words = getattr(decoded, "words", None)
+    if words:
+        try:
+            times_from_words(segments, list(words))
+        except Exception as e:  # noqa: BLE001 - Whisper's own times still stand
+            print(f"whisper_openvino: word times not applied: {type(e).__name__}: {e}")
     language = (getattr(decoded, "language", "") or "").strip("<|>") or "unknown"
     return {"language": language, "segments": segments}
 

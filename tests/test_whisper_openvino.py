@@ -93,6 +93,68 @@ def test_to_result():
         {"start": 28.0, "end": 28.0, "text": "Open end"}]
 
 
+def _word(word, start, end):
+    return types.SimpleNamespace(word=word, start_ts=start, end_ts=end)
+
+
+def test_lines_take_the_times_of_their_own_words():
+    decoded = types.SimpleNamespace(language="en", chunks=[
+        _chunk(" You're right on time.", 295.44, 297.44),
+        _chunk(" Let's go!", 300.44, 302.44)], words=[
+        _word(" You're", 295.66, 296.22), _word(" right", 296.22, 296.44),
+        _word(" on", 296.44, 296.70), _word(" time.", 296.70, 297.08),
+        _word(" Let's", 300.58, 301.0), _word(" go!", 301.0, 301.3)])
+    segs = wov.to_result(decoded)["segments"]
+    assert [(s["start"], s["end"]) for s in segs] == [(295.66, 297.08), (300.58, 301.3)]
+    assert [s["text"] for s in segs] == ["You're right on time.", "Let's go!"]
+
+
+def test_words_of_a_loop_the_lines_were_cleaned_of_are_skipped():
+    # Measured on a real chunk: the words held fifteen "so sick" that no line
+    # carried (cleanup had dropped them), between two ordinary lines.
+    segs = [{"start": 10.0, "end": 12.0, "text": "we're looking"},
+            {"start": 20.0, "end": 21.0, "text": "next line"}]
+    words = ([_word(" we're", 10.1, 10.3), _word(" looking", 10.3, 10.6)]
+             + [_word(w, 12.0 + i, 12.5 + i) for i, w in enumerate([" so", " sick"] * 3)]
+             + [_word(" next", 20.2, 20.4), _word(" line", 20.4, 20.8)])
+    assert wov.times_from_words(segs, words) == 2
+    assert (segs[0]["start"], segs[0]["end"]) == (10.1, 10.6)
+    assert (segs[1]["start"], segs[1]["end"]) == (20.2, 20.8)
+
+
+def test_a_line_with_unmatched_or_far_words_keeps_its_times():
+    segs = [{"start": 5.0, "end": 6.0, "text": "hello there"},
+            {"start": 8.0, "end": 9.0, "text": "far away"}]
+    words = [_word(" hello", 5.1, 5.4),                         # "there" missing
+             _word(" far", 15.0, 15.3), _word(" away", 15.3, 15.6)]   # 6 s out
+    assert wov.times_from_words(segs, words) == 0
+    assert segs == [{"start": 5.0, "end": 6.0, "text": "hello there"},
+                    {"start": 8.0, "end": 9.0, "text": "far away"}]
+
+
+def test_moved_lines_do_not_overlap_their_neighbours():
+    segs = [{"start": 168.0, "end": 172.0, "text": "every street"},
+            {"start": 172.5, "end": 174.6, "text": "I'm stumped"},
+            {"start": 1107.0, "end": 1108.0, "text": "Pikachu"},
+            {"start": 1108.0, "end": 1112.0, "text": "Pikachu"}]
+    words = [_word(" every", 171.6, 171.85), _word(" street", 171.85, 172.14),
+             _word(" I'm", 172.08, 172.5), _word(" stumped", 172.5, 174.64),
+             _word(" Pikachu", 1107.56, 1108.12), _word(" Pikachu", 1107.42, 1108.6)]
+    wov.times_from_words(segs, words)
+    assert segs[0]["end"] == segs[1]["start"] == 172.08
+    assert all(b["start"] >= a["end"] for a, b in zip(segs, segs[1:]))
+
+
+def test_word_timestamps_are_asked_for_when_the_pipeline_has_them():
+    pipe = _Pipe()
+    m = _model(pipe)
+    m.transcribe(np.zeros(16000, np.float32), language="en")
+    m._words = True
+    m.transcribe(np.zeros(16000, np.float32), language="en")
+    assert "word_timestamps" not in pipe.calls[0]
+    assert pipe.calls[1]["word_timestamps"] is True
+
+
 class _Pipe:
     """Stands in for openvino_genai.WhisperPipeline."""
 
