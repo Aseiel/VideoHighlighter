@@ -156,11 +156,15 @@ def running_servers(timeout: float = 1.0) -> dict:
         futures = {name: pool.submit(_probe, name, timeout)
                    for name in SERVER_BACKENDS}
         found = {name: future.result() for name, future in futures.items()}
-    if found.get("ollama") is not None:
-        _cache[resolve_ollama_host()] = list(found["ollama"])
-    if found.get("lmstudio") is not None:
-        from llm import lmstudio
-        _lmstudio_cache[lmstudio.resolve()] = list(found["lmstudio"])
+    # A server that did not answer is stored too, as the empty list the two
+    # functions above store when they cannot ask. Leaving it out meant the menu
+    # that called this asked the dead server again straight afterwards, on the
+    # GUI thread: on Windows a refused connection to localhost takes about two
+    # seconds per address tried, and opening a video froze the window for
+    # 4-7 s on every machine without LM Studio running. Refresh still asks.
+    from llm import lmstudio
+    _cache[resolve_ollama_host()] = list(found.get("ollama") or [])
+    _lmstudio_cache[lmstudio.resolve()] = list(found.get("lmstudio") or [])
     return found
 
 

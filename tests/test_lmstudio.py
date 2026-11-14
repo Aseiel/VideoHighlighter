@@ -338,6 +338,29 @@ def test_running_servers_asks_both_and_tells_off_from_empty(monkeypatch):
     assert llm_discovery.running_servers() == {"ollama": None, "lmstudio": []}
 
 
+
+def test_a_server_that_did_not_answer_is_not_asked_again(monkeypatch):
+    """The menu's follow-up lookup is answered from the probe, even when the
+    answer was "nothing there" - that lookup runs on the GUI thread."""
+    from modules.narration import llm_discovery
+    asked = []
+
+    def get(url, **kw):
+        asked.append(url)
+        raise _ConnectionError()
+    _requests(monkeypatch, get=get)
+    monkeypatch.setattr(lmstudio, "stored", lambda settings=None: "")
+    monkeypatch.setattr(llm_discovery, "resolve_ollama_host",
+                        lambda *a, **kw: "http://localhost:11434")
+    llm_discovery.forget_ollama_models()
+
+    assert llm_discovery.running_servers() == {"ollama": None, "lmstudio": None}
+    probed = len(asked)
+    assert llm_discovery.models_for("lmstudio") == []
+    assert llm_discovery.models_for("ollama") == []
+    assert len(asked) == probed
+
+
 def test_narration_preflight_for_lmstudio(monkeypatch):
     from modules.narration import story_run
     _requests(monkeypatch, get=_lmstudio_get)
