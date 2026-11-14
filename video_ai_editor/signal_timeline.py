@@ -1,4 +1,4 @@
-from .timeline_bars import TimelineBar, DraggableTimelineBar
+from .timeline_bars import TimelineBar, DraggableTimelineBar, BarLabel
 from collections import defaultdict
 import json
 
@@ -2007,7 +2007,7 @@ class SignalTimelineScene(QGraphicsScene):
                     # PySide 6.10 a parent passed to the constructor does not
                     # take ownership, so the label was deleted with its Python
                     # wrapper when this method returned and no bar had one.
-                    text = QGraphicsTextItem(label_text)
+                    text = BarLabel(label_text)
                     text.setParentItem(draggable_item)
                     text.setFont(font)
                     
@@ -2253,6 +2253,27 @@ class SignalTimelineScene(QGraphicsScene):
         self.pixels_per_second = zoom_level
         self.build_timeline()
     
+    def _holds(self, item) -> bool:
+        """True if `item` is alive and in this scene.
+
+        The scene's own items, like the playhead, outlive nothing: a rebuild's
+        clear() deletes them under any reference still held. This asks the
+        wrapper whether its C++ object is alive before touching it, then asks
+        the item which scene it is in. The old test, `item in self.items()`,
+        listed every item in the scene to answer the same question; with a
+        film's worth of shots that was 4,000 items on every playback tick and
+        every mouse move of a range drag.
+        """
+        if item is None:
+            return False
+        try:
+            from shiboken6 import isValid
+            if not isValid(item):
+                return False
+            return item.scene() is self
+        except Exception:
+            return False
+
     def set_current_time(self, seconds):
         """Set current time indicator — moves existing line instead of recreating"""
         self.current_time_seconds = seconds
@@ -2279,7 +2300,7 @@ class SignalTimelineScene(QGraphicsScene):
         # Move existing line or create if missing. None is now an expected state
         # rather than an absent attribute — build_timeline drops the reference
         # when it wipes the scene — so test for it directly.
-        if getattr(self, 'current_time_line', None) is not None and self.current_time_line in self.items():
+        if self._holds(getattr(self, 'current_time_line', None)):
             self.current_time_line.setLine(x, 0, x, h)
             self.current_time_caret.setPos(x, 0)
         else:
@@ -2315,8 +2336,7 @@ class SignalTimelineScene(QGraphicsScene):
         width  = max(2.0, (t1 - t0) * self.pixels_per_second)
         height = self.sceneRect().height()
 
-        if (self._selection_rect_item is not None
-                and self._selection_rect_item in self.items()):
+        if self._holds(self._selection_rect_item):
             self._selection_rect_item.setRect(x0, 0, width, height)
         else:
             pen   = QPen(QColor(47, 129, 247, 200), 1.5)
@@ -2337,8 +2357,7 @@ class SignalTimelineScene(QGraphicsScene):
 
         font = QFont("Consolas", 9, QFont.Weight.Bold)
 
-        if (self._selection_label_item is not None
-                and self._selection_label_item in self.items()):
+        if self._holds(self._selection_label_item):
             self._selection_label_item.setPlainText(text)
             self._selection_label_item.setPos(x0 + 4, 2)
         else:
@@ -2362,8 +2381,7 @@ class SignalTimelineScene(QGraphicsScene):
             return None
 
         # Make the rect visually distinct ("ready to drag")
-        if (self._selection_rect_item is not None
-                and self._selection_rect_item in self.items()):
+        if self._holds(self._selection_rect_item):
             # Brighter border, slightly more opaque fill
             self._selection_rect_item.setPen(QPen(QColor(47, 129, 247, 255), 2))
             self._selection_rect_item.setBrush(QBrush(QColor(47, 129, 247, 60)))
@@ -2379,7 +2397,7 @@ class SignalTimelineScene(QGraphicsScene):
         """Remove the selection overlay entirely."""
         for attr in ('_selection_rect_item', '_selection_label_item'):
             item = getattr(self, attr, None)
-            if item is not None and item in self.items():
+            if self._holds(item):
                 try:
                     self.removeItem(item)
                 except RuntimeError:
@@ -2398,8 +2416,7 @@ class SignalTimelineScene(QGraphicsScene):
         """
         if not self._selection_active:
             return False
-        if (self._selection_rect_item is None
-                or self._selection_rect_item not in self.items()):
+        if not self._holds(self._selection_rect_item):
             return False
         return self._selection_rect_item.contains(
             self._selection_rect_item.mapFromScene(scene_pos)

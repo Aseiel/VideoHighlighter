@@ -8,6 +8,45 @@ from PySide6.QtGui import (
 from PySide6.QtCore import QMimeData
 from PySide6.QtGui import QDrag
 
+
+class BarLabel(QGraphicsTextItem):
+    """A bar's text, drawn only while it can still be read.
+
+    The timeline zooms by scaling the view horizontally and leaving the height
+    alone, so zoomed out every label is its text squeezed sideways. Qt cannot
+    use its glyph cache for text under a non-uniform scale and draws each
+    glyph from its outline instead, which is the costliest thing a repaint
+    can do — for text that is a smear at that size anyway.
+
+    Measured on a 97-minute film with 1129 shots, zoomed to the whole film
+    with two cores: every playhead step repainted a 15-pixel strip in about
+    19 ms, against 7 ms with no shots, and hiding the labels alone took the
+    strip from 4.2 ms to nothing. On a laptop with half the single-core speed
+    that is more than a 30 fps playback tick has, and the window stops
+    answering.
+
+    The bar keeps its tooltip and its colour, so nothing is lost but the
+    smear; zoomed back in, the label paints again.
+    """
+
+    #: Horizontal-to-vertical scale below which the text is not drawn. At one
+    #: half it is still readable as squeezed text; much below that it is not.
+    MIN_SQUEEZE = 0.5
+
+    @classmethod
+    def legible(cls, transform) -> bool:
+        """True when `transform` leaves the text wide enough to read."""
+        sx, sy = abs(transform.m11()), abs(transform.m22())
+        if sy == 0:
+            return False
+        return sx >= cls.MIN_SQUEEZE * sy
+
+    def paint(self, painter, option, widget=None):
+        if not self.legible(painter.worldTransform()):
+            return
+        super().paint(painter, option, widget)
+
+
 class TimelineBar:
     """Represents a single signal bar on the timeline"""
     def __init__(self, start_time, end_time, y_position, height, color, label, 
