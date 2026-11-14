@@ -27,7 +27,10 @@ from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QDoubleSpinBox, QSpinBox,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QThread, QSettings, QObject
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import (
+    QColor, QFont, QTextCharFormat, QTextCursor, QTextLength,
+    QTextTableFormat,
+)
 
 from modules.ui.collapsible import CollapsibleSection
 from modules.ui.fit import fit_width
@@ -1251,11 +1254,11 @@ class LLMChatWidget(QWidget):
                     llm, data, video_path
                 )
                 stats = self.reasoning_engine.reasoning_engine.get_action_statistics()
-                self._append_system(
+                self._note(
                     f"🧠 Reasoning engine initialized with {stats['total_actions']} actions analyzed"
                 )
                 if not llm:
-                    self._append_system(
+                    self._note(
                         "ℹ️ Stats available now. Connect a model for reasoning questions."
                     )
             except Exception as e:
@@ -1289,11 +1292,7 @@ class LLMChatWidget(QWidget):
             self._timeline_bridge.set_timeline_window(window)
             self._timeline_bridge.set_scan_callback(self._trigger_visual_scan)
             self._update_context_label()
-            self._append_system(
-                "Timeline connected! You can now ask me to edit the timeline.\n"
-                "Examples: 'add a clip at 0:10 to 0:15', 'remove clip 2', "
-                "'show only person detections', 'play the clip at 0:30'"
-            )
+            self._note("Timeline connected.")
 
         # Always grab video path from timeline window
         if hasattr(window, 'video_path') and window.video_path:
@@ -1383,7 +1382,7 @@ class LLMChatWidget(QWidget):
                 self._analyzer.close()
             
             self._analyzer = VideoSeekAnalyzer(path, self._llm, verbose=False)
-            self._append_system(f"✅ Video analyzer ready: {os.path.basename(path)}")
+            self._note(f"✅ Video analyzer ready: {os.path.basename(path)}")
             return True
         except Exception as e:
             self._append_system(f"❌ Failed to initialize analyzer: {e}")
@@ -1446,9 +1445,10 @@ class LLMChatWidget(QWidget):
         self.send_btn.setEnabled(False)
         self.send_btn.setText("...")
         self.stop_btn.setEnabled(True)
-        self._append_html(
-            '<div style="color:#8BC34A;margin-top:8px;"><b>Assistant:</b></div>'
-        )
+        # The answer's box is opened by its first word, not here: whatever is
+        # said while the question is being prepared (a frame captured, a
+        # warning) then sits above the answer instead of underneath it.
+        self._answer_box = None
 
     def _start_agent_turn(self, message: str, history: list) -> None:
         from llm.assistant_agent import AgentWorker, compose_prompt, converse_for
@@ -2057,11 +2057,17 @@ class LLMChatWidget(QWidget):
         else:
             age_str = f"{age_sec/86400:.1f}d ago"
 
-        self._append_system(f"Auto-loading latest cache: {latest.name} ({age_str})")
+        self._note(f"Auto-loading latest cache: {latest.name} ({age_str})")
         self._load_cache_file(str(latest))
 
-    def _load_cache_file(self, filepath: str, video_path: str = "") -> bool:
-        """Load a .cache.json file and set it as analysis context."""
+    def _load_cache_file(self, filepath: str, video_path: str = "",
+                         announce: bool = False) -> bool:
+        """Load a .cache.json file and set it as analysis context.
+
+        ``announce`` puts the summary in the conversation, for a file the
+        user chose by hand. A cache found automatically is not news: the
+        context line above the chat already says what is loaded.
+        """
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -2088,7 +2094,7 @@ class LLMChatWidget(QWidget):
             audio = data.get("audio", {})
             n_audio = len(audio.get("peaks", [])) if isinstance(audio, dict) else 0
 
-            self._append_system(
+            (self._append_system if announce else self._note)(
                 f"Cache loaded: {os.path.basename(filepath)}\n"
                 f"  Duration: {int(dur)}s ({int(dur)//60}m{int(dur)%60:02d}s) | "
                 f"Objects: {n_obj} | Actions: {n_act} | "
@@ -2112,7 +2118,7 @@ class LLMChatWidget(QWidget):
             "Cache Files (*.cache.json);;JSON Files (*.json);;All Files (*)"
         )
         if path:
-            self._load_cache_file(path)
+            self._load_cache_file(path, announce=True)
 
     def _show_context_debug(self):
         """Show exactly what context text would be sent to the LLM."""
@@ -2527,20 +2533,16 @@ class LLMChatWidget(QWidget):
             # Update reasoning engine with now-connected LLM
             if hasattr(self, 'reasoning_engine') and self.reasoning_engine:
                 self.reasoning_engine.llm = self._llm
-                self._append_system("🧠 Reasoning engine now has LLM — 'why' questions enabled")
+                self._note("🧠 Reasoning engine now has LLM — 'why' questions enabled")
 
+            name = os.path.basename(gguf_path) if backend == 'llama-cpp' else model
             if self._analysis_data:
-                n_obj = len(self._analysis_data.get("objects", []))
-                n_act = len(self._analysis_data.get("actions", []))
-                self._append_system(
-                    f"Connected to {os.path.basename(gguf_path) if backend == 'llama-cpp' else model}. "
-                    f"Context ready: {n_obj} object entries, {n_act} actions."
-                )
+                self._append_system(f"Connected to {name}.")
             else:
                 self._append_system(
-                    f"Connected to {os.path.basename(gguf_path) if backend == 'llama-cpp' else model}. "
-                    f"WARNING: No video context! Use 'Load Cache' first."
-                )
+                    f"Connected to {name}. No analysis is loaded for this video "
+                    "yet, so answers have nothing to draw on. Use Load Cache, or "
+                    "analyse the video first.")
 
         except Exception as e:
             self.status_label.setText(f"Error: {e}")
@@ -2663,9 +2665,10 @@ class LLMChatWidget(QWidget):
         self.send_btn.setText("...")
         self.stop_btn.setEnabled(True)
 
-        self._append_html(
-            '<div style="color:#8BC34A;margin-top:8px;"><b>Assistant:</b></div>'
-        )
+        # The answer's box is opened by its first word, not here: whatever is
+        # said while the question is being prepared (a frame captured, a
+        # warning) then sits above the answer instead of underneath it.
+        self._answer_box = None
 
         # Build timeline context if connected
         timeline_ctx = ""
@@ -2703,13 +2706,10 @@ class LLMChatWidget(QWidget):
                     frame_b64 = window.capture_current_frame_base64()
                     if frame_b64:
                         self._append_system(
-                            f"📷 Frame captured at {window.current_time:.1f}s "
-                            f"({len(frame_b64)//1024}KB)"
+                            f"📷 Frame captured at {window.current_time:.1f}s"
                         )
                         if has_timeline:
-                            self._append_system(
-                                "ℹ️ Combining frame analysis with timeline context..."
-                            )
+                            self._note("Combining the frame with timeline context.")
                     else:
                         self._append_system("⚠️ Frame capture failed")
             else:
@@ -2731,13 +2731,10 @@ class LLMChatWidget(QWidget):
                     frame_b64 = window.capture_current_frame_base64()
                     if frame_b64:
                         self._append_system(
-                            f"📷 Frame captured at {window.current_time:.1f}s "
-                            f"({len(frame_b64)//1024}KB)"
+                            f"📷 Frame captured at {window.current_time:.1f}s"
                         )
                         if has_timeline:
-                            self._append_system(
-                                "ℹ️ Combining frame analysis with timeline context..."
-                            )
+                            self._note("Combining the frame with timeline context.")
                     else:
                         self._append_system("⚠️ Frame capture failed")
 
@@ -2921,9 +2918,10 @@ class LLMChatWidget(QWidget):
 
     @Slot(str)
     def _on_token(self, token: str):
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertText(token)
+        if getattr(self, "_answer_box", None) is None:
+            self._answer_box = self._open_box(mine=False)
+        cursor = self._answer_box.cellAt(0, 0).lastCursorPosition()
+        cursor.insertText(token, self._message_format())
         self.chat_display.setTextCursor(cursor)
         self.chat_display.ensureCursorVisible()
 
@@ -2936,11 +2934,7 @@ class LLMChatWidget(QWidget):
                 from .llm_timeline_bridge import parse_commands
                 commands = parse_commands(full_text)
                 if commands:
-                    cursor = self.chat_display.textCursor()
-                    cursor.movePosition(QTextCursor.End)
-                    cursor.insertText("\n")
-                    self.chat_display.setTextCursor(cursor)
-
+                    self._close_answer_box()
                     _, results = self._timeline_bridge.process_response(full_text)
                     for result in results:
                         self._append_html(
@@ -2952,10 +2946,7 @@ class LLMChatWidget(QWidget):
                     f'<div style="color:#ff9800;">Command error: {e}</div>'
                 )
 
-        cursor = self.chat_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        cursor.insertText("\n\n")
-        self.chat_display.setTextCursor(cursor)
+        self._close_answer_box()
 
         self.input_field.setEnabled(True)
         self.send_btn.setEnabled(True)
@@ -2965,6 +2956,7 @@ class LLMChatWidget(QWidget):
 
     @Slot(str)
     def _on_response_error(self, error_msg: str):
+        self._close_answer_box()
         self._append_html(
             f'<div style="color:#f44336;margin-left:12px;">Error: {error_msg}</div><br>'
         )
@@ -2975,6 +2967,7 @@ class LLMChatWidget(QWidget):
 
     def _clear_chat(self):
         self.chat_display.clear()
+        self._answer_box = None
         self._chat_history.clear()
         if self._llm and self._llm.is_loaded():
             self._append_system("Chat cleared. Ready for new questions.")
@@ -2994,19 +2987,67 @@ class LLMChatWidget(QWidget):
         self.chat_display.setTextCursor(cursor)
         self.chat_display.ensureCursorVisible()
 
+    # One box per message, as chat apps draw them: the user's on the right,
+    # the answer on the left, and nothing else boxed. Before this the whole
+    # conversation was one column of text under "You:" and "Assistant:" labels,
+    # and an answer took on the type of whatever note was printed just before
+    # it - grey italics, usually - because a streamed word inherits the format
+    # at the cursor.
+    _MINE_BG, _THEIRS_BG, _MESSAGE_FG = "#1f3a5f", "#2a2a2a", "#e8e8e8"
+
+    def _message_format(self) -> QTextCharFormat:
+        """The type a message is set in, stated so nothing is inherited."""
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(self._MESSAGE_FG))
+        fmt.setFontItalic(False)
+        fmt.setFontWeight(QFont.Normal)
+        return fmt
+
+    def _open_box(self, mine: bool):
+        """Add an empty message box at the end and return it."""
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        fmt = QTextTableFormat()
+        fmt.setBorder(0)
+        fmt.setCellSpacing(0)
+        fmt.setCellPadding(9)
+        fmt.setTopMargin(8)
+        fmt.setBottomMargin(2)
+        fmt.setAlignment(Qt.AlignRight if mine else Qt.AlignLeft)
+        if not mine:
+            # A fixed share of the width, so the box does not change shape
+            # with every word that streams into it.
+            fmt.setWidth(QTextLength(QTextLength.PercentageLength, 88))
+        box = cursor.insertTable(1, 1, fmt)
+        # The fill goes on the cell: a background set on the table itself is
+        # not painted.
+        cell = box.cellAt(0, 0)
+        shade = cell.format()
+        shade.setBackground(QColor(self._MINE_BG if mine else self._THEIRS_BG))
+        cell.setFormat(shade)
+        return box
+
+    def _close_answer_box(self):
+        self._answer_box = None
+        self._to_end()
+
+    def _to_end(self):
+        cursor = self.chat_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.chat_display.setTextCursor(cursor)
+        self.chat_display.ensureCursorVisible()
+
     def _append_user(self, text: str):
-        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        safe = safe.replace("\n", "<br>")
-        self._append_html(
-            f'<div style="color:#2f81f7;margin-top:8px;"><b>You:</b></div>'
-            f'<div style="color:#ccc;margin-left:12px;">{safe}</div><br>'
-        )
+        box = self._open_box(mine=True)
+        box.cellAt(0, 0).firstCursorPosition().insertText(
+            text, self._message_format())
+        self._to_end()
 
     def _append_system(self, text: str):
         safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         safe = safe.replace("\n", "<br>")
         self._append_html(
-            f'<div style="color:#aaa;font-style:italic;margin:4px 0;">{safe}</div>'
+            f'<div style="color:#8f8f8f;font-size:9pt;margin:4px 0;">{safe}</div>'
         )
 
     def seed_from_report(self, json_path: str):
@@ -3041,6 +3082,16 @@ class LLMChatWidget(QWidget):
             self.input_field.setPlaceholderText(
                 "e.g. why is every clip so similar?")
             self.input_field.setFocus()
+
+    def _note(self, text: str):
+        """Progress nobody acts on: the debug log, not the conversation.
+
+        What loaded, what connected, which engine came up. The chat used to
+        open on ten lines of it, cache file hashes included, above anything
+        the user had said. The context line already carries the state; this
+        keeps the detail for when something has gone wrong.
+        """
+        print(f"[chat] {text}")
 
     def _log(self, msg: str):
         self.status_label.setText(msg)
