@@ -112,13 +112,18 @@ class TestWhatTheRunAsksFor:
             log_fn=lambda _m: None) == {"chapters": 0, "clips": 0}
 
 
+# A run that names its model. Every test below that expects one to be built
+# says which, because a run that names none builds none - see TestNoModelChosen.
+CHOSEN = {"narration_model": {"backend": "ollama", "model": "some-model:1b"}}
+
+
 class TestNarrationNeverCostsTheRun:
     def test_an_unreachable_model_is_a_log_line_and_a_zero(self, monkeypatch):
         monkeypatch.setattr("modules.report.advisor.load_llm",
                             lambda *_a, **_kw: None)
         said = []
         assert story_run.narrate_report_file(
-            "nowhere.json", config={}, log_fn=said.append) == \
+            "nowhere.json", config=dict(CHOSEN), log_fn=said.append) == \
             {"chapters": 0, "clips": 0}
         assert any("could not reach" in line.lower() for line in said)
 
@@ -129,7 +134,7 @@ class TestNarrationNeverCostsTheRun:
         monkeypatch.setattr("modules.report.advisor.load_llm", _boom)
         said = []
         assert story_run.narrate_report_file(
-            "nowhere.json", config={}, log_fn=said.append)["clips"] == 0
+            "nowhere.json", config=dict(CHOSEN), log_fn=said.append)["clips"] == 0
         assert any("no CUDA device" in line for line in said)
 
     def test_a_pass_that_raises_loses_its_paragraphs_and_nothing_else(
@@ -142,7 +147,7 @@ class TestNarrationNeverCostsTheRun:
         monkeypatch.setattr("modules.narration.clip_story.tell_report_file", _boom)
         said = []
         assert story_run.narrate_report_file(
-            "nowhere.json", config={"narrate_chapters": False},
+            "nowhere.json", config={**CHOSEN, "narrate_chapters": False},
             log_fn=said.append) == {"chapters": 0, "clips": 0}
         assert any("the report moved" in line for line in said)
 
@@ -161,7 +166,7 @@ class TestNarrationNeverCostsTheRun:
             lambda *_a, **_kw: pytest.fail("read clips it could not see"))
         said = []
         assert story_run.narrate_report_file(
-            "nowhere.json", config={"narrate_chapters": False},
+            "nowhere.json", config={**CHOSEN, "narrate_chapters": False},
             log_fn=said.append)["clips"] == 0
         assert any("cannot see" in line for line in said)
 
@@ -172,6 +177,80 @@ class TestNarrationNeverCostsTheRun:
         assert story_run.narrate_report_file(
             "nowhere.json", config={}, log_fn=lambda _m: None,
             cancel_fn=lambda: True) == {"chapters": 0, "clips": 0}
+
+
+class TestNoModelChosen:
+    """A run that names no model narrates with none.
+
+    It used to narrate with "llama3": a name in the code, sent the frames
+    because nothing asked whether it could see, which Ollama then refused.
+    The user had picked a different model in the chat and was shown it as
+    connected.
+    """
+
+    def test_nothing_is_built_and_the_log_says_where_to_pick_one(
+            self, monkeypatch):
+        monkeypatch.setattr(
+            "modules.report.advisor.load_llm",
+            lambda *_a, **_kw: pytest.fail("built a model nobody chose"))
+        said = []
+        assert story_run.narrate_report_file(
+            "nowhere.json", config={}, log_fn=said.append) == \
+            {"chapters": 0, "clips": 0}
+        assert any("no model is chosen" in line for line in said)
+
+    def test_it_is_said_before_the_run_too(self, monkeypatch):
+        monkeypatch.setattr(
+            "modules.narration.llm_acceleration.decide",
+            lambda config, entry: {"backend": "ollama", "model": "",
+                                   "accelerated": False, "reason": ""})
+        (problem,) = story_run.preflight({})
+        assert "no model is chosen" in problem
+
+    def test_the_model_used_is_named(self, monkeypatch):
+        monkeypatch.setattr("modules.report.advisor.load_llm",
+                            lambda *_a, **_kw: _Recorder())
+        for module in ("chapter_story", "clip_story"):
+            monkeypatch.setattr(
+                f"modules.narration.{module}.tell_report_file",
+                lambda *_a, **_kw: 0)
+        said = []
+        story_run.narrate_report_file("nowhere.json", config=dict(CHOSEN),
+                                      log_fn=said.append)
+        assert any("Narrating with" in line and "some-model:1b" in line
+                   for line in said)
+
+    def test_a_blind_model_tells_chapters_without_being_handed_frames(
+            self, monkeypatch):
+        class _Blind(_Recorder):
+            def accepts_images(self):
+                return False
+
+        asked = {}
+        monkeypatch.setattr("modules.report.advisor.load_llm",
+                            lambda *_a, **_kw: _Blind())
+        monkeypatch.setattr(
+            "modules.narration.chapter_story.tell_report_file",
+            lambda *_a, **kw: asked.update(kw) or 3)
+        done = story_run.narrate_report_file(
+            "nowhere.json",
+            config={**CHOSEN, "narrate_clips": False},
+            log_fn=lambda _m: None)
+        assert done["chapters"] == 3
+        assert asked["use_frames"] is False
+
+    def test_a_model_that_sees_is_left_to_use_them(self, monkeypatch):
+        asked = {}
+        monkeypatch.setattr("modules.report.advisor.load_llm",
+                            lambda *_a, **_kw: _Recorder())
+        monkeypatch.setattr(
+            "modules.narration.chapter_story.tell_report_file",
+            lambda *_a, **kw: asked.update(kw) or 3)
+        story_run.narrate_report_file(
+            "nowhere.json",
+            config={**CHOSEN, "narrate_clips": False},
+            log_fn=lambda _m: None)
+        assert "use_frames" not in asked
 
 
 class TestTheEngineIsChosenBeforeTheModelIsBuilt:

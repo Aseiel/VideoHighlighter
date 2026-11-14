@@ -135,6 +135,30 @@ def migrate(models: Sequence[Mapping],
     return models
 
 
+def chat_entry(value_of) -> Optional[dict]:
+    """The model last connected in the LLM chat, as an entry, or ``None``.
+
+    For when the list above is empty. The chat has its own model picker, in the
+    main window and in the timeline viewer, and it is the one people find: a
+    model chosen there and shown as connected was then ignored by narration,
+    which went looking for a default nobody had picked and sent frames to it.
+    The model someone connected is a better guess than any name written here.
+
+    ``value_of`` reads one of the chat's stored settings by key, so this stays
+    free of Qt. A hosted model is not offered: narration reads frames, and
+    those stay on this machine.
+    """
+    backend = str(value_of("last_backend") or "").strip()
+    if backend == "llama-cpp":
+        return _clean({"backend": backend,
+                       "model": value_of("last_gguf_path"),
+                       "mmproj": value_of("last_mmproj_path")})
+    if backend in ("ollama", "lmstudio"):
+        return _clean({"backend": backend,
+                       "model": value_of(f"last_{backend}_model")})
+    return None
+
+
 def active(models: Sequence[Mapping], chosen: Optional[str]) -> Optional[dict]:
     """The entry the user last picked, or the first one as a default."""
     models = list(models or ())

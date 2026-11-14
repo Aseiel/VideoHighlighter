@@ -60,13 +60,18 @@ def test_untranslatable_segments_come_back_as_the_same_list(monkeypatch):
 
 # --- narration --------------------------------------------------------------
 
+# A text-only model that is pulled. These used to pass an empty config and lean
+# on "llama3" being assumed; a run that names no model now says so instead.
+TEXT_ONLY = {"narration_model": {"backend": "ollama", "model": "llama3"}}
+
+
 def _models(monkeypatch, names):
     monkeypatch.setattr(llm_discovery, "ollama_models", lambda *a, **k: list(names))
 
 
 def test_narration_without_ollama(monkeypatch):
     _models(monkeypatch, [])
-    (problem,) = story_run.preflight({})
+    (problem,) = story_run.preflight(TEXT_ONLY)
     assert "Ollama is not running" in problem and "Highlight Report" in problem
 
 
@@ -85,9 +90,9 @@ def test_narration_model_not_pulled(monkeypatch):
 
 def test_clip_descriptions_need_a_model_that_sees(monkeypatch):
     _models(monkeypatch, ["llama3:latest"])
-    (problem,) = story_run.preflight({})
+    (problem,) = story_run.preflight(TEXT_ONLY)
     assert "no vision half" in problem
-    assert story_run.preflight({"narrate_clips": False}) == []
+    assert story_run.preflight({**TEXT_ONLY, "narrate_clips": False}) == []
 
 
 @pytest.mark.parametrize("config", [
@@ -110,7 +115,7 @@ def test_a_probe_that_fails_says_nothing(monkeypatch):
     def broken(*a, **k):
         raise OSError("no network stack")
     monkeypatch.setattr(llm_discovery, "ollama_models", broken)
-    assert story_run.preflight({}) == []
+    assert story_run.preflight(TEXT_ONLY) == []
 
 
 # --- the run log ------------------------------------------------------------

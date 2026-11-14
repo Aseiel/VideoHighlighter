@@ -95,7 +95,7 @@ def preflight(config: Mapping) -> list:
 
     entry = _entry(config)
     backend = entry.get("backend") or "ollama"
-    name = entry.get("model") or "llama3"
+    name = entry.get("model") or ""
     off = ("or untick the narration boxes under Highlight Report to stop "
            "this warning")
 
@@ -105,6 +105,9 @@ def preflight(config: Mapping) -> list:
     if picked is not None and picked["backend"] == "openvino":
         from modules.narration.llm_acceleration import _is_ir_dir
         return [] if _is_ir_dir(picked["model"]) else [picked["reason"]]
+
+    if not name:
+        return ["Narration is on, but " + _NO_MODEL]
 
     if backend == "llama-cpp":
         if not os.path.exists(name):
@@ -140,6 +143,12 @@ def preflight(config: Mapping) -> list:
                 "so clips cannot be described from their frames; only chapters "
                 "will be written. Choose a vision model to describe clips."]
     return []
+
+
+# Said before a run and again at its tail when nothing names a model.
+_NO_MODEL = ("no model is chosen for it, so the report will have no written "
+             "parts. Add one from the menu beside AI Summary, or connect one "
+             "in LLM Chat.")
 
 
 def _lmstudio_preflight(name: str, do_clips: bool, off: str) -> list:
@@ -209,7 +218,7 @@ def narrate_report_file(json_path: str,
 
     entry = _entry(config)
     backend = entry.get("backend") or "ollama"
-    name = entry.get("model") or "llama3"
+    name = entry.get("model") or ""
     label = label_for(entry) if entry else f"{backend}/{name}"
 
     # Which engine this machine should narrate on, said in the log either way.
@@ -227,6 +236,13 @@ def narrate_report_file(json_path: str,
             backend, name = "openvino", picked["model"]
             label = f"openvino/{os.path.basename(name)}"
 
+    if not name:
+        # There used to be a default here, and it was the bug: a model nobody
+        # chose was sent the frames, refused them, and the report was written
+        # from text by something the user had never heard of.
+        log_fn("⚠️ Narration skipped — " + _NO_MODEL)
+        return done
+
     try:
         llm = advisor.load_llm(backend, name, mmproj=entry.get("mmproj"),
                                vision=True)
@@ -237,6 +253,9 @@ def narrate_report_file(json_path: str,
         log_fn(f"⚠️ Narration skipped — could not reach {label}. The report "
                "keeps its measurements; only the telling needs a model.")
         return done
+    # Named every run. The model is set in a different place from the chat's,
+    # and the only way to notice the wrong one is to be told which it is.
+    log_fn(f"🤖 Narrating with {label}.")
 
     # Asked once, before either pass, because the clip pass is meaningless
     # without it and the chapter pass is merely poorer — see the two passes'
@@ -249,9 +268,12 @@ def narrate_report_file(json_path: str,
         do_clips = False
 
     if do_chapters:
+        # A chapter can be told from its transcript, so a model that cannot
+        # see still narrates - but it is not handed frames it will refuse.
         done["chapters"] = _pass(
             "chapters", json_path, llm=llm, label=label,
-            log_fn=log_fn, cancel_fn=cancel_fn)
+            log_fn=log_fn, cancel_fn=cancel_fn,
+            **({} if sees else {"use_frames": False}))
     if do_clips and not (cancel_fn is not None and cancel_fn()):
         done["clips"] = _pass(
             "clips", json_path, llm=llm, label=label,
@@ -259,7 +281,8 @@ def narrate_report_file(json_path: str,
     return done
 
 
-def _pass(which: str, json_path: str, *, llm, label, log_fn, cancel_fn) -> int:
+def _pass(which: str, json_path: str, *, llm, label, log_fn, cancel_fn,
+          **extra) -> int:
     """One pass, with its failure contained. Returns how many it wrote.
 
     The two passes are called through one function because the only differences
@@ -278,7 +301,8 @@ def _pass(which: str, json_path: str, *, llm, label, log_fn, cancel_fn) -> int:
            "minutes rather than seconds.")
     try:
         return tell_report_file(json_path, llm=llm, model_name=label,
-                                log_fn=log_fn, cancel_fn=cancel_fn) or 0
+                                log_fn=log_fn, cancel_fn=cancel_fn,
+                                **extra) or 0
     except Exception as exc:
         log_fn(f"⚠️ The {noun} narration failed: {exc}")
         return 0

@@ -2501,6 +2501,10 @@ class LLMChatWidget(QWidget):
             settings.setValue("last_gguf_path", gguf_path)
             if mmproj_path:
                 settings.setValue("last_mmproj_path", mmproj_path)
+            # Remembered so narration can use the model connected here when
+            # none has been set for it: see `llm_models.chat_entry`.
+            if backend in ("ollama", "lmstudio") and model:
+                settings.setValue(f"last_{backend}_model", model)
 
             if backend == "llama-cpp":
                 model_name = os.path.basename(gguf_path)

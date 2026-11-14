@@ -259,6 +259,9 @@ class _OllamaBackend(_LLMBackend):
         # load() where the server will say, and otherwise discovered by the
         # first call that comes back as reasoning only.
         self._thinks = False
+        # Whether the model has a vision half. None until the server has said:
+        # see accepts_images().
+        self._sees: Optional[bool] = None
         # Starts small and only grows: Ollama reloads the model whenever
         # num_ctx changes, so shrinking back after a big request would pay that
         # reload again on the next one.
@@ -334,6 +337,12 @@ class _OllamaBackend(_LLMBackend):
             except Exception as exc:
                 print(f"   (could not read capabilities for {self.model}: {exc})")
 
+            if capabilities:
+                # The same list says whether the model has a vision half. Only
+                # believed when the server sent one: an older Ollama has no
+                # `capabilities` field, and nothing is "not told", not "cannot
+                # see".
+                self._sees = "vision" in capabilities
             if capabilities is not None:
                 self._thinks = "thinking" in capabilities
                 if self._thinks:
@@ -351,6 +360,15 @@ class _OllamaBackend(_LLMBackend):
 
     def is_loaded(self) -> bool:
         return self._loaded
+
+    def accepts_images(self) -> bool:
+        # What the server said at load(), when it said anything. A text-only
+        # model handed frames is refused outright ("Multimodal data provided,
+        # but model does not support multimodal requests"), so a caller that
+        # asks this first is spared a call that can only fail. Not told stays
+        # yes, as before: better to try than to warn about a limit that may
+        # not exist.
+        return True if self._sees is None else self._sees
 
     def generate(self, prompt: str, system: str = "", max_tokens: int = 1024,
                 temperature: float = 0.7, stream_callback: Optional[Callable] = None,
@@ -1285,6 +1303,15 @@ class LLMModule:
 
     def is_loaded(self) -> bool:
         return self._backend.is_loaded()
+
+    def accepts_images(self) -> bool:
+        """Whether the loaded model will look at frames it is handed.
+
+        A backend that cannot say is taken to see, which is what every caller
+        assumed before this could be asked.
+        """
+        asked = getattr(self._backend, "accepts_images", None)
+        return True if asked is None else bool(asked())
 
     def unload(self):
         self._backend.unload()

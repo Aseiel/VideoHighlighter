@@ -6892,13 +6892,6 @@ class VideoHighlighterGUI(QWidget):
             return None
         return json_path
 
-    def _ai_summary_settings(self):
-        """The model a report is written with, as ``(backend, name-or-path)``."""
-        entry = self._active_llm_model()
-        if not entry:
-            return ("ollama", "llama3")
-        return (entry["backend"], entry["model"])
-
     def _report_config(self):
         """What the run needs to write the report the way this window is set up.
 
@@ -6943,10 +6936,22 @@ class VideoHighlighterGUI(QWidget):
 
     def _active_llm_model(self):
         from PySide6.QtCore import QSettings
-        from modules.narration.llm_models import active
+        from modules.narration.llm_models import active, chat_entry
 
         s = QSettings("VideoHighlighter", "Pro")
-        return active(self._llm_models(), s.value("advisor/model_chosen"))
+        models = self._llm_models()
+        if models:
+            return active(models, s.value("advisor/model_chosen"))
+        # Nothing configured here: the model connected in the chat, rather
+        # than a name nobody chose. See `chat_entry`.
+        from llm.llm_chat_widget import LLMChatWidget
+        return chat_entry(QSettings(LLMChatWidget.SETTINGS_KEY, "LLMChat").value)
+
+    def _no_model_chosen(self):
+        """Say where a model is picked, instead of calling one nobody picked."""
+        self.append_log(
+            "⚠️ No model is chosen for this yet. Add one from the menu beside "
+            "AI Summary (“Add a model…”), or connect one in LLM Chat.")
 
     def write_ai_summary(self, question=None, reading=False, model=None):
         """Generate the summary and put it in the report, then open it.
@@ -6966,9 +6971,12 @@ class VideoHighlighterGUI(QWidget):
 
         from modules.report import advisor
         entry = model or self._active_llm_model()
-        backend = (entry or {}).get("backend", "ollama")
-        model = (entry or {}).get("model", "llama3")
-        mmproj = (entry or {}).get("mmproj")
+        if not entry:
+            self._no_model_chosen()
+            return
+        backend = entry.get("backend", "ollama")
+        model = entry["model"]
+        mmproj = entry.get("mmproj")
         self.append_log(
             f"🤖 Asking {backend}/{model} to "
             f"{'read what happens in this cut' if reading else 'summarise the report'}… "
@@ -7039,9 +7047,12 @@ class VideoHighlighterGUI(QWidget):
             return
 
         entry = model or self._active_llm_model()
-        backend = (entry or {}).get("backend", "ollama")
-        name = (entry or {}).get("model", "llama3")
-        mmproj = (entry or {}).get("mmproj")
+        if not entry:
+            self._no_model_chosen()
+            return
+        backend = entry.get("backend", "ollama")
+        name = entry["model"]
+        mmproj = entry.get("mmproj")
         self.append_log(
             f"📖 Asking {backend}/{name} to tell {len(chapters)} chapters — "
             "one call each, so this takes minutes, not seconds.")
@@ -7140,8 +7151,11 @@ class VideoHighlighterGUI(QWidget):
             return
 
         entry = model or self._active_llm_model()
-        backend = (entry or {}).get("backend", "ollama")
-        name = (entry or {}).get("model", "llama3")
+        if not entry:
+            self._no_model_chosen()
+            return
+        backend = entry.get("backend", "ollama")
+        name = entry["model"]
         rules_path = composition_rules_path()
         self.append_log(f"🧩 Asking {backend}/{name} for a rule that would "
                         "check that…")

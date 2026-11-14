@@ -86,3 +86,47 @@ class TestMigration:
 
     def test_nothing_configured_before_migrates_to_nothing(self):
         assert migrate([], None, None) == []
+
+
+class TestTheChatsModelStandsIn:
+    """With no list, narration uses the model connected in the chat.
+
+    The chat's picker is the one people find, in the main window and in the
+    timeline viewer. A model chosen and connected there was ignored by
+    narration, which fell back to a name written in the code instead.
+    """
+
+    @staticmethod
+    def _chat(**stored):
+        from modules.narration.llm_models import chat_entry
+        return chat_entry(stored.get)
+
+    def test_the_ollama_model_last_connected(self):
+        assert self._chat(last_backend="ollama",
+                          last_ollama_model="gemma4:31b") == \
+            {"backend": "ollama", "model": "gemma4:31b"}
+
+    def test_an_lm_studio_model(self):
+        assert self._chat(last_backend="lmstudio",
+                          last_lmstudio_model="google/gemma-4-e4b") == \
+            {"backend": "lmstudio", "model": "google/gemma-4-e4b"}
+
+    def test_a_gguf_brings_its_projector(self):
+        assert self._chat(last_backend="llama-cpp",
+                          last_gguf_path="D:/m/a.gguf",
+                          last_mmproj_path="D:/m/a-mmproj.gguf") == \
+            {"backend": "llama-cpp", "model": "D:/m/a.gguf",
+             "mmproj": "D:/m/a-mmproj.gguf"}
+
+    def test_a_hosted_model_is_not_offered(self):
+        # Narration reads frames, and those stay on this machine.
+        assert self._chat(last_backend="anthropic",
+                          last_anthropic_model="claude-sonnet-5") is None
+
+    def test_a_chat_never_connected_offers_nothing(self):
+        assert self._chat() is None
+        assert self._chat(last_backend="ollama") is None
+
+    def test_another_backends_model_is_not_borrowed(self):
+        assert self._chat(last_backend="lmstudio",
+                          last_ollama_model="gemma4:31b") is None
