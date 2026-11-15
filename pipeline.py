@@ -389,7 +389,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                 results.append((single_video_path, result))
                 
                 if result:
-                    log_fn(f"✅ Completed {idx}/{total_videos}: {os.path.basename(result)}")
+                    # A report-only run returns its segments, not a file.
+                    done_name = os.path.basename(
+                        result if isinstance(result, (str, os.PathLike))
+                        else single_video_path)
+                    log_fn(f"✅ Completed {idx}/{total_videos}: {done_name}")
                 else:
                     log_fn(f"⚠️ Failed {idx}/{total_videos}: {os.path.basename(single_video_path)}")
             except Exception as e:
