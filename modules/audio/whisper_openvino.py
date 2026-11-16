@@ -20,6 +20,8 @@ with the app's settings over three 10-minute clips (73.8 -> 13.1 s, 71.9 ->
   looked wrong on the processor was measured too and does not pay: on noisy
   audio it re-decodes most of them, which costs the speed, and the second
   noisy guess is no closer to the first.
+* Nor can it be told to forget the previous window, so a chunk is handed to
+  it in independent pieces of under 30 s (``PIECE_SECONDS``).
 
 The models are the OpenVINO project's own exports on Hugging Face
 (``OpenVINO/whisper-<size>-fp16-ov``, Apache-2.0 / MIT like the Whisper
@@ -148,6 +150,52 @@ def _compile_cache() -> Optional[str]:
         return None
 
 
+# Longest piece the pipeline is handed in one call. Given a whole 10-minute
+# chunk it walks it 30 s at a time, and each window carries the last one's
+# habits forward: measured 2026-11-16 on a 21-minute episode with the 'small'
+# model, once a window came back lowercase without punctuation the next ones
+# did too ("My name's Ash and I'm misty" where two people speak), and a window
+# opening on music came back as six words stretched over 20 s, with the dialogue
+# that followed it lost. openai-whisper has a switch for that carry-over
+# (condition_on_previous_text, off in this app); the pipeline has none, and an
+# initial prompt did not change it. Decoded as independent pieces of at most a
+# window, the first 10 minutes of that episode gave 1400 words instead of 1231,
+# 2 long unpunctuated lines instead of 11, the two speakers as two lines, and no
+# stretched line - for 41 s of decoding instead of 32.
+PIECE_SECONDS = 28.0
+# Each piece ends at the quietest moment of its last few seconds, so a cut
+# falls between words rather than through one.
+CUT_SEARCH_SECONDS = 6.0
+CUT_FRAME_SECONDS = 0.2
+
+
+def quiet_cuts(audio, piece: float = PIECE_SECONDS, search: float = CUT_SEARCH_SECONDS,
+               frame: float = CUT_FRAME_SECONDS) -> List[int]:
+    """Sample positions that split ``audio`` into pieces of at most ``piece``
+    seconds, each ending at the quietest ``frame`` of its last ``search``
+    seconds. Starts at 0 and ends at ``len(audio)``."""
+    import numpy as np
+
+    audio = np.asarray(audio, dtype=np.float32)
+    n = len(audio)
+    span = int(piece * SAMPLE_RATE)
+    width = max(1, int(frame * SAMPLE_RATE))
+    step = max(1, width // 2)
+    cuts = [0]
+    while n - cuts[-1] > span:
+        start = cuts[-1]
+        lo = start + max(width, int((piece - search) * SAMPLE_RATE))
+        hi = start + span
+        best, quietest = hi, None
+        for p in range(lo, hi - width + 1, step):
+            energy = float(np.mean(audio[p:p + width] ** 2))
+            if quietest is None or energy < quietest:
+                best, quietest = p + width // 2, energy
+        cuts.append(best)
+    cuts.append(n)
+    return cuts
+
+
 class Cancelled(RuntimeError):
     """The run was cancelled while a chunk was decoding."""
 
@@ -193,17 +241,20 @@ class OpenVINOWhisper:
         """Decode ``audio`` (a 16 kHz float array, as whisper.load_audio
         returns) into ``{"language": ..., "segments": [...]}``.
 
-        The pipeline decodes a whole chunk in one call and takes no callback
-        for long audio, so it runs on a helper thread while this one keeps the
-        bar moving (by the speed measured on the previous chunk) and watches
-        for a cancel. A cancel returns at once; the call already on the card
-        finishes on its own (seconds) and its result is dropped. Nothing is
-        killed.
+        Audio longer than one Whisper window is decoded as independent pieces
+        cut at quiet moments (``quiet_cuts``), each timed from the start of
+        ``audio``: see ``PIECE_SECONDS`` for why.
+
+        The pipeline decodes a piece in one call and takes no callback, so it
+        runs on a helper thread while this one keeps the bar moving (by the
+        speed measured so far) and watches for a cancel. A cancel returns at
+        once; the call already on the card finishes on its own (seconds) and
+        its result is dropped. Nothing is killed.
         """
         import numpy as np
 
-        samples = np.asarray(audio, dtype=np.float32).tolist()
-        seconds = len(samples) / SAMPLE_RATE
+        audio = np.asarray(audio, dtype=np.float32)
+        seconds = len(audio) / SAMPLE_RATE
         if seconds < MIN_SECONDS:
             # The last chunk of a video can be a sliver (16 samples, seen on a
             # 600.001 s file), and the pipeline refuses anything shorter than
@@ -212,6 +263,36 @@ class OpenVINOWhisper:
                 on_frac(1.0)
             return {"language": language if language and language != "auto" else "unknown",
                     "segments": []}
+
+        cuts = quiet_cuts(audio)
+        segments: List[Dict] = []
+        detected = None
+        for a, b in zip(cuts, cuts[1:]):
+            if (b - a) / SAMPLE_RATE < MIN_SECONDS:
+                continue
+            if should_cancel and should_cancel():
+                raise Cancelled("Transcription cancelled")
+
+            def piece_frac(f, _a=a, _b=b):
+                if on_frac:
+                    on_frac(min(0.95, (_a + f * (_b - _a)) / len(audio)))
+
+            decoded = self._decode(audio[a:b].tolist(), language, piece_frac,
+                                   should_cancel, poll)
+            got = to_result(decoded)
+            detected = detected or (got["language"] if got["language"] != "unknown" else None)
+            offset = a / SAMPLE_RATE
+            for seg in got["segments"]:
+                segments.append(dict(seg, start=seg["start"] + offset,
+                                     end=seg["end"] + offset))
+        if on_frac:
+            on_frac(1.0)
+        return {"language": detected or "unknown", "segments": segments}
+
+    def _decode(self, samples, language, on_frac, should_cancel, poll):
+        """One piece through the pipeline, on a helper thread; see
+        ``transcribe``."""
+        seconds = len(samples) / SAMPLE_RATE
         box: Dict = {}
 
         def work():
@@ -228,16 +309,13 @@ class OpenVINOWhisper:
             worker.join(poll)
             if should_cancel and should_cancel():
                 raise Cancelled("Transcription cancelled")
-            if on_frac:
-                on_frac(min(0.95, (time.time() - t0) / expected))
+            on_frac(min(0.95, (time.time() - t0) / expected))
         if "error" in box:
             raise box["error"]
         took = time.time() - t0
         if took > 0.5:
             self._speed = seconds / took
-        if on_frac:
-            on_frac(1.0)
-        return to_result(box["result"])
+        return box["result"]
 
 
 _TOKEN = re.compile(r"\w+(?:'\w+)*", re.UNICODE)

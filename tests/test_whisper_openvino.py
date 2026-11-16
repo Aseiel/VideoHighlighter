@@ -208,6 +208,75 @@ def test_the_bar_moves_while_a_chunk_decodes():
     assert len(seen) > 3 and seen[-1] == 1.0 and seen == sorted(seen)
 
 
+# ── independent pieces ───────────────────────────────────────────────────
+
+def _noise_with_gaps(seconds, gaps):
+    """Loud noise, silent for 0.4 s around each time in ``gaps``."""
+    rng = np.random.default_rng(0)
+    audio = rng.uniform(-0.5, 0.5, int(seconds * 16000)).astype(np.float32)
+    for g in gaps:
+        audio[int((g - 0.2) * 16000):int((g + 0.2) * 16000)] = 0.0
+    return audio
+
+
+def test_pieces_are_no_longer_than_a_window_and_cover_everything():
+    audio = _noise_with_gaps(95.0, [])
+    cuts = wov.quiet_cuts(audio)
+    assert cuts[0] == 0 and cuts[-1] == len(audio)
+    lengths = [(b - a) / 16000 for a, b in zip(cuts, cuts[1:])]
+    assert all(0 < x <= wov.PIECE_SECONDS for x in lengths)
+    assert len(cuts) - 1 == 4
+
+
+def test_a_cut_falls_in_the_quiet_between_words():
+    audio = _noise_with_gaps(40.0, [24.5])
+    cuts = wov.quiet_cuts(audio)
+    assert len(cuts) == 3
+    assert abs(cuts[1] / 16000 - 24.5) < 0.2
+
+
+def test_short_audio_is_one_piece():
+    audio = np.zeros(16000 * 20, np.float32)
+    assert wov.quiet_cuts(audio) == [0, len(audio)]
+
+
+class _PiecePipe:
+    """Records each piece's length; answers one line per piece."""
+
+    def __init__(self):
+        self.lengths = []
+
+    def generate(self, samples, **kwargs):
+        self.lengths.append(len(samples) / 16000)
+        return types.SimpleNamespace(language="<|en|>",
+                                     chunks=[_chunk("Hello there.", 1.0, 2.0)])
+
+
+def test_long_audio_is_decoded_in_independent_pieces_timed_from_the_start():
+    pipe = _PiecePipe()
+    audio = _noise_with_gaps(70.0, [25.0, 50.0])
+    out = _model(pipe).transcribe(audio, language="en", poll=0.01)
+    assert len(pipe.lengths) == 3
+    assert all(x <= wov.PIECE_SECONDS for x in pipe.lengths)
+    starts = [s["start"] for s in out["segments"]]
+    assert starts == pytest.approx([1.0, 26.0, 51.0], abs=0.25)
+    assert out["language"] == "en"
+
+
+def test_a_cancel_between_pieces_stops_the_rest():
+    pipe = _PiecePipe()
+    asked = []
+
+    def should_cancel():
+        asked.append(1)
+        return len(pipe.lengths) >= 1
+
+    with pytest.raises(wov.Cancelled):
+        _model(pipe).transcribe(_noise_with_gaps(70.0, []), should_cancel=should_cancel,
+                                poll=0.01)
+    assert len(pipe.lengths) == 1
+
+
 # ── inside a transcript ──────────────────────────────────────────────────
 
 @pytest.fixture
