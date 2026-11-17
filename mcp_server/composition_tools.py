@@ -173,7 +173,10 @@ def get_transcript(video_path: str, start: float = 0.0, end: Optional[float] = N
     path = _existing_file(video_path)
     transcript = (read_cache(path) or {}).get("transcript") or {}
     try:
-        from modules.audio import voice_pitch
+        # Pro-only module, by name: a static import is a promise this shared
+        # file cannot keep in the free edition (see tools._edition_module).
+        from mcp_server.tools import _edition_module
+        voice_pitch = _edition_module("modules.audio.voice_pitch")
         labels = voice_pitch.load(voice_pitch.cache_path_for(path))
         voice_of = lambda s: voice_pitch.voice_of(s, labels)  # noqa: E731
     except Exception:  # noqa: BLE001
