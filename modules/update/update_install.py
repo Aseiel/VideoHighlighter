@@ -55,7 +55,9 @@ def _fetch_bytes(url: str) -> bytes:
     from modules.system import https_certs
 
     request = urllib.request.Request(
-        url, headers={"Accept": "*/*"}, method="GET")
+        url, headers={"Accept": "*/*",
+                      "User-Agent": update_download.USER_AGENT},
+        method="GET")
     with urllib.request.urlopen(request, timeout=30,
                                 **https_certs.opener_kwargs()) as response:
         return response.read()

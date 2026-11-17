@@ -368,3 +368,36 @@ def test_which_http_errors_are_worth_another_try(tmp_path, code, retried):
         _plan(_entry("a.py", b"x")), BASE, str(tmp_path / "stage"), opener=flaky)
     assert result.ok is retried
     assert calls["n"] == (2 if retried else 1)
+
+
+# Cloudflare in front of the update host answers 403 to urllib's default
+# User-Agent; both real fetch paths must send the app's own.
+class _Sent(Exception):
+    pass
+
+
+def _capture(monkeypatch):
+    import urllib.request
+    seen = {}
+
+    def fake_urlopen(request, **_kwargs):
+        seen["ua"] = request.get_header("User-agent")
+        raise _Sent()
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def test_blob_download_sends_the_app_user_agent(monkeypatch):
+    seen = _capture(monkeypatch)
+    with pytest.raises(_Sent):
+        update_download._default_opener("https://host.invalid/files/x", {"Range": "bytes=0-"})
+    assert seen["ua"] == update_download.USER_AGENT
+    assert seen["ua"].startswith("VideoHighlighter/")
+
+
+def test_manifest_fetch_sends_the_app_user_agent(monkeypatch):
+    from modules.update import update_install
+    seen = _capture(monkeypatch)
+    with pytest.raises(_Sent):
+        update_install._fetch_bytes("https://host.invalid/manifest.json")
+    assert seen["ua"] == update_download.USER_AGENT

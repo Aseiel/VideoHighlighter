@@ -190,7 +190,10 @@ def _fetch(url: str) -> bytes:
 
     from modules.system import https_certs
 
-    request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+    from modules.update.update_download import USER_AGENT
+
+    request = urllib.request.Request(url, headers={"Cache-Control": "no-cache",
+                                                   "User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=60,
                                 **https_certs.opener_kwargs()) as response:
         return response.read()

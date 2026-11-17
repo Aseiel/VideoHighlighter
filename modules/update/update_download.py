@@ -30,6 +30,13 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from modules.update.update_manifest import hash_file, is_safe_relpath, local_path
+from version import __version__
+
+# Sent with every request to the update host. Cloudflare, in front of it,
+# answers 403 to urllib's default "Python-urllib/3.x": the update check sent
+# its own and worked, while the install sent none and failed on its first
+# request. Names the build only; no user, no machine.
+USER_AGENT = f"VideoHighlighter/{__version__}"
 
 TIMEOUT_SECONDS = 30
 WORKERS = 6
@@ -57,7 +64,9 @@ def _default_opener(url: str, headers: dict):
 
     from modules.system import https_certs
 
-    request = urllib.request.Request(url, headers=headers or {}, method="GET")
+    sent = {"User-Agent": USER_AGENT}
+    sent.update(headers or {})
+    request = urllib.request.Request(url, headers=sent, method="GET")
     return urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS,
                                   **https_certs.opener_kwargs())
 
