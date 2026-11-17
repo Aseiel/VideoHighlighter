@@ -61,6 +61,29 @@ class TestBoundsFromWords:
         # The last word is capped the same way, from the end.
         assert 298.9 < end <= 299.2
 
+    def test_the_silence_soaked_up_by_the_second_word_is_cut_too(self):
+        # Measured: "I" put before the silence, "bet" stretched over it, for
+        # a line said from about 214.7.
+        words = [(210.44, 210.94, " I", 1.0), (210.94, 215.26, " bet", 1.0),
+                 (215.26, 215.46, " one", 1.0), (215.46, 215.54, " of", 1.0),
+                 (215.54, 215.68, " those", 1.0), (215.68, 216.06, " treatments", 1.0),
+                 (216.06, 216.30, " would", 1.0), (216.30, 216.50, " work", 1.0),
+                 (216.50, 216.84, " wonders", 1.0), (216.84, 217.14, " for", 1.0),
+                 (217.14, 217.38, " me.", 1.0)]
+        start, end = st.bounds_from_words(words)
+        assert 214.0 < start < 215.0
+        assert end == pytest.approx(217.38)
+
+    def test_a_pause_after_the_first_word_is_not_silence_soaked_up(self):
+        # "do" runs long after "So," but is said: the line keeps its "So".
+        start, _ = st.bounds_from_words(QUESTION_WORDS)
+        assert start < 296.68
+
+    def test_a_long_last_word_is_capped_from_the_end_not_the_start(self):
+        start, end = st.bounds_from_words([(172.08, 172.5, " I'm", 1.0),
+                                           (172.5, 174.64, " stumped", 1.0)])
+        assert start == pytest.approx(172.08)
+
     def test_a_lone_word_keeps_its_end(self):
         start, end = st.bounds_from_words([(0.0, 11.7, " next", 0.9)])
         assert end == pytest.approx(11.7) and start < end

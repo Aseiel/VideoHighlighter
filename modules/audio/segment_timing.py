@@ -31,7 +31,9 @@ when this line now runs into it. Its text and end never change.
 The aligner has to begin at the start of the audio it is given, so the first
 word soaks up the silence before it; its *end* is right. As in Whisper's own
 word timestamps, a first or last word longer than twice the median word is
-cut back to that, from the side that touches the silence.
+cut back to that, from the side that touches the silence. The silence can
+land in the second or third word instead, with the words before it carried
+off with it; that word sets the start (``SOAKED_WORD_SECONDS``).
 
 Any failure leaves the segments as Whisper had them.
 """
@@ -45,6 +47,11 @@ from typing import Callable, List, Optional, Sequence, Tuple
 SECONDS_PER_WORD = 1.0
 MIN_STRETCHED = 6.0
 MAX_WORD_SECONDS = 0.7          # Whisper's cap on the median word
+# The silence before a line can also land in its second or third word (see
+# ``bounds_from_words``). Such a word ran 4.3 and 5.4 s; a word merely said
+# after a pause ("So, do you know...": "do" 0.78 s) is far shorter.
+LEADING_WORDS = 3
+SOAKED_WORD_SECONDS = 2.0
 
 # The aligner's mean word probability for the segment, below which its times
 # are not trusted. A line it placed well scored 0.7-0.85; squeezed into the
@@ -96,6 +103,18 @@ def bounds_from_words(words: Sequence[Word]) -> Optional[Tuple[float, float]]:
     last_start, last_end = spoken[-1][0], spoken[-1][1]
     if longest > 0:
         first_start = max(first_start, first_end - longest)
+        # Measured 2026-11-17: "I" at 210.44, then "bet" 210.94-215.26, for
+        # "I bet one of those..." said from about 214.7; "Ask" 784.66, then
+        # "Ketchum" 785.26-790.64, for a line said from 789.9. The words before
+        # the soaked one were put before the silence with it, so the line
+        # starts where that word ends, less what it and they take to say.
+        # Never the last word: the silence it soaks up is after the line.
+        for k in range(1, min(LEADING_WORDS, len(spoken) - 1)):
+            w_start, w_end = spoken[k][0], spoken[k][1]
+            if w_end - w_start > max(longest, SOAKED_WORD_SECONDS):
+                before = sum(min(max(0.0, w[1] - w[0]), longest) for w in spoken[:k])
+                first_start = max(first_start, w_end - longest - before)
+                break
         # A lone word soaked up the silence before it, not after: its end stands.
         if len(spoken) > 1:
             last_end = min(last_end, last_start + longest)
