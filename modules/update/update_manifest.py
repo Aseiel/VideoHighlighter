@@ -41,7 +41,7 @@ SIGNATURE_FILENAME = "manifest.json.sig"
 # ``tools/build_manifest.py keygen --update-module``. Deliberately NOT the
 # license signing key: a leaked release key must not also mint licenses.
 # Empty means "no releases can be verified" — every manifest is rejected.
-RELEASE_PUBLIC_KEY_HEX = ""
+RELEASE_PUBLIC_KEY_HEX = "8a94a2567d06027c30c5cdad206002c72afc2f2ad0109d6c30d1379c0fce2e7f"
 
 _CHUNK = 1024 * 1024
 
