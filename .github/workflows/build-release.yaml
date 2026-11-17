@@ -979,43 +979,13 @@ jobs:
           path: VideoHighlighter-${{ needs.version.outputs.slug }}.dmg
           retention-days: 7
 
-  bootstrap:
-    needs: version
-    if: ${{ !inputs.mac_only }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Build Windows bootstrap zip
-        # With the update host configured, the script tries its download
-        # mirror (mirror-release.yaml) before GitHub.
-        env:
-          UPDATE_BASE_URL: ${{ vars.UPDATE_BASE_URL }}
-        run: |
-          python tools/build_bootstrap_zip.py \
-            --edition free \
-            --tag "${{ needs.version.outputs.slug }}" \
-            --mirror-host "$UPDATE_BASE_URL" \
-            --out packaging/bootstrap/00-VideoHighlighter-Windows-Setup.zip
-      - name: Upload bootstrap artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: bootstrap-zip
-          # Leading 00- so GitHub's alphabetical Assets list puts the installer
-          # first. Without it, Setup.zip sank below the multi-GB .7z parts and
-          # the .dmg, and people clicked the wrong file.
-          path: packaging/bootstrap/00-VideoHighlighter-Windows-Setup.zip
-          retention-days: 7
-
   release:
     # `version` must be listed even though no build step needs its output
     # directly: needs.version.outputs.slug resolves to an empty string in a job
     # that does not depend on it, which would publish an untagged release.
     # build-web-windows is opt-in: a skipped web build must not skip the
     # release, a failed one must stop it.
-    needs: [version, build-windows, build-web-windows, build-mac, bootstrap]
+    needs: [version, build-windows, build-web-windows, build-mac]
     # mac_only skips the Windows jobs, and a skipped job is not a failed one.
     if: ${{ !inputs.dry_run && !inputs.mac_only && !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
@@ -1098,9 +1068,6 @@ jobs:
               echo "downloads NVIDIA acceleration (where it finds a card) and visual"
               echo "search the first time it starts."
             fi
-            echo ""
-            echo "\`00-VideoHighlighter-Windows-Setup.zip\` is the older script-based"
-            echo "installer, kept as a fallback."
           } >> release-notes.md
           cat release-notes.md
       - name: Create GitHub Release
@@ -1110,7 +1077,13 @@ jobs:
           name: VideoHighlighter ${{ needs.version.outputs.slug }}
           draft: true
           bodyFile: release-notes.md
-          artifacts: "windows-installer/*,windows-build/*,web-windows-build/*,mac-build/*,bootstrap-zip/*"
+          # No 00-VideoHighlighter-Windows-Setup.zip any more: the script
+          # installer it held was kept beside the .exe as a fallback from
+          # 0.11.2 on, and was downloaded 20-60 times less often (0.15.2: 8
+          # against 625). Releases before 0.11.2, where it was the only
+          # installer, still have it - and it still works against new
+          # releases, because it looks for the .7z parts by name.
+          artifacts: "windows-installer/*,windows-build/*,web-windows-build/*,mac-build/*"
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Say what still has to happen
         # A green run reads as "shipped", and it is not: the release is a draft,
