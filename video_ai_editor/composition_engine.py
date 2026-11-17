@@ -143,9 +143,19 @@ class _SignalCondition:
     # away most real co-occurrences on a technicality about sampling.
     within_secs: int = 0
 
+    # With the event's ``min_matching``: this one must be among the cues that
+    # hold. "Words, and at least one other sign" cannot be said with a count
+    # alone - measured, a count let a face and an unrelated question make
+    # three events out of five where nothing was said.
+    required: bool = False
+
     def holds(self, value) -> bool:
         if value is None:
             return False
+        # A second can carry several values - the words said in it - and the
+        # condition holds when any one of them does.
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return any(self.holds(v) for v in value)
         if self.any_of:
             return str(value).strip().lower() in self.any_of
         try:
@@ -206,6 +216,14 @@ class _EventSpec:
 
     window_secs: float = 0.75   # majority-vote smoothing window
     persist_secs: float = 0.5   # keep a ghost box this long after last seen
+
+    # How many of the signal conditions must hold, 0 meaning all of them.
+    # Some things show in one way or another rather than in all ways at once -
+    # a word, a face, a pause - and requiring every cue together finds only
+    # the moments where nothing was missed. With ``min_matching: 2`` any two
+    # of the listed cues within their ``within_secs`` are enough, and the
+    # event says which ones they were.
+    min_matching: int = 0
 
 
 class CompositionEngine:
@@ -512,12 +530,18 @@ class CompositionEngine:
                     # would put a boolean into the field detectors use for
                     # certainty -- the mistake this block already warns about
                     # below -- and 0.0 would read as "certainly not".
-                    overlay_bboxes.append({
+                    entry = {
                         'timestamp': ts,
                         'objects': [name],
                         'bboxes': [union],
                         'confidences': [],
-                    })
+                    }
+                    # Which cues it was, when not every one had to hold: the
+                    # reason is part of the answer.
+                    spec = next((s for s in signal_only if s.name == name), None)
+                    if spec is not None and spec.min_matching > 0:
+                        entry['evidence'] = {name: self._held(spec, ts, masks)}
+                    overlay_bboxes.append(entry)
                     continue
                 # A rule needs *every* detection it matched, so the event is
                 # only as sure as its weakest one. This used to emit 1.0, which
@@ -615,14 +639,27 @@ class CompositionEngine:
                 for spec in specs for c in spec.signals}
 
     @staticmethod
-    def _signals_hold(spec: _EventSpec, ts: float, masks: dict) -> bool:
-        """True when every one of *spec*'s signal conditions holds at *ts*."""
+    def _held(spec: _EventSpec, ts: float, masks: dict) -> list:
+        """The names of *spec*'s signal conditions that hold at *ts*."""
         sec = int(ts)
+        out = []
         for condition in spec.signals:
             mask = masks.get(id(condition)) or []
-            if not (0 <= sec < len(mask)) or not mask[sec]:
-                return False
-        return True
+            if 0 <= sec < len(mask) and mask[sec]:
+                out.append(condition.signal)
+        return out
+
+    @classmethod
+    def _signals_hold(cls, spec: _EventSpec, ts: float, masks: dict) -> bool:
+        """True when enough of *spec*'s signal conditions hold at *ts*: all of
+        them, or ``min_matching`` of them when the event sets it."""
+        need = len(spec.signals)
+        if spec.min_matching > 0:
+            need = min(need, spec.min_matching)
+        held = cls._held(spec, ts, masks)
+        if any(c.required and c.signal not in held for c in spec.signals):
+            return False
+        return len(held) >= need
 
     @staticmethod
     def _signal_span(signals: dict) -> int:
@@ -678,13 +715,18 @@ class CompositionEngine:
                                else float(s['max'])),
                     # `equals` is the single-value spelling of `any_of`; both
                     # land in the same set so the matching code has one path.
+                    # Several alternatives also fit in `equals` as "a|b|c" -
+                    # the one form the Advanced tab's single text column keeps.
                     any_of=frozenset(
-                        str(v).strip().lower()
+                        part.strip().lower()
                         for v in ([s['equals']] if s.get('equals') is not None
                                   else (s.get('any_of') or []))
+                        for part in str(v).split('|')
+                        if part.strip()
                     ),
                     sustained_secs=int(s.get('sustained_secs', 0) or 0),
                     within_secs=int(s.get('within_secs', 0) or 0),
+                    required=bool(s.get('required', False)),
                 )
                 for s in ev.get('signals', [])
                 if s.get('signal')
@@ -705,6 +747,7 @@ class CompositionEngine:
                 signals=signals,
                 window_secs=float(ev.get('window_secs', 0.75)),
                 persist_secs=float(ev.get('persist_secs', 0.5)),
+                min_matching=int(ev.get('min_matching', 0) or 0),
             ))
         return specs
 

@@ -44,6 +44,35 @@ def carry_rule_fields(original_rules, rebuilt_rules, owned=TABLE_RULE_KEYS) -> l
     return out
 
 
+# The signal-condition fields the table has columns for.
+TABLE_SIGNAL_KEYS = frozenset({"signal", "min", "max", "equals", "sustained_secs", "within_secs"})
+
+
+def carry_signal_fields(original_signals, rebuilt_signals, owned=TABLE_SIGNAL_KEYS) -> list:
+    """``rebuilt_signals`` with each condition's extra fields (``required``,
+    ``any_of``...) restored from its original, matched by signal name in order.
+
+    ``any_of`` is dropped when the table wrote an ``equals``: the table shows
+    one value, and a list carried beside an edited value would quietly win.
+    """
+    pool = [dict(c) for c in (original_signals or []) if isinstance(c, dict)]
+    used = set()
+    out = []
+    for cond in rebuilt_signals:
+        merged = dict(cond)
+        for i, old in enumerate(pool):
+            if i in used or old.get("signal") != cond.get("signal"):
+                continue
+            used.add(i)
+            for key, value in old.items():
+                if key in owned or (key == "any_of" and "equals" in merged):
+                    continue
+                merged.setdefault(key, value)
+            break
+        out.append(merged)
+    return out
+
+
 def top_level_fields(raw) -> dict:
     """Everything in a rules file except its events (e.g. ``outliner``)."""
     return {k: v for k, v in (raw or {}).items() if k != "events"} if isinstance(raw, dict) else {}

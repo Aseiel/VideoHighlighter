@@ -2798,6 +2798,12 @@ class VideoHighlighterGUI(QWidget):
                     entry['rules'] = carry_rule_fields(
                         (originals.get(entry['name']) or {}).get('rules'),
                         entry['rules'], owned=owned)
+                # And a signal condition's (``required``, a list in ``any_of``).
+                if entry.get('signals'):
+                    from modules.rules.rules_file import carry_signal_fields
+                    entry['signals'] = carry_signal_fields(
+                        (originals.get(entry['name']) or {}).get('signals'),
+                        entry['signals'])
 
             # Anything the table still cannot represent — an event with neither
             # kind of condition — is written back as it was read. The table
