@@ -43,6 +43,8 @@ EXPECTED_TOOLS = {
     "get_job", "list_jobs", "cancel_job",
     "dataset_health", "plan_reviewed_video", "add_reviewed_video",
     "start_dataset_comparison", "drop_reviewed_folders", "undo_reviewed_video",
+    "get_rules", "set_rule", "remove_rule", "start_apply_rules", "get_events",
+    "get_transcript",
 } | ({"start_example_search"} if HAS_EXAMPLE_SEARCH else set())   | ({"start_counter_check"} if tools.has_counter_check() else set())   | ({"start_counter_guided_run"} if tools.has_counter_guided() else set())
 
 needs_example_search = pytest.mark.skipif(

@@ -25,7 +25,12 @@ dataset's other videos, whether that helped and which part did not;
 drop_reviewed_folders or undo_reviewed_video take out what measured worse.
 Decide by the comparison's numbers: an addition is kept only when it did
 not measure worse. Classes are shown as codes (C01, ...) unless the user has
-turned real names on; the user has the table."""
+turned real names on; the user has the table.
+
+Composition rules turn per-second signals into named events on the timeline:
+get_rules, set_rule (add or replace one event), start_apply_rules (a job),
+get_events, get_transcript. The timeline window open on a video follows its
+files, so a change shows there without reopening it."""
 
 
 def build_server(jobs=None):
@@ -315,6 +320,10 @@ def build_server(jobs=None):
         """Stop a job. A queued job is dropped; a running one stops at its next
         checkpoint, which can take a little while."""
         return tools.cancel_job(jobs, job_id)
+
+    # Composition rules: read, change, apply, and what they found.
+    from mcp_server import composition_tools
+    composition_tools.register(mcp, jobs, read_only, starts)
 
     return mcp
 

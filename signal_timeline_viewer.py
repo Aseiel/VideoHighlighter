@@ -2315,7 +2315,7 @@ class SignalTimelineWindow(QMainWindow):
                     
                     # Try to peek inside
                     try:
-                        with open(f, 'r') as fh:
+                        with open(f, 'r', encoding='utf-8') as fh:
                             data = json.load(fh)
                             print(f"      Keys: {data.keys()}")
                             if 'video_path' in data:
@@ -2360,7 +2360,7 @@ class SignalTimelineWindow(QMainWindow):
                 print(f"    - {cache_file.name}")
                 try:
                     # Try to load it directly
-                    with open(cache_file, 'r') as f:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
                         cache_data = json.load(f)
                     
                     # Verify it's for this video

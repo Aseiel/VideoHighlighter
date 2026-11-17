@@ -749,7 +749,7 @@ class VideoAnalysisCache:
                 
                 if exact_cache_path.exists():
                     try:
-                        with open(exact_cache_path, 'r') as f:
+                        with open(exact_cache_path, 'r', encoding='utf-8') as f:
                             cache_data = json.load(f)
                         
                         # Check for highlight history
@@ -781,7 +781,7 @@ class VideoAnalysisCache:
             for cache_file in matching_files:
                 try:
                     print(f"    - Reading {cache_file.name}")
-                    with open(cache_file, 'r') as f:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
                         cache_data = json.load(f)
                     
                     # Check for highlight history
