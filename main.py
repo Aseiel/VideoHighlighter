@@ -3959,6 +3959,17 @@ class VideoHighlighterGUI(QWidget):
         legal_layout.addWidget(legal)
         layout.addWidget(legal_group)
 
+        # --- Thanks --- (modules/ui/credits.py: one list for both editions)
+        from modules.ui import credits
+        thanks_group = QGroupBox(i18n.t("Thanks"))
+        thanks_layout = QVBoxLayout(thanks_group)
+        thanks = QLabel(credits.html())
+        thanks.setTextFormat(Qt.RichText)
+        thanks.setWordWrap(True)
+        thanks.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        thanks_layout.addWidget(thanks)
+        layout.addWidget(thanks_group)
+
         layout.addStretch()
         return outer
 

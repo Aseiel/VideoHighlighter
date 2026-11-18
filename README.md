@@ -143,6 +143,11 @@ usually around. Bugs and ideas are welcome in
 - Performance tips on CPU/GPU
 - Troubleshooting common issues
 
+## Thanks
+
+To the people whose requests and reports improved the app, listed with what
+changed and by how much in [CREDITS.md](CREDITS.md).
+
 ## License
 
 Copyright (C) 2026 Przemysław Kreft and Meric Donmezer.
