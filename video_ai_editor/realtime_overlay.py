@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from modules.media.audio_device import follow_system_default
+from modules.ui.flow_layout import FlowRow
 
 try:
     import psutil
@@ -944,7 +945,9 @@ class OverlayView(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setStyleSheet("QGraphicsView { background-color: black; border: none; }")
-        self.setMinimumSize(320, 240)
+        # The same floor as the plain video surface it shares a stack with;
+        # a taller one here set the preview's minimum with the overlay off.
+        self.setMinimumSize(240, 135)
         self._vr_mode = False
         # One-shot "draw a box to teach a model" mode (see begin_teach_draw).
         self._teach_mode = False
@@ -1159,9 +1162,11 @@ class RealtimeOverlayPreview(QWidget):
         self._view = OverlayView(self._scene)
         layout.addWidget(self._view, 1)
 
-        # Controls row
-        controls = QHBoxLayout()
-        controls.setContentsMargins(4, 0, 4, 4)
+        # Controls row. It wraps: as one unbreakable line it was 650px, and
+        # this page sits in a stack whose minimum is its widest page — so the
+        # preview could not be narrower than that even with the overlay off.
+        controls_row = FlowRow(spacing=6, margins=(4, 0, 4, 4))
+        controls = controls_row.flow
 
         # Overlay toggle
         self._overlay_cb = QCheckBox("🎯 Live BBox Overlay")
@@ -1218,21 +1223,24 @@ class RealtimeOverlayPreview(QWidget):
         self._mem_label.setStyleSheet("color: #666; font-size: 10px;")
         controls.addWidget(self._mem_label)
 
-        # Time window slider
-        controls.addWidget(QLabel("Window:"))
+        # Time window slider — label, slider and value wrap as one.
+        window_group = QHBoxLayout()
+        window_group.setSpacing(6)
+        window_group.addWidget(QLabel("Window:"))
         self._window_slider = QSlider(Qt.Horizontal)
         self._window_slider.setRange(1, 20)  # 0.1s to 2.0s
         self._window_slider.setValue(5)       # 0.5s default
         self._window_slider.setFixedWidth(80)
         self._window_slider.setToolTip("Time window for showing nearby detections (0.1s - 2.0s)")
         self._window_slider.valueChanged.connect(self._on_window_changed)
-        controls.addWidget(self._window_slider)
+        window_group.addWidget(self._window_slider)
 
         self._window_label = QLabel("0.5s")
         self._window_label.setStyleSheet("color: #aaa; font-size: 11px; min-width: 30px;")
-        controls.addWidget(self._window_label)
+        window_group.addWidget(self._window_label)
+        controls.addLayout(window_group)
 
-        layout.addLayout(controls)
+        layout.addWidget(controls_row)
 
         # Style
         self.setStyleSheet("""

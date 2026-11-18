@@ -45,6 +45,7 @@ from modules import i18n
 from modules.ui.collapsible import CollapsibleSection
 from modules.ui import fit
 from modules.ui.fit import fit_icon_button, fit_width
+from modules.ui.flow_layout import FlowRow
 from modules.ui.theme import DARK as THEME
 from modules.ui import icons as ui_icons
 # Building this window blocks the GUI thread for several seconds, so it reports
@@ -847,9 +848,11 @@ class SignalTimelineWindow(QMainWindow):
         # ──────────────────────────────────────────────────────────
         # Transport controls
         # ──────────────────────────────────────────────────────────
-        controls_widget = QWidget()
-        controls_layout = QHBoxLayout(controls_widget)
-        controls_layout.setContentsMargins(0, 4, 0, 0)
+        # A row that wraps. As one unbreakable line it was 848px wide, and a
+        # dock cannot be narrower than its widest row — so the preview alone
+        # claimed most of a laptop screen before the timeline got any.
+        controls_widget = FlowRow(spacing=6, margins=(0, 4, 0, 0))
+        controls_layout = controls_widget.flow
 
         # Play button
         self.play_btn = QPushButton("▶ Play")
@@ -875,6 +878,9 @@ class SignalTimelineWindow(QMainWindow):
         self.time_slider.sliderPressed.connect(self._on_slider_pressed)
         self.time_slider.sliderReleased.connect(self._on_slider_released)
         self.time_slider.valueChanged.connect(self.seek_video)
+        # It takes whatever its line has spare; this is the least it is any
+        # use at, and so the point at which it moves to a line with more.
+        self.time_slider.setMinimumWidth(120)
         controls_layout.addWidget(self.time_slider)
 
         # Time label
@@ -2528,6 +2534,12 @@ class SignalTimelineWindow(QMainWindow):
         """Initialize the user interface with edit timeline"""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+        # A floor for the timeline itself. Now that its toolbar wraps, nothing
+        # in here needs more than a few hundred pixels — and a main window
+        # shrinks its centre to the minimum before it takes anything from the
+        # docks. Left alone the timeline was squeezed to a sliver beside a
+        # preview at full width, and the toolbar wrapped to ten lines.
+        central_widget.setMinimumWidth(self.TIMELINE_MIN_WIDTH)
         
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(8, 8, 8, 8)
@@ -2654,9 +2666,22 @@ class SignalTimelineWindow(QMainWindow):
             
             # Add as a dock widget on the bottom
             llm_dock = QDockWidget("LLM Assistant", self)
-            llm_dock.setWidget(self.llm_chat)
+            # In a scroll area, so the dock can be shorter than its contents.
+            # Settings, search and a conversation stacked up need 484px, and a
+            # dock's minimum is its contents' minimum — added to the timeline
+            # above it, that asked for more height than a laptop screen has.
+            # With room it fills the dock exactly as before; without, it
+            # scrolls instead of pushing the window off the screen.
+            llm_scroll = QScrollArea()
+            llm_scroll.setWidgetResizable(True)
+            llm_scroll.setFrameShape(QScrollArea.NoFrame)
+            llm_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            llm_scroll.setWidget(self.llm_chat)
+            llm_dock.setWidget(llm_scroll)
             self.addDockWidget(Qt.BottomDockWidgetArea, llm_dock)
             self._llm_dock = llm_dock
+            llm_dock.topLevelChanged.connect(self._docks_moved_by_user)
+            llm_dock.dockLocationChanged.connect(self._docks_moved_by_user)
         except ImportError:
             pass  # LLM modules not installed
 
@@ -2710,6 +2735,9 @@ class SignalTimelineWindow(QMainWindow):
         try:
             preview_dock = self.create_video_preview_dock()
             self.addDockWidget(Qt.LeftDockWidgetArea, preview_dock)
+            self._preview_dock = preview_dock
+            preview_dock.topLevelChanged.connect(self._docks_moved_by_user)
+            preview_dock.dockLocationChanged.connect(self._docks_moved_by_user)
         except Exception as e:
             print(f"⚠️ Could not create preview dock: {e}")
             # Continue without preview
@@ -2772,7 +2800,66 @@ class SignalTimelineWindow(QMainWindow):
         super().showEvent(event)
         if not getattr(self, "_dock_balanced", False):
             self._dock_balanced = True
-            QTimer.singleShot(0, self._balance_bottom_dock)
+            QTimer.singleShot(0, self._balance_docks)
+
+    # The least width the timeline keeps, and the most of the window the
+    # preview takes while the dock sizes are still the window's to choose.
+    TIMELINE_MIN_WIDTH = 560
+    PREVIEW_SHARE = 0.32
+
+    def resizeEvent(self, event):
+        # The dock sizes were chosen for the size the window opened at. A
+        # window opened at 1600px and then maximized would otherwise keep a
+        # preview sized for 1600 — wrapped controls on a 3440px screen.
+        super().resizeEvent(event)
+        if not getattr(self, "_dock_balanced", False):
+            return
+        timer = getattr(self, "_rebalance_timer", None)
+        if timer is None:
+            timer = self._rebalance_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(0)
+            timer.timeout.connect(self._balance_docks)
+        timer.start()
+
+    def event(self, event):
+        # The main window's own pixels are only the bars between its docks, so
+        # a press that lands on no child is the user taking hold of one. From
+        # then on the dock sizes are theirs and a resize leaves them alone.
+        if (event.type() == QEvent.Type.MouseButtonPress
+                and self.childAt(event.position().toPoint()) is None):
+            self._docks_user_sized = True
+        return super().event(event)
+
+    def _docks_moved_by_user(self, *_args):
+        self._docks_user_sized = True
+
+    def _balance_docks(self):
+        if getattr(self, "_docks_user_sized", False):
+            return
+        self._balance_preview_dock()
+        self._balance_bottom_dock()
+
+    def _balance_preview_dock(self):
+        """Size the preview for the window: its controls on one line where
+        there is room, and no more than its share of the width where not.
+
+        On one line the controls want about 850px. On a wide window that is a
+        quarter of it; on a 1080p screen it is nearly half, and the timeline —
+        what this window is for — would get what was left. There the preview
+        gives way and its controls wrap."""
+        dock = getattr(self, "_preview_dock", None)
+        if dock is None or not dock.isVisible() or dock.isFloating():
+            return
+        share = int(self.width() * self.PREVIEW_SHARE)
+        natural = dock.sizeHint().width()
+        target = max(dock.minimumSizeHint().width(), min(natural, share))
+        if dock.width() == target:
+            return
+        try:
+            self.resizeDocks([dock], [target], Qt.Orientation.Horizontal)
+        except Exception as e:
+            print(f"⚠️ Could not balance the preview dock: {e}")
 
     def _balance_bottom_dock(self):
         """Give the LLM dock enough height for a usable chat. Lowering the
@@ -3430,11 +3517,15 @@ class SignalTimelineWindow(QMainWindow):
 
     def create_edit_controls(self):
         """Edit toolbar — buttons grouped playback | clip ops | output, with
-        separators, so the row reads as three tools instead of nine buttons."""
-        controls = QWidget()
-        layout = QHBoxLayout(controls)
-        layout.setSpacing(6)
-        layout.setContentsMargins(4, 2, 4, 2)
+        separators, so the row reads as three tools instead of nine buttons.
+
+        It wraps. Side by side these controls are 1557px, which as a row that
+        could not break was the least the timeline could ever be: wider than
+        the room a 1080p screen has left between the preview and the panels,
+        so there the buttons were squeezed until their labels overlapped. With
+        room to spare it is still the one line it always was."""
+        controls = FlowRow(spacing=6, margins=(4, 2, 4, 2))
+        layout = controls.flow
 
         # -- Playback --
         self.play_edit_btn = QPushButton("Play Edit")

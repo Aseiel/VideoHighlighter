@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTextEdit, QLineEdit, QComboBox,
     QFileDialog, QApplication, QCheckBox,
-    QDialog, QDialogButtonBox, QDoubleSpinBox, QSpinBox,
+    QDialog, QDialogButtonBox, QDoubleSpinBox, QSpinBox, QSizePolicy,
 )
 from PySide6.QtCore import Qt, Signal, Slot, QThread, QSettings, QObject
 from PySide6.QtGui import (
@@ -34,6 +34,7 @@ from PySide6.QtGui import (
 
 from modules.ui.collapsible import CollapsibleSection
 from modules.ui.fit import fit_width
+from modules.ui.flow_layout import FlowRow
 from modules.ui.theme import DARK as THEME
 from modules.ui import icons as ui_icons
 
@@ -1008,14 +1009,32 @@ class LLMChatWidget(QWidget):
         # Visual search — its own foldable section, sibling of the settings
         # (it used to be nested inside them, so it vanished with them too).
         search_group = CollapsibleSection("Visual Search", settings_key="llm/visual-search")
-        search_layout = QHBoxLayout()
-        
-        search_layout.addWidget(QLabel("Search for:"))
+        # A row that wraps. On one unbreakable line these controls are 1525px,
+        # and that was the least any window holding this panel could be —
+        # wider than a laptop screen. With room it is the one line it was.
+        search_row = FlowRow(spacing=6)
+        search_layout = search_row.flow
+
+        def paired(label, field, *, grows=False):
+            """A label and its field, wrapping as one: apart, the label ends a
+            line and the field it names starts the next."""
+            pair = QHBoxLayout()
+            pair.setSpacing(6)
+            pair.addWidget(QLabel(label))
+            pair.addWidget(field)
+            box = search_layout.addLayout(pair)
+            if grows:
+                box.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                  QSizePolicy.Policy.Preferred)
+            return box
+
         self.search_target = QLineEdit()
         self.search_target.setPlaceholderText("explosion, person, car, etc.")
-        search_layout.addWidget(self.search_target)
-        
-        search_layout.addWidget(QLabel("From:"))
+        # The least a query field is any use at; below it, it takes a line of
+        # its own rather than shrinking to a few characters.
+        self.search_target.setMinimumWidth(160)
+        paired("Search for:", self.search_target, grows=True)
+
         self.search_start_time = TimeSpinBox()
         self.search_start_time.setRange(0, 99999)
         self.search_start_time.setValue(0)
@@ -1024,9 +1043,8 @@ class LLMChatWidget(QWidget):
         self.search_start_time.setToolTip(
             "Start searching from this timestamp. Type seconds (90) or mm:ss (1:30)."
         )
-        search_layout.addWidget(self.search_start_time)
+        paired("From:", self.search_start_time)
 
-        search_layout.addWidget(QLabel("Interval:"))
         self.search_interval = TimeSpinBox()
         self.search_interval.setRange(0.5, 600.0)  # up to 10 minutes per step
         self.search_interval.setValue(1.0)
@@ -1035,10 +1053,9 @@ class LLMChatWidget(QWidget):
         self.search_interval.setToolTip(
             "Time between sampled frames. Type seconds (60) or mm:ss (1:00)."
         )
-        search_layout.addWidget(self.search_interval)
-        
+        paired("Interval:", self.search_interval)
+
         # Engine selector: CLIP (fast GPU ranker) / LLM (VLM) / CLIP+LLM (funnel)
-        search_layout.addWidget(QLabel("Engine:"))
         self.search_engine_combo = QComboBox()
         self.search_engine_combo.addItem("CLIP + LLM", "clip_llm")
         self.search_engine_combo.addItem("CLIP only", "clip")
@@ -1052,7 +1069,7 @@ class LLMChatWidget(QWidget):
             "              same prompt and scoring, to compare the two on one video."
         )
         self.search_engine_combo.currentIndexChanged.connect(self._on_search_engine_changed)
-        search_layout.addWidget(self.search_engine_combo)
+        paired("Engine:", self.search_engine_combo)
 
         self.search_topk_label = QLabel("Top-K:")
         search_layout.addWidget(self.search_topk_label)
@@ -1114,24 +1131,27 @@ class LLMChatWidget(QWidget):
         self.search_prev_btn.setToolTip("Previous match")
         self.search_prev_btn.clicked.connect(lambda: self._step_search_result(-1))
         self.search_prev_btn.setEnabled(False)
-        search_layout.addWidget(self.search_prev_btn)
+        step_group = QHBoxLayout()
+        step_group.setSpacing(6)
+        step_group.addWidget(self.search_prev_btn)
 
         self.search_result_label = QLabel("0/0")
         self.search_result_label.setStyleSheet("color:#999;min-width:36px;")
         self.search_result_label.setAlignment(Qt.AlignCenter)
-        search_layout.addWidget(self.search_result_label)
+        step_group.addWidget(self.search_result_label)
 
         self.search_next_btn = QPushButton("▶")
         self.search_next_btn.setFixedWidth(30)
         self.search_next_btn.setToolTip("Next match")
         self.search_next_btn.clicked.connect(lambda: self._step_search_result(1))
         self.search_next_btn.setEnabled(False)
-        search_layout.addWidget(self.search_next_btn)
+        step_group.addWidget(self.search_next_btn)
+        search_layout.addLayout(step_group)
 
         # Search progress lives inside the section, under the controls row
         search_vbox = QVBoxLayout()
         search_vbox.setSpacing(4)
-        search_vbox.addLayout(search_layout)
+        search_vbox.addWidget(search_row)
 
         self.search_progress = QLabel("")
         self.search_progress.setStyleSheet("color:#2f81f7;font-style:italic;font-size:9pt;")
