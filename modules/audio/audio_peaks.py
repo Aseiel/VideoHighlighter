@@ -53,21 +53,12 @@ def extract_waveform_data(video_path, num_points=1000):
         
         duration = len(audio) / rate
         
-        # Downsample for visualization
-        step = max(1, len(audio) // num_points)
-        waveform = []
-        
-        for i in range(0, len(audio), step):
-            chunk = audio[i:i+step]
-            if len(chunk) > 0:
-                max_val = np.max(chunk) / 32768.0  # Normalize to [-1, 1]
-                min_val = np.min(chunk) / 32768.0
-                # RMS energy ~ perceived loudness (broadband events like explosions
-                # read hot, not just sharp transients with a high peak).
-                rms = float(np.sqrt(np.mean((chunk.astype(np.float64) / 32768.0) ** 2)))
-                waveform.append((min_val, max_val, rms))
-
-        return waveform
+        # Downsample for visualization: (min, max, rms) per bin. RMS is the
+        # perceived loudness (broadband events like explosions read hot, not
+        # just sharp transients with a high peak). Vectorised: at 50 ms bins a
+        # two-hour film is 144,000 of them.
+        from video_ai_editor.waveform import bin_audio
+        return bin_audio(audio, rate, num_points=num_points)
         
     finally:
         import os

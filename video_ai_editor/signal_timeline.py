@@ -1,11 +1,13 @@
 from .timeline_bars import TimelineBar, DraggableTimelineBar, BarLabel
 from collections import defaultdict
 import json
+import numpy as np
 
 from modules.segments import motion_curve
 from modules.system import repaint_trace
 from .filmstrip_lane import LANE_HEIGHT as FILMSTRIP_LANE_HEIGHT
 from .filmstrip_lane import FilmstripLane
+from .waveform_lane import WaveformLane, bin_levels
 from .filmstrip_painter import DEFAULT_ASPECT as DEFAULT_FILMSTRIP_ASPECT
 from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsTextItem,
@@ -295,63 +297,14 @@ class SignalTimelineScene(QGraphicsScene):
         # Draw waveform label
         self.row_labels.append(("AUDIO WAVEFORM", waveform_y))
         
-        # Draw the actual waveform
+        # Draw the actual waveform: one painted item, each bin across its own
+        # time span (video_ai_editor/waveform_lane.py).
         if len(self.waveform) > 0 and self.video_duration > 0:
-            # Calculate proper scaling
             total_width = self.sceneRect().width()
-            points_per_pixel = len(self.waveform) / total_width
-            
-            n_points = len(self.waveform)
-
-            # Color by ENERGY (RMS) where available; falls back to peak for old
-            # 2-tuple caches. Normalize against a high PERCENTILE (not the single
-            # loudest bin) so one loud transient (a bell) doesn't flatten the rest
-            # to one colour — spreads quiet->blue, typical->mid, loud->red, with
-            # outliers clipped to red.
-            def _energy(pt):
-                return pt[2] if len(pt) > 2 else (abs(pt[0]) + abs(pt[1])) / 2
-            _sorted_e = sorted(_energy(pt) for pt in self.waveform)
-
-            def _pct(p):
-                if not _sorted_e:
-                    return 0.0
-                return _sorted_e[min(len(_sorted_e) - 1, int(len(_sorted_e) * p))]
-            energy_lo = _pct(0.10)              # floor -> blue
-            energy_rng = max(_pct(0.97) - energy_lo, 1e-6)  # robust ceiling -> red
-
-            for i, pt in enumerate(self.waveform):
-                min_val, max_val = pt[0], pt[1]
-                # Each point is one of n_points equal bins tiling [0, video_duration];
-                # place it at the bin CENTER (i+0.5) so a transient lands on its real
-                # time instead of up to a full bin (~0.7s) early.
-                time_pos = ((i + 0.5) / n_points) * self.video_duration
-                x = time_pos * self.pixels_per_second
-
-                # Skip if beyond visible area
-                if x > total_width:
-                    break
-
-                # Map energy across [floor, ceiling] percentile range, clamped.
-                norm = (_energy(pt) - energy_lo) / energy_rng
-                norm = 0.0 if norm < 0 else (1.0 if norm > 1 else norm)
-                amplitude_index = min(255, int(norm * 255))
-              
-                # Get color
-                if self.waveform_colors and amplitude_index < len(self.waveform_colors):
-                    color = self.waveform_colors[amplitude_index]
-                    color.setAlpha(min(255, color.alpha() + 50))
-                else:
-                    color = QColor(47, 129, 247, 200)
-                
-                # Calculate y positions
-                y_center = waveform_y + height // 2
-                y_min = y_center + int(min_val * height // 2 * 0.8)
-                y_max = y_center + int(max_val * height // 2 * 0.8)
-                
-                # Draw vertical line - ensure minimum width
-                line_width = max(2, self.pixels_per_second / (len(self.waveform) / self.video_duration))
-                pen = QPen(color, min(5, line_width))  # Cap at 5 pixels thick
-                self.addLine(x, y_min, x, y_max, pen)
+            lane = WaveformLane(self.waveform, self.video_duration, self.pixels_per_second,
+                                total_width, height, self.waveform_colors)
+            lane.setPos(0, waveform_y)
+            self.addItem(lane)
 
             # Peak markers — small amber triangles above every peak the AUDIO
             # WAVEFORM ◀▶ arrows will jump to, so the sensitivity is visible as
@@ -515,25 +468,10 @@ class SignalTimelineScene(QGraphicsScene):
         if n == 0 or self.video_duration <= 0:
             return []
 
-        def _energy(pt):
-            return pt[2] if len(pt) > 2 else (abs(pt[0]) + abs(pt[1])) / 2
-
-        energies = [_energy(pt) for pt in wf]
-        s = sorted(energies)
-
-        def _pct(p):
-            return s[min(len(s) - 1, int(len(s) * p))]
-
-        lo = _pct(0.10)
-        rng = max(_pct(0.97) - lo, 1e-6)
-
-        series = []
-        for i, e in enumerate(energies):
-            norm = (e - lo) / rng
-            norm = 0.0 if norm < 0 else (1.0 if norm > 1 else norm)
-            t = ((i + 0.5) / n) * self.video_duration   # bin center (matches draw)
-            series.append((t, norm))
-        return series
+        energies = [pt[2] if len(pt) > 2 else (abs(pt[0]) + abs(pt[1])) / 2 for pt in wf]
+        levels = bin_levels(energies)                  # as the lane colours them
+        times = (np.arange(n) + 0.5) / n * self.video_duration   # bin centre
+        return list(zip(times.tolist(), levels.tolist()))
 
     def _waveform_peaks(self):
         """Peak times in the waveform whose normalized energy clears the

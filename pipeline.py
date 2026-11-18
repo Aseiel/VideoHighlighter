@@ -1040,10 +1040,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             if waveform_data is None:
                 try:
                     from modules.audio.audio_peaks import extract_waveform_data
-                    # Scale resolution with duration so bins stay ~0.25s (tight
-                    # waveform/preview alignment) instead of a fixed 1000 points
-                    # that become ~1.4s bins on long videos. Capped for draw perf.
-                    _wf_points = min(12000, max(2000, int(video_duration * 4)))
+                    # Bins of 50 ms whatever the length, so a sound lines up
+                    # with the playhead (video_ai_editor.waveform.BINS_PER_SECOND;
+                    # the lane paints only what is on screen, so no cap).
+                    from video_ai_editor.waveform import BINS_PER_SECOND as _WF_BPS
+                    _wf_points = max(2000, int(video_duration * _WF_BPS))
                     waveform_data = extract_waveform_data(processed_video_path, num_points=_wf_points)
                     log("✅ Waveform computed (was missing in cache)")
                 except Exception as e:
@@ -1056,10 +1057,11 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
             # Always try to compute waveform for the timeline viewer
             try:
                 from modules.audio.audio_peaks import extract_waveform_data
-                # Scale resolution with duration so bins stay ~0.25s (tight
-                # waveform/preview alignment) instead of a fixed 1000 points that
-                # become ~1.4s bins on long videos. Capped for scene-draw perf.
-                _wf_points = min(12000, max(2000, int(video_duration * 4)))
+                # Bins of 50 ms whatever the length, so a sound lines up with
+                # the playhead (video_ai_editor.waveform.BINS_PER_SECOND; the
+                # lane paints only what is on screen, so no cap).
+                from video_ai_editor.waveform import BINS_PER_SECOND as _WF_BPS
+                _wf_points = max(2000, int(video_duration * _WF_BPS))
                 waveform_data = extract_waveform_data(processed_video_path, num_points=_wf_points)
             except Exception as e:
                 log(f"⚠️ Waveform extraction failed: {e}")

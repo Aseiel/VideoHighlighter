@@ -68,7 +68,7 @@ from video_ai_editor.timeline_export import (
     record_start_for_format,
     skipped_note,
 )
-from video_ai_editor.waveform import WaveformVisualizer
+from video_ai_editor.waveform import WaveformVisualizer, is_coarse as waveform_is_coarse
 from video_ai_editor.timeline_bars import TimelineBar
 from video_ai_editor.signal_timeline import SignalTimelineScene, SignalTimelineView
 from video_ai_editor.edit_timeline import EditTimelineScene
@@ -589,9 +589,16 @@ class SignalTimelineWindow(QMainWindow):
         # silently dropped and the waveform never appeared.
         self.waveform_ready.connect(self._on_waveform_ready)
 
-        # Start background extraction if we don't have cached waveform
+        # Start background extraction if we don't have cached waveform, or
+        # the cached one is too coarse to line up with the playhead (a cache
+        # from before video_ai_editor.waveform.BINS_PER_SECOND; it stays on
+        # screen until the finer one replaces it).
         if not self.waveform or len(self.waveform) == 0:
             debug_log(f"  ⚠️ No cached waveform or empty waveform, starting extraction...")
+            self.init_waveform()
+        elif waveform_is_coarse(self.waveform, self.video_duration):
+            debug_log(f"  ⚠️ Cached waveform is coarse ({len(self.waveform)} points over "
+                      f"{self.video_duration:.0f}s), extracting a finer one...")
             self.init_waveform()
         else:
             debug_log(f"  ✅ Using cached waveform ({len(self.waveform)} points)")
@@ -1565,7 +1572,7 @@ class SignalTimelineWindow(QMainWindow):
         def extract_waveform():
             print("🎵 [thread] Starting waveform extraction...")
             visualizer = WaveformVisualizer(self.video_path)
-            data = visualizer.extract_waveform(num_points=2000)
+            data = visualizer.extract_waveform()
 
             if data is None:
                 print("❌ [thread] extract_waveform() returned None")
