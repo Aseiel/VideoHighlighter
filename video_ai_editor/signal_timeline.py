@@ -2847,6 +2847,30 @@ class SignalTimelineScene(QGraphicsScene):
 
         return y_pos + self.layer_height + self.layer_spacing
 
+# How far the wheel zooms. Out: until the whole video fills the view, and no
+# further - past that the timeline only shrinks into empty space and the next
+# zoom in takes a dozen notches to get back. In: until a second is this many
+# screen pixels - a 25 fps frame is then 40 px and a 50 ms waveform bin 50 px;
+# deeper than that shows nothing the media has.
+MAX_PX_PER_SECOND = 1000.0
+
+
+def clamp_zoom(current_pps: float, factor: float, view_width: float,
+               duration: float, max_pps: float = MAX_PX_PER_SECOND) -> float:
+    """The zoom factor to apply instead of ``factor``, so the effective
+    pixels per second stays between the whole video in ``view_width`` and
+    ``max_pps``. 1.0 means: already at the limit, do nothing."""
+    if current_pps <= 0:
+        return factor
+    lo = view_width / duration if duration > 0 and view_width > 0 else 0.0
+    hi = max(max_pps, lo)
+    wanted = min(hi, max(lo, current_pps * factor))
+    # Moving away from a limit is always allowed, even from outside it.
+    if (factor > 1 and current_pps >= hi) or (factor < 1 and current_pps <= lo):
+        return 1.0
+    return wanted / current_pps
+
+
 class SignalTimelineView(QGraphicsView):
     """Custom view with smooth zooming and panning"""
 
@@ -3059,10 +3083,15 @@ class SignalTimelineView(QGraphicsView):
         old_anchor = self.transformationAnchor()
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
 
-        if event.angleDelta().y() > 0:
-            self.scale(zoom_factor, 1.0)
-        else:
-            self.scale(1.0 / zoom_factor, 1.0)
+        factor = zoom_factor if event.angleDelta().y() > 0 else 1.0 / zoom_factor
+        scene = self.scene()
+        if scene is not None:
+            factor = clamp_zoom(
+                float(getattr(scene, "pixels_per_second", 0) or 0) * self.transform().m11(),
+                factor, float(self.viewport().width()),
+                float(getattr(scene, "video_duration", 0) or 0))
+        if abs(factor - 1.0) > 1e-6:
+            self.scale(factor, 1.0)
 
         self.setTransformationAnchor(old_anchor)
 
