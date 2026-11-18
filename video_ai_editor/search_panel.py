@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QSizePolicy, QSplitter, QComboBox, QMenu,
 )
 
+from modules.media.timecode import clock
 from modules.vision.face_emotions import EMOTION_LABELS
 
 THUMB_SIZE = 56    # face card thumbnail px
@@ -28,8 +29,7 @@ MIN_DUR    = 0.5  # seconds — segments shorter than this are dropped
 
 
 def _fmt(seconds: float) -> str:
-    m, s = divmod(int(seconds), 60)
-    return f"{m}:{s:02d}"
+    return clock(int(seconds))
 
 
 def _placeholder_pixmap(size: int) -> QPixmap:

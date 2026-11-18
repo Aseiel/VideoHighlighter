@@ -10,6 +10,8 @@ import sys
 import os
 from typing import Optional
 from pathlib import Path
+
+from modules.media.timecode import clock
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QCheckBox, QGroupBox,
@@ -171,8 +173,7 @@ class AnalysisOverlayWidget(QWidget):
             painter.drawText(10, h - 10, f"No detections at {self.current_time:.1f}s")
         
         # ── Timestamp (top-right) ──
-        mins, secs = divmod(int(self.current_time), 60)
-        ts_text = f"{mins:02d}:{secs:02d}"
+        ts_text = clock(self.current_time)
         painter.setFont(QFont("Consolas", 13, QFont.Bold))
         painter.setPen(QColor(0, 0, 0, 200))
         painter.drawText(w - 78, 27, ts_text)
@@ -458,8 +459,7 @@ class VideoPreviewWindow(QMainWindow):
         """Update duration display"""
         if duration > 0:
             self.time_slider.setMaximum(duration)
-            total_secs = duration // 1000
-            self.total_time = f"{total_secs // 60:02d}:{total_secs % 60:02d}"
+            self.total_time = clock(duration // 1000)
             self.update_time_label(self.player.position())
             
     @Slot(int)
@@ -480,9 +480,7 @@ class VideoPreviewWindow(QMainWindow):
                 
     def update_time_label(self, position):
         """Update time label"""
-        current_secs = position // 1000
-        current_time = f"{current_secs // 60:02d}:{current_secs % 60:02d}"
-        self.time_label.setText(f"{current_time} / {self.total_time}")
+        self.time_label.setText(f"{clock(position // 1000)} / {self.total_time}")
         
     @Slot(QMediaPlayer.PlaybackState)
     def update_play_button(self, state):

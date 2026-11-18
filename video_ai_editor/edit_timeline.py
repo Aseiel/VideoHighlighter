@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, QRectF, Signal, QTimer, QPointF
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QFont, QLinearGradient, QCursor, QPainter
 )
+from modules.media.timecode import clock
 from .timeline_bars import TimelineBar
 
 # ── thumbnail / hover modules ─────────────────────────────────────
@@ -35,10 +36,8 @@ HOVER_PREFETCH_SLOTS = 12
 
 
 def _fmt_time(seconds: float) -> str:
-    """Format timestamp as M:SS.t  →  1268.4 becomes '21:08.4'"""
-    mins = int(seconds // 60)
-    secs = seconds - mins * 60
-    return f"{mins}:{secs:04.1f}"
+    """1268.4 -> '21:08.4'; past an hour '1:09:05.0' (modules/media/timecode.py)."""
+    return clock(seconds, 1)
 
 
 def _fmt_duration(seconds: float) -> str:

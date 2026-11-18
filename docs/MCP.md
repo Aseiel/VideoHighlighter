@@ -67,6 +67,7 @@ Leave out `--scope user` to register it for the current project only. Run
 | `more_like_these` | Moments that look like ones already confirmed as right, by their timestamps. Instant, from the index a visual search saved |
 | `start_example_search` | Find more like this: an example region at given timestamps (job). Listed only in editions that have search by example |
 | `set_timeline_clips` | Put a list of clips on the app's edit timeline for a video, to adjust and export there |
+| `seek_timeline` | Move the open app's timeline viewer to a moment, to show the user what is being discussed. Pro (needs the live link) |
 | `start_counter_check` | Read an on-screen counter: when each value appears, and which of a run's clips cover them (job). Pro |
 | `start_counter_guided_run` | One clip per counter value, placed where the action model scores the chosen classes highest near it (job). Pro |
 | `dataset_health` | A hand-sorted training dataset: what would skew it, and which classes need more videos |

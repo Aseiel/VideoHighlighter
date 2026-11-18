@@ -5,6 +5,7 @@ import numpy as np
 
 from modules.segments import motion_curve
 from modules.system import repaint_trace
+from modules.media.timecode import clock
 from .filmstrip_lane import LANE_HEIGHT as FILMSTRIP_LANE_HEIGHT
 from .filmstrip_lane import FilmstripLane
 from .waveform_lane import WaveformLane, bin_levels
@@ -2055,12 +2056,7 @@ class SignalTimelineScene(QGraphicsScene):
     @staticmethod
     def _format_time_label(second):
         """H:MM:SS once we're past an hour, MM:SS otherwise."""
-        second = int(second)
-        h, rem = divmod(second, 3600)
-        m, s = divmod(rem, 60)
-        if h:
-            return f"{h:d}:{m:02d}:{s:02d}"
-        return f"{m:02d}:{s:02d}"
+        return clock(int(second))
 
     def draw_time_markers(self):
         """Draw the time ruler. The interval adapts to the *effective* zoom
@@ -2300,8 +2296,7 @@ class SignalTimelineScene(QGraphicsScene):
     def _update_selection_label(self, t0: float, t1: float, x0: float):
         """Update the time-range label that floats above the selection rect."""
         def fmt(t):
-            m, s = divmod(t, 60)
-            return f"{int(m):02d}:{s:05.2f}"
+            return clock(t, 2)
 
         duration = t1 - t0
         text = f"{fmt(t0)} → {fmt(t1)}  ({duration:.2f}s)  — drag to add"

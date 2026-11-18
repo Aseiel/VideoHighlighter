@@ -84,6 +84,9 @@ class _Window:
     def _reroute_edit_playback_to(self, index, pos):
         self.rerouted.append((index, pos))
 
+    def _log_audio_state(self, reason):    # a debug-log line, nothing to check
+        pass
+
 
 class TestStopThenClick:
     def test_a_click_after_stop_seeks_without_playing(self):

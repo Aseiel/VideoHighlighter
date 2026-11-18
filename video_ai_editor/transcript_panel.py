@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QEasingCurve
 from PySide6.QtGui import QColor, QTextCursor, QFont
 
+from modules.media.timecode import clock
+
 
 class TranscriptSegmentWidget(QFrame):
     """Single transcript segment — timestamp + text, clickable to seek"""
@@ -36,10 +38,9 @@ class TranscriptSegmentWidget(QFrame):
         layout.setSpacing(8)
 
         # Timestamp label
-        mins = int(self.start_time // 60)
-        secs = int(self.start_time % 60)
-        self.time_label = QLabel(f"{mins:02d}:{secs:02d}")
-        self.time_label.setFixedWidth(38)
+        self.time_label = QLabel(clock(self.start_time))
+        # Room for H:MM:SS: a film past an hour no longer counts minutes past 60.
+        self.time_label.setFixedWidth(50)
         self.time_label.setAlignment(Qt.AlignTop | Qt.AlignRight)
         self.time_label.setStyleSheet("""
             color: #aaaaaa;

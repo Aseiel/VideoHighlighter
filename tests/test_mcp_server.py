@@ -38,7 +38,7 @@ HAS_EXAMPLE_SEARCH = tools.has_example_search()
 EXPECTED_TOOLS = {
     "get_info", "probe_video", "scan_folder", "get_config",
     "start_highlight_run", "start_visual_search", "more_like_these",
-    "set_timeline_clips",
+    "set_timeline_clips", "seek_timeline",
     "start_expression_scan",
     "get_job", "list_jobs", "cancel_job",
     "dataset_health", "plan_reviewed_video", "add_reviewed_video",
@@ -533,6 +533,25 @@ def test_counter_guided_run_returns_one_event_per_value(server, jobs, video,
     with pytest.raises(ToolError, match="classes"):
         call(server, "start_counter_guided_run", video_path=video,
              roi=[0.0, 0.8, 0.1, 0.15], classes=[])
+
+
+def test_seek_timeline_says_why_when_the_app_is_not_there(server, video, monkeypatch):
+    """No app listening is an answer, not an error: the client tells the user.
+    An edition without a live link says so instead of trying."""
+    import importlib
+    import importlib.util
+    with pytest.raises(ToolError, match="0 or more"):
+        call(server, "seek_timeline", video_path=video, seconds=-1)
+    if importlib.util.find_spec("modules.system.live_link") is None:
+        result = call(server, "seek_timeline", video_path=video, seconds=1291.5)
+        assert result == {"live": False, "why": "this edition has no live link"}
+        return
+    live_link = importlib.import_module("modules.system.live_link")
+    sent = []
+    monkeypatch.setattr(live_link, "send", lambda cmd, args, **k: sent.append((cmd, args)))
+    result = call(server, "seek_timeline", video_path=video, seconds=1291.5)
+    assert result == {"live": False, "why": "the app is not running"}
+    assert sent[0][0] == "seek" and sent[0][1]["seconds"] == 1291.5
 
 
 def test_set_timeline_clips_becomes_the_newest_highlight_version(server, video,

@@ -28,7 +28,8 @@ from PySide6.QtCore import Qt, QRect, QRectF, Signal, Slot, QPointF, QTimer, QPo
 from PySide6.QtGui import (
     QColor, QPen, QBrush, QPainter, QFont, QPainterPath,
     QLinearGradient, QRadialGradient, QCursor, QAction,
-    QPainterPath, QFontMetrics, QDrag, QPixmap, QIntValidator
+    QPainterPath, QFontMetrics, QDrag, QPixmap, QIntValidator,
+    QKeySequence, QShortcut
 )
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -54,6 +55,8 @@ from modules.ui import icons as ui_icons
 # knowledge of who, if anyone, is watching.
 from modules.system import startup_splash
 from modules.media.audio_device import follow_system_default
+from modules.media.timecode import clock
+from video_ai_editor.clock_field import ClockField
 from video_ai_editor.video_preview import TimelineWithPreview
 from video_ai_editor.bbox_overlay import AnnotatedVideoManager
 from video_ai_editor.timeline_export import (
@@ -890,17 +893,12 @@ class SignalTimelineWindow(QMainWindow):
         self.time_slider.setMinimumWidth(120)
         controls_layout.addWidget(self.time_slider)
 
-        # Time label
-        self.preview_time_label = QLabel("00:00 / 00:00")
-        self.preview_time_label.setStyleSheet("""
-            QLabel {
-                color: #a0ffa0; font-family: 'Consolas', monospace;
-                font-weight: bold; padding: 8px; background-color: #141414;
-                border-radius: 4px; min-width: 120px;
-                qproperty-alignment: AlignCenter;
-            }
-        """)
+        # The clock, which a click turns into "go to time" (video_ai_editor/clock_field.py).
+        self.preview_time_label = ClockField()
+        self.preview_time_label.jumpRequested.connect(self._jump_to_time)
         controls_layout.addWidget(self.preview_time_label)
+        go_to_time = QShortcut(QKeySequence("Ctrl+G"), self)
+        go_to_time.activated.connect(self.preview_time_label.start_editing)
 
         # Show detections checkbox
         self.show_detections_checkbox = QCheckBox("Show Detections")
@@ -1367,9 +1365,7 @@ class SignalTimelineWindow(QMainWindow):
             lines.append('')
         
         # ── Timestamp ──
-        mins, secs = divmod(int(time_seconds), 60)
-        ms = int((time_seconds % 1) * 100)
-        lines.insert(0, f'<b style="color: #00ffff; font-size: 13px;">{mins:02d}:{secs:02d}.{ms:02d}</b>')
+        lines.insert(0, f'<b style="color: #00ffff; font-size: 13px;">{clock(time_seconds, 2)}</b>')
         
         if not actions and not objects:
             lines.append('<span style="color: #666;">No detections</span>')
@@ -1384,6 +1380,33 @@ class SignalTimelineWindow(QMainWindow):
         else:
             self._active_player.play()
             self.play_btn.setText("⏸ Pause")
+        self._log_audio_state("play/pause")
+
+    def _log_audio_state(self, reason):
+        """One debug-log line on where the sound is going, at each jump and
+        play/pause. Sound was reported lost after jumping between scenes with
+        nothing in the log to say why; this is what tells the next one apart:
+        a muted output, a zero volume, a device that moved, a player with no
+        audio track left, or the live player active instead of the shared one.
+        """
+        try:
+            player = self._active_player
+            ao = player.audioOutput()
+            which = "live" if player is not getattr(self, 'video_player', None) else "shared"
+            states = {QMediaPlayer.PlayingState: "playing", QMediaPlayer.PausedState: "paused",
+                      QMediaPlayer.StoppedState: "stopped"}
+            if ao is None:
+                out = "NO audio output"
+            else:
+                out = (f"muted={ao.isMuted()} volume={ao.volume():.2f} "
+                       f"device={ao.device().description()!r}")
+            print(f"🔊 audio [{reason}] t={self.current_time:.2f}s player={which} "
+                  f"{states.get(player.playbackState(), player.playbackState())} "
+                  f"hasAudio={player.hasAudio()} track={player.activeAudioTrack()} "
+                  f"{out} mute_btn={getattr(self, 'mute_btn', None) is not None and self.mute_btn.isChecked()} "
+                  f"slider={getattr(self, 'volume_slider', None) and self.volume_slider.value()}")
+        except Exception as e:  # noqa: BLE001 - a diagnostic never breaks playback
+            print(f"🔊 audio [{reason}] state unreadable: {type(e).__name__}: {e}")
 
     def _on_slider_pressed(self):
         """Hold off position updates while the handle is held."""
@@ -1466,10 +1489,7 @@ class SignalTimelineWindow(QMainWindow):
             self.time_slider.blockSignals(True)
             self.time_slider.setRange(0, int(duration))
             self.time_slider.blockSignals(False)
-            total_seconds = duration // 1000
-            mins = total_seconds // 60
-            secs = total_seconds % 60
-            self.total_duration_str = f"{mins:02d}:{secs:02d}"
+            self.total_duration_str = clock(duration // 1000)
             self.update_time_display(self.video_player.position())
 
             # --- SYNC DIAGNOSTIC ---------------------------------------------
@@ -1496,15 +1516,15 @@ class SignalTimelineWindow(QMainWindow):
                     )
 
     def update_time_display(self, position):
-        current_seconds = position // 1000
-        mins = current_seconds // 60
-        secs = current_seconds % 60
-        current_time_str = f"{mins:02d}:{secs:02d}"
-        
+        current_time_str = clock(position // 1000)
+        # The status bar's precise time follows playback too; it used to move
+        # only on a click or a seek and sat frozen while the video played.
+        if hasattr(self, 'time_label'):
+            self.time_label.setText(clock(position / 1000.0, 3))
         if hasattr(self, 'total_duration_str'):
-            self.preview_time_label.setText(f"{current_time_str} / {self.total_duration_str}")
+            self.preview_time_label.show_time(f"{current_time_str} / {self.total_duration_str}")
         else:
-            self.preview_time_label.setText(f"{current_time_str}")
+            self.preview_time_label.show_time(current_time_str)
 
     def update_play_button(self, state):
         """Update play button based on playback state"""
@@ -3010,6 +3030,12 @@ class SignalTimelineWindow(QMainWindow):
                 return True
 
             if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+                # A text box's Backspace is a character, not "delete the
+                # selected clips" -- typing a time or a search would eat them.
+                from PySide6.QtWidgets import QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox
+                if isinstance(QApplication.focusWidget(),
+                              (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)):
+                    return False
                 if (obj == self or
                     (hasattr(self, 'edit_view') and self.edit_view.hasFocus()) or
                     (hasattr(self, 'edit_scene') and len(self.edit_scene.selectedItems()) > 0)):
@@ -3055,13 +3081,12 @@ class SignalTimelineWindow(QMainWindow):
         """One status line: video stats + current edit length. The old info bar
         and the existing status message each showed duration; this merges them
         so Actions/Objects aren't lost to whoever calls showMessage last."""
-        mins, secs = int(self.video_duration // 60), int(self.video_duration % 60)
         try:
             edit_len = self.edit_scene.get_total_duration()
         except Exception:
             edit_len = 0.0
         self.statusBar().showMessage(
-            f"Duration: {mins:02d}:{secs:02d} • Actions: {len(self.action_types)} • "
+            f"Duration: {clock(self.video_duration)} • Actions: {len(self.action_types)} • "
             f"Objects: {len(self.object_classes)} | Edit: {edit_len:.1f}s"
         )
 
@@ -4498,11 +4523,16 @@ class SignalTimelineWindow(QMainWindow):
         
         if hasattr(self, 'video_player'):
             self._active_player.setPosition(int(self.current_time * 1000))
-        
-        minutes = int(self.current_time // 60)
-        secs = int(self.current_time % 60)
-        msec = int((self.current_time % 1) * 1000)
-        self.time_label.setText(f"{minutes:02d}:{secs:02d}.{msec:03d}")
+
+        self.time_label.setText(clock(self.current_time, 3))
+        self._log_audio_state("jump")
+
+    def _jump_to_time(self, seconds):
+        """A time typed into the clock: the same jump as a click on the
+        timeline, and the clock follows at once, since a paused player may
+        not report its new position."""
+        self.on_time_clicked(float(seconds))
+        self.update_time_display(int(self.current_time * 1000))
 
     def _pause_edit_playback(self):
         """Pause edit playback while preserving playlist state."""
@@ -4551,12 +4581,8 @@ class SignalTimelineWindow(QMainWindow):
         # Update playhead
         self.signal_scene.set_current_time(self.current_time)
         
-        # Update time label
-        minutes = int(self.current_time // 60)
-        seconds = int(self.current_time % 60)
-        ms = int((self.current_time % 1) * 1000)
-        self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{ms:03d}")
-        
+        self.time_label.setText(clock(self.current_time, 3))
+
         # Update detection panel
         self._update_detection_panel(self.current_time)
 
@@ -4747,11 +4773,7 @@ class SignalTimelineWindow(QMainWindow):
         else:
             self.edit_scene.clear_active_clip()
 
-        # Update time label
-        minutes = int(self.current_time // 60)
-        seconds = int(self.current_time % 60)
-        ms      = int((self.current_time % 1) * 1000)
-        self.time_label.setText(f"{minutes:02d}:{seconds:02d}.{ms:03d}")
+        self.time_label.setText(clock(self.current_time, 3))
 
     def _reroute_edit_playback_to(self, clip_index: int, current_pos: float):
         """
@@ -4799,9 +4821,7 @@ class SignalTimelineWindow(QMainWindow):
     def on_clip_double_clicked(self, start_time, end_time):
         self.current_time = start_time
         self.signal_scene.set_current_time(start_time)
-        minutes = int(start_time // 60)
-        seconds = int(start_time % 60)
-        self.time_label.setText(f"Clip: {minutes:02d}:{seconds:02d}")
+        self.time_label.setText(f"Clip: {clock(start_time)}")
         
         self._single_clip_playing = True
         self.play_video_clip(start_time, end_time)
@@ -4882,10 +4902,8 @@ class SignalTimelineWindow(QMainWindow):
         """
         self.update_edit_duration()
 
-        minutes = int(cut_time // 60)
-        seconds = cut_time % 60
         self.statusBar().showMessage(
-            f"✂️  Cut at {minutes:02d}:{seconds:05.2f}  —  "
+            f"✂️  Cut at {clock(cut_time, 2)}  —  "
             f"{len(self.edit_scene.clips)} clips in timeline",
             4000
         )

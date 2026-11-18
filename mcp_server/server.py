@@ -217,6 +217,15 @@ def build_server(jobs=None):
         selection, or to correct one a run made. A later run replaces them."""
         return tools.set_timeline_clips(video_path, clips, note=note)
 
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                          idempotentHint=True, openWorldHint=False))
+    def seek_timeline(video_path: str, seconds: float) -> dict:
+        """Move the open app's timeline viewer to a moment (seconds), opening
+        the viewer on the video first if another one is open. Use it to show
+        the user the moment being discussed. Needs the app running; returns
+        live: false with the reason when it is not."""
+        return tools.seek_timeline(video_path, seconds)
+
     @mcp.tool(annotations=read_only)
     def dataset_health(dataset: str, aliases: Optional[str] = None) -> dict:
         """Is a hand-sorted training dataset healthy? dataset is the folder

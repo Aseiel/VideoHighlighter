@@ -635,6 +635,25 @@ def set_timeline_clips(video_path: str, clips: Sequence[Sequence[float]],
                      "holds these clips, ready to adjust and export.")}
 
 
+def seek_timeline(video_path: str, seconds: float) -> dict:
+    """Move the running app's timeline viewer to ``seconds`` of ``video_path``."""
+    path = _existing_file(video_path)
+    seconds = float(seconds)
+    if seconds < 0:
+        raise ValueError("seconds must be 0 or more")
+    try:
+        live_link = _edition_module("modules.system.live_link")
+    except ImportError:
+        return {"live": False, "why": "this edition has no live link"}
+    try:
+        result = live_link.send("seek", {"video_path": path, "seconds": seconds})
+    except live_link.LiveLinkError as e:
+        return {"live": False, "why": str(e)}
+    if result is None:
+        return {"live": False, "why": "the app is not running"}
+    return {"live": True, **result}
+
+
 def get_job(jobs: JobManager, job_id: str, log_lines: int = 20) -> dict:
     job = jobs.get(job_id)
     if job is None:
