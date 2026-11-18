@@ -1092,17 +1092,30 @@ class SignalTimelineScene(QGraphicsScene):
         if hasattr(self, 'current_time_seconds'):
             self.set_current_time(self.current_time_seconds)
         
-        # Restore view zoom/scroll
-        if views and old_transform:
+        # Restore view zoom/scroll. The view's zoom was set for the
+        # pixels-per-second the scene was last drawn at, so what to keep is
+        # what the view showed - pixels per second on screen. When the scene's
+        # own scale has not changed, the transform is already right and is
+        # left alone.
+        #
+        # This used to compare the new scene's width with that width divided
+        # by the zoom, which differ whenever the view is zoomed at all, and
+        # then multiply the zoom by itself: every rebuild squared it (0.66,
+        # 0.43, 0.19, 0.03). A filter toggle, a layer, a search result or the
+        # waveform arriving each rebuild, so a few of them shrank a zoomed-out
+        # video to a few pixels - its bars gone from the timeline - or blew a
+        # zoomed-in one past anything on it, and the wheel took dozens of
+        # notches to undo it.
+        if views and old_transform is not None:
             view = views[0]
-            m11 = old_transform.m11()
-            old_visible_width = self.sceneRect().width() / m11 if m11 != 0 else 1
-            if old_visible_width > 0 and abs(old_visible_width - width) > 10:
-                scale_factor = width / old_visible_width
-                view.setTransform(old_transform.scale(scale_factor, 1.0))
+            drawn_for = getattr(self, "_view_pps", None) or self.pixels_per_second
+            if self.pixels_per_second > 0 and drawn_for != self.pixels_per_second:
+                view.setTransform(old_transform.scale(
+                    drawn_for / self.pixels_per_second, 1.0))
                 view.horizontalScrollBar().setValue(old_h_scroll)
                 # Zoom changed — re-pick the ruler interval for it.
                 self.draw_time_markers()
+        self._view_pps = self.pixels_per_second
 
         print(f"✅ Timeline rebuilt successfully, "
               f"{len(self.row_labels)} lanes, final height={self.sceneRect().height()}")
