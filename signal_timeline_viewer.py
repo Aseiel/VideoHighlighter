@@ -2552,6 +2552,11 @@ class SignalTimelineWindow(QMainWindow):
 
         # Create splitter for main content
         splitter = QSplitter(Qt.Orientation.Vertical)
+        # Neither timeline can be dragged out of sight. Collapsible, as a
+        # QSplitter is by default, the handle taken to the bottom left the
+        # edit timeline 0 px tall: every clip gone, and nothing but a thin
+        # handle to say where they went.
+        splitter.setChildrenCollapsible(False)
         
         # Create signal timeline view (top)
         signal_widget = QWidget()

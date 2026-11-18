@@ -64,3 +64,32 @@ def test_a_short_edit_opens_on_its_clips(app, clip, private_settings):
         assert shown.left() <= first.left() < first.right() <= shown.right()
     finally:
         win.close()
+
+
+def test_neither_timeline_can_be_dragged_out_of_sight(app, clip, private_settings):
+    # QSplitter collapses a pane whose handle is dragged past its minimum;
+    # the edit timeline went to 0 px and took every clip with it.
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QSplitter
+    try:
+        from signal_timeline_viewer import SignalTimelineWindow
+        win = SignalTimelineWindow(clip, {"final_segments": [[8, 14]]})
+    except Exception as e:  # a missing optional runtime in this interpreter
+        pytest.skip(f"the viewer cannot be built here: {e}")
+    try:
+        win.setFixedSize(1366, 728)
+        win.show()
+        for _ in range(60):
+            app.processEvents()
+        splitter = next(
+            s for s in win.findChildren(QSplitter)
+            if s.orientation() == Qt.Orientation.Vertical
+            and s.isAncestorOf(win.edit_view) and s.isAncestorOf(win.signal_view))
+        total = sum(splitter.sizes())
+        for far in (total + 100, -100):
+            splitter.moveSplitter(far, 1)
+            for _ in range(10):
+                app.processEvents()
+            assert min(splitter.sizes()) > 0, splitter.sizes()
+    finally:
+        win.close()
