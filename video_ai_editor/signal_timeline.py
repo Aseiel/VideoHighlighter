@@ -2972,6 +2972,40 @@ class SignalTimelineView(QGraphicsView):
         super().resizeEvent(event)
         self._fit_vertical()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_opened_at_playhead", False):
+            self._opened_at_playhead = True
+            # After the layout has given the view its real width.
+            QTimer.singleShot(0, self._open_at_playhead)
+
+    def _open_at_playhead(self):
+        """Open on the playhead, not on the middle of the video.
+
+        A QGraphicsView shows a scene wider than itself centred, so a film
+        opened on its middle: 621-632 s of a 1249 s video, with the playhead
+        at 0 and the clips at the start out of sight until something scrolled.
+        Nothing did before Play or a click, and the timeline read as empty.
+        Deliberately not ensure_time_visible: that honours the Follow
+        Playhead toggle, which is about playback, not where the view opens.
+        """
+        scene = self.scene()
+        if scene is None:
+            return
+        pps = float(getattr(scene, "pixels_per_second", 0) or 0)
+        if pps <= 0:
+            return
+        x = float(getattr(scene, "current_time_seconds", 0) or 0) * pps
+        vp = self.viewport().rect()
+        left = self.mapToScene(vp.topLeft()).x()
+        right = self.mapToScene(vp.topRight()).x()
+        width = right - left
+        if width <= 0 or left <= x <= right:
+            return
+        # The playhead 35% in from the left, as ensure_time_visible puts it;
+        # at 0 the scroll bar stops at the start.
+        self.centerOn(x + width * 0.15, self.mapToScene(vp.center()).y())
+
     def _fit_vertical(self):
         """Scale scene to fit view height, down to MIN_LANE_PITCH_PX per lane"""
         scene = self.scene()
