@@ -7,7 +7,7 @@ import queue
 import threading
 import traceback
 
-from modules.media.video_regions import crop_frame_for_analysis, normalize_analysis_region
+from modules.media.video_regions import FULL_FRAME, crop_frame_for_analysis, normalize_analysis_region
 
 # Grey levels of frame-to-frame change treated as noise in the motion curve's
 # energy. Encoders shimmer a few levels on a perfectly still shot; real
@@ -85,6 +85,14 @@ def detect_scenes_motion_optimized(video_path,
             progress_callback(sampled_done, 0, "Motion Detection",
                               f"Analyzed {sampled_done} sampled frames")
     analysis_region = normalize_analysis_region(analysis_region)
+    # Black bars never change and water down every frame's difference, so
+    # cuts fall under the threshold (modules/media/picture_area.py has the
+    # measurement). Top and bottom only when a region is chosen: there the
+    # columns are halves of the frame, not a picture with bars beside it.
+    from modules.media import picture_area
+    picture = picture_area.find(video_path, rows_only=analysis_region != FULL_FRAME)
+    if picture is not None and debug:
+        print(f"Picture {picture.describe()}; black bars left out")
     
     scenes = []
     motion_events = []
@@ -136,6 +144,8 @@ def detect_scenes_motion_optimized(video_path,
                     break
                 
                 if frame_idx % frame_skip == 0:
+                    if picture is not None:
+                        frame = picture.crop(frame)
                     frame = crop_frame_for_analysis(frame, analysis_region)
 
                     # Downscale on CPU to reduce GPU memory usage

@@ -97,6 +97,9 @@ class ShotList:
     # frame (a dissolve, a fade, a wipe). Its cut is listed at its middle.
     gradual: tuple = ()
     notes: tuple = field(default_factory=tuple)
+    # ``(x, y, w, h)`` of the picture the cuts were found in, when black bars
+    # were left out; empty when the whole frame was read.
+    picture_area: tuple = ()
 
     @property
     def shots(self) -> list:
@@ -261,12 +264,22 @@ def detect_shots(video_path: str,
     fps = fps_num / fps_den
     expected = max(1, int(round(duration * fps)))
 
+    # Black bars never change, so they water down every frame's difference
+    # and cuts fall under the bar (modules/media/picture_area.py has the
+    # measurement). Read the picture, not the frame.
+    from modules.media import picture_area
+    area = picture_area.find(video_path)
+    scale = f"scale={WIDTH}:{HEIGHT}:flags=area"
+    if area is not None:
+        print(f"shot_boundaries: picture {area.describe()}; bars left out")
+        scale = f"{area.ffmpeg_filter()},{scale}"
+
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
            "-i", video_path, "-map", "0:v:0", "-an", "-sn",
            # Every frame the file holds, once: no frames dropped or doubled
            # to fit a constant rate.
            "-fps_mode", "passthrough",
-           "-vf", f"scale={WIDTH}:{HEIGHT}:flags=area",
+           "-vf", scale,
            "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             creationflags=_creation_flags())
@@ -331,7 +344,8 @@ def detect_shots(video_path: str,
                     cut_frames=tuple(int(i) for i in cuts),
                     cut_times=tuple(cut_times), exact_times=exact,
                     notes=tuple(notes), method=method,
-                    gradual=tuple((int(a), int(b)) for a, b in gradual))
+                    gradual=tuple((int(a), int(b)) for a, b in gradual),
+                    picture_area=tuple(area[:4]) if area is not None else ())
 
 
 def to_dict(shots: ShotList) -> dict:
@@ -341,7 +355,8 @@ def to_dict(shots: ShotList) -> dict:
             "cut_frames": list(shots.cut_frames),
             "cut_times": [round(t, 4) for t in shots.cut_times],
             "method": shots.method, "exact_times": shots.exact_times,
-            "gradual": [list(g) for g in shots.gradual]}
+            "gradual": [list(g) for g in shots.gradual],
+            "picture_area": list(shots.picture_area) or None}
 
 
 def main(argv=None) -> int:
