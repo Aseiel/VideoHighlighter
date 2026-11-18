@@ -2643,6 +2643,9 @@ class SignalTimelineWindow(QMainWindow):
         self.edit_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.edit_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.edit_view.setFixedHeight(120)
+        # An edit reads from its start: narrower than the view, it sits at
+        # the left rather than floating in the middle.
+        self.edit_view.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.edit_view.setAcceptDrops(True)
         self.edit_view.viewport().setAcceptDrops(True)
         self.edit_view.setStyleSheet(f"""
@@ -2801,6 +2804,21 @@ class SignalTimelineWindow(QMainWindow):
         if not getattr(self, "_dock_balanced", False):
             self._dock_balanced = True
             QTimer.singleShot(0, self._balance_docks)
+            QTimer.singleShot(0, self._open_edit_at_start)
+
+    def _open_edit_at_start(self):
+        """Open the edit timeline on its first clip.
+
+        A QGraphicsView shows a scene wider than itself centred. The edit
+        scene is at least 1000 px however few clips it holds, so a short edit
+        opened on the empty middle: with three clips the first was a 29 px
+        sliver at the left edge, with one or two short ones none showed at all
+        until the wheel scrolled them back.
+        """
+        view = getattr(self, "edit_view", None)
+        if view is not None:
+            bar = view.horizontalScrollBar()
+            bar.setValue(bar.minimum())
 
     # The least width the timeline keeps, and the most of the window the
     # preview takes while the dock sizes are still the window's to choose.
