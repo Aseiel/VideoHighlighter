@@ -158,7 +158,8 @@ def group_folds(strat: np.ndarray, groups: np.ndarray, folds: int, seed: int) ->
 
 
 def out_of_fold(x, targets, groups, splits, steps, seed, log,
-                x_extra=None, groups_extra=None, should_stop=None, models=None):
+                x_extra=None, groups_extra=None, should_stop=None, models=None,
+                device=None):
     """Held-out scores for every clip, and for ``x_extra`` (test clips) the
     mean over the fold heads that never saw the clip's source video (NaN when
     none qualifies). Each fold's head is appended to ``models`` when given."""
@@ -170,7 +171,8 @@ def out_of_fold(x, targets, groups, splits, steps, seed, log,
     extra_n = np.zeros(n_extra)
     for i, (tr, te) in enumerate(splits, 1):
         _check(should_stop)
-        model = H.train_head(x[tr], targets[tr], n_classes, steps=steps, seed=seed)
+        model = H.train_head(x[tr], targets[tr], n_classes, steps=steps, seed=seed,
+                             device=device)
         if models is not None:
             models.append(model)
         scores[te] = H.predict_proba(model, x[te])
@@ -244,7 +246,9 @@ def main(argv=None, *, log: Callable[[str], None] = print,
                     help="each block below the top trains at this times the one above")
     ft.add_argument("--ft-head-lr", type=float, default=2e-4)
     ft.add_argument("--ft-batch", type=int, default=16, help="clips per training step")
-    ft.add_argument("--device", default="auto", help="auto (Intel, then NVIDIA), xpu, cuda or cpu")
+    ap.add_argument("--device", default="auto",
+                    help="where training runs: auto (Intel, then NVIDIA, else the processor "
+                         "for the head; fine-tuning needs a card), xpu, cuda or cpu")
     ft.add_argument("--frame-cache", default=None,
                     help="folder for the decoded frames (default: in the app's data folder)")
     args = ap.parse_args(argv)
@@ -380,6 +384,11 @@ def _train(args, log, should_stop) -> int:
     from modules.vision import frame_encoder
 
     started = time.time()
+    try:
+        args.head_device = H.head_device(getattr(args, "device", "auto"))
+    except ValueError as e:
+        log(f"❌ {e}")
+        return 1
     finetuning = args.finetune_blocks > 0
     FT = device = None
     if finetuning:
@@ -460,7 +469,8 @@ def _train(args, log, should_stop) -> int:
         f"{len(classes)} classes, {n_videos} source videos")
 
     folds = group_folds(strat, groups, args.folds, args.seed)
-    log(f"Scoring on unseen source videos ({len(folds)} folds)")
+    log(f"Scoring on unseen source videos ({len(folds)} folds, heads trained on "
+        f"{args.head_device})")
     single = targets.sum(1) == 1
     best = None
     for steps in [int(s) for s in str(args.steps).split(",") if s.strip()]:
@@ -469,7 +479,7 @@ def _train(args, log, should_stop) -> int:
         scores, scores_extra = out_of_fold(x, targets, groups, folds, steps, args.seed, log,
                                            x_extra=x_extra if extra else None,
                                            groups_extra=g_extra, should_stop=should_stop,
-                                           models=fold_heads)
+                                           models=fold_heads, device=args.head_device)
         acc = _single_accuracy(scores, targets, single)
         log(f"  {steps} steps: held-out single-action accuracy {acc:.3f}")
         if best is None or acc > best[1] + 1e-9:
@@ -484,7 +494,7 @@ def _train(args, log, should_stop) -> int:
     if in_train.any() and in_val.any():
         log("\nScoring val/ as the dataset defines it (training on train/ only)")
         model = H.train_head(x[in_train], targets[in_train], len(classes), steps=steps,
-                             seed=args.seed)
+                             seed=args.seed, device=args.head_device)
         val_pred = H.predict_proba(model, x[in_val]).argmax(1)
         shared = np.isin(groups[in_val], groups[in_train])
         val_scores = {"clips": int(in_val.sum()),
@@ -521,7 +531,8 @@ def _train(args, log, should_stop) -> int:
 
     _check(should_stop)
     log(f"\nTraining the saved head on all {len(clips)} clips ({steps} steps)")
-    model = H.train_head(x, targets, len(classes), steps=steps, seed=args.seed)
+    model = H.train_head(x, targets, len(classes), steps=steps, seed=args.seed,
+                         device=args.head_device)
     os.makedirs(out, exist_ok=True)
     head_path = os.path.join(out, HEAD_FILE)
     H.export_onnx(model, head_path, tokens)
@@ -597,7 +608,8 @@ def _finetune_and_save(FT, run):
     _check(r.should_stop)
     log(f"\nFinal model: training the head on all {len(targets)} clips ({r.steps} steps), then "
         f"fine-tuning with it ({_epochs(ft['epochs'])})")
-    head0 = H.train_head(r.x, targets, len(classes), steps=r.steps, seed=args.seed)
+    head0 = H.train_head(r.x, targets, len(classes), steps=r.steps, seed=args.seed,
+                         device=args.head_device)
     final = FT.Settings(**{**FT.settings_dict(settings), "epochs": ft["epochs"]})
     tower, head, _ = FT.finetune(base_vm, head0, r.frame_cache, r.rows, targets, final, device,
                                  log=log, check=lambda: _check(r.should_stop), label="final ")

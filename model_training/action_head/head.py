@@ -84,19 +84,41 @@ def class_weights(targets: np.ndarray, power: float = CLASS_WEIGHT_POWER) -> np.
     return (len(targets) / (targets.shape[1] * counts)) ** power
 
 
+def head_device(requested: str = "auto") -> str:
+    """Where a head trains: ``auto`` is an Intel graphics card (XPU), else an
+    NVIDIA one (CUDA), else the processor. Measured 2026-11-19 on an Arc A750,
+    1,900 clips, 1,500 steps: 4 vectors per clip 19 s on the processor and
+    11 s on the card, 36 vectors per clip 98 s and 13 s. A device asked for
+    by name that PyTorch cannot use is a ValueError."""
+    req = (requested or "auto").strip().lower()
+    xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
+    cuda = torch.cuda.is_available()
+    if req == "auto":
+        return "xpu" if xpu else "cuda" if cuda else "cpu"
+    if req == "cpu" or req.startswith("xpu") and xpu or req.startswith("cuda") and cuda:
+        return req
+    raise ValueError(f"PyTorch cannot use the device {requested!r} here")
+
+
 def train_head(x: np.ndarray, labels, n_classes: int, *, steps: int = 1500,
-               seed: int = 0, power: float = CLASS_WEIGHT_POWER) -> ActionHead:
+               seed: int = 0, power: float = CLASS_WEIGHT_POWER,
+               device=None) -> ActionHead:
     """Train on ``x`` [N, T, dims] with ``labels``: one class index per clip,
-    or multi-hot [N, classes] for clips showing several actions."""
+    or multi-hot [N, classes] for clips showing several actions.
+
+    ``device`` (a torch device or its name, e.g. ``"xpu"``) is where the
+    training runs (``head_device``); the returned head is always on the CPU,
+    where it is scored and exported. None is the CPU."""
+    dev = torch.device(device or "cpu")
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     x = np.asarray(x, np.float32)
     targets = as_targets(labels, n_classes)
     flat = x.reshape(-1, x.shape[-1])
-    model = ActionHead(x.shape[-1], n_classes, mean=flat.mean(0), std=flat.std(0) + 1e-5)
+    model = ActionHead(x.shape[-1], n_classes, mean=flat.mean(0), std=flat.std(0) + 1e-5).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=LR / 2, weight_decay=WEIGHT_DECAY)
-    xt, yt = torch.as_tensor(x), torch.as_tensor(targets)
-    w = torch.as_tensor(class_weights(targets, power), dtype=torch.float32)
+    xt, yt = torch.as_tensor(x).to(dev), torch.as_tensor(targets).to(dev)
+    w = torch.as_tensor(class_weights(targets, power), dtype=torch.float32).to(dev)
     # A clip's weight is the mean weight of the actions it shows.
     sample_w = (yt * w).sum(1) / yt.sum(1).clamp(min=1)
     smooth = yt * (1 - LABEL_SMOOTHING) + LABEL_SMOOTHING / n_classes
@@ -105,18 +127,18 @@ def train_head(x: np.ndarray, labels, n_classes: int, *, steps: int = 1500,
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, LR, total_steps=epochs * per_epoch)
     for _ in range(epochs):
         model.train()
-        for b in torch.as_tensor(rng.permutation(len(yt))).split(BATCH):
+        for b in torch.as_tensor(rng.permutation(len(yt))).to(dev).split(BATCH):
             xb = xt[b]
-            keep = torch.as_tensor(rng.random(xb.shape[1]) > FRAME_DROP)
+            keep = rng.random(xb.shape[1]) > FRAME_DROP
             if int(keep.sum()) >= 2:
-                xb = xb[:, keep]
+                xb = xb[:, torch.as_tensor(keep).to(dev)]
             loss = F.binary_cross_entropy_with_logits(model(xb), smooth[b], reduction="none")
             loss = (loss.sum(1) * sample_w[b]).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
             sched.step()
-    return model.eval()
+    return model.cpu().eval()
 
 
 def predict_proba(model: ActionHead, x: np.ndarray, batch: int = 1024) -> np.ndarray:

@@ -82,11 +82,14 @@ def compare_features(x: np.ndarray, targets: np.ndarray, groups: np.ndarray,
     that measured worse, which is what says which of the added clips to
     take out again.
     ``train_fn(x, targets, n_classes, steps=, seed=)``, ``predict_fn(model, x)``
-    and ``folds_fn(strat, groups, folds, seed)`` default to the trainer's own.
+    and ``folds_fn(strat, groups, folds, seed)`` default to the trainer's own
+    (heads trained on the graphics card when there is one).
     """
     if train_fn is None or predict_fn is None:
         from model_training.action_head import head as H
-        train_fn, predict_fn = train_fn or H.train_head, predict_fn or H.predict_proba
+        import functools
+        train_fn = train_fn or functools.partial(H.train_head, device=H.head_device())
+        predict_fn = predict_fn or H.predict_proba
     if folds_fn is None:
         from model_training.action_head.train import group_folds as folds_fn
     added = np.asarray(added, bool)
