@@ -52,6 +52,8 @@ from typing import Callable, Iterable, List, Optional, Sequence
 
 import numpy as np
 
+from model_training.action_head import views as V
+
 HEAD_MODEL = "head.onnx"
 HEAD_META = "head.json"
 HEAD_KIND = "action-head"
@@ -391,6 +393,9 @@ class ActionHead:
         self.meta = read_head_meta(folder)
         self.classes: List[str] = list(self.meta["classes"])
         self.frames = int(self.meta.get("frames", 4))
+        # What of each frame the head was trained on (model_training/action_head/
+        # views.py): crops here are expanded the same way before encoding.
+        self.views = V.of(self.meta)
         self.encoder_id = self.meta.get("encoder")
         self.own_encoder = own_encoder(folder, self.meta)
         self.thresholds = [None if t is None else float(t)
@@ -731,10 +736,13 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
             if not items:
                 continue
             t0 = _time.perf_counter()
-            feats = part_encoder.encode_bgr([c for _, _, _, crops in items for c in crops])
+            # A head trained on tiles of each frame reads them here too.
+            views = V.of(scorer)
+            feats = part_encoder.encode_bgr([c for _, _, _, crops in items
+                                             for c in V.expand(crops, views)])
             timing["encode"] += _time.perf_counter() - t0
             timing["encoded"] += len(feats)
-            feats = feats.reshape(len(items), scorer.frames, -1)
+            feats = feats.reshape(len(items), V.tokens(scorer.frames, views), -1)
             scores = scorer.scores(feats)
             timing["hits"] += int(scorer.detected(scores).sum())
             for (_, w, region, _), s in zip(items, scores):
@@ -802,7 +810,7 @@ def run_action_detection_siglip(video_path: str, *, head: Optional[ActionHead] =
                             x1, y1, x2, y2 = region
                             queue.append((p, w, region,
                                           [pending[f][0][y1:y2, x1:x2] for f in frames]))
-                if len(queue) * head.frames >= ENCODE_BATCH:
+                if len(queue) * V.tokens(head.frames, V.of(head)) >= ENCODE_BATCH:
                     flush()
                 if progress_callback:
                     # What the old action models showed in the progress bar.

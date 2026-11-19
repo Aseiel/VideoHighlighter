@@ -103,11 +103,13 @@ def _utf8_stdout() -> None:
             pass
 
 
-def default_cache(data_path: str, encoder_id: str, frames: int) -> str:
+def default_cache(data_path: str, encoder_id: str, frames: int, views: str = "whole") -> str:
     from modules.system import app_paths
     digest = hashlib.sha1(os.path.abspath(data_path).lower().encode("utf-8")).hexdigest()[:12]
+    # Whole-frame caches keep their old name, so existing ones are still found.
+    tag = "" if views == "whole" else "-" + views.replace("+", "-")
     return os.path.join(app_paths.user_data_dir(), "cache", "action_head",
-                        f"{digest}-{encoder_id}-{frames}f.npz")
+                        f"{digest}-{encoder_id}-{frames}f{tag}.npz")
 
 
 def default_frame_cache(data_path: str) -> str:
@@ -213,6 +215,10 @@ def main(argv=None, *, log: Callable[[str], None] = print,
     ap.add_argument("--out", default=None, help="output folder (default: models/actions/<name>)")
     ap.add_argument("--name", default=DEFAULT_NAME)
     ap.add_argument("--frames", type=int, default=4)
+    ap.add_argument("--views", default="whole", choices=("whole", "whole+tiles"),
+                    help="what of each frame the head sees: the whole frame, or the whole "
+                         "frame plus its quarters and centre (views.py; six encoder passes "
+                         "per frame, in training and in use)")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--steps", default=DEFAULT_STEPS,
                     help="training lengths to compare on held-out videos")
@@ -381,6 +387,9 @@ def _train(args, log, should_stop) -> int:
         if args.frames != 4:
             log("❌ Fine-tuning scores 4 frames per clip, as the app does; leave --frames at 4")
             return 1
+        if getattr(args, "views", "whole") != "whole":
+            log("❌ Fine-tuning reads whole frames only; leave --views at whole")
+            return 1
         try:
             device = FT.resolve_device(args.device)
             import transformers  # noqa: F401 - the starting weights come through it
@@ -406,8 +415,12 @@ def _train(args, log, should_stop) -> int:
     if encoder is None:
         log("❌ The frame encoder is not available; see the lines above")
         return 1
-    cache = Fx.FeatureCache(args.cache or default_cache(args.data_path, encoder.encoder_id, args.frames),
-                            encoder.encoder_id, args.frames, encoder.dims)
+    from model_training.action_head import views as V
+    views = V.check(getattr(args, "views", V.WHOLE))
+    tokens = V.tokens(args.frames, views)
+    cache = Fx.FeatureCache(args.cache or default_cache(args.data_path, encoder.encoder_id,
+                                                        args.frames, views),
+                            encoder.encoder_id, tokens, encoder.dims)
     n = len(clips)
     paths = [c.path for c in clips + extra]
     frame_cache = shared_probe = None
@@ -421,7 +434,7 @@ def _train(args, log, should_stop) -> int:
         _encode_from_frames(frame_cache, keys, encoder, cache, log, should_stop)
         shared_probe = encoder.encode_pixels(frame_encoder.probe_pixels())[0]
     x_all, ok = Fx.encode_clips(paths, args.data_path, encoder,
-                                cache, log=log, should_stop=should_stop)
+                                cache, log=log, should_stop=should_stop, views=views)
     _check(should_stop)
     if finetuning:
         # Training needs the card's memory; the shared encoder's work is done.
@@ -511,7 +524,7 @@ def _train(args, log, should_stop) -> int:
     model = H.train_head(x, targets, len(classes), steps=steps, seed=args.seed)
     os.makedirs(out, exist_ok=True)
     head_path = os.path.join(out, HEAD_FILE)
-    H.export_onnx(model, head_path, args.frames)
+    H.export_onnx(model, head_path, tokens)
     check = H.onnx_proba(H.load_onnx_session(head_path), x[:64])
     drift = float(np.abs(check - H.predict_proba(model, x[:64])).max())
     if drift > 1e-4:
@@ -643,7 +656,9 @@ def _meta(args, encoder_id, dims, classes, ev, steps, folds, n_clips, n_videos, 
         "encoder": encoder_id,
         "frames": args.frames,
         "input": f"features [N, frames, {dims}]: frame encoder vectors, "
-                 f"frames evenly across the clip",
+                 f"frames evenly across the clip"
+                 + ("" if getattr(args, "views", "whole") == "whole" else
+                    ", each followed in turn by its quarters and centre (views.py)"),
         "output": "logits [N, classes]; a sigmoid gives each action's own score, and an "
                   "action is detected when its score reaches its trust threshold",
         "activation": "sigmoid",
@@ -661,6 +676,11 @@ def _meta(args, encoder_id, dims, classes, ev, steps, folds, n_clips, n_videos, 
         "val_folder": val_scores,
         "per_class": per_class,
         "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        # What of each frame was encoded (views.py): the head reads frames x
+        # per-frame views vectors per clip, in views.expand's order. Written
+        # only when it is not whole frames, which a head without it is, so
+        # whole-frame heads are as they always were.
+        **({} if getattr(args, "views", "whole") == "whole" else {"views": args.views}),
     }
 
 

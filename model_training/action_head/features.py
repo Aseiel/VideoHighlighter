@@ -125,12 +125,23 @@ class FeatureCache:
 
 def encode_clips(paths: Sequence[str], root: str, encoder, cache: FeatureCache,
                  log: Callable[[str], None] = print, save_every: int = 200,
-                 should_stop: Optional[Callable[[], bool]] = None) -> tuple:
-    """Vectors for every clip: ``(features [N, frames, dims] float32, ok [N] bool)``.
+                 should_stop: Optional[Callable[[], bool]] = None,
+                 views: str = "whole") -> tuple:
+    """Vectors for every clip: ``(features [N, tokens, dims] float32, ok [N] bool)``.
 
     A clip that cannot be decoded is ``ok=False`` with zeros, and the caller
     leaves it out. The cache is saved as it goes, so a stopped run resumes.
+
+    ``views`` (``views.py``) says what of each frame is encoded. The cache's
+    ``frames`` is then the vectors per clip, and the frames read from the clip
+    are that divided by the vectors each frame gives.
     """
+    from model_training.action_head import views as V
+
+    per = V.per_frame(views)
+    if cache.frames % per:
+        raise ValueError(f"a cache of {cache.frames} vectors per clip does not fit "
+                         f"views {views!r} ({per} per frame)")
     feats = np.zeros((len(paths), cache.frames, cache.dims), np.float32)
     ok = np.zeros(len(paths), bool)
     todo = []
@@ -147,11 +158,11 @@ def encode_clips(paths: Sequence[str], root: str, encoder, cache: FeatureCache,
     for n, (i, p, key) in enumerate(todo, 1):
         if should_stop and should_stop():
             break
-        frames = read_frames(p, cache.frames)
+        frames = read_frames(p, cache.frames // per)
         if not frames:
             failed.append(p)
             continue
-        v = encoder.encode_bgr(frames)
+        v = encoder.encode_bgr(V.expand(frames, views))
         cache.put(key, v)
         feats[i], ok[i] = v, True
         if n % save_every == 0 or n == len(todo):

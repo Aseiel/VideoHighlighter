@@ -291,11 +291,14 @@ def _head_model(folder: str, *, encoder=None, head=None,
         raise RuntimeError(f"head trained on {head.encoder_id}, not {enc.encoder_id}")
     read = frame_reader or embed_mod.read_frames
 
+    from model_training.action_head import views as V
+    views = V.of(head)
+
     def scores(path: str):
         frames = read(path, head.frames)
         if len(frames) != head.frames:
             return None
-        return head.scores(enc.encode_bgr(frames)[None])[0]
+        return head.scores(enc.encode_bgr(V.expand(frames, views))[None])[0]
 
     return scores, head.classes
 
