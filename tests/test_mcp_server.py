@@ -667,8 +667,11 @@ def test_restart_app_waits_until_the_new_app_answers(monkeypatch):
         assert tools.restart_app()["why"] == "this edition has no live link"
         return
     live_link = importlib.import_module("modules.system.live_link")
+    # Back only once the reopened video is on screen: an answer alone, or a
+    # viewer still being built, is not enough (a command then built a second one).
     answers = iter([{"restarting": True, "reopen": "v.mp4", "seconds": 3.0},
-                    None, None, {"app": "VideoHighlighter"}])
+                    None, {"timeline_video": None, "viewer_opening": True},
+                    {"timeline_video": "v.mp4", "viewer_opening": False}])
     sent = []
     monkeypatch.setattr(live_link, "send",
                         lambda cmd, args, **k: sent.append(cmd) or next(answers))
@@ -698,3 +701,32 @@ def test_restart_app_reports_a_refusal_and_a_slow_start(monkeypatch):
     out = tools.restart_app(timeout=10, sleep=lambda s: now.__setitem__(0, now[0] + s),
                             clock=lambda: now[0])
     assert out["back_after_s"] is None and "did not answer" in out["why"]
+
+
+
+def test_commands_wait_while_the_viewer_is_still_opening():
+    class Err(Exception):
+        pass
+    calls = []
+
+    def send(cmd, args):
+        calls.append(cmd)
+        if len(calls) < 3:
+            raise Err("Live link failed: RuntimeError: The timeline viewer is still opening; try again")
+        return {"ok": 1}
+    link = type("L", (), {"LiveLinkError": Err, "send": staticmethod(send)})
+    now = [0.0]
+    out = tools._send_when_ready(link, "seek", {}, sleep=lambda s: now.__setitem__(0, now[0] + s),
+                                 clock=lambda: now[0])
+    assert out == {"ok": 1} and calls == ["seek"] * 3
+
+
+def test_other_live_link_errors_are_not_retried():
+    class Err(Exception):
+        pass
+
+    def send(cmd, args):
+        raise Err("Unknown command: seek")
+    link = type("L", (), {"LiveLinkError": Err, "send": staticmethod(send)})
+    with pytest.raises(Err, match="Unknown command"):
+        tools._send_when_ready(link, "seek", {}, sleep=lambda s: None)

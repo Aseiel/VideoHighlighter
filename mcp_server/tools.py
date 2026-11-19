@@ -571,6 +571,25 @@ def start_counter_guided_run(jobs: JobManager, video_path: str, roi: Sequence[fl
     return {"job_id": job.id, "status": job.status}
 
 
+# The app turns a command away while its timeline viewer is still being built
+# (seconds on a long video): opening a second one mid-build is what it refuses.
+STILL_OPENING = "still opening"
+
+
+def _send_when_ready(live_link, cmd: str, args: dict, *, wait: float = 60.0,
+                     sleep=time.sleep, clock=time.monotonic):
+    """``live_link.send``, retried while the app says its viewer is still
+    opening; any other answer or error is returned or raised as it came."""
+    start = clock()
+    while True:
+        try:
+            return live_link.send(cmd, args)
+        except live_link.LiveLinkError as e:
+            if STILL_OPENING not in str(e) or clock() - start >= wait:
+                raise
+        sleep(1.0)
+
+
 def show_live(video_path: str, spans: Sequence[Sequence[float]], note: str) -> dict:
     """Put clips on the running app's edit timeline, if an app is listening.
 
@@ -584,7 +603,7 @@ def show_live(video_path: str, spans: Sequence[Sequence[float]], note: str) -> d
     except ImportError:
         return {"live": False, "why": "this edition has no live link"}
     try:
-        result = live_link.send("show_clips", {
+        result = _send_when_ready(live_link, "show_clips", {
             "video_path": video_path, "clips": [list(s) for s in spans], "note": note})
     except live_link.LiveLinkError as e:
         return {"live": False, "why": str(e)}
@@ -647,7 +666,7 @@ def seek_timeline(video_path: str, seconds: float) -> dict:
     except ImportError:
         return {"live": False, "why": "this edition has no live link"}
     try:
-        result = live_link.send("seek", {"video_path": path, "seconds": seconds})
+        result = _send_when_ready(live_link, "seek", {"video_path": path, "seconds": seconds})
     except live_link.LiveLinkError as e:
         return {"live": False, "why": str(e)}
     if result is None:
@@ -688,7 +707,7 @@ def set_overlay(video_path: str, mode: str = "cache", shape: Optional[str] = Non
     if seconds is not None:
         args["seconds"] = float(seconds)
     try:
-        result = live_link.send("overlay", args)
+        result = _send_when_ready(live_link, "overlay", args)
     except live_link.LiveLinkError as e:
         return {"live": False, "why": str(e)}
     if result is None:
@@ -720,15 +739,23 @@ def restart_app(wait: bool = True, timeout: float = 120.0, *,
         return out
     # The old app closes ~0.3 s after answering; give it time to be gone before
     # a ping could still reach it.
+    # Back means answering and, when a video was to be reopened, showing it:
+    # a command sent before that would find no viewer and open a second one.
+    want = os.path.normcase(os.path.abspath(result["reopen"])) if result.get("reopen") else None
     start = clock()
     sleep(2.0)
     while clock() - start < timeout:
         try:
-            if live_link.send("ping", {}, timeout=5.0) is not None:
+            ping = live_link.send("ping", {}, timeout=5.0)
+        except live_link.LiveLinkError:
+            ping = None
+        if ping is not None:
+            shown = ping.get("timeline_video")
+            ready = not ping.get("viewer_opening") and (
+                want is None or (shown and os.path.normcase(os.path.abspath(shown)) == want))
+            if ready:
                 out["back_after_s"] = round(clock() - start, 1)
                 return out
-        except live_link.LiveLinkError:
-            pass
         sleep(1.0)
     out["back_after_s"] = None
     out["why"] = f"the app did not answer within {timeout:.0f} s; it may still be starting"

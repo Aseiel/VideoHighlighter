@@ -3397,7 +3397,8 @@ class VideoHighlighterGUI(QWidget):
         from version import __edition__, __version__
         _, video = self._live_timeline_video()
         return {"app": "VideoHighlighter", "edition": __edition__,
-                "version": __version__, "timeline_video": video}
+                "version": __version__, "timeline_video": video,
+                "viewer_opening": bool(getattr(self, "_timeline_opening", False))}
 
     def _live_restart(self, args):
         """Close and start again, so code changed on disk is the code running.
@@ -7540,6 +7541,24 @@ class VideoHighlighterGUI(QWidget):
         return widget
 
     def open_timeline_viewer(self, video_path=None):
+        """Open the timeline viewer, once at a time.
+
+        Building it takes seconds on a long video and pumps events while it
+        does, so a second request (a click, a live-link command, the reopen
+        after a restart) could arrive mid-build and start another window: on
+        2026-11-19 a restart's reopen and an overlay command built two viewers
+        of one 1080p film. The second request is turned away instead.
+        """
+        if getattr(self, "_timeline_opening", False):
+            self.append_log("⏳ The timeline viewer is still opening.")
+            return
+        self._timeline_opening = True
+        try:
+            return self._open_timeline_viewer(video_path)
+        finally:
+            self._timeline_opening = False
+
+    def _open_timeline_viewer(self, video_path=None):
         """Open timeline viewer for the selected video, or for ``video_path``
         (a restart reopens the video it had open; the button's
         ``clicked(bool)`` lands here too, hence the type check)."""

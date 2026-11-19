@@ -80,3 +80,32 @@ def test_a_failed_start_keeps_the_app_open(app, monkeypatch):
     timers[0]()
     assert ("close",) not in events
     assert "stays open" in events[-1][1]
+
+
+def test_the_viewer_is_not_opened_twice_at_once(app):
+    """A request arriving while the viewer is being built (the build pumps
+    events) is turned away, not answered with a second window."""
+    app, window, events, timers, video = app
+    built = []
+
+    def build(video_path=None):
+        built.append(video_path)
+        # mid-build, another request arrives (a click, a live-link command)
+        assert app.open_timeline_viewer(video_path="other.mp4") is None
+    app._open_timeline_viewer = build
+    app.open_timeline_viewer = types.MethodType(main.VideoHighlighterGUI.open_timeline_viewer, app)
+    app.open_timeline_viewer(video_path=video)
+    assert built == [video]
+    assert any("still opening" in e[1] for e in events if e[0] == "log")
+    app.open_timeline_viewer(video_path=video)      # and it opens again after
+    assert built == [video, video]
+
+
+def test_live_commands_are_refused_while_the_viewer_opens(app):
+    app, window, events, timers, video = app
+    viewer_on = getattr(main.VideoHighlighterGUI, "_live_viewer_on", None)
+    if viewer_on is None:                            # an edition without seek/overlay
+        pytest.skip("no viewer-driving live commands in this edition")
+    app._timeline_opening = True
+    with pytest.raises(RuntimeError, match="still opening"):
+        viewer_on(app, {"video_path": video})
