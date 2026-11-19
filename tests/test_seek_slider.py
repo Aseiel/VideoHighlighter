@@ -74,6 +74,7 @@ class _Window:
     _on_slider_pressed = stv.SignalTimelineWindow._on_slider_pressed
     _on_slider_released = stv.SignalTimelineWindow._on_slider_released
     seek_video = stv.SignalTimelineWindow.seek_video
+    _seek_showing = staticmethod(stv.SignalTimelineWindow._seek_showing)
     _handle_position_update = stv.SignalTimelineWindow._handle_position_update
 
 

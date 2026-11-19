@@ -50,6 +50,10 @@ class _Player:
     def setPosition(self, ms):
         self.position = ms
 
+    def playbackState(self):
+        # After a stop: the seek must still not play (pausing is not playing).
+        return stv.QMediaPlayer.StoppedState
+
 
 class _Recorder:
     """Accepts any call; every one is harmless here."""
@@ -61,6 +65,7 @@ class _Recorder:
 class _Window:
     # The window's own handler, which on_edit_clip_clicked delegates to.
     on_edit_time_clicked = stv.SignalTimelineWindow.on_edit_time_clicked
+    _seek_showing = staticmethod(stv.SignalTimelineWindow._seek_showing)
 
     def __init__(self, clips):
         self._active_player = _Player()

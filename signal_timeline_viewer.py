@@ -1091,8 +1091,11 @@ class SignalTimelineWindow(QMainWindow):
 
             # Sync position only — do NOT play+pause to force a frame.
             # On 4K video a 100ms play burst decodes ~6 frames through QGraphicsScene,
-            # which hangs the main thread. Let the frame arrive naturally on play/seek.
-            self._active_player.setPosition(current_pos)
+            # which hangs the main thread. A stopped player shows nothing on a
+            # seek, though (the overlay's player has never played when it is
+            # first switched to): _seek_showing pauses it first, which decodes
+            # the one frame and nothing more.
+            self._seek_showing(self._active_player, current_pos)
             if was_playing:
                 self._active_player.play()
 
@@ -1138,7 +1141,7 @@ class SignalTimelineWindow(QMainWindow):
                 self._precomp_widget.setVisible(True)
 
             # Sync position
-            self._active_player.setPosition(current_pos)
+            self._seek_showing(self._active_player, current_pos)
             if was_playing:
                 self._active_player.play()
 
@@ -1170,7 +1173,7 @@ class SignalTimelineWindow(QMainWindow):
                 self._precomp_widget.setVisible(False)
 
             # Sync position
-            self._active_player.setPosition(current_pos)
+            self._seek_showing(self._active_player, current_pos)
             if was_playing:
                 self._active_player.play()
 
@@ -1423,6 +1426,21 @@ class SignalTimelineWindow(QMainWindow):
         """
         self.seek_video(self.time_slider.value())
 
+    @staticmethod
+    def _seek_showing(player, position_ms):
+        """Seek so the frame appears while paused.
+
+        A QMediaPlayer in StoppedState accepts the position but renders
+        nothing: the overlay's own player has never played when the viewer
+        switches to it, and any player is stopped again after the end of the
+        video, so the picture stayed black until a play/pause. Pausing first
+        puts it in PausedState, where a seek decodes and shows exactly that
+        frame (measured: 0 frames after a stopped seek, 1 after pause+seek).
+        """
+        if player.playbackState() == QMediaPlayer.StoppedState:
+            player.pause()
+        player.setPosition(position_ms)
+
     def seek_video(self, position_ms):
         """Seek the video to a slider position, in milliseconds."""
         duration = self._active_player.duration()
@@ -1433,7 +1451,7 @@ class SignalTimelineWindow(QMainWindow):
 
         self._block_position_updates = True
         new_position_ms = max(0, min(int(position_ms), duration))
-        self._active_player.setPosition(new_position_ms)
+        self._seek_showing(self._active_player, new_position_ms)
 
         # Update everything immediately — don't wait for positionChanged,
         # which won't fire reliably while the player is paused.
@@ -4522,7 +4540,7 @@ class SignalTimelineWindow(QMainWindow):
             self.signal_view.ensure_time_visible(self.current_time)
         
         if hasattr(self, 'video_player'):
-            self._active_player.setPosition(int(self.current_time * 1000))
+            self._seek_showing(self._active_player, int(self.current_time * 1000))
 
         self.time_label.setText(clock(self.current_time, 3))
         self._log_audio_state("jump")
@@ -4576,7 +4594,7 @@ class SignalTimelineWindow(QMainWindow):
         
         # Seek the video player to show the frame
         if hasattr(self, '_active_player'):
-            self._active_player.setPosition(int(self.current_time * 1000))
+            self._seek_showing(self._active_player, int(self.current_time * 1000))
         
         # Update playhead
         self.signal_scene.set_current_time(self.current_time)
@@ -4726,7 +4744,7 @@ class SignalTimelineWindow(QMainWindow):
 
         # Seek video player
         if hasattr(self, 'video_player'):
-            self._active_player.setPosition(int(self.current_time * 1000))
+            self._seek_showing(self._active_player, int(self.current_time * 1000))
 
         # Edit-playback state (use the real sentinel, not the never-set _edit_playlist)
         edit_active = getattr(self, '_edit_playback_active', False)
