@@ -69,6 +69,7 @@ Leave out `--scope user` to register it for the current project only. Run
 | `set_timeline_clips` | Put a list of clips on the app's edit timeline for a video, to adjust and export there |
 | `seek_timeline` | Move the open app's timeline viewer to a moment, to show the user what is being discussed. Pro (needs the live link) |
 | `set_overlay` | Switch the open viewer's overlay (off, cache, realtime, precomp) and boxes or outlines, optionally at a moment, to show what a detector found. Pro (needs the live link) |
+| `restart_app` | Restart the running app so changed code runs, reopening the video and moment it showed; refused while work is in progress. Both editions (needs the live link) |
 | `start_counter_check` | Read an on-screen counter: when each value appears, and which of a run's clips cover them (job). Pro |
 | `start_counter_guided_run` | One clip per counter value, placed where the action model scores the chosen classes highest near it (job). Pro |
 | `dataset_health` | A hand-sorted training dataset: what would skew it, and which classes need more videos |

@@ -3364,6 +3364,81 @@ class VideoHighlighterGUI(QWidget):
         self.process_mode_combo.setCurrentIndex(pidx if pidx >= 0 else 0)
         self.on_process_mode_changed()  # sync spinner enabled
 
+        # The MCP server's way into this window (restart, see below).
+        self._start_live_link()
+
+    def _start_live_link(self):
+        """Listen for the MCP server (modules.system.live_link). Two commands:
+        ``ping`` (is the app here, what is open) and ``restart`` (close and
+        start again, coming back to the same video and moment)."""
+        try:
+            from modules.system.live_link import LiveLinkServer
+            self._live_link = LiveLinkServer(
+                {"ping": self._live_ping, "restart": self._live_restart},
+                parent=self)
+        except Exception as e:  # noqa: BLE001 - the app works without it
+            print(f"⚠️ Live link not started: {e}")
+            self._live_link = None
+        # A restart asked over the live link comes back where it was.
+        from modules.system import app_restart
+        reopen = app_restart.take_reopen()
+        if reopen:
+            QTimer.singleShot(1500, lambda: self._reopen_after_restart(*reopen))
+
+    def _live_timeline_video(self):
+        window = getattr(self, "timeline_window", None)
+        try:
+            return window, (os.path.abspath(window.video_path) if window else None)
+        except RuntimeError:                       # the window was destroyed
+            self.timeline_window = None
+            return None, None
+
+    def _live_ping(self, args):
+        from version import __edition__, __version__
+        _, video = self._live_timeline_video()
+        return {"app": "VideoHighlighter", "edition": __edition__,
+                "version": __version__, "timeline_video": video}
+
+    def _live_restart(self, args):
+        """Close and start again, so code changed on disk is the code running.
+        Refused while work is in progress; the reply goes out before closing."""
+        from modules.system import app_restart
+        window, video = self._live_timeline_video()
+        work = app_restart.busy([(self, app_restart.MAIN_WORK),
+                                 (window, app_restart.VIEWER_WORK)])
+        if work:
+            raise RuntimeError(f"Not restarting: {', '.join(work)} in progress. "
+                               "Try again when it has finished.")
+        try:
+            shown = bool(window is not None and window.isVisible())
+        except RuntimeError:
+            shown = False
+        video = video if shown else None
+        seconds = round(float(window.current_time), 2) if video else None
+        self.append_log("🔁 Restarting at Claude's request"
+                        + (f"; reopening {os.path.basename(video)}" if video else "") + ".")
+
+        def go():
+            try:
+                app_restart.spawn(video, seconds)
+            except Exception as e:  # noqa: BLE001 - stay open rather than vanish
+                self.append_log(f"⚠️ Restart failed, the app stays open: {e}")
+                return
+            self.close()                    # saves settings, then exits
+
+        QTimer.singleShot(300, go)          # let this reply reach the caller first
+        return {"restarting": True, "reopen": video, "seconds": seconds}
+
+    def _reopen_after_restart(self, video, seconds):
+        try:
+            self.open_timeline_viewer(video_path=video)
+            window, _ = self._live_timeline_video()
+            if window is not None and seconds is not None:
+                window._jump_to_time(seconds)
+            self.append_log(f"🔁 Restarted; reopened {os.path.basename(video)}.")
+        except Exception as e:  # noqa: BLE001 - a fresh start is still a start
+            print(f"⚠️ Could not reopen {video} after the restart: {e}")
+
     def resizeEvent(self, event):
         """Record where a resize settled.
 
@@ -7464,19 +7539,22 @@ class VideoHighlighterGUI(QWidget):
                 tabs.setCurrentIndex(index)
         return widget
 
-    def open_timeline_viewer(self):
-        """Open timeline viewer for the selected video"""
+    def open_timeline_viewer(self, video_path=None):
+        """Open timeline viewer for the selected video, or for ``video_path``
+        (a restart reopens the video it had open; the button's
+        ``clicked(bool)`` lands here too, hence the type check)."""
         # Its on-demand analysis reads config.yaml: give it what is on screen.
         self.save_config()
-        video_paths = self.get_file_list()
-        
-        if not video_paths:
-            self.append_log("⚠️ No video selected. Please add a video first.")
-            return
-        
-        # Use the first video in the list
-        video_path = video_paths[0]
-        
+        if not isinstance(video_path, str) or not video_path:
+            video_paths = self.get_file_list()
+
+            if not video_paths:
+                self.append_log("⚠️ No video selected. Please add a video first.")
+                return
+
+            # Use the first video in the list
+            video_path = video_paths[0]
+
         if not os.path.exists(video_path):
             self.append_log(f"⚠️ Video file not found: {video_path}")
             return

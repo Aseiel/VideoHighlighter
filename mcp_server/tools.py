@@ -9,6 +9,7 @@ Every result is JSON-able and carries paths, timestamps, scores and text only.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Optional, Sequence
 
 from mcp_server.jobs import Job, JobCancelled, JobManager
@@ -693,6 +694,45 @@ def set_overlay(video_path: str, mode: str = "cache", shape: Optional[str] = Non
     if result is None:
         return {"live": False, "why": "the app is not running"}
     return {"live": True, **result}
+
+
+def restart_app(wait: bool = True, timeout: float = 120.0, *,
+                sleep=time.sleep, clock=time.monotonic) -> dict:
+    """Ask the running app to close and start again (so code changed on disk
+    is what runs), reopening the video and moment its timeline viewer showed.
+
+    The app refuses while a run, analysis or download is in progress, and says
+    which. With ``wait`` this returns once the new app answers, or says it has
+    not within ``timeout`` seconds.
+    """
+    try:
+        live_link = _edition_module("modules.system.live_link")
+    except ImportError:
+        return {"live": False, "why": "this edition has no live link"}
+    try:
+        result = live_link.send("restart", {}, timeout=30.0)
+    except live_link.LiveLinkError as e:
+        return {"live": False, "why": str(e)}
+    if result is None:
+        return {"live": False, "why": "the app is not running"}
+    out = {"live": True, **result}
+    if not wait:
+        return out
+    # The old app closes ~0.3 s after answering; give it time to be gone before
+    # a ping could still reach it.
+    start = clock()
+    sleep(2.0)
+    while clock() - start < timeout:
+        try:
+            if live_link.send("ping", {}, timeout=5.0) is not None:
+                out["back_after_s"] = round(clock() - start, 1)
+                return out
+        except live_link.LiveLinkError:
+            pass
+        sleep(1.0)
+    out["back_after_s"] = None
+    out["why"] = f"the app did not answer within {timeout:.0f} s; it may still be starting"
+    return out
 
 
 def get_job(jobs: JobManager, job_id: str, log_lines: int = 20) -> dict:

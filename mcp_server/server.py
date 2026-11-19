@@ -240,6 +240,16 @@ def build_server(jobs=None):
         reason when it is not."""
         return tools.set_overlay(video_path, mode=mode, shape=shape, seconds=seconds)
 
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                          idempotentHint=False, openWorldHint=False))
+    def restart_app(wait: bool = True) -> dict:
+        """Restart the running app so code changed on disk is the code it runs.
+        It closes through its own close path (settings saved) and reopens the
+        video and moment its timeline viewer showed. Refused, with the reason,
+        while a run, analysis or download is in progress. With wait (default)
+        it returns once the new app answers (back_after_s), up to two minutes."""
+        return tools.restart_app(wait=wait)
+
     @mcp.tool(annotations=read_only)
     def dataset_health(dataset: str, aliases: Optional[str] = None) -> dict:
         """Is a hand-sorted training dataset healthy? dataset is the folder

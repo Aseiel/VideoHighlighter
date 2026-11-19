@@ -38,7 +38,7 @@ HAS_EXAMPLE_SEARCH = tools.has_example_search()
 EXPECTED_TOOLS = {
     "get_info", "probe_video", "scan_folder", "get_config",
     "start_highlight_run", "start_visual_search", "more_like_these",
-    "set_timeline_clips", "seek_timeline", "set_overlay",
+    "set_timeline_clips", "seek_timeline", "set_overlay", "restart_app",
     "start_expression_scan",
     "get_job", "list_jobs", "cancel_job",
     "dataset_health", "plan_reviewed_video", "add_reviewed_video",
@@ -658,3 +658,43 @@ def test_only_the_protocol_reaches_stdout():
     assert proc.stdout.replace(b"\r\n", b"\n") == b"PROTO\n"
     for noise in (b"noise-print", b"noise-fd", b"noise-child"):
         assert noise in proc.stderr
+
+
+def test_restart_app_waits_until_the_new_app_answers(monkeypatch):
+    import importlib
+    import importlib.util
+    if importlib.util.find_spec("modules.system.live_link") is None:
+        assert tools.restart_app()["why"] == "this edition has no live link"
+        return
+    live_link = importlib.import_module("modules.system.live_link")
+    answers = iter([{"restarting": True, "reopen": "v.mp4", "seconds": 3.0},
+                    None, None, {"app": "VideoHighlighter"}])
+    sent = []
+    monkeypatch.setattr(live_link, "send",
+                        lambda cmd, args, **k: sent.append(cmd) or next(answers))
+    now = [0.0]
+    out = tools.restart_app(sleep=lambda s: now.__setitem__(0, now[0] + s),
+                            clock=lambda: now[0])
+    assert sent == ["restart", "ping", "ping", "ping"]
+    assert out["live"] and out["reopen"] == "v.mp4" and out["back_after_s"] == 4.0
+
+
+def test_restart_app_reports_a_refusal_and_a_slow_start(monkeypatch):
+    import importlib
+    import importlib.util
+    if importlib.util.find_spec("modules.system.live_link") is None:
+        return
+    live_link = importlib.import_module("modules.system.live_link")
+
+    def refuse(cmd, args, **k):
+        raise live_link.LiveLinkError("Live link failed: Not restarting: a download in progress")
+    monkeypatch.setattr(live_link, "send", refuse)
+    out = tools.restart_app()
+    assert out["live"] is False and "a download" in out["why"]
+
+    monkeypatch.setattr(live_link, "send",
+                        lambda cmd, args, **k: {"restarting": True} if cmd == "restart" else None)
+    now = [0.0]
+    out = tools.restart_app(timeout=10, sleep=lambda s: now.__setitem__(0, now[0] + s),
+                            clock=lambda: now[0])
+    assert out["back_after_s"] is None and "did not answer" in out["why"]
