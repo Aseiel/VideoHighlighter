@@ -38,7 +38,7 @@ HAS_EXAMPLE_SEARCH = tools.has_example_search()
 EXPECTED_TOOLS = {
     "get_info", "probe_video", "scan_folder", "get_config",
     "start_highlight_run", "start_visual_search", "more_like_these",
-    "set_timeline_clips", "seek_timeline",
+    "set_timeline_clips", "seek_timeline", "set_overlay",
     "start_expression_scan",
     "get_job", "list_jobs", "cancel_job",
     "dataset_health", "plan_reviewed_video", "add_reviewed_video",
@@ -552,6 +552,35 @@ def test_seek_timeline_says_why_when_the_app_is_not_there(server, video, monkeyp
     result = call(server, "seek_timeline", video_path=video, seconds=1291.5)
     assert result == {"live": False, "why": "the app is not running"}
     assert sent[0][0] == "seek" and sent[0][1]["seconds"] == 1291.5
+
+
+def test_set_overlay_sends_only_what_was_asked(server, video, monkeypatch):
+    import importlib
+    import importlib.util
+    if importlib.util.find_spec("modules.system.live_link") is None:
+        result = call(server, "set_overlay", video_path=video, mode="cache")
+        assert result == {"live": False, "why": "this edition has no live link"}
+        return
+    live_link = importlib.import_module("modules.system.live_link")
+    sent = []
+    monkeypatch.setattr(live_link, "send", lambda cmd, args, **k: sent.append((cmd, args)))
+    result = call(server, "set_overlay", video_path=video, mode="cache", shape="outlines",
+                  seconds=1428)
+    assert result == {"live": False, "why": "the app is not running"}
+    assert sent[0] == ("overlay", {"video_path": video, "mode": "cache",
+                                   "shape": "outlines", "seconds": 1428.0})
+    call(server, "set_overlay", video_path=video, mode="off")
+    assert sent[1][1] == {"video_path": video, "mode": "off"}
+
+
+@pytest.mark.parametrize("kw, match", [
+    ({"mode": "sideways"}, "mode must be"),
+    ({"mode": "cache", "shape": "circles"}, "shape must be"),
+    ({"mode": "cache", "seconds": -1}, "0 or more"),
+])
+def test_set_overlay_refuses_bad_arguments(server, video, kw, match):
+    with pytest.raises(ToolError, match=match):
+        call(server, "set_overlay", video_path=video, **kw)
 
 
 def test_set_timeline_clips_becomes_the_newest_highlight_version(server, video,

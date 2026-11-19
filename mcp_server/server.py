@@ -226,6 +226,20 @@ def build_server(jobs=None):
         live: false with the reason when it is not."""
         return tools.seek_timeline(video_path, seconds)
 
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                          idempotentHint=True, openWorldHint=False))
+    def set_overlay(video_path: str, mode: str = "cache", shape: Optional[str] = None,
+                    seconds: Optional[float] = None) -> dict:
+        """Switch the open app's timeline viewer overlay, opening the viewer on
+        the video first if another one is open. mode: off, cache (detections
+        from the analysis cache), realtime (recognised live on the current
+        frame) or precomp (pre-rendered annotated video). shape: boxes or
+        outlines (the traced shape inside each box); omit to keep the viewer's
+        choice. seconds also moves the playhead. Use it to show the user what a
+        detector found. Needs the app running; returns live: false with the
+        reason when it is not."""
+        return tools.set_overlay(video_path, mode=mode, shape=shape, seconds=seconds)
+
     @mcp.tool(annotations=read_only)
     def dataset_health(dataset: str, aliases: Optional[str] = None) -> dict:
         """Is a hand-sorted training dataset healthy? dataset is the folder

@@ -654,6 +654,47 @@ def seek_timeline(video_path: str, seconds: float) -> dict:
     return {"live": True, **result}
 
 
+OVERLAY_MODES = ("off", "cache", "realtime", "precomp")
+OVERLAY_SHAPES = ("boxes", "outlines")
+
+
+def set_overlay(video_path: str, mode: str = "cache", shape: Optional[str] = None,
+                seconds: Optional[float] = None) -> dict:
+    """Switch the running app's timeline viewer overlay for ``video_path``.
+
+    ``mode``: off, cache (detections from the analysis cache), realtime (the
+    current frame recognised live) or precomp (the pre-rendered annotated
+    video). ``shape``: boxes or outlines, for the cache and realtime modes;
+    omitted keeps the viewer's choice. ``seconds`` also moves the playhead.
+    """
+    path = _existing_file(video_path)
+    mode = str(mode or "").strip().lower()
+    if mode not in OVERLAY_MODES:
+        raise ValueError(f"mode must be one of {OVERLAY_MODES}")
+    if shape is not None:
+        shape = str(shape).strip().lower()
+        if shape not in OVERLAY_SHAPES:
+            raise ValueError(f"shape must be one of {OVERLAY_SHAPES}")
+    if seconds is not None and float(seconds) < 0:
+        raise ValueError("seconds must be 0 or more")
+    try:
+        live_link = _edition_module("modules.system.live_link")
+    except ImportError:
+        return {"live": False, "why": "this edition has no live link"}
+    args = {"video_path": path, "mode": mode}
+    if shape is not None:
+        args["shape"] = shape
+    if seconds is not None:
+        args["seconds"] = float(seconds)
+    try:
+        result = live_link.send("overlay", args)
+    except live_link.LiveLinkError as e:
+        return {"live": False, "why": str(e)}
+    if result is None:
+        return {"live": False, "why": "the app is not running"}
+    return {"live": True, **result}
+
+
 def get_job(jobs: JobManager, job_id: str, log_lines: int = 20) -> dict:
     job = jobs.get(job_id)
     if job is None:
