@@ -252,7 +252,10 @@ def split_audio(video_file, chunk_length=600, should_cancel=None):
     video_dir = os.path.dirname(os.path.abspath(video_file))
     base, _ = os.path.splitext(os.path.basename(video_file))
     
-    out_pattern = os.path.join(video_dir, f"{base}_chunk_%03d.wav")
+    # The segment muxer reads the output name as a printf pattern, so a `%` in
+    # the folder or file name ("0% ...") is taken as a format and the split
+    # fails. `%%` is its literal percent; the files it writes carry a single one.
+    out_pattern = os.path.join(video_dir, base).replace("%", "%%") + "_chunk_%03d.wav"
 
     # Remove old chunks if they exist (safety cleanup)
     _remove_chunks(video_dir, base)
