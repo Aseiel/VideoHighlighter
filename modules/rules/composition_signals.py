@@ -50,6 +50,15 @@ What a rule can refer to
     performance. And five negatives is few enough that only the first digit of
     "4 of 5" means anything. A filter, not a verdict.
 
+``motion_level``, ``motion_rhythm``, ``motion_beat_hz``
+    From ``modules/vision/motion_rhythm.py``: how much the picture moves each
+    second (mean optical flow) and how regularly, 0-1. Sustained activity
+    repeats on a beat; repositioning, walking and camera moves do not, so
+    ``motion_rhythm`` with ``min: 0.4`` keeps the first and drops the
+    stretches in between. The whole frame is measured, camera included. The
+    first rule that asks for it decodes the video once (minutes); afterwards
+    it is cached.
+
 ``expression``
     The expression reading for the second, as a label. Only the clearest face
     in each second, which is ``face_scan``'s reduction, not one made here.
@@ -210,6 +219,16 @@ def gather(video_path: str,
             signals["waveform_peak_density_pct"] = (
                 curves.get("peak_density_pct") or [])
             signals.setdefault("audio_level", curves.get("level") or [])
+
+    if asked("motion_level", "motion_rhythm", "motion_beat_hz"):
+        from modules.vision import motion_rhythm
+        motion = motion_rhythm.analyse(video_path, cache_dir=cache_dir,
+                                       progress=progress, cancel=cancel,
+                                       log_fn=log_fn)
+        if motion:
+            signals["motion_level"] = motion.get("level") or []
+            signals["motion_rhythm"] = motion.get("rhythm") or []
+            signals["motion_beat_hz"] = motion.get("beat_hz") or []
 
     if asked("expression"):
         labels = expression_labels(video_path, cache_dir=cache_dir)
