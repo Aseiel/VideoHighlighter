@@ -29,6 +29,16 @@ detection, where the same shift cost YOLOX 3-4% of its boxes.
 **Never silently.** A card that cannot decode the file (H.264 wider than
 4096, say) falls back to the processor, and the caller is told which decoder
 it got, to log.
+
+**OpenCV cannot be asked whether it worked.** Its ``CAP_PROP_HW_ACCELERATION``
+reports the decoder that was *requested*: when FFmpeg's hardware set-up then
+fails ("hwaccel initialisation returned error"), FFmpeg decodes in software and
+the property still says D3D11. Seen 2026-11-20 on a 4320x2160 H.264 film: the
+index log said "decoded on gpu" while the card sat at 1 % and a processor core
+at 100 %. So the file is checked first (``gpu_refusal``): a codec FFmpeg has no
+hardware decoder for on Windows, or H.264 larger than 4096 on a side - the
+limit of the H.264 decoders in Intel Arc and NVIDIA cards - goes straight to
+the processor, and the log names the reason.
 """
 
 from __future__ import annotations
@@ -43,6 +53,32 @@ ENV_VAR = "VH_VIDEO_DECODE"
 GPU = "gpu"
 CPU = "cpu"
 DEFAULT = GPU
+
+# What FFmpeg's D3D11 hardware decoding takes, as OpenCV names it (FOURCC).
+H264_MAX_SIDE = 4096
+_H264 = {"h264", "avc1", "avc3", "x264", "davc"}
+_GPU_CODECS = _H264 | {"hevc", "hev1", "hvc1", "h265", "x265", "vp09", "vp9", "av01", "av1",
+                       "mpg2", "mp2v", "mpeg", "vc-1", "vc1", "wvc1", "wmv3"}
+
+
+def fourcc_name(value) -> str:
+    """OpenCV's ``CAP_PROP_FOURCC`` (a float holding four bytes) as text."""
+    n = int(value or 0)
+    return "".join(chr((n >> (8 * i)) & 0xFF) for i in range(4)).strip("\x00 ")
+
+
+def gpu_refusal(codec: str, width: float, height: float) -> Optional[str]:
+    """Why the cards' video decoders will not take this video, or None when
+    they should. An unknown (empty) codec is not refused."""
+    c = (codec or "").strip().lower()
+    if not c:
+        return None
+    if c not in _GPU_CODECS:
+        return f"no GPU decoder for {codec.strip()}"
+    w, h = int(width or 0), int(height or 0)
+    if c in _H264 and max(w, h) > H264_MAX_SIDE:
+        return f"H.264 {w}x{h} is larger than GPU decoders take ({H264_MAX_SIDE})"
+    return None
 
 _ALIASES = {
     "gpu": GPU, "hw": GPU, "hardware": GPU, "auto": GPU, "": GPU,
@@ -95,7 +131,13 @@ def open_sparse(path: str, choice: Optional[str] = None) -> Tuple[object, str]:
             cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG,
                                    [cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY])
             if cap.isOpened() and (cap.get(cv2.CAP_PROP_HW_ACCELERATION) or 0) > 0:
-                return cap, GPU
+                why = gpu_refusal(fourcc_name(cap.get(cv2.CAP_PROP_FOURCC)),
+                                  cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+                                  cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                if why is None:
+                    return cap, GPU
+                cap.release()
+                return cv2.VideoCapture(path), f"cpu ({why})"
             cap.release()
         except (cv2.error, AttributeError):   # an OpenCV without the option
             pass
