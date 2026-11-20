@@ -24,9 +24,30 @@ drift out of step with `motion_peaks`.
 """
 from __future__ import annotations
 
+import bisect
 import math
 
 STEP = 0.5
+
+# A shot change is not movement. Leaving out the cut frame alone was not
+# enough: the frames beside it still differ from each other by most of the
+# picture, and 13 of the 15 highest values of one film's curve sat within
+# half a second of a cut (2026-11-20). Its cuts faded over about a second,
+# and with half a second the fade's tail still read as a peak. So nothing
+# within a second of a cut counts - not on the curve, not as a peak, not as
+# a sudden stop.
+CUT_EDGE_SECONDS = 1.0
+
+# A peak is the top of the curve, standing out from the seconds around it:
+#  - the highest value within PEAK_WINDOW_SECONDS either side,
+#  - at or above the video's own PEAK_PERCENTILE (judged against this video,
+#    so resolution, mastering and an analysis copy do not move it),
+#  - at least PEAK_PROMINENCE of its height above the lower of the two lows
+#    within PEAK_BASE_SECONDS on either side (a bump, not a plateau's ripple).
+PEAK_WINDOW_SECONDS = 2.0
+PEAK_PERCENTILE = 90.0
+PEAK_BASE_SECONDS = 5.0
+PEAK_PROMINENCE = 0.3
 
 
 def build_curve(samples, fps, duration=0.0, step=STEP, exclude_frames=()):
@@ -42,8 +63,9 @@ def build_curve(samples, fps, duration=0.0, step=STEP, exclude_frames=()):
     if not fps or fps <= 0 or step <= 0:
         return None
     exclude = set(exclude_frames or ())
+    cuts = sorted(f / fps for f in exclude)
     rows = [(row[0] / fps, float(row[1])) for row in samples
-            if row[0] not in exclude]
+            if row[0] not in exclude and not near_cut(row[0] / fps, cuts)]
     if not rows:
         return None
     last = max(t for t, _ in rows)
@@ -57,6 +79,83 @@ def build_curve(samples, fps, duration=0.0, step=STEP, exclude_frames=()):
     if top > 0:
         values = [round(v / top, 3) for v in values]
     return {"step": float(step), "values": values}
+
+
+def near_cut(t, cuts, edge=CUT_EDGE_SECONDS):
+    """Whether time ``t`` is within ``edge`` seconds of a cut (``cuts`` sorted)."""
+    if not cuts:
+        return False
+    i = bisect.bisect_left(cuts, t)
+    return any(0 <= j < len(cuts) and abs(cuts[j] - t) <= edge for j in (i - 1, i))
+
+
+def cut_times(scenes):
+    """Cut times from a cache's ``scenes`` (each one's start but the first)."""
+    out = []
+    for s in scenes or []:
+        start = s.get("start") if isinstance(s, dict) else (s[0] if s else None)
+        if start:
+            out.append(float(start))
+    return sorted(out)
+
+
+def find_peaks(curve, cuts=()):
+    """Times of the curve's peaks (see the PEAK_* settings), never at a cut.
+
+    Each peak is marked at the middle of its highest bin, so the mark sits at
+    the top of the movement - not at its end, where the old rule (now
+    :func:`stops`' job) put it.
+    """
+    values, step = _values(curve)
+    if not values:
+        return []
+    cuts = sorted(cuts or ())
+    v = [0.0 if near_cut((i + 0.5) * step, cuts) else float(x) for i, x in enumerate(values)]
+    live = sorted(x for x in v if x > 0)
+    if not live:
+        return []
+    floor = live[min(len(live) - 1, int(len(live) * PEAK_PERCENTILE / 100.0))]
+    w = max(1, int(round(PEAK_WINDOW_SECONDS / step)))
+    b = max(w, int(round(PEAK_BASE_SECONDS / step)))
+    out = []
+    i, n = 0, len(v)
+    while i < n:
+        x = v[i]
+        if x > 0 and x >= floor and x == max(v[max(0, i - w):i + w + 1]):
+            left = min(v[max(0, i - b):i] or [x])
+            right = min(v[i + 1:i + b + 1] or [x])
+            if x - max(left, right) >= PEAK_PROMINENCE * x:
+                out.append(round((i + 0.5) * step, 3))
+                i += w + 1          # one mark per bump; a flat top is not two peaks
+                continue
+        i += 1
+    return out
+
+
+def drop_near_cuts(times, cuts, edge=CUT_EDGE_SECONDS):
+    """``times`` without the ones within ``edge`` of a cut."""
+    cuts = sorted(cuts or ())
+    return [t for t in times or [] if not near_cut(float(t), cuts, edge)]
+
+
+def upgrade(cache):
+    """A cache written before peaks meant peaks, read the new way, in place.
+
+    Until 2026-11-20 ``motion_peaks`` held movement that ends in stillness
+    (now ``motion_stops``, "Sudden stop"). A cache with a curve but no
+    ``motion_stops`` is from then: its old peaks become stops (minus any on a
+    cut), and its peaks are found on its own curve. A cache without a curve
+    is left as it is - there is nothing to find peaks on. Idempotent.
+    """
+    if not isinstance(cache, dict) or "motion_stops" in cache:
+        return cache
+    curve = cache.get("motion_curve")
+    if not isinstance(curve, dict) or not curve.get("values"):
+        return cache
+    cuts = cut_times(cache.get("scenes"))
+    cache["motion_stops"] = drop_near_cuts(cache.get("motion_peaks") or [], cuts)
+    cache["motion_peaks"] = find_peaks(curve, cuts)
+    return cache
 
 
 OUTLIER_PERCENTILE = 99.5

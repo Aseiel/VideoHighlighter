@@ -50,7 +50,8 @@ def detect_scenes_motion_optimized(video_path,
 
     `details`, when a dict, receives `motion_curve` — how much changed between
     sampled frames before any threshold, scene cuts left out, binned (see
-    modules/segments/motion_curve.py).
+    modules/segments/motion_curve.py) — and `motion_stops`, movement that ends
+    in stillness. The third value returned, the peaks, are the curve's tops.
     An out-parameter rather than a fourth return value because every caller
     unpacks exactly three.
     """
@@ -538,10 +539,22 @@ def detect_scenes_motion_optimized(video_path,
                                 timestamp = scene_motion[spike_idx][0] / fps
                                 motion_peaks.append(timestamp)
 
-        if details is not None and not (cancel_flag and cancel_flag.is_set()):
-            from modules.segments.motion_curve import build_curve
-            details["motion_curve"] = build_curve(motion_energy, fps, video_duration,
-                                                  exclude_frames=cut_frames)
+        # What the loop above found is movement that ends in stillness: a
+        # "sudden stop", not a peak (it marks the burst's last spike before the
+        # quiet, and a big movement that carries on never qualifies). Peaks are
+        # the tops of the motion curve. Neither counts within a second of a cut.
+        # See modules/segments/motion_curve.py.
+        if not (cancel_flag and cancel_flag.is_set()):
+            from modules.segments import motion_curve as _mc
+            _cuts = sorted(f / fps for f in cut_frames)
+            motion_stops = _mc.drop_near_cuts(motion_peaks, _cuts)
+            curve = _mc.build_curve(motion_energy, fps, video_duration,
+                                    exclude_frames=cut_frames)
+            if curve is not None:
+                motion_peaks = _mc.find_peaks(curve, _cuts)
+            if details is not None:
+                details["motion_curve"] = curve
+                details["motion_stops"] = motion_stops
 
         if debug and not (cancel_flag and cancel_flag.is_set()):
             print(f"Shots: {len(scenes)}, Motion events: {len(motion_events)}, Peaks: {len(motion_peaks)}")

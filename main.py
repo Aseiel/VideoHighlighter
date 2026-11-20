@@ -7675,6 +7675,8 @@ class VideoHighlighterGUI(QWidget):
                     latest_file = max(matching_files, key=lambda p: p.stat().st_mtime)
                     with open(latest_file, 'r') as f:
                         cache_data = json.load(f)
+                    from modules.segments.motion_curve import upgrade as _upgrade_motion
+                    _upgrade_motion(cache_data)
                     self.append_log(f"✅ Loaded cache: {latest_file.name}")
                 else:
                     # Check if user suppressed this warning

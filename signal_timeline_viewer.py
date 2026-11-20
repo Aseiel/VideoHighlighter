@@ -2413,6 +2413,8 @@ class SignalTimelineWindow(QMainWindow):
                     # Try to load it directly
                     with open(cache_file, 'r', encoding='utf-8') as f:
                         cache_data = json.load(f)
+                    from modules.segments.motion_curve import upgrade as _upgrade_motion
+                    _upgrade_motion(cache_data)
                     
                     # Verify it's for this video
                     if cache_data.get("video_hash") == video_hash:
@@ -3449,13 +3451,15 @@ class SignalTimelineWindow(QMainWindow):
             self.cache_data["motion_events"] = result.get("motion_events", [])
             self.cache_data["motion_peaks"] = result.get("motion_peaks", [])
             self.cache_data["motion_curve"] = result.get("motion_curve")
+            self.cache_data["motion_stops"] = result.get("motion_stops", [])
             self._merge_into_cache_file(result)
-            for layer in ("scenes", "motion_events", "motion_peaks"):
+            for layer in ("scenes", "motion_events", "motion_peaks", "motion_stops"):
                 self._enable_layer_and_reload(layer)
             if row:
                 row["status"].setText(
                     f"✓ {len(result.get('scenes', []))} shots, "
-                    f"{len(result.get('motion_peaks', []))} peaks")
+                    f"{len(result.get('motion_peaks', []))} peaks, "
+                    f"{len(result.get('motion_stops', []))} sudden stops")
         elif kind == "audio":
             self.cache_data["audio_peaks"] = result.get("audio_peaks", [])
             self.cache_data["audio"] = result.get("audio", {})

@@ -162,7 +162,7 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
                          search_keywords=None, keyword_matches=None, action_bboxes=None,
                          object_bboxes=None, action_detections_all=None,
                          composed_event_names=None, loudness_bursts=None,
-                         loudness_levels=None, motion_curve=None):
+                         loudness_levels=None, motion_curve=None, motion_stops=None):
     """
     Collect all analysis results into a structured dictionary for caching.
 
@@ -231,6 +231,9 @@ def collect_analysis_data(video_path, video_duration, fps, transcript_segments,
         # How much motion, every half second — what lets the timeline show which
         # peak was the big one. See modules/segments/motion_curve.py.
         "motion_curve": motion_curve,
+        # Movement that ends in stillness ("Sudden stop"), kept apart from
+        # the peaks since 2026-11-20 (modules/segments/motion_curve.py).
+        "motion_stops": [float(t) for t in (motion_stops or [])],
         "pipeline_version": "1.0",
         "cache_flags": {
             "keyword_segments_only": keyword_segments_only,
@@ -678,6 +681,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
         motion_events = []
         motion_peaks = []
         motion_curve = None  # For timeline viewer; absent from older caches
+        motion_stops = []    # Sudden stops; peaks are the curve's tops
         audio_peaks = []
         waveform_data = None  # For timeline viewer
         using_cache = False
@@ -739,6 +743,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                             motion_events = cached_data.get("motion_events", [])
                             motion_peaks = cached_data.get("motion_peaks", [])
                             motion_curve = cached_data.get("motion_curve")
+                            motion_stops = cached_data.get("motion_stops", [])
                             keyword_matches = cached_data.get("keyword_matches", [])
 
 
@@ -961,6 +966,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         details=motion_details,
                     )
                     motion_curve = motion_details.get("motion_curve")
+                    motion_stops = motion_details.get("motion_stops", [])
                     
                     # Unpack the results
                     if result and len(result) == 3:
@@ -1159,6 +1165,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     cached_data["motion_events"] = [float(t) for t in motion_events]
                     cached_data["motion_peaks"] = [float(t) for t in motion_peaks]
                     cached_data["motion_curve"] = motion_curve
+                    cached_data["motion_stops"] = [float(t) for t in motion_stops]
                 if audio_backfill:
                     audio_block = cached_data.get("audio")
                     if isinstance(audio_block, dict):
@@ -1637,6 +1644,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                     loudness_bursts=loudness_bursts,
                     loudness_levels=loudness_levels,
                     motion_curve=motion_curve,
+                    motion_stops=motion_stops,
                 )
                 
                 # Add analysis parameters for future validation
@@ -2865,6 +2873,7 @@ def run_highlighter(video_path, sample_rate=5, gui_config: dict = None,
                         loudness_bursts=loudness_bursts,
                         loudness_levels=loudness_levels,
                         motion_curve=motion_curve,
+                        motion_stops=motion_stops,
                     )
 
                 # Hand the edit timeline EXACTLY what we cut (post-subtract,

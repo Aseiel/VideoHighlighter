@@ -478,6 +478,9 @@ def run_motion(video_path: str, *, frame_skip: Optional[int] = None,
         "motion_events": [float(t) for t in motion_events],
         "motion_peaks": [float(t) for t in motion_peaks],
         "motion_curve": details.get("motion_curve"),
+        # Movement that ends in stillness ("Sudden stop"); peaks are the
+        # curve's tops. See modules/segments/motion_curve.py.
+        "motion_stops": [float(t) for t in details.get("motion_stops") or []],
     }
 
 
@@ -546,7 +549,9 @@ def read_caches(video_path: str) -> list:
     for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                out.append(json.load(f))
+                # Older caches' peaks read the new way (motion_curve.upgrade).
+                from modules.segments.motion_curve import upgrade
+                out.append(upgrade(json.load(f)))
         except Exception:
             continue
     return out

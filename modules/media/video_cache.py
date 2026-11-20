@@ -456,7 +456,10 @@ class VideoAnalysisCache:
 
                 print(f"✓ Cache loaded from: {cache_path}")
                 self.stats["hits"] += 1
-                return cache_data
+                # Peaks meant "movement that ends in stillness" before
+                # 2026-11-20; an older cache is read the new way.
+                from modules.segments.motion_curve import upgrade
+                return upgrade(cache_data)
 
             except (json.JSONDecodeError, KeyError) as e:
                 print(f"⚠ Cache file corrupted: {e}, will re-process")

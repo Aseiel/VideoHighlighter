@@ -40,10 +40,11 @@ class SignalTimelineScene(QGraphicsScene):
     # Opacity range motion bars are shaded across, weakest to strongest. The
     # floor keeps the weakest bar visible as something to grab.
     MOTION_ALPHA_RANGE = (90, 255)
-    # Seconds before a motion peak that count towards its strength. The
-    # detector stamps a peak on the last spike before the picture goes still,
-    # so the burst that made it is just behind the timestamp, not on it.
-    MOTION_PEAK_LOOKBACK = 2.0
+    # Seconds before a motion peak that count towards its strength. Peaks used
+    # to be stamped on the last spike before the picture went still, with the
+    # burst behind them; since 2026-11-20 a peak is the top of the curve
+    # itself, so only its own half-second bin counts.
+    MOTION_PEAK_LOOKBACK = 0.5
 
     time_clicked = Signal(float)
     time_dragged = Signal(float)
@@ -160,7 +161,7 @@ class SignalTimelineScene(QGraphicsScene):
             ('visual_search', [f"Search: {q}" for q in self.visual_queries]),
             ('expressions', ['Expressions']),
             ('scenes', ['Shots']),
-            ('motion', ['Motion Events', 'Motion Peaks']),
+            ('motion', ['Motion Events', 'Motion Peaks', 'Motion Stops']),
             ('audio', ['Audio Peaks']),
             ('highlights', ['Final Highlights']),
             # Last, so it sits at the bottom of the stack — as close as the
@@ -202,6 +203,7 @@ class SignalTimelineScene(QGraphicsScene):
             'scenes': QColor(200, 200, 100),
             'motion_events': QColor(255, 150, 50),
             'motion_peaks': QColor(255, 200, 100),
+            'motion_stops': QColor(120, 190, 255),
             'audio_peaks': QColor(150, 100, 255),
             'highlights': QColor(50, 200, 50),
             'visual_search': QColor(255, 100, 255),
@@ -562,6 +564,9 @@ class SignalTimelineScene(QGraphicsScene):
         return [float(p) if not isinstance(p, dict) else float(p.get('time', 0))
                 for p in self.cache_data.get('motion_peaks', [])]
 
+    def _nav_timestamps_motion_stops(self):
+        return [float(p) for p in self.cache_data.get('motion_stops', [])]
+
     def _nav_timestamps_audio_peaks(self):
         return [float(p) if not isinstance(p, dict) else float(p.get('time', 0))
                 for p in self.cache_data.get('audio_peaks', [])]
@@ -618,6 +623,7 @@ class SignalTimelineScene(QGraphicsScene):
             'scenes': self._nav_timestamps_scenes,
             'motion_events': self._nav_timestamps_motion_events,
             'motion_peaks': self._nav_timestamps_motion_peaks,
+            'motion_stops': self._nav_timestamps_motion_stops,
             'audio_peaks': self._nav_timestamps_audio_peaks,
             'highlights': self._nav_timestamps_highlights,
             'transcript': self._nav_timestamps_transcript,
@@ -982,6 +988,10 @@ class SignalTimelineScene(QGraphicsScene):
         # Layer 6: Motion Peaks
         if self.visible_layers.get('motion_peaks', True):
             current_y = self.draw_motion_peaks_layer(current_y)
+
+        # Layer 6b: Sudden stops (movement that ends in stillness)
+        if self.visible_layers.get('motion_stops', True) and self.cache_data.get('motion_stops'):
+            current_y = self.draw_motion_stops_layer(current_y)
         
         # Layer 7: Audio Peaks
         if self.visible_layers.get('audio_peaks', True):
@@ -1592,6 +1602,27 @@ class SignalTimelineScene(QGraphicsScene):
 
         return y_pos + self.layer_height + self.layer_spacing
    
+    def draw_motion_stops_layer(self, y_pos):
+        """Sudden stops: movement that ends in stillness - what the peaks row
+        showed before 2026-11-20 (modules/segments/motion_curve.py)."""
+        self.row_labels.append(("SUDDEN STOPS", y_pos))
+        merged = self._merge_intervals(
+            [(float(t), float(t) + 0.5, {'label': 'Stop'})
+             for t in self.cache_data.get('motion_stops', [])])
+        for start, end, meta in merged:
+            count = meta.get('merged_count', 1)
+            bar = TimelineBar(
+                start, end, y_pos, self.layer_height,
+                QColor(self.colors['motion_stops']),
+                f"Stop x{count}" if count > 1 else "Stop",
+                confidence=9,
+                metadata={'timestamp': start, 'merged_count': count,
+                          'meaning': "movement that ends in stillness"},
+            )
+            self.draw_bar(bar)
+            self.bars.append(bar)
+        return y_pos + self.layer_height + self.layer_spacing
+
     def draw_motion_peaks_layer(self, y_pos):
         """Draw motion peaks, with optional merging"""
         self.row_labels.append(("MOTION PEAKS", y_pos))

@@ -45,10 +45,11 @@ class TestBuildCurve:
 
     def test_scene_cuts_are_left_out(self):
         # A cut changes the whole picture at once; it is not the video's
-        # biggest movement.
-        rows = [(0, 1.0), (15, 50.0), (30, 1.0)]
-        curve = mc.build_curve(rows, FPS, duration=1.5, exclude_frames={15})
-        assert curve["values"] == [1.0, 0.0, 1.0]
+        # biggest movement - and neither are the frames within a second of
+        # it, which still differ by most of the picture (CUT_EDGE_SECONDS).
+        rows = [(0, 1.0), (15, 50.0), (30, 1.0), (90, 2.0)]   # 0, 0.5 (cut), 1.0, 3.0 s
+        curve = mc.build_curve(rows, FPS, duration=3.5, exclude_frames={15})
+        assert curve["values"] == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
 
     def test_nothing_to_bin_is_no_curve_rather_than_a_flat_one(self):
         assert mc.build_curve([], FPS, duration=10.0) is None
@@ -161,11 +162,12 @@ class TestTimelineRows:
         assert any(i.toPlainText().startswith("★1 ")
                    for i in text_items(scene))
 
-    def test_the_burst_just_before_a_peak_counts_towards_it(self, app):
-        # The detector stamps the peak at the end of its burst.
+    def test_a_peak_is_measured_at_its_own_mark(self, app):
+        # A peak sits on the top of the curve (since 2026-11-20); a burst a
+        # second and a half before it belongs to something else.
         scene = peak_scene(app, curve_with_spikes({18.5: 1.0, 35.0: 0.6}))
         bars = peak_bars(scene)
-        assert bars[1].metadata["rank"] == "1 of 4"
+        assert bars[2].metadata["rank"] == "1 of 4"
 
     def test_bars_keep_their_labels(self, app):
         # A label parented through the constructor was deleted with its
@@ -226,3 +228,59 @@ class TestDisplayTop:
     def test_empty_or_still(self):
         from modules.segments import motion_curve as mc
         assert mc.display_top([]) == 1.0 and mc.display_top([0.0, 0.0]) == 1.0
+
+
+class TestPeaksStopsAndCuts:
+    """2026-11-20: a peak is the top of the curve, movement that ends in
+    stillness is a sudden stop, and a shot change is neither."""
+
+    @staticmethod
+    def curve(values, step=0.5):
+        return {"step": step, "values": values}
+
+    def test_a_peak_is_marked_at_the_top_not_where_the_movement_ends(self):
+        from modules.segments import motion_curve as mc
+        v = [0.1] * 40
+        v[20:27] = [0.3, 0.6, 0.9, 1.0, 0.8, 0.5, 0.3]      # one bump, top at bin 23
+        assert mc.find_peaks(self.curve(v)) == [11.75]
+
+    def test_a_big_movement_that_carries_on_is_still_a_peak(self):
+        from modules.segments import motion_curve as mc
+        v = [0.1] * 60
+        v[20:40] = [0.2 + 0.04 * i for i in range(10)] + [0.6 - 0.02 * i for i in range(10)]
+        assert len(mc.find_peaks(self.curve(v))) == 1
+
+    def test_a_flat_busy_stretch_has_no_peaks(self):
+        from modules.segments import motion_curve as mc
+        assert mc.find_peaks(self.curve([0.5] * 100)) == []
+
+    def test_nothing_within_a_second_of_a_cut_is_a_peak(self):
+        from modules.segments import motion_curve as mc
+        v = [0.1] * 40
+        v[20] = 1.0                                          # 10.0-10.5 s
+        assert mc.find_peaks(self.curve(v), cuts=[10.4]) == []
+        assert mc.find_peaks(self.curve(v), cuts=[13.0]) == [10.25]
+
+    def test_the_curve_leaves_out_the_frames_beside_a_cut(self):
+        from modules.segments import motion_curve as mc
+        samples = [(f, 5.0 if 95 <= f <= 105 else 1.0) for f in range(0, 300, 5)]
+        c = mc.build_curve(samples, fps=10, duration=30, exclude_frames=[100])
+        assert max(c["values"][18:23]) < 1.0 or set(c["values"][18:23]) == {0.0}
+        assert max(c["values"]) == 1.0                       # the rest still scaled
+
+    def test_an_old_cache_is_read_the_new_way_once(self):
+        from modules.segments import motion_curve as mc
+        v = [0.1] * 40
+        v[30] = 1.0
+        cache = {"motion_curve": self.curve(v), "motion_peaks": [2.1, 15.0],
+                 "scenes": [{"start": 0.0, "end": 2.0}, {"start": 2.0, "end": 20.0}]}
+        mc.upgrade(cache)
+        assert cache["motion_stops"] == [15.0]                # 2.1 sat on the cut at 2.0
+        assert cache["motion_peaks"] == [15.25]
+        again = dict(cache)
+        assert mc.upgrade(again) == cache                     # idempotent
+
+    def test_a_cache_without_a_curve_is_left_alone(self):
+        from modules.segments import motion_curve as mc
+        cache = {"motion_peaks": [3.0]}
+        assert mc.upgrade(cache) == {"motion_peaks": [3.0]}
