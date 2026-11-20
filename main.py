@@ -3379,11 +3379,34 @@ class VideoHighlighterGUI(QWidget):
         except Exception as e:  # noqa: BLE001 - the app works without it
             print(f"⚠️ Live link not started: {e}")
             self._live_link = None
-        # A restart asked over the live link comes back where it was.
+        # A restart asked over the live link comes back where it was: the
+        # windows where they stood, the video at the moment it showed.
         from modules.system import app_restart
+        geometry = app_restart.take_geometry()
+        self._restore_geometry(self, geometry.get("main"))
+        self._reopen_viewer_geometry = geometry.get("viewer")
         reopen = app_restart.take_reopen()
         if reopen:
             QTimer.singleShot(1500, lambda: self._reopen_after_restart(*reopen))
+
+    @staticmethod
+    def _saved_geometry(widget):
+        """A window's place on screen (Qt's saveGeometry: screen, size,
+        maximised) as text for the restart's hand-over, or None."""
+        try:
+            return bytes(widget.saveGeometry().toBase64()).decode("ascii")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _restore_geometry(widget, saved):
+        if not saved or widget is None:
+            return
+        try:
+            from PySide6.QtCore import QByteArray
+            widget.restoreGeometry(QByteArray.fromBase64(saved.encode("ascii")))
+        except Exception as e:  # noqa: BLE001 - a misplaced window is still a window
+            print(f"⚠️ Could not put the window back where it was: {e}")
 
     def _live_timeline_video(self):
         window = getattr(self, "timeline_window", None)
@@ -3419,9 +3442,12 @@ class VideoHighlighterGUI(QWidget):
         self.append_log("🔁 Restarting at Claude's request"
                         + (f"; reopening {os.path.basename(video)}" if video else "") + ".")
 
+        geometry = {"main": self._saved_geometry(self),
+                    "viewer": self._saved_geometry(window) if video else None}
+
         def go():
             try:
-                app_restart.spawn(video, seconds)
+                app_restart.spawn(video, seconds, geometry=geometry)
             except Exception as e:  # noqa: BLE001 - stay open rather than vanish
                 self.append_log(f"⚠️ Restart failed, the app stays open: {e}")
                 return
@@ -3434,6 +3460,7 @@ class VideoHighlighterGUI(QWidget):
         try:
             self.open_timeline_viewer(video_path=video)
             window, _ = self._live_timeline_video()
+            self._restore_geometry(window, getattr(self, "_reopen_viewer_geometry", None))
             if window is not None and seconds is not None:
                 window._jump_to_time(seconds)
             self.append_log(f"🔁 Restarted; reopened {os.path.basename(video)}.")

@@ -16,6 +16,7 @@ What to reopen travels in two environment variables the new process reads once
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -23,6 +24,10 @@ from typing import Callable, Iterable, Optional, Sequence
 
 ENV_VIDEO = "VH_REOPEN_VIDEO"
 ENV_SECONDS = "VH_REOPEN_AT"
+# Where the windows were: {"main": ..., "viewer": ...}, each Qt's saveGeometry()
+# as base64, so the restarted app opens where the old one was (screen,
+# size, maximised) - not where a fresh start would put it.
+ENV_GEOMETRY = "VH_REOPEN_GEOMETRY"
 
 # Attributes of the main window and the timeline viewer that hold work in
 # progress, with the words for the refusal. Anything with ``isRunning()``
@@ -73,13 +78,18 @@ def relaunch_command(argv: Optional[Sequence[str]] = None,
 
 
 def spawn(video: Optional[str] = None, seconds: Optional[float] = None, *,
+          geometry: Optional[dict] = None,
           command: Optional[Sequence[str]] = None,
           popen: Callable = subprocess.Popen):
     """Start the new process, detached from this one, in the same folder (the
-    app reads ./cache and config.yaml relative to it)."""
+    app reads ./cache and config.yaml relative to it). ``geometry`` is where
+    the windows were (see ``ENV_GEOMETRY``)."""
     env = dict(os.environ)
     env.pop(ENV_VIDEO, None)
     env.pop(ENV_SECONDS, None)
+    env.pop(ENV_GEOMETRY, None)
+    if geometry:
+        env[ENV_GEOMETRY] = json.dumps({k: str(v) for k, v in geometry.items() if v})
     if video:
         env[ENV_VIDEO] = str(video)
         if seconds is not None:
@@ -92,6 +102,18 @@ def spawn(video: Optional[str] = None, seconds: Optional[float] = None, *,
     else:
         kwargs["start_new_session"] = True
     return popen(list(command or relaunch_command()), **kwargs)
+
+
+def take_geometry(environ=None) -> dict:
+    """Where a restart asked the windows to be (``{"main": b64, "viewer": b64}``),
+    or ``{}``. Removed as it is read, so it happens once."""
+    environ = os.environ if environ is None else environ
+    raw = environ.pop(ENV_GEOMETRY, None)
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, str) and v} if isinstance(data, dict) else {}
 
 
 def take_reopen(environ=None) -> Optional[tuple]:

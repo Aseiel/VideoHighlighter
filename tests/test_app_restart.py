@@ -85,3 +85,22 @@ def test_take_reopen_ignores_a_missing_file_and_a_bad_time(tmp_path):
     video = tmp_path / "v.mp4"
     video.write_bytes(b"x")
     assert ar.take_reopen({ar.ENV_VIDEO: str(video), ar.ENV_SECONDS: "soon"}) == (str(video), None)
+
+
+def test_where_the_windows_were_travels_with_the_restart(monkeypatch):
+    monkeypatch.setenv(ar.ENV_GEOMETRY, "stale")
+    seen = {}
+    ar.spawn(None, None, geometry={"main": "AAA=", "viewer": None},
+             command=["app"], popen=lambda cmd, **kw: seen.update(kw))
+    env = seen["env"]
+    assert ar.take_geometry(env) == {"main": "AAA="}
+    assert ar.take_geometry(env) == {}                      # read once
+
+
+def test_no_geometry_and_bad_geometry_are_nothing(monkeypatch):
+    seen = {}
+    monkeypatch.delenv(ar.ENV_GEOMETRY, raising=False)
+    ar.spawn(None, None, command=["app"], popen=lambda cmd, **kw: seen.update(kw))
+    assert ar.ENV_GEOMETRY not in seen["env"]
+    assert ar.take_geometry({ar.ENV_GEOMETRY: "not json"}) == {}
+    assert ar.take_geometry({ar.ENV_GEOMETRY: "[1, 2]"}) == {}

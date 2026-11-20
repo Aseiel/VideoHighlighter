@@ -37,10 +37,12 @@ def app(tmp_path, monkeypatch):
                                 close=lambda: events.append(("close",)))
     for name in ("_live_timeline_video", "_live_restart"):
         setattr(app, name, types.MethodType(getattr(main.VideoHighlighterGUI, name), app))
+    app._saved_geometry = lambda w: "VIEWER" if w is window else "MAIN"
     timers = []
     monkeypatch.setattr(main.QTimer, "singleShot", lambda ms, fn: timers.append(fn))
     monkeypatch.setattr(app_restart, "spawn",
-                        lambda video, seconds: events.append(("spawn", video, seconds)))
+                        lambda video, seconds, geometry=None: events.append(
+                            ("spawn", video, seconds, geometry)))
     return app, window, events, timers, str(video)
 
 
@@ -51,7 +53,7 @@ def test_answers_first_then_starts_the_new_app_then_closes(app):
     assert [e[0] for e in events] == ["log"]          # nothing has happened yet
     timers[0]()
     assert [e[0] for e in events] == ["log", "spawn", "close"]
-    assert events[1] == ("spawn", video, 1428.04)
+    assert events[1] == ("spawn", video, 1428.04, {"main": "MAIN", "viewer": "VIEWER"})
 
 
 def test_refuses_while_work_runs(app):
@@ -67,13 +69,13 @@ def test_a_hidden_viewer_is_not_reopened(app):
     window.isVisible = lambda: False
     assert app._live_restart({})["reopen"] is None
     timers[0]()
-    assert events[1] == ("spawn", None, None)
+    assert events[1] == ("spawn", None, None, {"main": "MAIN", "viewer": None})
 
 
 def test_a_failed_start_keeps_the_app_open(app, monkeypatch):
     app, window, events, timers, _ = app
 
-    def boom(video, seconds):
+    def boom(video, seconds, geometry=None):
         raise OSError("no such file")
     monkeypatch.setattr(app_restart, "spawn", boom)
     app._live_restart({})
@@ -109,3 +111,19 @@ def test_live_commands_are_refused_while_the_viewer_opens(app):
     app._timeline_opening = True
     with pytest.raises(RuntimeError, match="still opening"):
         viewer_on(app, {"video_path": video})
+
+
+def test_a_window_comes_back_where_it_was():
+    from PySide6.QtWidgets import QApplication, QWidget
+    QApplication.instance() or QApplication([])
+    G = main.VideoHighlighterGUI
+    old = QWidget()
+    old.setGeometry(140, 160, 640, 420)
+    saved = G._saved_geometry(old)
+    assert saved and isinstance(saved, str)
+    new = QWidget()
+    G._restore_geometry(new, saved)
+    assert (new.geometry().width(), new.geometry().height()) == (640, 420)
+    assert (new.geometry().x(), new.geometry().y()) == (140, 160)
+    G._restore_geometry(new, None)                   # nothing saved: nothing moves
+    G._restore_geometry(None, saved)
