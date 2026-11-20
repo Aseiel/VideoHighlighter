@@ -9,6 +9,14 @@ was measured with.
 of the old trainer's time. Here every frame is grabbed in order and only the
 chosen ones are converted, so a clip costs one sequential decode.
 
+**Reading overlaps encoding.** Clips are decoded on the processor a few ahead,
+in threads, while the encoder works on the graphics card; done one after the
+other, each waited for the other. The card's own video decoder does not help
+here: measured 2026-11-20 on dataset clips (125-150 frames, 720p) it read 7.5
+clips/s against the processor's 19, because opening it costs more per file than
+decoding a few seconds of video (``modules/media/video_decode.py`` is for long
+films read sparsely, where it pays).
+
 **The cache is keyed by the clip and the encoder.** A key is the clip's path
 relative to the dataset, its size and its modification time, so an edited or
 replaced clip is encoded again and a moved dataset is not. A cache from
@@ -18,7 +26,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterable, Iterator, Optional, Sequence
 
 import numpy as np
 
@@ -80,6 +88,36 @@ def read_frame_sets(path: str, counts: Sequence[int], convert=None) -> list:
         if len(got) < len(set(targets)):
             return []
     return [got[t] for t in targets]
+
+
+READ_AHEAD = 8
+READ_THREADS = 4
+
+
+def prefetch(items: Iterable, fn: Callable, ahead: int = READ_AHEAD,
+             threads: int = READ_THREADS) -> Iterator[tuple]:
+    """``(item, fn(item))`` in the order of ``items``, with ``fn`` already
+    running on up to ``ahead`` items beyond the one handed out. Decoding in
+    OpenCV releases the GIL, so threads read in parallel. Stopping early (the
+    caller breaks) cancels what has not started."""
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    items = iter(items)
+    with ThreadPoolExecutor(max(1, threads)) as pool:
+        pending: deque = deque()
+        try:
+            for item in items:
+                pending.append((item, pool.submit(fn, item)))
+                if len(pending) > ahead:
+                    first, fut = pending.popleft()
+                    yield first, fut.result()
+            while pending:
+                first, fut = pending.popleft()
+                yield first, fut.result()
+        finally:
+            for _, fut in pending:
+                fut.cancel()
 
 
 def clip_key(path: str, root: str) -> str:
@@ -155,10 +193,10 @@ def encode_clips(paths: Sequence[str], root: str, encoder, cache: FeatureCache,
         log(f"Encoding {len(todo)} clips ({len(paths) - len(todo)} cached) "
             f"with {encoder.encoder_id} on {encoder.label}")
     start, failed = time.time(), []
-    for n, (i, p, key) in enumerate(todo, 1):
+    k = cache.frames // per
+    for n, ((i, p, key), frames) in enumerate(prefetch(todo, lambda t: read_frames(t[1], k)), 1):
         if should_stop and should_stop():
             break
-        frames = read_frames(p, cache.frames // per)
         if not frames:
             failed.append(p)
             continue
