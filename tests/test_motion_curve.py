@@ -207,3 +207,22 @@ class TestTimelineRows:
         assert all(b.alpha is None for b in bars)
         assert not [i for i in scene.items() if isinstance(i, QGraphicsPathItem)
                     and i.zValue() in (-4, 5)]
+
+
+class TestDisplayTop:
+    """One freak bin must not flatten the whole drawn curve."""
+
+    def test_a_single_freak_bin_is_left_out(self):
+        from modules.segments import motion_curve as mc
+        values = [1.0] + [0.01 + 0.04 * (i % 10) / 10 for i in range(2000)]   # flash at 0:02
+        top = mc.display_top(values)
+        assert 0.04 <= top <= 0.05
+
+    def test_an_ordinary_videos_biggest_moment_stays_the_top(self):
+        from modules.segments import motion_curve as mc
+        values = [0.2 + 0.3 * (i % 7) / 7 for i in range(1000)] + [0.9, 1.0]
+        assert mc.display_top(values) == 1.0
+
+    def test_empty_or_still(self):
+        from modules.segments import motion_curve as mc
+        assert mc.display_top([]) == 1.0 and mc.display_top([0.0, 0.0]) == 1.0

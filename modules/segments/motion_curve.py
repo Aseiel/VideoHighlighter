@@ -59,6 +59,30 @@ def build_curve(samples, fps, duration=0.0, step=STEP, exclude_frames=()):
     return {"step": float(step), "values": values}
 
 
+OUTLIER_PERCENTILE = 99.5
+OUTLIER_FACTOR = 3.0
+
+
+def display_top(values):
+    """The level a curve is drawn at full height for: its highest value that
+    is not a freak outlier.
+
+    The curve is divided by the video's own maximum, so one freak bin flattens
+    everything else. Seen 2026-11-20: a film whose bin at 0:02 (a flash from
+    black) was 1.0 while every other bin was 0.05 or less, so the whole curve
+    drew under 5 % of the row and looked like a video with no movement at
+    all. A value more than ``OUTLIER_FACTOR`` times the 99.5th percentile is
+    left out here and drawn clipped at full height; an ordinary video's
+    biggest moment is well within that, so its curve draws as before.
+    """
+    vals = sorted(v for v in (values or []) if v > 0)
+    if not vals:
+        return 1.0
+    p = vals[min(len(vals) - 1, int(len(vals) * OUTLIER_PERCENTILE / 100.0))]
+    kept = [v for v in vals if v <= OUTLIER_FACTOR * p]
+    return kept[-1] if kept else vals[-1]
+
+
 def _values(curve):
     if not isinstance(curve, dict):
         return None, None

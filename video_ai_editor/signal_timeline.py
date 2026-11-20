@@ -1698,12 +1698,14 @@ class SignalTimelineScene(QGraphicsScene):
             return
         pts = downsample(values[:int(round(span_s / step)) or 1],
                          points=max(2, int(width_px)))
-        top = max(pts) or 1.0
+        # Full height is the highest ordinary value, not a single freak bin
+        # (motion_curve.display_top); anything above it is drawn clipped.
+        top = motion_curve.display_top(values) or 1.0
         usable = height * 0.9
         bottom = y_pos + height
         dx = width_px / len(pts)
 
-        points = [QPointF((i + 0.5) * dx, bottom - (v / top) * usable)
+        points = [QPointF((i + 0.5) * dx, bottom - min(v / top, 1.0) * usable)
                   for i, v in enumerate(pts)]
 
         area = QPainterPath(QPointF(0, bottom))
@@ -1728,7 +1730,7 @@ class SignalTimelineScene(QGraphicsScene):
 
         avg = motion_curve.mean_level(curve)
         if avg > 0:
-            y_avg = bottom - (avg / top) * usable
+            y_avg = bottom - min(avg / top, 1.0) * usable
             pen = QPen(QColor(255, 255, 255, 60), 1, Qt.PenStyle.DashLine)
             line = self.addLine(0, y_avg, width_px, y_avg, pen)
             line.setZValue(-4)
@@ -1740,10 +1742,10 @@ class SignalTimelineScene(QGraphicsScene):
         dot. Drawn over the bar and taking no clicks, like the outline."""
         at = motion_curve.peak_time(curve, start, end)
         level = motion_curve.level_at(curve, at)
-        top = max(curve['values']) or 1.0
+        top = motion_curve.display_top(curve['values']) or 1.0
         x = at * self.pixels_per_second
         bottom = y_pos + height
-        y = bottom - (level / top) * height * 0.9
+        y = bottom - min(level / top, 1.0) * height * 0.9
 
         accent = QColor(255, 214, 90)
         items = [
