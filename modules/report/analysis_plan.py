@@ -46,7 +46,8 @@ from typing import Iterable, Mapping, Sequence
 # whole point — it is the part that stops this bug coming back a fourth time.
 GATED_ARTIFACTS: dict[str, tuple[str, ...]] = {
     # scenes + motion_events + motion_peaks all come from one detector pass.
-    "motion": ("scene_points", "motion_event_points", "motion_peak_points"),
+    "motion": ("scene_points", "motion_event_points", "motion_peak_points",
+               "motion_stop_points"),
     "audio_peaks": ("audio_peak_points",),
     # With no actions typed, the points alone switch the pass on (every class
     # the installed model knows counts), and a blank list is the same cache

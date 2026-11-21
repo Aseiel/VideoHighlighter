@@ -76,6 +76,7 @@ SIGNAL_PROSE = {
     "scene": "a shot change",
     "motion_event": "movement",
     "motion_peak": "a burst of movement",
+    "motion_stop": "movement that stops dead",
     "audio": "a rise in sound",
     "keyword": "something said",
     "object": "what was on screen",

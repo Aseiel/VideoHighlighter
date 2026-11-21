@@ -45,6 +45,7 @@ SIGNAL_LABELS = (
     ("scene", "Shot change"),
     ("motion_event", "Motion event"),
     ("motion_peak", "Motion peak"),
+    ("motion_stop", "Sudden stop"),
     ("audio", "Audio peak"),
     ("loudness_burst", "Loudness burst"),
     ("keyword", "Keyword"),
@@ -61,7 +62,7 @@ SIGNAL_LABELS = (
 # Signals that count toward the multi-signal boost. A position bonus is not
 # evidence about content, and the pipeline's own boost test excludes them, so
 # counting them here would over-report the signal count.
-BOOST_SIGNALS = ("motion_event", "motion_peak", "audio", "loudness_burst",
+BOOST_SIGNALS = ("motion_event", "motion_peak", "motion_stop", "audio", "loudness_burst",
                  "keyword", "object", "face")
 
 # How many unselected peaks to report. These are the moments a user would

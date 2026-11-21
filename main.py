@@ -1638,8 +1638,16 @@ class VideoHighlighterGUI(QWidget):
 
         self.spin_motion_peak = QSpinBox(); self.spin_motion_peak.setRange(0,100); self.spin_motion_peak.setValue(scoring_cfg.get("motion_peak_points", 3))
         self.spin_motion_peak.setToolTip(
-            "Points when motion inside a shot rises above that shot's average, "
-            "then stays low for about 4 seconds of samples.")
+            "Points at the top of the motion curve: the most movement within 2 s "
+            "either side, in the video's own top tenth and well above the quiet "
+            "around it. Judged against the video itself, so a smaller copy finds "
+            "the same peaks.")
+
+        self.spin_motion_stop = QSpinBox(); self.spin_motion_stop.setRange(0,100); self.spin_motion_stop.setValue(scoring_cfg.get("motion_stop_points", 0))
+        self.spin_motion_stop.setToolTip(
+            "Points where movement stops dead: motion inside a shot rises above "
+            "that shot's average, then stays low for about 4 seconds. The same "
+            "motion pass finds it; the timeline shows it as Sudden stop.")
 
         self.spin_audio_peak = QSpinBox(); self.spin_audio_peak.setRange(0,100); self.spin_audio_peak.setValue(scoring_cfg.get("audio_peak_points", 0))
         self.spin_audio_peak.setToolTip(
@@ -1762,10 +1770,11 @@ class VideoHighlighterGUI(QWidget):
                 ("Shot change points:", self._points_row_with_button(
                     self.spin_scene_points, "motion", "Scan motion",
                     "Detect shot changes and motion across every video in the list "
-                    "and cache them (covers shot change, motion event and motion peak "
+                    "and cache them (covers shot change, motion event, motion peak and sudden stop "
                     "— one pass). No highlights are cut.")),
                 ("Motion event points:", self.spin_motion_event_points),
                 ("Motion peak points:", self.spin_motion_peak),
+                ("Sudden stop points:", self.spin_motion_stop),
             )),
             ("Audio", (
                 ("Audio peak points:", self._points_row_with_button(
@@ -4625,6 +4634,7 @@ class VideoHighlighterGUI(QWidget):
             "scene_points": int(self.spin_scene_points.value()),
             "motion_event_points": int(self.spin_motion_event_points.value()),
             "motion_peak_points": int(self.spin_motion_peak.value()),
+            "motion_stop_points": int(self.spin_motion_stop.value()),
             "audio_peak_points": int(self.spin_audio_peak.value()),
             "loudness_burst_points": int(self.spin_loudness_burst.value()),
             "keyword_points": int(self.spin_keyword_points.value()),
@@ -5056,6 +5066,7 @@ class VideoHighlighterGUI(QWidget):
             ("scene_points", self.spin_scene_points),
             ("motion_event_points", self.spin_motion_event_points),
             ("motion_peak_points", self.spin_motion_peak),
+            ("motion_stop_points", self.spin_motion_stop),
             ("audio_peak_points", self.spin_audio_peak),
             ("loudness_burst_points", self.spin_loudness_burst),
             ("keyword_points", self.spin_keyword_points),
@@ -5246,6 +5257,7 @@ class VideoHighlighterGUI(QWidget):
                 "scene_points": int(self.spin_scene_points.value()),
                 "motion_event_points": int(self.spin_motion_event_points.value()),
                 "motion_peak_points": int(self.spin_motion_peak.value()),
+                "motion_stop_points": int(self.spin_motion_stop.value()),
                 "audio_peak_points": int(self.spin_audio_peak.value()),
                 "loudness_burst_points": int(self.spin_loudness_burst.value()),
                 "keyword_points": int(self.spin_keyword_points.value()),
@@ -6045,6 +6057,7 @@ class VideoHighlighterGUI(QWidget):
         scene_points = int(self.spin_scene_points.value())
         motion_event_points = int(self.spin_motion_event_points.value())
         motion_peak_points = int(self.spin_motion_peak.value())
+        motion_stop_points = int(self.spin_motion_stop.value())
         audio_peak_points = int(self.spin_audio_peak.value())
         loudness_burst_points = int(self.spin_loudness_burst.value())
         
@@ -6070,7 +6083,7 @@ class VideoHighlighterGUI(QWidget):
         face_points = (int(self.spin_face_expression.value())
                        if self.selected_face_labels() else 0)
 
-        total_points = (scene_points + motion_event_points + motion_peak_points + 
+        total_points = (scene_points + motion_event_points + motion_peak_points + motion_stop_points + 
                        audio_peak_points + loudness_burst_points +
                        keyword_points + transcript_points + 
                        beginning_points + ending_points + object_points + action_points
@@ -6130,6 +6143,7 @@ class VideoHighlighterGUI(QWidget):
             "scene_points": int(self.spin_scene_points.value()),
             "motion_event_points": int(self.spin_motion_event_points.value()),
             "motion_peak_points": int(self.spin_motion_peak.value()),
+            "motion_stop_points": int(self.spin_motion_stop.value()),
             "audio_peak_points": int(self.spin_audio_peak.value()),
             "loudness_burst_points": int(self.spin_loudness_burst.value()),
             "keyword_points": int(self.spin_keyword_points.value()),
@@ -7815,6 +7829,10 @@ if __name__ == "__main__":
         multiprocessing.set_start_method("spawn")
     except RuntimeError:
         pass
+    # Run from source, each spawned helper would import this whole file again
+    # (cv2, Qt, OpenVINO, the assistant) and print the launch into the console.
+    from modules.system.child_processes import keep_main_out_of_children
+    keep_main_out_of_children()
     # Tells Setup and the uninstaller the app is open (AppMutex), so they wait
     # for it to close instead of deleting around the files it holds.
     from modules.system import app_mutex

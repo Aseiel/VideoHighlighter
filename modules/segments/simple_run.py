@@ -12,6 +12,7 @@ SIMPLE_SCORING = {
     "scene_points": 2,
     "motion_event_points": 0,
     "motion_peak_points": 5,
+    "motion_stop_points": 0,
     "audio_peak_points": 0,
     "loudness_burst_points": 5,
     "keyword_points": 0,
@@ -68,7 +69,7 @@ def idle_status_text(n: int) -> str:
 def simple_scoring_total() -> int:
     keys = (
         "scene_points", "motion_event_points", "motion_peak_points",
-        "audio_peak_points", "loudness_burst_points", "keyword_points",
+        "motion_stop_points", "audio_peak_points", "loudness_burst_points", "keyword_points",
         "transcript_points", "object_points", "action_points",
         "face_expression_points", "beginning_points", "ending_points",
     )

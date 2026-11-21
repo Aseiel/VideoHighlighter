@@ -484,6 +484,79 @@ def run_motion(video_path: str, *, frame_skip: Optional[int] = None,
     }
 
 
+SHOTS_FRAME_ACCURATE = "shot_boundaries"
+
+
+def run_shots(video_path: str, *, progress: ProgressFn = None, cancel=None,
+              log=print) -> dict:
+    """Every cut, frame-accurate (modules/segments/shot_boundaries.py), as a
+    cache patch: ``scenes`` and ``scenes_source``.
+
+    Its own run because the motion pass's cuts are a by-product: it samples
+    every few frames against a fixed threshold, so a cut between two shots of
+    similar brightness, or a shot shorter than half a second, cannot be in it.
+    On one 97-minute film it held 1129 shots where this finds 2044. Once this
+    has run, a motion pass keeps these shots and replaces only the motion.
+    """
+    import hashlib
+    import json
+    import os
+
+    from modules.segments import shot_boundaries
+
+    # Cached per file, in the same place and shape as the Pro edition's
+    # chapter pass, so either edition reuses the other's cuts.
+    st = os.stat(video_path)
+    key = hashlib.sha256(
+        f"{os.path.abspath(video_path)}_{st.st_size}_{st.st_mtime}".encode()).hexdigest()
+    path = os.path.join("./cache", "shots", key + ".json")
+    found = None
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                found = [tuple(s) for s in json.load(fh)["shots"]]
+            log(f"🎬 Reusing {len(found)} shots found earlier.")
+        except Exception as exc:  # noqa: BLE001 - detect again
+            print(f"run_shots: shot cache unreadable ({exc}); detecting again")
+            found = None
+    if found is None:
+        if progress:
+            progress(0, 1, "Shots", "Finding every cut…")
+
+        def step(*args):
+            if progress and len(args) >= 2 and args[1]:
+                progress(args[0], args[1], "Shots", "Finding every cut…")
+        try:
+            result = shot_boundaries.detect_shots(
+                video_path, progress_fn=step,
+                should_cancel=(cancel.is_set if cancel is not None else None),
+                log_fn=lambda m: print(m))
+        except shot_boundaries.ShotDetectionCancelled as exc:
+            raise _Cancelled() from exc
+        found = [(round(a, 3), round(b, 3)) for a, b in result.shots]
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"video": os.path.basename(video_path),
+                           "method": result.method, "shots": found}, fh)
+        except OSError as exc:
+            print(f"run_shots: shots not cached ({exc})")
+    if cancel is not None and cancel.is_set():
+        raise _Cancelled()
+    if progress:
+        progress(1, 1, "Shots", f"{len(found)} shots")
+    return {"scenes": [{"start": float(s), "end": float(e)} for s, e in found],
+            "scenes_source": SHOTS_FRAME_ACCURATE}
+
+
+def keep_frame_accurate_shots(patch: dict, cache: Optional[dict]) -> dict:
+    """A motion patch without its ``scenes`` when the cache already holds the
+    frame-accurate ones - the motion pass's cuts would replace better cuts."""
+    if (cache or {}).get("scenes_source") == SHOTS_FRAME_ACCURATE and "scenes" in patch:
+        patch = {k: v for k, v in patch.items() if k != "scenes"}
+    return patch
+
+
 # --------------------------------------------------------------------------- #
 # Audio peaks
 # --------------------------------------------------------------------------- #
@@ -800,6 +873,14 @@ def run_composition(video_path: str, *, cache_dir: str = "./cache",
     # from real detections. Written on every run so the list tracks the current
     # rules — a renamed or deleted rule stops being claimed as an event.
     out = {"objects": rebuilt, "composed_event_names": sorted(known)}
+    # What each signal condition read over every run, so a bar can say how
+    # deep, how loud, how sure - not only that its rule held.
+    try:
+        from modules.rules import rule_evidence
+        from modules.rules.rule_explain import _load
+        out["composed_evidence"] = rule_evidence.evidence(_load(rules_path), composed, signals)
+    except Exception as e:  # noqa: BLE001 - evidence is an extra, never a failure
+        log(f"⚠️ Could not record what the rules measured: {e}")
     if detected or outlined:
         # Only when a pass ran here. Composed boxes are still kept out (see
         # above); what goes back is the detector's own output, so the next run

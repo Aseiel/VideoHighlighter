@@ -2005,6 +2005,89 @@ class SignalTimelineWindow(QMainWindow):
             2000,
         )
 
+    def refresh_expression_checkboxes(self):
+        """One checkbox per expression class, nested under EXPRESSIONS - the
+        objects group's shape, for the same reason: each class is its own row
+        on the timeline, and this panel is where rows are shown and hidden."""
+        box = getattr(self, '_expression_box', None)
+        scene = getattr(self, 'signal_scene', None)
+        if box is None or scene is None:
+            return
+        layout = box.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.expression_checkboxes = {}
+        counts = scene.expression_moments()
+        seconds = scene.expression_seconds()
+        if counts:
+            header = QWidget()
+            hl = QHBoxLayout(header)
+            hl.setContentsMargins(0, 0, 0, 2)
+            hl.setSpacing(6)
+            label = QLabel("Show:")
+            label.setStyleSheet("color:#888;font-size:8pt;")
+            hl.addWidget(label)
+            all_btn = self._mini_button("all", "Show every expression")
+            all_btn.setFixedSize(24, 16)
+            all_btn.clicked.connect(lambda: self._set_all_expression_rows(True))
+            hl.addWidget(all_btn)
+            none_btn = self._mini_button("none", "Hide every expression")
+            none_btn.setFixedSize(30, 16)
+            none_btn.clicked.connect(lambda: self._set_all_expression_rows(False))
+            hl.addWidget(none_btn)
+            hl.addStretch()
+            layout.addWidget(header)
+        for name, moments in counts.items():
+            # The moments ◀ ▶ step through, so the two numbers agree.
+            checkbox = QCheckBox(f"{name} ({moments})")
+            checkbox.setChecked(scene.visible_expressions.get(name, True))
+            checkbox.setToolTip(
+                f"Show the '{name}' row, and let ◀ ▶ stop on it - "
+                f"{moments} moments, {seconds.get(name, 0)} s read in all")
+            checkbox.stateChanged.connect(
+                lambda state, e=name: self._toggle_expression(e, state))
+            layout.addWidget(checkbox)
+            self.expression_checkboxes[name] = checkbox
+        self._apply_expression_fold()
+
+    def _apply_expression_fold(self):
+        box = getattr(self, '_expression_box', None)
+        fold = getattr(self, '_expression_fold', None)
+        if box is None or fold is None:
+            return
+        boxes = getattr(self, 'expression_checkboxes', {})
+        expanded = getattr(self, '_expression_rows_expanded', True)
+        box.setVisible(bool(boxes) and expanded)
+        fold.setVisible(bool(boxes))
+        shown = sum(1 for cb in boxes.values() if cb.isChecked())
+        total = len(boxes)
+        if expanded:
+            fold.setText("▾")
+            fold.setToolTip("Hide the expression list")
+        else:
+            fold.setText("▸" if shown == total else f"▸ {shown}/{total}")
+            fold.setToolTip(f"Show the expression list ({shown}/{total} visible)")
+
+    def _toggle_expression_fold(self):
+        self._expression_rows_expanded = not getattr(self, '_expression_rows_expanded', True)
+        self._apply_expression_fold()
+
+    def _toggle_expression(self, name: str, state):
+        visible = (state == Qt.CheckState.Checked.value)
+        self.signal_scene.set_expression_filter(name, visible)
+        self._apply_expression_fold()
+        self.statusBar().showMessage(
+            f"Showing '{name}'" if visible else f"Hiding '{name}' — ◀ ▶ now skip it", 2000)
+
+    def _set_all_expression_rows(self, visible: bool):
+        self.signal_scene.set_all_expressions_visible(visible)
+        self.refresh_expression_checkboxes()
+        self.statusBar().showMessage(
+            "Showing all expressions" if visible else "Hid all expressions", 2000)
+
     def _build_event_header(self) -> QWidget:
         """'Show: all / none' quick toggles above the event list."""
         header = QWidget()
@@ -2522,6 +2605,7 @@ class SignalTimelineWindow(QMainWindow):
         self.refresh_event_checkboxes()   # composed events may have just appeared
         self.refresh_action_checkboxes()
         self.refresh_object_checkboxes()  # and so may object classes
+        self.refresh_expression_checkboxes()  # and the face scan's classes
 
         # Audio waveform may have just been added.
         try:
@@ -3215,9 +3299,15 @@ class SignalTimelineWindow(QMainWindow):
         # Motion & scenes / Audio: no inputs — one detector pass each, folded
         # into the cache. Motion covers scene, motion-event and motion-peak rows.
         lay.addLayout(self._make_analyze_row(
-            "motion", "Motion & shots",
-            "Detect shot changes and motion over the whole video (shot change, motion "
-            "event and motion peak — one pass)."))
+            "shots", "Shots",
+            "Find every cut, frame-accurate (reads the whole video once). Replaces "
+            "the shots the motion pass found, which miss cuts between shots of "
+            "similar brightness and shots under half a second; a later motion run "
+            "keeps these."))
+        lay.addLayout(self._make_analyze_row(
+            "motion", "Motion",
+            "Detect motion over the whole video: motion events, peaks and sudden "
+            "stops (one pass). Also finds shots, unless Shots has already run."))
         lay.addLayout(self._make_analyze_row(
             "audio", "Audio",
             "Detect audio peaks (and the waveform) over the whole video."))
@@ -3372,6 +3462,9 @@ class SignalTimelineWindow(QMainWindow):
             try:
                 if kind == "motion":
                     result = run_motion(self.video_path, progress=progress, cancel=cancel)
+                elif kind == "shots":
+                    from modules.report.analysis_ondemand import run_shots
+                    result = run_shots(self.video_path, progress=progress, cancel=cancel)
                 elif kind == "audio":
                     result = run_audio(self.video_path, progress=progress, cancel=cancel)
                 elif kind == "expressions":
@@ -3446,20 +3539,34 @@ class SignalTimelineWindow(QMainWindow):
             return
 
         if kind == "motion":
-            # One pass yields three signals; fold and enable all three layers.
-            self.cache_data["scenes"] = result.get("scenes", [])
+            # One pass yields several signals; fold and enable their layers.
+            # Its shots only when the frame-accurate ones are not there.
+            from modules.report.analysis_ondemand import keep_frame_accurate_shots
+            patch = keep_frame_accurate_shots(dict(result or {}), self.cache_data)
+            kept_shots = "scenes" not in patch
+            if not kept_shots:
+                self.cache_data["scenes"] = result.get("scenes", [])
             self.cache_data["motion_events"] = result.get("motion_events", [])
             self.cache_data["motion_peaks"] = result.get("motion_peaks", [])
             self.cache_data["motion_curve"] = result.get("motion_curve")
             self.cache_data["motion_stops"] = result.get("motion_stops", [])
-            self._merge_into_cache_file(result)
+            self._merge_into_cache_file(patch)
             for layer in ("scenes", "motion_events", "motion_peaks", "motion_stops"):
                 self._enable_layer_and_reload(layer)
             if row:
+                shots = ("frame-accurate shots kept" if kept_shots
+                         else f"{len(result.get('scenes', []))} shots")
                 row["status"].setText(
-                    f"✓ {len(result.get('scenes', []))} shots, "
+                    f"✓ {shots}, "
                     f"{len(result.get('motion_peaks', []))} peaks, "
                     f"{len(result.get('motion_stops', []))} sudden stops")
+        elif kind == "shots":
+            self.cache_data["scenes"] = result.get("scenes", [])
+            self.cache_data["scenes_source"] = result.get("scenes_source")
+            self._merge_into_cache_file(dict(result or {}))
+            self._enable_layer_and_reload("scenes")
+            if row:
+                row["status"].setText(f"✓ {len(result.get('scenes', []))} shots, frame-accurate")
         elif kind == "audio":
             self.cache_data["audio_peaks"] = result.get("audio_peaks", [])
             self.cache_data["audio"] = result.get("audio", {})
@@ -3481,6 +3588,7 @@ class SignalTimelineWindow(QMainWindow):
                 return
             self.signal_scene.set_expressions(result, rebuild=False)
             self._enable_layer_and_reload("expressions")
+            self.refresh_expression_checkboxes()
             if row:
                 from modules.vision.face_scan import label_counts
                 counts = {k: v for k, v in label_counts(result).items()
@@ -3557,6 +3665,7 @@ class SignalTimelineWindow(QMainWindow):
         self.refresh_event_checkboxes()
         self.refresh_action_checkboxes()
         self.refresh_object_checkboxes()
+        self.refresh_expression_checkboxes()
         if hasattr(self, "label_panel"):
             self.label_panel.refresh_labels()
 
@@ -3931,9 +4040,14 @@ class SignalTimelineWindow(QMainWindow):
             display_name = layer_name.replace('_', ' ').title()
             has_data = self.signal_scene.layer_has_data(layer_name)
             checkbox = QCheckBox(display_name)
-            # Start empty signal types unchecked + hidden to reduce clutter.
-            # setChecked runs before the connect below, so it won't fire toggle_layer.
-            checkbox.setChecked(has_data)
+            # Start empty signal types unchecked + hidden to reduce clutter, and
+            # the rest as they were last left (scene.chosen_layers, saved with
+            # the filters). setChecked runs before the connect below, so it
+            # won't fire toggle_layer.
+            chosen = getattr(self.signal_scene, "chosen_layers", {}).get(layer_name, True)
+            checkbox.setChecked(has_data and chosen)
+            if has_data and not chosen:
+                self.signal_scene.visible_layers[layer_name] = False
             if not has_data:
                 self.signal_scene.visible_layers[layer_name] = False
                 checkbox.setToolTip("No detections for this signal type")
@@ -3992,6 +4106,31 @@ class SignalTimelineWindow(QMainWindow):
                 obj_layout.setSpacing(2)
                 self._object_box.setVisible(False)
                 layer_layout.addWidget(self._object_box)
+                continue
+
+            if layer_name == 'expressions':
+                # Same shape as objects: the checkbox shows the group, the
+                # caret a checkbox per expression class the scan found.
+                row = QWidget()
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(4)
+                row_layout.addWidget(checkbox)
+                row_layout.addStretch()
+                self._expression_fold = self._mini_button("▾", "Hide the expression list")
+                self._expression_fold.setFixedSize(34, 16)
+                self._expression_fold.setVisible(False)   # nothing to fold until a scan exists
+                self._expression_fold.clicked.connect(self._toggle_expression_fold)
+                row_layout.addWidget(self._expression_fold)
+                layer_layout.addWidget(row)
+
+                self._expression_rows_expanded = True
+                self._expression_box = QWidget()
+                ex_layout = QVBoxLayout(self._expression_box)
+                ex_layout.setContentsMargins(18, 0, 0, 0)   # reads as a child row
+                ex_layout.setSpacing(2)
+                self._expression_box.setVisible(False)
+                layer_layout.addWidget(self._expression_box)
                 continue
 
             if layer_name == 'events':
@@ -4070,6 +4209,7 @@ class SignalTimelineWindow(QMainWindow):
         self.refresh_event_checkboxes()
         self.refresh_action_checkboxes()
         self.refresh_object_checkboxes()
+        self.refresh_expression_checkboxes()
 
         # Avoid ranges — exclude a dragged-selection range from highlight selection
         avoid_group = CollapsibleSection(
@@ -4414,8 +4554,14 @@ class SignalTimelineWindow(QMainWindow):
 
     @Slot(str, int)
     def toggle_layer(self, layer_name, state):
-        """Toggle visibility of a layer"""
-        self.signal_scene.visible_layers[layer_name] = (state == Qt.CheckState.Checked.value)
+        """Toggle visibility of a layer - and remember it, so a restart opens
+        on the same layers."""
+        visible = (state == Qt.CheckState.Checked.value)
+        chooser = getattr(self.signal_scene, "choose_layer", None)
+        if chooser is not None:
+            chooser(layer_name, visible)
+        else:
+            self.signal_scene.visible_layers[layer_name] = visible
         self.signal_scene.build_timeline()
 
     def _enable_layer(self, layer_name, rebuild=True):
@@ -5235,6 +5381,7 @@ class SignalTimelineWindow(QMainWindow):
         self.refresh_event_checkboxes()
         self.refresh_action_checkboxes()
         self.refresh_object_checkboxes()
+        self.refresh_expression_checkboxes()
     
     def show_all_filters(self):
         """Show all actions, objects and composed events, full confidence range"""

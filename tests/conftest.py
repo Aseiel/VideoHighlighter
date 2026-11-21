@@ -111,6 +111,25 @@ _DEVICE_VARS = ("VH_BACKEND", "VH_DIRECTML", "VH_DIRECTML_FP16",
                 "VH_DIRECTML_DEVICE")
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _free_qt_leftovers_on_the_main_thread():
+    """Collect each module's garbage when the module ends, on the main thread.
+
+    Some tests leave Qt objects in reference cycles (a timeline scene with its
+    items, a widget, a QObject), which only the garbage collector frees. The
+    collector runs in whichever thread happens to allocate when it is due, and
+    the teach windows run Python on worker QThreads. When it fired there, it
+    deleted those GUI objects off the GUI thread - undefined in Qt - and the
+    whole run died with a segfault in a teach test that had nothing to do with
+    them, at a point that moved with any change in allocation (a new test file
+    elsewhere was enough). Collecting at every module boundary frees them here
+    instead; once per module costs seconds, once per test doubled the run.
+    """
+    yield
+    import gc
+    gc.collect()
+
+
 @pytest.fixture(autouse=True)
 def _no_device_choice_leaks():
     """Every test starts and ends with the automatic backend."""

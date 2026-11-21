@@ -144,6 +144,9 @@ class SignalTimelineScene(QGraphicsScene):
         #    (`<video>_faces.json`), not in cache_data, so it is read here and
         #    kept apart: reload_cache_data must not drop it.
         self.expressions: dict = {}
+        # Per class, shown or hidden from the Layers panel; a class not in here
+        # is shown, so a new scan's classes appear without a step.
+        self.visible_expressions: dict = {}
         self.expression_merge_gap = 2.0  # seconds — one sample a second, so
         #                                  a single unread frame is not a cut
         self._load_expressions()
@@ -243,8 +246,18 @@ class SignalTimelineScene(QGraphicsScene):
         self._selection_end_time = None    # float seconds
         self._selection_active = False     # True = selection exists and can be dragged
 
+        # Layer ticks the user set by hand, saved with the filters (see
+        # save_filters); the Layers panel starts from these.
+        self.chosen_layers: dict = {}
+        self._saved_rows: dict = {}
         self.load_filters()
         self.build_timeline()
+
+    def choose_layer(self, layer_name, visible):
+        """A layer ticked or unticked by hand: shown or hidden, and remembered."""
+        self.visible_layers[layer_name] = bool(visible)
+        self.chosen_layers[layer_name] = bool(visible)
+        self.save_filters()
 
     def generate_waveform_colors(self):
         """Generate color gradient for waveform based on amplitude"""
@@ -438,10 +451,16 @@ class SignalTimelineScene(QGraphicsScene):
         self.action_types = self._extract_action_types()
         self.object_classes = self._extract_object_classes()
         self.event_types = self._extract_event_types()
-        # Keep prior show/hide for types that persist; default new ones to shown.
-        self.visible_actions = {a: prev_actions.get(a, True) for a in self.action_types}
-        self.visible_objects = {o: prev_objects.get(o, True) for o in self.object_classes}
-        self.visible_events = {e: prev_events.get(e, True) for e in self.event_types}
+        # Keep prior show/hide for types that persist; a type that was not
+        # there when the filters were read takes its saved choice, and only a
+        # type never seen before defaults to shown.
+        saved = getattr(self, "_saved_rows", {})
+        self.visible_actions = {a: prev_actions.get(a, saved.get("actions", {}).get(a, True))
+                                for a in self.action_types}
+        self.visible_objects = {o: prev_objects.get(o, saved.get("objects", {}).get(o, True))
+                                for o in self.object_classes}
+        self.visible_events = {e: prev_events.get(e, saved.get("events", {}).get(e, True))
+                               for e in self.event_types}
         # Palettes are indexed by position in these lists, so they have to be
         # rebuilt alongside them or colours shift onto the wrong rows.
         self.object_colors = self._color_palette(len(self.object_classes), start_hue=340)
@@ -2055,6 +2074,26 @@ class SignalTimelineScene(QGraphicsScene):
         if bar.metadata:
             for key, value in bar.metadata.items():
                 tooltip_lines.append(f"{key}: {value}")
+            # A composed event is only as clear as its name: say what its rule
+            # checked (modules/rules/rule_explain.py).
+            if bar.metadata.get('composed'):
+                try:
+                    from modules.rules.rule_explain import explain_event
+                    why = explain_event(bar.metadata.get('type'))
+                except Exception:  # noqa: BLE001 - a tooltip never breaks drawing
+                    why = []
+                if why:
+                    tooltip_lines += [""] + why
+                # ...and what those conditions read over this bar's seconds.
+                try:
+                    from modules.rules import rule_evidence
+                    run = rule_evidence.for_bar(
+                        (self.cache_data or {}).get('composed_evidence'),
+                        bar.metadata.get('type'), bar.start_time, bar.end_time)
+                    if run:
+                        tooltip_lines += [""] + rule_evidence.describe(run)
+                except Exception:  # noqa: BLE001
+                    pass
         
         tooltip = "\n".join(tooltip_lines)
         
@@ -2439,7 +2478,17 @@ class SignalTimelineScene(QGraphicsScene):
             "visible_actions": self.visible_actions,
             "visible_objects": self.visible_objects,
             "visible_events": self.visible_events,
+            "visible_expressions": self.visible_expressions,
+            # Only the layers someone ticked or unticked: an empty layer starts
+            # hidden, and saving that would keep it hidden once it has data.
+            "visible_layers": self.chosen_layers,
         }
+        # Rows not in view now keep the choice the file had for them.
+        for key, current in (("visible_actions", self.visible_actions),
+                             ("visible_objects", self.visible_objects),
+                             ("visible_events", self.visible_events)):
+            data[key] = {**getattr(self, "_saved_rows", {}).get(key.split("_", 1)[1], {}),
+                         **current}
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
@@ -2470,6 +2519,17 @@ class SignalTimelineScene(QGraphicsScene):
             for k in self.visible_events:
                 if k in saved_events:
                     self.visible_events[k] = bool(saved_events[k])
+            # Kept whole: the scan is loaded separately and may name its
+            # classes only after this runs.
+            self.visible_expressions.update(
+                {str(k): bool(v) for k, v in (data.get("visible_expressions") or {}).items()})
+            # The rows a later reload may bring (events after the rules run,
+            # classes after a detection pass) take these instead of "shown".
+            self._saved_rows = {
+                kind: {str(k): bool(v) for k, v in (data.get(f"visible_{kind}") or {}).items()}
+                for kind in ("actions", "objects", "events")}
+            self.chosen_layers.update(
+                {str(k): bool(v) for k, v in (data.get("visible_layers") or {}).items()})
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -2777,14 +2837,47 @@ class SignalTimelineScene(QGraphicsScene):
     def _nav_timestamps_expressions(self):
         """Bar starts, neutral left out: ◀ ▶ step through the moments a face
         shows something, and neutral is most of any scan."""
-        runs = self._expression_runs()
+        runs = self._shown_expression_runs()
         named = [label for label in runs if label != 'neutral'] or list(runs)
         return sorted(start for label in named for start, _e, _m in runs[label])
+
+    def _shown_expression_runs(self):
+        """``_expression_runs`` without the classes hidden in the Layers panel."""
+        return {label: merged for label, merged in self._expression_runs().items()
+                if self.visible_expressions.get(label, True)}
+
+    def expression_seconds(self) -> dict:
+        """``{label: seconds}`` the scan read each class, in display order."""
+        counts: dict = {}
+        for label in self._expression_runs():
+            counts[label] = 0
+        for value in self.expressions.values():
+            label = str((value or {}).get('label') or '')
+            if label in counts:
+                counts[label] += 1
+        return counts
+
+    def expression_moments(self) -> dict:
+        """``{label: bars}`` - the moments ◀ ▶ step through for each class, so
+        the number beside a class in the Layers panel is the arrows' count."""
+        return {label: len(merged) for label, merged in self._expression_runs().items()}
+
+    def set_expression_filter(self, label, visible):
+        """Show or hide one expression class's row."""
+        self.visible_expressions[label] = bool(visible)
+        self.save_filters()
+        self.build_timeline()
+
+    def set_all_expressions_visible(self, visible):
+        for label in self._expression_runs():
+            self.visible_expressions[label] = bool(visible)
+        self.save_filters()
+        self.build_timeline()
 
     def draw_expressions_layer(self, y_pos):
         """One row per expression class the scan found."""
         self.row_labels.append(("EXPRESSIONS", y_pos))
-        runs = self._expression_runs()
+        runs = self._shown_expression_runs()
         if not runs:
             return y_pos + self.layer_height + self.layer_spacing
 
