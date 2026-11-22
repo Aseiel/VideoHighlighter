@@ -105,7 +105,8 @@ def trim(clips, new_indices):
     footage once rather than both losing it. Returns a new list; a trimmed
     clip's pieces take its place in the edit order."""
     out = [tuple(c) for c in clips]
-    marked = [i in set(new_indices) for i in range(len(out))]
+    new_indices = set(new_indices)
+    marked = [i in new_indices for i in range(len(out))]
     i = 0
     while i < len(out):
         if not marked[i]:
