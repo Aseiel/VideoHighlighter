@@ -1,0 +1,78 @@
+name: CLA
+
+# Shows a failed "CLA signed" check on a pull request whose author has not
+# signed the Contributor License Agreement yet (CLA.md, signed once through
+# cla-assistant.io).
+#
+# CLA Assistant itself reports `license/cla` as "pending" until the author
+# signs - a yellow dot that is easy to miss and never fails. This turns its
+# answer into a check that is red when unsigned and green when signed, with
+# Details linking to the signing page. When the author signs, CLA Assistant
+# updates its status, that `status` event runs this again, and the check turns
+# green with no one pressing anything.
+#
+# Safe on pull requests from forks: it never checks out or runs the pull
+# request's code - it only reads and writes commit statuses.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  status:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to check"
+        required: true
+
+permissions:
+  statuses: write
+  pull-requests: read
+
+jobs:
+  cla:
+    # On `status` events, only CLA Assistant's own status matters - and never
+    # ours, or every status this posts would start another run.
+    if: github.event_name != 'status' || github.event.context == 'license/cla'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            let sha;
+            if (context.eventName === 'pull_request_target') {
+              sha = context.payload.pull_request.head.sha;
+            } else if (context.eventName === 'status') {
+              sha = context.payload.sha;
+            } else {
+              const { data } = await github.rest.pulls.get({
+                owner, repo, pull_number: Number(context.payload.inputs.pr) });
+              sha = data.head.sha;
+            }
+
+            // On a fresh pull request CLA Assistant may not have reported
+            // yet; give it a minute before calling the agreement unsigned.
+            let cla;
+            for (let attempt = 0; attempt < 6; attempt++) {
+              const { data } = await github.rest.repos.getCombinedStatusForRef({
+                owner, repo, ref: sha });
+              cla = data.statuses.find(s => s.context === 'license/cla');
+              if (cla) break;
+              await new Promise(resolve => setTimeout(resolve, 10000));
+            }
+
+            const signed = Boolean(cla) && cla.state === 'success';
+            const description = signed
+              ? 'Contributor License Agreement signed'
+              : cla
+                ? 'Not signed yet - click Details to sign the CLA'
+                : 'No CLA check reported - click Details to sign the CLA';
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha,
+              context: 'CLA signed',
+              state: signed ? 'success' : 'failure',
+              description,
+              target_url: (cla && cla.target_url)
+                || `https://cla-assistant.io/${owner}/${repo}`,
+            });
+            core.info(`${sha}: ${signed ? 'signed' : 'not signed'}`);
