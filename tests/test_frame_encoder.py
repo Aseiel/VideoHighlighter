@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 
 import numpy as np
 import pytest
@@ -311,3 +312,40 @@ def test_openvino_processor_route_computes_in_fp32(monkeypatch, device, expected
     monkeypatch.setattr(fe, "_compile_cache_dir", lambda: None)
     fe._OpenVINORunner("vision.onnx", device)
     assert compiled == [(device, expected)]
+
+
+class _GpuCore:
+    """An OpenVINO Core listing the given GPUs: name -> (architecture, name, type)."""
+
+    def __init__(self, gpus):
+        self._gpus = gpus
+        self.available_devices = ["CPU"] + list(gpus)
+
+    def get_property(self, dev, prop):
+        arch, name, kind = self._gpus[dev]
+        value = {"DEVICE_ARCHITECTURE": arch, "FULL_DEVICE_NAME": name,
+                 "DEVICE_TYPE": kind}[prop]
+        if value is None:
+            raise RuntimeError("unsupported property")
+        return value
+
+
+@pytest.mark.parametrize("gpus, expected", [
+    # The 0.15.3 report: a Radeon OpenVINO listed must not be used (Whisper
+    # compiled on it crashed the app).
+    ({"GPU": ("GPU: vendor=0x1002 arch=gfx803", "AMD Radeon RX 550", "Type.DISCRETE")},
+     (None, False)),
+    ({"GPU": ("GPU: vendor=0x8086 arch=v12.55.8", "Intel(R) Arc(TM) A750 Graphics (dGPU)",
+              "Type.DISCRETE")}, ("GPU", True)),
+    # No vendor in the architecture: the name decides.
+    ({"GPU": (None, "Intel(R) UHD Graphics 770 (iGPU)", "Type.INTEGRATED")}, ("GPU", False)),
+    ({"GPU": (None, "AMD Radeon(TM) Vega 11 Graphics", "Type.INTEGRATED")}, (None, False)),
+    # An Intel iGPU beside a Radeon: the Intel one, even though the Radeon is discrete.
+    ({"GPU.0": ("GPU: vendor=0x8086 arch=v12.2.0", "Intel(R) UHD Graphics", "Type.INTEGRATED"),
+      "GPU.1": ("GPU: vendor=0x1002 arch=x", "AMD Radeon RX 6600", "Type.DISCRETE")},
+     ("GPU.0", False)),
+])
+def test_openvino_gpu_is_intel_only(monkeypatch, gpus, expected):
+    monkeypatch.setitem(sys.modules, "openvino",
+                        types.SimpleNamespace(Core=lambda: _GpuCore(gpus)))
+    assert fe._openvino_gpu() == expected

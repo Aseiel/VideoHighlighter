@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from typing import Callable, Optional, Sequence
 
@@ -233,10 +234,35 @@ def read_meta(folder: str) -> dict:
 # Routes
 # ---------------------------------------------------------------------------
 
+def _is_intel_gpu(core, dev: str) -> bool:
+    """True when OpenVINO's ``dev`` is an Intel card.
+
+    OpenVINO's GPU plugin is written for Intel, but it reaches cards through
+    OpenCL and can list another vendor's: on a Ryzen with a Radeon RX 550
+    (reported 2026-11-23, 0.15.3) it listed one, and compiling Whisper there
+    killed the app with an access violation no ``except`` can catch. So a card
+    is used only when it says it is Intel: ``DEVICE_ARCHITECTURE`` carries the
+    PCI vendor ("GPU: vendor=0x8086 arch=..."), and the name is the check when
+    it does not.
+    """
+    try:
+        arch = str(core.get_property(dev, "DEVICE_ARCHITECTURE"))
+    except Exception:  # noqa: BLE001
+        arch = ""
+    m = re.search(r"vendor\s*=\s*(0x[0-9a-fA-F]+)", arch)
+    if m:
+        return int(m.group(1), 16) == 0x8086
+    try:
+        name = str(core.get_property(dev, "FULL_DEVICE_NAME"))
+    except Exception:  # noqa: BLE001
+        return False
+    return "intel" in name.lower()
+
+
 def _openvino_gpu() -> tuple:
     """(device, is_discrete) of the Intel GPU OpenVINO can drive, discrete
-    first; (None, False) when there is none. OpenVINO's GPU plugin is
-    Intel-only, so any GPU it lists is Intel."""
+    first; (None, False) when there is none. A GPU of another vendor that
+    OpenVINO lists is left out (see ``_is_intel_gpu``)."""
     try:
         import openvino as ov
         core = ov.Core()
@@ -245,6 +271,9 @@ def _openvino_gpu() -> tuple:
         return None, False
     found = []
     for dev in gpus:
+        if not _is_intel_gpu(core, dev):
+            print(f"ℹ️ OpenVINO {dev} is not an Intel GPU; not used")
+            continue
         try:
             kind = str(core.get_property(dev, "DEVICE_TYPE"))
         except Exception:  # noqa: BLE001

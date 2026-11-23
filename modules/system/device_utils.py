@@ -142,15 +142,17 @@ def _openvino_info(log_fn=print):
     + action recognition).
     """
     try:
-        from openvino import Core
-        devices = Core().available_devices
-        if not any(d == "GPU" or d.startswith("GPU.") for d in devices):
+        # Only an Intel card: OpenVINO can list another vendor's GPU, and
+        # models compiled on one crash the app (see frame_encoder._is_intel_gpu).
+        from modules.vision.frame_encoder import _openvino_gpu
+        device, _discrete = _openvino_gpu()
+        if not device:
             return None
-        log_fn(f"✅ Intel GPU available via OpenVINO: {devices}")
+        log_fn(f"✅ Intel GPU available via OpenVINO: {device}")
         return DeviceInfo(
             yolo_pt_device="cpu",
             yolo_ov_device="cpu",
-            openvino_device="GPU",
+            openvino_device=device,
             pytorch_device="cpu",
             motion_device="cpu",
             use_openvino_yolo=True,
