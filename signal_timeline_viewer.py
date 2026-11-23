@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QFrame, QLineEdit, QSlider, QGraphicsRectItem, QGraphicsTextItem,
     QMessageBox, QDockWidget, QMenu, QGraphicsLineItem,
     QComboBox, QListWidget, QListWidgetItem, QDialog,
-    QDialogButtonBox, QFormLayout, QTabWidget
+    QDialogButtonBox, QFormLayout, QTabWidget, QToolButton
 )
 from PySide6.QtCore import Qt, QRect, QRectF, Signal, Slot, QPointF, QTimer, QPoint, QMimeData, QLoggingCategory, QUrl, QEvent
 from PySide6.QtGui import (
@@ -2903,6 +2903,13 @@ class SignalTimelineWindow(QMainWindow):
 
         # Controls is the working tab; the others wait behind it.
         controls_dock.raise_()
+
+        # Keep the dock controls accessible even after every dock is closed.
+        panels_button = QToolButton(self)
+        panels_button.setText("Panels")
+        panels_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        panels_button.setMenu(self.createPopupMenu())
+        self.statusBar().addPermanentWidget(panels_button)
 
         # Qt elides a tabified dock's title to make it fit, and in a narrow
         # right column it cut them past the point of reading: "Contr…", "Sea…",
