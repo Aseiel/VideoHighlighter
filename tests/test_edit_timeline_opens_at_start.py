@@ -93,3 +93,37 @@ def test_neither_timeline_can_be_dragged_out_of_sight(app, clip, private_setting
             assert min(splitter.sizes()) > 0, splitter.sizes()
     finally:
         win.close()
+
+
+def test_closed_docks_can_be_reopened_from_timeline_status_bar(app, clip, private_settings):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QDockWidget, QToolButton
+    from signal_timeline_viewer import SignalTimelineWindow
+
+    win = SignalTimelineWindow(clip, {"final_segments": [[8, 14]]})
+    try:
+        win.show()
+        app.processEvents()
+        docks = win.findChildren(QDockWidget, options=Qt.FindDirectChildrenOnly)
+        controls = next(dock for dock in docks if dock.windowTitle() == "Controls")
+        for dock in docks:
+            dock.close()
+        app.processEvents()
+        assert all(dock.isHidden() for dock in docks)
+
+        panels = next(
+            (button for button in win.statusBar().findChildren(QToolButton)
+             if button.text() == "Panels"),
+            None,
+        )
+        assert panels is not None
+        assert panels.isVisible()
+        action = controls.toggleViewAction()
+        assert action in panels.menu().actions()
+        assert not action.isChecked()
+        action.trigger()
+        app.processEvents()
+        assert controls.isVisible()
+        assert action.isChecked()
+    finally:
+        win.close()
