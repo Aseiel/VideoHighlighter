@@ -46,6 +46,9 @@ class TestResolving:
         out = co.trim([CLIP_2, CLIP_3], [1])
         assert out == [CLIP_2, (963.2, 978.4), (991.6, 994.9)]
 
+    def test_trim_accepts_an_index_iterator(self):
+        assert co.trim([CLIP_3, CLIP_2], iter([1])) == [CLIP_3]
+
     def test_trim_never_leaves_a_sliver(self):
         assert co.trim([(0, 10), (0.2, 10)], [1]) == [(0, 10)]
 
