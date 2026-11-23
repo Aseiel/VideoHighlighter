@@ -152,16 +152,36 @@ class TestItNeverOutranksSomethingFaster:
     def test_an_intel_gpu_still_wins(self, monkeypatch):
         """OpenVINO drives the Arc in the packaged build, and DirectML would be
         a slower route to the same card."""
-        fake_openvino = types.ModuleType("openvino")
-        fake_openvino.Core = lambda: types.SimpleNamespace(
-            available_devices=["CPU", "GPU"])
-        monkeypatch.setitem(sys.modules, "openvino", fake_openvino)
+        _openvino_lists(monkeypatch, "GPU: vendor=0x8086 arch=v12.55.8",
+                        "Intel(R) Arc(TM) A750 Graphics (dGPU)")
         monkeypatch.setattr(device_utils, "_ort_dml", _FakeOrtDml())
 
         info = device_utils.detect_best_device(log_fn=lambda *_: None)
 
         assert info.backend_name == "Intel GPU (OpenVINO)"
         assert info.onnx_dml_yolo is False
+
+    def test_a_radeon_openvino_lists_is_not_taken_for_intel(self, monkeypatch):
+        """OpenVINO can list an AMD card; models compiled on it crashed the
+        app (0.15.3, RX 550), so it goes to DirectML like any other card."""
+        _openvino_lists(monkeypatch, "GPU: vendor=0x1002 arch=gfx803", "AMD Radeon RX 550")
+        monkeypatch.setattr(device_utils, "_ort_dml", _FakeOrtDml())
+
+        info = device_utils.detect_best_device(log_fn=lambda *_: None)
+
+        assert info.backend_name != "Intel GPU (OpenVINO)"
+        assert info.openvino_device != "GPU"
+
+
+def _openvino_lists(monkeypatch, architecture, name):
+    """A stand-in OpenVINO whose one GPU reports this architecture and name."""
+    props = {"DEVICE_ARCHITECTURE": architecture, "FULL_DEVICE_NAME": name,
+             "DEVICE_TYPE": "Type.DISCRETE"}
+    fake_openvino = types.ModuleType("openvino")
+    fake_openvino.Core = lambda: types.SimpleNamespace(
+        available_devices=["CPU", "GPU"],
+        get_property=lambda dev, prop: props[prop])
+    monkeypatch.setitem(sys.modules, "openvino", fake_openvino)
 
 
 class TestChoosingIt:
