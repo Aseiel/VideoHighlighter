@@ -114,7 +114,8 @@ class TestViewerFollowsAClick:
 
     def _window(self, video, owner=None, report=None):
         import types
-        w = types.SimpleNamespace(video_path=video, _owner=owner, jumps=[], shown=[])
+        w = types.SimpleNamespace(video_path=video, _owner=owner, jumps=[], shown=[],
+                                  isVisible=lambda: True)
         w._jump_to_time = w.jumps.append
         w.show_report = lambda p: w.shown.append(p) or True
         w.report_panel = types.SimpleNamespace(path=report)
@@ -142,6 +143,34 @@ class TestViewerFollowsAClick:
         assert owner.opened == [str(other)]
         assert new.shown == ["compare.html"] and new.jumps == [12.0]
         assert w.jumps == []
+
+    def test_this_videos_time_from_a_hidden_tab_brings_the_tab_back(self, viewer_cls, tmp_path):
+        import types
+        me = tmp_path / "a.mp4"
+        me.write_bytes(b"")
+        owner = types.SimpleNamespace(timeline_window=None, opened=[])
+        w = self._window(str(me), owner=owner, report="r.html")
+        w.isVisible = lambda: False
+
+        def open_timeline_viewer(video_path=None):
+            owner.opened.append(video_path)
+            owner.timeline_window = w
+        owner.open_timeline_viewer = open_timeline_viewer
+        viewer_cls._seek_from_report(w, 30.0, "")
+        assert owner.opened == [str(me)] and w.jumps == [30.0] and w.shown == []
+
+    def test_a_popped_report_is_left_alone_when_the_video_changes(self, viewer_cls, tmp_path):
+        import types
+        other = tmp_path / "b.mp4"
+        other.write_bytes(b"")
+        new = self._window(str(other))
+        owner = types.SimpleNamespace(timeline_window=None)
+        owner.open_timeline_viewer = lambda video_path=None: setattr(owner, "timeline_window", new)
+        w = self._window("a.mp4", owner=owner, report="compare.html")
+        kept = []
+        w._report_host = types.SimpleNamespace(popped=True, keep_on_top=lambda: kept.append(1))
+        viewer_cls._seek_from_report(w, 12.0, str(other))
+        assert new.jumps == [12.0] and new.shown == [] and kept == [1]
 
     def test_a_missing_video_does_nothing(self, viewer_cls, tmp_path):
         import types
@@ -180,6 +209,10 @@ class TestPopOut:
         for v in made:
             v.close()
             v.deleteLater()
+        if rp._SHARED["window"] is not None:
+            rp._SHARED["window"].close_quietly()
+            rp._SHARED["window"].deleteLater()
+        rp._SHARED.update(window=None, host=None)
         app.processEvents()
 
     def test_pop_out_moves_the_panel_into_a_real_window_and_back(self, qt):
@@ -189,13 +222,13 @@ class TestPopOut:
         assert panel.window() is viewer
         panel.pop_btn.setChecked(True)
         app.processEvents()
-        assert panel.window() is host.window and host.window.isVisible()
+        assert panel.window() is rp._SHARED["window"] and host.window.isVisible()
         assert host.window.windowFlags() & Qt.WindowType.Window
         assert not (host.window.windowFlags() & Qt.WindowType.Tool & ~Qt.WindowType.Window)
         assert host.window.windowTitle() == "Report — film.mp4" and dock.isHidden()
         panel.pop_btn.setChecked(False)
         app.processEvents()
-        assert panel.window() is viewer and not host.window.isVisible()
+        assert panel.window() is viewer and not rp._SHARED["window"].isVisible()
 
     def test_closing_the_window_docks_the_report_back(self, qt):
         app, build = qt
@@ -206,23 +239,57 @@ class TestPopOut:
         app.processEvents()
         assert not panel.pop_btn.isChecked() and panel.window() is viewer
 
-    def test_the_next_viewer_opens_it_where_it_was_left(self, qt):
+    def test_a_new_viewer_does_not_take_the_window_in_use(self, qt):
+        # Opening another video from a report must not swap the report out.
         app, build = qt
         _v, _d, first, _h = build()
         first.pop_btn.setChecked(True)
         app.processEvents()
         _v2, _d2, second, host2 = build()
         app.processEvents()
-        assert second.pop_btn.isChecked() and second.window() is host2.window
+        assert first.pop_btn.isChecked() and not second.pop_btn.isChecked()
+        assert first.window() is rp._SHARED["window"] and second.window() is _v2
 
-    def test_the_window_hides_and_returns_with_the_viewer(self, qt):
+    def test_a_new_viewer_pops_out_by_itself_when_the_window_is_free(self, qt):
+        app, build = qt
+        _v, _d, first, _h = build()
+        first.pop_btn.setChecked(True)
+        app.processEvents()
+        first.pop_btn.setChecked(False)          # docked by hand: the choice is now "tab"
+        rp.QSettings().setValue(rp.POPPED_KEY, True)
+        app.processEvents()
+        _v2, _d2, second, _h2 = build()
+        app.processEvents()
+        assert second.pop_btn.isChecked() and second.window() is rp._SHARED["window"]
+
+    def test_popping_another_report_sends_the_first_home(self, qt):
+        app, build = qt
+        v1, d1, first, h1 = build()
+        v2, d2, second, h2 = build()
+        first.pop_btn.setChecked(True)
+        second.pop_btn.setChecked(True)
+        app.processEvents()
+        assert second.window() is rp._SHARED["window"] and first.window() is v1
+        assert not first.pop_btn.isChecked() and not d1.isHidden()
+
+    def test_a_tab_switch_leaves_the_report_window_alone(self, qt):
+        # A click on another video's time hides this viewer (its tab goes to
+        # the back); the one report window must stay exactly where it is.
         app, build = qt
         viewer, _d, panel, host = build()
         panel.pop_btn.setChecked(True)
         app.processEvents()
+        win = rp._SHARED["window"]
         viewer.hide()
         app.processEvents()
-        assert not host.window.isVisible()
-        viewer.show()
+        assert win.isVisible() and panel.window() is win and panel.pop_btn.isChecked()
+
+    def test_closing_the_viewer_takes_its_report_home_but_keeps_the_choice(self, qt):
+        app, build = qt
+        viewer, _d, panel, host = build()
+        panel.pop_btn.setChecked(True)
         app.processEvents()
-        assert host.window.isVisible()
+        viewer.close()
+        app.processEvents()
+        assert not rp._SHARED["window"].isVisible() and rp._SHARED["host"] is None
+        assert rp._setting_bool(rp.POPPED_KEY)

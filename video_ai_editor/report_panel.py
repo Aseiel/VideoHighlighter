@@ -365,17 +365,25 @@ class ReportWindow(QWidget):
 
 
 class ReportHost(QObject):
-    """Where the panel lives: the viewer's Report tab, or a window of its own.
+    """Where a viewer's panel lives: its Report tab, or the app's report window.
 
-    The panel moves between the two without being rebuilt, so the page, its
-    scroll position and the glowing time come along. The choice is remembered
-    (QSettings), as is where the window was put. The window follows the
-    viewer: hidden with it, shown again with it, gone when it is."""
+    There is **one** report window for the whole app (:func:`shared_window`),
+    not one per viewer. A click on a time in another video switches the
+    viewer's tab; the report must stay exactly as it was -- same page, same
+    scroll, the glowing time -- and stay on top for the next click. With a
+    window per viewer, the switch hid one window and showed another: a fresh
+    copy of the page, from the top, which read as the report closing.
+
+    The window shows one panel at a time: popping another viewer's report out
+    puts the previous one back in its own tab. A new viewer pops out by itself
+    (the remembered choice) only when the window is free, so opening a video
+    from a report never takes the report's place. Moving between the tab and
+    the window keeps the panel itself, so nothing reloads.
+    """
 
     def __init__(self, viewer, dock, panel: ReportPanel, title: str = "Report"):
         super().__init__(viewer)
         self.viewer, self.dock, self.panel = viewer, dock, panel
-        self.window: Optional[ReportWindow] = None
         self.title = title
         # The dock holds a holder rather than the panel itself, so the panel
         # can leave and come back without the dock losing its widget.
@@ -386,62 +394,119 @@ class ReportHost(QObject):
         dock.setWidget(self.holder)
         panel.pop_btn.toggled.connect(self.set_popped)
         viewer.installEventFilter(self)
+        viewer.destroyed.connect(self._viewer_gone)
         if _setting_bool(POPPED_KEY):
-            QTimer.singleShot(0, lambda: panel.pop_btn.setChecked(True))
+            QTimer.singleShot(0, self._pop_if_free)
 
     @property
     def popped(self) -> bool:
         return self.panel.pop_btn.isChecked()
 
+    @property
+    def window(self) -> Optional["ReportWindow"]:
+        win = _SHARED.get("window")
+        return win if win is not None and _SHARED.get("host") is self else None
+
+    def _pop_if_free(self) -> None:
+        if _SHARED.get("host") is None:
+            self.panel.pop_btn.setChecked(True)
+
     def set_popped(self, on: bool) -> None:
-        QSettings().setValue(POPPED_KEY, bool(on))
         if on:
-            if self.window is None:
-                self.window = ReportWindow(self.title)
-                self.window.closed.connect(lambda: self.panel.pop_btn.setChecked(False))
-                self.viewer.destroyed.connect(self.window.deleteLater)
-                geometry = QSettings().value(GEOMETRY_KEY)
-                if geometry is None or not self.window.restoreGeometry(geometry):
-                    self.window.resize(760, 900)
-            self.window.layout().addWidget(self.panel)
+            QSettings().setValue(POPPED_KEY, True)
+            win = shared_window()
+            other = _SHARED.get("host")
+            if other is not None and other is not self:
+                other.take_back()                 # one report in the window at a time
+            _SHARED["host"] = self
+            win.setWindowTitle(self.title)
+            win.layout().addWidget(self.panel)
             self.panel.pop_btn.setText("Dock")
             self.dock.hide()
-            self.window.show()
-            self.window.raise_()
+            win.show()
+            win.raise_()
         else:
-            self.holder.layout().addWidget(self.panel)
-            self.panel.pop_btn.setText("Pop out")
-            if self.window is not None and self.window.isVisible():
-                self.window.close_quietly()
-            self.dock.show()
-            self.dock.raise_()
+            if _SHARED.get("host") is self:
+                QSettings().setValue(POPPED_KEY, False)
+                _SHARED["host"] = None
+                win = _SHARED.get("window")
+                if win is not None and win.isVisible():
+                    win.close_quietly()
+            self._to_dock()
         self.panel.show()
+
+    def take_back(self) -> None:
+        """Back into this viewer's tab without touching the window or the
+        remembered choice (another viewer's report is taking the window)."""
+        if _SHARED.get("host") is self:
+            _SHARED["host"] = None
+        self.panel.pop_btn.blockSignals(True)
+        self.panel.pop_btn.setChecked(False)
+        self.panel.pop_btn.blockSignals(False)
+        self._to_dock()
+        self.panel.show()
+
+    def _to_dock(self) -> None:
+        self.holder.layout().addWidget(self.panel)
+        self.panel.pop_btn.setText("Pop out")
+        self.dock.show()
 
     def reveal(self) -> None:
         """Bring the report forward wherever it lives."""
-        if self.popped and self.window is not None:
-            self.window.show()
-            self.window.raise_()
-            self.window.activateWindow()
+        win = self.window
+        if self.popped and win is not None:
+            win.show()
+            win.raise_()
+            win.activateWindow()
         else:
             self.dock.show()
             self.dock.raise_()
 
+    def keep_on_top(self) -> None:
+        """After the viewer window has come forward (a click switched videos),
+        put the report back above it, so the next click is where it was."""
+        win = self.window
+        if win is not None and win.isVisible():
+            QTimer.singleShot(60, lambda: (win.raise_(), win.activateWindow()))
+
     def eventFilter(self, obj, event):         # noqa: N802 - Qt override
-        if obj is self.viewer and self.window is not None and self.popped:
-            kind = event.type()
-            if kind in (QEvent.Type.Hide, QEvent.Type.Close):
-                if self.window.isVisible():
-                    QSettings().setValue(GEOMETRY_KEY, self.window.saveGeometry())
-                    self.window.hide()
-            elif kind == QEvent.Type.Show:
-                # Where the report window was last left -- by this viewer or by
-                # the tab before it, so switching videos keeps it in one place.
-                geometry = QSettings().value(GEOMETRY_KEY)
-                if geometry is not None:
-                    self.window.restoreGeometry(geometry)
-                self.window.show()
+        # A tab switch hides the viewer; the report window stays. Only closing
+        # the viewer (its tab, or the whole window) takes its report home.
+        # The remembered choice stays: closing a film is not "dock the report".
+        if obj is self.viewer and event.type() == QEvent.Type.Close and self.window is not None:
+            win = self.window
+            self.take_back()
+            win.close_quietly()
         return False
+
+    def _viewer_gone(self, *_):
+        if _SHARED.get("host") is self:
+            _SHARED["host"] = None
+            win = _SHARED.get("window")
+            if win is not None:
+                win.close_quietly()
+
+
+# The one report window, and which viewer's panel is in it.
+_SHARED: dict = {"window": None, "host": None}
+
+
+def shared_window() -> "ReportWindow":
+    win = _SHARED.get("window")
+    if win is None:
+        win = ReportWindow("Report")
+        geometry = QSettings().value(GEOMETRY_KEY)
+        if geometry is None or not win.restoreGeometry(geometry):
+            win.resize(760, 900)
+        win.closed.connect(_window_closed_by_user)
+        _SHARED["window"] = win
+    return win
+
+
+def _window_closed_by_user() -> None:
+    host = _SHARED.get("host")
+    if host is not None:
+        host.panel.pop_btn.setChecked(False)      # docks it back and forgets the choice
 
 
 def _setting_bool(key: str) -> bool:
