@@ -674,6 +674,31 @@ def seek_timeline(video_path: str, seconds: float) -> dict:
     return {"live": True, **result}
 
 
+def show_report(video_path: str, report_path: str, popped: Optional[bool] = None) -> dict:
+    """Show an HTML report in the running app's timeline viewer on
+    ``video_path``, where its marked times move the playhead (see
+    docs/REPORT-PANEL.md). ``popped``: True for a window of its own, False for
+    the viewer's Report tab, None to keep where the user put it."""
+    path = _existing_file(video_path)
+    report = _existing_file(report_path)
+    if not report.lower().endswith((".html", ".htm")):
+        raise ValueError("report_path must be an .html page")
+    try:
+        live_link = _edition_module("modules.system.live_link")
+    except ImportError:
+        return {"live": False, "why": "this edition has no live link"}
+    args = {"video_path": path, "report_path": report}
+    if popped is not None:
+        args["popped"] = bool(popped)
+    try:
+        result = _send_when_ready(live_link, "show_report", args)
+    except live_link.LiveLinkError as e:
+        return {"live": False, "why": str(e)}
+    if result is None:
+        return {"live": False, "why": "the app is not running"}
+    return {"live": True, **result}
+
+
 OVERLAY_MODES = ("off", "cache", "realtime", "precomp")
 OVERLAY_SHAPES = ("boxes", "outlines")
 

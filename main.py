@@ -6917,26 +6917,23 @@ class VideoHighlighterGUI(QWidget):
         leaks ~2.5GB. See open_timeline_viewer() for the same guard.
         """
         try:
-            existing = getattr(self, 'timeline_window', None)
+            existing = self._viewer_for(video_path)
+            tabs = self._viewer_tabs_window()
             if existing is not None:
-                try:
-                    if getattr(existing, 'video_path', None) == video_path:
-                        existing.show()
-                        existing.raise_()
-                        existing.activateWindow()
-                        self.append_log("📊 Reusing open timeline viewer.")
-                        return
-                except RuntimeError:
-                    # Underlying C++ object was deleted — fall through.
-                    self.timeline_window = None
+                if tabs.tabs.indexOf(existing) < 0:
+                    existing.refresh_from_disk()   # its tab was closed: catch up
+                tabs.show_viewer(existing)
+                self._on_viewer_tab(existing)
+                self.append_log("📊 Reusing open timeline viewer.")
+                return
 
             from signal_timeline_viewer import SignalTimelineWindow
             self.append_log(f"📊 Opening timeline viewer for: {os.path.basename(video_path)}")
-            self.timeline_window = SignalTimelineWindow(video_path, analysis_data)
-            self.timeline_window.show()
-            self.llm_chat.set_timeline_window(self.timeline_window)
-            self.llm_chat.set_video_path(video_path)
-            self.llm_chat.load_cache_for_video(video_path)
+            window = SignalTimelineWindow(video_path, analysis_data)
+            self.timeline_window = window
+            self._viewers[self._viewer_key(video_path)] = window
+            tabs.show_viewer(window)
+            self._on_viewer_tab(window)
         except Exception as e:
             self.append_log(f"❌ Failed to open timeline viewer: {e}")
     def _why_report_candidates(self) -> list:
@@ -7599,6 +7596,54 @@ class VideoHighlighterGUI(QWidget):
         finally:
             self._timeline_opening = False
 
+    # ── the viewers, one tab each (video_ai_editor/viewer_tabs.py) ──────────
+
+    @staticmethod
+    def _viewer_key(video_path):
+        return os.path.normcase(os.path.abspath(str(video_path or "")))
+
+    def _viewer_for(self, video_path):
+        """The viewer already built for ``video_path`` (a tab, or closed and
+        kept for reuse), or None."""
+        if not hasattr(self, "_viewers"):
+            self._viewers = {}
+        key = self._viewer_key(video_path)
+        viewer = self._viewers.get(key)
+        if viewer is None:
+            return None
+        try:
+            viewer.objectName()               # raises once the C++ side is gone
+        except RuntimeError:
+            self._viewers.pop(key, None)
+            return None
+        return viewer
+
+    def _viewer_tabs_window(self):
+        tabs = getattr(self, "_viewer_tabs", None)
+        if tabs is None:
+            from video_ai_editor.viewer_tabs import ViewerTabs
+            tabs = ViewerTabs()
+            tabs.current_changed.connect(self._on_viewer_tab)
+            self._viewer_tabs = tabs
+        if not hasattr(self, "_viewers"):
+            self._viewers = {}
+        return tabs
+
+    def _on_viewer_tab(self, viewer):
+        """The viewer in front is "the open viewer" for everything that asks
+        (the live link, the assistant, the per-signal runs)."""
+        if viewer is None or viewer is getattr(self, "_chat_viewer", None):
+            self.timeline_window = viewer or self.timeline_window
+            return
+        self.timeline_window = viewer
+        self._chat_viewer = viewer
+        try:
+            self.llm_chat.set_timeline_window(viewer)
+            self.llm_chat.set_video_path(viewer.video_path)
+            self.llm_chat.load_cache_for_video(viewer.video_path)
+        except Exception as e:  # noqa: BLE001 - the assistant is optional
+            print(f"⚠️ Assistant did not follow the viewer tab: {e}")
+
     def _open_timeline_viewer(self, video_path=None):
         """Open timeline viewer for the selected video, or for ``video_path``
         (a restart reopens the video it had open; the button's
@@ -7628,45 +7673,50 @@ class VideoHighlighterGUI(QWidget):
             # LLM chat), and its 4K players can't be torn down without blocking,
             # so creating a fresh one each open leaks ~2.5GB per cycle. Re-show
             # the existing one when the video matches.
-            existing = getattr(self, 'timeline_window', None)
-            if existing is not None:
+            existing = self._viewer_for(video_path)
+            tabs = self._viewer_tabs_window()
+            if existing is not None and tabs.tabs.indexOf(existing) >= 0:
+                # Still a tab: live reload has kept it current, so just bring
+                # it forward -- a report click between two videos lands here.
+                tabs.show_viewer(existing)
+                self._on_viewer_tab(existing)
+                return
+            if existing is not None:    # built before, its tab closed since
                 try:
-                    same_video = (getattr(existing, 'video_path', None) == video_path)
-                    if same_video:
-                        # Pick up any signals added on demand since it was opened
-                        # (per-signal Run buttons fold into the cache on disk).
-                        #
-                        # Reusing the window is not the instant path it looks
-                        # like: the refresh re-ingests every signal and redraws
-                        # the timeline, which on a long video takes as long as
-                        # building the window did — and it blocks the GUI
-                        # thread, with the old view still on screen. Without the
-                        # splash, reopening looked like the app had frozen.
-                        startup_splash.begin("Reopening timeline viewer",
-                                             os.path.basename(video_path),
-                                             steps=4, parent=self)
-                        try:
-                            existing.refresh_from_disk()
-                        except Exception as e:
-                            self.append_log(f"⚠️ Could not refresh timeline cache: {e}")
-                        finally:
-                            startup_splash.finish(existing)
-                        # Un-mute (close() muted the audio outputs) and re-show
-                        for ao_attr, obj in (('audio_output', existing),
-                                             ('_audio', getattr(existing, 'realtime_preview', None))):
-                            ao = getattr(obj, ao_attr, None) if obj is not None else None
-                            if ao is not None:
-                                try:
-                                    ao.setMuted(False)
-                                except Exception:
-                                    pass
-                        existing.show()
-                        existing.raise_()
-                        existing.activateWindow()
-                        self.append_log("📊 Reusing open timeline viewer.")
-                        return
+                    # Pick up any signals added on demand since it was opened
+                    # (per-signal Run buttons fold into the cache on disk).
+                    #
+                    # Reusing the window is not the instant path it looks
+                    # like: the refresh re-ingests every signal and redraws
+                    # the timeline, which on a long video takes as long as
+                    # building the window did — and it blocks the GUI
+                    # thread, with the old view still on screen. Without the
+                    # splash, reopening looked like the app had frozen.
+                    startup_splash.begin("Reopening timeline viewer",
+                                         os.path.basename(video_path),
+                                         steps=4, parent=self)
+                    try:
+                        existing.refresh_from_disk()
+                    except Exception as e:
+                        self.append_log(f"⚠️ Could not refresh timeline cache: {e}")
+                    finally:
+                        startup_splash.finish(existing)
+                    # Un-mute (close() muted the audio outputs) and re-show
+                    for ao_attr, obj in (('audio_output', existing),
+                                         ('_audio', getattr(existing, 'realtime_preview', None))):
+                        ao = getattr(obj, ao_attr, None) if obj is not None else None
+                        if ao is not None:
+                            try:
+                                ao.setMuted(False)
+                            except Exception:
+                                pass
+                    tabs.show_viewer(existing)
+                    self._on_viewer_tab(existing)
+                    self.append_log("📊 Reusing open timeline viewer.")
+                    return
                 except RuntimeError:
                     # Underlying C++ object was deleted — fall through to recreate
+                    self._viewers.pop(self._viewer_key(video_path), None)
                     self.timeline_window = None
 
             # Check if cache exists - use the same parameters as in pipeline
@@ -7762,17 +7812,17 @@ class VideoHighlighterGUI(QWidget):
                 window.preview_frame.connect(self.on_preview_frame)
                 window.preview_enabled = self._preview_enabled
                 self.timeline_window = window
-                window.show()
+                self._viewers[self._viewer_key(video_path)] = window
+                self._viewer_tabs_window().show_viewer(window)
             finally:
                 # finally: a viewer that fails half-way must not leave an
                 # always-on-top splash stranded over the app with no window
                 # behind it to explain itself. `window` stays None in that
                 # case, so a *previous* viewer is never raised by mistake.
                 startup_splash.finish(window)
-            # Connect LLM chat to timeline and video
-            self.llm_chat.set_timeline_window(self.timeline_window)
-            self.llm_chat.set_video_path(video_path)
-            self.llm_chat.load_cache_for_video(video_path)
+            # Connect LLM chat to timeline and video (a no-op when the tab
+            # change has done it already)
+            self._on_viewer_tab(self.timeline_window)
 
         except ImportError as e:
             self.append_log(f"❌ Failed to import timeline viewer: {e}")

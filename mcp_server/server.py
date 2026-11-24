@@ -228,6 +228,19 @@ def build_server(jobs=None):
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=True, openWorldHint=False))
+    def show_report(video_path: str, report_path: str, popped: Optional[bool] = None) -> dict:
+        """Show an HTML report page beside the open app's timeline viewer on
+        video_path (opened first if another video is in front). Times the page
+        marks (data-vh-t) become links that move the playhead, switching to
+        another open video when the time is in it. popped: true for a window of
+        its own, false for the viewer's Report tab, omit to keep the user's
+        choice. Use it to put an analysis the user should check next to the
+        footage. Needs the app running; returns live: false with the reason
+        when it is not."""
+        return tools.show_report(video_path, report_path, popped=popped)
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                          idempotentHint=True, openWorldHint=False))
     def set_overlay(video_path: str, mode: str = "cache", shape: Optional[str] = None,
                     seconds: Optional[float] = None) -> dict:
         """Switch the open app's timeline viewer overlay, opening the viewer on

@@ -435,6 +435,11 @@ class ReportHost(QObject):
                     QSettings().setValue(GEOMETRY_KEY, self.window.saveGeometry())
                     self.window.hide()
             elif kind == QEvent.Type.Show:
+                # Where the report window was last left -- by this viewer or by
+                # the tab before it, so switching videos keeps it in one place.
+                geometry = QSettings().value(GEOMETRY_KEY)
+                if geometry is not None:
+                    self.window.restoreGeometry(geometry)
                 self.window.show()
         return False
 

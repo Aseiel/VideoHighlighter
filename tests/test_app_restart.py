@@ -59,7 +59,10 @@ def test_spawn_passes_what_to_reopen_and_detaches(monkeypatch, tmp_path):
     assert seen["cmd"] == ["app"] and seen["cwd"] == os.getcwd()
     assert seen["env"][ar.ENV_VIDEO] == "v.mp4" and seen["env"][ar.ENV_SECONDS] == "1428.500"
     if sys.platform == "win32":
-        assert seen["creationflags"] & subprocess.DETACHED_PROCESS
+        # A hidden console of its own, never none: without one, every console
+        # program the app starts opens a window of its own.
+        assert seen["creationflags"] & subprocess.CREATE_NO_WINDOW
+        assert not seen["creationflags"] & subprocess.DETACHED_PROCESS
     else:
         assert seen["start_new_session"]
 

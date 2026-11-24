@@ -210,6 +210,7 @@ class TestSpace:
         win.toggle_edit_playback = lambda: win.played.append("edit")
         win.toggle_video_playback = lambda: win.played.append("video")
         win.isActiveWindow = lambda: True
+        win.isVisible = lambda: True     # the viewer on screen (the filter is app-wide)
         return win
 
     def test_after_clicking_an_edit_clip_space_plays_the_edit(self, app):
@@ -232,6 +233,14 @@ class TestSpace:
         win = self.window()
         self.press_space(win)
         assert win.played == ["video"]
+
+    def test_a_viewer_not_on_screen_leaves_space_alone(self, app):
+        # Several viewers can be alive at once (tabs, or closed and kept for
+        # reuse); the filter is app-wide, so a hidden one must not play too.
+        win = self.window()
+        win.isVisible = lambda: False
+        assert self.press_space(win) is False
+        assert win.played == []
 
     def test_play_edit_resumes_in_the_clicked_overlapping_clip(self, app):
         win = self.window()

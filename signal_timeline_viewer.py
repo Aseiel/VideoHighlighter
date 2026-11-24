@@ -3112,6 +3112,11 @@ class SignalTimelineWindow(QMainWindow):
     def eventFilter(self, obj, event):
         """Global event filter for delete, spacebar, and cut-mode exit"""
         if event.type() == event.Type.KeyPress:
+            # The filter is app-wide, and several viewers can be alive (tabs of
+            # one window, or closed and kept for reuse): only the one on screen
+            # answers, or Space would play every video at once.
+            if not self.isVisible():
+                return False
 
             if event.key() == Qt.Key_Escape:
                 if hasattr(self, 'cut_mode_btn') and self.cut_mode_btn.isChecked():

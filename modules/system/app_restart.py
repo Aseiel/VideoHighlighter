@@ -97,7 +97,13 @@ def spawn(video: Optional[str] = None, seconds: Optional[float] = None, *,
     kwargs = {"cwd": os.getcwd(), "env": env, "close_fds": True,
               "stdin": subprocess.DEVNULL}
     if sys.platform == "win32":
-        kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0)
+        # A console of its own, hidden -- not none. Run from source the app is
+        # a console program, and with no console at all (DETACHED_PROCESS)
+        # every ffmpeg/ffprobe it starts without CREATE_NO_WINDOW got a fresh
+        # visible console window, titled with the interpreter's path, each time.
+        # A hidden console is what they share instead, as they share the
+        # terminal's when the app is started from one.
+        kwargs["creationflags"] = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
                                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     else:
         kwargs["start_new_session"] = True
