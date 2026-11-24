@@ -185,6 +185,19 @@ def main(argv) -> int:
         check("pipeline imports", False, f"{type(e).__name__}: {e}")
         return finish()
 
+    # The timeline viewer's Report tab is a web view. Its Python module can
+    # import while the browser process it starts was left out of the bundle,
+    # and then the tab is blank with nothing in the log -- so check both.
+    try:
+        from PySide6.QtWebEngineWidgets import QWebEngineView  # noqa: F401
+        base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.dirname(__file__))
+        found = any(f.lower().startswith("qtwebengineprocess")
+                    for _root, _dirs, files in os.walk(base) for f in files)
+        check("report web view bundled", found,
+              "" if found else "QtWebEngineProcess is missing")
+    except BaseException as e:
+        check("report web view bundled", False, f"{type(e).__name__}: {e}")
+
     import multiprocessing
     context = multiprocessing.get_context("spawn")
     try:

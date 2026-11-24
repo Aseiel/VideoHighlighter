@@ -202,6 +202,8 @@ jobs:
             --hidden-import PySide6.QtQuick `
             --hidden-import PySide6.QtQuickWidgets `
             --hidden-import PySide6.QtMultimedia `
+            --hidden-import PySide6.QtWebEngineCore `
+            --hidden-import PySide6.QtWebEngineWidgets `
             --hidden-import modules.system.smoke_test `
             --hidden-import psutil `
             --collect-submodules whisper `
@@ -819,6 +821,8 @@ jobs:
             --hidden-import PySide6.QtQuick \
             --hidden-import PySide6.QtQuickWidgets \
             --hidden-import PySide6.QtMultimedia \
+            --hidden-import PySide6.QtWebEngineCore \
+            --hidden-import PySide6.QtWebEngineWidgets \
             --collect-submodules whisper \
             --collect-submodules yolox \
             --collect-submodules model_hub \

@@ -475,6 +475,19 @@ def tool_identity() -> dict:
     return record
 
 
+def source_time(text: str, seconds: float) -> str:
+    """``text`` (already a time) marked as a moment of the source video.
+
+    Plain text in a browser; in the timeline viewer's report panel
+    (``video_ai_editor/report_panel.py``) a click moves the playhead to
+    ``seconds``. Only source positions are marked -- this report also prints
+    times inside the rendered output, and those must not move the playhead.
+    Its own player buttons (``.seek``/``.qseek``, ``data-t``) are source
+    seconds as well, and the panel takes those over too.
+    """
+    return f'<span data-vh-t="{float(seconds):.2f}">{html.escape(str(text))}</span>'
+
+
 def format_timestamp(seconds: float) -> str:
     """Seconds -> ``M:SS`` or ``H:MM:SS`` once past an hour."""
     total = int(seconds)
@@ -1835,7 +1848,7 @@ def _expression_arc(report: Mapping) -> str:
     rows = [e for e in (arc.get("episodes") or [])][:8]
     if rows:
         cells = "".join(
-            f'<tr><td>{html.escape(format_timestamp(e["start"]))} – '
+            f'<tr><td>{source_time(format_timestamp(e["start"]), e["start"])} – '
             f'{html.escape(format_timestamp(e["end"]))}</td>'
             f'<td>{e["seconds"]:.0f}s</td>'
             f'<td>{html.escape(str(e["dominant"]))}</td>'
@@ -2007,7 +2020,7 @@ def _chapters(report: Mapping) -> str:
         # Greyed when nothing was taken from it, so "which stretches did the cut
         # ignore" is answerable at a glance rather than by reading eleven blocks.
         unused = " unused" if not clips else ""
-        span = (f'{html.escape(str(ch["timestamp"]))} – '
+        span = (f'{source_time(ch["timestamp"], ch["start"])} – '
                 f'{html.escape(format_timestamp(float(ch["end"])))}')
         # The words this stretch used and its neighbours did not, beside the
         # positional title rather than replacing it. Replacing it would make a
@@ -2538,7 +2551,8 @@ def _quote_lines(quotes: Sequence[Mapping], seekable: bool = False) -> str:
         stamp = html.escape(str(q.get("timestamp") or ""))
         at = float(q.get("start") or 0.0)
         mark = (f'<button class="qseek" data-t="{at:.0f}">{stamp}</button>'
-                if seekable else f'<span class="qt">{stamp}</span>')
+                if seekable else
+                f'<span class="qt" data-vh-t="{at:.2f}">{stamp}</span>')
         speaker = str(q.get("speaker") or "").strip()
         who = f'<span class="spk">{html.escape(speaker)}</span> ' if speaker else ""
         rows.append(f'<li>{mark} {who}'
@@ -2929,9 +2943,9 @@ def render_html(report: Mapping, title: Optional[str] = None,
         segs.append(
             f'<div class="seg" id="clip-{e["index"]}">{thumb}<div class="body">'
             f'<div><span class="num">Clip {e["index"]}</span>'
-            f'<span class="rng">{html.escape(e["range"])}</span> · '
+            f'<span class="rng">{source_time(e["range"], e["start"])}</span> · '
             f'<span class="pts">{e["score"]:.0f} points</span></div>'
-            f'<div class="meta">peak at {html.escape(e["timestamp"])} · '
+            f'<div class="meta">peak at {source_time(e["timestamp"], e.get("second", e["start"]))} · '
             f'{e["duration"]:.0f}s long{from_chapter}</div>'
             f'{_bars(e, max_points)}'
             f'{story}'
@@ -2947,7 +2961,7 @@ def render_html(report: Mapping, title: Optional[str] = None,
     near = ""
     if report["near_misses"]:
         rows = "".join(
-            f'<tr><td>{html.escape(e["timestamp"])}</td>'
+            f'<tr><td>{source_time(e["timestamp"], e["second"])}</td>'
             f'<td>{e["score"]:.0f}</td>'
             f'<td>{html.escape(", ".join(e["signals_present"]) or "—")}</td>'
             f'<td>{html.escape(", ".join(e["objects"]) or "—")}</td>'
