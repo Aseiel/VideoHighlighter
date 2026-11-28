@@ -551,8 +551,10 @@ def run_shots(video_path: str, *, progress: ProgressFn = None, cancel=None,
 
 def keep_frame_accurate_shots(patch: dict, cache: Optional[dict]) -> dict:
     """A motion patch without its ``scenes`` when the cache already holds the
-    frame-accurate ones - the motion pass's cuts would replace better cuts."""
-    if (cache or {}).get("scenes_source") == SHOTS_FRAME_ACCURATE and "scenes" in patch:
+    frame-accurate ones - the motion pass's cuts would replace better cuts.
+    A Shots patch (it carries ``scenes_source`` itself) always goes through."""
+    if ((cache or {}).get("scenes_source") == SHOTS_FRAME_ACCURATE and "scenes" in patch
+            and patch.get("scenes_source") != SHOTS_FRAME_ACCURATE):
         patch = {k: v for k, v in patch.items() if k != "scenes"}
     return patch
 
@@ -936,7 +938,10 @@ def merge_into_cache(video_path: str, patch: dict, *, seed: dict = None,
                         disk = json.load(f)
                 except Exception:
                     continue
-                disk.update(patch)
+                # Per file, against what that file holds: the main window's
+                # Scan motion used to fold its coarse cuts over the Shots
+                # run's frame-accurate ones, because only the viewer checked.
+                disk.update(keep_frame_accurate_shots(patch, disk))
                 atomic_write_json(Path(cache_file), disk)
                 wrote += 1
             log(f"💾 Analysis merged → {wrote} cache file(s)")

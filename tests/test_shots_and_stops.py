@@ -63,3 +63,59 @@ def test_sudden_stops_are_named_weighed_and_gated_like_peaks():
 def test_the_simple_run_does_not_score_stops():
     from modules.segments.simple_run import SIMPLE_SCORING
     assert SIMPLE_SCORING["motion_stop_points"] == 0
+
+
+# --- shots and motion as separate scans (main window, 2026-11-28) ------------
+
+def _cache_dir_with(tmp_path, monkeypatch, cache: dict):
+    import json
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "cache").mkdir()
+    path = tmp_path / "cache" / "abc.cache.json"
+    path.write_text(json.dumps(cache), encoding="utf-8")
+    monkeypatch.setattr(ao, "_cache_files", lambda vp: ("abc", [path]))
+    return path
+
+
+def test_the_main_window_s_motion_scan_keeps_frame_accurate_shots(tmp_path, monkeypatch):
+    """Only the viewer checked before folding: Scan motion in the main window
+    replaced 2044 frame-accurate cuts with the motion pass's 1129."""
+    import json
+    path = _cache_dir_with(tmp_path, monkeypatch, {
+        "scenes": [{"start": 0.0, "end": 0.4}, {"start": 0.4, "end": 9.0}],
+        "scenes_source": ao.SHOTS_FRAME_ACCURATE})
+    ao.merge_into_cache("film.mp4", {"scenes": [{"start": 0.0, "end": 9.0}],
+                                     "motion_peaks": [3.0]}, log=lambda *a: None)
+    disk = json.loads(path.read_text(encoding="utf-8"))
+    assert len(disk["scenes"]) == 2 and disk["motion_peaks"] == [3.0]
+
+
+def test_a_shots_scan_replaces_earlier_frame_accurate_shots(tmp_path, monkeypatch):
+    import json
+    path = _cache_dir_with(tmp_path, monkeypatch, {
+        "scenes": [{"start": 0.0, "end": 9.0}], "scenes_source": ao.SHOTS_FRAME_ACCURATE})
+    ao.merge_into_cache("film.mp4", {"scenes": [{"start": 0.0, "end": 4.0},
+                                                {"start": 4.0, "end": 9.0}],
+                                     "scenes_source": ao.SHOTS_FRAME_ACCURATE},
+                        log=lambda *a: None)
+    assert len(json.loads(path.read_text(encoding="utf-8"))["scenes"]) == 2
+
+
+def test_saved_status_tells_shots_from_motion():
+    from modules.report.scan_state import KINDS, kinds_in
+    assert "shots" in KINDS and KINDS.index("shots") < KINDS.index("motion")
+    accurate = {"scenes": [{"start": 0, "end": 1}],
+                "scenes_source": ao.SHOTS_FRAME_ACCURATE}
+    assert kinds_in(accurate) == {"shots"}                       # no motion yet
+    assert kinds_in({**accurate, "motion_curve": [0.1]}) == {"shots", "motion"}
+    # the motion pass's own cuts are motion's result, not a shots scan
+    assert kinds_in({"scenes": [{"start": 0, "end": 1}]}) == {"motion"}
+
+
+def test_the_main_window_has_a_scan_button_for_each():
+    import re
+    from pathlib import Path
+    src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text(encoding="utf-8")
+    assert re.search(r'spin_scene_points, "shots", "Scan shots"', src)
+    assert re.search(r'spin_motion_event_points, "motion", "Scan motion"', src)
+    assert 'if self.kind == "shots":' in src

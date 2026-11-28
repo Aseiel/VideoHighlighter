@@ -19,7 +19,12 @@ from __future__ import annotations
 from typing import Callable, Dict, Iterable, List, Optional
 
 # The kinds the main window can scan, in the order it lists them.
-KINDS = ("motion", "audio", "transcript", "objects", "actions", "composition")
+KINDS = ("shots", "motion", "audio", "transcript", "objects", "actions",
+         "composition")
+
+# Written by the Shots run (analysis_ondemand.SHOTS_FRAME_ACCURATE); not
+# imported, to keep this module free of the runners.
+_FRAME_ACCURATE = "shot_boundaries"
 
 
 def kinds_in(cache: dict) -> frozenset:
@@ -27,8 +32,14 @@ def kinds_in(cache: dict) -> frozenset:
     cache = cache or {}
     found = set()
 
-    if (cache.get("scenes") or cache.get("motion_events")
-            or cache.get("motion_peaks") or cache.get("motion_curve")):
+    # Shots and motion are separate scans. The motion pass also leaves cuts,
+    # but coarse ones, so "shots saved" means the frame-accurate run's.
+    frame_accurate = cache.get("scenes_source") == _FRAME_ACCURATE
+    if frame_accurate and cache.get("scenes"):
+        found.add("shots")
+    if (cache.get("motion_events") or cache.get("motion_peaks")
+            or cache.get("motion_curve")
+            or (cache.get("scenes") and not frame_accurate)):
         found.add("motion")
 
     audio = cache.get("audio") if isinstance(cache.get("audio"), dict) else {}

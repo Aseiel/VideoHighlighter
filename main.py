@@ -763,7 +763,10 @@ class SignalRunWorker(QThread):
             if self.preview_enabled and not self._cancel_flag.is_set():
                 self.preview.emit(frame, boxes, sec)
 
+        if self.kind == "shots":
+            return aod.run_shots(video_path, progress=progress, cancel=c, log=self.log.emit)
         if self.kind == "motion":
+            # merge_into_cache keeps frame-accurate shots over these cuts.
             return aod.run_motion(video_path, progress=progress, cancel=c, log=self.log.emit)
         if self.kind == "audio":
             return aod.run_audio(video_path, progress=progress, cancel=c, log=self.log.emit)
@@ -1627,8 +1630,9 @@ class VideoHighlighterGUI(QWidget):
 
         self.spin_scene_points = QSpinBox(); self.spin_scene_points.setRange(0,100); self.spin_scene_points.setValue(scoring_cfg.get("scene_points", 0))
         self.spin_scene_points.setToolTip(
-            "Points on the second a shot change happens (a jump in frame difference). "
-            "One hit per cut, not for the rest of the shot.")
+            "Points on the second a shot change happens. One hit per cut, not "
+            "for the rest of the shot. Scan shots finds every cut to the frame; "
+            "without it a full run uses the motion pass's coarser cuts.")
 
         self.spin_motion_event_points = QSpinBox(); self.spin_motion_event_points.setRange(0,100); self.spin_motion_event_points.setValue(scoring_cfg.get("motion_event_points", 0))
         self.spin_motion_event_points.setToolTip(
@@ -1762,17 +1766,24 @@ class VideoHighlighterGUI(QWidget):
         face_h.addWidget(self.btn_face_labels)
         face_h.addStretch(1)
 
-        # Scene / motion-event / motion-peak all come from ONE detector pass, so
-        # the button lives on the first of the three and runs all three.
+        # Shots and motion are separate scans. Shots finds every cut to the
+        # frame (modules/segments/shot_boundaries.py); the motion pass samples
+        # every few frames, so its cuts are a coarse by-product and it keeps
+        # the Shots run's once those are saved. Motion event, peak and sudden
+        # stop come from ONE motion pass, so its button runs all three.
         # Keyword + transcript points likewise share one transcription pass.
         groups = (
             ("Movement && shots", (
                 ("Shot change points:", self._points_row_with_button(
-                    self.spin_scene_points, "motion", "Scan motion",
-                    "Detect shot changes and motion across every video in the list "
-                    "and cache them (covers shot change, motion event, motion peak and sudden stop "
-                    "— one pass). No highlights are cut.")),
-                ("Motion event points:", self.spin_motion_event_points),
+                    self.spin_scene_points, "shots", "Scan shots",
+                    "Find every shot change, to the frame, across every video in "
+                    "the list and cache them. No highlights are cut.")),
+                ("Motion event points:", self._points_row_with_button(
+                    self.spin_motion_event_points, "motion", "Scan motion",
+                    "Detect motion across every video in the list and cache it "
+                    "(covers motion event, motion peak and sudden stop — one "
+                    "pass). Shots already found by Scan shots are kept. No "
+                    "highlights are cut.")),
                 ("Motion peak points:", self.spin_motion_peak),
                 ("Sudden stop points:", self.spin_motion_stop),
             )),
